@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 RESTART_SCRIPT = ROOT / "restart.sh"
@@ -20,10 +21,83 @@ def test_restart_script_preheats_codex_acp_fallback_dependency():
     assert "prepare_codex_acp_dependency" in text.split("start_service() {", 1)[1]
 
 
-def test_application_startup_preheats_codex_model_capabilities():
-    main_source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
-    assert "kickoff_acp_model_preheat" in main_source
-    assert 'kickoff_acp_model_preheat(["codex"], cwd=os.getcwd())' in main_source
+def test_application_startup_preheats_codex_model_capabilities_without_join(
+    monkeypatch,
+):
+    import src.acp.helper as acp_helper
+    import src.coco_model as coco_model
+    import src.main as main_module
+
+    events = []
+    preheat_calls = []
+
+    class ThreadMustNotBeJoined:
+        def join(self, *_args, **_kwargs):
+            raise AssertionError("application startup must not join ACP preheat")
+
+    class FakeCocoModelManager:
+        def kickoff_preheat(self):
+            events.append("coco-preheat")
+
+    class FakeFeishuClient:
+        def __init__(self, *, message_callback):
+            self.message_callback = message_callback
+
+        def start(self):
+            events.append("feishu-start")
+
+        def close(self):
+            events.append("feishu-close")
+
+    def fake_codex_preheat(tool_names, cwd):
+        preheat_calls.append((tool_names, cwd))
+        events.append("codex-preheat")
+        return ThreadMustNotBeJoined()
+
+    monkeypatch.setattr(acp_helper, "kickoff_acp_model_preheat", fake_codex_preheat)
+    monkeypatch.setattr(
+        coco_model,
+        "get_coco_model_manager",
+        lambda: FakeCocoModelManager(),
+    )
+    monkeypatch.setattr(main_module.os, "getcwd", lambda: "/repo")
+    monkeypatch.setattr(
+        main_module,
+        "_load_feishu_runtime",
+        lambda: (None, None, FakeFeishuClient),
+    )
+    monkeypatch.setattr(
+        main_module.Application,
+        "_install_signal_handlers",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        main_module.Application,
+        "_shutdown_lock_managers",
+        staticmethod(lambda: None),
+    )
+
+    app = object.__new__(main_module.Application)
+    app.settings = SimpleNamespace(
+        validate_feishu_config=lambda: True,
+        app_id="test-app-id",
+        sandbox_timeout=30,
+        default_acp_tool=None,
+        ttadk_preheat_enabled=False,
+        ttadk_preheat_on_startup=False,
+        acp_model_preheat_on_startup=True,
+    )
+    app.feishu_client = None
+
+    app.run()
+
+    assert preheat_calls == [(["codex"], "/repo")]
+    assert events == [
+        "coco-preheat",
+        "codex-preheat",
+        "feishu-start",
+        "feishu-close",
+    ]
 
 
 def test_restart_script_syncs_python_and_prepares_platform_sandbox():

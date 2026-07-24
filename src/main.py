@@ -222,8 +222,8 @@ class Application:
         # ACP model list preheat (background best-effort).
         try:
             if getattr(self.settings, "acp_model_preheat_on_startup", True):
-                from acp.helper import kickoff_acp_model_preheat
-                from coco_model import get_coco_model_manager
+                from .acp.helper import kickoff_acp_model_preheat
+                from .coco_model import get_coco_model_manager
 
                 get_coco_model_manager().kickoff_preheat()
                 kickoff_acp_model_preheat(["codex"], cwd=os.getcwd())
