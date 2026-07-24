@@ -219,16 +219,16 @@ class Application:
         except Exception:
             logger.debug("Application.run: TTADK preheat failed", exc_info=True)
 
-        # Coco ACP model list preheat (background best-effort) — keeps the 5min
-        # cache warm so /coco shows the real model list instead of degrading to
-        # the static DEFAULT_MODELS when the cold-spawn probe is slow.
+        # ACP model list preheat (background best-effort).
         try:
             if getattr(self.settings, "acp_model_preheat_on_startup", True):
+                from acp.helper import kickoff_acp_model_preheat
                 from coco_model import get_coco_model_manager
 
                 get_coco_model_manager().kickoff_preheat()
+                kickoff_acp_model_preheat(["codex"], cwd=os.getcwd())
         except Exception:
-            logger.debug("Application.run: coco model preheat failed", exc_info=True)
+            logger.debug("Application.run: ACP model preheat failed", exc_info=True)
 
         self._install_signal_handlers()
 

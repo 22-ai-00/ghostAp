@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import src.acp.helper as _helper_mod
 from src.acp.helper import fetch_acp_models
 from src.coco_model.manager import DEFAULT_MODELS
+from src.ttadk.models import ACPModelOption
 
 
 def test_fetch_codex_models_timeout_returns_empty_without_adapter_models(monkeypatch, tmp_path):
@@ -177,6 +178,46 @@ def test_fetch_coco_models_uses_manager_cache_when_real_models_present(monkeypat
 # ---------------------------------------------------------------------------
 # Non-coco ACP probe cache tests
 # ---------------------------------------------------------------------------
+
+
+def test_codex_success_cache_remains_fresh_for_thirty_minutes(monkeypatch):
+    key = _helper_mod._probe_key("codex", "/repo")
+    _helper_mod._acp_probe_cache[key] = (
+        _helper_mod._time.time() - 600,
+        [ACPModelOption(name="gpt-test", description="test", is_default=True)],
+    )
+
+    async def probe_must_not_run(*_args, **_kwargs):
+        raise AssertionError("ten-minute-old Codex cache should still be fresh")
+
+    monkeypatch.setattr(_helper_mod, "probe_acp_models", probe_must_not_run)
+    assert [m.name for m in fetch_acp_models("codex", cwd="/repo")] == ["gpt-test"]
+
+
+def test_background_preheat_deduplicates_codex(monkeypatch):
+    calls = []
+
+    def fake_fetch(tool_name, *, cwd):
+        calls.append((tool_name, cwd))
+        return [
+            ACPModelOption(
+                name="gpt-test",
+                description="test",
+                is_default=True,
+            )
+        ]
+
+    monkeypatch.setattr(_helper_mod, "fetch_acp_models", fake_fetch)
+
+    thread = _helper_mod.kickoff_acp_model_preheat(
+        ["codex", "codex"],
+        "/repo",
+    )
+    assert thread is not None
+    thread.join(timeout=1.0)
+
+    assert not thread.is_alive()
+    assert calls == [("codex", "/repo")]
 
 
 def test_fetch_acp_models_non_coco_caches_successful_probe(monkeypatch):

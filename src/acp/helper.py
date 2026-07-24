@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 #
 # Three coordinated layers, all keyed by (tool_name, cwd) and guarded by a
 # single leaf lock:
-#   * positive cache  — a successful probe result, reused for _ACP_PROBE_CACHE_TTL.
+#   * positive cache  — a successful probe result, reused for its tool-specific TTL.
 #   * negative cache  — remembers a recent empty/timed-out probe so a stuck tool
 #                       (e.g. claude, which lacks ACP serve support and burns the
 #                       full probe timeout every call) is not re-probed on every
@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 _acp_probe_cache: dict[tuple[str, str], tuple[float, list[ACPModelOption]]] = {}
 _acp_probe_cache_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 _ACP_PROBE_CACHE_TTL = 300  # 5 minutes
+_CODEX_PROBE_CACHE_TTL = 1800  # 30 minutes
 _ACP_NEG_CACHE_TTL = 45  # remember "no models / timed out" briefly to avoid re-probing
 
 # Negative cache: key -> timestamp of the failed probe.
@@ -51,6 +52,14 @@ _acp_neg_cache: dict[tuple[str, str], float] = {}
 # Single-flight registry: key -> Event signalling the in-flight probe finished.
 _acp_probe_inflight: dict[tuple[str, str], threading.Event] = {}
 _acp_probe_generation: dict[tuple[str, str], int] = {}
+
+
+def _positive_probe_cache_ttl(tool_name: str) -> float:
+    return float(
+        _CODEX_PROBE_CACHE_TTL
+        if str(tool_name or "").strip().lower() == "codex"
+        else _ACP_PROBE_CACHE_TTL
+    )
 
 
 def _probe_key(tool_name: str, cwd: Optional[str]) -> tuple[str, str]:
@@ -144,7 +153,7 @@ def _get_cached_probe(tool_name: str, cwd: Optional[str] = None) -> list[ACPMode
     if not entry:
         return []
     ts, models = entry
-    if (_time.time() - ts) > _ACP_PROBE_CACHE_TTL:
+    if (_time.time() - ts) > _positive_probe_cache_ttl(tool_name):
         return []
     return _copy_models(models)
 
@@ -378,6 +387,54 @@ def fetch_acp_models(
         return fallback
 
     return []
+
+
+def kickoff_acp_model_preheat(
+    tool_names: list[str],
+    cwd: str,
+) -> threading.Thread | None:
+    """Best-effort background preheat for ACP model capability caches."""
+    normalized_tools: list[str] = []
+    seen: set[str] = set()
+    for raw_tool_name in tool_names:
+        tool_name = str(raw_tool_name or "").strip()
+        if not tool_name or tool_name in seen:
+            continue
+        seen.add(tool_name)
+        normalized_tools.append(tool_name)
+
+    if not normalized_tools:
+        return None
+
+    def _preheat() -> None:
+        for tool_name in normalized_tools:
+            started_at = _time.monotonic()
+            try:
+                models = fetch_acp_models(tool_name, cwd=cwd)
+                count = len(models)
+                outcome = "success" if models else "empty"
+                logger.info(
+                    "[ACP] model preheat tool=%s count=%d outcome=%s duration_ms=%.1f",
+                    tool_name,
+                    count,
+                    outcome,
+                    (_time.monotonic() - started_at) * 1000,
+                )
+            except Exception:
+                logger.info(
+                    "[ACP] model preheat tool=%s count=0 outcome=failed duration_ms=%.1f",
+                    tool_name,
+                    (_time.monotonic() - started_at) * 1000,
+                    exc_info=True,
+                )
+
+    thread = threading.Thread(
+        target=_preheat,
+        name="acp-model-preheat",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _coco_target_default(current_model: Optional[str]) -> str:

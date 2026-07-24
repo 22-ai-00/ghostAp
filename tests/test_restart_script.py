@@ -20,6 +20,12 @@ def test_restart_script_preheats_codex_acp_fallback_dependency():
     assert "prepare_codex_acp_dependency" in text.split("start_service() {", 1)[1]
 
 
+def test_application_startup_preheats_codex_model_capabilities():
+    main_source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+    assert "kickoff_acp_model_preheat" in main_source
+    assert 'kickoff_acp_model_preheat(["codex"], cwd=os.getcwd())' in main_source
+
+
 def test_restart_script_syncs_python_and_prepares_platform_sandbox():
     text = RESTART_SCRIPT.read_text(encoding="utf-8")
     start_body = text.split("start_service() {", 1)[1]
