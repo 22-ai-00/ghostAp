@@ -34,6 +34,7 @@ class ControlPlane:
 
         self._system_cmd_gate_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._system_cmd_inflight_by_chat: dict[str, int] = {}
+        self._system_cmd_runs_by_chat: dict[str, set[str]] = {}
 
         self._thread = threading.Thread(
             target=self._loop,
@@ -51,16 +52,22 @@ class ControlPlane:
         try:
             # 1) System command gate state
             if ev.task_type in {"system_help", "system_exit"}:
+                terminal = {
+                    TaskStatus.SUCCEEDED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELED,
+                }
                 with self._system_cmd_gate_lock:
-                    cur = int(self._system_cmd_inflight_by_chat.get(ev.chat_id, 0) or 0)
+                    runs = self._system_cmd_runs_by_chat.setdefault(ev.chat_id, set())
                     if ev.status == TaskStatus.RUNNING:
-                        self._system_cmd_inflight_by_chat[ev.chat_id] = cur + 1
-                    elif ev.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED}:
-                        nxt = max(0, cur - 1)
-                        if nxt <= 0:
-                            self._system_cmd_inflight_by_chat.pop(ev.chat_id, None)
-                        else:
-                            self._system_cmd_inflight_by_chat[ev.chat_id] = nxt
+                        runs.add(ev.run_id)
+                    elif ev.status in terminal:
+                        runs.discard(ev.run_id)
+                    if runs:
+                        self._system_cmd_inflight_by_chat[ev.chat_id] = len(runs)
+                    else:
+                        self._system_cmd_runs_by_chat.pop(ev.chat_id, None)
+                        self._system_cmd_inflight_by_chat.pop(ev.chat_id, None)
 
             # 2) Deferred exit processing wakeup
             if ev.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED}:
