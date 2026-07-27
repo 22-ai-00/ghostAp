@@ -300,13 +300,13 @@ Append a detailed section to `.Memory/2026-07-24.md` covering:
 
 Add a roughly 20-character summary line under `2026-07-24` in `.Memory/Abstract.md`.
 
-- [ ] **Step 3: Commit memory and plan**
+- [x] **Step 3: Commit memory and plan**
 
 ```bash
 git add \
   .Memory/2026-07-24.md \
   .Memory/Abstract.md \
-  docs/superpowers/plans/2026-07-24-codex-model-selection-recovery.md
+  docs/2026-07-24-codex-model-selection-recovery-plan.md
 git commit -m "docs(memory): record codex selection recovery"
 ```
 
