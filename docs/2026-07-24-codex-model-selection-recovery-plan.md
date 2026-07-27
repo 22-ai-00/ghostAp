@@ -310,7 +310,7 @@ git add \
 git commit -m "docs(memory): record codex selection recovery"
 ```
 
-- [ ] **Step 4: Review, push, and restart**
+- [x] **Step 4: Review, push, and restart**
 
 After independent code review is clean:
 
@@ -323,7 +323,7 @@ git push origin dev
 
 Require the fetched divergence to have zero commits on the remote-only side before push. Never force-push.
 
-- [ ] **Step 5: Verify production restart**
+- [x] **Step 5: Verify production restart**
 
 Inspect the new `logs.log` tail and require:
 
