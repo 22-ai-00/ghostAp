@@ -182,9 +182,13 @@ def test_fetch_coco_models_uses_manager_cache_when_real_models_present(monkeypat
 
 def test_codex_success_cache_remains_fresh_for_thirty_minutes(monkeypatch):
     key = _helper_mod._probe_key("codex", "/repo")
-    _helper_mod._acp_probe_cache[key] = (
-        _helper_mod._time.time() - 600,
-        [ACPModelOption(name="gpt-test", description="test", is_default=True)],
+    monkeypatch.setitem(
+        _helper_mod._acp_probe_cache,
+        key,
+        (
+            _helper_mod._time.time() - 600,
+            [ACPModelOption(name="gpt-test", description="test", is_default=True)],
+        ),
     )
 
     async def probe_must_not_run(*_args, **_kwargs):
