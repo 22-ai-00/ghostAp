@@ -1033,7 +1033,7 @@ class EmployeeDispatchCoordinator:
             raise
 
     def recover_incomplete_attempts(self) -> tuple[FinalizedEmployeeAttempt, ...]:
-        """Terminalize unknown committed outcomes; never call the execution gateway."""
+        """Reconcile Actor facts, then terminalize unknowns without re-execution."""
 
         self._recover_legacy_router_dispatches()
         self._synchronize_gateway_from_journal()
@@ -1045,12 +1045,45 @@ class EmployeeDispatchCoordinator:
         return tuple(
             self.finalize_attempt(
                 attempt_id,
-                GatewayExecutionResult(
-                    GatewayExecutionStatus.ACTION_REQUIRED,
-                    safe_error_code="unknown_dispatch_outcome",
-                ),
+                self._recovered_execution_result(attempt_id),
             )
             for attempt_id in pending
+        )
+
+    def _recovered_execution_result(
+        self,
+        attempt_id: str,
+    ) -> GatewayExecutionResult:
+        runtime = self._employee_runtime
+        terminal = runtime.terminal(attempt_id) if runtime is not None else None
+        if terminal is None:
+            return GatewayExecutionResult(
+                GatewayExecutionStatus.ACTION_REQUIRED,
+                safe_error_code="unknown_dispatch_outcome",
+            )
+        if terminal.status == "completed":
+            if terminal.output:
+                return GatewayExecutionResult(
+                    GatewayExecutionStatus.COMPLETED,
+                    output=terminal.output,
+                )
+            return GatewayExecutionResult(
+                GatewayExecutionStatus.ACTION_REQUIRED,
+                safe_error_code="employee_result_unavailable_after_restart",
+            )
+        status = {
+            "timeout": GatewayExecutionStatus.TIMEOUT,
+            "canceled": GatewayExecutionStatus.CANCELED,
+            "action_required": GatewayExecutionStatus.ACTION_REQUIRED,
+        }.get(terminal.status)
+        if status is None:
+            return GatewayExecutionResult(
+                GatewayExecutionStatus.ACTION_REQUIRED,
+                safe_error_code="unknown_dispatch_outcome",
+            )
+        return GatewayExecutionResult(
+            status,
+            safe_error_code=terminal.error_code or f"employee_actor_{status.value}",
         )
 
     def reconcile_terminal_snapshots(self) -> int:

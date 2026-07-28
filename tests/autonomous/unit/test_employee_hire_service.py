@@ -28,6 +28,7 @@ from src.autonomous.provisioning.hire_state import (
     HireProjection,
     HireProjectionError,
 )
+from src.autonomous.provisioning.verification import VerificationChallenge
 from src.autonomous.workforce.projection import commit_workforce_events
 from src.config.settings import Settings
 
@@ -172,6 +173,138 @@ def _service(
         ),
     )
     return service, writer, projection
+
+
+def _seed_automatically_activated_hire(
+    service: ProductionEmployeeHireService,
+    *,
+    unsafe_action_required_effect: bool = False,
+) -> DurableHireState:
+    state = service.start_hire(_request())
+    app_id = "cli_employee"
+    credential_ref = "vault://employee"
+    for next_state in (
+        HireEffectState.PREPARED,
+        HireEffectState.EXECUTING,
+        HireEffectState.COMMITTED,
+    ):
+        state = service.commit_effect_transition(
+            state.intent_id,
+            effect_id="register-app",
+            effect_type="app_registration",
+            next_state=next_state,
+            metadata={"app_id": app_id},
+        )
+    state = service._commit_phase_transition(state, HirePhase.STORING_CREDENTIAL)
+    for next_state in (
+        HireEffectState.PREPARED,
+        HireEffectState.EXECUTING,
+        HireEffectState.COMMITTED,
+    ):
+        state = service.commit_effect_transition(
+            state.intent_id,
+            effect_id="store-credential",
+            effect_type="credential_storage",
+            next_state=next_state,
+            metadata={
+                "app_id": app_id,
+                "credential_ref": credential_ref,
+            },
+        )
+    state = service._bind_principal(state, app_id, credential_ref)
+    slash_metadata = {
+        "app_id": app_id,
+        "slash_spec_hash": "slash_hash",
+        "slash_observed_hash": "slash_hash",
+        "slash_verified_at": "100.0",
+        "generation": "1",
+    }
+    for next_state in (
+        HireEffectState.PREPARED,
+        HireEffectState.EXECUTING,
+        HireEffectState.COMMITTED,
+    ):
+        state = service.commit_effect_transition(
+            state.intent_id,
+            effect_id="slash-reconcile:1:1",
+            effect_type="slash_reconciliation",
+            next_state=next_state,
+            metadata=slash_metadata,
+        )
+    channel_metadata = {
+        "app_id": app_id,
+        "identity_app_id": app_id,
+        "generation": "1",
+        "connection_id": "conn_generation_1",
+        "channel_verified_at": "101.0",
+    }
+    for next_state in (
+        HireEffectState.PREPARED,
+        HireEffectState.EXECUTING,
+        HireEffectState.COMMITTED,
+    ):
+        state = service.commit_effect_transition(
+            state.intent_id,
+            effect_id="channel-start:1",
+            effect_type="channel_start",
+            next_state=next_state,
+            metadata=channel_metadata,
+        )
+    if unsafe_action_required_effect:
+        state = service.commit_effect_transition(
+            state.intent_id,
+            effect_id="unsafe-recovery-evidence",
+            effect_type="unsafe_recovery_probe",
+            next_state=HireEffectState.PREPARED,
+        )
+        state = service.commit_effect_transition(
+            state.intent_id,
+            effect_id="unsafe-recovery-evidence",
+            effect_type="unsafe_recovery_probe",
+            next_state=HireEffectState.ACTION_REQUIRED,
+        )
+    state = service.begin_activation_verification(
+        VerificationChallenge(
+            hire_intent_id=state.intent_id,
+            tenant_key=state.tenant_key,
+            app_id=app_id,
+            agent_id=state.agent_id,
+            generation=1,
+            requester_principal_id=state.requester_principal_id,
+            requester_union_id=state.requester_union_id,
+            expected_slash_spec_hash="slash_hash",
+            nonce="nonce_generation_1",
+            issued_at=102.0,
+            expires_at=1_002.0,
+        )
+    )
+    return service.commit_automatic_activation(
+        state.intent_id,
+        activated_at=103.0,
+    )
+
+
+def _reopen_service(
+    tmp_path: Path,
+    *,
+    writer_epoch: int,
+) -> tuple[ProductionEmployeeHireService, JournalWriter]:
+    writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=FileAnchor(tmp_path / "anchor.json"),
+        hmac_key=HMAC_KEY,
+        writer_epoch=writer_epoch,
+    )
+    return (
+        ProductionEmployeeHireService(
+            writer,
+            ProjectionState(),
+            visible_employee_limit=1,
+            release_evidence_ready=True,
+            credential_keyring_ready=True,
+        ),
+        writer,
+    )
 
 
 def test_new_and_duplicate_hire_submit_only_after_all_commit_locks_release(
@@ -1106,6 +1239,189 @@ def test_recover_rebuilds_hire_and_canonical_projection(tmp_path: Path) -> None:
     assert recovered_service.start_hire(_request()) == admitted
     assert len(tuple(reopened_writer.replay())) == 1
     recovered_service.close()
+
+
+def test_recover_reopens_exact_phase_only_shutdown_channel_history(
+    tmp_path: Path,
+) -> None:
+    first, _writer, _projection = _service(tmp_path)
+    active = _seed_automatically_activated_hire(first)
+    assert active.phase is HirePhase.ACTIVE
+    assert active.verification_consumed is True
+    first.begin_channel_revalidation(
+        active.intent_id,
+        observed_generation=active.channel_generation,
+    )
+    first.close()
+
+    restarted, restarted_writer = _reopen_service(tmp_path, writer_epoch=2)
+    after_constructor = restarted.get_state(active.intent_id)
+    assert after_constructor is not None
+    assert after_constructor.phase is HirePhase.READY_PENDING_VERIFICATION
+
+    recovered = restarted.recover().get(active.intent_id)
+
+    assert recovered is not None
+    assert recovered.phase is HirePhase.VALIDATING
+    assert recovered.channel_generation == active.channel_generation
+    assert recovered.verification_consumed is True
+    assert all(
+        effect_state is HireEffectState.COMMITTED
+        for _effect_id, effect_state in recovered.effects
+    )
+    recovery_frames = [
+        frame
+        for frame in restarted_writer.replay()
+        if any(
+            event.event_type == "hire.channel.phase_only_recovery"
+            for event in frame.events
+        )
+    ]
+    assert len(recovery_frames) == 1
+    assert [event.event_type for event in recovery_frames[0].events] == [
+        "hire.channel.phase_only_recovery",
+        "employee.state_changed",
+    ]
+    restarted.close()
+
+
+def test_recover_refuses_shutdown_history_with_action_required_effect(
+    tmp_path: Path,
+) -> None:
+    first, _writer, _projection = _service(tmp_path)
+    active = _seed_automatically_activated_hire(
+        first,
+        unsafe_action_required_effect=True,
+    )
+    first.begin_channel_revalidation(
+        active.intent_id,
+        observed_generation=active.channel_generation,
+    )
+    first.close()
+
+    restarted, restarted_writer = _reopen_service(tmp_path, writer_epoch=2)
+    refused = restarted.recover().get(active.intent_id)
+
+    assert refused is not None
+    assert refused.phase is HirePhase.ACTION_REQUIRED
+    assert (
+        refused.effect_state("unsafe-recovery-evidence")
+        is HireEffectState.ACTION_REQUIRED
+    )
+    assert not any(
+        event.event_type == "hire.channel.phase_only_recovery"
+        for frame in restarted_writer.replay()
+        for event in frame.events
+    )
+    restarted.close()
+
+
+def test_phase_only_recovery_survives_crash_between_pending_and_disposal(
+    tmp_path: Path,
+) -> None:
+    first, _writer, _projection = _service(tmp_path)
+    active = _seed_automatically_activated_hire(first)
+    first.begin_channel_revalidation(
+        active.intent_id,
+        observed_generation=active.channel_generation,
+    )
+    first.close()
+
+    pending_service, _pending_writer = _reopen_service(
+        tmp_path,
+        writer_epoch=2,
+    )
+    pending = pending_service.get_state(active.intent_id)
+    assert pending is not None
+    assert pending.phase is HirePhase.READY_PENDING_VERIFICATION
+    pending_service.close()
+
+    disposal_service, disposal_writer = _reopen_service(
+        tmp_path,
+        writer_epoch=3,
+    )
+    recovered = disposal_service.recover().get(active.intent_id)
+
+    assert recovered is not None
+    assert recovered.phase is HirePhase.VALIDATING
+    assert recovered.verification_consumed is True
+    recovery_frames = [
+        frame
+        for frame in disposal_writer.replay()
+        if any(
+            event.event_type == "hire.channel.phase_only_recovery"
+            for event in frame.events
+        )
+    ]
+    assert len(recovery_frames) == 1
+    disposal_service.close()
+
+
+def test_guarded_reopen_stays_pending_after_new_channel_before_fresh_challenge(
+    tmp_path: Path,
+) -> None:
+    first, _writer, _projection = _service(tmp_path)
+    active = _seed_automatically_activated_hire(first)
+    first.begin_channel_revalidation(
+        active.intent_id,
+        observed_generation=active.channel_generation,
+    )
+    first.close()
+    restarted, _restarted_writer = _reopen_service(tmp_path, writer_epoch=2)
+    reopened = restarted.recover().get(active.intent_id)
+    assert reopened is not None
+    assert reopened.phase is HirePhase.VALIDATING
+
+    for next_state in (
+        HireEffectState.PREPARED,
+        HireEffectState.EXECUTING,
+        HireEffectState.COMMITTED,
+    ):
+        reopened = restarted.commit_effect_transition(
+            reopened.intent_id,
+            effect_id="slash-reconcile:2:1",
+            effect_type="slash_reconciliation",
+            next_state=next_state,
+            metadata=(
+                {
+                    "slash_spec_hash": "slash_hash",
+                    "slash_observed_hash": "slash_hash",
+                    "slash_verified_at": "104.0",
+                }
+                if next_state is HireEffectState.COMMITTED
+                else None
+            ),
+        )
+    for next_state in (
+        HireEffectState.PREPARED,
+        HireEffectState.EXECUTING,
+        HireEffectState.COMMITTED,
+    ):
+        reopened = restarted.commit_effect_transition(
+            reopened.intent_id,
+            effect_id="channel-start:2",
+            effect_type="employee_channel_start",
+            next_state=next_state,
+            metadata=(
+                {
+                    "app_id": reopened.app_id,
+                    "identity_app_id": reopened.app_id,
+                    "generation": "2",
+                    "connection_id": "conn_generation_2",
+                    "channel_verified_at": "105.0",
+                }
+                if next_state is HireEffectState.COMMITTED
+                else None
+            ),
+        )
+
+    interrupted = restarted.recover().get(active.intent_id)
+
+    assert interrupted is not None
+    assert interrupted.phase is HirePhase.VALIDATING
+    assert interrupted.channel_generation == 2
+    assert interrupted.verification_consumed is True
+    restarted.close()
 
 
 def test_hire_state_and_replay_projection_are_frozen(tmp_path: Path) -> None:

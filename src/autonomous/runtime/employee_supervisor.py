@@ -47,10 +47,12 @@ class EmployeeRuntimeSupervisor:
         self._actors: dict[str, EmployeeActor] = {}
         self._assignment_owner: dict[str, str] = {}
         self._terminals: dict[str, EmployeeAssignmentTerminal] = {}
+        self._terminal_sink_emitted: set[str] = set()
         self._conditions: dict[str, threading.Event] = {}
         self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._closed = False
         self._retired: set[str] = set()
+        self._recovering = False
 
     def ensure_employee(self, agent_id: str) -> EmployeeActor:
         with self._lock:
@@ -77,6 +79,25 @@ class EmployeeRuntimeSupervisor:
     def recover(self) -> int:
         if self._writer is None:
             return len(self._actors)
+        with self._lock:
+            if self._recovering:
+                raise RuntimeError("employee supervisor recovery is already running")
+            if any(
+                assignment_id not in self._terminals
+                for assignment_id in self._assignment_owner
+            ):
+                raise RuntimeError(
+                    "employee supervisor recovery conflicts with live assignments"
+                )
+            self._recovering = True
+        try:
+            return self._recover_from_journal()
+        finally:
+            with self._lock:
+                self._recovering = False
+
+    def _recover_from_journal(self) -> int:
+        assert self._writer is not None
         records: dict[str, dict[str, object]] = {}
         for frame in self._writer.replay():
             for event in frame.events:
@@ -87,10 +108,39 @@ class EmployeeRuntimeSupervisor:
                 if event.event_type == "employee.actor.assignment_queued":
                     record.update(event.payload)
                 elif event.event_type == "employee.actor.assignment_terminal":
-                    record["terminal"] = True
+                    terminal_payload = dict(event.payload)
+                    existing = record.get("terminal_payload")
+                    if existing is not None and existing != terminal_payload:
+                        raise RuntimeError("employee actor terminal replay conflicts")
+                    record["terminal_payload"] = terminal_payload
         recovered = 0
         for assignment_id, record in records.items():
-            if record.get("terminal") is True:
+            terminal_payload = record.get("terminal_payload")
+            if isinstance(terminal_payload, dict):
+                agent_id = terminal_payload.get("agent_id")
+                queued_agent_id = record.get("agent_id")
+                status = terminal_payload.get("status")
+                error_code = terminal_payload.get("error_code")
+                if (
+                    not isinstance(agent_id, str)
+                    or not agent_id
+                    or (
+                        isinstance(queued_agent_id, str)
+                        and queued_agent_id
+                        and queued_agent_id != agent_id
+                    )
+                    or status not in {"completed", "timeout", "canceled", "action_required"}
+                    or not isinstance(error_code, str)
+                ):
+                    raise RuntimeError("employee actor terminal replay is invalid")
+                self._restore_terminal(
+                    agent_id,
+                    EmployeeAssignmentTerminal(
+                        assignment_id,
+                        status,
+                        error_code=error_code,
+                    ),
+                )
                 continue
             agent_id = record.get("agent_id")
             payload_ref = record.get("payload_ref", "")
@@ -144,12 +194,26 @@ class EmployeeRuntimeSupervisor:
         assignment_id = assignment.assignment_id
         agent_id = assignment.bootstrap.session_key.agent_id
         with self._lock:
+            if self._recovering:
+                raise RuntimeError("employee supervisor recovery is running")
             owner = self._assignment_owner.get(assignment_id)
             if owner is not None and owner != agent_id:
                 raise ValueError("assignment identity belongs to another employee")
             self._assignment_owner[assignment_id] = agent_id
             self._conditions.setdefault(assignment_id, threading.Event())
         return self.ensure_employee(agent_id).submit(assignment)
+
+    def terminal(self, assignment_id: str) -> EmployeeAssignmentTerminal | None:
+        """Return one live or Journal-restored terminal without waiting."""
+
+        if (
+            not isinstance(assignment_id, str)
+            or not assignment_id
+            or assignment_id != assignment_id.strip()
+        ):
+            raise ValueError("assignment_id is required")
+        with self._lock:
+            return self._terminals.get(assignment_id)
 
     def wait_terminal(
         self,
@@ -202,14 +266,59 @@ class EmployeeRuntimeSupervisor:
         for actor in actors:
             actor.close()
 
+    def _restore_terminal(
+        self,
+        agent_id: str,
+        terminal: EmployeeAssignmentTerminal,
+    ) -> None:
+        """Index a replayed fact without re-emitting its process-local sink."""
+
+        with self._lock:
+            owner = self._assignment_owner.get(terminal.assignment_id)
+            if owner is not None and owner != agent_id:
+                raise RuntimeError("employee actor terminal owner conflicts")
+            existing = self._terminals.get(terminal.assignment_id)
+            if existing is not None:
+                terminal = self._merge_terminal(existing, terminal)
+            self._assignment_owner[terminal.assignment_id] = agent_id
+            self._terminals[terminal.assignment_id] = terminal
+            event = self._conditions.setdefault(
+                terminal.assignment_id,
+                threading.Event(),
+            )
+            event.set()
+
     def _record_terminal(self, terminal: EmployeeAssignmentTerminal) -> None:
         with self._lock:
-            if terminal.assignment_id in self._terminals:
-                return
+            existing = self._terminals.get(terminal.assignment_id)
+            if existing is not None:
+                terminal = self._merge_terminal(existing, terminal)
             self._terminals[terminal.assignment_id] = terminal
             event = self._conditions.setdefault(terminal.assignment_id, threading.Event())
             event.set()
+            if terminal.assignment_id in self._terminal_sink_emitted:
+                return
+            self._terminal_sink_emitted.add(terminal.assignment_id)
         self._external_sink(terminal)
+
+    @staticmethod
+    def _merge_terminal(
+        existing: EmployeeAssignmentTerminal,
+        incoming: EmployeeAssignmentTerminal,
+    ) -> EmployeeAssignmentTerminal:
+        """Merge the Journal placeholder with a matching live terminal."""
+
+        if (
+            existing.assignment_id != incoming.assignment_id
+            or existing.status != incoming.status
+            or existing.error_code != incoming.error_code
+        ):
+            raise RuntimeError("employee actor terminal result conflicts")
+        if existing.output and incoming.output and existing.output != incoming.output:
+            raise RuntimeError("employee actor terminal output conflicts")
+        if incoming.output and not existing.output:
+            return incoming
+        return existing
 
     def _commit_recovery_terminal(
         self,

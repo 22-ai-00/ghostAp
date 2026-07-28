@@ -127,6 +127,34 @@ def test_add_commits_only_after_employee_bot_confirms_membership(tmp_path, reque
     assert fx.service.is_degraded("agt_1", "oc_team") is False
 
 
+def test_batch_membership_health_rebuilds_projection_once(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    fx = _fixture(tmp_path)
+    fx.service.mutate(_request())
+    rebuild_calls = 0
+    rebuild_projection = fx.service.rebuild_projection
+
+    def counted_rebuild():
+        nonlocal rebuild_calls
+        rebuild_calls += 1
+        return rebuild_projection()
+
+    monkeypatch.setattr(fx.service, "rebuild_projection", counted_rebuild)
+
+    health = fx.service.degraded_for(
+        ("agt_1", "agt_missing", "agt_1"),
+        "oc_team",
+    )
+
+    assert health == {
+        "agt_1": False,
+        "agt_missing": True,
+    }
+    assert rebuild_calls == 1
+
+
 def test_remove_only_removes_chat_membership_not_global_employee(tmp_path) -> None:
     fx = _fixture(tmp_path, member_groups=("oc_team", "oc_other"))
 

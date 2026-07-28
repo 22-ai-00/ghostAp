@@ -110,10 +110,10 @@ class TestRendererThrottling:
         assert "header" in content
         assert "body" in content
 
-        # Check for categories
+        # Help content stays compact; quick-action buttons live in /menu.
         elements = content["body"]["elements"]
         buttons_row = next((e for e in elements if e.get("tag") == "column_set"), None)
-        assert buttons_row is not None
+        assert buttons_row is None
 
         # Check for content text (now inside collapsible_panel elements)
         found = False

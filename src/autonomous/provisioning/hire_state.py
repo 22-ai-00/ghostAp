@@ -276,7 +276,8 @@ class HireProjection:
         bot_intents: dict[str, str] = {}
         existing_app_intents: dict[str, str] = {}
         for frame in frames:
-            for event in frame.events:
+            phase_only_recovery_intents: set[str] = set()
+            for event_index, event in enumerate(frame.events):
                 created = _created_state(event, frame.sequence)
                 if created is not None:
                     if created.intent_id in states or created.agent_id in agent_intents:
@@ -307,6 +308,32 @@ class HireProjection:
                 if intent_id is None:
                     continue
                 current = states[intent_id]
+                if event.event_type == "hire.channel.phase_only_recovery":
+                    generation = event.payload.get("generation")
+                    companion = (
+                        frame.events[1]
+                        if event_index == 0 and len(frame.events) == 2
+                        else None
+                    )
+                    if (
+                        set(event.payload) != {"generation"}
+                        or event.aggregate_id != current.intent_id
+                        or current.phase is not HirePhase.ACTION_REQUIRED
+                        or isinstance(generation, bool)
+                        or not isinstance(generation, int)
+                        or generation <= 0
+                        or generation != current.channel_generation
+                        or companion is None
+                        or companion.event_type != "employee.state_changed"
+                        or companion.aggregate_id != current.agent_id
+                        or companion.payload
+                        != {"state": HirePhase.VALIDATING.value}
+                    ):
+                        raise HireProjectionError(
+                            "invalid phase-only channel recovery marker"
+                        )
+                    phase_only_recovery_intents.add(intent_id)
+                    continue
                 if event.event_type == "hire.requester_identity_bound":
                     if set(event.payload) != {"requester_union_id"}:
                         raise HireProjectionError("invalid requester identity payload")
@@ -335,8 +362,17 @@ class HireProjection:
                         phase = HirePhase(_required_string(event.payload, "state"))
                     except ValueError as exc:
                         raise HireProjectionError("invalid hire phase") from exc
-                    if phase not in _ALLOWED_PHASE_SUCCESSORS[current.phase]:
+                    phase_only_recovery = (
+                        current.phase is HirePhase.ACTION_REQUIRED
+                        and phase is HirePhase.VALIDATING
+                        and intent_id in phase_only_recovery_intents
+                    )
+                    if (
+                        phase not in _ALLOWED_PHASE_SUCCESSORS[current.phase]
+                        and not phase_only_recovery
+                    ):
                         raise HireProjectionError("invalid hire phase transition")
+                    phase_only_recovery_intents.discard(intent_id)
                     states[intent_id] = replace(
                         current,
                         phase=phase,
@@ -687,6 +723,10 @@ class HireProjection:
                     channel_connection_id=channel_connection_id,
                     channel_verified_at=channel_verified_at,
                     last_sequence=frame.sequence,
+                )
+            if phase_only_recovery_intents:
+                raise HireProjectionError(
+                    "phase-only channel recovery marker was not consumed"
                 )
         return cls(MappingProxyType(states))
 

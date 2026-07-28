@@ -385,8 +385,17 @@ class TestClassifyIntent:
             assert result.action == SlockCommandAction.STOP
 
     def test_no_fast_match_falls_through_to_llm(self):
-        """When no fast match, the LLM placeholder returns UNKNOWN."""
-        result = _run(self.router.classify_intent("请给我讲个笑话"))
+        """When no fast match, an UNKNOWN LLM response is returned."""
+        unknown_response = (
+            '{"action": "unknown", "confidence": 0.0, "params": {}}'
+        )
+        with patch.object(
+            self.router,
+            "_call_llm",
+            AsyncMock(return_value=unknown_response),
+        ) as mock_llm:
+            result = _run(self.router.classify_intent("请给我讲个笑话"))
+        mock_llm.assert_awaited_once()
         assert result.action == SlockCommandAction.UNKNOWN
         assert result.confidence == 0.0
 
@@ -401,8 +410,17 @@ class TestClassifyIntent:
         """With a very high threshold, pattern matches below it fall through to LLM."""
         router = IntentRouter(confidence_threshold=0.99)
         # STOP has confidence 0.95, which is below 0.99
-        result = _run(router.classify_intent("停掉 slock"))
-        # Since 0.95 < 0.99, the fast match is discarded and LLM placeholder returns UNKNOWN
+        unknown_response = (
+            '{"action": "unknown", "confidence": 0.0, "params": {}}'
+        )
+        with patch.object(
+            router,
+            "_call_llm",
+            AsyncMock(return_value=unknown_response),
+        ) as mock_llm:
+            result = _run(router.classify_intent("停掉 slock"))
+        mock_llm.assert_awaited_once()
+        # Since 0.95 < 0.99, the fast match is discarded and LLM returns UNKNOWN.
         assert result.action == SlockCommandAction.UNKNOWN
 
 
@@ -765,6 +783,43 @@ class TestExpandedPatterns:
         assert result is not None
         assert result.action == SlockCommandAction.STATUS
         assert result.confidence == 0.88
+
+    # --- Explicit current-team member phrases -> EMPLOYEE_LIST ---
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "团队成员现在都有谁",
+            "当前团队成员有哪些",
+        ],
+    )
+    def test_team_member_phrases_use_employee_list(self, text: str):
+        result = self.router._fast_pattern_match(text)
+        assert result is not None
+        assert result.action == SlockCommandAction.EMPLOYEE_LIST
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "你们都能做什么",
+            "团队能做什么",
+        ],
+    )
+    def test_team_capability_questions_use_employee_list(self, text: str):
+        result = self.router._fast_pattern_match(text)
+        assert result is not None
+        assert result.action == SlockCommandAction.EMPLOYEE_LIST
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "团队能不能做一个登录页面",
+            "你们能不能做代码审查",
+        ],
+    )
+    def test_concrete_capability_requests_are_not_employee_list(self, text: str):
+        result = self.router._fast_pattern_match(text)
+        assert result is None or result.action != SlockCommandAction.EMPLOYEE_LIST
 
     # --- "看看谁在"/"谁在线" -> ROLE_LIST ---
 

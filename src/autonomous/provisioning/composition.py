@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import hashlib
+import inspect
 import logging
 import re
 import threading
@@ -608,10 +609,17 @@ class _RuntimeTeamBackend:
     ) -> None:
         if idempotency_key:
             try:
+                signature = inspect.signature(self._notify)
+            except (TypeError, ValueError):
                 self._notify(message_id, chat_id, result, idempotency_key)
                 return
+            try:
+                signature.bind(message_id, chat_id, result, idempotency_key)
             except TypeError:
                 pass
+            else:
+                self._notify(message_id, chat_id, result, idempotency_key)
+                return
         self._notify(message_id, chat_id, result)
 
 
@@ -4388,6 +4396,8 @@ class EmployeeDepartmentRuntime:
                         continue
                     try:
                         channel_status = channels.status(state.agent_id)
+                        if self._closing:
+                            return
                         if (
                             channel_status is not None
                             and channel_status.generation
@@ -4418,21 +4428,29 @@ class EmployeeDepartmentRuntime:
                                 )
                             )
                         ):
+                            if self._closing:
+                                return
                             service.begin_channel_revalidation(
                                 state.intent_id,
                                 observed_generation=state.channel_generation,
                             )
+                            if self._closing:
+                                return
                             self._submit_intent(state.intent_id)
                         elif (
                             state.phase is HirePhase.READY_PENDING_VERIFICATION
                             and state.verification_expires_at <= time.time()
                         ):
+                            if self._closing:
+                                return
                             self._renew_activation_challenge(state)
                     except Exception as exc:
                         logger.error(
                             "employee Channel monitor failed closed: %s",
                             type(exc).__name__,
                         )
+            if self._closing:
+                return
             await asyncio.sleep(2.0)
 
     async def _retry_terminal_notifications(self) -> None:

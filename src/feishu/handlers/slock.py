@@ -58,6 +58,7 @@ _NON_IMPERATIVE_TEAM_TASK_RE = re.compile(
     r"(?:吗|么|了吗|好了没)[？?]?$",
     re.IGNORECASE,
 )
+_LARK_MD_INLINE_SPECIAL_RE = re.compile(r"([\\`*_~\[\]()<>|#!])")
 
 
 def _normalize_existing_hire_app_id(value: object) -> str:
@@ -101,6 +102,19 @@ def _confidence_threshold(value: object, default: float) -> float:
     else:
         return default
     return threshold if 0.0 <= threshold <= 1.0 else default
+
+
+def _escape_lark_md_inline(value: object) -> str:
+    """Render one dynamic value as a bounded, single-line Markdown literal."""
+
+    normalized = " ".join(str(value or "").splitlines()).strip()
+    return _LARK_MD_INLINE_SPECIAL_RE.sub(r"\\\1", normalized)
+
+
+def _membership_is_degraded(value: object) -> bool:
+    """Fail closed unless membership health is the exact boolean ``False``."""
+
+    return value is not False
 
 
 def _get_nli_loop():
@@ -448,7 +462,9 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     if (
                         employee is not None
                         and chat_id in employee.member_groups
-                        and not membership.is_degraded(employee.agent_id, chat_id)
+                        and not _membership_is_degraded(
+                            membership.is_degraded(employee.agent_id, chat_id)
+                        )
                     ):
                         employees.append(employee)
                 employees = list(
@@ -572,6 +588,33 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 return
             # Engine already active — dispatch activate as status
             self._dispatch_nli_intent(message_id, chat_id, text, project, intent_result)
+            return
+
+        if (
+            not engine
+            and intent_result
+            and intent_result.action == SlockCommandAction.EMPLOYEE_LIST
+            and intent_result.confidence >= 0.85
+            and intent_result.confidence
+            >= _confidence_threshold(
+                getattr(
+                    self.ctx.settings,
+                    "slock_nli_confidence_threshold",
+                    0.7,
+                ),
+                0.7,
+            )
+        ):
+            # Journal-backed employees do not depend on the legacy Slock
+            # engine.  A current-team query remains available before or after
+            # legacy engine activation.
+            self._dispatch_nli_intent(
+                message_id,
+                chat_id,
+                text,
+                project,
+                intent_result,
+            )
             return
 
         if intent_result and intent_result.action == SlockCommandAction.CHITCHAT:
@@ -1087,6 +1130,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         "help": "查看帮助信息",
         "new_role": "创建新角色",
         "role_list": "查看角色列表",
+        "employee_list": "查看当前群团队成员",
         "task_list": "查看任务列表",
         "task_assign": "分配任务",
         "task_status": "查看任务状态",
@@ -1157,6 +1201,8 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             self.show_task_status(message_id, chat_id, project)
         elif action == SlockCommandAction.ROLE_LIST:
             self.list_roles(message_id, chat_id, project)
+        elif action == SlockCommandAction.EMPLOYEE_LIST:
+            self.list_current_team_members(message_id, chat_id)
         elif action == SlockCommandAction.TEAM_LIST:
             self.list_teams(message_id, chat_id, project)
         elif action == SlockCommandAction.ACTIVATE:
@@ -2699,6 +2745,198 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         except Exception as exc:
             logger.error("visible employee hire dispatch failed: %s", type(exc).__name__)
             self.reply_text(message_id, "独立飞书智能体创建启动失败，请查看安全日志后重试。")
+
+    def list_current_team_members(self, message_id: str, chat_id: str) -> None:
+        """List persistent employees with confirmed membership in this chat."""
+
+        from ...autonomous.domain.enums import EmployeeState, WorkerType
+        from ...thread.manager import get_current_tenant_key
+
+        tenant_key = get_current_tenant_key() or ""
+        if not tenant_key:
+            self.reply_text(message_id, "⚠️ 无法确认租户身份。")
+            return
+
+        membership_service = getattr(
+            self.ctx,
+            "employee_membership_service",
+            None,
+        )
+
+        hire_service = getattr(self.ctx, "employee_hire_service", None)
+        if hire_service is None:
+            self.reply_text(message_id, "员工管理服务尚未接入，无法查询当前团队。")
+            return
+
+        try:
+            projection = hire_service.synchronize_projection()
+            employees = [
+                employee
+                for employee in projection.employees.values()
+                if employee.tenant_key == tenant_key
+                and employee.worker_type is WorkerType.VISIBLE
+                and employee.state is not EmployeeState.ARCHIVED
+                and chat_id in getattr(employee, "member_groups", ())
+            ]
+        except Exception:
+            logger.exception("current team employee membership query failed")
+            self.reply_text(
+                message_id,
+                "⚠️ 无法确认当前群团队成员状态，请稍后重试。",
+            )
+            return
+
+        if not employees:
+            self.reply_text(
+                message_id,
+                "当前群没有可确认的员工成员。"
+                "使用 `/role add` 将员工加入本群，或 `/roster` 查看全局花名册。",
+            )
+            return
+
+        membership_degraded: dict[str, bool] = {}
+        batch_health = (
+            getattr(type(membership_service), "degraded_for", None)
+            if membership_service is not None
+            else None
+        )
+        if callable(batch_health):
+            try:
+                batch_result = membership_service.degraded_for(
+                    (employee.agent_id for employee in employees),
+                    chat_id,
+                )
+                if not isinstance(batch_result, dict):
+                    raise TypeError("invalid membership health snapshot")
+            except Exception:
+                logger.exception(
+                    "current team employee membership health snapshot failed"
+                )
+                batch_result = {}
+            membership_degraded = {
+                employee.agent_id: _membership_is_degraded(
+                    batch_result.get(employee.agent_id, True)
+                )
+                for employee in employees
+            }
+        else:
+            for employee in employees:
+                if membership_service is None:
+                    membership_degraded[employee.agent_id] = True
+                    continue
+                try:
+                    membership_degraded[
+                        employee.agent_id
+                    ] = _membership_is_degraded(
+                        membership_service.is_degraded(
+                            employee.agent_id,
+                            chat_id,
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "current team employee membership health query failed"
+                    )
+                    membership_degraded[employee.agent_id] = True
+
+        runtime_views: dict[str, object] = {}
+        runtime_facade = getattr(self.ctx, "employee_runtime_facade", None)
+        list_runtime = getattr(
+            runtime_facade,
+            "list_employee_runtime_statuses",
+            None,
+        )
+        if callable(list_runtime):
+            try:
+                runtime_views = {
+                    view.agent_id: view
+                    for view in list_runtime(tenant_key)
+                }
+            except Exception:
+                logger.exception("current team employee runtime query failed")
+
+        lines: list[str] = []
+        for employee in sorted(employees, key=lambda item: item.name):
+            tool = _escape_lark_md_inline(
+                getattr(employee, "tool", "") or "未配置"
+            )
+            model = _escape_lark_md_inline(getattr(employee, "model", "") or "")
+            tool_model = f"{tool}/{model}" if model else tool
+            emoji = _escape_lark_md_inline(
+                getattr(employee, "emoji", "") or "🤖"
+            )
+            name = _escape_lark_md_inline(employee.name)
+            membership_label = (
+                "⚠️ 群关系待确认"
+                if membership_degraded.get(employee.agent_id, True)
+                else "✅ 已确认在群"
+            )
+            line = (
+                f"{emoji} **员工**：{name}　{tool_model}　"
+                f"{membership_label}"
+            )
+            role = _escape_lark_md_inline(
+                getattr(employee, "role", "") or "未设置"
+            )
+            capabilities = ", ".join(
+                _escape_lark_md_inline(capability)
+                for capability in getattr(employee, "capabilities", ())
+                if str(capability)
+            ) or "未声明"
+            if employee.state is EmployeeState.ACTION_REQUIRED:
+                lifecycle = "⚠️ 待恢复"
+            elif employee.state is EmployeeState.ACTIVE:
+                lifecycle = "✅ 在职"
+            elif employee.state is EmployeeState.RETIRING:
+                lifecycle = "🔄 退休中"
+            else:
+                lifecycle = "⏳ 配置中"
+            line += (
+                f"　{lifecycle}\n  角色：{role}\n  能力：{capabilities}"
+            )
+            runtime_view = runtime_views.get(employee.agent_id)
+            if runtime_view is not None:
+                bot_state = str(
+                    getattr(runtime_view, "bot_state", "unknown")
+                ).upper()
+                actor_state = str(
+                    getattr(runtime_view, "actor_state", "unknown")
+                ).upper()
+                admission = (
+                    "可接任务"
+                    if not membership_degraded.get(employee.agent_id, True)
+                    and employee.state is EmployeeState.ACTIVE
+                    and getattr(runtime_view, "can_accept", False) is True
+                    else "不可接任务"
+                )
+                line += (
+                    f"\n  Bot {bot_state} / Agent {actor_state}　"
+                    f"{admission}"
+                )
+            else:
+                line += "\n  运行状态未知　暂不可确认接单"
+            lines.append(line)
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"当前团队成员（{len(employees)}人）",
+                },
+                "template": "green",
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": "\n\n".join(lines),
+                    },
+                },
+            ],
+        }
+        self.reply_card(message_id, card)
 
     def list_employees_roster(self, message_id: str, chat_id: str) -> None:
         """List all tenant employees with state and group membership count."""

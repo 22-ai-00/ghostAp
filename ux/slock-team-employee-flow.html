@@ -10,6 +10,7 @@
     main { max-width: 1080px; margin: auto; display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
     .card { background: white; border: 1px solid #dee0e3; border-radius: 14px; overflow: hidden; box-shadow: 0 8px 24px #1f23290d; }
     .header { padding: 15px 18px; color: white; font-weight: 700; background: linear-gradient(135deg, #3370ff, #4e83fd); }
+    .green { background: linear-gradient(135deg, #159a62, #2dbf7f); }
     .orange { background: linear-gradient(135deg, #f59e0b, #f97316); }
     .red { background: linear-gradient(135deg, #d14343, #e65c5c); }
     .body { padding: 18px; display: grid; gap: 12px; }
@@ -23,6 +24,18 @@
 </head>
 <body>
   <main>
+    <section class="card">
+      <div class="header green">当前群团队员工（2人）</div>
+      <div class="body">
+        <strong>🤖 员工：柳七月　claude/sonnet　✅ 已确认在群　⚠️ 待恢复</strong>
+        <span class="note">角色：reviewer<br>能力：review, security<br>Bot STOPPED / Agent READY_COLD　不可接任务</span>
+        <strong>🤖 员工：柳神　codex/gpt-5　✅ 已确认在群　✅ 在职</strong>
+        <span class="note">角色：coder<br>能力：coding, testing<br>Bot READY / Agent READY_WARM　可接任务</span>
+        <div>这里展示 Journal 中已加入当前群的真实员工，不再读取旧 Slock 虚拟角色表。</div>
+        <span class="note">“员工存在”和“当前可执行”分开表达；异常员工仍会显示，避免误报团队为空。</span>
+      </div>
+    </section>
+
     <section class="card">
       <div class="header">Slock 员工创建</div>
       <div class="body">

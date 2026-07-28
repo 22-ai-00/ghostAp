@@ -128,6 +128,22 @@ def _stable_id(prefix: str, tenant_key: str, message_id: str) -> str:
     return f"{prefix}_{hashlib.sha256(canonical).hexdigest()}"
 
 
+def _frame_matches(
+    frame: TransactionFrame,
+    expected: tuple[tuple[str, str, Mapping[str, object]], ...],
+) -> bool:
+    return len(frame.events) == len(expected) and all(
+        event.event_type == event_type
+        and event.aggregate_id == aggregate_id
+        and dict(event.payload) == dict(payload)
+        for event, (event_type, aggregate_id, payload) in zip(
+            frame.events,
+            expected,
+            strict=True,
+        )
+    )
+
+
 class ProductionEmployeeHireService:
     """Admit, execute, and recover the Journal/Vault hire Saga."""
 
@@ -1707,6 +1723,248 @@ class ProductionEmployeeHireService:
         except Exception:
             raise HireAdmissionError("employee workspace projection failed") from None
 
+    def _has_exact_phase_only_channel_shutdown_history(
+        self,
+        state: DurableHireState,
+        frames: tuple[TransactionFrame, ...],
+    ) -> bool:
+        generation = state.channel_generation
+        channel_effect_id = f"channel-start:{generation}"
+        channel_metadata = dict(state.metadata_for(channel_effect_id))
+        slash_effect_id = self._latest_slash_effect_id(state, generation)
+        slash_metadata = (
+            dict(state.metadata_for(slash_effect_id))
+            if slash_effect_id is not None
+            else {}
+        )
+        if (
+            state.phase is not HirePhase.ACTION_REQUIRED
+            or generation <= 0
+            or not state.app_id
+            or not state.credential_ref
+            or not state.verification_nonce
+            or state.verification_consumed is not True
+            or state.activation_source != "channel_ready"
+            or state.activation_verified_at <= 0
+            or not math.isfinite(state.activation_verified_at)
+            or not state.slash_spec_hash
+            or state.slash_spec_hash != state.slash_observed_hash
+            or state.channel_identity_app_id != state.app_id
+            or not state.channel_connection_id
+            or state.effect_state(channel_effect_id)
+            is not HireEffectState.COMMITTED
+            or channel_metadata.get("app_id") != state.app_id
+            or channel_metadata.get("identity_app_id") != state.app_id
+            or channel_metadata.get("generation") != str(generation)
+            or channel_metadata.get("connection_id")
+            != state.channel_connection_id
+            or slash_effect_id is None
+            or state.effect_state(slash_effect_id) is not HireEffectState.COMMITTED
+            or slash_metadata.get("slash_spec_hash") != state.slash_spec_hash
+            or slash_metadata.get("slash_observed_hash") != state.slash_spec_hash
+            or any(
+                effect_state is not HireEffectState.COMMITTED
+                for _effect_id, effect_state in state.effects
+            )
+        ):
+            return False
+
+        related_frames = tuple(
+            frame
+            for frame in frames
+            if any(
+                event.aggregate_id in {state.intent_id, state.agent_id}
+                for event in frame.events
+            )
+        )
+        if len(related_frames) < 5:
+            return False
+        crashed, validating, pending, action_required = related_frames[-4:]
+        activation_payload = {
+            "tenant_key": state.tenant_key,
+            "app_id": state.app_id,
+            "agent_id": state.agent_id,
+            "generation": generation,
+            "slash_spec_hash": state.slash_spec_hash,
+            "channel_connection_id": state.channel_connection_id,
+            "requester_principal_id": state.requester_principal_id,
+            "requester_union_id": state.requester_union_id,
+            "source": "channel_ready",
+            "activated_at": state.activation_verified_at,
+        }
+        activation_frame = next(
+            (
+                frame
+                for frame in reversed(related_frames[:-4])
+                if _frame_matches(
+                    frame,
+                    (
+                        (
+                            "hire.activation.automatic",
+                            state.intent_id,
+                            activation_payload,
+                        ),
+                        (
+                            "employee.state_changed",
+                            state.agent_id,
+                            {"state": HirePhase.ACTIVE.value},
+                        ),
+                    ),
+                )
+            ),
+            None,
+        )
+        old_writer_epoch = crashed.writer_epoch
+        restart_writer_epoch = pending.writer_epoch
+        return (
+            activation_frame is not None
+            and state.last_sequence == action_required.sequence
+            and validating.writer_epoch == old_writer_epoch
+            and restart_writer_epoch != old_writer_epoch
+            # A second crash can happen after the restart wrote PENDING but
+            # before it disposes the consumed nonce as ACTION_REQUIRED.  The
+            # exact four-frame chain is still phase-only evidence even when
+            # those two recovery transitions have distinct writer epochs.
+            and action_required.writer_epoch != old_writer_epoch
+            and _frame_matches(
+                crashed,
+                (
+                    (
+                        "hire.channel.crashed",
+                        state.intent_id,
+                        {"generation": generation},
+                    ),
+                ),
+            )
+            and _frame_matches(
+                validating,
+                (
+                    (
+                        "employee.state_changed",
+                        state.agent_id,
+                        {"state": HirePhase.VALIDATING.value},
+                    ),
+                ),
+            )
+            and _frame_matches(
+                pending,
+                (
+                    (
+                        "employee.state_changed",
+                        state.agent_id,
+                        {"state": HirePhase.READY_PENDING_VERIFICATION.value},
+                    ),
+                ),
+            )
+            and _frame_matches(
+                action_required,
+                (
+                    (
+                        "employee.state_changed",
+                        state.agent_id,
+                        {"state": HirePhase.ACTION_REQUIRED.value},
+                    ),
+                ),
+            )
+        )
+
+    def _reopen_exact_phase_only_channel_shutdown(
+        self,
+        state: DurableHireState,
+    ) -> DurableHireState:
+        with self.employee_dispatch_guard(), self._writer.transaction_guard():
+            self._synchronize_projection_to_journal_locked()
+            state = self._require_hire(state.intent_id)
+            frames = tuple(self._writer.replay())
+            if not self._has_exact_phase_only_channel_shutdown_history(
+                state,
+                frames,
+            ):
+                return state
+            events = (
+                JournalEvent(
+                    event_type="hire.channel.phase_only_recovery",
+                    aggregate_id=state.intent_id,
+                    payload={"generation": state.channel_generation},
+                ),
+                JournalEvent(
+                    event_type="employee.state_changed",
+                    aggregate_id=state.agent_id,
+                    payload={"state": HirePhase.VALIDATING.value},
+                ),
+            )
+            last_frame = self._writer.get_last_frame()
+            writer_sequence = 0 if last_frame is None else last_frame.sequence
+            writer_hash = "" if last_frame is None else last_frame.frame_hash
+            expected_versions = self._writer.get_aggregate_versions(
+                (state.intent_id, state.agent_id)
+            )
+            try:
+                validate_workforce_events(self._projection_state, (events[-1],))
+            except ProjectionError as exc:
+                raise HireAdmissionError(
+                    "phase-only channel recovery transition rejected"
+                ) from exc
+            result = self._writer.commit(
+                events,
+                expected_versions,
+                expected_head_sequence=writer_sequence,
+                expected_head_hash=writer_hash,
+            )
+            if result.state is not CommitState.ANCHORED:
+                raise AnchorMismatchError(
+                    "phase-only channel recovery was not anchored"
+                )
+            apply_frame(self._projection_state, result.frame)
+            self._hire_projection = HireProjection.rebuild(self._writer.replay())
+            reopened = self._require_hire(state.intent_id)
+            if reopened.phase is not HirePhase.VALIDATING:
+                raise HireAdmissionError(
+                    "phase-only channel recovery did not enter VALIDATING"
+                )
+            return reopened
+
+    def _has_pending_phase_only_channel_recovery(
+        self,
+        state: DurableHireState,
+    ) -> bool:
+        recovery_sequence = 0
+        recovery_generation = 0
+        fresh_challenge_sequence = 0
+        for frame in self._writer.replay():
+            for event in frame.events:
+                if (
+                    event.aggregate_id == state.intent_id
+                    and event.event_type == "hire.channel.phase_only_recovery"
+                ):
+                    generation = event.payload.get("generation")
+                    if isinstance(generation, bool) or not isinstance(
+                        generation,
+                        int,
+                    ):
+                        continue
+                    recovery_sequence = frame.sequence
+                    recovery_generation = generation
+                    fresh_challenge_sequence = 0
+                elif (
+                    recovery_sequence > 0
+                    and frame.sequence > recovery_sequence
+                    and event.aggregate_id == state.intent_id
+                    and event.event_type
+                    in {
+                        "hire.verification.challenge_issued",
+                        "hire.verification.challenge_reissued",
+                    }
+                ):
+                    generation = event.payload.get("generation")
+                    if (
+                        not isinstance(generation, bool)
+                        and isinstance(generation, int)
+                        and generation > recovery_generation
+                    ):
+                        fresh_challenge_sequence = frame.sequence
+        return recovery_sequence > fresh_challenge_sequence
+
     def _bind_principal(
         self,
         state: DurableHireState,
@@ -1819,6 +2077,12 @@ class ProductionEmployeeHireService:
                         ),
                     },
                 )
+            if state.phase is HirePhase.ACTION_REQUIRED:
+                state = self._reopen_exact_phase_only_channel_shutdown(state)
+                # ACTION_REQUIRED is otherwise terminal.  A guarded reopen must
+                # remain VALIDATING until composition launches a fresh,
+                # generation-fenced Channel configuration.
+                continue
             if state.phase is HirePhase.VALIDATING and state.verification_nonce:
                 effect_types = dict(state.effect_types)
                 if any(
@@ -1830,6 +2094,11 @@ class ProductionEmployeeHireService:
                     # The ingress replay owns this anchored phase-status reply.
                     # Advancing first would reinterpret the same /status as an
                     # activation attempt after restart.
+                    continue
+                if (
+                    state.verification_consumed
+                    and self._has_pending_phase_only_channel_recovery(state)
+                ):
                     continue
                 self._commit_phase_transition(
                     state,
@@ -1868,7 +2137,11 @@ class ProductionEmployeeHireService:
                             "error_code": "activation_nonce_consumed_without_commit",
                         },
                     )
-                self._commit_phase_transition(state, HirePhase.ACTION_REQUIRED)
+                state = self._commit_phase_transition(
+                    state,
+                    HirePhase.ACTION_REQUIRED,
+                )
+                self._reopen_exact_phase_only_channel_shutdown(state)
                 continue
             if state.phase is HirePhase.READY_PENDING_VERIFICATION:
                 effect_types = dict(state.effect_types)

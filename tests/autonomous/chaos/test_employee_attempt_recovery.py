@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 
 
@@ -98,7 +99,145 @@ def test_unknown_dispatch_recovers_action_required_without_rerun(
     reopened.close()
 
 
-def _reopen_recovery_harness(tmp_path, prior):
+def test_actor_terminal_is_preserved_when_gateway_recovery_follows_process_death(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A durable Actor failure is not downgraded to an unknown dispatch outcome."""
+
+    from src.autonomous.journal.frame import JournalEvent
+    from src.autonomous.journal.writer import CommitState
+    from tests.autonomous.integration.test_employee_slock_gateway import (
+        _real_coordinator_harness,
+    )
+
+    harness = _real_coordinator_harness(tmp_path)
+    prepared = harness.coordinator.prepare_next()
+    assert prepared is not None
+    acp_calls = []
+
+    def forbidden_acp(*args, **kwargs):
+        acp_calls.append((args, kwargs))
+        raise AssertionError("recovery must not rerun ACP")
+
+    monkeypatch.setattr(harness.engine, "_run_acp_session", forbidden_acp)
+    aggregate = f"employee-assignment:{prepared.binding.attempt_id}"
+    terminal = JournalEvent(
+        event_type="employee.actor.assignment_terminal",
+        aggregate_id=aggregate,
+        payload={
+            "agent_id": prepared.binding.agent_id,
+            "status": "action_required",
+            "error_code": "employee_session_failed",
+            "output_digest": "",
+        },
+    )
+    result = harness.writer.commit(
+        (terminal,),
+        harness.writer.get_aggregate_versions((aggregate,)),
+    )
+    assert result.state is CommitState.ANCHORED
+    harness.close()
+
+    reopened = _reopen_recovery_harness(
+        tmp_path,
+        harness,
+        employee_runtime_mode="actor",
+    )
+    runtime = reopened.coordinator.employee_runtime
+    assert runtime is not None
+    try:
+        runtime.recover()
+
+        recovered = reopened.coordinator.recover_incomplete_attempts()
+        assert len(recovered) == 1
+        snapshot = reopened.coordinator.team_attempt_result(prepared.binding.acceptance_id)
+        assert snapshot is not None
+        assert snapshot.status == "action_required"
+        assert snapshot.error_code == "employee_session_failed"
+        gateway_terminals = [
+            event
+            for frame in reopened.writer.replay()
+            for event in frame.events
+            if event.aggregate_id == prepared.binding.attempt_id
+            and event.event_type == "employee.execution_attempt.terminal"
+        ]
+        assert len(gateway_terminals) == 1
+        assert reopened.coordinator.recover_incomplete_attempts() == ()
+        assert acp_calls == []
+    finally:
+        reopened.close()
+
+
+def test_actor_completed_digest_without_result_is_action_required_after_restart(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A digest proves completion, but cannot replace the lost result body."""
+
+    from src.autonomous.journal.frame import JournalEvent
+    from src.autonomous.journal.writer import CommitState
+    from tests.autonomous.integration.test_employee_slock_gateway import (
+        _real_coordinator_harness,
+    )
+
+    harness = _real_coordinator_harness(tmp_path)
+    prepared = harness.coordinator.prepare_next()
+    assert prepared is not None
+    acp_calls = []
+
+    def forbidden_acp(*args, **kwargs):
+        acp_calls.append((args, kwargs))
+        raise AssertionError("recovery must not rerun ACP")
+
+    monkeypatch.setattr(harness.engine, "_run_acp_session", forbidden_acp)
+    aggregate = f"employee-assignment:{prepared.binding.attempt_id}"
+    terminal = JournalEvent(
+        event_type="employee.actor.assignment_terminal",
+        aggregate_id=aggregate,
+        payload={
+            "agent_id": prepared.binding.agent_id,
+            "status": "completed",
+            "error_code": "",
+            "output_digest": hashlib.sha256(b"lost result").hexdigest(),
+        },
+    )
+    result = harness.writer.commit(
+        (terminal,),
+        harness.writer.get_aggregate_versions((aggregate,)),
+    )
+    assert result.state is CommitState.ANCHORED
+    harness.close()
+
+    reopened = _reopen_recovery_harness(
+        tmp_path,
+        harness,
+        employee_runtime_mode="actor",
+    )
+    runtime = reopened.coordinator.employee_runtime
+    assert runtime is not None
+    try:
+        runtime.recover()
+
+        recovered = reopened.coordinator.recover_incomplete_attempts()
+        assert len(recovered) == 1
+        assert recovered[0].status.value == "action_required"
+        snapshot = reopened.coordinator.team_attempt_result(prepared.binding.acceptance_id)
+        assert snapshot is not None
+        assert snapshot.status == "action_required"
+        assert snapshot.error_code == "employee_result_unavailable_after_restart"
+        assert reopened.coordinator.recover_incomplete_attempts() == ()
+        assert acp_calls == []
+    finally:
+        reopened.close()
+
+
+def _reopen_recovery_harness(
+    tmp_path,
+    prior,
+    *,
+    employee_runtime_mode="legacy_one_shot",
+):
     """Open new Writer/Blob/Router/Data/Hire projection owners from disk."""
 
     from contextlib import contextmanager
@@ -180,7 +319,7 @@ def _reopen_recovery_harness(tmp_path, prior):
             return self.projection_state
 
     coordinator_kwargs = dict(
-        employee_runtime_mode="legacy_one_shot",
+        employee_runtime_mode=employee_runtime_mode,
         writer=writer,
         hire_service=_Hire(),
         ingress_service=ingress,
@@ -205,6 +344,7 @@ def _reopen_recovery_harness(tmp_path, prior):
     coordinator = EmployeeDispatchCoordinator(**coordinator_kwargs)
 
     def close():
+        coordinator.close()
         data.close()
         ingress.close()
         writer.close()

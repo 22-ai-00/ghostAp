@@ -270,14 +270,38 @@ class EmployeeTeamService:
         if len(task) > _MAX_TASK_CHARS:
             raise ValueError("team task exceeds maximum length")
         if self._coordinator is not None:
-            run = self._coordinator.start_task(
+            run_id = self._coordinator.task_run_id(
+                tenant_key=tenant_key,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+            with self._lock:
+                if self._closed:
+                    raise TeamServiceError("team service is closed")
+            existing = self._coordinator.projection().runs.get(run_id)
+            if existing is not None:
+                state = self._adapt_v2(existing)
+                if state.status != "running":
+                    raise TeamAdmissionError(f"team_run_{state.status}")
+                return state
+
+            targets = tuple(self._backend.list_active(tenant_key, chat_id))
+            if not targets:
+                raise TeamAdmissionError("no_active_team_employee")
+            with self._lock:
+                if self._closed:
+                    raise TeamServiceError("team service is closed")
+            run, created = self._coordinator.admit_task(
                 tenant_key=tenant_key,
                 message_id=message_id,
                 chat_id=chat_id,
                 requester_principal_id=requester_principal_id,
                 task=task,
             )
-            return self._adapt_v2(run)
+            state = self._adapt_v2(run)
+            if not created and state.status != "running":
+                raise TeamAdmissionError(f"team_run_{state.status}")
+            return state
         run_id = "teamrun_" + hashlib.sha256(
             f"{tenant_key}\0{message_id}".encode()
         ).hexdigest()

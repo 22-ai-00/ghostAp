@@ -59,6 +59,8 @@ def _projected_employee(
     tenant_key: str = "tenant_a",
     member_groups: tuple[str, ...] = ("oc_g1",),
     bot_principal_id: str = "bot_test1",
+    role: str = "coder",
+    capabilities: tuple[str, ...] = ("coding", "testing"),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         agent_id=agent_id,
@@ -71,6 +73,8 @@ def _projected_employee(
         tenant_key=tenant_key,
         member_groups=member_groups,
         bot_principal_id=bot_principal_id,
+        role=role,
+        capabilities=capabilities,
     )
 
 
@@ -78,13 +82,14 @@ def _handler_for_roster(
     *,
     hire_service=None,
     fire_service=None,
+    membership_service=None,
     runtime_facade=None,
 ) -> SlockHandler:
     handler = object.__new__(SlockHandler)
     handler.ctx = SimpleNamespace(
         employee_hire_service=hire_service,
         employee_fire_service=fire_service,
-        employee_membership_service=None,
+        employee_membership_service=membership_service,
         employee_runtime_facade=runtime_facade,
         project_manager=MagicMock(),
         settings=SimpleNamespace(admin_user_ids=frozenset({"ou_admin"})),
@@ -93,6 +98,416 @@ def _handler_for_roster(
     handler.reply_card = MagicMock(return_value=True)
     handler.send_text_to_chat = MagicMock(return_value=True)
     return handler
+
+
+class TestListCurrentTeamMembers:
+    def test_filters_to_current_chat_and_marks_membership_and_runtime_state(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "src.thread.manager.get_current_tenant_key",
+            lambda: "tenant_a",
+        )
+        confirmed = _projected_employee(
+            agent_id="agt_atlas",
+            name="Atlas",
+            member_groups=("oc_team",),
+            role="architect",
+            capabilities=("coding", "review"),
+        )
+        other_chat = _projected_employee(
+            agent_id="agt_nova",
+            name="Nova",
+            member_groups=("oc_other",),
+        )
+        degraded = _projected_employee(
+            agent_id="agt_drift",
+            name="Drift",
+            member_groups=("oc_team",),
+        )
+        membership_service = MagicMock()
+        membership_service.is_degraded.side_effect = (
+            lambda agent_id, _chat_id: agent_id == degraded.agent_id
+        )
+        hire_service = MagicMock()
+        hire_service.synchronize_projection.return_value = SimpleNamespace(
+            employees={
+                employee.agent_id: employee
+                for employee in (confirmed, other_chat, degraded)
+            }
+        )
+        runtime_facade = MagicMock()
+        runtime_facade.list_employee_runtime_statuses.return_value = (
+            SimpleNamespace(
+                agent_id=confirmed.agent_id,
+                bot_state="ready",
+                actor_state="ready_hot",
+                can_accept=True,
+            ),
+            SimpleNamespace(
+                agent_id=other_chat.agent_id,
+                bot_state="ready",
+                actor_state="ready_hot",
+                can_accept=True,
+            ),
+            SimpleNamespace(
+                agent_id=degraded.agent_id,
+                bot_state="ready",
+                actor_state="ready_hot",
+                can_accept=True,
+            ),
+        )
+        handler = _handler_for_roster(
+            hire_service=hire_service,
+            membership_service=membership_service,
+            runtime_facade=runtime_facade,
+        )
+
+        assert hasattr(handler, "list_current_team_members"), (
+            "SlockHandler must expose the current-chat employee roster"
+        )
+        handler.list_current_team_members("om_1", "oc_team")
+
+        payload = "\n".join(
+            [
+                *(
+                    str(call.args[1])
+                    for call in handler.reply_text.call_args_list
+                ),
+                *(
+                    json.dumps(call.args[1], ensure_ascii=False)
+                    for call in handler.reply_card.call_args_list
+                ),
+            ]
+        )
+        assert "Atlas" in payload
+        assert "architect" in payload
+        assert "coding, review" in payload
+        assert "Bot READY / Agent READY_HOT" in payload
+        assert "可接任务" in payload
+        assert "Nova" not in payload
+        assert "Drift" in payload
+        assert "群关系待确认" in payload
+        assert "/new-role" not in payload
+        hire_service.synchronize_projection.assert_called_once_with()
+        membership_service.is_degraded.assert_any_call("agt_atlas", "oc_team")
+        runtime_facade.list_employee_runtime_statuses.assert_called_once_with(
+            "tenant_a"
+        )
+
+    def test_confirmed_unavailable_employee_remains_visible(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "src.thread.manager.get_current_tenant_key",
+            lambda: "tenant_a",
+        )
+        recovering = _projected_employee(
+            agent_id="agt_recovering",
+            name="Recovering",
+            state=EmployeeState.ACTION_REQUIRED,
+            member_groups=("oc_team",),
+            role="reviewer",
+            capabilities=("review",),
+        )
+        hire_service = MagicMock()
+        hire_service.synchronize_projection.return_value = SimpleNamespace(
+            employees={recovering.agent_id: recovering}
+        )
+        membership_service = MagicMock()
+        membership_service.is_degraded.return_value = False
+        runtime_facade = MagicMock()
+        runtime_facade.list_employee_runtime_statuses.return_value = (
+            SimpleNamespace(
+                agent_id=recovering.agent_id,
+                bot_state="stopped",
+                actor_state="stopped",
+                can_accept=False,
+            ),
+        )
+        handler = _handler_for_roster(
+            hire_service=hire_service,
+            membership_service=membership_service,
+            runtime_facade=runtime_facade,
+        )
+
+        handler.list_current_team_members("om_1", "oc_team")
+
+        payload = json.dumps(
+            handler.reply_card.call_args.args[1],
+            ensure_ascii=False,
+        )
+        assert "Recovering" in payload
+        assert "⚠️ 待恢复" in payload
+        assert "Bot STOPPED / Agent STOPPED" in payload
+        assert "不可接任务" in payload
+
+    def test_membership_health_is_loaded_in_one_batch_snapshot(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "src.thread.manager.get_current_tenant_key",
+            lambda: "tenant_a",
+        )
+        ready = _projected_employee(
+            agent_id="agt_ready",
+            name="Ready",
+            member_groups=("oc_team",),
+        )
+        degraded = _projected_employee(
+            agent_id="agt_degraded",
+            name="Degraded",
+            member_groups=("oc_team",),
+        )
+
+        class BatchMembership:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def degraded_for(self, agent_ids, chat_id):
+                self.calls.append((tuple(agent_ids), chat_id))
+                return {
+                    ready.agent_id: False,
+                    degraded.agent_id: True,
+                }
+
+            def is_degraded(self, *_args):
+                raise AssertionError("per-employee replay must not run")
+
+        membership_service = BatchMembership()
+        hire_service = MagicMock()
+        hire_service.synchronize_projection.return_value = SimpleNamespace(
+            employees={
+                ready.agent_id: ready,
+                degraded.agent_id: degraded,
+            }
+        )
+        handler = _handler_for_roster(
+            hire_service=hire_service,
+            membership_service=membership_service,
+            runtime_facade=None,
+        )
+
+        handler.list_current_team_members("om_1", "oc_team")
+
+        assert membership_service.calls == [
+            ((ready.agent_id, degraded.agent_id), "oc_team")
+        ]
+        payload = json.dumps(
+            handler.reply_card.call_args.args[1],
+            ensure_ascii=False,
+        )
+        assert "Ready" in payload
+        assert "Degraded" in payload
+        assert "群关系待确认" in payload
+
+    @pytest.mark.parametrize("malformed_health", [None, 0, ""])
+    def test_malformed_batch_membership_health_fails_closed(
+        self,
+        monkeypatch,
+        malformed_health,
+    ):
+        monkeypatch.setattr(
+            "src.thread.manager.get_current_tenant_key",
+            lambda: "tenant_a",
+        )
+        employee = _projected_employee(
+            agent_id="agt_batch_unknown",
+            name="Batch Unknown",
+            member_groups=("oc_team",),
+        )
+
+        class BatchMembership:
+            def degraded_for(self, agent_ids, _chat_id):
+                assert tuple(agent_ids) == (employee.agent_id,)
+                return {employee.agent_id: malformed_health}
+
+        hire_service = MagicMock()
+        hire_service.synchronize_projection.return_value = SimpleNamespace(
+            employees={employee.agent_id: employee}
+        )
+        runtime_facade = MagicMock()
+        runtime_facade.list_employee_runtime_statuses.return_value = (
+            SimpleNamespace(
+                agent_id=employee.agent_id,
+                bot_state="ready",
+                actor_state="ready_hot",
+                can_accept=True,
+            ),
+        )
+        handler = _handler_for_roster(
+            hire_service=hire_service,
+            membership_service=BatchMembership(),
+            runtime_facade=runtime_facade,
+        )
+
+        handler.list_current_team_members("om_1", "oc_team")
+
+        payload = json.dumps(
+            handler.reply_card.call_args.args[1],
+            ensure_ascii=False,
+        )
+        assert "群关系待确认" in payload
+        assert "不可接任务" in payload
+        assert "已确认在群" not in payload
+
+    @pytest.mark.parametrize("malformed_health", [None, 0, ""])
+    def test_malformed_legacy_membership_health_fails_closed(
+        self,
+        monkeypatch,
+        malformed_health,
+    ):
+        monkeypatch.setattr(
+            "src.thread.manager.get_current_tenant_key",
+            lambda: "tenant_a",
+        )
+        employee = _projected_employee(
+            agent_id="agt_legacy_unknown",
+            name="Legacy Unknown",
+            member_groups=("oc_team",),
+        )
+
+        class LegacyMembership:
+            def is_degraded(self, _agent_id, _chat_id):
+                return malformed_health
+
+        hire_service = MagicMock()
+        hire_service.synchronize_projection.return_value = SimpleNamespace(
+            employees={employee.agent_id: employee}
+        )
+        runtime_facade = MagicMock()
+        runtime_facade.list_employee_runtime_statuses.return_value = (
+            SimpleNamespace(
+                agent_id=employee.agent_id,
+                bot_state="ready",
+                actor_state="ready_hot",
+                can_accept=True,
+            ),
+        )
+        handler = _handler_for_roster(
+            hire_service=hire_service,
+            membership_service=LegacyMembership(),
+            runtime_facade=runtime_facade,
+        )
+
+        handler.list_current_team_members("om_1", "oc_team")
+
+        payload = json.dumps(
+            handler.reply_card.call_args.args[1],
+            ensure_ascii=False,
+        )
+        assert "群关系待确认" in payload
+        assert "不可接任务" in payload
+        assert "已确认在群" not in payload
+
+    def test_missing_runtime_view_is_explicitly_unknown(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "src.thread.manager.get_current_tenant_key",
+            lambda: "tenant_a",
+        )
+        employee = _projected_employee(
+            agent_id="agt_unknown",
+            name="Unknown Runtime",
+            member_groups=("oc_team",),
+        )
+        hire_service = MagicMock()
+        hire_service.synchronize_projection.return_value = SimpleNamespace(
+            employees={employee.agent_id: employee}
+        )
+        membership_service = MagicMock()
+        membership_service.is_degraded.return_value = False
+        runtime_facade = MagicMock()
+        runtime_facade.list_employee_runtime_statuses.return_value = ()
+        handler = _handler_for_roster(
+            hire_service=hire_service,
+            membership_service=membership_service,
+            runtime_facade=runtime_facade,
+        )
+
+        handler.list_current_team_members("om_1", "oc_team")
+
+        payload = json.dumps(
+            handler.reply_card.call_args.args[1],
+            ensure_ascii=False,
+        )
+        assert "Unknown Runtime" in payload
+        assert "运行状态未知" in payload
+        assert "暂不可确认接单" in payload
+
+    def test_missing_membership_health_service_keeps_persisted_member_visible(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "src.thread.manager.get_current_tenant_key",
+            lambda: "tenant_a",
+        )
+        employee = _projected_employee(
+            agent_id="agt_membership_unknown",
+            name="Persisted Member",
+            member_groups=("oc_team",),
+        )
+        hire_service = MagicMock()
+        hire_service.synchronize_projection.return_value = SimpleNamespace(
+            employees={employee.agent_id: employee}
+        )
+        handler = _handler_for_roster(
+            hire_service=hire_service,
+            membership_service=None,
+            runtime_facade=None,
+        )
+
+        handler.list_current_team_members("om_1", "oc_team")
+
+        payload = json.dumps(
+            handler.reply_card.call_args.args[1],
+            ensure_ascii=False,
+        )
+        assert "Persisted Member" in payload
+        assert "群关系待确认" in payload
+        assert "暂不可确认接单" in payload
+
+    def test_employee_name_is_rendered_as_single_line_markdown_literal(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "src.thread.manager.get_current_tenant_key",
+            lambda: "tenant_a",
+        )
+        employee = _projected_employee(
+            agent_id="agt_literal",
+            name="**伪标题**\n[点击](https://invalid.example)",
+            member_groups=("oc_team",),
+        )
+        hire_service = MagicMock()
+        hire_service.synchronize_projection.return_value = SimpleNamespace(
+            employees={employee.agent_id: employee}
+        )
+        membership_service = MagicMock()
+        membership_service.is_degraded.return_value = False
+        handler = _handler_for_roster(
+            hire_service=hire_service,
+            membership_service=membership_service,
+            runtime_facade=MagicMock(
+                list_employee_runtime_statuses=MagicMock(return_value=())
+            ),
+        )
+
+        handler.list_current_team_members("om_1", "oc_team")
+
+        content = handler.reply_card.call_args.args[1]["elements"][0]["text"][
+            "content"
+        ]
+        assert "\n[点击]" not in content
+        assert r"\*\*伪标题\*\*" in content
+        assert r"\[点击\]\(https://invalid.example\)" in content
 
 
 class TestListEmployeesRoster:

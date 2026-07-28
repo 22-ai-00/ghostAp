@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.autonomous.team import TeamAdmissionError
-from src.slock_engine.intent_router import IntentResult
+from src.slock_engine.intent_router import IntentResult, IntentRouter
 from src.slock_engine.models import AgentIdentity, SlockTask
 from src.slock_engine.slash_commands import SlockCommandAction
 
@@ -188,6 +188,58 @@ def test_natural_language_command_still_uses_nli_before_team_admission():
 
     handler._classify_with_timeout.assert_awaited_once()
     handler._dispatch_nli_intent.assert_called_once()
+    handler.ctx.employee_team_service.start_task.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "你们都能做什么",
+        "团队能做什么",
+    ],
+)
+def test_team_capability_question_lists_members_without_starting_task(text):
+    handler = _make_handler()
+    engine = _make_engine_for_plan()
+    handler.ctx.slock_engine_manager.get_activated_engine.return_value = engine
+    handler.ctx.employee_team_service = MagicMock()
+    handler._intent_router = IntentRouter()
+    handler.list_current_team_members = MagicMock()
+    handler._classify_with_timeout = MagicMock(
+        side_effect=AssertionError("Capability query must use deterministic NLI")
+    )
+
+    handler.handle_message("om_capabilities", "oc_team", text, None)
+
+    handler.list_current_team_members.assert_called_once_with(
+        "om_capabilities",
+        "oc_team",
+    )
+    handler.ctx.employee_team_service.start_task.assert_not_called()
+    handler._classify_with_timeout.assert_not_called()
+    handler._execute_routed_message.assert_not_called()
+
+
+def test_employee_list_does_not_require_legacy_slock_engine():
+    handler = _make_handler()
+    handler.ctx.slock_engine_manager.get_activated_engine.return_value = None
+    handler.ctx.employee_team_service = MagicMock()
+    handler._intent_router = IntentRouter()
+    handler.list_current_team_members = MagicMock()
+    handler._send_no_engine_hint = MagicMock()
+
+    handler.handle_message(
+        "om_members",
+        "oc_team",
+        "团队成员现在都有谁",
+        None,
+    )
+
+    handler.list_current_team_members.assert_called_once_with(
+        "om_members",
+        "oc_team",
+    )
+    handler._send_no_engine_hint.assert_not_called()
     handler.ctx.employee_team_service.start_task.assert_not_called()
 
 

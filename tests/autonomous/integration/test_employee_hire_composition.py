@@ -36,6 +36,7 @@ from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.provisioning.composition import (
     EmployeeDepartmentRuntime,
     RuntimeReadiness,
+    _RuntimeTeamBackend,
 )
 from src.autonomous.provisioning.hire_port import EmployeeHireRequest
 from src.autonomous.provisioning.hire_state import (
@@ -3536,6 +3537,242 @@ def test_channel_monitor_revalidates_stalled_reconnect(monkeypatch) -> None:
 
     assert revalidations == [(state.intent_id, state.channel_generation)]
     assert submissions == [state.intent_id]
+
+
+def test_channel_monitor_stops_before_revalidation_when_close_starts_mid_iteration(
+    monkeypatch,
+) -> None:
+    runtime = EmployeeDepartmentRuntime()
+    state = DurableHireState(
+        intent_id="hire_shutdown_race",
+        agent_id="agt_shutdown_race",
+        phase=HirePhase.ACTIVE,
+        channel_generation=7,
+    )
+    revalidations: list[tuple[str, int]] = []
+    submissions: list[str] = []
+
+    class Service:
+        @staticmethod
+        def list_states():
+            return (state,)
+
+        @staticmethod
+        def begin_channel_revalidation(intent_id: str, *, observed_generation: int):
+            revalidations.append((intent_id, observed_generation))
+
+    def close_during_status(_agent_id: str):
+        runtime._closing = True
+        return SimpleNamespace(
+            agent_id=state.agent_id,
+            generation=state.channel_generation,
+            state=ChannelProcessState.CRASHED,
+            error_code="channel-crashed",
+            ready_metadata={},
+        )
+
+    runtime._service = Service()
+    runtime._channels = SimpleNamespace(status=close_during_status)
+    runtime._submit_intent = submissions.append  # type: ignore[method-assign]
+
+    async def stop_monitor(_seconds: float) -> None:
+        runtime._closing = True
+
+    monkeypatch.setattr(asyncio, "sleep", stop_monitor)
+    asyncio.run(runtime._monitor_channels())
+
+    assert revalidations == []
+    assert submissions == []
+
+
+def test_team_notification_internal_type_error_is_not_retried_without_key() -> None:
+    attempts: list[str] = []
+
+    def notify(
+        _message_id: str,
+        _chat_id: str,
+        _result: str,
+        idempotency_key: str,
+    ) -> None:
+        attempts.append(idempotency_key)
+        raise TypeError("internal serialization failed")
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+
+    with pytest.raises(TypeError, match="internal serialization failed"):
+        backend.notify(
+            "om_1",
+            "oc_team",
+            "result",
+            idempotency_key="stable-key",
+        )
+
+    assert attempts == ["stable-key"]
+
+
+def test_channel_monitor_stops_before_submit_when_close_starts_during_revalidation(
+    monkeypatch,
+) -> None:
+    runtime = EmployeeDepartmentRuntime()
+    state = DurableHireState(
+        intent_id="hire_shutdown_submit_race",
+        agent_id="agt_shutdown_submit_race",
+        phase=HirePhase.ACTIVE,
+        channel_generation=8,
+    )
+    revalidations: list[tuple[str, int]] = []
+    submissions: list[str] = []
+
+    class Service:
+        @staticmethod
+        def list_states():
+            return (state,)
+
+        @staticmethod
+        def begin_channel_revalidation(intent_id: str, *, observed_generation: int):
+            revalidations.append((intent_id, observed_generation))
+            runtime._closing = True
+
+    runtime._service = Service()
+    runtime._channels = SimpleNamespace(
+        status=lambda _agent_id: SimpleNamespace(
+            agent_id=state.agent_id,
+            generation=state.channel_generation,
+            state=ChannelProcessState.CRASHED,
+            error_code="channel-crashed",
+            ready_metadata={},
+        )
+    )
+    runtime._submit_intent = submissions.append  # type: ignore[method-assign]
+
+    async def stop_monitor(_seconds: float) -> None:
+        runtime._closing = True
+
+    monkeypatch.setattr(asyncio, "sleep", stop_monitor)
+    asyncio.run(runtime._monitor_channels())
+
+    assert revalidations == [(state.intent_id, state.channel_generation)]
+    assert submissions == []
+
+
+def test_channel_monitor_stops_before_challenge_renewal_when_close_starts(
+    monkeypatch,
+) -> None:
+    runtime = EmployeeDepartmentRuntime()
+    state = DurableHireState(
+        intent_id="hire_shutdown_renewal_race",
+        agent_id="agt_shutdown_renewal_race",
+        phase=HirePhase.READY_PENDING_VERIFICATION,
+        channel_generation=9,
+        verification_expires_at=1.0,
+    )
+    renewals: list[str] = []
+    runtime._service = SimpleNamespace(list_states=lambda: (state,))
+    runtime._channels = SimpleNamespace(
+        status=lambda _agent_id: SimpleNamespace(
+            agent_id=state.agent_id,
+            generation=state.channel_generation,
+            state=ChannelProcessState.READY,
+            error_code="",
+            ready_metadata={},
+        )
+    )
+    runtime._renew_activation_challenge = (  # type: ignore[method-assign]
+        lambda current: renewals.append(current.intent_id)
+    )
+
+    def close_during_expiry_check() -> float:
+        runtime._closing = True
+        return 2.0
+
+    async def stop_monitor(_seconds: float) -> None:
+        runtime._closing = True
+
+    monkeypatch.setattr(time, "time", close_during_expiry_check)
+    monkeypatch.setattr(asyncio, "sleep", stop_monitor)
+    asyncio.run(runtime._monitor_channels())
+
+    assert renewals == []
+
+
+def test_recovery_wires_guarded_reopen_to_fresh_generation_configuration() -> None:
+    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
+    state = DurableHireState(
+        intent_id="hire_guarded_reopen",
+        agent_id="agt_guarded_reopen",
+        phase=HirePhase.VALIDATING,
+        credential_ref="vault://guarded-reopen",
+        channel_generation=11,
+    )
+    revalidations: list[tuple[str, int]] = []
+    configurations: list[tuple[str, bool, int]] = []
+    submissions: list[str] = []
+
+    class Service:
+        projection_state = SimpleNamespace(bot_principals={})
+        runtime_recovered = False
+
+        @staticmethod
+        def recover():
+            return SimpleNamespace(states={state.intent_id: state})
+
+        @staticmethod
+        def recover_manifest_reauthorizations():
+            return ()
+
+        @staticmethod
+        def begin_channel_revalidation(
+            intent_id: str,
+            *,
+            observed_generation: int,
+        ):
+            revalidations.append((intent_id, observed_generation))
+            return state
+
+        @classmethod
+        def mark_runtime_recovered(cls) -> None:
+            cls.runtime_recovered = True
+
+    async def configure(
+        intent_id: str,
+        *,
+        force_slash_refresh: bool = False,
+    ) -> None:
+        configurations.append(
+            (
+                intent_id,
+                force_slash_refresh,
+                runtime._target_channel_generation(state),
+            )
+        )
+
+    async def no_terminal_notifications() -> None:
+        return None
+
+    def submit(coroutine, *, label: str) -> None:
+        submissions.append(label)
+        asyncio.run(coroutine)
+
+    runtime._service = Service()  # type: ignore[assignment]
+    runtime._execution_blockers = ("test-isolation",)
+    runtime._configure_intent = configure  # type: ignore[method-assign]
+    runtime._submit_coroutine = submit  # type: ignore[method-assign]
+    runtime._start_monitor_in_loop = lambda: None  # type: ignore[method-assign]
+    runtime._retry_terminal_notifications = (  # type: ignore[method-assign]
+        no_terminal_notifications
+    )
+    runtime._resume_recoverable_activation_required_replies = (  # type: ignore[method-assign]
+        lambda: None
+    )
+
+    runtime.recover()
+
+    assert revalidations == [(state.intent_id, state.channel_generation)]
+    assert configurations == [
+        (state.intent_id, True, state.channel_generation + 1)
+    ]
+    assert submissions == ["recovery"]
+    assert Service.runtime_recovered is True
 
 
 def test_ready_notification_retries_after_runtime_restart(tmp_path: Path) -> None:

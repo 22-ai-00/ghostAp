@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -209,18 +209,33 @@ class EmployeeMembershipService:
     def is_degraded(self, agent_id: str, team_id: str) -> bool:
         """Deny unless Journal proves ACTIVE membership for this exact chat."""
 
+        return self.degraded_for((agent_id,), team_id).get(agent_id, True)
+
+    def degraded_for(
+        self,
+        agent_ids: Iterable[str],
+        team_id: str,
+    ) -> dict[str, bool]:
+        """Resolve many membership health checks from one Journal snapshot."""
+
+        unique_agent_ids = tuple(dict.fromkeys(agent_ids))
         self.rebuild_projection()
         projection = self._hire.synchronize_projection()
-        employee = projection.employees.get(agent_id)
-        if employee is None or team_id not in employee.member_groups:
-            return True
+        health: dict[str, bool] = {}
         with self._mutex:
-            matches = tuple(
-                record
-                for key, record in self._state.records.items()
-                if key[1] == team_id and key[2] == agent_id
-            )
-        return len(matches) != 1 or matches[0].state is not MembershipState.ACTIVE
+            for agent_id in unique_agent_ids:
+                employee = projection.employees.get(agent_id)
+                if employee is None or team_id not in employee.member_groups:
+                    health[agent_id] = True
+                    continue
+                record = self._state.records.get(
+                    (employee.tenant_key, team_id, agent_id)
+                )
+                health[agent_id] = (
+                    record is None
+                    or record.state is not MembershipState.ACTIVE
+                )
+        return health
 
     def mutate(
         self,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -32,6 +33,30 @@ class TeamCoordinatorError(RuntimeError):
 
 
 DecisionProvider = Callable[[TeamRunV2, tuple[object, ...], str], CoordinatorDecision]
+
+_PUBLIC_BLOCK_REASONS = frozenset(
+    {
+        "cancel_requested",
+        "done_criteria_unsatisfied",
+        "employee_assignment_canceled",
+        "employee_result_anchor_failed",
+        "employee_result_unavailable_after_restart",
+        "employee_session_failed",
+        "employee_session_timeout",
+        "no_capable_team_employee",
+        "no_capable_team_reviewer",
+        "team_assignment_failed",
+        "team_coordinator_failed",
+        "team_dispatch_failed",
+        "team_execution_failed",
+        "team_history_unavailable",
+        "team_review_failed",
+        "team_revision_failed",
+        "team_step_deadline_expired",
+        "team_task_failed",
+        "unknown_dispatch_outcome",
+    }
+)
 
 
 class SessionCoordinatorDecisionProvider:
@@ -202,6 +227,20 @@ class TeamCoordinatorActor:
         self._active: set[str] = set()
         self._closed = False
 
+    @staticmethod
+    def task_run_id(
+        *,
+        tenant_key: str,
+        chat_id: str,
+        message_id: str,
+        project_id: str = "",
+    ) -> str:
+        """Return the stable aggregate ID used to deduplicate one ingress task."""
+
+        return "teamrun2_" + hashlib.sha256(
+            f"{tenant_key}\0{chat_id}\0{project_id}\0{message_id}".encode()
+        ).hexdigest()
+
     def start_task(
         self,
         *,
@@ -213,18 +252,47 @@ class TeamCoordinatorActor:
         project_id: str = "",
         done_criteria: tuple[str, ...] = ("deliverable_non_empty", "review_completed"),
     ) -> TeamRunV2:
+        run, _created = self.admit_task(
+            tenant_key=tenant_key,
+            message_id=message_id,
+            chat_id=chat_id,
+            requester_principal_id=requester_principal_id,
+            task=task,
+            project_id=project_id,
+            done_criteria=done_criteria,
+        )
+        return run
+
+    def admit_task(
+        self,
+        *,
+        tenant_key: str,
+        message_id: str,
+        chat_id: str,
+        requester_principal_id: str,
+        task: str,
+        project_id: str = "",
+        done_criteria: tuple[str, ...] = ("deliverable_non_empty", "review_completed"),
+    ) -> tuple[TeamRunV2, bool]:
+        """Durably admit a task and report whether this call created the run."""
+
         if not task.strip() or len(task) > 4_000:
             raise ValueError("invalid team task")
-        run_id = "teamrun2_" + hashlib.sha256(
-            f"{tenant_key}\0{chat_id}\0{project_id}\0{message_id}".encode()
-        ).hexdigest()
+        run_id = self.task_run_id(
+            tenant_key=tenant_key,
+            chat_id=chat_id,
+            project_id=project_id,
+            message_id=message_id,
+        )
         task_digest = hashlib.sha256(task.encode()).hexdigest()
         safe_goal = f"encrypted-team-task:{task_digest[:16]}"
         with self._lock:
+            if self._closed:
+                raise TeamCoordinatorError("team coordinator is closed")
             projection = self.projection()
             existing = projection.runs.get(run_id)
             if existing is not None:
-                return existing
+                return existing, False
             task_ref = self._publish_json(
                 {
                     "task": task,
@@ -263,7 +331,7 @@ class TeamCoordinatorActor:
             )
             run = self.projection().runs[run_id]
             self._schedule(run_id)
-            return run
+            return run, True
 
     def projection(self):
         return rebuild_team_projection(self._writer.replay())
@@ -273,11 +341,18 @@ class TeamCoordinatorActor:
         pending = [
             run.run_id
             for run in projection.runs.values()
-            if run.phase not in {
-                TeamRunPhase.COMPLETED,
-                TeamRunPhase.BLOCKED,
-                TeamRunPhase.CANCELED,
-            }
+            if (
+                run.phase
+                not in {
+                    TeamRunPhase.COMPLETED,
+                    TeamRunPhase.BLOCKED,
+                    TeamRunPhase.CANCELED,
+                }
+                or (
+                    run.phase is TeamRunPhase.BLOCKED
+                    and self._blocked_notification_pending(projection, run.run_id)
+                )
+            )
         ]
         for run_id in pending:
             self._schedule(run_id)
@@ -375,7 +450,14 @@ class TeamCoordinatorActor:
 
     def _run(self, run_id: str) -> None:
         try:
-            self._drive(run_id)
+            run = self.projection().runs[run_id]
+            if run.phase is TeamRunPhase.BLOCKED:
+                self._deliver_block_notification(
+                    run,
+                    self._public_block_reason(run.error_code),
+                )
+            else:
+                self._drive(run_id)
         except Exception:
             try:
                 self._block(run_id, "team_coordinator_failed")
@@ -770,11 +852,15 @@ class TeamCoordinatorActor:
         return True
 
     def _assignment_failed(self, assignment, error_code: str) -> None:
+        safe_error = self._public_block_reason(error_code)
         self._commit(
             JournalEvent(
                 event_type="team.v2.assignment.failed",
                 aggregate_id=assignment.assignment_id,
-                payload={"run_id": assignment.run_id, "error_code": error_code},
+                payload={
+                    "run_id": assignment.run_id,
+                    "error_code": safe_error,
+                },
             )
         )
 
@@ -809,18 +895,35 @@ class TeamCoordinatorActor:
             )
         )
 
-    def _notify(self, run: TeamRunV2, output: str) -> None:
+    def _notify(
+        self,
+        run: TeamRunV2,
+        output: str,
+        *,
+        purpose: str = "final",
+    ) -> None:
         idempotency_key = hashlib.sha256(
-            f"team-final\0{run.run_id}".encode()
+            f"team-{purpose}\0{run.run_id}".encode()
         ).hexdigest()[:50]
+        notify = self._backend.notify
         try:
-            self._backend.notify(
+            parameters = inspect.signature(notify).parameters.values()
+        except (TypeError, ValueError):
+            supports_idempotency = True
+        else:
+            supports_idempotency = any(
+                parameter.name == "idempotency_key"
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        if supports_idempotency:
+            notify(
                 run.message_id,
                 run.chat_id,
                 output,
                 idempotency_key=idempotency_key,
             )
-        except TypeError:
+        else:
             # Compatibility-only backends predate the idempotent notify port.
             # Production coordinator composition always accepts this key.
             self._backend.notify(run.message_id, run.chat_id, output)
@@ -835,13 +938,114 @@ class TeamCoordinatorActor:
                 TeamRunPhase.CANCELED,
             }:
                 return
+            notify_prefix = self._blocked_notify_prefix(run_id)
             for (aggregate, effect_type), state in projection.effects.items():
-                if (aggregate == run_id or aggregate.startswith(run_id + ":")) and state in {
-                    "prepared",
-                    "executing",
-                }:
+                belongs_to_run = aggregate == run_id or aggregate.startswith(run_id + ":")
+                is_block_notification = (
+                    aggregate.startswith(notify_prefix) and effect_type == "notify"
+                )
+                if (
+                    belongs_to_run
+                    and not is_block_notification
+                    and state in {"prepared", "executing"}
+                ):
                     self._effect(aggregate, effect_type, "action_required")
-            self._phase(run, TeamRunPhase.BLOCKED, error=error_code)
+            safe_error = self._public_block_reason(error_code)
+
+        self._deliver_block_notification(run, safe_error)
+
+        with self._lock:
+            current = self.projection().runs[run_id]
+            if current.phase not in {
+                TeamRunPhase.COMPLETED,
+                TeamRunPhase.BLOCKED,
+                TeamRunPhase.CANCELED,
+            }:
+                self._phase(current, TeamRunPhase.BLOCKED, error=safe_error)
+
+    @staticmethod
+    def _public_block_reason(error_code: object) -> str:
+        if isinstance(error_code, str) and error_code in _PUBLIC_BLOCK_REASONS:
+            return error_code
+        return "team_task_failed"
+
+    @staticmethod
+    def _blocked_notify_prefix(run_id: str) -> str:
+        return f"{run_id}:blocked-notify:"
+
+    @classmethod
+    def _blocked_notification_attempts(
+        cls,
+        projection,
+        run_id: str,
+    ) -> tuple[tuple[int, str, str], ...]:
+        prefix = cls._blocked_notify_prefix(run_id)
+        attempts = []
+        for (aggregate, effect_type), state in projection.effects.items():
+            if effect_type != "notify" or not aggregate.startswith(prefix):
+                continue
+            ordinal = aggregate[len(prefix) :]
+            if ordinal.isdigit() and int(ordinal) > 0:
+                attempts.append((int(ordinal), aggregate, state))
+        return tuple(sorted(attempts))
+
+    @classmethod
+    def _blocked_notification_pending(cls, projection, run_id: str) -> bool:
+        return not any(
+            state == "committed"
+            for _ordinal, _aggregate, state in cls._blocked_notification_attempts(
+                projection,
+                run_id,
+            )
+        )
+
+    def _deliver_block_notification(
+        self,
+        run: TeamRunV2,
+        safe_error: str,
+    ) -> bool:
+        """Deliver or durably retry the terminal notice using one logical key."""
+
+        with self._lock:
+            projection = self.projection()
+            attempts = self._blocked_notification_attempts(projection, run.run_id)
+            if any(state == "committed" for _ordinal, _aggregate, state in attempts):
+                return True
+            replayable = next(
+                (
+                    (aggregate, state)
+                    for _ordinal, aggregate, state in reversed(attempts)
+                    if state in {"prepared", "executing"}
+                ),
+                None,
+            )
+            if replayable is None:
+                ordinal = attempts[-1][0] + 1 if attempts else 1
+                aggregate = f"{self._blocked_notify_prefix(run.run_id)}{ordinal}"
+                self._effect(aggregate, "notify", "prepared")
+                state = "prepared"
+            else:
+                aggregate, state = replayable
+            if state == "prepared":
+                self._effect(aggregate, "notify", "executing")
+
+        content = (
+            f"⚠️ 团队任务未完成（`{run.run_id[:20]}…`）。"
+            f"原因：`{safe_error}`。请执行 `/roster` 查看员工状态后重试。"
+        )
+        try:
+            self._notify(run, content, purpose="blocked")
+        except Exception:
+            with self._lock:
+                projection = self.projection()
+                if projection.effects.get((aggregate, "notify")) == "executing":
+                    self._effect(aggregate, "notify", "action_required")
+            return False
+        with self._lock:
+            projection = self.projection()
+            if projection.effects.get((aggregate, "notify")) == "executing":
+                self._effect(aggregate, "notify", "committed")
+        return True
 
     def _phase(
         self,
