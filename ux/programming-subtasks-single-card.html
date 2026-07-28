@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>普通编程模式 · 子任务单主卡预览</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: #111315;
+      --card: #242629;
+      --line: #45484d;
+      --muted: #a8abb2;
+      --text: #f4f5f7;
+      --green: #42d36b;
+      --orange: #ff9f32;
+      --pink: #ff8fa6;
+      --blue: #4c8dff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--page);
+      color: var(--text);
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(1060px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 40px 0 56px;
+    }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    .lead { margin: 0 0 28px; color: var(--muted); }
+    .comparison {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 24px;
+      align-items: start;
+    }
+    .stage {
+      padding: 16px;
+      border: 1px solid #303338;
+      border-radius: 18px;
+      background: #181a1d;
+    }
+    .stage > h2 {
+      margin: 0 0 12px;
+      font-size: 14px;
+      color: var(--muted);
+    }
+    .stack { display: grid; gap: 12px; }
+    .card {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--card);
+      box-shadow: 0 10px 30px rgb(0 0 0 / 18%);
+    }
+    .header {
+      padding: 14px 16px;
+      background: #17331e;
+      color: #9cf0ae;
+      font-weight: 700;
+    }
+    .header small {
+      display: block;
+      margin-top: 2px;
+      color: #74c889;
+      font-weight: 500;
+    }
+    .body { padding: 16px; }
+    .summary {
+      padding: 12px 14px;
+      border: 1px solid var(--orange);
+      border-radius: 12px;
+    }
+    .summary-title { font-weight: 700; }
+    .task {
+      margin-top: 10px;
+      padding-left: 24px;
+      color: #e8e9ec;
+    }
+    .record {
+      margin-top: 14px;
+      padding: 11px 14px;
+      border: 1px solid var(--pink);
+      border-radius: 12px;
+      color: #d7d8dc;
+    }
+    .answer {
+      margin: 0 0 14px;
+      color: #f1f2f4;
+    }
+    .footer {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px solid #3b3e43;
+      color: var(--muted);
+    }
+    .child .body { min-height: 112px; }
+    .empty-note {
+      margin-top: 10px;
+      color: #858991;
+      font-size: 12px;
+    }
+    .callout {
+      margin-top: 22px;
+      padding: 14px 16px;
+      border-left: 3px solid var(--blue);
+      border-radius: 8px;
+      background: #1d2738;
+      color: #dce8ff;
+    }
+    @media (max-width: 760px) {
+      main { width: min(430px, calc(100% - 24px)); padding-top: 24px; }
+      .comparison { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>普通编程模式 · 子任务单主卡</h1>
+    <p class="lead">子任务是主任务的执行细节；没有独立产物和操作时，不应额外占用一条飞书消息。</p>
+
+    <div class="comparison">
+      <section class="stage">
+        <h2>Before · 重复消息</h2>
+        <div class="stack">
+          <article class="card">
+            <div class="header">✅ 完成 · GhostAP · Codex</div>
+            <div class="body">
+              <p class="answer">完成状态判断修复并通过相关回归。</p>
+              <div class="summary">
+                <div class="summary-title">✅ 并行子任务 · 1 个 · 完成 1</div>
+                <div class="task">• ✅ 子任务 · #1.a · 子代理 · gpt-5.6-sol/high</div>
+              </div>
+              <div class="record">📋 执行记录 · 65 步</div>
+              <div class="footer">🛠️ Codex · gpt-5.6-sol/high · ✅ 4m47s</div>
+            </div>
+          </article>
+
+          <article class="card child">
+            <div class="header">🧬 子任务<small>已完成 · 子卡 #1.a · 来自主卡 #1</small></div>
+            <div class="body">
+              <strong>✅ 已完成</strong>
+              <div class="empty-note">没有独立正文、产物或操作，只重复状态和模型。</div>
+              <div class="footer">🛠️ 子代理 · gpt-5.6-sol/high · ✅ 1m02s</div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section class="stage">
+        <h2>After · 单主卡</h2>
+        <article class="card">
+          <div class="header">✅ 完成 · GhostAP · Codex</div>
+          <div class="body">
+            <p class="answer">完成状态判断修复并通过相关回归。</p>
+            <div class="summary">
+              <div class="summary-title">✅ 并行子任务 · 1 个 · 完成 1</div>
+              <div class="task">• ✅ 子任务 · #1.a · 子代理 · gpt-5.6-sol/high</div>
+            </div>
+            <div class="record">📋 执行记录 · 65 步</div>
+            <div class="footer">🛠️ Codex · gpt-5.6-sol/high · ✅ 4m47s</div>
+          </div>
+        </article>
+      </section>
+    </div>
+
+    <div class="callout">
+      保留主卡顶部的并行子任务摘要；子代理产生的文本、工具调用和图片继续进入主卡执行流。
+      只有卡片超出飞书容量时，才由现有分页机制创建续接卡。
+    </div>
+  </main>
+</body>
+</html>

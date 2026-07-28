@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>子任务错误折叠预览</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f6f7;
+      color: #1f2329;
+    }
+    body {
+      margin: 0;
+      padding: 32px 16px;
+    }
+    main {
+      max-width: 680px;
+      margin: 0 auto;
+    }
+    .eyebrow {
+      margin: 0 0 10px;
+      color: #646a73;
+      font-size: 13px;
+    }
+    .card {
+      overflow: hidden;
+      border: 1px solid #dee0e3;
+      border-radius: 12px;
+      background: #fff;
+      box-shadow: 0 4px 18px rgb(31 35 41 / 8%);
+    }
+    .header {
+      padding: 18px 20px 16px;
+      background: #fef0f0;
+      border-top: 4px solid #f54a45;
+    }
+    .header h1 {
+      margin: 0;
+      font-size: 17px;
+      line-height: 1.4;
+    }
+    .header p {
+      margin: 6px 0 0;
+      color: #8f3b3a;
+      font-size: 13px;
+    }
+    .body {
+      display: grid;
+      gap: 14px;
+      padding: 18px 20px 20px;
+    }
+    .progress {
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: #f5f6f7;
+      font-size: 14px;
+    }
+    .summary {
+      margin: 0;
+      font-size: 14px;
+      line-height: 1.65;
+    }
+    details {
+      border: 1px solid #f2b8b5;
+      border-radius: 8px;
+      background: #fffafa;
+    }
+    summary {
+      padding: 12px 14px;
+      cursor: pointer;
+      list-style: none;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    summary::-webkit-details-marker {
+      display: none;
+    }
+    summary::before {
+      content: "›";
+      display: inline-block;
+      margin-right: 8px;
+      color: #d83931;
+      transform: rotate(0);
+      transition: transform 160ms ease;
+    }
+    details[open] summary::before {
+      transform: rotate(90deg);
+    }
+    pre {
+      max-height: 280px;
+      overflow: auto;
+      margin: 0;
+      padding: 14px;
+      border-top: 1px solid #f2b8b5;
+      color: #4e5969;
+      font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      padding-top: 4px;
+      color: #8f959e;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">目标状态 · 默认折叠完整错误</p>
+    <article class="card">
+      <header class="header">
+        <h1>🧬 子任务 · 验证卡片渲染</h1>
+        <p>执行失败 · 来自主卡 #1</p>
+      </header>
+      <section class="body">
+        <div class="progress">整体 4/5 · 当前 5/5 最终验证</div>
+        <p class="summary">
+          ❌ <strong>错误摘要</strong><br>
+          pytest 验证未通过，完整输出已收起。
+        </p>
+        <details>
+          <summary>错误详情 · JSON / 测试输出 / 调用栈</summary>
+          <pre>{
+  "formatted_output": "FAILED tests/test_card_renderer.py::test_error_panel\n
+AssertionError: expected collapsible_panel\n
+Traceback (most recent call last):\n  ..."
+}</pre>
+        </details>
+        <div class="footer">
+          <span>❌ 执行失败</span>
+          <span>完整诊断仍可按需展开</span>
+        </div>
+      </section>
+    </article>
+  </main>
+</body>
+</html>

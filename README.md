@@ -30,6 +30,7 @@ GhostAP 把“执行策略”和“工具传输”拆开：
 - Python 3.11+
 - `uv`
 - 飞书/Lark 企业自建应用，开启长连接接收事件
+- 如需使用客户端 Slash Command 面板，飞书 PC 端需 7.70+，移动端需 7.71+
 - 如需使用 `/wf`，需要 Node.js 20+
 - 需要使用的 AI 工具或 ACP Provider 已在本机安装并完成各自认证
 - 可见员工 Channel 在 Linux 使用 `bubblewrap`，在 macOS 使用系统 Seatbelt；
@@ -55,6 +56,17 @@ uv sync --group dev
 2. 在“事件与回调”中启用“使用长连接接收事件”。
 3. 订阅 `im.message.receive_v1`。
 4. 授权消息接收、消息发送和卡片更新相关权限。
+5. 授权 `application:app_slash_command:read` 和
+   `application:app_slash_command:write`，然后创建并发布新的应用版本。
+
+服务启动后会在后台通过官方 OpenAPI 对账主 Bot 的 Slash Command 面板，
+注册 GhostAP 当前支持的主要命令；Channel SDK 仍负责接收用户选择命令后产生的
+普通消息事件。飞书单个应用最多支持 100 条 Slash Command，GhostAP 只展示主要
+拼写，`/wt`、`/workflow`、`/enter_codex` 等兼容别名仍可直接发送。
+
+Slash Command 创建或更新后通常约 5 分钟生效，客户端还可能缓存约 3 分钟；
+若面板暂未刷新，可等待后重启飞书客户端。缺少上述权限时主 Bot 不会停止服务，
+日志会记录可操作的同步告警，补权限并发布应用版本后重启 GhostAP 即可重新对账。
 
 ### 配置环境变量
 

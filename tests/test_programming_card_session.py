@@ -12,7 +12,6 @@ from src.card.programming_adapter import (
 )
 from src.card.session import CardSession
 from src.card.session.config import SessionConfig
-from src.card.state.models import CardMetadata
 
 
 class MockClient:
@@ -44,21 +43,9 @@ def _make_programming_session(mode_name="coco", image_uploader=None, **kwargs):
         session_id=f"prog_{mode_name}",
     )
 
-    counter = {"value": 1}
-
-    def make_task_session(task_metadata: CardMetadata) -> CardSession:
-        counter["value"] += 1
-        return CardSession(
-            chat_id="chat_prog",
-            config=SessionConfig(metadata=task_metadata, reply_to="origin_msg"),
-            delivery=delivery,
-            session_id=f"prog_{mode_name}_{counter['value']}",
-        )
-
     return (
         ProgrammingCardSession(
             session,
-            session_factory=make_task_session,
             base_metadata=metadata,
             image_uploader=image_uploader,
         ),
@@ -623,11 +610,12 @@ class TestProgrammingCardSession:
         assert task_list.tasks[1]["name"] == "任务 B"
         assert not any(block.kind == "plan" for block in pcs.session.state.blocks)
 
-    def test_parallel_agent_tasks_open_independent_cards(self):
+    def test_parallel_agent_tasks_stay_in_main_card(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 
         pcs, client = _make_programming_session()
         pcs.start()
+        creates_after_start = len(client.creates)
 
         pcs.on_event(ACPEvent(
             event_type=ACPEventType.TOOL_CALL_START,
@@ -650,17 +638,15 @@ class TestProgrammingCardSession:
             ),
         ))
 
-        assert len(client.creates) >= 3
-        states = [session.state for session in pcs._agent_sessions.values()]
-        assert {state.metadata.card_sequence for state in states} == {"1.a", "1.b"}
-        assert all(state.metadata.is_subagent for state in states)
-        assert all(state.metadata.parent_card_seq == "1" for state in states)
-        assert {state.metadata.tool_name for state in states} == {"Explore"}
+        assert len(client.creates) == creates_after_start
+        assert [item["sequence"] for item in pcs.session.state.metadata.subagents] == [
+            "1.a",
+            "1.b",
+        ]
 
-    def test_escaped_agent_marker_stays_out_of_child_metadata_and_chrome(self):
+    def test_escaped_agent_marker_stays_out_of_main_subtask_summary(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
         from src.card.render.budget import RenderBudget
-        from src.card.render.footer import render_footer
         from src.card.render.renderer import render_card
 
         pcs, _ = _make_programming_session()
@@ -676,27 +662,20 @@ class TestProgrammingCardSession:
             ),
         ))
 
-        child_state = pcs._agent_sessions["call_internal"].state
-        card_json = render_card(child_state, RenderBudget())[0]._card_json
-        header_text = json.dumps(card_json["header"], ensure_ascii=False)
-        footer_text = "\n".join(
-            element["content"]
-            for element in render_footer(child_state)
-            if isinstance(element.get("content"), str)
-        )
-        for surface in (header_text, footer_text):
-            assert "call_internal" not in surface
-            assert "ordinary_output" not in surface
-            assert "\\n" not in surface
+        card_json = render_card(pcs.session.state, RenderBudget())[0]._card_json
+        rendered = json.dumps(card_json, ensure_ascii=False)
+        assert "call_internal" not in rendered
+        assert "ordinary_output" not in rendered
+        assert "\\n" not in rendered
+        assert pcs.session.state.metadata.subagents[0]["tool"] == "agent"
+        assert pcs.session.state.metadata.subagents[0]["label"] == "子任务"
 
-        assert child_state.metadata.tool_name == "agent"
-        assert child_state.metadata.unit_label == "子任务"
-
-    def test_task_tool_opens_independent_card(self):
+    def test_task_tool_updates_main_card_without_independent_card(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 
         pcs, client = _make_programming_session()
         pcs.start()
+        creates_after_start = len(client.creates)
 
         pcs.on_event(ACPEvent(
             event_type=ACPEventType.TOOL_CALL_START,
@@ -709,14 +688,17 @@ class TestProgrammingCardSession:
             ),
         ))
 
-        assert len(client.creates) >= 2
-        assert "task-tool-1" in pcs._agent_sessions
-        state = pcs._agent_sessions["task-tool-1"].state
-        assert state.metadata.is_subagent
-        assert state.metadata.unit_label == "依赖分析"
-        assert state.metadata.tool_name == "task"
+        assert len(client.creates) == creates_after_start
+        assert pcs.session.state.metadata.subagents == (
+            {
+                "label": "依赖分析",
+                "tool": "task",
+                "status": "running",
+                "sequence": "1.a",
+            },
+        )
 
-    def test_task_tool_updates_generic_label_when_description_arrives_late(self):
+    def test_main_subtask_summary_updates_generic_label_when_description_arrives_late(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 
         pcs, _ = _make_programming_session()
@@ -743,10 +725,12 @@ class TestProgrammingCardSession:
             ),
         ))
 
-        state = pcs._agent_sessions["task-tool-late"].state
-        assert state.metadata.unit_label == "梳理 Deep 任务列表展示问题"
+        assert (
+            pcs.session.state.metadata.subagents[0]["label"]
+            == "梳理 Deep 任务列表展示问题"
+        )
 
-    def test_task_tool_structured_json_uses_readable_label_without_stdout(self):
+    def test_main_subtask_summary_uses_readable_json_label_without_stdout(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 
         pcs, _ = _make_programming_session()
@@ -785,9 +769,10 @@ class TestProgrammingCardSession:
             ),
         ))
 
-        state = pcs._agent_sessions["task-tool-json"].state
-        assert state.metadata.unit_label == "读取 src/card/orchestrator.py"
-        rendered_payload = str(state.blocks)
+        summary = pcs.session.state.metadata.subagents[0]
+        assert summary["label"] == "读取 src/card/orchestrator.py"
+        assert summary["status"] == "completed"
+        rendered_payload = str(summary)
         assert "stdout" not in rendered_payload
         assert "1290" not in rendered_payload
 
@@ -861,7 +846,6 @@ class TestProgrammingCardSession:
         pcs.cancel(reason="user_stop")
 
         assert pcs.session.state.terminal == "cancelled"
-        assert pcs._agent_sessions["agent-task-1"].state.terminal == "cancelled"
         assert pcs.session.state.metadata.subagents[0]["status"] == "cancelled"
         body = str(render_card(pcs.session.state, RenderBudget())[0]._card_json["body"]["elements"])
         assert "⚪ 实现后端接口" in body
@@ -895,65 +879,6 @@ class TestProgrammingCardSession:
         pcs.finish()
 
         assert pcs.session.state.terminal == "completed"
-
-    def test_subagent_terminal_delivery_stays_tracked_until_abort(self):
-        pcs, _ = _make_programming_session()
-        pcs.start()
-
-        class BlockingAgentSession:
-            closed = False
-            close_called = False
-            terminal_event = None
-
-            def dispatch(self, event):
-                self.terminal_event = event
-
-            def wait_delivery_idle(self, *, timeout):
-                return False
-
-            def close(self):
-                self.close_called = True
-                self.closed = True
-
-        agent = BlockingAgentSession()
-        pcs._agent_sessions["agent-blocked"] = agent
-
-        pcs.finish()
-
-        assert agent.terminal_event.type == CardEventType.COMPLETED
-        assert pcs._agent_sessions["agent-blocked"] is agent
-        assert pcs.wait_delivery_idle(timeout=0.1) is False
-        assert pcs.terminal_delivery_succeeded() is False
-
-        pcs.abort()
-
-        assert agent.close_called is True
-        assert pcs._agent_sessions == {}
-
-    def test_agent_task_uses_card_session_factory_create_subagent_when_available(self):
-        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
-
-        pcs, _ = _make_programming_session()
-        calls: list[tuple[str, str]] = []
-
-        def create_subagent(parent, *, branch_id, tool_name, metadata):
-            calls.append((branch_id, tool_name))
-            return pcs._session_factory(metadata)
-
-        pcs._subagent_session_factory = create_subagent
-        pcs.start()
-        pcs.on_event(ACPEvent(
-            event_type=ACPEventType.TOOL_CALL_START,
-            tool_call=ToolCallInfo(
-                id="agent-task-1",
-                title="Agent",
-                kind="other",
-                status="in_progress",
-                content="实现后端接口\n子代理：Explore",
-            ),
-        ))
-
-        assert calls == [("a", "Explore")]
 
     def test_render_omits_process_summary_after_later_text_updates(self):
         """Completed tools join the folded execution record beside answer text."""

@@ -89,6 +89,7 @@ from .handlers import (
 )
 from .handlers.worktree import WorktreeHandler
 from .image_handler import FeishuImageHandler
+from .main_slash_commands import reconcile_main_agent_slash_commands
 from .message_cache import MessageCache
 from .renderers.deep_renderer import DeepRenderer
 from .renderers.spec_renderer import SpecRenderer
@@ -228,6 +229,7 @@ class FeishuWSClient:
         self._closed = False
         self._api_client: Optional[lark.Client] = None
         self._channel_client: Optional[FeishuChannel] = None
+        self._slash_command_sync_thread: Optional[threading.Thread] = None
         self._channel_client_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
         # ACPSessionManager: IdleHealth 相关协作者统一通过 IdleHealthConfig 注入，
@@ -864,6 +866,44 @@ class FeishuWSClient:
                     ),
                 )
             return self._channel_client
+
+    def _sync_main_slash_commands(self) -> None:
+        """Best-effort convergence of the main Bot's Slash discovery panel."""
+
+        try:
+            verified = asyncio.run(
+                reconcile_main_agent_slash_commands(self._get_api_client())
+            )
+        except Exception as exc:
+            logger.warning(
+                "Main Agent Slash Command sync skipped (%s); grant and publish "
+                "application:app_slash_command:read and "
+                "application:app_slash_command:write",
+                type(exc).__name__,
+            )
+            return
+
+        logger.info(
+            "Main Agent Slash Commands ready: total=%d created=%d updated=%d "
+            "deleted=%d",
+            len(verified.observed),
+            len(verified.created),
+            len(verified.updated),
+            len(verified.deleted),
+        )
+
+    def _start_main_slash_command_sync(self) -> None:
+        """Start at most one non-blocking Slash reconciliation worker."""
+
+        if self._slash_command_sync_thread is not None:
+            return
+        thread = threading.Thread(
+            target=self._sync_main_slash_commands,
+            name="main-slash-command-sync",
+            daemon=True,
+        )
+        self._slash_command_sync_thread = thread
+        thread.start()
 
 
 
@@ -2794,6 +2834,7 @@ class FeishuWSClient:
         self._message_cache.start_cleanup_thread()
         self._card_event_cache.start_cleanup_thread()
         self._ws_health_monitor.start_watchdog()
+        self._start_main_slash_command_sync()
 
         # Restore slock engines from persisted marker files
         import os

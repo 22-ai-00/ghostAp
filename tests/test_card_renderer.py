@@ -5,6 +5,7 @@ import json
 
 import pytest
 
+from src.card.events import CardEvent
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import (
     _assemble_card_json,
@@ -20,6 +21,7 @@ from src.card.state.models import (
     HeaderState,
     TaskListBlock,
 )
+from src.card.state.reducer import reduce_card_state
 
 
 def _iter_dict_nodes(obj):
@@ -305,6 +307,59 @@ class TestSubtaskCardProjection:
         assert not any(
             "Deep · 执行中" in str(element)
             for element in body
+        )
+
+    def test_subtask_failure_details_are_collapsed_by_default(self):
+        raw_error = (
+            '{"formatted_output":"FAILED tests/test_card_renderer.py::test_error_panel\\n'
+            + "AssertionError: expected collapsible_panel\\n"
+            + ("Traceback line\\n" * 400)
+            + '"}'
+        )
+        state = reduce_card_state(
+            CardState(
+                metadata=CardMetadata(
+                    engine_type="deep",
+                    unit_kind="subagent",
+                    unit_label="验证卡片渲染",
+                    card_sequence="1.a",
+                    is_subagent=True,
+                    parent_card_seq="1",
+                ),
+            ),
+            CardEvent.failed(raw_error),
+        )
+
+        cards = render_card(state, RenderBudget())
+        error_panels = [
+            element
+            for card in cards
+            for element in card._card_json["body"]["elements"]
+            if element.get("tag") == "collapsible_panel"
+            and "错误详情" in str(element.get("header", {}))
+        ]
+
+        assert error_panels
+        assert all(panel["expanded"] is False for panel in error_panels)
+        assert all(
+            "测试失败：tests/test_card_renderer.py::test_error_panel"
+            in panel["header"]["title"]["content"]
+            for panel in error_panels
+        )
+        assert all(
+            "formatted_output" not in panel["header"]["title"]["content"]
+            for panel in error_panels
+        )
+        assert raw_error in "".join(
+            str(child.get("content", ""))
+            for panel in error_panels
+            for child in panel.get("elements", [])
+        )
+        assert not any(
+            raw_error in str(element)
+            for card in cards
+            for element in card._card_json["body"]["elements"]
+            if element.get("tag") != "collapsible_panel"
         )
 
 

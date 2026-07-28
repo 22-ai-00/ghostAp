@@ -91,6 +91,18 @@ def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
     # Avoid starting extra cache threads here; close() logic is covered elsewhere.
     monkeypatch.setattr(ws.MessageCache, "start_cleanup_thread", lambda self: None)
     monkeypatch.setattr(ws.MessageCache, "stop_cleanup_thread", lambda self: None)
+    monkeypatch.setattr(
+        ws.SlockEngineManager,
+        "restore_from_disk",
+        lambda self, root: 0,
+    )
+    slash_sync_starts = []
+    monkeypatch.setattr(
+        ws.FeishuWSClient,
+        "_start_main_slash_command_sync",
+        lambda self: slash_sync_starts.append(True),
+        raising=False,
+    )
 
     client = ws.FeishuWSClient(message_callback=lambda *a, **k: None)
     membership_audits = []
@@ -113,6 +125,7 @@ def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
     t.join(timeout=1.0)
     assert len(created) >= 2
     assert membership_audits == [True]
+    assert slash_sync_starts == [True]
     assert all(item["log_level"] == ws.ChannelLogLevel.WARNING for item in created)
     assert all(item["source"] == "ghostap" for item in created)
     assert not t.is_alive()

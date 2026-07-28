@@ -25,7 +25,7 @@ class PromptAssessment:
 
 
 _CANCELLED_REASONS = frozenset({"cancelled", "canceled"})
-_SUCCESSFUL_TOOL_STATUSES = frozenset({"completed"})
+_TERMINAL_TOOL_STATUSES = frozenset({"completed", "failed"})
 
 
 def _status(value: Any) -> str:
@@ -36,7 +36,9 @@ def classify_prompt_result(result: object) -> PromptAssessment:
     """Classify whether a prompt result proves that requested work is complete.
 
     ``end_turn`` is necessary but not sufficient: a result with pending plan
-    entries or any tool call not explicitly marked successful is incomplete.
+    entries or any non-terminal tool call is incomplete. Failed tool attempts are
+    terminal and may be followed by a successful recovery within the same prompt;
+    treating their history as pending would make every TDD/debugging turn fail.
     Unknown states fail closed so backend additions cannot silently become success.
     """
 
@@ -71,19 +73,19 @@ def classify_prompt_result(result: object) -> PromptAssessment:
     incomplete_tools = [
         tool
         for tool in (getattr(result, "tool_calls", None) or ())
-        if _status(tool) not in _SUCCESSFUL_TOOL_STATUSES
+        if _status(tool) not in _TERMINAL_TOOL_STATUSES
     ]
     if incomplete_tools:
         return PromptAssessment(
             outcome=PromptOutcome.INCOMPLETE,
             stop_reason=stop_reason,
-            detail=f"仍有 {len(incomplete_tools)} 个工具调用未成功完成",
+            detail=f"仍有 {len(incomplete_tools)} 个工具调用未进入终态",
         )
 
     return PromptAssessment(
         outcome=PromptOutcome.COMPLETED,
         stop_reason=stop_reason,
-        detail="ACP 已正常结束且没有未决计划或工具调用",
+        detail="ACP 已正常结束且没有未决计划或非终态工具调用",
     )
 
 

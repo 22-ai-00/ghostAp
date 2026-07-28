@@ -828,7 +828,6 @@ class ProgrammingModeHandler(BaseHandler):
         from ...card.delivery.factory import create_card_delivery
         from ...card.programming_adapter import ProgrammingCardSession, build_programming_metadata
         from ...card.session import CardSession
-        from ...card.session.factory import CardSessionFactory
 
         project_name = project.project_name if project else None
         project_path = project.root_path if project else global_working_dir
@@ -909,23 +908,9 @@ class ProgrammingModeHandler(BaseHandler):
             delivery=delivery,
             callbacks=card_callbacks,
         )
-        session_factory = CardSessionFactory(delivery)
-        subagent_callbacks = card_callbacks
-
-        def _create_subagent(parent, *, branch_id: str, tool_name: str, metadata):
-            return session_factory.create_subagent(
-                parent,
-                branch_id=branch_id,
-                tool_name=tool_name,
-                metadata=metadata,
-                chat_id=chat_id,
-                reply_to=message_id,
-                callbacks=subagent_callbacks,
-            )
 
         prog_session = ProgrammingCardSession(
             card_session,
-            subagent_session_factory=_create_subagent,
             base_metadata=metadata,
             image_uploader=self.upload_acp_image,
         )

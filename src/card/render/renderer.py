@@ -13,6 +13,7 @@ from src.card.engine_meta import engine_type_to_cmd
 from src.card.render.atoms import AtomKind, RenderAtom, estimate_atom_size, flatten_to_atoms
 from src.card.render.budget import RenderBudget
 from src.card.render.buttons import render_buttons
+from src.card.render.error import render_collapsed_error_panel
 from src.card.render.footer import render_footer
 from src.card.render.header import render_header
 from src.card.render.layout import SectionLayout, paginate_layout
@@ -364,6 +365,16 @@ def compute_content_hash(state: CardState) -> str:
 # --- Individual atom renderer functions (signature: atom, state, budget, block_index → dict|None) ---
 
 def _render_atom_text(atom: RenderAtom, state: CardState, budget: RenderBudget, block_index: dict) -> dict:
+    if (
+        atom.block_id == "_error"
+        and state.terminal == "failed"
+        and state.metadata.is_subagent
+    ):
+        block = block_index.get(atom.block_id)
+        return render_collapsed_error_panel(
+            detail_content=_normalize_text_markdown(atom.content),
+            full_content=str(getattr(block, "content", "") or atom.content),
+        )
     return _render_text_element(atom, block_index)
 
 

@@ -77,29 +77,18 @@ def _agent_event(event_type: ACPEventType, *, status: str) -> ACPEvent:
     )
 
 
-def test_production_subagent_factory_does_not_complete_parent_card() -> None:
-    """A child TOOL_CALL_DONE must not close the long-running parent card."""
-    delivery = CardDelivery(_CardClient())
+def test_agent_completion_updates_main_summary_without_completing_parent() -> None:
+    """A subtask TOOL_CALL_DONE only updates the main-card summary."""
+    client = _CardClient()
+    delivery = CardDelivery(client)
     metadata = build_programming_metadata(
         "codex",
         project_name="ghostAp",
         working_dir="/repo",
     )
     parent = _card_session(delivery, session_id="parent", metadata=metadata)
-    children: list[CardSession] = []
-
-    def create_subagent(parent_session, *, branch_id, tool_name, metadata):
-        child = _card_session(
-            delivery,
-            session_id=f"child-{branch_id}",
-            metadata=metadata,
-        )
-        children.append(child)
-        return child
-
     programming = ProgrammingCardSession(
         parent,
-        subagent_session_factory=create_subagent,
         base_metadata=metadata,
     )
     try:
@@ -111,11 +100,10 @@ def test_production_subagent_factory_does_not_complete_parent_card() -> None:
             _agent_event(ACPEventType.TOOL_CALL_DONE, status="completed")
         )
 
-        assert len(children) == 1
-        assert children[0].state is not None
-        assert children[0].state.terminal == "completed"
+        assert client.created == 1
         assert parent.state is not None
         assert parent.state.terminal == "running"
+        assert parent.state.metadata.subagents[0]["status"] == "completed"
 
         programming.on_event(
             ACPEvent(
@@ -129,9 +117,9 @@ def test_production_subagent_factory_does_not_complete_parent_card() -> None:
         programming.abort()
 
 
-def test_missing_child_factory_degrades_to_parent_tool_not_parent_terminal() -> None:
-    """Without a child-card factory, an agent call is still only a tool call."""
-    delivery = CardDelivery(_CardClient())
+def test_agent_call_uses_main_summary_not_tool_or_child_card() -> None:
+    client = _CardClient()
+    delivery = CardDelivery(client)
     parent = _card_session(delivery, session_id="parent-no-factory")
     programming = ProgrammingCardSession(parent)
     try:
@@ -145,7 +133,9 @@ def test_missing_child_factory_degrades_to_parent_tool_not_parent_terminal() -> 
 
         assert parent.state is not None
         assert parent.state.terminal == "running"
-        assert any(block.kind == "tool_call" for block in parent.state.blocks)
+        assert client.created == 1
+        assert not any(block.kind == "tool_call" for block in parent.state.blocks)
+        assert parent.state.metadata.subagents[0]["status"] == "completed"
     finally:
         programming.abort()
 
@@ -154,21 +144,7 @@ def test_execute_output_containing_subagent_marker_stays_parent_tool() -> None:
     """Source text mentioning the marker must not turn an exec into a child task."""
     delivery = CardDelivery(_CardClient())
     parent = _card_session(delivery, session_id="parent-exec-marker")
-    children: list[CardSession] = []
-
-    def create_subagent(parent_session, *, branch_id, tool_name, metadata):
-        child = _card_session(
-            delivery,
-            session_id=f"unexpected-child-{branch_id}",
-            metadata=metadata,
-        )
-        children.append(child)
-        return child
-
-    programming = ProgrammingCardSession(
-        parent,
-        subagent_session_factory=create_subagent,
-    )
+    programming = ProgrammingCardSession(parent)
     try:
         programming.start()
         programming.on_event(
@@ -196,7 +172,6 @@ def test_execute_output_containing_subagent_marker_stays_parent_tool() -> None:
             )
         )
 
-        assert children == []
         assert parent.state is not None
         assert parent.state.terminal == "running"
         assert any(block.kind == "tool_call" for block in parent.state.blocks)
@@ -205,24 +180,10 @@ def test_execute_output_containing_subagent_marker_stays_parent_tool() -> None:
 
 
 def test_known_agent_call_keeps_routing_when_terminal_shape_changes() -> None:
-    """Once bound as a child task, later events route by the stable call id."""
+    """Once summarized as a subtask, later events route by the stable call id."""
     delivery = CardDelivery(_CardClient())
     parent = _card_session(delivery, session_id="parent-shape-change")
-    children: list[CardSession] = []
-
-    def create_subagent(parent_session, *, branch_id, tool_name, metadata):
-        child = _card_session(
-            delivery,
-            session_id=f"child-{branch_id}",
-            metadata=metadata,
-        )
-        children.append(child)
-        return child
-
-    programming = ProgrammingCardSession(
-        parent,
-        subagent_session_factory=create_subagent,
-    )
+    programming = ProgrammingCardSession(parent)
     try:
         programming.start()
         programming.on_event(
@@ -250,32 +211,19 @@ def test_known_agent_call_keeps_routing_when_terminal_shape_changes() -> None:
             )
         )
 
-        assert len(children) == 1
-        assert children[0].state is not None
-        assert children[0].state.terminal == "failed"
         assert parent.state is not None
         assert parent.state.terminal == "running"
+        assert parent.state.metadata.subagents[0]["status"] == "failed"
     finally:
         programming.abort()
 
 
-def test_agent_image_routes_to_bound_child_before_terminal() -> None:
-    delivery = CardDelivery(_CardClient())
+def test_agent_image_routes_to_main_card_with_task_attribution() -> None:
+    client = _CardClient()
+    delivery = CardDelivery(client)
     parent = _card_session(delivery, session_id="parent-child-image")
-    children: list[CardSession] = []
-
-    def create_subagent(parent_session, *, branch_id, tool_name, metadata):
-        child = _card_session(
-            delivery,
-            session_id=f"child-image-{branch_id}",
-            metadata=metadata,
-        )
-        children.append(child)
-        return child
-
     programming = ProgrammingCardSession(
         parent,
-        subagent_session_factory=create_subagent,
         image_uploader=lambda _: "img_child",
     )
     try:
@@ -296,32 +244,21 @@ def test_agent_image_routes_to_bound_child_before_terminal() -> None:
             )
         )
 
-        assert len(children) == 1
-        assert children[0].state is not None
-        assert any(block.kind == "image" for block in children[0].state.blocks)
         assert parent.state is not None
-        assert not any(block.kind == "image" for block in parent.state.blocks)
+        assert client.created == 1
+        image_block = next(
+            block for block in parent.state.blocks if block.kind == "image"
+        )
+        assert "分析剩余实现" in image_block.alt
     finally:
         programming.abort()
 
 
-def test_late_agent_image_falls_back_to_parent_with_task_attribution() -> None:
+def test_late_agent_image_stays_in_main_card_with_task_attribution() -> None:
     delivery = CardDelivery(_CardClient())
     parent = _card_session(delivery, session_id="parent-late-child-image")
-    children: list[CardSession] = []
-
-    def create_subagent(parent_session, *, branch_id, tool_name, metadata):
-        child = _card_session(
-            delivery,
-            session_id=f"late-child-image-{branch_id}",
-            metadata=metadata,
-        )
-        children.append(child)
-        return child
-
     programming = ProgrammingCardSession(
         parent,
-        subagent_session_factory=create_subagent,
         image_uploader=lambda _: "img_late_child",
     )
     try:
@@ -332,8 +269,7 @@ def test_late_agent_image_falls_back_to_parent_with_task_attribution() -> None:
         programming.on_event(
             _agent_event(ACPEventType.TOOL_CALL_DONE, status="completed")
         )
-        assert children[0].state is not None
-        task_label = children[0].state.metadata.unit_label
+        task_label = parent.state.metadata.subagents[0]["label"]
 
         programming.on_event(
             ACPEvent(
@@ -421,13 +357,15 @@ def test_end_turn_with_active_tool_is_incomplete() -> None:
     ("status", "expected"),
     [
         ("completed", PromptOutcome.COMPLETED),
-        ("failed", PromptOutcome.INCOMPLETE),
+        ("failed", PromptOutcome.COMPLETED),
+        ("pending", PromptOutcome.INCOMPLETE),
+        ("in_progress", PromptOutcome.INCOMPLETE),
         ("future_pending_state", PromptOutcome.INCOMPLETE),
         ("", PromptOutcome.INCOMPLETE),
         (None, PromptOutcome.INCOMPLETE),
     ],
 )
-def test_end_turn_requires_explicitly_completed_tool_status(
+def test_end_turn_requires_tool_calls_to_be_terminal(
     status: str | None,
     expected: PromptOutcome,
 ) -> None:
