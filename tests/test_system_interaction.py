@@ -3,7 +3,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from src import __version__
 from src.feishu.handlers.system import SystemHandler
 
 
@@ -68,12 +67,13 @@ class TestSystemInteraction(unittest.TestCase):
         # Verify content structure
         card = json.loads(content)
         self.assertIn("header", card)
-        self.assertEqual(card["header"]["title"]["content"], f"📖 GhostAP 使用帮助 v{__version__}")
+        self.assertEqual(card["header"]["title"]["content"], "📖 GhostAP 使用帮助")
 
-        # Verify category buttons exist
-        elements = card["body"]["elements"]
-        has_buttons = any(e.get("tag") == "column_set" for e in elements)
-        self.assertTrue(has_buttons)
+        # The full help is documentation-only: quick-action buttons belong in /menu.
+        self.assertEqual(_collect_buttons(card), [])
+        card_text = _card_text(card)
+        self.assertNotIn("常用操作", card_text)
+        self.assertNotIn("GhostAP 使用帮助 v", card_text)
 
     def test_handle_menu_command(self):
         """测试 /menu 命令生成并发送菜单卡片"""

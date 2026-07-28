@@ -4483,39 +4483,78 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self.reply_text(message_id, status_text)
 
     def show_workflow_help(self, message_id: str) -> None:
-        """Show workflow mode help and usage guide."""
+        """Show the Workflow usage guide as a structured Feishu card."""
+        from ...card import CardBuilder
+        from ...card.themes import PANEL_STYLES
+
         # Pull the authoritative Node-version text so the full help keeps the
         # same contract as engine.run_workflow() and the card-entry messages.
         from ...workflow_engine.engine import _node_version_required_text
 
-        help_text = (
-            "**🔄 Workflow 模式帮助**\n\n"
-            "Workflow 模式通过 AI 编排脚本自动拆解复杂任务为多阶段、多智能体协同执行。\n\n"
-            "**前置要求**:\n"
-            f"• {_node_version_required_text()}\n\n"
-            "**命令列表**:\n"
-            "• `/wf <需求描述>` — AI 生成编排脚本并执行\n"
-            "• `/wf <模板名> [key=value ...]` — 使用内置/保存的模板\n"
-            "• `/wf_status` — 查看当前 Workflow 进度\n"
-            "• `/wf_save <名称> [--global]` — 保存脚本为模板\n"
-            "• `/wf_list` — 列出可用模板\n"
-            "• `/wf_delete <名称> [--global]` — 删除模板\n"
-            "• `/wf_history` — 查看执行历史\n"
-            "• `/wf_help` — 显示本帮助\n"
-            "• `/stop_wf` — 停止正在执行的 Workflow\n\n"
-            "**执行流程**:\n"
-            "① 主编排 Agent 选择 → 选择工具+模型（单一选择）\n"
-            "② 评审 Agent 选择 → 选择一组用于评审的工具+模型（可多选或 Auto）\n"
-            "③ 自动生成并执行 → 生成编排脚本后立即启动，多阶段并行执行，实时进度卡片更新\n\n"
-            "**特性**:\n"
-            "• 多工具并行调度（coco/claude/aiden/codex/traex）\n"
-            "• **每个工具 Agent 可自主继续拆分 subagent 并行工作**，显著提升复杂任务收敛速度\n"
-            "• Agent 按任务动态规划角色分工\n"
-            "• Journal 缓存避免重复执行\n"
-            "• 子任务自动拆分与依赖编排\n"
-            "• 可引用并组合多个已保存 Workflow（workflow refs）"
+        sections = [
+            (
+                "📚 命令列表",
+                "`/wf <需求描述>` · AI 生成编排脚本并执行\n"
+                "`/wf <模板名> [key=value ...]` · 使用内置或保存的模板\n"
+                "`/wf_status` · 查看当前 Workflow 进度\n"
+                "`/wf_save <名称> [--global]` · 保存脚本为模板\n"
+                "`/wf_list` · 列出可用模板\n"
+                "`/wf_delete <名称> [--global]` · 删除模板\n"
+                "`/wf_history` · 查看执行历史\n"
+                "`/wf_help` · 显示本帮助\n"
+                "`/stop_wf` · 停止正在执行的 Workflow",
+            ),
+            (
+                "🧭 执行流程",
+                "**① 主编排 Agent** · 选择一个工具和模型\n"
+                "**② 评审 Agent** · 选择一个或多个工具和模型，或使用 Auto\n"
+                "**③ 自动生成并执行** · 脚本生成后立即启动，多阶段并行执行并实时更新进度卡片",
+            ),
+            (
+                "✨ 核心能力",
+                "• 多工具并行调度（coco / claude / aiden / codex / traex）\n"
+                "• 工具 Agent 可继续拆分 subagent 并行工作\n"
+                "• Agent 按任务动态规划角色分工\n"
+                "• Journal 缓存避免重复执行\n"
+                "• 子任务自动拆分与依赖编排\n"
+                "• 引用并组合多个已保存 Workflow（workflow refs）",
+            ),
+        ]
+
+        elements = [
+            {
+                "tag": "markdown",
+                "content": "Workflow 通过 AI 编排脚本，将复杂需求拆解为多阶段、多 Agent 协同任务。",
+            },
+            {
+                "tag": "markdown",
+                "content": f"**运行要求**\n{_node_version_required_text()}",
+            },
+            {"tag": "hr"},
+        ]
+        for index, (title, body) in enumerate(sections):
+            elements.append({
+                "tag": "collapsible_panel",
+                "expanded": index == 0,
+                "header": {
+                    "title": {"tag": "markdown", "content": f"**{title}**"},
+                    "vertical_align": "center",
+                },
+                "border": {
+                    "color": PANEL_STYLES["border_normal"],
+                    "corner_radius": PANEL_STYLES["corner_radius"],
+                },
+                "vertical_spacing": PANEL_STYLES["vertical_spacing"],
+                "padding": PANEL_STYLES["padding_standard"],
+                "elements": [{"tag": "markdown", "content": body}],
+            })
+
+        card = CardBuilder._wrap_card(
+            header_title="⚡ Workflow 使用帮助",
+            header_template="turquoise",
+            elements=elements,
         )
-        self.reply_text(message_id, help_text)
+        self.reply_card(message_id, card)
 
     # ------------------------------------------------------------------
     # Template management commands

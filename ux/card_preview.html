@@ -290,15 +290,6 @@ body {
   font-family: 'JetBrains Mono', 'Fira Code', monospace;
   font-size: 12px;
 }
-.help-actions-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-.help-actions-grid .btn {
-  padding: 7px 10px;
-  font-size: 13px;
-}
 .help-section {
   border: 1px solid #e5e7eb;
   border-radius: 6px;
@@ -309,10 +300,15 @@ body {
 .help-section strong {
   color: #1f2329;
 }
-@media (max-width: 360px) {
-  .help-actions-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
+.help-section-summary {
+  color: #1f2329;
+  font-weight: 600;
+}
+.help-section-body {
+  margin-top: 6px;
+}
+.help-section-collapsed .help-section-body {
+  display: none;
 }
 
 /* === Task List === */
@@ -882,7 +878,7 @@ tests/test_tools.py::test_tool_history_fold PASSED
   <div class="card-label">System · /help</div>
   <div class="feishu-card">
     <div class="card-header header-blue">
-      <div class="title">📖 GhostAP 使用帮助 v0.2.0</div>
+      <div class="title">📖 GhostAP 使用帮助</div>
     </div>
     <div class="card-body">
       <div class="help-status">
@@ -890,32 +886,70 @@ tests/test_tools.py::test_tool_history_fold PASSED
         <span class="path">.../aiwork/ghostAp</span>
       </div>
 
-      <div class="text-content"><strong>常用操作</strong></div>
-      <div class="help-actions-grid">
-        <button class="btn btn-primary">Deep</button>
-        <button class="btn btn-primary">Worktree</button>
-        <button class="btn btn-default">工具</button>
-        <button class="btn btn-default">TTADK</button>
-        <button class="btn btn-default">状态</button>
-        <button class="btn btn-default">切项目</button>
-      </div>
-
       <div class="help-section">
-        <strong>🔄 编程模式切换</strong><br>
-        <code>/coco</code> · <code>/claude</code> · <code>/aiden</code> · <code>/codex</code> · <code>/gemini</code> · <code>/exit</code>
+        <div class="help-section-summary">⌄ 🔄 编程模式切换</div>
+        <div class="help-section-body">
+          <code>/coco</code> · <code>/claude</code> · <code>/aiden</code> · <code>/codex</code> · <code>/gemini</code> · <code>/exit</code>
+        </div>
       </div>
-      <div class="help-section">
-        <strong>📋 Spec / 🌳 Worktree</strong><br>
-        <code>/spec &lt;需求&gt;</code> · <code>/wt &lt;目标&gt;</code> · <code>/worktree &lt;目标&gt;</code>
+      <div class="help-section help-section-collapsed">
+        <div class="help-section-summary">› 📋 Spec / 🌳 Worktree</div>
+        <div class="help-section-body">
+          <code>/spec &lt;需求&gt;</code> · <code>/wt &lt;目标&gt;</code> · <code>/worktree &lt;目标&gt;</code>
+        </div>
       </div>
-      <div class="help-section">
-        <strong>📂 项目管理</strong><br>
-        <code>/projects</code> · <code>/new</code> · <code>/new-chat</code> · <code>/switch</code> · <code>/diff</code>
+      <div class="help-section help-section-collapsed">
+        <div class="help-section-summary">› 📂 项目管理</div>
+        <div class="help-section-body">
+          <code>/projects</code> · <code>/new</code> · <code>/new-chat</code> · <code>/switch</code> · <code>/diff</code>
+        </div>
       </div>
 
       <hr class="card-hr">
       <div class="notation">
         ⏰ 长时间无更新超过 30 分钟才会关闭/回收；运行中的任务会自动顺延，回收前提醒续期。
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card-wrapper">
+  <div class="card-label">Workflow · /wf_help</div>
+  <div class="feishu-card">
+    <div class="card-header header-turquoise">
+      <div class="title">⚡ Workflow 使用帮助</div>
+    </div>
+    <div class="card-body">
+      <div class="text-content">
+        Workflow 通过 AI 编排脚本，将复杂需求拆解为多阶段、多 Agent 协同任务。
+      </div>
+
+      <div class="text-content">
+        <strong>运行要求</strong><br>
+        Node.js ≥ 20，并确保 <code>node</code> 已加入 PATH。
+      </div>
+
+      <div class="help-section">
+        <div class="help-section-summary">⌄ 命令列表</div>
+        <div class="help-section-body">
+          <code>/wf &lt;需求描述&gt;</code> · 生成编排脚本并执行<br>
+          <code>/wf_status</code> · 查看进度<br>
+          <code>/wf_save</code> · 保存模板<br>
+          <code>/wf_list</code> · 查看模板<br>
+          <code>/stop_wf</code> · 停止任务
+        </div>
+      </div>
+      <div class="help-section help-section-collapsed">
+        <div class="help-section-summary">› 执行流程</div>
+        <div class="help-section-body">
+          主编排 Agent → 评审 Agent / Auto → 自动生成并执行
+        </div>
+      </div>
+      <div class="help-section help-section-collapsed">
+        <div class="help-section-summary">› 核心能力</div>
+        <div class="help-section-body">
+          多工具并行调度 · 动态角色分工 · 子任务拆分与依赖编排 · Workflow 模板组合
+        </div>
       </div>
     </div>
   </div>

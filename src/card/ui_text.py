@@ -286,9 +286,8 @@ UI_TEXT = {
     "system_menu_btn_ttadk": "TTADK",
     "system_menu_btn_acp": "工具",
     "system_menu_btn_help": "📖 帮助",
-    "system_help_title": "📖 GhostAP 使用帮助 v{version}",
+    "system_help_title": "📖 GhostAP 使用帮助",
     "system_help_status_header": "**当前状态** · {mode} · 项目: {project}\n<font color='grey'>{cwd}</font>",
-    "system_help_quick_entry": "**常用操作**",
     "system_help_section_modes": "🔄 编程模式切换",
     "system_help_section_modes_body": (
         "`/coco` · 进入 Coco 编程模式（字节跳动 AI）\n"

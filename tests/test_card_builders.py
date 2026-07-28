@@ -148,8 +148,8 @@ def test_help_card_mentions_new_chat_project_group():
     assert "项目群" in card_text
 
 
-def test_help_card_quick_actions_use_compact_mobile_grid():
-    """Front help actions should render as compact two-column callback buttons."""
+def test_help_card_omits_quick_action_buttons():
+    """The documentation-only help card should leave quick actions to /menu."""
     SystemBuilder._build_help_card_cached.cache_clear()
 
     msg_type, card_json = SystemBuilder.build_help_card(
@@ -161,7 +161,7 @@ def test_help_card_quick_actions_use_compact_mobile_grid():
     assert msg_type == "interactive"
     card = json.loads(card_json)
     buttons = _collect_buttons(card)
-    quick_buttons = [
+    help_action_buttons = [
         button
         for button in buttons
         if button.get("value", {}).get("action")
@@ -175,17 +175,8 @@ def test_help_card_quick_actions_use_compact_mobile_grid():
         }
     ]
 
-    assert [button["value"]["action"] for button in quick_buttons[:6]] == [
-        "enter_deep_prompt",
-        "show_worktree_menu",
-        "show_acp_menu",
-        "show_ttadk_menu",
-        "show_status",
-        "switch_project",
-    ]
-    assert all(button["size"] == "small" for button in quick_buttons)
-    assert all(button.get("behaviors") == [{"type": "callback", "value": button["value"]}] for button in quick_buttons)
-    assert [button["type"] for button in quick_buttons[:2]] == ["primary", "primary"]
+    assert help_action_buttons == []
+    assert "常用操作" not in json.dumps(card, ensure_ascii=False)
 
 
 def test_project_status_card_includes_switch_and_group_jump_without_duplicate_path():

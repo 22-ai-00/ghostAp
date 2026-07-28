@@ -41,13 +41,6 @@ if TYPE_CHECKING:
 _LOCK_BODY_PLACEHOLDER = "{{__LOCK_BODY_c0f1e2d3a4b5__}}"
 
 
-def _get_version() -> str:
-    """Return the project version string."""
-    from src import __version__
-
-    return __version__
-
-
 class SystemBuilder:
     """System-related card building utilities."""
 
@@ -119,33 +112,6 @@ class SystemBuilder:
             if len(compact) <= limit:
                 return compact
         return "..." + text[-max(1, limit - 3):]
-
-    @staticmethod
-    def _help_callback_button(label: str, button_type: str, action: str, project_id: Optional[str]) -> dict:
-        button = SystemBuilder._callback_button(
-            text=SystemBuilder._mobile_safe_button_label(label),
-            button_type=button_type,
-            action={"action": action, "project_id": project_id},
-        )
-        button["size"] = "small"
-        return button
-
-    @staticmethod
-    def _build_help_quick_action_elements(project_id: Optional[str]) -> list[dict]:
-        quick_actions = [
-            (UI_TEXT["system_menu_btn_deep_task"], "primary", "enter_deep_prompt"),
-            (UI_TEXT["system_menu_btn_worktree"], "primary", "show_worktree_menu"),
-            (UI_TEXT["system_menu_btn_workflow"], "primary", "show_workflow_menu"),
-            (UI_TEXT["system_menu_btn_acp"], "default", "show_acp_menu"),
-            (UI_TEXT["system_menu_btn_ttadk"], "default", "show_ttadk_menu"),
-            (UI_TEXT["system_menu_btn_status"], "default", "show_status"),
-            (UI_TEXT["system_menu_btn_switch_project"], "default", "switch_project"),
-        ]
-        quick_buttons = [
-            SystemBuilder._help_callback_button(label, btn_type, action, project_id)
-            for label, btn_type, action in quick_actions
-        ]
-        return build_responsive_layout(quick_buttons, mobile_force_vertical=False)
 
     @staticmethod
     def _build_select_static(
@@ -2046,18 +2012,18 @@ class SystemBuilder:
         session_idle_timeout: int | None = None,
         session_idle_warn_at_remaining: int | None = None,
     ) -> tuple[str, str]:
-        """Build the help card with all commands expanded and mobile-friendly quick actions.
+        """Build a documentation-only help card with collapsible command sections.
 
         The ``category`` parameter is accepted for backward compatibility but
         no longer drives tab switching — the card always renders every section
         so users see all commands at once.
         """
-        del category  # kept for call-site compatibility; unused
+        del category, project_id  # kept for call-site/cache compatibility; unused
 
         project_info = f"**{project_name}**" if project_name else UI_TEXT["system_no_project"]
         cwd_display = SystemBuilder._compact_help_path(working_dir or root_path or "~")
 
-        # All command sections — rendered inline so nothing is hidden behind a tab.
+        # All command sections stay in one card; only the first is expanded initially.
         sections = [
             (
                 UI_TEXT["system_help_section_modes"],
@@ -2139,10 +2105,7 @@ class SystemBuilder:
                     project=project_info
                 ),
             },
-            {"tag": "hr"},
-            {"tag": "markdown", "content": UI_TEXT["system_help_quick_entry"]},
         ]
-        elements.extend(SystemBuilder._build_help_quick_action_elements(project_id))
         elements.append({"tag": "hr"})
 
         for idx, (title, body) in enumerate(sections):
@@ -2162,9 +2125,7 @@ class SystemBuilder:
         elements.append({"tag": "hr"})
         elements.append({"tag": "markdown", "content": tips, "text_size": "notation"})
 
-        card = CoreBuilder._wrap_card(
-            UI_TEXT["system_help_title"].format(version=_get_version()), "blue", elements
-        )
+        card = CoreBuilder._wrap_card(UI_TEXT["system_help_title"], "blue", elements)
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod

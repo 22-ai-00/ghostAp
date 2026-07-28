@@ -1,8 +1,8 @@
-"""Tests for workflow entry-card messaging, help text, and unknown-command handling.
+"""Tests for workflow entry-card messaging, help card, and unknown-command handling.
 
 Validates that:
-- ``show_workflow_help`` mentions key commands (``/wf``, ``/wf_help``, ``/stop_wf``)
-- ``show_workflow_help`` describes the current flow (①主编排Agent选择 → ②评审Agent选择 → 自动生成并执行)
+- ``show_workflow_help`` replies with a Schema 2.0 card instead of raw Markdown text
+- the help card mentions key commands and describes the current execution flow
 - ``handle_workflow_command`` with an unknown subcommand produces an error message
   that points to ``/wf_help`` and lists major commands
 - ``handle_show_workflow_menu`` (entry-card "开始" button) now launches the
@@ -10,12 +10,13 @@ Validates that:
   ``/wf <需求>`` manually (the previous text-only response)
 """
 
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
 
 class TestWorkflowHelpText(unittest.TestCase):
-    """Validate help-message content."""
+    """Validate the structured Workflow help card."""
 
     def _make_handler(self):
         from src.feishu.handlers.workflow import WorkflowHandler
@@ -35,18 +36,35 @@ class TestWorkflowHelpText(unittest.TestCase):
     def test_help_mentions_core_commands(self):
         handler = self._make_handler()
         handler.show_workflow_help("msg")
-        args, _kwargs = handler.reply_text.call_args
-        text = args[1]
+        handler.reply_text.assert_not_called()
+        handler.reply_card.assert_called_once()
+
+        args, _kwargs = handler.reply_card.call_args
+        card = args[1]
+        self.assertEqual(card["schema"], "2.0")
+        self.assertEqual(card["header"]["title"]["content"], "⚡ Workflow 使用帮助")
+        self.assertEqual(card["header"]["template"], "turquoise")
+
+        panels = [
+            element
+            for element in card["body"]["elements"]
+            if element.get("tag") == "collapsible_panel"
+        ]
+        self.assertEqual(len(panels), 3)
+        self.assertTrue(panels[0]["expanded"])
+        self.assertTrue(all(not panel["expanded"] for panel in panels[1:]))
+
+        text = json.dumps(card, ensure_ascii=False)
         # These are the commands we expect to appear in the help output.
         for snippet in ("/wf", "/wf_help", "/wf_status", "/stop_wf", "/wf_save", "/wf_list"):
             self.assertIn(snippet, text, f"help text missing command {snippet!r}")
 
     def test_help_flow_matches_new_execution_steps(self):
-        """The "执行流程" section must describe the 3/5-step orchestrator flow."""
+        """The execution panel must describe the current three-step orchestrator flow."""
         handler = self._make_handler()
         handler.show_workflow_help("msg")
-        args, _kwargs = handler.reply_text.call_args
-        text = args[1]
+        args, _kwargs = handler.reply_card.call_args
+        text = json.dumps(args[1], ensure_ascii=False)
         self.assertIn("执行流程", text)
         # Assert current descriptions are present (Orchestrator Agent → Review Agent → Auto execute).
         for keyword in ("Agent", "工具", "自动生成", "执行"):
