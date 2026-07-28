@@ -378,8 +378,10 @@ class TestSchemaValidationRetry(unittest.TestCase):
         self.assertIsNone(result.parsed)
         # But raw output is still returned
         self.assertEqual(result.output, invalid_output)
-        # No error field (schema failure is not a hard error)
-        self.assertIsNone(result.error)
+        # A structured node contract must fail closed after retries; callers
+        # can still inspect the raw output for diagnostics.
+        self.assertIsNotNone(result.error)
+        self.assertIn("schema validation", result.error.lower())
 
 
 # ---------------------------------------------------------------------------

@@ -391,21 +391,51 @@ function validateMeta(meta) {
 }
 
 // ---------------------------------------------------------------------------
-// Schema validation (shallow structural check)
+// Schema validation (compact recursive shape check)
 // ---------------------------------------------------------------------------
 
 function matchesSchema(value, schema) {
-  if (!schema || typeof schema !== 'object') return true;
-  if (typeof value !== 'object' || value === null) return false;
-
-  for (const key of Object.keys(schema)) {
-    if (!(key in value)) return false;
-    const expectedType = schema[key];
-    if (typeof expectedType === 'string' && typeof value[key] !== expectedType) {
-      return false;
+  if (typeof schema === 'string') {
+    const aliases = {
+      str: 'string',
+      list: 'array',
+      dict: 'object',
+      float: 'number',
+      int: 'integer',
+      bool: 'boolean',
+      none: 'null',
+      '*': 'any',
+    };
+    const knownTypes = new Set([
+      'string', 'array', 'object', 'number', 'integer', 'boolean', 'null', 'any',
+    ]);
+    let expected = aliases[schema.trim().toLowerCase()] || schema.trim().toLowerCase();
+    if (!knownTypes.has(expected)) expected = 'string';
+    if (expected === 'any') return true;
+    if (expected === 'array') return Array.isArray(value);
+    if (expected === 'object') {
+      return typeof value === 'object' && value !== null && !Array.isArray(value);
     }
+    if (expected === 'number') return typeof value === 'number' && Number.isFinite(value);
+    if (expected === 'integer') return Number.isInteger(value);
+    if (expected === 'null') return value === null;
+    return typeof value === expected;
   }
-  return true;
+  if (schema === null) return value === null;
+  if (typeof schema === 'boolean') return typeof value === 'boolean';
+  if (typeof schema === 'number') return typeof value === 'number' && Number.isFinite(value);
+  if (Array.isArray(schema)) {
+    if (!Array.isArray(value)) return false;
+    if (schema.length === 0) return true;
+    return value.every((item) => matchesSchema(item, schema[0]));
+  }
+  if (typeof schema === 'object') {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+    return Object.keys(schema).every(
+      (key) => key in value && matchesSchema(value[key], schema[key]),
+    );
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -469,41 +499,27 @@ async function agent(promptOrOpts, opts = {}) {
     throw new Error('agent_call: backpressure retries exhausted');
   }
 
-  const maxSchemaAttempts = opts.schema ? 3 : 1;
-
-  for (let attempt = 0; attempt < maxSchemaAttempts; attempt++) {
-    let result;
-    try {
-      result = await callWithBackpressureRetry();
-    } catch (err) {
-      if (err instanceof CancelledError) throw err;
-      return { error: err.message };
-    }
-
-    // Schema validation with retry
-    if (opts.schema) {
-      const payload = typeof result === 'object' && result !== null && 'data' in result
-        ? result.data
-        : result;
-
-      if (matchesSchema(payload, opts.schema)) {
-        return payload;
-      }
-
-      if (attempt < maxSchemaAttempts - 1) {
-        debugLog(`[runtime] Schema mismatch on attempt ${attempt + 1}, retrying...`);
-        continue;
-      }
-      // Final attempt failed schema - return what we have
-      return payload;
-    }
-
-    // No schema - return raw
-    if (typeof result === 'object' && result !== null && 'data' in result) {
-      return result.data;
-    }
-    return result;
+  let result;
+  try {
+    result = await callWithBackpressureRetry();
+  } catch (err) {
+    if (err instanceof CancelledError) throw err;
+    return { error: err.message };
   }
+
+  // AgentExecutor owns structured-output retries. Repeating agent_call here
+  // would multiply its attempts (formerly up to 3×3 calls). The runtime only
+  // propagates the authoritative error and performs one defense-in-depth check.
+  if (typeof result === 'object' && result !== null && result.error) {
+    return { error: sanitizePath(String(result.error)) };
+  }
+  const payload = typeof result === 'object' && result !== null && 'data' in result
+    ? result.data
+    : result;
+  if (opts.schema && !matchesSchema(payload, opts.schema)) {
+    return { error: 'Structured output schema validation failed at runtime boundary' };
+  }
+  return payload;
 }
 
 // NOTE: parallel() runs N agent-call descriptors truly concurrently via
@@ -512,9 +528,8 @@ async function agent(promptOrOpts, opts = {}) {
 // ThreadPoolExecutor size so that neither side starves the other. The cap is
 // controlled by the host via the init message (`params.max_concurrent`),
 // which itself is bounded by HARD_MAX_CONCURRENT on the Python side. pipeline()
-// is intentionally NOT parallel across items at the outer level — it iterates
-// each item through its stages sequentially — so do not mistake it for an
-// unbounded concurrency primitive.
+// reuses this scheduler for item-level parallelism while keeping stages within
+// each item sequential.
 async function parallel(items) {
   if (!Array.isArray(items)) {
     throw new TypeError('parallel() expects an array');
@@ -594,8 +609,8 @@ async function parallel(items) {
 }
 
 async function pipeline(items, ...args) {
-  // pipeline(items, ...stages) — parallel/map: items run concurrently via Promise.all;
-  // each item flows through stages sequentially (map-reduce style).
+  // pipeline(items, ...stages) — bounded parallel/map: items run concurrently
+  // through parallel(); each item flows through stages sequentially.
   // NOTE: this is NOT an outer-level concurrent primitive for stage fan-out —
   // use parallel() if you need heterogeneous tasks fanned out concurrently.
   // For strictly sequential item processing use sequence(...) / serialPipeline(...).
@@ -651,11 +666,9 @@ async function pipeline(items, ...args) {
     }
   }
 
-  let firstError = null;
   let failed = false;
 
-  const results = await Promise.all(
-    items.map(async (item) => {
+  const itemTasks = items.map((item) => async () => {
       let current = item;
       for (let i = 0; i < stages.length; i++) {
         const stage = stages[i];
@@ -677,15 +690,15 @@ async function pipeline(items, ...args) {
           }
           if (!failed) {
             failed = true;
-            firstError = err;
             abortInFlight(err);
           }
           throw err;
         }
       }
       return current;
-    }),
-  ).finally(restoreSendRequest);
+    });
+
+  const results = await parallel(itemTasks).finally(restoreSendRequest);
 
   return results;
 }

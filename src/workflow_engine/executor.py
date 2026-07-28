@@ -439,6 +439,7 @@ class AgentExecutor:
 
                 # Schema validation with retry (separate from general retry)
                 parsed: Optional[dict[str, Any]] = None
+                schema_error: Optional[str] = None
                 if params.output_schema:
                     valid, parsed = self._validate_schema(output_text, params.output_schema)
 
@@ -491,8 +492,14 @@ class AgentExecutor:
                         valid, parsed = self._validate_schema(output_text, params.output_schema)
 
                     if not valid:
+                        attempts = 1 + schema_retry_count
+                        schema_error = (
+                            "Structured output schema validation failed "
+                            f"after {attempts} attempt{'s' if attempts != 1 else ''}"
+                        )
                         logger.warning(
-                            "[AgentExecutor] Schema validation exhausted retries for tool=%s",
+                            "[AgentExecutor] %s for tool=%s",
+                            schema_error,
                             params.tool,
                         )
 
@@ -502,6 +509,7 @@ class AgentExecutor:
                     parsed=parsed,
                     token_usage=total_token_usage,
                     duration_s=duration_s,
+                    error=schema_error,
                     tool=params.tool,
                     model=params.model,
                 )
@@ -812,12 +820,15 @@ class AgentExecutor:
         return "".join(parts)
 
     def _validate_schema(self, output: str, schema: dict[str, Any]) -> tuple[bool, Optional[dict[str, Any]]]:
-        """Try JSON parse + validate against schema keys.
+        """Try JSON parse + validate against GhostAP's compact shape schema.
 
         Validation strategy:
         - Parse the output as JSON.
-        - Check that all top-level keys defined in the schema are present in
-          the parsed result.
+        - Require a top-level object.
+        - Recursively validate required keys and value shapes.
+
+        Type-name descriptors and JSON exemplar values are both supported.
+        ``[]`` accepts any array; ``[schema]`` validates every array item.
 
         Returns:
             (valid, parsed_dict_or_None)
@@ -833,16 +844,98 @@ class AgentExecutor:
         if not isinstance(parsed, dict):
             return False, None
 
-        # Validate that all required schema keys are present
-        required_keys = set(schema.keys())
-        present_keys = set(parsed.keys())
-
-        if not required_keys.issubset(present_keys):
-            missing = required_keys - present_keys
-            logger.debug("[AgentExecutor] Schema validation: missing keys %s", missing)
+        mismatch = self._schema_mismatch(parsed, schema)
+        if mismatch is not None:
+            logger.debug("[AgentExecutor] Schema validation: %s", mismatch)
             return False, None
 
         return True, parsed
+
+    @classmethod
+    def _schema_mismatch(
+        cls,
+        value: Any,
+        schema: Any,
+        path: str = "$",
+    ) -> Optional[str]:
+        """Return the first compact-schema mismatch, or ``None`` when valid."""
+        if isinstance(schema, str):
+            expected = schema.strip().lower()
+            aliases = {
+                "str": "string",
+                "list": "array",
+                "dict": "object",
+                "float": "number",
+                "int": "integer",
+                "bool": "boolean",
+                "none": "null",
+                "*": "any",
+            }
+            expected = aliases.get(expected, expected)
+            known_types = {
+                "string",
+                "array",
+                "object",
+                "number",
+                "integer",
+                "boolean",
+                "null",
+                "any",
+            }
+            # Unknown strings such as "low" are example values and therefore
+            # express the string type rather than an unsupported descriptor.
+            if expected not in known_types:
+                expected = "string"
+
+            type_ok = {
+                "string": isinstance(value, str),
+                "array": isinstance(value, list),
+                "object": isinstance(value, dict),
+                "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+                "integer": isinstance(value, int) and not isinstance(value, bool),
+                "boolean": isinstance(value, bool),
+                "null": value is None,
+                "any": True,
+            }[expected]
+            return None if type_ok else f"{path} expected {expected}"
+
+        if schema is None:
+            return None if value is None else f"{path} expected null"
+
+        if isinstance(schema, bool):
+            return None if isinstance(value, bool) else f"{path} expected boolean"
+
+        if isinstance(schema, (int, float)):
+            valid_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+            return None if valid_number else f"{path} expected number"
+
+        if isinstance(schema, list):
+            if not isinstance(value, list):
+                return f"{path} expected array"
+            if not schema:
+                return None
+            for index, item in enumerate(value):
+                mismatch = cls._schema_mismatch(item, schema[0], f"{path}[{index}]")
+                if mismatch is not None:
+                    return mismatch
+            return None
+
+        if isinstance(schema, dict):
+            if not isinstance(value, dict):
+                return f"{path} expected object"
+            for key, child_schema in schema.items():
+                if key not in value:
+                    return f"{path}.{key} is required"
+                mismatch = cls._schema_mismatch(
+                    value[key],
+                    child_schema,
+                    f"{path}.{key}",
+                )
+                if mismatch is not None:
+                    return mismatch
+            return None
+
+        return f"{path} has unsupported schema descriptor {type(schema).__name__}"
 
     def _extract_json_from_text(self, text: str) -> Optional[dict[str, Any]]:
         """Attempt to extract JSON from text that may contain markdown fences.

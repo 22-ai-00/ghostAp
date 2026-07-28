@@ -135,6 +135,52 @@ class TestSchemaValidation(unittest.TestCase):
         valid, parsed = executor._validate_schema("not json at all", schema)
         self.assertFalse(valid)
 
+    def test_wrong_compact_schema_types_fail(self):
+        executor = self._make_executor()
+        schema = {
+            "summary": "string",
+            "findings": "array",
+            "score": "number",
+            "done": "boolean",
+        }
+        output = json.dumps({
+            "summary": "ok",
+            "findings": "not-an-array",
+            "score": True,
+            "done": 1,
+        })
+
+        valid, parsed = executor._validate_schema(output, schema)
+
+        self.assertFalse(valid)
+        self.assertIsNone(parsed)
+
+    def test_nested_exemplar_schema_validates_recursively(self):
+        executor = self._make_executor()
+        schema = {
+            "summary": "",
+            "metrics": {"count": 0, "complete": False},
+            "findings": [{"severity": "", "line": 0}],
+        }
+        valid_output = json.dumps({
+            "summary": "ok",
+            "metrics": {"count": 2, "complete": True},
+            "findings": [{"severity": "high", "line": 12}],
+        })
+        invalid_output = json.dumps({
+            "summary": "ok",
+            "metrics": {"count": "two", "complete": True},
+            "findings": [{"severity": "high", "line": "twelve"}],
+        })
+
+        valid, parsed = executor._validate_schema(valid_output, schema)
+        invalid, invalid_parsed = executor._validate_schema(invalid_output, schema)
+
+        self.assertTrue(valid)
+        self.assertIsNotNone(parsed)
+        self.assertFalse(invalid)
+        self.assertIsNone(invalid_parsed)
+
     def test_extract_json_from_markdown_fence(self):
         executor = self._make_executor()
         text = '```json\n{"key": "value"}\n```'
@@ -553,6 +599,9 @@ class TestRuntimeParallelConcurrency(unittest.TestCase):
         stop_exc: list[Exception] = []
         last_err_text = ""
         agent_count = 0
+        active_agent_count = 0
+        max_active_agent_count = 0
+        agent_count_lock = threading.Lock()
         try:
             proc = subprocess.Popen(
                 [node, "--experimental-vm-modules", runtime_path, script_path],
@@ -577,6 +626,7 @@ class TestRuntimeParallelConcurrency(unittest.TestCase):
 
             def reader() -> None:
                 nonlocal init_sent, last_err_text, agent_count
+                nonlocal active_agent_count, max_active_agent_count
                 try:
                     for raw in iter(proc.stdout.readline, ""):
                         line = raw.strip()
@@ -610,10 +660,17 @@ class TestRuntimeParallelConcurrency(unittest.TestCase):
                             last_err_text = json.dumps(params)
                             break
                         if method == "agent_call" and msg_id is not None:
-                            agent_count += 1
+                            with agent_count_lock:
+                                agent_count += 1
+                                active_agent_count += 1
+                                max_active_agent_count = max(
+                                    max_active_agent_count,
+                                    active_agent_count,
+                                )
                             duration = float(params.get("prompt") or 5.0)
 
                             def _reply(rid: Any, d: float) -> None:
+                                nonlocal active_agent_count
                                 time.sleep(d)
                                 write_line({
                                     "jsonrpc": "2.0",
@@ -624,6 +681,8 @@ class TestRuntimeParallelConcurrency(unittest.TestCase):
                                         "duration_s": d,
                                     },
                                 })
+                                with agent_count_lock:
+                                    active_agent_count -= 1
 
                             threading.Thread(
                                 target=_reply, args=(msg_id, duration),
@@ -655,7 +714,11 @@ class TestRuntimeParallelConcurrency(unittest.TestCase):
             return (
                 proc.returncode if proc.returncode is not None else -1,
                 last_err_text,
-                f"agent_calls={agent_count}\n" + (err_bytes or ""),
+                (
+                    f"agent_calls={agent_count}\n"
+                    f"max_active_agent_calls={max_active_agent_count}\n"
+                    + (err_bytes or "")
+                ),
             )
         finally:
             try:
@@ -721,6 +784,44 @@ class TestRuntimeParallelConcurrency(unittest.TestCase):
             f"4 parallel 2s calls with cap=2 took only {elapsed:.2f}s; "
             f"cap may not be honoured.",
         )
+
+    def test_pipeline_honours_item_concurrency_cap(self):
+        """pipeline keeps item-level map parallelism without unbounded fan-out."""
+        user_script = (
+            "export const meta = { name: 'pipeline-cap', description: 'pipeline-cap', "
+            "phases: [{title: 't', detail: 't'}], maxConcurrent: 2};\n"
+            "export async function run(args) {\n"
+            "  const items = ['0.2', '0.2', '0.2', '0.2'];\n"
+            "  const results = await pipeline(items, async p => agent(p));\n"
+            "  return { done: results.length };\n"
+            "}\n"
+        )
+
+        rc, _, diagnostics = self._run_script(user_script, max_concurrent=2)
+
+        self.assertEqual(rc, 0, f"runtime exited non-zero: {diagnostics}")
+        self.assertIn("agent_calls=4", diagnostics)
+        self.assertIn(
+            "max_active_agent_calls=2",
+            diagnostics,
+            f"pipeline exceeded item concurrency cap:\n{diagnostics}",
+        )
+
+    def test_schema_mismatch_does_not_repeat_whole_agent_call(self):
+        """Python owns schema retries; JS only performs a fail-closed check."""
+        user_script = (
+            "export const meta = { name: 'schema-once', description: 'schema-once', "
+            "phases: [{title: 't', detail: 't'}]};\n"
+            "export async function run(args) {\n"
+            "  return agent('0', { schema: { answer: 'string' } });\n"
+            "}\n"
+        )
+
+        rc, result, diagnostics = self._run_script(user_script, max_concurrent=2)
+
+        self.assertEqual(rc, 0, f"runtime exited non-zero: {diagnostics}")
+        self.assertIn("agent_calls=1", diagnostics)
+        self.assertIn("error", result.lower())
 
 
 def shutil_which(name):
@@ -865,8 +966,7 @@ if __name__ == "__main__":
 
 
 class TestPipelineSemantics(unittest.TestCase):
-    """Assert pipeline is documented as a parallel/map primitive and the
-    runtime uses Promise.all to fan out items."""
+    """Assert pipeline is a bounded parallel/map primitive."""
 
     RUNTIME_JS = "src/workflow_engine/runtime/runtime.js"
 
@@ -909,11 +1009,8 @@ class TestPipelineSemantics(unittest.TestCase):
             "pipeline section of prompt must mention 'map' (parallel/map semantics)",
         )
 
-    def test_pipeline_runtime_uses_promise_all_for_items(self):
-        """White-box check: the pipeline() function body must use
-        Promise.all over items, matching the documented parallel/map
-        semantics. This guards against accidental refactors that would
-        serialize items without updating the prompt."""
+    def test_pipeline_runtime_reuses_bounded_parallel_scheduler(self):
+        """pipeline must reuse parallel() so item fan-out honours the host cap."""
         import re
         text = self._runtime_text()
         # Locate the pipeline function definition...
@@ -935,11 +1032,30 @@ class TestPipelineSemantics(unittest.TestCase):
                     break
         self.assertIsNotNone(end, "could not find end of pipeline function")
         body = text[open_brace:end]
-        self.assertIn(
-            "Promise.all",
+        self.assertRegex(
             body,
-            "pipeline() body must use Promise.all for items-level concurrency",
+            r"await\s+parallel\s*\(",
+            "pipeline() must delegate item scheduling to bounded parallel()",
         )
+        self.assertNotIn(
+            "Promise.all(\n    items.map",
+            body,
+            "pipeline() must not eagerly create one promise per input item",
+        )
+
+    def test_prompt_requires_scope_first_pipeline_and_barrier_discipline(self):
+        from src.workflow_engine.script_gen import build_script_gen_prompt
+
+        prompt = build_script_gen_prompt(
+            requirement="analyze and update many files",
+            available_tools=["coco", "claude"],
+            orchestrator_agent="coco",
+        ).lower()
+
+        self.assertIn("scope first", prompt)
+        self.assertIn("pipeline-first", prompt)
+        self.assertIn("barrier", prompt)
+        self.assertIn("structured output", prompt)
 
     def test_sequence_helper_hinted_in_prompt(self):
         """The prompt should hint at sequence() / serialPipeline() so users

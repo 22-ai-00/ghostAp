@@ -119,7 +119,10 @@ _SCRIPT_GEN_PROMPT_TEMPLATE = """\
 
 目标是生成 Claude-style 动态 workflow：脚本本身负责按用户需求动态选择模式、拆分任务、处理失败并收敛，而不是把所有决策再次外包给一个慢速大 Agent。
 
-- 不要先派一个大而慢的 analysis agent；直接基于用户需求选择 classify/fanout/verify/loop/race 等模式并开始执行。
+- **Scope First**：不要先派一个大而慢的 analysis agent 包办完整工作。范围明确时直接形成有上限的 worklist；范围未知时先用一个轻量 scout Agent 发现并裁剪工作项，再展开执行。
+- **Pipeline-First**：同一批 work item 要经过相同的多个阶段时优先使用 `pipeline()`；它保持 item 内 stage 串行、item 间有界并行，避免手写无界 Promise fan-out。
+- **Barrier Discipline**：只有下游必须看到全部上游结果（去重、排名、交叉比较、全局汇总）时才使用 `parallel()`/`fanout()` 后的 barrier；否则让各 item 在 pipeline 中持续向后流动。
+- **Structured Output Contract**：跨节点传递的数据必须用紧凑 shape schema 约束。schema 失配是节点失败，必须检查 `result.error`，不得把未验证文本继续传给下游。
 - 直接基于用户需求选择 classify/fanout/verify/loop/race，不要生成固定两步 "Analysis -> Execution" 模板。
 - 每个 agent() label 必须唯一，例如 `analysis-router-1`、`impl-worker-2`、`verify-r1-security`；不要复用 task-analysis、analysis、worker 等通用 label。
 - 为每个 agent() 显式设置短超时：轻量分类/路由 60-90s，普通子任务 120-180s，只有确实需要长推理时才使用 300s。
@@ -160,7 +163,8 @@ const result = await agent(prompt, {{
   role: "architect",      // optional role/persona
   label: "task-label",    // required: unique label for tracking
   phase: "Phase Title",   // optional phase association
-  schema: {{ key: "string" }},  // optional output schema validation
+  // compact recursive shape contract; [] accepts any array, [{{...}}] validates every item
+  schema: {{ key: "string", findings: [{{ severity: "", line: 0 }}] }},
   timeout: 180,           // required: bound every direct agent call
 }});
 if (result && result.error) return {{ error: result.error, stage: "agent-call" }};
@@ -172,7 +176,7 @@ const [r1, r2, r3] = await parallel([
   () => agent("task 3", {{ tool: "aiden", label: "parallel-3", timeout: 120 }}),
 ]);
 
-// Parallel/map: items run concurrently, each flows through stages sequentially
+// Bounded parallel/map: items honour maxConcurrent; stages stay sequential per item
 const results = await pipeline(items, stage1Fn, stage2Fn, {{ continueOnFailure: true }});
 
 // Strict sequential execution (each step receives previous result)
@@ -319,6 +323,7 @@ const fastest = await race([
 6. **fanout → loop(verify)**: 并行处理后循环验证直到全部通过
 
 **选择模式的决策树：**
+- 同构 work item 经过相同多阶段？ → pipeline（默认首选）
 - 任务有多种类型？ → classify
 - 可拆为独立子问题？ → fanout
 - 需要高置信度？ → verify
@@ -328,7 +333,7 @@ const fastest = await race([
 
 ## Best Practices (MUST FOLLOW)
 
-1. **优先使用高阶模式** — 当任务匹配某个模式时，直接使用 classify/fanout/verify/generate/
+1. **优先使用 pipeline 或高阶模式** — 同构多阶段 worklist 优先 pipeline；当任务匹配某个模式时，直接使用 classify/fanout/verify/generate/
    tournament/loop，而非手写等价逻辑。模式内置了错误处理、重试和收敛检测。
 
 2. **Assign different tools to different roles/tasks** — Diversity of AI perspectives
@@ -500,7 +505,7 @@ Based on the user requirement above, generate a COMPLETE workflow script that:
 1. Selects the most appropriate pattern(s) for this specific task
 2. Leverages multiple tools for diversity and robustness
 3. Includes verification for critical outputs
-4. Maximizes parallelism where possible
+4. Uses bounded parallelism where dependencies allow it; never creates unbounded fan-out
 5. Uses clear phases and labels for observability
 6. Gives every direct agent() call and pattern descriptor a unique label and explicit timeout
 7. Checks `result.error` or uses try/catch before returning direct agent outputs
