@@ -21,6 +21,11 @@ _ERRMSG_RE = re.compile(r"ErrMsg:\s*([^;]+)")
 _EMAIL_ADDRESS_RE = re.compile(
     r"(?<![\w.+-])[\w.+-]+@(?:[\w-]+\.)+[A-Za-z]{2,}(?![\w.-])"
 )
+_FEISHU_IMAGE_KEY_RE = re.compile(
+    r"^img_[A-Za-z0-9][A-Za-z0-9_-]{0,255}$"
+)
+_MARKDOWN_LABEL_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f`*_{}\[\]<>]+")
+_MAX_MARKDOWN_IMAGE_LABEL_CHARS = 80
 
 
 def sanitize_card_text_for_audit(text: str) -> str:
@@ -28,6 +33,95 @@ def sanitize_card_text_for_audit(text: str) -> str:
     if not text:
         return text
     return _EMAIL_ADDRESS_RE.sub("[redacted:email]", text)
+
+
+def _bounded_plain_image_label(alt: str) -> str:
+    label = _MARKDOWN_LABEL_UNSAFE_RE.sub(" ", alt)
+    label = " ".join(label.split())
+    if len(label) > _MAX_MARKDOWN_IMAGE_LABEL_CHARS:
+        label = (
+            label[: _MAX_MARKDOWN_IMAGE_LABEL_CHARS - 1].rstrip()
+            + "…"
+        )
+    if not label:
+        return "（图片引用已移除）"
+    return f"（图片：{label}）"
+
+
+def sanitize_markdown_image_references(text: str) -> str:
+    """Neutralize local/remote Markdown image targets before CardKit sees them."""
+    if "![" not in text:
+        return text
+
+    output: list[str] = []
+    cursor = 0
+    while True:
+        start = text.find("![", cursor)
+        if start < 0:
+            output.append(text[cursor:])
+            break
+        output.append(text[cursor:start])
+        alt_end = text.find("](", start + 2)
+        if alt_end < 0:
+            output.append("！[")
+            cursor = start + 2
+            continue
+
+        depth = 1
+        escaped = False
+        target_end: int | None = None
+        index = alt_end + 2
+        while index < len(text):
+            char = text[index]
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    target_end = index
+                    break
+            index += 1
+
+        if target_end is None:
+            output.append("！[")
+            cursor = start + 2
+            continue
+
+        target = text[alt_end + 2 : target_end].strip()
+        if (
+            len(target) >= 2
+            and target.startswith("<")
+            and target.endswith(">")
+        ):
+            target = target[1:-1].strip()
+        if _FEISHU_IMAGE_KEY_RE.fullmatch(target):
+            output.append(text[start : target_end + 1])
+        else:
+            output.append(
+                _bounded_plain_image_label(text[start + 2 : alt_end])
+            )
+        cursor = target_end + 1
+    return "".join(output)
+
+
+def _sanitize_payload_markdown_images(node):
+    if isinstance(node, dict):
+        is_markdown = str(node.get("tag") or "").lower() == "markdown"
+        for key, value in list(node.items()):
+            if is_markdown and key == "content" and isinstance(value, str):
+                node[key] = sanitize_markdown_image_references(value)
+            else:
+                node[key] = _sanitize_payload_markdown_images(value)
+        return node
+    if isinstance(node, list):
+        for index, value in enumerate(node):
+            node[index] = _sanitize_payload_markdown_images(value)
+        return node
+    return node
 
 
 def _sanitize_payload_for_audit(node):
@@ -46,12 +140,14 @@ def _sanitize_payload_for_audit(node):
 
 def _guard_payload(card_payload: dict) -> dict:
     """Pre-flight guard: truncate payload if it exceeds Feishu limits (200 elements)."""
+    card_payload = _sanitize_payload_markdown_images(card_payload)
     card_payload = _sanitize_payload_for_audit(card_payload)
     raw = json.dumps(card_payload, ensure_ascii=False)
     guarded = check_and_truncate_payload(raw)
     if guarded is raw:
         return card_payload
-    return _sanitize_payload_for_audit(json.loads(guarded))
+    guarded_payload = _sanitize_payload_markdown_images(json.loads(guarded))
+    return _sanitize_payload_for_audit(guarded_payload)
 
 
 def _find_element_content(payload: dict, element_id: str | None) -> tuple[bool, str]:
@@ -347,7 +443,11 @@ class PageMutator:
 
         try:
             seq = self._sequences.next_sequence(page.card_id)
-            content = sanitize_card_text_for_audit(card.active_element.text)
+            content = sanitize_card_text_for_audit(
+                sanitize_markdown_image_references(
+                    card.active_element.text,
+                )
+            )
             self._client.update_element(
                 page.card_id,
                 card.active_element.element_id,
@@ -455,14 +555,16 @@ class PageMutator:
                 self._sequences.reset(page.card_id)
                 return MutationOutcome(kind="reconcile", message=f"recreate:{fallback_err.code}")
             logger.warning("Fallback card patch failed on %s: %s", page.card_id, str(fallback_err))
-            self._bindings.update_signature(session_id, page.page_index, card.structure_signature)
-            self._bindings.update_text(session_id, page.page_index, "card_content_invalid")
-            return MutationOutcome(kind="applied", message=f"fallback_suppressed:{fallback_err.code}")
+            return MutationOutcome(
+                kind="reconcile",
+                message=f"fallback_failed:{fallback_err.code}",
+            )
         except Exception as fallback_exc:
             logger.warning("Fallback card patch failed on %s: %s", page.card_id, str(fallback_exc))
-            self._bindings.update_signature(session_id, page.page_index, card.structure_signature)
-            self._bindings.update_text(session_id, page.page_index, "card_content_invalid")
-            return MutationOutcome(kind="applied", message="fallback_suppressed")
+            return MutationOutcome(
+                kind="reconcile",
+                message="fallback_failed",
+            )
 
     def _create_audit_rejected_fallback_page(
         self,
@@ -531,11 +633,13 @@ class PageMutator:
                 self._sequences.reset(page.card_id)
                 return MutationOutcome(kind="reconcile", message=f"recreate:{fallback_err.code}")
             logger.warning("Audit fallback card patch failed on %s: %s", page.card_id, str(fallback_err))
-            self._bindings.update_signature(session_id, page.page_index, card.structure_signature)
-            self._bindings.update_text(session_id, page.page_index, "card_audit_rejected")
-            return MutationOutcome(kind="applied", message=f"fallback_audit_suppressed:{fallback_err.code}")
+            return MutationOutcome(
+                kind="reconcile",
+                message=f"fallback_audit_failed:{fallback_err.code}",
+            )
         except Exception as fallback_exc:
             logger.warning("Audit fallback card patch failed on %s: %s", page.card_id, str(fallback_exc))
-            self._bindings.update_signature(session_id, page.page_index, card.structure_signature)
-            self._bindings.update_text(session_id, page.page_index, "card_audit_rejected")
-            return MutationOutcome(kind="applied", message="fallback_audit_suppressed")
+            return MutationOutcome(
+                kind="reconcile",
+                message="fallback_audit_failed",
+            )

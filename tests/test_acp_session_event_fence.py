@@ -1,13 +1,15 @@
 """Regression tests for per-prompt ACP event handler ownership."""
 
 import asyncio
+import base64
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from src.acp.client import GhostAPClient
-from src.acp.models import ACPEvent, ACPEventType
+from src.acp.models import ACPEvent, ACPEventType, ACPImageInfo
 from src.acp.session import ACPSession
 
 
@@ -115,3 +117,99 @@ def test_close_clears_handler_and_releases_active_image_snapshot(
     assert session._event_handler is None
     assert client._current_image_snapshot() is None
     assert snapshot.active is False
+
+
+def test_prompt_emits_changed_referenced_image_before_snapshot_release(
+    tmp_path: Path,
+) -> None:
+    """A final Markdown path must become an image event while attribution is live."""
+
+    image_path = tmp_path / "final-evidence.png"
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    client = GhostAPClient(
+        on_event=session._dispatch_event,
+        root_dir=str(tmp_path),
+    )
+    session._client = client
+
+    class ImageWritingConnection:
+        async def prompt(self, **_kwargs):
+            image_path.write_bytes(b"\x89PNG\r\n\x1a\nchanged-image")
+            session._dispatch_event(
+                _text_event(f"完成，证据见 ![result]({image_path})")
+            )
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = ImageWritingConnection()
+    session._session_id = "session-image"
+    observed: list[tuple[ACPEventType, bool]] = []
+
+    def receive(event: ACPEvent) -> None:
+        snapshot = client._current_image_snapshot()
+        observed.append(
+            (
+                event.event_type,
+                bool(snapshot is not None and snapshot.active),
+            )
+        )
+
+    result = asyncio.run(session.prompt("create evidence", on_event=receive))
+
+    image_events = [
+        snapshot_active
+        for event_type, snapshot_active in observed
+        if event_type is ACPEventType.IMAGE_CHUNK
+    ]
+    assert result.stop_reason == "end_turn"
+    assert image_events == [True]
+    assert client._current_image_snapshot() is None
+
+
+def test_prompt_does_not_repeat_image_already_emitted_by_tool_update(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "tool-evidence.png"
+    payload = b"\x89PNG\r\n\x1a\ntool-image"
+    image_id = f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    client = GhostAPClient(
+        on_event=session._dispatch_event,
+        root_dir=str(tmp_path),
+    )
+    session._client = client
+
+    class RepeatedImageConnection:
+        async def prompt(self, **_kwargs):
+            image_path.write_bytes(payload)
+            session._dispatch_event(
+                ACPEvent(
+                    event_type=ACPEventType.IMAGE_CHUNK,
+                    image=ACPImageInfo(
+                        image_id=image_id,
+                        mime_type="image/png",
+                        data=base64.b64encode(payload).decode("ascii"),
+                        source_uri=str(image_path),
+                    ),
+                )
+            )
+            session._dispatch_event(
+                _text_event(f"证据仍是 ![result]({image_path})")
+            )
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = RepeatedImageConnection()
+    session._session_id = "session-image-dedupe"
+    images: list[str] = []
+
+    asyncio.run(
+        session.prompt(
+            "create evidence",
+            on_event=lambda event: (
+                images.append(event.image.image_id)
+                if event.image is not None
+                else None
+            ),
+        )
+    )
+
+    assert images == [image_id]

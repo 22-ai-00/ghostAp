@@ -67,7 +67,7 @@ class TransportError(Exception):
                     return True
             except ValueError:
                 continue
-        return False
+        return "invalid image key" in text.lower()
 
     @property
     def is_audit_rejected(self) -> bool:

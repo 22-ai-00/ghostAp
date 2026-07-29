@@ -110,6 +110,10 @@ _BARE_IMAGE_PATH_RE = re.compile(
     r"""(?P<path>(?:file://[^\s`"'<>|]+|(?:/|\.\.?/)?[^\s`"'<>|]+\.(?:png|jpe?g|gif|webp|bmp)))""",
     re.IGNORECASE,
 )
+_MARKDOWN_IMAGE_TARGET_RE = re.compile(
+    r"""!\[[^\]\r\n]*\]\((?P<target>[^)\r\n]+)\)""",
+    re.IGNORECASE,
+)
 
 
 @dataclass(eq=False)
@@ -472,6 +476,16 @@ def _local_image_candidates(value: Any) -> list[str]:
         if not isinstance(current, str):
             continue
         text = current[:12_000]
+        for match in _MARKDOWN_IMAGE_TARGET_RE.finditer(text):
+            target = match.group("target").strip()
+            if target.startswith("<") and ">" in target:
+                target = target[1 : target.index(">")].strip()
+            elif any(char.isspace() for char in target):
+                target = target.split(maxsplit=1)[0]
+            if Path(unquote(urlparse(target).path or target)).suffix.casefold() in (
+                _IMAGE_FILE_SUFFIXES
+            ):
+                candidates.append(target)
         candidates.extend(
             match.group("path").strip()
             for match in _QUOTED_IMAGE_PATH_RE.finditer(text)

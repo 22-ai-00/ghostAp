@@ -19,7 +19,11 @@ from acp.stdio import spawn_agent_process
 from ..config import get_settings
 from ..utils.async_helpers import safe_wait_for
 from ..utils.errors import get_error_detail
-from .client import ACPHistoryStore, GhostAPClient
+from .client import (
+    ACPHistoryStore,
+    GhostAPClient,
+    emit_referenced_changed_local_image_events,
+)
 from .models import ACPEvent, ACPEventType, ACPSessionState, PromptResult
 
 logger = logging.getLogger(__name__)
@@ -380,6 +384,7 @@ class ACPSession:
 
         # Collector aggregates text/tool calls/plan/modified_files.
         collected_tool_calls: dict[str, Any] = {}
+        emitted_image_ids: set[str] = set()
         result = PromptResult(stop_reason="")
         last_event_monotonic = [time.monotonic()]
         image_snapshot: object = {}
@@ -408,6 +413,8 @@ class ACPSession:
                         for p in ev.tool_call.locations or []:
                             if p:
                                 result.add_modified_file(p)
+                elif ev.event_type == ACPEventType.IMAGE_CHUNK and ev.image:
+                    emitted_image_ids.add(ev.image.image_id)
                 elif ev.event_type == ACPEventType.PLAN_UPDATE:
                     result.set_plan(ev.plan)
             except Exception:
@@ -455,6 +462,29 @@ class ACPSession:
                     await asyncio.sleep(min(0.005, quiet_s - quiet_for))
             except Exception:
                 logger.debug("grace window wait failed", exc_info=True)
+
+            if self._client is not None:
+                try:
+                    def _emit_new_image(event: ACPEvent) -> None:
+                        if (
+                            event.image is not None
+                            and event.image.image_id in emitted_image_ids
+                        ):
+                            return
+                        _collector(event)
+
+                    emit_referenced_changed_local_image_events(
+                        self._cwd,
+                        image_snapshot,
+                        result.text,
+                        _emit_new_image,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[ACP:%s] changed image discovery failed",
+                        self._agent_cmd,
+                        exc_info=True,
+                    )
 
         finally:
             if self._client is not None:

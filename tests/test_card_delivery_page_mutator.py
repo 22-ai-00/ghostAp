@@ -475,7 +475,9 @@ class TestUpdatePage:
             calls[1]["card_json"]["body"]["elements"][0]["content"]
         )
 
-    def test_update_page_content_invalid_suppresses_repeated_bad_signature_when_fallback_fails(self):
+    def test_update_page_content_invalid_fallback_failure_keeps_binding_state(
+        self,
+    ):
         client = MockClient()
         bindings = BindingStore()
         sequences = SequenceManager()
@@ -503,13 +505,154 @@ class TestUpdatePage:
         card = _make_card(signature="bad_sig")
         outcome = mutator.update_page("sess_1", page, card)
 
-        assert outcome.kind == "applied"
-        assert outcome.message == "fallback_suppressed:230099"
+        assert outcome.kind == "reconcile"
+        assert outcome.message == "fallback_failed:230099"
         binding = bindings.get("sess_1")
         assert binding is not None
-        assert binding.pages[0].signature == "bad_sig"
-        assert binding.pages[0].last_text == "card_content_invalid"
+        assert binding.pages[0].signature == "old_sig"
+        assert binding.pages[0].last_text == "old_text"
         assert len(calls) == 2
+
+    def test_update_page_audit_fallback_failure_does_not_advance_binding(self):
+        client = MockClient()
+        bindings = BindingStore()
+        sequences = SequenceManager()
+        mutator = PageMutator(client, bindings, sequences)
+
+        bindings.create("sess_1", "chat_1")
+        bindings.set_page(
+            "sess_1",
+            0,
+            "msg_1",
+            "card_1",
+            "old_sig",
+            "old_text",
+        )
+        page = bindings.get("sess_1").pages[0]
+        calls = []
+
+        def update_card(card_id, card_json, *, sequence=0):
+            calls.append(
+                {
+                    "card_id": card_id,
+                    "card_json": card_json,
+                    "sequence": sequence,
+                }
+            )
+            if len(calls) == 1:
+                raise TransportError(
+                    "The messages do NOT pass the audit",
+                    code=230028,
+                )
+            raise TransportError("fallback transport unavailable", code=1)
+
+        client.update_card = update_card
+        outcome = mutator.update_page(
+            "sess_1",
+            page,
+            _make_card(signature="new_sig"),
+        )
+
+        assert outcome.kind == "reconcile"
+        assert outcome.message == "fallback_audit_failed:1"
+        binding = bindings.get("sess_1")
+        assert binding is not None
+        assert binding.pages[0].signature == "old_sig"
+        assert binding.pages[0].last_text == "old_text"
+        assert len(calls) == 2
+
+    def test_update_page_sanitizes_only_markdown_image_references(self):
+        client = MockClient()
+        bindings = BindingStore()
+        sequences = SequenceManager()
+        mutator = PageMutator(client, bindings, sequences)
+        bindings.create("sess_1", "chat_1")
+        bindings.set_page(
+            "sess_1",
+            0,
+            "msg_1",
+            "card_1",
+            "old_sig",
+            "old_text",
+        )
+        page = bindings.get("sess_1").pages[0]
+        long_alt = "evidence" * 100
+        content = (
+            f"before ![{long_alt}](/tmp/private/final.png) "
+            "valid ![uploaded](img_v3_evidence)"
+        )
+        native_image = {
+            "tag": "img",
+            "img_key": "img_v3_native",
+            "alt": {"tag": "plain_text", "content": "native"},
+        }
+        card = RenderedCard(
+            _card_json={
+                "body": {
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "element_id": "el_1",
+                            "content": content,
+                        },
+                        native_image,
+                    ]
+                }
+            },
+            structure_signature="new_sig",
+            page_index=0,
+            total_pages=1,
+            active_element=ActiveElement(element_id="el_1", text=content),
+        )
+
+        outcome = mutator.update_page("sess_1", page, card)
+
+        assert outcome.kind == "applied"
+        sent = client.updates[0]["card_json"]["body"]["elements"]
+        safe_markdown = sent[0]["content"]
+        assert "/tmp/private/final.png" not in safe_markdown
+        assert "![uploaded](img_v3_evidence)" in safe_markdown
+        assert len(safe_markdown) < 300
+        assert sent[1] == native_image
+
+    def test_stream_element_sanitizes_invalid_markdown_image_reference(self):
+        client = MockClient()
+        bindings = BindingStore()
+        sequences = SequenceManager()
+        mutator = PageMutator(client, bindings, sequences)
+        bindings.create("sess_1", "chat_1")
+        bindings.set_page(
+            "sess_1",
+            0,
+            "msg_1",
+            "card_1",
+            "sig",
+            "old_text",
+        )
+        page = bindings.get("sess_1").pages[0]
+        text = (
+            "done ![local](/tmp/private.png) "
+            "![uploaded](img_v3_uploaded)"
+        )
+
+        outcome = mutator.stream_element(
+            "sess_1",
+            page,
+            _make_card(text=text),
+        )
+
+        assert outcome.kind == "applied"
+        sent = client.elements[0]["content"]
+        assert "/tmp/private.png" not in sent
+        assert "![uploaded](img_v3_uploaded)" in sent
+
+    def test_invalid_image_key_message_is_content_invalid_without_code(self):
+        error = TransportError(
+            "card contains invalid image keys: /tmp/private.png",
+            code=0,
+        )
+
+        assert error.is_content_invalid is True
 
     def test_update_page_audit_rejection_patches_safe_fallback(self):
         """Audit rejection is permanent for the raw payload; patch a safe terminal fallback."""
