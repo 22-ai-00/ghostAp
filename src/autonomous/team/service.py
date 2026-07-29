@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -178,6 +179,8 @@ class TeamBackend(Protocol):
         result: str,
         *,
         idempotency_key: str = "",
+        tenant_key: str = "",
+        requester_principal_id: str = "",
     ) -> None: ...
 
     def submit_direct(
@@ -554,7 +557,7 @@ class EmployeeTeamService:
                     return
                 self._commit_effect(state.run_id, "notify", "prepared")
                 self._commit_effect(state.run_id, "notify", "executing")
-                self._backend.notify(state.message_id, state.chat_id, synthesis.output)
+                self._notify(state, synthesis.output)
                 self._commit_effect(state.run_id, "notify", "committed")
                 self._commit(
                     JournalEvent(
@@ -745,7 +748,7 @@ class EmployeeTeamService:
                 try:
                     self._commit_effect(notify_aggregate, "notify", "prepared")
                     self._commit_effect(notify_aggregate, "notify", "executing")
-                    self._backend.notify(state.message_id, state.chat_id, failure_notice)
+                    self._notify(state, failure_notice)
                     self._commit_effect(notify_aggregate, "notify", "committed")
                 except Exception:
                     self._commit_effect(notify_aggregate, "notify", "action_required")
@@ -756,6 +759,32 @@ class EmployeeTeamService:
                     payload={"error_code": error_code},
                 )
             )
+
+    def _notify(self, state: TeamRunState, result: str) -> None:
+        notify = self._backend.notify
+        try:
+            parameters = tuple(inspect.signature(notify).parameters.values())
+        except (TypeError, ValueError):
+            supports_recipient_scope = False
+        else:
+            supports_recipient_scope = all(
+                any(
+                    parameter.name == name
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+                for name in ("tenant_key", "requester_principal_id")
+            )
+        if supports_recipient_scope:
+            notify(
+                state.message_id,
+                state.chat_id,
+                result,
+                tenant_key=state.tenant_key,
+                requester_principal_id=state.requester_principal_id,
+            )
+            return
+        notify(state.message_id, state.chat_id, result)
 
     def _commit_effect(self, aggregate_id: str, effect_type: str, state: str) -> None:
         self._commit(

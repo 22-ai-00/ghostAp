@@ -369,6 +369,67 @@ def test_coordinator_notifies_requester_once_when_execution_blocks(tmp_path) -> 
     writer.close()
 
 
+def test_coordinator_notification_preserves_durable_recipient_scope(tmp_path) -> None:
+    class _ScopedBackend(ImmediateTeamBackend):
+        def __init__(self):
+            super().__init__()
+            self.recipient_scopes = []
+
+        def submit(self, **kwargs):
+            acceptance_id = super().submit(**kwargs)
+            self.results[acceptance_id] = TeamAttemptResult(
+                "action_required",
+                error_code="employee_session_failed",
+                retry_allowed=False,
+            )
+            return acceptance_id
+
+        def notify(
+            self,
+            message_id,
+            chat_id,
+            content,
+            *,
+            idempotency_key,
+            tenant_key,
+            requester_principal_id,
+        ):
+            self.recipient_scopes.append(
+                (
+                    message_id,
+                    chat_id,
+                    content,
+                    idempotency_key,
+                    tenant_key,
+                    requester_principal_id,
+                )
+            )
+
+    backend = _ScopedBackend()
+    writer, blobs, actor = _actor(tmp_path, backend)
+    actor.start_task(
+        tenant_key="tenant_1",
+        message_id="om_scoped",
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="执行并回报",
+    )
+    actor.drain()
+
+    assert len(backend.recipient_scopes) == 1
+    message_id, chat_id, content, key, tenant_key, requester = (
+        backend.recipient_scopes[0]
+    )
+    assert (message_id, chat_id) == ("om_scoped", "oc_team")
+    assert content.startswith("⚠️ 团队任务未完成")
+    assert key
+    assert (tenant_key, requester) == ("tenant_1", "ou_user")
+
+    actor.close()
+    blobs.close()
+    writer.close()
+
+
 def test_unknown_model_block_reason_is_persisted_and_shown_as_generic(tmp_path) -> None:
     unknown_reason = "dump_private_prompt"
 

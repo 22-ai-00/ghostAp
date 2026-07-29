@@ -1591,6 +1591,37 @@ def test_runtime_recovers_team_before_it_can_start_dispatch(
     runtime.close()
 
 
+def test_runtime_composition_can_defer_all_recovery_until_notifier_is_ready(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    recoveries: list[str] = []
+    original_recover = EmployeeDepartmentRuntime.recover
+
+    def recover_runtime(runtime):
+        recoveries.append("recover")
+        return original_recover(runtime)
+
+    monkeypatch.setattr(EmployeeDepartmentRuntime, "recover", recover_runtime)
+    runtime = _runtime(
+        _settings(tmp_path, limit=1, context_configured=True),
+        release_evidence_ready=True,
+        registrar=_Registrar(),
+        channel_supervisor=_Channels(),
+        slash_reconciler_factory=lambda _app_id, _secret: _Slash(),
+        notification_link=lambda *_: None,
+        team_notification=lambda *_: None,
+        context_source_factory=_ContextSourceFactory(),
+        group_memory_backend=_GroupMemory(),
+        recover_immediately=False,
+    )
+
+    assert recoveries == []
+    runtime.recover()
+    assert recoveries == ["recover"]
+    runtime.close()
+
+
 def _persist_queued_team_assignment_then_crash(root: str, pipe) -> None:
     """Subprocess half of the restart E2E; deliberately skips runtime.close()."""
 
@@ -3608,6 +3639,415 @@ def test_team_notification_internal_type_error_is_not_retried_without_key() -> N
         )
 
     assert attempts == ["stable-key"]
+
+
+def test_team_notification_forwards_durable_recipient_scope() -> None:
+    notifications: list[tuple[str, str, str, str, str, str]] = []
+
+    def notify(
+        message_id: str,
+        chat_id: str,
+        result: str,
+        *,
+        idempotency_key: str,
+        tenant_key: str,
+        requester_principal_id: str,
+    ) -> None:
+        notifications.append(
+            (
+                message_id,
+                chat_id,
+                result,
+                idempotency_key,
+                tenant_key,
+                requester_principal_id,
+            )
+        )
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert notifications == [
+        (
+            "om_1",
+            "oc_team",
+            "result",
+            "stable-key",
+            "tenant-a",
+            "ou_requester",
+        )
+    ]
+
+
+def test_team_notification_retries_scope_without_optional_idempotency_key() -> None:
+    notifications: list[tuple[str, str]] = []
+
+    def notify(
+        _message_id: str,
+        _chat_id: str,
+        _result: str,
+        *,
+        tenant_key: str,
+        requester_principal_id: str,
+    ) -> None:
+        notifications.append((tenant_key, requester_principal_id))
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert notifications == [("tenant-a", "ou_requester")]
+
+
+def test_team_notification_supports_legacy_fourth_key_with_scoped_kwargs() -> None:
+    notifications: list[tuple[str, str, str]] = []
+
+    def notify(
+        _message_id: str,
+        _chat_id: str,
+        _result: str,
+        stable_uuid: str,
+        *,
+        tenant_key: str,
+        requester_principal_id: str,
+    ) -> None:
+        notifications.append(
+            (stable_uuid, tenant_key, requester_principal_id)
+        )
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert notifications == [
+        ("stable-key", "tenant-a", "ou_requester")
+    ]
+
+
+def test_team_notification_prefers_legacy_fourth_key_over_catch_all_kwargs() -> None:
+    notifications: list[tuple[str, str, str]] = []
+
+    def notify(
+        _message_id: str,
+        _chat_id: str,
+        _result: str,
+        stable_uuid: str = "",
+        **kwargs: str,
+    ) -> None:
+        notifications.append(
+            (
+                stable_uuid,
+                kwargs["tenant_key"],
+                kwargs["requester_principal_id"],
+            )
+        )
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert notifications == [
+        ("stable-key", "tenant-a", "ou_requester")
+    ]
+
+
+def test_team_notification_preserves_legacy_fourth_positional_parameter() -> None:
+    attempts: list[str] = []
+
+    def notify(_message_id, _chat_id, _result, stable_uuid) -> None:
+        attempts.append(stable_uuid)
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert attempts == ["stable-key"]
+
+
+def test_team_notification_supports_positional_only_recipient_scope() -> None:
+    attempts: list[tuple[str, str, str]] = []
+
+    def notify(
+        _message_id,
+        _chat_id,
+        _result,
+        stable_uuid,
+        tenant,
+        requester,
+        /,
+    ) -> None:
+        attempts.append((stable_uuid, tenant, requester))
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert attempts == [("stable-key", "tenant-a", "ou_requester")]
+
+
+def test_team_notification_preserves_three_argument_callback() -> None:
+    attempts: list[tuple[str, str, str]] = []
+    backend = _RuntimeTeamBackend(
+        SimpleNamespace(),
+        lambda message_id, chat_id, result: attempts.append(
+            (message_id, chat_id, result)
+        ),
+    )
+
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert attempts == [("om_1", "oc_team", "result")]
+
+
+def test_team_notification_preserves_opaque_callback_four_arg_shape() -> None:
+    class _OpaqueNotify:
+        @property
+        def __signature__(self):
+            raise ValueError("opaque")
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[object, ...]] = []
+
+        def __call__(self, *args: object) -> None:
+            self.calls.append(args)
+
+    notify = _OpaqueNotify()
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert notify.calls == [("om_1", "oc_team", "result", "stable-key")]
+
+
+@pytest.mark.parametrize(
+    ("transport_success", "expected_effect_state"),
+    (
+        (True, "committed"),
+        (False, "action_required"),
+    ),
+)
+def test_recovered_team_notification_crosses_main_bot_audit_boundary_once(
+    tmp_path: Path,
+    transport_success: bool,
+    expected_effect_state: str,
+) -> None:
+    from src.autonomous.team import (
+        TeamAttemptResult,
+        TeamCoordinatorActor,
+        TeamRunPhase,
+    )
+    from src.feishu.handlers.base import BaseHandler
+    from src.feishu.ws_client import FeishuWSClient
+    from src.project.mapper import MessageLinker
+    from src.thread.manager import get_current_tenant_key
+    from tests.autonomous.team_helpers import (
+        ImmediateTeamBackend,
+        make_team_storage,
+    )
+
+    class _InitialFailureBackend(ImmediateTeamBackend):
+        def submit(self, **kwargs):
+            acceptance_id = super().submit(**kwargs)
+            self.results[acceptance_id] = TeamAttemptResult(
+                "action_required",
+                error_code="employee_session_failed",
+                retry_allowed=False,
+            )
+            return acceptance_id
+
+        def notify(
+            self,
+            _message_id,
+            _chat_id,
+            _content,
+            *,
+            idempotency_key,
+        ) -> None:
+            assert idempotency_key
+            raise RuntimeError("initial notification transport unavailable")
+
+    writer, blobs = make_team_storage(tmp_path / "team")
+    first_actor = TeamCoordinatorActor(
+        writer=writer,
+        blob_store=blobs,
+        active_key_id="team-key",
+        backend=_InitialFailureBackend(),
+        poll_seconds=0.001,
+    )
+    run = first_actor.start_task(
+        tenant_key="tenant_1",
+        message_id="om_recovered_team",
+        chat_id="oc_team",
+        requester_principal_id="ou_requester",
+        task="恢复后向请求者汇报",
+    )
+    first_actor.drain()
+    first_projection = first_actor.projection()
+    assert first_projection.runs[run.run_id].phase is TeamRunPhase.BLOCKED
+    assert (
+        first_projection.effects[
+            (f"{run.run_id}:blocked-notify:1", "notify")
+        ]
+        == "action_required"
+    )
+    first_actor.close()
+
+    audit = MainBotSendAuditLog.open(
+        tmp_path / "main-bot-audit",
+        anchor_path=tmp_path / "main-bot-audit.anchor",
+        hmac_key=b"a" * 32,
+    )
+    linker = MessageLinker()
+    transport_calls: list[object] = []
+    transport_tenants: list[str | None] = []
+
+    def reply(request):
+        transport_calls.append(request)
+        transport_tenants.append(get_current_tenant_key())
+        return SimpleNamespace(
+            success=lambda: transport_success,
+            code=0 if transport_success else 230001,
+            msg="" if transport_success else "reply rejected",
+            data=(
+                SimpleNamespace(message_id="om_team_result")
+                if transport_success
+                else None
+            ),
+        )
+
+    api_client = SimpleNamespace(
+        im=SimpleNamespace(
+            v1=SimpleNamespace(
+                message=SimpleNamespace(reply=reply),
+            )
+        )
+    )
+    handler = BaseHandler(
+        SimpleNamespace(
+            api_client_factory=lambda: api_client,
+            settings=SimpleNamespace(
+                default_reply_mode="message",
+                im_api_max_retries=1,
+                ref_note_enabled=False,
+            ),
+            main_bot_outbound_audit=audit.record_attempt,
+            main_bot_outbound_audit_failure=audit.mark_incomplete,
+            tenant_key_resolver=get_current_tenant_key,
+            message_linker=linker,
+        )
+    )
+    client = FeishuWSClient.__new__(FeishuWSClient)
+    client._message_linker = linker
+    client._get_chat_mode = lambda _chat_id: "group"
+    client._reply_text = handler.reply_text
+    recovered_backend = _RuntimeTeamBackend(
+        SimpleNamespace(),
+        client._reply_employee_team_message,
+    )
+    reopened_actor = TeamCoordinatorActor(
+        writer=writer,
+        blob_store=blobs,
+        active_key_id="team-key",
+        backend=recovered_backend,
+        poll_seconds=0.001,
+    )
+
+    try:
+        assert reopened_actor.recover() == 1
+        reopened_actor.drain()
+
+        projection = reopened_actor.projection()
+        assert (
+            projection.effects[
+                (f"{run.run_id}:blocked-notify:2", "notify")
+            ]
+            == expected_effect_state
+        )
+        assert len(transport_calls) == 1
+        assert transport_tenants == ["tenant_1"]
+        assert get_current_tenant_key() is None
+
+        origin = linker.query("om_recovered_team")
+        assert origin is not None
+        assert origin["chat_id"] == "oc_team"
+        assert origin["sender_id"] == "ou_requester"
+        assert origin["tenant_key"] == "tenant_1"
+
+        upper_bound = time.time() + 1
+        assert audit.count_target_attempts(
+            "tenant_1",
+            hashlib.sha256(b"om_recovered_team").hexdigest(),
+            0,
+            upper_bound,
+        ) == 1
+        assert audit.count_target_attempts(
+            "tenant_1",
+            hashlib.sha256(b"oc_team").hexdigest(),
+            0,
+            upper_bound,
+        ) == 1
+        if not transport_success:
+            assert all(
+                state != "committed"
+                for (aggregate, effect_type), state in projection.effects.items()
+                if aggregate.startswith(f"{run.run_id}:blocked-notify:")
+                and effect_type == "notify"
+            )
+    finally:
+        reopened_actor.close()
+        audit.close()
+        blobs.close()
+        writer.close()
 
 
 def test_channel_monitor_stops_before_submit_when_close_starts_during_revalidation(

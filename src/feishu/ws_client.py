@@ -222,7 +222,22 @@ class FeishuWSClient:
     - `close()` 提供 best-effort 资源回收（线程/缓存/调度器等）。
     """
 
-    def __init__(self, message_callback: Callable[[str, str, str, Optional[str]], None]):
+    def __init__(
+        self,
+        message_callback: Callable[[str, str, str, Optional[str]], None],
+    ):
+        self._employee_department_runtime = None
+        self._employee_runtime_init_cleanup_done = False
+        try:
+            self._initialize(message_callback)
+        except BaseException:
+            self._close_employee_runtime_after_initialization_failure()
+            raise
+
+    def _initialize(
+        self,
+        message_callback: Callable[[str, str, str, Optional[str]], None],
+    ) -> None:
         self.settings = get_settings()
         self.message_callback = message_callback
         self._client: Optional[ObservedLarkWSClient] = None
@@ -394,12 +409,21 @@ class FeishuWSClient:
                 ),
                 notification_status=self._reply_employee_hire_status,
                 team_notification=(
-                    lambda message_id, _chat_id, result, idempotency_key="": self._reply_text(
+                    lambda message_id,
+                    chat_id,
+                    result,
+                    idempotency_key="",
+                    tenant_key="",
+                    requester_principal_id="": self._reply_employee_team_message(
                         message_id,
+                        chat_id,
                         result,
+                        tenant_key=tenant_key,
+                        requester_principal_id=requester_principal_id,
                         idempotency_key=idempotency_key or None,
                     )
                 ),
+                recover_immediately=False,
             )
         except Exception as exc:
             logger.error(
@@ -643,6 +667,7 @@ class FeishuWSClient:
         # Bind forwarding methods directly on instance (replaces __getattr__ dispatch)
         from .router import bind_forwarding_methods
         bind_forwarding_methods(self, self._handler_ctx)
+        self._recover_employee_runtime_after_handler_binding()
 
         # ------------------------------------------------------------------
         # Control-plane (deferred /exit, system command gate)
@@ -669,6 +694,39 @@ class FeishuWSClient:
 
         # Configure trace logging
         configure_logging_with_trace()
+
+    def _recover_employee_runtime_after_handler_binding(self) -> None:
+        """Start durable recovery only after the main-Bot reply path exists."""
+
+        runtime = self._employee_department_runtime
+        if runtime is None:
+            return
+        try:
+            if not callable(getattr(self, "_reply_text", None)):
+                raise RuntimeError("main Bot reply transport is not bound")
+            runtime.recover()
+        except Exception:
+            self._close_employee_runtime_after_initialization_failure()
+            raise
+
+    def _close_employee_runtime_after_initialization_failure(self) -> None:
+        """Close a composed runtime once without masking the init failure."""
+
+        runtime = getattr(self, "_employee_department_runtime", None)
+        if runtime is None or getattr(
+            self,
+            "_employee_runtime_init_cleanup_done",
+            False,
+        ):
+            return
+        self._employee_runtime_init_cleanup_done = True
+        try:
+            runtime.close()
+        except BaseException:
+            logger.error(
+                "Employee Department cleanup failed after initialization error",
+                exc_info=True,
+            )
 
     def _register_action(self, handler: Callable, exact: Optional[str] = None, prefix: Optional[str] = None):
         """Register a card action handler."""
@@ -2407,6 +2465,51 @@ class FeishuWSClient:
         finally:
             set_current_tenant_key(previous_tenant_key)
 
+    def _reply_employee_team_message(
+        self,
+        message_id: str,
+        chat_id: str,
+        text: str,
+        *,
+        tenant_key: str,
+        requester_principal_id: str,
+        idempotency_key: str | None = None,
+    ) -> object | None:
+        """Restore durable Team Run requester scope before a recovered reply."""
+
+        if not all(
+            isinstance(value, str) and bool(value)
+            for value in (
+                message_id,
+                chat_id,
+                tenant_key,
+                requester_principal_id,
+            )
+        ):
+            logger.warning("employee team notification recipient scope is unavailable")
+            raise RuntimeError("employee team notification recipient scope is unavailable")
+        if not self._restore_durable_message_origin(
+            message_id=message_id,
+            chat_id=chat_id,
+            sender_id=requester_principal_id,
+            tenant_key=tenant_key,
+        ):
+            logger.warning("employee team notification recipient scope is unavailable")
+            raise RuntimeError("employee team notification recipient scope is unavailable")
+        previous_tenant_key = get_current_tenant_key()
+        set_current_tenant_key(tenant_key)
+        try:
+            reply_id = self._reply_text(
+                message_id,
+                text,
+                idempotency_key=idempotency_key,
+            )
+            if not reply_id:
+                raise RuntimeError("employee team notification delivery failed")
+            return reply_id
+        finally:
+            set_current_tenant_key(previous_tenant_key)
+
     def _restore_employee_hire_origin(self, state: object) -> bool:
         message_id = getattr(state, "message_id", "")
         chat_id = getattr(state, "chat_id", "")
@@ -2417,39 +2520,49 @@ class FeishuWSClient:
             for value in (message_id, chat_id, sender_id)
         ) or not isinstance(tenant_key, str):
             return False
+        return self._restore_durable_message_origin(
+            message_id=message_id,
+            chat_id=chat_id,
+            sender_id=sender_id,
+            tenant_key=tenant_key,
+        )
+
+    def _restore_durable_message_origin(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        sender_id: str,
+        tenant_key: str,
+    ) -> bool:
+        """Rebuild trusted in-memory provenance from anchored durable facts."""
+
         try:
             origin = self._message_linker.query(message_id)
         except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
             return False
         if origin is not None:
-            if (
-                origin.get("origin_message_id") != message_id
-                or origin.get("chat_id") != chat_id
-                or origin.get("sender_id") != sender_id
-                or origin.get("chat_type") not in {"p2p", "group", "topic_group"}
-                or origin.get("tenant_key") not in {None, "", tenant_key}
-            ):
+            chat_type = origin.get("chat_type")
+            if chat_type not in {"p2p", "group", "topic_group"}:
                 return False
         else:
             chat_mode = self._get_chat_mode(chat_id)
             if chat_mode is None:
                 return False
-            try:
-                registered = self._message_linker.register_trusted_origin_if_absent(
+            chat_type = "topic_group" if chat_mode == "topic" else chat_mode
+        try:
+            return (
+                self._message_linker.register_trusted_origin_with_tenant(
                     message_id,
                     chat_id=chat_id,
                     sender_id=sender_id,
-                    chat_type="topic_group" if chat_mode == "topic" else chat_mode,
+                    chat_type=chat_type,
+                    tenant_key=tenant_key,
                 )
-            except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
-                return False
-            if registered is not True:
-                return False
-        try:
-            self._message_linker.register_origin(message_id, tenant_key=tenant_key)
+                is True
+            )
         except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
             return False
-        return True
 
     def _get_chat_mode(self, chat_id: str) -> str | None:
         """Read structural chat mode from the official Chat API.

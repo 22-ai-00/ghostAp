@@ -907,25 +907,38 @@ class TeamCoordinatorActor:
         ).hexdigest()[:50]
         notify = self._backend.notify
         try:
-            parameters = inspect.signature(notify).parameters.values()
+            parameters = tuple(inspect.signature(notify).parameters.values())
         except (TypeError, ValueError):
             supports_idempotency = True
+            supports_recipient_scope = False
         else:
             supports_idempotency = any(
                 parameter.name == "idempotency_key"
                 or parameter.kind is inspect.Parameter.VAR_KEYWORD
                 for parameter in parameters
             )
-        if supports_idempotency:
-            notify(
-                run.message_id,
-                run.chat_id,
-                output,
-                idempotency_key=idempotency_key,
+            supports_recipient_scope = all(
+                any(
+                    parameter.name == name
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
+                for name in ("tenant_key", "requester_principal_id")
             )
+        kwargs = {}
+        if supports_idempotency:
+            kwargs["idempotency_key"] = idempotency_key
+        if supports_recipient_scope:
+            kwargs.update(
+                tenant_key=run.tenant_key,
+                requester_principal_id=run.requester_principal_id,
+            )
+        if kwargs:
+            notify(run.message_id, run.chat_id, output, **kwargs)
         else:
             # Compatibility-only backends predate the idempotent notify port.
-            # Production coordinator composition always accepts this key.
+            # Production coordinator composition accepts the key and durable
+            # recipient scope.
             self._backend.notify(run.message_id, run.chat_id, output)
 
     def _block(self, run_id: str, error_code: str) -> None:

@@ -357,6 +357,56 @@ def test_v1_team_run_uses_fixed_analysis_review_synthesis_pipeline(tmp_path) -> 
     writer.close()
 
 
+def test_v1_team_notification_preserves_durable_recipient_scope(tmp_path) -> None:
+    class _ScopedBackend(_Backend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recipient_scopes: list[tuple[str, str]] = []
+
+        def notify(
+            self,
+            message_id: str,
+            chat_id: str,
+            result: str,
+            *,
+            tenant_key: str,
+            requester_principal_id: str,
+        ) -> None:
+            self.recipient_scopes.append(
+                (tenant_key, requester_principal_id)
+            )
+            super().notify(message_id, chat_id, result)
+
+    writer = make_writer(tmp_path)
+    backend = _ScopedBackend()
+    service = EmployeeTeamService(
+        writer=writer,
+        backend=backend,
+        runtime_mode="legacy_pipeline",
+        attempt_timeout_seconds=1,
+        poll_seconds=0.001,
+    )
+
+    admitted = service.start_task(
+        tenant_key="tenant_1",
+        message_id="om_scoped_v1",
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="修复后回报",
+    )
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        state = service.get_run(admitted.run_id)
+        if state is not None and state.status != "running":
+            break
+        time.sleep(0.01)
+
+    assert state is not None and state.status == "completed"
+    assert backend.recipient_scopes == [("tenant_1", "ou_user")]
+    service.close()
+    writer.close()
+
+
 def test_restart_marks_unfinished_run_action_required(tmp_path) -> None:
     writer = make_writer(tmp_path)
     backend = _Backend()

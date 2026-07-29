@@ -606,21 +606,91 @@ class _RuntimeTeamBackend:
         result: str,
         *,
         idempotency_key: str = "",
+        tenant_key: str = "",
+        requester_principal_id: str = "",
     ) -> None:
+        try:
+            signature = inspect.signature(self._notify)
+        except (TypeError, ValueError):
+            if idempotency_key:
+                self._notify(message_id, chat_id, result, idempotency_key)
+                return
+            self._notify(message_id, chat_id, result)
+            return
+
+        base_args = (message_id, chat_id, result)
+        candidates: list[tuple[tuple[object, ...], dict[str, str]]] = []
+        fixed_positional = tuple(
+            parameter
+            for parameter in signature.parameters.values()
+            if parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+        )
+        explicit_idempotency_parameter = signature.parameters.get(
+            "idempotency_key"
+        )
+        prefer_legacy_positional_key = (
+            idempotency_key
+            and len(fixed_positional) >= 4
+            and explicit_idempotency_parameter is None
+        )
+        if tenant_key and requester_principal_id:
+            scoped_kwargs = {
+                "tenant_key": tenant_key,
+                "requester_principal_id": requester_principal_id,
+            }
+            if idempotency_key:
+                if prefer_legacy_positional_key:
+                    candidates.append(
+                        ((*base_args, idempotency_key), scoped_kwargs)
+                    )
+                candidates.extend(
+                    (
+                        (
+                            base_args,
+                            {
+                                **scoped_kwargs,
+                                "idempotency_key": idempotency_key,
+                            },
+                        ),
+                    )
+                )
+                if not prefer_legacy_positional_key:
+                    candidates.append(
+                        ((*base_args, idempotency_key), scoped_kwargs)
+                    )
+            candidates.append((base_args, scoped_kwargs))
+            if len(fixed_positional) >= 6:
+                candidates.append(
+                    (
+                        (
+                            *base_args,
+                            idempotency_key,
+                            tenant_key,
+                            requester_principal_id,
+                        ),
+                        {},
+                    )
+                )
         if idempotency_key:
+            candidates.extend(
+                (
+                    (base_args, {"idempotency_key": idempotency_key}),
+                    ((*base_args, idempotency_key), {}),
+                )
+            )
+        candidates.append((base_args, {}))
+        for args, kwargs in candidates:
             try:
-                signature = inspect.signature(self._notify)
-            except (TypeError, ValueError):
-                self._notify(message_id, chat_id, result, idempotency_key)
-                return
-            try:
-                signature.bind(message_id, chat_id, result, idempotency_key)
+                signature.bind(*args, **kwargs)
             except TypeError:
-                pass
-            else:
-                self._notify(message_id, chat_id, result, idempotency_key)
-                return
-        self._notify(message_id, chat_id, result)
+                continue
+            self._notify(*args, **kwargs)
+            return
+        raise TypeError("unsupported employee team notification callback signature")
 
 
 class _SlashReconciler(Protocol):
@@ -742,6 +812,7 @@ class EmployeeDepartmentRuntime:
         employee_environment_provider: EmployeeEnvironmentProvider | None = None,
         membership_health: Any = None,
         manager_client_factory: Callable[[], Any] | None = None,
+        recover_immediately: bool = True,
     ) -> EmployeeDepartmentRuntime:
         limit = getattr(settings, "autonomous_visible_employee_limit", 0)
         if limit == 0:
@@ -934,7 +1005,8 @@ class EmployeeDepartmentRuntime:
                     ),
                     coordinator_decision_provider=decision_provider,
                 )
-            runtime.recover()
+            if recover_immediately:
+                runtime.recover()
             return runtime
         except Exception as exc:
             logger.error(

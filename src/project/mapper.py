@@ -180,6 +180,67 @@ class MessageLinker:
             self._cleanup_unlocked(now)
             return True
 
+    def register_trusted_origin_with_tenant(
+        self,
+        origin_message_id: str,
+        *,
+        chat_id: str,
+        sender_id: str,
+        chat_type: str,
+        tenant_key: str,
+    ) -> bool:
+        """Atomically validate trusted coordinates and attach their tenant."""
+
+        if not all(
+            isinstance(value, str) and bool(value)
+            for value in (
+                origin_message_id,
+                chat_id,
+                sender_id,
+                chat_type,
+                tenant_key,
+            )
+        ):
+            return False
+        if chat_type not in {"p2p", "group", "topic_group"}:
+            return False
+        with self._lock:
+            now = time.time()
+            item = self._origins.get(origin_message_id)
+            if item is not None:
+                rec, timestamp = item
+                if now - timestamp > self._ttl:
+                    self._evict_origin_unlocked(origin_message_id)
+                else:
+                    if (
+                        rec.get("origin_message_id") != origin_message_id
+                        or rec.get("chat_id") != chat_id
+                        or rec.get("sender_id") != sender_id
+                        or rec.get("chat_type") != chat_type
+                        or rec.get("tenant_key") not in {None, "", tenant_key}
+                    ):
+                        return False
+                    rec["tenant_key"] = tenant_key
+                    self._origins[origin_message_id] = (rec, now)
+                    self._cleanup_unlocked(now)
+                    return True
+            self._origins[origin_message_id] = (
+                {
+                    "origin_message_id": origin_message_id,
+                    "request_id": None,
+                    "chat_id": chat_id,
+                    "project_id": None,
+                    "chat_type": chat_type,
+                    "sender_id": sender_id,
+                    "tenant_key": tenant_key,
+                    "reply_message_ids": [],
+                    "task_run_ids": [],
+                },
+                now,
+            )
+            self._cleanup_unlocked(now)
+            return True
+
     def link_reply(self, origin_message_id: str, reply_message_id: str) -> None:
         if not origin_message_id or not reply_message_id:
             return

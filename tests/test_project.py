@@ -656,6 +656,36 @@ class TestMessageLinker:
             chat_type="p2p",
         ) is False
 
+    def test_trusted_origin_tenant_attachment_is_one_atomic_cas(self):
+        linker = MessageLinker(ttl=60, max_size=100)
+        assert linker.register_trusted_origin_if_absent(
+            "om_team",
+            chat_id="oc_team",
+            sender_id="ou_requester",
+            chat_type="group",
+        ) is True
+
+        assert linker.register_trusted_origin_with_tenant(
+            "om_team",
+            chat_id="oc_team",
+            sender_id="ou_requester",
+            chat_type="group",
+            tenant_key="tenant-a",
+        ) is True
+        assert linker.register_trusted_origin_with_tenant(
+            "om_team",
+            chat_id="oc_other",
+            sender_id="ou_other",
+            chat_type="group",
+            tenant_key="tenant-b",
+        ) is False
+
+        origin = linker.query("om_team")
+        assert origin is not None
+        assert origin["chat_id"] == "oc_team"
+        assert origin["sender_id"] == "ou_requester"
+        assert origin["tenant_key"] == "tenant-a"
+
 
 class TestEvictionCallbackOutsideLock:
     """AC-R01: on_eviction fires outside _lock — callback can safely use ProjectManager."""
