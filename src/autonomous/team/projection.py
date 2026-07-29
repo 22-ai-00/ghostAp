@@ -43,6 +43,14 @@ _PHASE_EDGES = {
         TeamRunPhase.BLOCKED,
         TeamRunPhase.CANCELED,
     },
+    TeamRunPhase.FINALIZING: {
+        TeamRunPhase.BLOCKED,
+        TeamRunPhase.CANCELED,
+    },
+    TeamRunPhase.BLOCKING: {
+        TeamRunPhase.BLOCKED,
+        TeamRunPhase.CANCELED,
+    },
 }
 
 
@@ -60,6 +68,46 @@ def _assert_no_open_effects(
         )
     ):
         raise TeamProjectionError("team run has unresolved effects")
+
+
+def _validated_done_checks(run: TeamRunV2, value: object) -> dict[str, bool]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != set(run.done_criteria)
+        or any(
+            type(item) is not bool or item is not True
+            for item in value.values()
+        )
+    ):
+        raise TeamProjectionError("team run done criteria are not satisfied")
+    return dict(value)
+
+
+def _has_pending_final_notification(
+    effects: dict[tuple[str, str], str],
+    run_id: str,
+) -> bool:
+    legacy = f"{run_id}:notify"
+    prefix = f"{run_id}:final-notify:"
+    states = [
+        state
+        for (aggregate, effect_type), state in effects.items()
+        if effect_type == "notify"
+        and (aggregate == legacy or aggregate.startswith(prefix))
+    ]
+    return bool(states) and "committed" not in states
+
+
+def _has_pending_block_notification(
+    effects: dict[tuple[str, str], str],
+    run_id: str,
+) -> bool:
+    prefix = f"{run_id}:blocked-notify:"
+    return not any(
+        state == "committed"
+        for (aggregate, effect_type), state in effects.items()
+        if effect_type == "notify" and aggregate.startswith(prefix)
+    )
 
 
 def rebuild_team_projection(frames: Iterable[object]) -> TeamProjection:
@@ -105,6 +153,21 @@ def _apply_event(
     if event.event_type.startswith("team.v2.effect."):
         effect_type = str(payload["effect_type"])
         state = event.event_type.rsplit(".", 1)[-1]
+        owner = next(
+            (
+                run
+                for run_id, run in runs.items()
+                if event.aggregate_id == run_id
+                or event.aggregate_id.startswith(run_id + ":")
+            ),
+            None,
+        )
+        if (
+            owner is not None
+            and _terminal(owner.phase)
+            and state in {"prepared", "executing"}
+        ):
+            raise TeamProjectionError("terminal TeamRun cannot open an effect")
         previous = effects.get((event.aggregate_id, effect_type))
         allowed = {
             None: {"prepared"},
@@ -119,6 +182,42 @@ def _apply_event(
     run = runs.get(run_id)
     if run is None:
         raise TeamProjectionError("TeamRun V2 event precedes creation")
+    if event.event_type == "team.v2.run.finalization_started":
+        if run.phase not in {
+            TeamRunPhase.REVIEWING,
+            TeamRunPhase.REVISING,
+        }:
+            raise TeamProjectionError("TeamRun V2 finalization is premature")
+        done_checks = _validated_done_checks(run, payload.get("done_checks"))
+        runs[run_id] = replace(
+            run,
+            phase=TeamRunPhase.FINALIZING,
+            final_result_ref=BlobRef.from_dict(payload["result_ref"]),
+            final_done_checks=done_checks,
+        )
+        return
+    if event.event_type == "team.v2.run.finalization_reopened":
+        if (
+            run.phase is not TeamRunPhase.COMPLETED
+            or run.final_result_ref is None
+            or not run.final_done_checks
+            or not _has_pending_final_notification(effects, run_id)
+        ):
+            raise TeamProjectionError(
+                "TeamRun V2 finalization repair is not allowed"
+            )
+        runs[run_id] = replace(run, phase=TeamRunPhase.FINALIZING)
+        return
+    if event.event_type == "team.v2.run.block_notification_reopened":
+        if (
+            run.phase is not TeamRunPhase.BLOCKED
+            or not _has_pending_block_notification(effects, run_id)
+        ):
+            raise TeamProjectionError(
+                "TeamRun V2 block notification repair is not allowed"
+            )
+        runs[run_id] = replace(run, phase=TeamRunPhase.BLOCKING)
+        return
     if event.event_type == "team.v2.run.phase_changed":
         destination = TeamRunPhase(str(payload["phase"]))
         if destination not in _PHASE_EDGES.get(run.phase, set()):
@@ -138,20 +237,25 @@ def _apply_event(
         )
         return
     if event.event_type == "team.v2.run.completed":
-        if run.phase not in {TeamRunPhase.REVIEWING, TeamRunPhase.REVISING}:
+        if run.phase not in {
+            TeamRunPhase.REVIEWING,
+            TeamRunPhase.REVISING,
+            TeamRunPhase.FINALIZING,
+        }:
             raise TeamProjectionError("TeamRun V2 completion is premature")
         _assert_no_open_effects(effects, run_id)
-        done_checks = payload.get("done_checks")
-        if (
-            not isinstance(done_checks, dict)
-            or set(done_checks) != set(run.done_criteria)
-            or any(type(value) is not bool or value is not True for value in done_checks.values())
+        done_checks = _validated_done_checks(run, payload.get("done_checks"))
+        result_ref = BlobRef.from_dict(payload["result_ref"])
+        if run.phase is TeamRunPhase.FINALIZING and (
+            run.final_result_ref != result_ref
+            or dict(run.final_done_checks) != done_checks
         ):
-            raise TeamProjectionError("team run done criteria are not satisfied")
+            raise TeamProjectionError("TeamRun V2 finalization evidence changed")
         runs[run_id] = replace(
             run,
             phase=TeamRunPhase.COMPLETED,
-            final_result_ref=BlobRef.from_dict(payload["result_ref"]),
+            final_result_ref=result_ref,
+            final_done_checks=done_checks,
         )
         return
     if event.event_type == "team.v2.collaboration.observed":
@@ -166,6 +270,8 @@ def _apply_event(
         ):
             raise TeamProjectionError("invalid collaboration assignment authority")
         if run.phase in {
+            TeamRunPhase.FINALIZING,
+            TeamRunPhase.BLOCKING,
             TeamRunPhase.COMPLETED,
             TeamRunPhase.BLOCKED,
             TeamRunPhase.CANCELED,

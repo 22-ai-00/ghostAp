@@ -32,6 +32,17 @@ class TeamCoordinatorError(RuntimeError):
     pass
 
 
+class _FinalNotificationRetry(TeamCoordinatorError):
+    pass
+
+
+class _FinalNotificationExhausted(TeamCoordinatorError):
+    pass
+
+
+_MAX_FINAL_NOTIFICATION_ATTEMPTS = 3
+
+
 DecisionProvider = Callable[[TeamRunV2, tuple[object, ...], str], CoordinatorDecision]
 
 _PUBLIC_BLOCK_REASONS = frozenset(
@@ -49,6 +60,7 @@ _PUBLIC_BLOCK_REASONS = frozenset(
         "team_coordinator_failed",
         "team_dispatch_failed",
         "team_execution_failed",
+        "team_final_notification_failed",
         "team_history_unavailable",
         "team_review_failed",
         "team_revision_failed",
@@ -419,6 +431,8 @@ class TeamCoordinatorActor:
                 or run.chat_id != chat_id
                 or run.phase
                 in {
+                    TeamRunPhase.FINALIZING,
+                    TeamRunPhase.BLOCKING,
                     TeamRunPhase.COMPLETED,
                     TeamRunPhase.BLOCKED,
                     TeamRunPhase.CANCELED,
@@ -453,6 +467,7 @@ class TeamCoordinatorActor:
             self._executor.submit(self._run, run_id)
 
     def _run(self, run_id: str) -> None:
+        retry_final_notification = False
         try:
             projection = self.projection()
             run = projection.runs[run_id]
@@ -461,17 +476,41 @@ class TeamCoordinatorActor:
                 and run.final_result_ref is not None
                 and self._final_notification_pending(projection, run_id)
             ):
-                self._deliver_final_notification(
-                    run,
-                    self._read_text(run.final_result_ref),
+                self._commit(
+                    JournalEvent(
+                        event_type="team.v2.run.finalization_reopened",
+                        aggregate_id=run.run_id,
+                        payload={"run_id": run.run_id},
+                    )
                 )
-            elif run.phase is TeamRunPhase.BLOCKED:
-                self._deliver_block_notification(
-                    run,
-                    self._public_block_reason(run.error_code),
+                self._resume_finalization(self.projection().runs[run_id])
+            elif run.phase is TeamRunPhase.FINALIZING:
+                self._resume_finalization(run)
+            elif (
+                run.phase is TeamRunPhase.BLOCKED
+                and self._blocked_notification_pending(projection, run_id)
+            ):
+                self._commit(
+                    JournalEvent(
+                        event_type="team.v2.run.block_notification_reopened",
+                        aggregate_id=run.run_id,
+                        payload={"run_id": run.run_id},
+                    )
                 )
+                self._resume_block_notification(
+                    self.projection().runs[run_id]
+                )
+            elif run.phase is TeamRunPhase.BLOCKING:
+                self._resume_block_notification(run)
             else:
                 self._drive(run_id)
+        except _FinalNotificationRetry:
+            retry_final_notification = True
+        except _FinalNotificationExhausted:
+            try:
+                self._block(run_id, "team_final_notification_failed")
+            except Exception:
+                pass
         except Exception:
             try:
                 self._block(run_id, "team_coordinator_failed")
@@ -480,6 +519,8 @@ class TeamCoordinatorActor:
         finally:
             with self._lock:
                 self._active.discard(run_id)
+                if retry_final_notification:
+                    self._schedule(run_id)
 
     def _drive(self, run_id: str) -> None:
         while True:
@@ -886,6 +927,33 @@ class TeamCoordinatorActor:
         *,
         done_checks: dict[str, bool],
     ) -> None:
+        self._commit(
+            JournalEvent(
+                event_type="team.v2.run.finalization_started",
+                aggregate_id=run.run_id,
+                payload={
+                    "run_id": run.run_id,
+                    "result_ref": result_ref.to_dict(),
+                    "done_checks": done_checks,
+                },
+            )
+        )
+        finalizing = self.projection().runs[run.run_id]
+        if (
+            finalizing.final_result_ref is None
+            or self._read_text(finalizing.final_result_ref) != output
+        ):
+            raise TeamCoordinatorError("durable final result changed")
+        self._resume_finalization(finalizing)
+
+    def _resume_finalization(self, run: TeamRunV2) -> None:
+        if (
+            run.phase is not TeamRunPhase.FINALIZING
+            or run.final_result_ref is None
+            or not run.final_done_checks
+        ):
+            raise TeamCoordinatorError("durable finalization is incomplete")
+        output = self._read_text(run.final_result_ref)
         if not self._deliver_final_notification(run, output):
             raise TeamCoordinatorError("final notification is not committed")
         self._commit(
@@ -894,8 +962,8 @@ class TeamCoordinatorActor:
                 aggregate_id=run.run_id,
                 payload={
                     "run_id": run.run_id,
-                    "result_ref": result_ref.to_dict(),
-                    "done_checks": done_checks,
+                    "result_ref": run.final_result_ref.to_dict(),
+                    "done_checks": dict(run.final_done_checks),
                 },
             )
         )
@@ -981,6 +1049,23 @@ class TeamCoordinatorActor:
             }:
                 self._phase(current, TeamRunPhase.BLOCKED, error=safe_error)
 
+    def _resume_block_notification(self, run: TeamRunV2) -> None:
+        if run.phase is not TeamRunPhase.BLOCKING:
+            raise TeamCoordinatorError(
+                "durable block notification repair is incomplete"
+            )
+        safe_error = self._public_block_reason(run.error_code)
+        if not self._deliver_block_notification(run, safe_error):
+            return
+        with self._lock:
+            current = self.projection().runs[run.run_id]
+            if current.phase is TeamRunPhase.BLOCKING:
+                self._phase(
+                    current,
+                    TeamRunPhase.BLOCKED,
+                    error=safe_error,
+                )
+
     @staticmethod
     def _public_block_reason(error_code: object) -> str:
         if isinstance(error_code, str) and error_code in _PUBLIC_BLOCK_REASONS:
@@ -1054,6 +1139,10 @@ class TeamCoordinatorActor:
                 None,
             )
             if replayable is None:
+                if len(attempts) >= _MAX_FINAL_NOTIFICATION_ATTEMPTS:
+                    raise _FinalNotificationExhausted(
+                        "final notification attempts are exhausted"
+                    )
                 if attempts:
                     ordinal = attempts[-1][0] + 1
                     aggregate = (
@@ -1079,7 +1168,17 @@ class TeamCoordinatorActor:
                         "notify",
                         "action_required",
                     )
-            raise
+                attempts = self._final_notification_attempts(
+                    self.projection(),
+                    run.run_id,
+                )
+            if len(attempts) >= _MAX_FINAL_NOTIFICATION_ATTEMPTS:
+                raise _FinalNotificationExhausted(
+                    "final notification attempts are exhausted"
+                )
+            raise _FinalNotificationRetry(
+                "final notification delivery will retry"
+            )
         with self._lock:
             projection = self.projection()
             if projection.effects.get((aggregate, "notify")) == "executing":

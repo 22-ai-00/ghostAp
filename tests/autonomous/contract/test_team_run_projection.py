@@ -83,7 +83,9 @@ def test_team_run_phase_contract_exposes_required_states() -> None:
         "dispatching",
         "reviewing",
         "revising",
+        "finalizing",
         "completed",
+        "blocking",
         "blocked",
         "canceled",
     }
@@ -114,4 +116,30 @@ def test_completed_run_requires_durable_evidence_for_every_done_criterion() -> N
     )
 
     with pytest.raises(TeamProjectionError, match="done criteria"):
+        _apply_event({run.run_id: run}, {}, {}, {}, event)
+
+
+def test_terminal_run_rejects_new_open_effect() -> None:
+    run = TeamRunV2(
+        "teamrun2_terminal",
+        "tenant_1",
+        "oc_team",
+        "",
+        "om_1",
+        "ou_1",
+        _ref(),
+        "goal",
+        ("deliverable_non_empty",),
+        "session",
+        phase=TeamRunPhase.COMPLETED,
+        final_result_ref=_ref(),
+        final_done_checks={"deliverable_non_empty": True},
+    )
+    event = JournalEvent(
+        "team.v2.effect.prepared",
+        f"{run.run_id}:final-notify:1",
+        {"effect_type": "notify"},
+    )
+
+    with pytest.raises(TeamProjectionError, match="terminal"):
         _apply_event({run.run_id: run}, {}, {}, {}, event)

@@ -22,7 +22,9 @@ class TeamRunPhase(StrEnum):
     DISPATCHING = "dispatching"
     REVIEWING = "reviewing"
     REVISING = "revising"
+    FINALIZING = "finalizing"
     COMPLETED = "completed"
+    BLOCKING = "blocking"
     BLOCKED = "blocked"
     CANCELED = "canceled"
 
@@ -71,6 +73,7 @@ class TeamRunV2:
     assignment_ids: tuple[str, ...] = ()
     handoff_count: int = 0
     final_result_ref: BlobRef | None = None
+    final_done_checks: Mapping[str, bool] = field(default_factory=dict)
     error_code: str = ""
 
     def __post_init__(self) -> None:
@@ -86,6 +89,11 @@ class TeamRunV2:
             raise ValueError("invalid team goal")
         object.__setattr__(self, "done_criteria", tuple(self.done_criteria))
         object.__setattr__(self, "assignment_ids", tuple(self.assignment_ids))
+        object.__setattr__(
+            self,
+            "final_done_checks",
+            MappingProxyType(dict(self.final_done_checks)),
+        )
         if not self.done_criteria or any(not item.strip() for item in self.done_criteria):
             raise ValueError("team run requires done criteria")
         if len(self.assignment_ids) > MAX_TEAM_ASSIGNMENTS:
@@ -94,6 +102,21 @@ class TeamRunV2:
             raise ValueError("team turn bound exceeded")
         if not 0 <= self.handoff_count <= MAX_TEAM_HANDOFFS:
             raise ValueError("team handoff bound exceeded")
+        if self.final_done_checks and (
+            set(self.final_done_checks) != set(self.done_criteria)
+            or any(
+                type(value) is not bool or value is not True
+                for value in self.final_done_checks.values()
+            )
+        ):
+            raise ValueError("invalid final done checks")
+        if self.phase in {
+            TeamRunPhase.FINALIZING,
+            TeamRunPhase.COMPLETED,
+        } and (
+            self.final_result_ref is None or not self.final_done_checks
+        ):
+            raise ValueError("finalizing team run lacks durable result")
 
 
 @dataclass(frozen=True, slots=True)

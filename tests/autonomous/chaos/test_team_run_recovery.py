@@ -200,6 +200,61 @@ class _RetryableNotifyBackend(ImmediateTeamBackend):
         self.notifications.append((message_id, chat_id, result))
 
 
+class _FailOnceNotifyBackend(_RetryableNotifyBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_remaining = 1
+
+    def notify(self, *args, idempotency_key, **kwargs):
+        self.idempotency_keys.append(idempotency_key)
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("simulated transient final delivery failure")
+        message_id, chat_id, result = args
+        self.notifications.append((message_id, chat_id, result))
+
+
+class _FinalFailingBlockSuccessBackend(_RetryableNotifyBackend):
+    def notify(self, *args, idempotency_key, **kwargs):
+        message_id, chat_id, result = args
+        if result.startswith("⚠️"):
+            self.notifications.append((message_id, chat_id, result))
+            return
+        self.idempotency_keys.append(idempotency_key)
+        raise RuntimeError("simulated persistent final delivery failure")
+
+
+def _seed_final_notification_action_required(
+    writer,
+    blobs,
+    *,
+    message_id: str,
+):
+    actor = _actor(writer, blobs, ImmediateTeamBackend())
+    original_effect = actor._effect  # noqa: SLF001
+
+    def crash_before_notify_execute(aggregate, effect_type, state):
+        if (
+            aggregate.endswith(":notify")
+            and effect_type == "notify"
+            and state == "executing"
+        ):
+            raise SystemExit("simulated process death after notify prepared")
+        return original_effect(aggregate, effect_type, state)
+
+    actor._effect = crash_before_notify_execute  # type: ignore[method-assign] # noqa: SLF001
+    run = actor.start_task(
+        tenant_key="tenant_1",
+        message_id=message_id,
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="构造历史 final notification 状态",
+    )
+    actor.drain()
+    original_effect(f"{run.run_id}:notify", "notify", "action_required")
+    return actor, run
+
+
 def test_restart_from_final_notify_executing_converges_without_duplicate(tmp_path) -> None:
     writer, blobs = make_team_storage(tmp_path)
     crashing = _CrashNotifyBackend()
@@ -213,7 +268,7 @@ def test_restart_from_final_notify_executing_converges_without_duplicate(tmp_pat
     )
     first.drain()
     projection = first.projection()
-    assert projection.runs[run.run_id].phase is TeamRunPhase.REVISING
+    assert projection.runs[run.run_id].phase is TeamRunPhase.FINALIZING
     assert projection.effects[(f"{run.run_id}:notify", "notify")] == "executing"
     first.close()
 
@@ -225,6 +280,68 @@ def test_restart_from_final_notify_executing_converges_without_duplicate(tmp_pat
     assert len(recovered_backend.notifications) == 1
     _assert_no_lost_instruction(writer)
     second.close()
+    blobs.close()
+    writer.close()
+
+
+def test_transient_final_delivery_failure_retries_without_blocking_run(
+    tmp_path,
+) -> None:
+    writer, blobs = make_team_storage(tmp_path)
+    backend = _FailOnceNotifyBackend()
+    actor = _actor(writer, blobs, backend)
+    run = actor.start_task(
+        tenant_key="tenant_1",
+        message_id="om_notify_transient",
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="瞬时通知失败后继续交付",
+    )
+    actor.drain()
+
+    projection = actor.projection()
+    assert projection.runs[run.run_id].phase is TeamRunPhase.COMPLETED
+    assert len(backend.idempotency_keys) == 2
+    assert len(set(backend.idempotency_keys)) == 1
+    assert len(backend.notifications) == 1
+    assert not backend.notifications[0][2].startswith("⚠️")
+    actor.close()
+    blobs.close()
+    writer.close()
+
+
+def test_persistent_final_delivery_failure_has_bounded_attempts(
+    tmp_path,
+) -> None:
+    writer, blobs = make_team_storage(tmp_path)
+    backend = _FinalFailingBlockSuccessBackend()
+    actor = _actor(writer, blobs, backend)
+    run = actor.start_task(
+        tenant_key="tenant_1",
+        message_id="om_notify_persistent",
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="持续通知失败后有界停车",
+    )
+    actor.drain()
+
+    projection = actor.projection()
+    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKED
+    final_attempts = [
+        aggregate
+        for (aggregate, effect_type), state in projection.effects.items()
+        if effect_type == "notify"
+        and (
+            aggregate == f"{run.run_id}:notify"
+            or aggregate.startswith(f"{run.run_id}:final-notify:")
+        )
+        and state == "action_required"
+    ]
+    assert len(final_attempts) == 3
+    assert len(backend.idempotency_keys) == 3
+    assert len(set(backend.idempotency_keys)) == 1
+    assert actor.recover() == 0
+    actor.close()
     blobs.close()
     writer.close()
 
@@ -255,7 +372,7 @@ def test_restart_from_final_notify_prepared_resumes_before_completion(
     )
     first.drain()
     projection = first.projection()
-    assert projection.runs[run.run_id].phase is TeamRunPhase.REVISING
+    assert projection.runs[run.run_id].phase is TeamRunPhase.FINALIZING
     assert projection.effects[(f"{run.run_id}:notify", "notify")] == "prepared"
     first.close()
 
@@ -273,30 +390,67 @@ def test_restart_from_final_notify_prepared_resumes_before_completion(
     writer.close()
 
 
+def test_completed_notification_repair_reopens_before_dispatch(
+    tmp_path,
+) -> None:
+    writer, blobs = make_team_storage(tmp_path)
+    first, run = _seed_final_notification_action_required(
+        writer,
+        blobs,
+        message_id="om_notify_repair_crash",
+    )
+    seeded = first.projection().runs[run.run_id]
+    first._commit(  # noqa: SLF001
+        JournalEvent(
+            "team.v2.run.completed",
+            run.run_id,
+            {
+                "run_id": run.run_id,
+                "result_ref": seeded.final_result_ref.to_dict(),
+                "done_checks": dict(seeded.final_done_checks),
+            },
+        )
+    )
+    first.close()
+
+    crashing = _actor(writer, blobs, _CrashNotifyBackend())
+    assert crashing.recover() == 1
+    crashing.drain()
+    projection = crashing.projection()
+    assert projection.runs[run.run_id].phase is TeamRunPhase.FINALIZING
+    assert any(
+        state == "executing"
+        for (aggregate, effect_type), state in projection.effects.items()
+        if aggregate.startswith(f"{run.run_id}:final-notify:")
+        and effect_type == "notify"
+    )
+    crashing.close()
+
+    recovered_backend = _RetryableNotifyBackend()
+    recovered = _actor(writer, blobs, recovered_backend)
+    assert recovered.recover() == 1
+    recovered.drain()
+    assert (
+        recovered.projection().runs[run.run_id].phase
+        is TeamRunPhase.COMPLETED
+    )
+    assert len(recovered_backend.notifications) == 1
+    recovered.close()
+    blobs.close()
+    writer.close()
+
+
 def test_restart_from_final_notify_action_required_starts_new_attempt(
     tmp_path,
 ) -> None:
     writer, blobs = make_team_storage(tmp_path)
-    failing_backend = _RetryableNotifyBackend(fail=True)
-    first = _actor(writer, blobs, failing_backend)
-    original_phase = first._phase  # noqa: SLF001
-
-    def crash_before_block_phase(run, phase, **kwargs):
-        if phase is TeamRunPhase.BLOCKED:
-            raise SystemExit("simulated process death before run blocking")
-        return original_phase(run, phase, **kwargs)
-
-    first._phase = crash_before_block_phase  # type: ignore[method-assign] # noqa: SLF001
-    run = first.start_task(
-        tenant_key="tenant_1",
+    first, run = _seed_final_notification_action_required(
+        writer,
+        blobs,
         message_id="om_notify_action_required",
-        chat_id="oc_team",
-        requester_principal_id="ou_user",
-        task="通知 action-required 边界恢复",
     )
-    first.drain()
     projection = first.projection()
-    assert projection.runs[run.run_id].phase is TeamRunPhase.REVISING
+    assert projection.runs[run.run_id].phase is TeamRunPhase.FINALIZING
     assert (
         projection.effects[(f"{run.run_id}:notify", "notify")]
         == "action_required"
@@ -314,9 +468,7 @@ def test_restart_from_final_notify_action_required_starts_new_attempt(
         projection.effects[(f"{run.run_id}:final-notify:1", "notify")]
         == "committed"
     )
-    assert recovered_backend.idempotency_keys == [
-        failing_backend.idempotency_keys[0]
-    ]
+    assert len(recovered_backend.idempotency_keys) == 1
     assert len(recovered_backend.notifications) == 1
     second.close()
     blobs.close()
@@ -327,40 +479,20 @@ def test_recover_repairs_completed_run_with_uncommitted_final_notification(
     tmp_path,
 ) -> None:
     writer, blobs = make_team_storage(tmp_path)
-    failing_backend = _RetryableNotifyBackend(fail=True)
-    first = _actor(writer, blobs, failing_backend)
-    original_phase = first._phase  # noqa: SLF001
-
-    def crash_before_block_phase(run, phase, **kwargs):
-        if phase is TeamRunPhase.BLOCKED:
-            raise SystemExit("simulated legacy completion window")
-        return original_phase(run, phase, **kwargs)
-
-    first._phase = crash_before_block_phase  # type: ignore[method-assign] # noqa: SLF001
-    run = first.start_task(
-        tenant_key="tenant_1",
+    first, run = _seed_final_notification_action_required(
+        writer,
+        blobs,
         message_id="om_notify_legacy_completed",
-        chat_id="oc_team",
-        requester_principal_id="ou_user",
-        task="修复历史 completed 通知",
     )
-    first.drain()
-    projection = first.projection()
-    final_assignment = next(
-        assignment
-        for assignment in projection.assignments.values()
-        if assignment.run_id == run.run_id and assignment.role == "finalize"
-    )
+    seeded = first.projection().runs[run.run_id]
     first._commit(  # noqa: SLF001
         JournalEvent(
             "team.v2.run.completed",
             run.run_id,
             {
                 "run_id": run.run_id,
-                "result_ref": final_assignment.contribution_ref.to_dict(),
-                "done_checks": {
-                    criterion: True for criterion in run.done_criteria
-                },
+                "result_ref": seeded.final_result_ref.to_dict(),
+                "done_checks": dict(seeded.final_done_checks),
             },
         )
     )
@@ -378,9 +510,7 @@ def test_recover_repairs_completed_run_with_uncommitted_final_notification(
         projection.effects[(f"{run.run_id}:final-notify:1", "notify")]
         == "committed"
     )
-    assert recovered_backend.idempotency_keys == [
-        failing_backend.idempotency_keys[0]
-    ]
+    assert len(recovered_backend.idempotency_keys) == 1
     assert len(recovered_backend.notifications) == 1
     assert second.recover() == 0
     second.close()
@@ -437,7 +567,7 @@ def test_restart_after_final_notify_commit_completes_without_resend(
     )
     first.drain()
     projection = first.projection()
-    assert projection.runs[run.run_id].phase is TeamRunPhase.REVISING
+    assert projection.runs[run.run_id].phase is TeamRunPhase.FINALIZING
     assert projection.effects[(f"{run.run_id}:notify", "notify")] == "committed"
     assert len(first_backend.notifications) == 1
     first.close()
