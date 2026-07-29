@@ -686,6 +686,54 @@ class TestMessageLinker:
         assert origin["sender_id"] == "ou_requester"
         assert origin["tenant_key"] == "tenant-a"
 
+    def test_refresh_order_allows_later_expired_origin_cleanup(
+        self,
+        monkeypatch,
+    ):
+        now = 0.0
+        monkeypatch.setattr("src.project.mapper.time.time", lambda: now)
+        linker = MessageLinker(ttl=10, max_size=100)
+
+        linker.register_origin("om_a", request_id="req_a")
+        now = 1.0
+        linker.register_origin("om_b", request_id="req_b")
+        linker.link_reply("om_b", "om_reply_b")
+        linker.link_task("om_b", "run_b")
+
+        now = 9.0
+        linker.register_origin("om_a", request_id="req_a")
+        now = 12.0
+        linker.register_origin("om_c", request_id="req_c")
+
+        assert linker.query("om_a") is not None
+        assert linker.resolve_origin(reply_message_id="om_reply_b") is None
+        assert linker.resolve_origin(run_id="run_b") is None
+        assert linker.resolve_origin(request_id="req_b") is None
+
+    def test_refresh_order_capacity_evicts_oldest_and_clears_reverse_indexes(
+        self,
+        monkeypatch,
+    ):
+        now = 0.0
+        monkeypatch.setattr("src.project.mapper.time.time", lambda: now)
+        linker = MessageLinker(ttl=60, max_size=2)
+
+        linker.register_origin("om_a", request_id="req_a")
+        now = 1.0
+        linker.register_origin("om_b", request_id="req_b")
+        linker.link_reply("om_b", "om_reply_b")
+        linker.link_task("om_b", "run_b")
+
+        now = 2.0
+        linker.register_origin("om_a", request_id="req_a")
+        now = 3.0
+        linker.register_origin("om_c", request_id="req_c")
+
+        assert linker.query("om_a") is not None
+        assert linker.resolve_origin(reply_message_id="om_reply_b") is None
+        assert linker.resolve_origin(run_id="run_b") is None
+        assert linker.resolve_origin(request_id="req_b") is None
+
 
 class TestEvictionCallbackOutsideLock:
     """AC-R01: on_eviction fires outside _lock — callback can safely use ProjectManager."""

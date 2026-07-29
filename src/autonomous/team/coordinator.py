@@ -352,6 +352,10 @@ class TeamCoordinatorActor:
                     run.phase is TeamRunPhase.BLOCKED
                     and self._blocked_notification_pending(projection, run.run_id)
                 )
+                or (
+                    run.phase is TeamRunPhase.COMPLETED
+                    and self._final_notification_pending(projection, run.run_id)
+                )
             )
         ]
         for run_id in pending:
@@ -450,8 +454,18 @@ class TeamCoordinatorActor:
 
     def _run(self, run_id: str) -> None:
         try:
-            run = self.projection().runs[run_id]
-            if run.phase is TeamRunPhase.BLOCKED:
+            projection = self.projection()
+            run = projection.runs[run_id]
+            if (
+                run.phase is TeamRunPhase.COMPLETED
+                and run.final_result_ref is not None
+                and self._final_notification_pending(projection, run_id)
+            ):
+                self._deliver_final_notification(
+                    run,
+                    self._read_text(run.final_result_ref),
+                )
+            elif run.phase is TeamRunPhase.BLOCKED:
                 self._deliver_block_notification(
                     run,
                     self._public_block_reason(run.error_code),
@@ -872,17 +886,8 @@ class TeamCoordinatorActor:
         *,
         done_checks: dict[str, bool],
     ) -> None:
-        aggregate = f"{run.run_id}:notify"
-        projection = self.projection()
-        notify_state = projection.effects.get((aggregate, "notify"))
-        if notify_state is None:
-            self._effect(aggregate, "notify", "prepared")
-            self._effect(aggregate, "notify", "executing")
-            self._notify(run, output)
-            self._effect(aggregate, "notify", "committed")
-        elif notify_state == "executing":
-            self._notify(run, output)
-            self._effect(aggregate, "notify", "committed")
+        if not self._deliver_final_notification(run, output):
+            raise TeamCoordinatorError("final notification is not committed")
         self._commit(
             JournalEvent(
                 event_type="team.v2.run.completed",
@@ -985,6 +990,110 @@ class TeamCoordinatorActor:
     @staticmethod
     def _blocked_notify_prefix(run_id: str) -> str:
         return f"{run_id}:blocked-notify:"
+
+    @staticmethod
+    def _legacy_final_notify_aggregate(run_id: str) -> str:
+        return f"{run_id}:notify"
+
+    @staticmethod
+    def _final_notify_prefix(run_id: str) -> str:
+        return f"{run_id}:final-notify:"
+
+    @classmethod
+    def _final_notification_attempts(
+        cls,
+        projection,
+        run_id: str,
+    ) -> tuple[tuple[int, str, str], ...]:
+        attempts = []
+        legacy_aggregate = cls._legacy_final_notify_aggregate(run_id)
+        legacy_state = projection.effects.get((legacy_aggregate, "notify"))
+        if legacy_state is not None:
+            attempts.append((0, legacy_aggregate, legacy_state))
+        prefix = cls._final_notify_prefix(run_id)
+        for (aggregate, effect_type), state in projection.effects.items():
+            if effect_type != "notify" or not aggregate.startswith(prefix):
+                continue
+            ordinal = aggregate[len(prefix) :]
+            if ordinal.isdigit() and int(ordinal) > 0:
+                attempts.append((int(ordinal), aggregate, state))
+        return tuple(sorted(attempts))
+
+    @classmethod
+    def _final_notification_pending(cls, projection, run_id: str) -> bool:
+        attempts = cls._final_notification_attempts(projection, run_id)
+        return bool(attempts) and not any(
+            state == "committed"
+            for _ordinal, _aggregate, state in attempts
+        )
+
+    def _deliver_final_notification(
+        self,
+        run: TeamRunV2,
+        output: str,
+    ) -> bool:
+        """Deliver one logical final notice across crash-safe attempts."""
+
+        with self._lock:
+            projection = self.projection()
+            attempts = self._final_notification_attempts(
+                projection,
+                run.run_id,
+            )
+            if any(
+                state == "committed"
+                for _ordinal, _aggregate, state in attempts
+            ):
+                return True
+            replayable = next(
+                (
+                    (aggregate, state)
+                    for _ordinal, aggregate, state in reversed(attempts)
+                    if state in {"prepared", "executing"}
+                ),
+                None,
+            )
+            if replayable is None:
+                if attempts:
+                    ordinal = attempts[-1][0] + 1
+                    aggregate = (
+                        f"{self._final_notify_prefix(run.run_id)}{ordinal}"
+                    )
+                else:
+                    aggregate = self._legacy_final_notify_aggregate(run.run_id)
+                self._effect(aggregate, "notify", "prepared")
+                state = "prepared"
+            else:
+                aggregate, state = replayable
+            if state == "prepared":
+                self._effect(aggregate, "notify", "executing")
+
+        try:
+            self._notify(run, output)
+        except Exception:
+            with self._lock:
+                projection = self.projection()
+                if projection.effects.get((aggregate, "notify")) == "executing":
+                    self._effect(
+                        aggregate,
+                        "notify",
+                        "action_required",
+                    )
+            raise
+        with self._lock:
+            projection = self.projection()
+            if projection.effects.get((aggregate, "notify")) == "executing":
+                self._effect(aggregate, "notify", "committed")
+            projection = self.projection()
+            return any(
+                state == "committed"
+                for _ordinal, _aggregate, state in (
+                    self._final_notification_attempts(
+                        projection,
+                        run.run_id,
+                    )
+                )
+            )
 
     @classmethod
     def _blocked_notification_attempts(

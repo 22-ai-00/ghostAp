@@ -3776,6 +3776,77 @@ def test_team_notification_prefers_legacy_fourth_key_over_catch_all_kwargs() -> 
     ]
 
 
+def test_team_notification_prefers_positional_only_key_over_catch_all_kwargs() -> None:
+    notifications: list[tuple[str, dict[str, str]]] = []
+
+    def notify(
+        _message_id: str,
+        _chat_id: str,
+        _result: str,
+        idempotency_key: str = "",
+        /,
+        **kwargs: str,
+    ) -> None:
+        notifications.append((idempotency_key, kwargs))
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert notifications == [
+        (
+            "stable-key",
+            {
+                "tenant_key": "tenant-a",
+                "requester_principal_id": "ou_requester",
+            },
+        )
+    ]
+
+
+def test_team_notification_prefers_all_positional_only_scope_over_kwargs() -> None:
+    notifications: list[tuple[str, str, str, dict[str, str]]] = []
+
+    def notify(
+        _message_id: str,
+        _chat_id: str,
+        _result: str,
+        idempotency_key: str = "",
+        tenant_key: str = "",
+        requester_principal_id: str = "",
+        /,
+        **kwargs: str,
+    ) -> None:
+        notifications.append(
+            (
+                idempotency_key,
+                tenant_key,
+                requester_principal_id,
+                kwargs,
+            )
+        )
+
+    backend = _RuntimeTeamBackend(SimpleNamespace(), notify)
+    backend.notify(
+        "om_1",
+        "oc_team",
+        "result",
+        idempotency_key="stable-key",
+        tenant_key="tenant-a",
+        requester_principal_id="ou_requester",
+    )
+
+    assert notifications == [
+        ("stable-key", "tenant-a", "ou_requester", {})
+    ]
+
+
 def test_team_notification_preserves_legacy_fourth_positional_parameter() -> None:
     attempts: list[str] = []
 

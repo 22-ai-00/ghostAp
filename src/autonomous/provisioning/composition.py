@@ -635,7 +635,11 @@ class _RuntimeTeamBackend:
         prefer_legacy_positional_key = (
             idempotency_key
             and len(fixed_positional) >= 4
-            and explicit_idempotency_parameter is None
+            and (
+                explicit_idempotency_parameter is None
+                or explicit_idempotency_parameter.kind
+                is inspect.Parameter.POSITIONAL_ONLY
+            )
         )
         if tenant_key and requester_principal_id:
             scoped_kwargs = {
@@ -643,6 +647,18 @@ class _RuntimeTeamBackend:
                 "requester_principal_id": requester_principal_id,
             }
             if idempotency_key:
+                if len(fixed_positional) >= 6:
+                    candidates.append(
+                        (
+                            (
+                                *base_args,
+                                idempotency_key,
+                                tenant_key,
+                                requester_principal_id,
+                            ),
+                            {},
+                        )
+                    )
                 if prefer_legacy_positional_key:
                     candidates.append(
                         ((*base_args, idempotency_key), scoped_kwargs)
@@ -663,18 +679,6 @@ class _RuntimeTeamBackend:
                         ((*base_args, idempotency_key), scoped_kwargs)
                     )
             candidates.append((base_args, scoped_kwargs))
-            if len(fixed_positional) >= 6:
-                candidates.append(
-                    (
-                        (
-                            *base_args,
-                            idempotency_key,
-                            tenant_key,
-                            requester_principal_id,
-                        ),
-                        {},
-                    )
-                )
         if idempotency_key:
             candidates.extend(
                 (

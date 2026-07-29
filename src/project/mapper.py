@@ -115,6 +115,7 @@ class MessageLinker:
             if tenant_key:
                 rec["tenant_key"] = tenant_key
             self._origins[origin_message_id] = (rec, now)
+            self._origins.move_to_end(origin_message_id)
             self._cleanup_unlocked(now)
 
     def get_request_id(self, origin_message_id: str) -> Optional[str]:
@@ -222,6 +223,7 @@ class MessageLinker:
                         return False
                     rec["tenant_key"] = tenant_key
                     self._origins[origin_message_id] = (rec, now)
+                    self._origins.move_to_end(origin_message_id)
                     self._cleanup_unlocked(now)
                     return True
             self._origins[origin_message_id] = (
@@ -263,6 +265,7 @@ class MessageLinker:
                 rec["reply_message_ids"].append(reply_message_id)
             self._reply_to_origin[reply_message_id] = origin_message_id
             self._origins[origin_message_id] = (rec, now)
+            self._origins.move_to_end(origin_message_id)
             self._cleanup_unlocked(now)
 
     def link_task(self, origin_message_id: str, run_id: str) -> None:
@@ -287,6 +290,7 @@ class MessageLinker:
                 rec["task_run_ids"].append(run_id)
             self._run_to_origin[run_id] = origin_message_id
             self._origins[origin_message_id] = (rec, now)
+            self._origins.move_to_end(origin_message_id)
             self._cleanup_unlocked(now)
 
     def resolve_origin(
@@ -345,7 +349,6 @@ class MessageLinker:
                 self._run_to_origin.pop(run_id, None)
 
     def _cleanup_unlocked(self, now: float) -> None:
-        # TTL cleanup (OrderedDict keeps insertion order; we still do best-effort scan)
         expired = []
         for mid, (_, ts) in self._origins.items():
             if now - ts > self._ttl:
@@ -355,5 +358,5 @@ class MessageLinker:
         for mid in expired:
             self._evict_origin_unlocked(mid)
         while len(self._origins) > self._max_size:
-            mid, _ = self._origins.popitem(last=False)
+            mid = next(iter(self._origins))
             self._evict_origin_unlocked(mid)
