@@ -1,7 +1,16 @@
 import threading
 import time
+from contextlib import contextmanager
 
-from src.tasking import TaskPriority, TaskScheduler, TaskSpec, TaskStatus
+import pytest
+
+from src.tasking import (
+    TaskPriority,
+    TaskScheduler,
+    TaskSpec,
+    TaskStatus,
+    get_current_task_run_id,
+)
 
 
 def test_scheduler_respects_global_concurrency_limit():
@@ -330,3 +339,252 @@ def test_dispatch_submit_failure_rolls_back_running_and_sets_failed():
         assert scheduler._running_by_project[st.project_serial_key] == 0
     finally:
         scheduler._executor.submit = original_submit
+
+
+def test_fence_admission_rejects_new_work_and_cancels_queued_tasks():
+    scheduler = TaskScheduler(max_concurrent=1, per_key_concurrency=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocker(_ctx):
+        started.set()
+        assert release.wait(timeout=2)
+        return "done"
+
+    running = scheduler.submit(
+        TaskSpec(chat_id="chat", name="running", queue_key="shared"),
+        blocker,
+    )
+    assert started.wait(timeout=1)
+    queued = scheduler.submit(
+        TaskSpec(chat_id="chat", name="queued", queue_key="shared"),
+        lambda _ctx: pytest.fail("fenced queued work must not execute"),
+    )
+
+    scheduler.fence_admission()
+
+    assert queued.wait(timeout=1).status == TaskStatus.CANCELED
+    with pytest.raises(RuntimeError, match="admission"):
+        scheduler.submit(
+            TaskSpec(chat_id="chat", name="late"),
+            lambda _ctx: None,
+        )
+
+    release.set()
+    assert running.wait(timeout=2).status == TaskStatus.SUCCEEDED
+    scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_fence_cancels_worker_waiting_at_run_guard_as_canceled():
+    attempted = threading.Event()
+    canceled = threading.Event()
+
+    class BlockingGuard:
+        @contextmanager
+        def task_guard(self):
+            attempted.set()
+            assert canceled.wait(timeout=2)
+            raise RuntimeError("restart admission canceled")
+            yield
+
+        def cancel_waiters(self):
+            canceled.set()
+
+    guard = BlockingGuard()
+    scheduler = TaskScheduler(
+        max_concurrent=1,
+        per_key_concurrency=1,
+        run_guard=guard.task_guard,
+    )
+    callback_called = False
+
+    def callback(_ctx):
+        nonlocal callback_called
+        callback_called = True
+
+    handle = scheduler.submit(TaskSpec(chat_id="chat", name="waiting"), callback)
+    assert attempted.wait(timeout=1)
+
+    scheduler.fence_admission()
+
+    result = handle.wait(timeout=2)
+    assert result.status == TaskStatus.CANCELED
+    assert not callback_called
+    assert scheduler._running_total_normal == 0
+    scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_bounded_drain_requests_cooperative_cancel_after_timeout():
+    scheduler = TaskScheduler(max_concurrent=1, per_key_concurrency=1)
+    started = threading.Event()
+
+    def cooperative(ctx):
+        started.set()
+        while True:
+            ctx.check_canceled()
+            time.sleep(0.005)
+
+    handle = scheduler.submit(TaskSpec(chat_id="chat", name="active"), cooperative)
+    assert started.wait(timeout=1)
+    scheduler.fence_admission()
+
+    assert scheduler.wait_for_idle(timeout=0.02) is False
+    assert scheduler.cancel_active() == 1
+    assert handle.wait(timeout=2).status == TaskStatus.CANCELED
+    assert scheduler.wait_for_idle(timeout=0.2) is True
+    scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_base_exception_reaches_failed_terminal_before_guard_release():
+    observed: list[TaskStatus] = []
+    scheduler: TaskScheduler
+
+    @contextmanager
+    def guard():
+        try:
+            yield
+        finally:
+            state = scheduler.get_state(handle.run_id)
+            assert state is not None
+            observed.append(state.status)
+
+    class FatalTaskSignal(BaseException):
+        pass
+
+    scheduler = TaskScheduler(
+        max_concurrent=1,
+        per_key_concurrency=1,
+        run_guard=guard,
+    )
+    handle = scheduler.submit(
+        TaskSpec(chat_id="chat", name="fatal"),
+        lambda _ctx: (_ for _ in ()).throw(FatalTaskSignal("fatal callback")),
+    )
+
+    result = handle.wait(timeout=2)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.error == "fatal callback"
+    assert observed == [TaskStatus.FAILED]
+    assert scheduler._running_total_normal == 0
+    scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_guard_enter_base_exception_releases_slot_and_reaches_failed_terminal():
+    class FatalGuardAdmission(BaseException):
+        pass
+
+    class FatalEnterGuard:
+        def __enter__(self):
+            raise FatalGuardAdmission("fatal guard admission")
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return False
+
+    scheduler = TaskScheduler(
+        max_concurrent=1,
+        per_key_concurrency=1,
+        run_guard=FatalEnterGuard,
+    )
+    handle = scheduler.submit(
+        TaskSpec(chat_id="chat", name="fatal-guard-enter"),
+        lambda _ctx: pytest.fail("callback must not run after guard rejection"),
+    )
+
+    result = handle.wait(timeout=2)
+
+    assert result.status == TaskStatus.FAILED
+    assert result.error == "fatal guard admission"
+    assert scheduler._running_total_normal == 0
+    assert scheduler.wait_for_idle(timeout=0.2) is True
+    scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_guard_exit_base_exception_does_not_escape_wait_or_rewrite_success():
+    class FatalGuardRelease(BaseException):
+        pass
+
+    class FatalExitGuard:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            raise FatalGuardRelease("fatal guard release")
+
+    scheduler = TaskScheduler(
+        max_concurrent=1,
+        per_key_concurrency=1,
+        run_guard=FatalExitGuard,
+    )
+    handle = scheduler.submit(
+        TaskSpec(chat_id="chat", name="fatal-guard-exit"),
+        lambda _ctx: "completed-before-release",
+    )
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        future = handle.get_state().future
+        if future is not None and future.done():
+            break
+        time.sleep(0.001)
+    assert future is not None and future.done()
+
+    result = handle.wait(timeout=2)
+
+    assert result.status == TaskStatus.SUCCEEDED
+    assert result.value == "completed-before-release"
+    assert scheduler._running_total_normal == 0
+    scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_scheduler_publishes_request_scoped_run_id_inside_callback():
+    scheduler = TaskScheduler(max_concurrent=1, per_key_concurrency=1)
+    observed: list[str | None] = []
+
+    handle = scheduler.submit(
+        TaskSpec(chat_id="chat", name="owner-context"),
+        lambda _ctx: observed.append(get_current_task_run_id()),
+    )
+
+    assert handle.wait(timeout=2).status == TaskStatus.SUCCEEDED
+    assert observed == [handle.run_id]
+    assert get_current_task_run_id() is None
+    scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_nested_submit_replaces_inherited_parent_run_id():
+    scheduler = TaskScheduler(max_concurrent=2, per_key_concurrency=1)
+    parent_observed: list[str | None] = []
+    child_observed: list[str | None] = []
+    child_handles = []
+
+    def parent(_ctx):
+        parent_observed.append(get_current_task_run_id())
+        child_handles.append(
+            scheduler.submit(
+                TaskSpec(
+                    chat_id="chat",
+                    name="child",
+                    queue_key="chat:child",
+                ),
+                lambda _child_ctx: child_observed.append(
+                    get_current_task_run_id()
+                ),
+            )
+        )
+
+    parent_handle = scheduler.submit(
+        TaskSpec(
+            chat_id="chat",
+            name="parent",
+            queue_key="chat:parent",
+        ),
+        parent,
+    )
+
+    assert parent_handle.wait(timeout=2).status == TaskStatus.SUCCEEDED
+    assert child_handles[0].wait(timeout=2).status == TaskStatus.SUCCEEDED
+    assert parent_observed == [parent_handle.run_id]
+    assert child_observed == [child_handles[0].run_id]
+    assert child_observed != parent_observed
+    assert get_current_task_run_id() is None
+    scheduler.stop(wait=True, shutdown_executor=True)

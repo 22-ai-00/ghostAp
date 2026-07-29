@@ -244,25 +244,62 @@ class ProjectContext:
     def set_programming_mode(self, mode_type: str, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
         """Generic mode setter — replaces per-mode set_*_mode methods."""
         mode_flag, snap_attr = self._MODE_ATTRS[mode_type]
-        setattr(self, mode_flag, enabled)
-        if enabled and session_id:
-            setattr(self, snap_attr, SessionSnapshot(
-                session_id=session_id, query_count=query_count, last_query="", is_resumable=True
-            ))
-        elif not enabled:
-            snap = getattr(self, snap_attr)
-            if snap:
-                snap.is_resumable = True
+        with self._chat_lock:
+            setattr(self, mode_flag, enabled)
+            if enabled and session_id:
+                setattr(self, snap_attr, SessionSnapshot(
+                    session_id=session_id, query_count=query_count, last_query="", is_resumable=True
+                ))
+            elif not enabled:
+                snap = getattr(self, snap_attr)
+                if snap:
+                    snap.is_resumable = True
 
     def update_programming_snapshot(self, mode_type: str, query: str, query_count: int, session_id: Optional[str] = None):
         """Generic snapshot updater — replaces per-mode update_*_snapshot methods."""
         _, snap_attr = self._MODE_ATTRS[mode_type]
-        snap = getattr(self, snap_attr)
-        if snap:
-            snap.last_query = query
-            snap.query_count = query_count
-            if session_id:
-                snap.session_id = session_id
+        with self._chat_lock:
+            snap = getattr(self, snap_attr)
+            if snap:
+                snap.last_query = query
+                snap.query_count = query_count
+                if session_id:
+                    snap.session_id = session_id
+
+    def get_programming_snapshot(
+        self,
+        mode_type: str,
+    ) -> Optional[SessionSnapshot]:
+        """Read one programming snapshot under the context mutation lock."""
+        _, snap_attr = self._MODE_ATTRS[mode_type]
+        with self._chat_lock:
+            return getattr(self, snap_attr)
+
+    def clear_programming_snapshot(self, mode_type: str) -> bool:
+        """Atomically clear one programming snapshot."""
+        _, snap_attr = self._MODE_ATTRS[mode_type]
+        with self._chat_lock:
+            if getattr(self, snap_attr) is None:
+                return False
+            setattr(self, snap_attr, None)
+            return True
+
+    def clear_programming_snapshot_if_matches(
+        self,
+        mode_type: str,
+        session_id: str,
+    ) -> bool:
+        """Compare-and-clear a snapshot without erasing a newer replacement."""
+        expected = str(session_id or "")
+        if not expected:
+            return False
+        _, snap_attr = self._MODE_ATTRS[mode_type]
+        with self._chat_lock:
+            snapshot = getattr(self, snap_attr)
+            if str(getattr(snapshot, "session_id", "") or "") != expected:
+                return False
+            setattr(self, snap_attr, None)
+            return True
 
     # ── Backward-compatible delegates ──
 
@@ -368,9 +405,10 @@ class ProjectContext:
                 for item in self.conversation_history
             ],
         }
-        for mode_type, (mode_flag, snap_attr) in self._MODE_ATTRS.items():
-            d[mode_flag] = getattr(self, mode_flag)
-            d[snap_attr] = self._snap_to_dict(getattr(self, snap_attr))
+        with self._chat_lock:
+            for mode_type, (mode_flag, snap_attr) in self._MODE_ATTRS.items():
+                d[mode_flag] = getattr(self, mode_flag)
+                d[snap_attr] = self._snap_to_dict(getattr(self, snap_attr))
         return d
 
     @staticmethod

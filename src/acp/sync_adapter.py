@@ -39,6 +39,8 @@ from .startup_utils import initial_startup_diagnostics, safe_float_or_none
 
 logger = logging.getLogger(__name__)
 
+_PROMPT_CANCEL_DRAIN_TIMEOUT_S = 5.0
+
 # 供 resolve_agent_spec 内部 best-effort 读取 manager 缓存时使用，避免引入额外锁实现。
 _NULL_LOCK = contextlib.nullcontext()
 
@@ -1903,6 +1905,38 @@ class SyncACPSession:
                     effective_timeout,
                 )
             self.cancel(wait=True, timeout=2.0)
+            try:
+                future.result(timeout=_PROMPT_CANCEL_DRAIN_TIMEOUT_S)
+            except (
+                asyncio.CancelledError,
+                concurrent.futures.CancelledError,
+            ):
+                pass
+            except TimeoutError:
+                if not future.done():
+                    future.cancel()
+                    self._force_dead = True
+                    logger.warning(
+                        "[ACP:%s] prompt cancel did not drain within %.1fs; "
+                        "session marked dead",
+                        agent_type_str,
+                        _PROMPT_CANCEL_DRAIN_TIMEOUT_S,
+                    )
+                # A completed future may itself carry TimeoutError. In that
+                # case prompt ownership has already drained successfully.
+            except Exception as drain_error:
+                # A prompt-side exception after cancel is still a terminal future:
+                # its finally block has released prompt ownership and event routing.
+                # Transport-terminal errors additionally make the session unsafe
+                # to reuse even though the future itself is complete.
+                drain_detail = str(drain_error).casefold()
+                if (
+                    isinstance(drain_error, (ConnectionError, BrokenPipeError))
+                    or "terminal state" in drain_detail
+                    or "broken pipe" in drain_detail
+                    or ("connection" in drain_detail and "closed" in drain_detail)
+                ):
+                    self._force_dead = True
             raise TimeoutError(f"ACP prompt 执行超时 ({effective_timeout}s)") from e
         except Exception as e:
             err_detail = str(e).lower()
@@ -1921,7 +1955,10 @@ class SyncACPSession:
                     )
             raise
         finally:
-            self._active_future = None
+            # Retain an undrained future so close() can make one more cancellation
+            # attempt while evicting the force-dead session.
+            if future.done() or not getattr(self, "_force_dead", False):
+                self._active_future = None
 
     def set_model(self, model_id: str, timeout: float = 10.0) -> bool:
         """Switch model on the running ACP session via session/setModel.
@@ -1987,30 +2024,48 @@ class SyncACPSession:
 
     def close(self) -> None:
         """Close session and stop event loop."""
-        self._stop_watchdog()
         active_future = getattr(self, "_active_future", None)
-        if active_future is not None and not active_future.done():
-            active_future.cancel()
-        self._active_future = None
-        if self._acp_session and self._loop:
-            try:
+        close_future = None
+        try:
+            self._stop_watchdog()
+            if active_future is not None and not active_future.done():
+                active_future.cancel()
+            if self._acp_session is not None and self._loop is None:
+                raise RuntimeError(
+                    "ACP transport cannot close without its event loop"
+                )
+            if self._acp_session and self._loop:
                 future = asyncio.run_coroutine_threadsafe(
                     self._acp_session.close(),
                     self._loop,
                 )
+                close_future = future
                 future.result(timeout=10)
-            except (TimeoutError, OSError, RuntimeError) as e:
-                logger.debug("Error closing ACP session: %s", get_error_detail(e))
 
-        if self._loop:
-            self._drain_loop_before_close()
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            if self._loop_thread and self._loop_thread.is_alive():
-                self._loop_thread.join(timeout=5)
-            self._loop.close()
+            if self._loop:
+                self._drain_loop_before_close()
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                if self._loop_thread and self._loop_thread.is_alive():
+                    self._loop_thread.join(timeout=5)
+                    if self._loop_thread.is_alive():
+                        raise RuntimeError(
+                            "ACP event loop thread did not stop"
+                        )
+                self._loop.close()
+        except BaseException:
+            self._force_dead = True
+            if close_future is not None and not close_future.done():
+                close_future.cancel()
+            logger.warning(
+                "ACP session close did not confirm transport termination",
+                exc_info=True,
+            )
+            raise
+        else:
+            self._active_future = None
             self._loop = None
-
-        self._acp_session = None
+            self._loop_thread = None
+            self._acp_session = None
 
     def _drain_loop_before_close(self) -> None:
         """Run pending subprocess pipe callbacks before closing the loop."""
@@ -2030,7 +2085,9 @@ class SyncACPSession:
             future = asyncio.run_coroutine_threadsafe(_drain(), loop)
             future.result(timeout=2.0)
         except (TimeoutError, OSError, RuntimeError) as e:
-            logger.debug("[ACP:%s] loop drain before close skipped: %s", self._agent_type, get_error_detail(e))
+            raise RuntimeError(
+                f"ACP event loop drain failed: {get_error_detail(e)}"
+            ) from e
 
     def to_snapshot(self) -> dict:
         """Return session snapshot for persistence."""

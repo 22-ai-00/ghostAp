@@ -519,10 +519,19 @@ class TestClaudeCLISession:
 
         popen_calls = []
 
-        def fake_popen(args, cwd, stdout, stderr, text, env=None):
+        def fake_popen(
+            args,
+            cwd,
+            stdout,
+            stderr,
+            text,
+            env=None,
+            start_new_session=False,
+        ):
             popen_calls.append((args, env))
             assert env is not None
             assert "CLAUDECODE" not in env
+            assert start_new_session is (os.name == "posix")
             return procs.pop(0)
 
         with (

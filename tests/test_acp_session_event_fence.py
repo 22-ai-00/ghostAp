@@ -119,6 +119,30 @@ def test_close_clears_handler_and_releases_active_image_snapshot(
     assert snapshot.active is False
 
 
+def test_close_transport_failure_keeps_termination_handles(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+
+    class FailingContext:
+        async def __aexit__(self, *_args):
+            raise RuntimeError("transport process still alive")
+
+    context = FailingContext()
+    connection = object()
+    process = object()
+    session._ctx_manager = context
+    session._conn = connection
+    session._proc = process
+
+    with pytest.raises(RuntimeError, match="transport process still alive"):
+        asyncio.run(session.close())
+
+    assert session._ctx_manager is context
+    assert session._conn is connection
+    assert session._proc is process
+
+
 def test_prompt_emits_changed_referenced_image_before_snapshot_release(
     tmp_path: Path,
 ) -> None:

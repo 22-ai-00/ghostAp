@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from src.acp.models import (
@@ -214,6 +216,433 @@ def test_known_agent_call_keeps_routing_when_terminal_shape_changes() -> None:
         assert parent.state is not None
         assert parent.state.terminal == "running"
         assert parent.state.metadata.subagents[0]["status"] == "failed"
+    finally:
+        programming.abort()
+
+
+def test_failed_agent_summary_keeps_only_bounded_safe_error_detail() -> None:
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(delivery, session_id="parent-failed-detail")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="agent-failed-detail",
+                    title="agent",
+                    kind="other",
+                    status="in_progress",
+                    content="检查服务状态\n子代理：Explore",
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-failed-detail",
+                    title="agent",
+                    kind="other",
+                    status="failed",
+                    content=json.dumps(
+                        {
+                            "call_id": "call_private_123",
+                            "stdout": "SECRET_STDOUT_MUST_NOT_LEAK",
+                            "error": (
+                                "\x1b[31mcall_private_123 backend timed out "
+                                "![](/tmp/private.png)\n"
+                                + "x" * 500
+                            ),
+                        }
+                    ),
+                ),
+            )
+        )
+
+        assert parent.state is not None
+        summary = parent.state.metadata.subagents[0]
+        assert summary["status"] == "failed"
+        assert 0 < len(summary["error"]) <= 160
+        assert "backend timed out" in summary["error"]
+        assert "call_private_123" not in summary["error"]
+        assert "SECRET_STDOUT_MUST_NOT_LEAK" not in summary["error"]
+        assert "\x1b" not in summary["error"]
+        assert "\n" not in summary["error"]
+        assert "![](" not in summary["error"]
+        assert parent.state.terminal == "running"
+    finally:
+        programming.abort()
+
+
+def test_failed_agent_prefers_structured_result_over_raw_content() -> None:
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(delivery, session_id="parent-structured-failure")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="toolu_01STRUCTURED",
+                    title="agent",
+                    kind="other",
+                    status="in_progress",
+                    content="检查结构化错误\n子代理：Explore",
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="toolu_01STRUCTURED",
+                    title="agent",
+                    kind="other",
+                    status="failed",
+                    content="RAW_CONTENT_MUST_NOT_LEAK",
+                    result={
+                        "call_id": "toolu_01STRUCTURED",
+                        "error": "toolu_01STRUCTURED structured transport timeout",
+                    },
+                ),
+            )
+        )
+
+        assert parent.state is not None
+        summary = parent.state.metadata.subagents[0]
+        assert summary["error"] == "structured transport timeout"
+        assert "RAW_CONTENT_MUST_NOT_LEAK" not in str(summary)
+        assert parent.state.terminal == "running"
+    finally:
+        programming.abort()
+
+
+def test_failed_agent_plain_output_uses_stable_fallback() -> None:
+    """Unstructured terminal output is not proof that the text is an error."""
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(delivery, session_id="parent-plain-failure-output")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="agent-plain-failure",
+                    title="agent",
+                    kind="other",
+                    status="in_progress",
+                    content="检查失败输出\n子代理：Explore",
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-plain-failure",
+                    title="agent",
+                    kind="other",
+                    status="failed",
+                    content=(
+                        "PRIVATE_WORKSPACE_SOURCE and /srv/internal/project "
+                        "are raw output, not a typed exception"
+                    ),
+                ),
+            )
+        )
+
+        assert parent.state is not None
+        summary = parent.state.metadata.subagents[0]
+        assert summary["error"] == "子任务执行失败"
+        assert "PRIVATE_WORKSPACE_SOURCE" not in str(summary)
+        assert "/srv/internal/project" not in str(summary)
+    finally:
+        programming.abort()
+
+
+def test_failed_terminal_preserves_generic_label_instead_of_output_command() -> None:
+    client = _CardClient()
+    delivery = CardDelivery(client)
+    parent = _card_session(delivery, session_id="parent-generic-label")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="agent-generic-label",
+                    title="task",
+                    kind="other",
+                    status="in_progress",
+                    content="",
+                ),
+            )
+        )
+        assert parent.state.metadata.subagents[0]["label"] == "子任务"
+
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-generic-label",
+                    title="task",
+                    kind="other",
+                    status="failed",
+                    content=json.dumps(
+                        {
+                            "command": [
+                                "/bin/zsh",
+                                "-lc",
+                                "uv run secret-command",
+                            ],
+                            "error": "transport timeout",
+                        }
+                    ),
+                ),
+            )
+        )
+
+        assert parent.state is not None
+        summary = parent.state.metadata.subagents[0]
+        assert summary["label"] == "子任务"
+        assert "secret-command" not in str(summary)
+        assert client.created == 1
+    finally:
+        programming.abort()
+
+
+def test_failed_agent_terminal_ignores_late_nonterminal_update() -> None:
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(delivery, session_id="parent-late-agent-update")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="agent-late-update",
+                    title="agent",
+                    kind="other",
+                    status="in_progress",
+                    content="保留失败终态\n子代理：Explore",
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-late-update",
+                    title="agent",
+                    kind="other",
+                    status="failed",
+                    content="first transport timeout",
+                ),
+            )
+        )
+        failed_summary = dict(parent.state.metadata.subagents[0])
+
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=ToolCallInfo(
+                    id="agent-late-update",
+                    title="shell",
+                    kind="execute",
+                    status="in_progress",
+                    content="late command output",
+                ),
+            )
+        )
+
+        assert parent.state is not None
+        assert parent.state.metadata.subagents[0] == failed_summary
+        assert parent.state.terminal == "running"
+    finally:
+        programming.abort()
+
+
+@pytest.mark.parametrize(
+    ("first_status", "conflicting_status"),
+    [("failed", "completed"), ("completed", "failed")],
+)
+def test_agent_first_terminal_status_wins_conflicting_done(
+    first_status: str,
+    conflicting_status: str,
+) -> None:
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(
+        delivery,
+        session_id=f"parent-terminal-{first_status}",
+    )
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="agent-terminal-fence",
+                    title="agent",
+                    kind="other",
+                    status="in_progress",
+                    content="终态栅栏\n子代理：Explore",
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-terminal-fence",
+                    title="agent",
+                    kind="other",
+                    status=first_status,
+                    content="first terminal detail",
+                ),
+            )
+        )
+        first_summary = dict(parent.state.metadata.subagents[0])
+
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-terminal-fence",
+                    title="shell",
+                    kind="execute",
+                    status=conflicting_status,
+                    content="conflicting terminal detail",
+                ),
+            )
+        )
+
+        assert parent.state is not None
+        assert parent.state.metadata.subagents[0] == first_summary
+        assert parent.state.terminal == "running"
+    finally:
+        programming.abort()
+
+
+def test_duplicate_failed_terminal_only_enriches_failure_detail() -> None:
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(delivery, session_id="parent-duplicate-failure")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="agent-duplicate-failure",
+                    title="agent",
+                    kind="other",
+                    status="in_progress",
+                    content="补充失败原因\n子代理：Explore",
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-duplicate-failure",
+                    title="agent",
+                    kind="other",
+                    status="failed",
+                    content="",
+                ),
+            )
+        )
+        first_summary = dict(parent.state.metadata.subagents[0])
+
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-duplicate-failure",
+                    title="shell",
+                    kind="execute",
+                    status="failed",
+                    content=json.dumps(
+                        {"error": "later structured timeout"}
+                    ),
+                ),
+            )
+        )
+
+        assert parent.state is not None
+        summary = parent.state.metadata.subagents[0]
+        assert summary["label"] == first_summary["label"]
+        assert summary["tool"] == first_summary["tool"]
+        assert summary["sequence"] == first_summary["sequence"]
+        assert summary["error"] == "later structured timeout"
+        assert parent.state.terminal == "running"
+    finally:
+        programming.abort()
+
+
+def test_duplicate_failed_terminal_preserves_existing_specific_reason() -> None:
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(delivery, session_id="parent-stable-failure-reason")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="agent-stable-failure",
+                    title="agent",
+                    kind="other",
+                    status="in_progress",
+                    content="保持首个真实失败原因\n子代理：Explore",
+                ),
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-stable-failure",
+                    title="agent",
+                    kind="other",
+                    status="failed",
+                    content=json.dumps(
+                        {"error": "permission denied by repository policy"}
+                    ),
+                ),
+            )
+        )
+        first_summary = dict(parent.state.metadata.subagents[0])
+
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="agent-stable-failure",
+                    title="shell",
+                    kind="execute",
+                    status="failed",
+                    content=json.dumps(
+                        {"error": "late generic transport timeout"}
+                    ),
+                ),
+            )
+        )
+
+        assert parent.state is not None
+        assert parent.state.metadata.subagents[0] == first_summary
+        assert (
+            parent.state.metadata.subagents[0]["error"]
+            == "permission denied by repository policy"
+        )
     finally:
         programming.abort()
 

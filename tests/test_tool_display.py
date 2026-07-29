@@ -115,6 +115,18 @@ def test_task_label_rejects_unterminated_json_fragment():
     assert extract_tool_call_label(call, generic_labels={"task"}) == "子任务"
 
 
+def test_task_label_rejects_truncated_formatted_output_fragment():
+    call = ToolCallInfo(
+        id="call_internal",
+        title="task",
+        kind="other",
+        status="in_progress",
+        content='"formatted_output": "FFFFFF',
+    )
+
+    assert extract_tool_call_label(call, generic_labels={"task"}) == "子任务"
+
+
 @pytest.mark.parametrize(
     "label",
     [
@@ -133,3 +145,87 @@ def test_task_label_keeps_bracketed_or_json_named_human_text(label):
     )
 
     assert extract_tool_call_label(call, generic_labels={"task"}) == label
+
+
+def test_failure_detail_extracts_nested_error_without_structured_stdout():
+    detail = tool_display.sanitize_tool_failure_detail(
+        {
+            "call_id": "call_private_123",
+            "stdout": "SECRET_STDOUT_MUST_NOT_LEAK",
+            "result": {
+                "message": "call_private_123 transport timed out",
+            },
+        }
+    )
+
+    assert detail == "transport timed out"
+    assert "SECRET_STDOUT_MUST_NOT_LEAK" not in detail
+
+
+def test_failure_detail_removes_arbitrary_structured_ids_and_commands():
+    current_call_id = "550e8400-e29b-41d4-a716-446655440000"
+    payload_call_id = "toolu_01JZ8G7R4M"
+    nested_id = "request-opaque-987"
+    command = "uv run secret-command --token hidden"
+
+    detail = tool_display.sanitize_tool_failure_detail(
+        {
+            "call_id": payload_call_id,
+            "command": ["/bin/zsh", "-lc", command],
+            "result": {
+                "id": nested_id,
+                "error": (
+                    f"{current_call_id} {payload_call_id} {nested_id} "
+                    f"{command} timed out"
+                ),
+            },
+        },
+        opaque_ids=(current_call_id,),
+    )
+
+    assert "timed out" in detail
+    assert current_call_id not in detail
+    assert payload_call_id not in detail
+    assert nested_id not in detail
+    assert command not in detail
+
+
+def test_failure_detail_removes_short_id_without_corrupting_other_numbers():
+    detail = tool_display.sanitize_tool_failure_detail(
+        {
+            "id": 1,
+            "error": "request 1 failed after 10 attempts",
+        }
+    )
+
+    assert detail == "request failed after 10 attempts"
+
+
+def test_failure_detail_removes_known_id_without_corrupting_word_substrings():
+    detail = tool_display.sanitize_tool_failure_detail(
+        {
+            "id": "test",
+            "error": "latest test failed",
+        }
+    )
+
+    assert detail == "latest failed"
+
+
+def test_failure_detail_removes_full_ansi_and_redacts_secrets():
+    secret = "sk-0123456789abcdef"
+
+    detail = tool_display.sanitize_tool_failure_detail(
+        (
+            "\x1b]8;;https://evil.example/private\x07click\x1b]8;;\x07 "
+            "\x1b[31mAPI_TOKEN="
+            f"{secret} timed out\x1b[0m\u202e"
+        )
+    )
+
+    assert "timed out" in detail
+    assert secret not in detail
+    assert "evil.example" not in detail
+    assert "\x1b" not in detail
+    assert "\x07" not in detail
+    assert "\u202e" not in detail

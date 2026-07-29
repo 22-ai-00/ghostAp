@@ -7,6 +7,9 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from src.utils.redact import redact_sensitive
+from src.utils.text import sanitize_single_line_label
+
 _MAX_LABEL_CHARS = 80
 _JSON_EDGE_LINES = {"{", "}", "[", "]"}
 _AGENT_TOOL_TITLES = {"agent", "subagent", "task"}
@@ -15,6 +18,10 @@ _LITERAL_ESCAPE_RE = re.compile(r"""\\(?:["'nrtbfv0])""")
 _CONTROL_SEPARATOR_RE = re.compile(r"(?:\\[nrtbfv0]|[\x00-\x1f\x7f])")
 _INLINE_STRUCTURED_RE = re.compile(
     r"""[{\[]\s*["'][^"']+["']\s*:""",
+    re.IGNORECASE,
+)
+_LEADING_STRUCTURED_MEMBER_RE = re.compile(
+    r"""^\s*["'][^"']+["']\s*:""",
     re.IGNORECASE,
 )
 _MALFORMED_ARRAY_RE = re.compile(
@@ -28,6 +35,66 @@ _CODE_FRAGMENT_RE = re.compile(
     r"|==|!=|<=|>=|:=|=>|&&|\|\|"
     r")",
     re.IGNORECASE,
+)
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:"
+    r"(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)"
+    r"|(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]"
+    r"|(?:\x1b[P^_]|\x90|\x98|\x9e|\x9f)"
+    r"[\s\S]*?(?:\x1b\\|\x9c|$)"
+    r"|\x1b[@-_]"
+    r")",
+)
+_UNSAFE_FORMAT_CONTROL_RE = re.compile(
+    r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]"
+)
+_FAILURE_KEYS = (
+    "error",
+    "error_message",
+    "message",
+    "reason",
+    "detail",
+    "stderr",
+)
+_FAILURE_IGNORED_KEYS = frozenset(
+    {
+        "call_id",
+        "command",
+        "cmd",
+        "id",
+        "input",
+        "output",
+        "prompt",
+        "raw_output",
+        "stdout",
+    }
+)
+_OPAQUE_VALUE_KEYS = frozenset(
+    {
+        "call_id",
+        "id",
+        "request_id",
+        "tool_call_id",
+        "tool_use_id",
+    }
+)
+_COMMAND_VALUE_KEYS = frozenset({"cmd", "command"})
+_MARKDOWN_META_TRANSLATION = str.maketrans(
+    {
+        "<": "＜",
+        "\\": "＼",
+        "`": "ˋ",
+        "*": "＊",
+        "_": "＿",
+        "[": "［",
+        "]": "］",
+        "(": "（",
+        ")": "）",
+        "!": "！",
+        "#": "＃",
+        ">": "＞",
+        "~": "～",
+    }
 )
 
 _READ_TYPES = {"read", "read_file", "cat", "head", "tail", "list", "ls", "tree"}
@@ -74,6 +141,59 @@ def sanitize_tool_event_content(content: str, *, fallback: str = "") -> str:
     if parsed is None:
         return text
     return summarize_tool_call_content(text, fallback=fallback, max_chars=160)
+
+
+def sanitize_tool_failure_detail(
+    content: object,
+    *,
+    fallback: str = "子任务执行失败",
+    max_chars: int = 160,
+    opaque_ids: Iterable[object] = (),
+    allow_unstructured: bool = True,
+) -> str:
+    """Extract one bounded, markdown-neutral failure reason.
+
+    Structured tool payloads may contain full stdout, opaque call IDs, command
+    metadata, and terminal control sequences. Only explicit error fields are
+    eligible when ``allow_unstructured`` is false; everything else is reduced
+    to the caller-provided fallback.
+    """
+
+    if isinstance(content, Mapping) or (
+        isinstance(content, Sequence)
+        and not isinstance(content, (str, bytes, bytearray))
+    ):
+        text = ""
+        parsed = content
+    else:
+        text = str(content or "").strip()
+        parsed = _parse_json(text)
+    candidate = (
+        _find_failure_text(parsed)
+        if parsed is not None
+        else text if allow_unstructured else ""
+    )
+    if not candidate:
+        candidate = str(fallback or "")
+    candidate = _ANSI_ESCAPE_RE.sub("", candidate)
+    candidate = _remove_opaque_values(
+        candidate,
+        (
+            *_collect_opaque_values(parsed),
+            *_normalize_opaque_values(opaque_ids),
+        ),
+    )
+    candidate = _OPAQUE_CALL_ID_RE.sub("", candidate)
+    candidate = redact_sensitive(candidate)
+    candidate = _CONTROL_SEPARATOR_RE.sub(" ", candidate)
+    candidate = _UNSAFE_FORMAT_CONTROL_RE.sub("", candidate)
+    candidate = sanitize_single_line_label(
+        candidate,
+        fallback=fallback,
+        max_chars=max_chars + 1,
+    )
+    candidate = candidate.translate(_MARKDOWN_META_TRANSLATION)
+    return _truncate(candidate, max_chars)
 
 
 def extract_tool_call_label(
@@ -151,6 +271,8 @@ def is_unhelpful_display_label(value: str) -> bool:
         return True
     if text.startswith("{") or _MALFORMED_ARRAY_RE.search(text):
         return True
+    if _LEADING_STRUCTURED_MEMBER_RE.search(text):
+        return True
     if _INLINE_STRUCTURED_RE.search(text):
         return True
     if _CODE_FRAGMENT_RE.search(text):
@@ -165,6 +287,128 @@ def _parse_json(text: str) -> Any | None:
         return json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
+
+
+def _find_failure_text(value: Any) -> str:
+    if isinstance(value, Mapping):
+        normalized = {
+            str(key).strip().lower(): item
+            for key, item in value.items()
+        }
+        for key in _FAILURE_KEYS:
+            if key not in normalized:
+                continue
+            item = normalized[key]
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+            nested = _find_failure_text(item)
+            if nested:
+                return nested
+        for key, item in normalized.items():
+            if key in _FAILURE_IGNORED_KEYS:
+                continue
+            if not isinstance(item, Mapping) and not (
+                isinstance(item, Sequence)
+                and not isinstance(item, (str, bytes, bytearray))
+            ):
+                continue
+            nested = _find_failure_text(item)
+            if nested:
+                return nested
+        return ""
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        for item in value:
+            nested = _find_failure_text(item)
+            if nested:
+                return nested
+    return ""
+
+
+def _collect_opaque_values(value: Any) -> tuple[str, ...]:
+    values: list[str] = []
+
+    def add(item: object) -> None:
+        text = str(item if item is not None else "").strip()
+        if text and text not in values:
+            values.append(text)
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for raw_key, nested in item.items():
+                key = str(raw_key).strip().lower()
+                is_nested_collection = isinstance(nested, Mapping) or (
+                    isinstance(nested, Sequence)
+                    and not isinstance(nested, (str, bytes, bytearray))
+                )
+                if key in _OPAQUE_VALUE_KEYS and not is_nested_collection:
+                    add(nested)
+                elif key in _COMMAND_VALUE_KEYS:
+                    for command_value in _command_opaque_values(nested):
+                        add(command_value)
+                if is_nested_collection:
+                    visit(nested)
+        elif isinstance(item, Sequence) and not isinstance(
+            item,
+            (str, bytes, bytearray),
+        ):
+            for nested in item:
+                visit(nested)
+
+    if value is not None:
+        visit(value)
+    return tuple(values)
+
+
+def _command_opaque_values(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return (value.strip(),) if value.strip() else ()
+    if not isinstance(value, Sequence) or isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        return ()
+
+    parts = [str(part).strip() for part in value if str(part).strip()]
+    values = [" ".join(parts)] if parts else []
+    if "-lc" in parts:
+        index = parts.index("-lc")
+        if index + 1 < len(parts):
+            values.append(parts[index + 1])
+    return tuple(values)
+
+
+def _normalize_opaque_values(values: Iterable[object]) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes, bytearray)):
+        values = (values,)
+    normalized: list[str] = []
+    for value in values:
+        text = str(value if value is not None else "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return tuple(normalized)
+
+
+def _remove_opaque_values(text: str, values: Iterable[str]) -> str:
+    cleaned = str(text or "")
+    unique = sorted(
+        {
+            str(value if value is not None else "").strip()
+            for value in values
+            if str(value if value is not None else "").strip()
+        },
+        key=len,
+        reverse=True,
+    )
+    for value in unique:
+        cleaned = re.sub(
+            rf"(?<![\w]){re.escape(value)}(?![\w])",
+            "",
+            cleaned,
+        )
+    return cleaned
 
 
 def _describe_json_payload(data: Any) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import threading
@@ -21,8 +22,27 @@ from ..config import get_settings
 from ..utils.errors import get_error_detail
 from ..utils.retry import RetryPolicy, prompt_with_retry
 from .employee_cli_sandbox import EmployeeCLISandbox
+from .process_cleanup import terminate_and_reap_process_tree
 
 logger = logging.getLogger(__name__)
+
+_CLI_TERMINATE_GRACE_S = 5.0
+_CLI_KILL_GRACE_S = 3.0
+
+
+def _terminate_and_reap_process(
+    proc: subprocess.Popen,
+    *,
+    process_group_id: int | None = None,
+) -> bool:
+    """Bounded TERM→KILL cleanup for one CLI subprocess tree."""
+    return terminate_and_reap_process_tree(
+        proc,
+        process_group_id=process_group_id,
+        terminate_grace=_CLI_TERMINATE_GRACE_S,
+        kill_grace=_CLI_KILL_GRACE_S,
+        label="ClaudeCLI",
+    )
 
 
 @dataclass
@@ -52,7 +72,9 @@ class SyncClaudeCLISession:
         self._cwd = cwd
         self._cfg = config or ClaudeCLIConfig()
         self._proc: Optional[subprocess.Popen] = None
+        self._proc_group_id: int | None = None
         self._cancel_event = threading.Event()
+        self._force_dead = False
         self._tool_filter = None
         self._employee_sandbox = (
             EmployeeCLISandbox(cwd=cwd, process_env=employee_process_env)
@@ -171,6 +193,7 @@ class SyncClaudeCLISession:
             """Run one claude invocation and return (returncode, stdout, stderr, state)."""
             args = _build_args(resumed)
             chunks: list[str] = []
+            ensure_process_stopped: Callable[[], bool] | None = None
             try:
                 # Claude Code CLI refuses to launch inside another Claude Code session.
                 # Our process may run under Claude Code / other wrappers, so we must
@@ -190,6 +213,12 @@ class SyncClaudeCLISession:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    start_new_session=(os.name == "posix"),
+                )
+                self._proc_group_id = (
+                    getattr(self._proc, "pid", None)
+                    if os.name == "posix"
+                    else None
                 )
 
                 deadline = (time.monotonic() + timeout) if timeout else None
@@ -199,29 +228,54 @@ class SyncClaudeCLISession:
                 # since blocking readline cannot check these conditions.
                 terminated_reason: list[str] = []
                 proc_ref = self._proc
+                proc_group_id = self._proc_group_id
+                cleanup_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+                cleanup_done = threading.Event()
+                cleanup_succeeded = [False]
+
+                def _ensure_process_stopped() -> bool:
+                    with cleanup_lock:
+                        if cleanup_done.is_set():
+                            return cleanup_succeeded[0]
+                        cleanup_succeeded[0] = _terminate_and_reap_process(
+                            proc_ref,
+                            process_group_id=proc_group_id,
+                        )
+                        cleanup_done.set()
+                        if not cleanup_succeeded[0]:
+                            self._force_dead = True
+                        return cleanup_succeeded[0]
+
+                ensure_process_stopped = _ensure_process_stopped
 
                 def _watchdog():
                     while True:
-                        try:
-                            if proc_ref.poll() is not None:
-                                return
-                        except Exception:
-                            return
                         if self._cancel_event.is_set():
                             terminated_reason.append("cancelled")
-                            try:
-                                proc_ref.terminate()
-                            except Exception:
-                                pass
+                            _ensure_process_stopped()
+                            return
+                        try:
+                            leader_exited = proc_ref.poll() is not None
+                        except Exception:
+                            _ensure_process_stopped()
+                            return
+                        if leader_exited:
+                            # A descendant may still own stdout/stderr after the
+                            # CLI leader exits. Converge the whole process group
+                            # before letting the blocking reader wait for EOF.
+                            _ensure_process_stopped()
                             return
                         if deadline and time.monotonic() > deadline:
                             terminated_reason.append("timeout")
-                            try:
-                                proc_ref.terminate()
-                            except Exception:
-                                pass
+                            _ensure_process_stopped()
                             return
-                        self._cancel_event.wait(timeout=1.0)
+                        wait_timeout = 0.1
+                        if deadline is not None:
+                            wait_timeout = min(
+                                wait_timeout,
+                                max(0.0, deadline - time.monotonic()),
+                            )
+                        self._cancel_event.wait(timeout=wait_timeout)
 
                 watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
                 watchdog_thread.start()
@@ -230,27 +284,56 @@ class SyncClaudeCLISession:
                     if terminated_reason:
                         break
                     if self._cancel_event.is_set():
-                        self._proc.terminate()
-                        self._proc.wait(timeout=5)
+                        _ensure_process_stopped()
                         return (1, "".join(chunks), "", "cancelled")
                     if deadline and time.monotonic() > deadline:
-                        self._proc.terminate()
-                        self._proc.wait(timeout=5)
-                        return (1, "".join(chunks), "", "timeout")
+                        try:
+                            leader_running = proc_ref.poll() is None
+                        except Exception:
+                            leader_running = True
+                        if leader_running:
+                            _ensure_process_stopped()
+                            return (1, "".join(chunks), "", "timeout")
                     chunks.append(line)
                     if on_event:
                         on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=line))
 
-                self._proc.wait(timeout=30)
-
                 if terminated_reason:
+                    _ensure_process_stopped()
                     return (1, "".join(chunks), "", terminated_reason[0])
+                try:
+                    self._proc.wait(timeout=_CLI_TERMINATE_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    reaped = _ensure_process_stopped()
+                    if not reaped:
+                        self._force_dead = True
+                    if deadline and time.monotonic() >= deadline:
+                        return (1, "".join(chunks), "", "timeout")
+                    raise
 
                 rc = int(self._proc.returncode or 0)
                 err = (self._proc.stderr.read() or "").strip("\n") if self._proc.stderr else ""
                 return (rc, "".join(chunks).strip("\n"), err, "ok")
             finally:
-                self._proc = None
+                proc = self._proc
+                proc_group_id = self._proc_group_id
+                if proc is None:
+                    self._proc = None
+                    self._proc_group_id = None
+                elif (
+                    ensure_process_stopped()
+                    if ensure_process_stopped is not None
+                    else _terminate_and_reap_process(
+                        proc,
+                        process_group_id=proc_group_id,
+                    )
+                ):
+                    self._proc = None
+                    self._proc_group_id = None
+                else:
+                    self._force_dead = True
+                    self._proc = proc
+                    self._proc_group_id = proc_group_id
 
         def _is_missing_conversation(err_text: str, out_text: str) -> bool:
             blob = (err_text or "") + "\n" + (out_text or "")
@@ -333,8 +416,19 @@ class SyncClaudeCLISession:
                 logger.debug("SyncClaudeCLISession.cancel: terminate failed", exc_info=True)
 
     def close(self) -> None:
-        # Nothing persistent to close.
-        return
+        proc = self._proc
+        if proc is None:
+            return
+        if _terminate_and_reap_process(
+            proc,
+            process_group_id=self._proc_group_id,
+        ):
+            self._proc = None
+            self._proc_group_id = None
+            return
+        self._force_dead = True
+        self._proc = proc
+        raise RuntimeError("Claude CLI failed to terminate subprocess")
 
     def to_snapshot(self) -> dict:
         return {

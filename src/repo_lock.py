@@ -1,8 +1,8 @@
 """Repo-level mutex lock manager (in-memory, single-process).
 
-Prevents multiple chats from concurrently operating on the same git repository.
-Supports reentrant acquire (same chat_id), p2p privilege bypass, idle-timeout
-auto-release via a background daemon thread.
+Prevents concurrent requests from operating on the same git repository.
+Supports request-owner reentrant acquire, p2p privilege bypass, and renewable
+lease cleanup via a background daemon thread.
 
 已知限制（V1）：
 - 纯内存单进程实现，进程重启后所有仓库锁状态丢失（重启后所有子进程已终止，
@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import math
 import threading
 import time
 from collections.abc import Generator
@@ -26,6 +27,27 @@ from src.utils.lock_order import LockLevel, ordered_lock
 from src.utils.path import normalize_repo_path
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_HEARTBEAT_INTERVAL_S = 30.0
+_HEARTBEAT_RENEWALS_PER_LEASE = 3.0
+
+
+def get_repo_lock_heartbeat_interval(manager: object) -> float:
+    """Return a safe numeric heartbeat interval from a repo-lock manager."""
+
+    raw = getattr(
+        manager,
+        "heartbeat_interval",
+        _DEFAULT_HEARTBEAT_INTERVAL_S,
+    )
+    if (
+        isinstance(raw, bool)
+        or not isinstance(raw, (int, float))
+        or not math.isfinite(raw)
+        or raw <= 0
+    ):
+        return _DEFAULT_HEARTBEAT_INTERVAL_S
+    return float(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +126,7 @@ class RepoLockEntry:
     """Internal bookkeeping for a single repo lock."""
 
     chat_id: str
+    owner_id: str = ""
     refcount: int = 1
     acquired_at: float = field(default_factory=time.monotonic)
     last_active_time: float = field(default_factory=time.monotonic)
@@ -240,15 +263,39 @@ class RepoLockManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def acquire(self, root_path: str, chat_id: str, is_p2p: bool = False, *, sender_id: str = "") -> AcquireResult:
-        """Try to acquire a lock on *root_path* for *chat_id*.
+    @property
+    def heartbeat_interval(self) -> float:
+        """Renew active leases at least three times before they expire."""
+
+        lease_seconds = float(self._hard_timeout)
+        if not math.isfinite(lease_seconds) or lease_seconds <= 0:
+            return _DEFAULT_HEARTBEAT_INTERVAL_S
+        return min(
+            _DEFAULT_HEARTBEAT_INTERVAL_S,
+            lease_seconds / _HEARTBEAT_RENEWALS_PER_LEASE,
+        )
+
+    def acquire(
+        self,
+        root_path: str,
+        chat_id: str,
+        is_p2p: bool = False,
+        *,
+        sender_id: str = "",
+        owner_id: str | None = None,
+    ) -> AcquireResult:
+        """Try to acquire a lock for one chat/request owner.
 
         本方法支持**可重入**（reentrant）语义：
 
         - ``is_p2p=True`` → 始终成功（私聊特权，不实际获取锁）。
-        - 同一 ``chat_id`` 重复获取 → refcount++，成功。调用方需对应
+        - 同一 ``(chat_id, owner_id)`` 重复获取 → refcount++，成功。调用方需对应
           调用 ``release()`` 来递减 refcount，降为 0 时释放。
-        - 不同 ``chat_id`` 持有 → 拒绝，返回持有者信息。
+        - 不同 owner 持有 → 拒绝，返回持有聊天信息。
+
+        ``owner_id=None`` preserves the legacy chat-scoped API for callers
+        outside the task scheduler. Production request paths pass the current
+        scheduler run id explicitly.
         """
         key = normalize_repo_path(root_path)
         if key is None:
@@ -261,16 +308,26 @@ class RepoLockManager:
         self._ensure_cleanup_thread()
 
         now = time.monotonic()
+        normalized_owner_id = str(owner_id or "")
         with self._mu:
             entry = self._locks.get(key)
             if entry is None:
                 # No one holds this lock — create new entry.
-                self._locks[key] = RepoLockEntry(chat_id=chat_id, acquired_at=now, last_active_time=now, last_sender_id=sender_id)
+                self._locks[key] = RepoLockEntry(
+                    chat_id=chat_id,
+                    owner_id=normalized_owner_id,
+                    acquired_at=now,
+                    last_active_time=now,
+                    last_sender_id=sender_id,
+                )
                 logger.info("RepoLock: acquired %s by chat=%s", key, chat_id[:12])
                 return AcquireResult(success=True)
 
-            if entry.chat_id == chat_id:
-                # Reentrant — same chat, bump refcount + refresh activity.
+            if (
+                entry.chat_id == chat_id
+                and entry.owner_id == normalized_owner_id
+            ):
+                # Reentrant — same request owner, bump refcount + refresh.
                 entry.refcount += 1
                 entry.last_active_time = now
                 entry.last_sender_id = sender_id
@@ -293,16 +350,27 @@ class RepoLockManager:
                 last_active_time=entry.last_active_time,
             )
 
-    def release(self, root_path: str, chat_id: str) -> None:
+    def release(
+        self,
+        root_path: str,
+        chat_id: str,
+        *,
+        owner_id: str | None = None,
+    ) -> None:
         """Decrement refcount; remove entry when it reaches 0."""
         key = normalize_repo_path(root_path)
         if key is None:
             return
 
         notify_chats: set[str] = set()
+        normalized_owner_id = str(owner_id or "")
         with self._mu:
             entry = self._locks.get(key)
-            if entry is None or entry.chat_id != chat_id:
+            if (
+                entry is None
+                or entry.chat_id != chat_id
+                or entry.owner_id != normalized_owner_id
+            ):
                 return
             entry.refcount -= 1
             if entry.refcount <= 0:
@@ -340,14 +408,25 @@ class RepoLockManager:
         if notify_chats:
             self.on_release.emit(key, notify_chats)
 
-    def touch(self, root_path: str, chat_id: str) -> None:
+    def touch(
+        self,
+        root_path: str,
+        chat_id: str,
+        *,
+        owner_id: str | None = None,
+    ) -> None:
         """Refresh ``last_active_time`` to prevent idle-timeout release."""
         key = normalize_repo_path(root_path)
         if key is None:
             return
+        normalized_owner_id = str(owner_id or "")
         with self._mu:
             entry = self._locks.get(key)
-            if entry and entry.chat_id == chat_id:
+            if (
+                entry
+                and entry.chat_id == chat_id
+                and entry.owner_id == normalized_owner_id
+            ):
                 entry.last_active_time = time.monotonic()
 
     def list_locks(self) -> list[RepoLockInfo]:
@@ -418,6 +497,7 @@ class RepoLockManager:
         on_conflict: Optional[Callable[[AcquireResult], None]] = None,
         *,
         sender_id: str = "",
+        owner_id: str | None = None,
     ) -> Generator[AcquireResult, None, None]:
         """Context manager that acquires and auto-releases a repo lock.
 
@@ -434,7 +514,13 @@ class RepoLockManager:
           ``AcquireResult`` and the result is yielded with
           ``success=False``.  The caller must check ``result.success``.
         """
-        result = self.acquire(root_path, chat_id, is_p2p=is_p2p, sender_id=sender_id)
+        result = self.acquire(
+            root_path,
+            chat_id,
+            is_p2p=is_p2p,
+            sender_id=sender_id,
+            owner_id=owner_id,
+        )
         if not result.success:
             if on_conflict is not None:
                 on_conflict(result)
@@ -454,7 +540,11 @@ class RepoLockManager:
         finally:
             # Only release for non-p2p — p2p never actually acquired.
             if not is_p2p:
-                self.release(root_path, chat_id)
+                self.release(
+                    root_path,
+                    chat_id,
+                    owner_id=owner_id,
+                )
 
     # ------------------------------------------------------------------
     # Background cleanup
@@ -492,11 +582,17 @@ class RepoLockManager:
                     path, entry.chat_id[:12], now - entry.last_active_time,
                 )
 
-            # Phase 2: hard_timeout — force-evict entries with refcount > 0
-            # that have been held longer than the absolute hard limit.
+            # Phase 2: hard_timeout — reclaim only an active entry whose
+            # renewable lease has stopped receiving touch() heartbeats.
+            # Total runtime is deliberately not a cap: programming tasks may
+            # validly run longer than this threshold, and reclaiming a recently
+            # renewed lock would allow another request to mutate the same repo.
             hard_expired = [
                 path for path, entry in self._locks.items()
-                if entry.refcount > 0 and (now - entry.acquired_at) > self._hard_timeout
+                if (
+                    entry.refcount > 0
+                    and (now - entry.last_active_time) > self._hard_timeout
+                )
             ]
             for path in hard_expired:
                 entry = self._locks.pop(path)
@@ -507,8 +603,13 @@ class RepoLockManager:
                 if blocked:
                     released_blocked.append((path, blocked))
                 logger.critical(
-                    "RepoLock: hard-timeout force-reclaimed %s (chat=%s, refcount=%d, held=%.0fs)",
-                    path, entry.chat_id[:12], entry.refcount, now - entry.acquired_at,
+                    "RepoLock: hard-timeout force-reclaimed %s "
+                    "(chat=%s, refcount=%d, lease_idle=%.0fs, held=%.0fs)",
+                    path,
+                    entry.chat_id[:12],
+                    entry.refcount,
+                    now - entry.last_active_time,
+                    now - entry.acquired_at,
                 )
                 hard_reclaimed.append((path, entry.chat_id))
 

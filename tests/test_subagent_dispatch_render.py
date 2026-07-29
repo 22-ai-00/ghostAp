@@ -34,6 +34,25 @@ def test_render_subagent_dispatch_panel_uses_orange_parallel_summary():
     assert "UI 回归 · #5.b · Codex · gpt-5" in panel["elements"][0]["content"]
 
 
+def test_render_subagent_dispatch_panel_does_not_present_unknown_status_as_success():
+    panel = render_subagent_dispatch_panel(
+        [
+            {
+                "label": "状态损坏的子任务",
+                "tool": "Codex",
+                "status": "unexpected-terminal",
+            }
+        ]
+    )
+
+    assert panel is not None
+    assert panel["expanded"] is True
+    assert panel["border"]["color"] == "orange"
+    assert panel["header"]["title"]["content"].startswith("🟠")
+    assert "未知 1" in panel["header"]["title"]["content"]
+    assert "暂无状态" not in panel["header"]["title"]["content"]
+
+
 def test_build_subagent_dispatch_atom_renders_through_registry():
     atom = build_subagent_dispatch_atom(_subagents())
 

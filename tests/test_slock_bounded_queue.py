@@ -223,6 +223,27 @@ class TestTrimEscalations:
 class TestBoundedExecutorQueueFull:
     """AC-17: BoundedExecutor rejects submissions when queue is full."""
 
+    def test_shutdown_can_cancel_queued_work_during_service_quiesce(self):
+        executor = BoundedExecutor(max_workers=1, max_queue_size=3)
+        running = threading.Event()
+        release = threading.Event()
+        queued_ran = threading.Event()
+
+        def first():
+            running.set()
+            release.wait(timeout=2)
+
+        first_future = executor.submit(first)
+        assert running.wait(timeout=1)
+        queued_future = executor.submit(queued_ran.set)
+
+        executor.shutdown(wait=False, cancel_futures=True)
+        release.set()
+        first_future.result(timeout=1)
+
+        assert queued_future.cancelled()
+        assert not queued_ran.is_set()
+
     def test_queue_full_raises_error(self):
         """Fill worker+queue capacity, then next submit raises QueueFullError."""
         barrier = threading.Barrier(2 + 1)  # 2 workers + main thread signal

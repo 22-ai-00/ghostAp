@@ -272,6 +272,12 @@ class TestTelemetryPublicExports:
                 self.last_active = last_active
                 self.message_count = message_count
 
+            def to_snapshot(self) -> dict:
+                return {"session_id": self.session_id}
+
+            def close(self) -> None:
+                return None
+
         now = time.time()
         dummy = DummySession(last_active=now - 60)
 

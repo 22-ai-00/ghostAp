@@ -34,7 +34,11 @@ class EngineResourceGroup:
         return engines
 
     @staticmethod
-    def wait_stopped(engines: list[Any], timeout_s: float = 5.0, interval_s: float = 0.05) -> None:
+    def wait_stopped(
+        engines: list[Any],
+        timeout_s: float = 5.0,
+        interval_s: float = 0.05,
+    ) -> bool:
         deadline = time.time() + max(0.1, timeout_s)
         while time.time() < deadline:
             any_running = False
@@ -46,12 +50,22 @@ class EngineResourceGroup:
                 except Exception:
                     continue
             if not any_running:
-                return
+                return True
             time.sleep(interval_s)
+        for engine in engines:
+            try:
+                if engine and getattr(engine, "is_running", False):
+                    return False
+            except Exception:
+                logger.debug(
+                    "failed to observe engine shutdown state",
+                    exc_info=True,
+                )
+                return False
+        return True
 
     def cleanup_all(self) -> None:
         try:
             self.manager.cleanup_all()
         except Exception as exc:
             logger.debug("清理%s_manager失败: %s", self.name, get_error_detail(exc))
-

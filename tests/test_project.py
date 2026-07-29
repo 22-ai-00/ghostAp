@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -153,6 +154,59 @@ class TestProjectContext:
         assert restored.ttadk_model_name == "gpt-5.2"
         assert restored.ttadk_yolo_enabled is True
 
+    def test_snapshot_compare_and_clear_is_atomic_with_replacement(self):
+        ctx = ProjectContext(
+            project_id="test",
+            project_name="Test",
+            root_path="/tmp/test",
+        )
+        old_read = threading.Event()
+        allow_old_read = threading.Event()
+
+        class BlockingSnapshot:
+            query_count = 1
+            last_query = ""
+            is_resumable = True
+
+            @property
+            def session_id(self):
+                old_read.set()
+                allow_old_read.wait(timeout=2)
+                return "old-session"
+
+        ctx.coco_session_snapshot = BlockingSnapshot()
+        cleared: list[bool] = []
+
+        clear_worker = threading.Thread(
+            target=lambda: cleared.append(
+                ctx.clear_programming_snapshot_if_matches(
+                    "coco",
+                    "old-session",
+                )
+            )
+        )
+        clear_worker.start()
+        assert old_read.wait(timeout=1)
+
+        replacement_worker = threading.Thread(
+            target=lambda: ctx.set_programming_mode(
+                "coco",
+                True,
+                "replacement-session",
+                0,
+            )
+        )
+        replacement_worker.start()
+        allow_old_read.set()
+        clear_worker.join(timeout=2)
+        replacement_worker.join(timeout=2)
+
+        assert not clear_worker.is_alive()
+        assert not replacement_worker.is_alive()
+        assert cleared == [True]
+        assert ctx.coco_session_snapshot is not None
+        assert ctx.coco_session_snapshot.session_id == "replacement-session"
+
 
 class TestProjectManager:
     @pytest.fixture
@@ -180,6 +234,53 @@ class TestProjectManager:
         assert project is not None
         assert project.project_id == "test_proj"
         assert project.project_name == "Test Project"
+
+    def test_persist_project_context_flushes_snapshot_tombstone(
+        self,
+        temp_storage,
+        project_dir,
+    ):
+        manager = ProjectManager(storage_path=temp_storage)
+        success, _, project = manager.create_project(
+            project_id="persist-tombstone",
+            project_name="Persist Tombstone",
+            root_path=project_dir,
+            chat_id="chat-1",
+        )
+        assert success and project is not None
+        project.set_programming_mode("coco", True, "old-session", 1)
+        assert manager.persist_project_context(project) is True
+        assert project.clear_programming_snapshot_if_matches(
+            "coco",
+            "old-session",
+        )
+        assert manager.persist_project_context(project) is True
+
+        restored = ProjectManager(storage_path=temp_storage)
+        restored_project = restored.get_project_for_chat("persist-tombstone")
+        assert restored_project is not None
+        assert restored_project.coco_session_snapshot is None
+
+    def test_persist_project_context_reports_disk_failure(
+        self,
+        temp_storage,
+        project_dir,
+    ):
+        manager = ProjectManager(storage_path=temp_storage)
+        success, _, project = manager.create_project(
+            project_id="persist-failure",
+            project_name="Persist Failure",
+            root_path=project_dir,
+            chat_id="chat-1",
+        )
+        assert success and project is not None
+
+        with patch.object(
+            manager,
+            "_write_atomic",
+            side_effect=OSError("disk unavailable"),
+        ):
+            assert manager.persist_project_context(project) is False
 
     def test_create_duplicate_project(self, temp_storage, project_dir):
         manager = ProjectManager(storage_path=temp_storage)

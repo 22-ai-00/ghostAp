@@ -146,6 +146,96 @@ class TestSyncAdapterTimeoutMessage:
                     session.send_prompt("hello", timeout=42)
                 assert "42" in str(exc_info.value)
 
+    def test_timeout_marks_session_dead_when_original_prompt_does_not_drain(self):
+        """A sent cancel notification is not proof that the prompt has stopped."""
+        from src.acp.sync_adapter import SyncACPSession
+
+        session = SyncACPSession.__new__(SyncACPSession)
+        session._acp_session = MagicMock()
+        session._loop = MagicMock()
+        session._active_future = None
+        session._force_dead = False
+        session.last_active = 0
+        session.message_count = 0
+        session.last_query = ""
+        session._watchdog_timer = None
+        session._watchdog_lock = threading.Lock()
+        session.cancel = MagicMock()
+        session._start_watchdog = MagicMock()
+
+        pending = concurrent.futures.Future()
+
+        with (
+            patch("asyncio.run_coroutine_threadsafe", return_value=pending),
+            patch(
+                "src.acp.sync_adapter._PROMPT_CANCEL_DRAIN_TIMEOUT_S",
+                0.01,
+                create=True,
+            ),
+        ):
+            with pytest.raises(TimeoutError, match="ACP prompt 执行超时"):
+                session.send_prompt("hello", timeout=0.01)
+
+        session.cancel.assert_called_once_with(wait=True, timeout=2.0)
+        assert pending.cancelled()
+        assert session._force_dead is True
+
+    def test_cancel_drain_terminal_transport_error_marks_session_dead(self):
+        """A drained future can be terminal while its ACP transport is unusable."""
+        from src.acp.sync_adapter import SyncACPSession
+
+        session = SyncACPSession.__new__(SyncACPSession)
+        session._acp_session = MagicMock()
+        session._loop = MagicMock()
+        session._active_future = None
+        session._force_dead = False
+        session._log_failures = False
+        session.last_active = 0
+        session.message_count = 0
+        session.last_query = ""
+        session.cancel = MagicMock()
+        session._start_watchdog = MagicMock()
+
+        future = MagicMock()
+        future.result.side_effect = [
+            TimeoutError(),
+            ConnectionError("connection closed"),
+        ]
+        future.done.return_value = True
+
+        with patch("asyncio.run_coroutine_threadsafe", return_value=future):
+            with pytest.raises(TimeoutError, match="ACP prompt 执行超时"):
+                session.send_prompt("hello", timeout=0.01)
+
+        session.cancel.assert_called_once_with(wait=True, timeout=2.0)
+        assert session._force_dead is True
+
+    def test_completed_prompt_side_timeout_is_not_marked_undrained(self):
+        """Future.result can raise TimeoutError from a completed prompt itself."""
+        from src.acp.sync_adapter import SyncACPSession
+
+        session = SyncACPSession.__new__(SyncACPSession)
+        session._acp_session = MagicMock()
+        session._loop = MagicMock()
+        session._active_future = None
+        session._force_dead = False
+        session._log_failures = False
+        session.last_active = 0
+        session.message_count = 0
+        session.last_query = ""
+        session.cancel = MagicMock()
+        session._start_watchdog = MagicMock()
+
+        completed = concurrent.futures.Future()
+        completed.set_exception(TimeoutError("prompt-side timeout"))
+
+        with patch("asyncio.run_coroutine_threadsafe", return_value=completed):
+            with pytest.raises(TimeoutError, match="ACP prompt 执行超时"):
+                session.send_prompt("hello", timeout=30)
+
+        assert completed.done()
+        assert session._force_dead is False
+
 
 # ===========================================================================
 # T8: review.py diagnostics — friendly text for TimeoutError
@@ -2581,6 +2671,4 @@ class TestRetryMaxAttemptsZeroDisablesRetry:
         assert result is None
         # pipeline_fn should NOT have been called (since we return None before any attempt)
         mock_pipeline.assert_not_called()
-
-
 

@@ -85,6 +85,22 @@ class TestBoundaryExtras:
             _build_settings(**{setting_key: value})
 
 
+class TestProgrammingTimeoutValidation:
+    @pytest.mark.parametrize(
+        "setting_key",
+        ["coco_execution_timeout", "claude_execution_timeout"],
+    )
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_execution_timeout_must_be_positive(self, setting_key, value):
+        with pytest.raises(ValidationError, match=setting_key):
+            _build_settings(**{setting_key: value})
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf")])
+    def test_finalization_reserve_must_be_finite(self, value):
+        with pytest.raises(ValidationError, match="programming_finalization_reserve_s"):
+            _build_settings(programming_finalization_reserve_s=value)
+
+
 class TestCardButtonLayoutLiteral:
     """Tests for card_button_layout Literal['desktop','mobile','responsive']."""
 

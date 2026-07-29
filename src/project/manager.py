@@ -161,6 +161,13 @@ class ProjectManager:
                 return None
             return ctx
 
+    def persist_project_context(self, project: ProjectContext) -> bool:
+        """Flush one still-registered project after an in-place state mutation."""
+        with self._lock:
+            if self._projects.get(project.project_id) is not project:
+                return False
+            return self._save_projects()
+
     @staticmethod
     def _is_visible(ctx: ProjectContext, chat_id: Optional[str]) -> bool:
         """Check if a project is visible to the given chat_id.
@@ -431,7 +438,7 @@ class ProjectManager:
                 return None, "该项目已绑定到其他群聊，如需在当前群使用同一仓库，请使用 /new 创建新项目"
         return None, None
 
-    def _save_projects(self):
+    def _save_projects(self) -> bool:
         try:
             data = {
                 "projects": {pid: ctx.to_snapshot() for pid, ctx in self._projects.items()},
@@ -441,8 +448,10 @@ class ProjectManager:
             with self._file_lock(True):
                 self._write_atomic(data)
             self._rebuild_bound_chat_index()
+            return True
         except Exception as e:
             logger.error("保存项目数据失败: %s", get_error_detail(e))
+            return False
 
     def _rebuild_bound_chat_index(self):
         """Rebuild the reverse index (bound_chat_id -> project_id).

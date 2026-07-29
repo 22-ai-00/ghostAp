@@ -825,6 +825,107 @@ class TestProgrammingCardSession:
         assert "✅ 实现后端接口" in body
         assert "完成 1" in body
 
+    def test_failed_subagent_panel_renders_safe_error_as_subordinate_line(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.render.budget import RenderBudget
+        from src.card.render.renderer import render_card
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="agent-task-failed",
+                title="Agent",
+                kind="other",
+                status="in_progress",
+                content="验证终态交付\n子代理：Explore",
+            ),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="agent-task-failed",
+                title="Agent",
+                kind="other",
+                status="failed",
+                content=json.dumps(
+                    {
+                        "error": (
+                            "backend timed out while waiting for final card"
+                        )
+                    }
+                ),
+            ),
+        ))
+
+        body = str(
+            render_card(
+                pcs.session.state,
+                RenderBudget(),
+            )[0]._card_json["body"]["elements"]
+        )
+        assert pcs.session.state.terminal == "running"
+        assert "❌ 验证终态交付" in body
+        assert "原因：backend timed out while waiting for final card" in body
+
+    def test_subagent_panel_sanitizes_untrusted_label_at_render_boundary(self):
+        from src.card.render.tools import render_subagent_dispatch_panel
+
+        secret = "sk-0123456789abcdef"
+        panel = render_subagent_dispatch_panel(
+            [
+                {
+                    "status": "failed",
+                    "label": (
+                        "\x1b[31mcall_private_123 API_TOKEN="
+                        f"{secret} ![](/tmp/private.png)\u202e"
+                    ),
+                    "tool": "agent",
+                    "error": "transport timeout",
+                }
+            ]
+        )
+
+        assert panel is not None
+        body = panel["elements"][0]["content"]
+        assert secret not in body
+        assert "call_private_123" not in body
+        assert "\x1b" not in body
+        assert "![](" not in body
+        assert "\u202e" not in body
+        assert "原因：transport timeout" in body
+
+    def test_subagent_panel_sanitizes_all_untrusted_metadata_fields(self):
+        from src.card.render.tools import render_subagent_dispatch_panel
+
+        secret = "sk-0123456789abcdef"
+        panel = render_subagent_dispatch_panel(
+            [
+                {
+                    "status": "failed",
+                    "label": "检查渲染边界",
+                    "tool": (
+                        "\x1b[31mcall_private_tool "
+                        "![](/tmp/private-tool.png)"
+                    ),
+                    "model": f"API_TOKEN={secret} **private-model**",
+                    "sequence": "1.a\n![private](/tmp/private-seq.png)",
+                    "error": "transport timeout",
+                }
+            ]
+        )
+
+        assert panel is not None
+        body = panel["elements"][0]["content"]
+        assert secret not in body
+        assert "call_private_tool" not in body
+        assert "\x1b" not in body
+        assert "![](" not in body
+        assert "**private-model**" not in body
+        assert "/tmp/private-seq.png" not in body
+        assert "#1.a" not in body
+
     def test_cancel_updates_parent_subagent_summary_before_terminal(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
         from src.card.render.budget import RenderBudget
@@ -851,6 +952,55 @@ class TestProgrammingCardSession:
         assert "⚪ 实现后端接口" in body
         assert "取消 1" in body
         assert "运行中 1" not in body
+
+    def test_timeout_failure_marks_live_subagent_cancelled_not_failed(self):
+        """A parent deadline must not fabricate a child-agent failure."""
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="agent-task-timeout",
+                title="Agent",
+                kind="other",
+                status="in_progress",
+                content="检查超时收尾\n子代理：Explore",
+            ),
+        ))
+
+        pcs.fail(
+            "parent prompt timeout",
+            unfinished_subagent_status="cancelled",
+        )
+
+        assert pcs.session.state.terminal == "failed"
+        assert pcs.session.state.metadata.subagents[0]["status"] == "cancelled"
+
+    def test_finalization_success_does_not_fabricate_live_subagent_completion(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="agent-task-finalization",
+                title="Agent",
+                kind="other",
+                status="in_progress",
+                content="等待收尾\n子代理：Explore",
+            ),
+        ))
+
+        pcs.finish(
+            fallback_text="已完成安全收尾",
+            unfinished_subagent_status="cancelled",
+        )
+
+        assert pcs.session.state.terminal == "completed"
+        assert pcs.session.state.metadata.subagents[0]["status"] == "cancelled"
 
     def test_parent_completion_survives_subagent_summary_dispatch_failure(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
@@ -1038,7 +1188,7 @@ class TestNonStreamingFallback:
         session = MagicMock()
 
         def send_prompt(_text, *, on_event, timeout):
-            assert timeout == 60
+            assert timeout == 33
             on_event(ACPEvent(event_type=ACPEventType.IMAGE_CHUNK, image=image))
             return PromptResult(stop_reason="end_turn", text="图片已生成")
 
@@ -1047,6 +1197,7 @@ class TestNonStreamingFallback:
             settings=SimpleNamespace(
                 coco_execution_timeout=60,
                 claude_execution_timeout=60,
+                programming_finalization_reserve_s=0,
                 repo_lock_hard_timeout=120,
             ),
             is_coco=True,
@@ -1083,6 +1234,153 @@ class TestNonStreamingFallback:
                 "alt": {"tag": "plain_text", "content": "图片 1"},
             }
         ]
+
+    def test_timeout_uses_reserved_finalization_turn(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from src.acp.models import PromptResult
+        from src.feishu.handlers.programming import ProgrammingModeHandler
+
+        calls: list[tuple[str, int | float | None]] = []
+
+        class Session:
+            _force_dead = False
+
+            def send_prompt(self, prompt, *, on_event, timeout):
+                calls.append((prompt, timeout))
+                if len(calls) == 1:
+                    raise TimeoutError("primary deadline")
+                return PromptResult(stop_reason="end_turn", text="安全收尾完成")
+
+        handler = SimpleNamespace(
+            settings=SimpleNamespace(
+                coco_execution_timeout=90,
+                claude_execution_timeout=90,
+                programming_finalization_reserve_s=30,
+                repo_lock_hard_timeout=120,
+            ),
+            is_coco=True,
+            mode_name="Coco",
+            upload_acp_image=MagicMock(),
+            reply_card=MagicMock(),
+            reply_text=MagicMock(),
+            add_reaction=MagicMock(),
+            _replace_timed_out_session=MagicMock(),
+            _retire_finalization_session=MagicMock(),
+        )
+
+        ProgrammingModeHandler._handle_response_non_streaming(
+            handler,
+            "message-1",
+            "chat-1",
+            "BRIDGE CONTEXT: unrelated prior authorization",
+            Session(),
+            None,
+            "/workspace",
+            _finalization_task_text="完成并提交原任务",
+        )
+
+        assert [timeout for _, timeout in calls] == [60, 30]
+        assert "不要创建新的子代理" in calls[1][0]
+        assert "完成并提交原任务" in calls[1][0]
+        assert "BRIDGE CONTEXT" not in calls[1][0]
+        assert "安全收尾完成" in handler.reply_text.call_args.args[1]
+        handler.add_reaction.assert_called_once()
+
+    def test_timeout_without_reserve_still_retires_session(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from src.feishu.handlers.programming import ProgrammingModeHandler
+
+        class Session:
+            _force_dead = False
+
+            def send_prompt(self, _prompt, *, on_event, timeout):
+                raise TimeoutError(f"hard deadline {timeout}")
+
+        retire = MagicMock()
+        handler = SimpleNamespace(
+            settings=SimpleNamespace(
+                coco_execution_timeout=60,
+                claude_execution_timeout=60,
+                programming_finalization_reserve_s=0,
+                repo_lock_hard_timeout=120,
+            ),
+            is_coco=True,
+            mode_name="Coco",
+            upload_acp_image=MagicMock(),
+            reply_card=MagicMock(),
+            reply_text=MagicMock(),
+            add_reaction=MagicMock(),
+            _replace_timed_out_session=MagicMock(),
+            _retire_finalization_session=retire,
+        )
+
+        session = Session()
+        ProgrammingModeHandler._handle_response_non_streaming(
+            handler,
+            "message-1",
+            "chat-1",
+            "hard-timeout task",
+            session,
+            None,
+            "/workspace",
+        )
+
+        retire.assert_called_once()
+        retire_call = retire.call_args
+        assert retire_call.kwargs["chat_id"] == "chat-1"
+        assert retire_call.kwargs["project"] is None
+        assert retire_call.kwargs["thread_id"] is None
+        assert retire_call.kwargs["active_session"] is session
+        assert 0 < retire_call.kwargs["retirement_budget_s"] <= 60
+
+    def test_retirement_failure_still_returns_timeout_error_card(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from src.feishu.handlers.programming import ProgrammingModeHandler
+
+        class Session:
+            _force_dead = False
+
+            def send_prompt(self, _prompt, *, on_event, timeout):
+                raise TimeoutError(f"hard deadline {timeout}")
+
+        session = Session()
+        handler = SimpleNamespace(
+            settings=SimpleNamespace(
+                coco_execution_timeout=60,
+                claude_execution_timeout=60,
+                programming_finalization_reserve_s=0,
+                repo_lock_hard_timeout=120,
+            ),
+            is_coco=True,
+            mode_name="Coco",
+            upload_acp_image=MagicMock(),
+            reply_card=MagicMock(),
+            reply_text=MagicMock(),
+            add_reaction=MagicMock(),
+            _replace_timed_out_session=MagicMock(),
+            _retire_finalization_session=MagicMock(
+                side_effect=RuntimeError("retirement lock unavailable"),
+            ),
+        )
+
+        ProgrammingModeHandler._handle_response_non_streaming(
+            handler,
+            "message-1",
+            "chat-1",
+            "hard-timeout task",
+            session,
+            None,
+            "/workspace",
+        )
+
+        assert session._force_dead is True
+        handler.reply_card.assert_called_once()
 
     def test_result_text_used_as_primary_response(self):
         """When send_prompt returns result.text, it should be the final response."""

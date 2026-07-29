@@ -22,6 +22,7 @@ from .scheduler import (
     TaskScheduler,
     TaskSpec,
     TaskStatus,
+    get_current_task_run_id,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "TaskResult",
     "SYSTEM_QUEUE_SUFFIX",
     "DEFAULT_QUEUE_SUFFIX",
+    "get_current_task_run_id",
 ]

@@ -614,11 +614,21 @@ class ACPSession:
             try:
                 await self._ctx_manager.__aexit__(None, None, None)
             except Exception as e:
-                logger.debug("[ACP:%s] Error closing session: %s", self._agent_cmd, get_error_detail(e))
+                logger.warning(
+                    "[ACP:%s] transport termination failed: %s",
+                    self._agent_cmd,
+                    get_error_detail(e),
+                    exc_info=True,
+                )
+                raise
             self._ctx_manager = None
             self._conn = None
             self._proc = None
             await _drain_loop_callbacks()
+        elif self._conn is not None or self._proc is not None:
+            raise RuntimeError(
+                "ACP transport handles exist without their process context"
+            )
         logger.info("[ACP:%s] Session closed: %s", self._agent_cmd, (self._session_id or "none")[:8])
 
     def _dispatch_event(self, event: ACPEvent) -> None:

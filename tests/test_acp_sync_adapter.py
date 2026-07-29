@@ -99,6 +99,100 @@ def test_expected_prompt_connection_close_does_not_warn(monkeypatch, caplog):
     assert session._force_dead is True
 
 
+def test_close_timeout_keeps_transport_handles_and_raises(monkeypatch):
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._agent_type = "codex"
+    session._force_dead = False
+    session._active_future = None
+    session._stop_watchdog = lambda: None
+    backend = SimpleNamespace(close=lambda: asyncio.sleep(0))
+    session._acp_session = backend
+
+    class _Loop:
+        def stop(self):
+            return None
+
+        def call_soon_threadsafe(self, _callback):
+            return None
+
+        def close(self):
+            return None
+
+    loop = _Loop()
+    session._loop = loop
+    session._loop_thread = None
+    session._drain_loop_before_close = lambda: None
+
+    close_future: concurrent.futures.Future[None] = concurrent.futures.Future()
+    close_future.set_exception(TimeoutError("transport close timed out"))
+
+    def submit(coro, _loop):
+        coro.close()
+        return close_future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+
+    with pytest.raises(TimeoutError, match="transport close timed out"):
+        session.close()
+
+    assert session._force_dead is True
+    assert session._acp_session is backend
+    assert session._loop is loop
+
+
+def test_close_refuses_to_clear_loop_when_loop_thread_does_not_stop(
+    monkeypatch,
+):
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._agent_type = "codex"
+    session._force_dead = False
+    session._active_future = None
+    session._stop_watchdog = lambda: None
+    backend = SimpleNamespace(close=lambda: asyncio.sleep(0))
+    session._acp_session = backend
+
+    class _Loop:
+        def __init__(self):
+            self.close_called = False
+
+        def stop(self):
+            return None
+
+        def call_soon_threadsafe(self, _callback):
+            return None
+
+        def close(self):
+            self.close_called = True
+
+    class _Thread:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout):
+            assert timeout == 5
+
+    loop = _Loop()
+    session._loop = loop
+    session._loop_thread = _Thread()
+    session._drain_loop_before_close = lambda: None
+
+    def submit(coro, _loop):
+        coro.close()
+        future: concurrent.futures.Future[None] = concurrent.futures.Future()
+        future.set_result(None)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+
+    with pytest.raises(RuntimeError, match="event loop thread did not stop"):
+        session.close()
+
+    assert session._force_dead is True
+    assert session._acp_session is backend
+    assert session._loop is loop
+    assert loop.close_called is False
+
+
 @pytest.mark.asyncio
 async def test_official_codex_startup_applies_explicit_model_before_ready(monkeypatch):
     """The official adapter ignores Zed CLI flags, so startup must set its config option."""

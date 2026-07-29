@@ -155,6 +155,12 @@ class TestListActiveSessionsTimeAgo:
                 self.last_active = last_active
                 self.message_count = message_count
 
+            def to_snapshot(self) -> dict:
+                return {"session_id": self.session_id}
+
+            def close(self) -> None:
+                return None
+
         # 使用默认 telemetry，验证正常路径下 idle_bucket/idle_health 暴露语义不变。
         mgr = ACPSessionManager(
             agent_type="coco",
@@ -250,6 +256,12 @@ class TestIdleHealthServiceInjection:
                 self.last_active = last_active
                 self.message_count = message_count
 
+            def to_snapshot(self) -> dict:
+                return {"session_id": self.session_id}
+
+            def close(self) -> None:
+                return None
+
         now = time.time()
         dummy = DummySession(last_active=now - 120)
 
@@ -286,6 +298,12 @@ class TestIdleHealthServiceInjection:
                 self.session_id = "session-ctx-1"
                 self.last_active = last_active
                 self.message_count = message_count
+
+            def to_snapshot(self) -> dict:
+                return {"session_id": self.session_id}
+
+            def close(self) -> None:
+                return None
 
         # 通过让 SSOT helper 抛出可预期异常，触发 IdleHealth UNKNOWN 回退路径，
         # 从而验证 ACPSessionManager 在调用 telemetry 时传递了完整路由上下文。

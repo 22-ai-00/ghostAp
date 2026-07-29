@@ -48,6 +48,94 @@ class TestRepoLockAcquire:
         assert len(locks) == 1
         assert locks[0].refcount == 2
 
+    def test_same_chat_different_request_owner_conflicts(
+        self,
+        mgr: RepoLockManager,
+    ):
+        mgr.acquire(
+            f"{_TMP}/repo1",
+            "chat_A",
+            owner_id="run-1",
+        )
+
+        result = mgr.acquire(
+            f"{_TMP}/repo1",
+            "chat_A",
+            owner_id="run-2",
+        )
+
+        assert result.success is False
+        assert result.holder_chat_id == "chat_A"
+        assert mgr.list_locks()[0].refcount == 1
+
+    def test_same_request_owner_remains_reentrant(
+        self,
+        mgr: RepoLockManager,
+    ):
+        mgr.acquire(
+            f"{_TMP}/repo1",
+            "chat_A",
+            owner_id="run-1",
+        )
+
+        result = mgr.acquire(
+            f"{_TMP}/repo1",
+            "chat_A",
+            owner_id="run-1",
+        )
+
+        assert result.success is True
+        assert mgr.list_locks()[0].refcount == 2
+
+    def test_different_request_cannot_touch_or_release_holder(
+        self,
+        mgr: RepoLockManager,
+    ):
+        mgr.acquire(
+            f"{_TMP}/repo1",
+            "chat_A",
+            owner_id="run-1",
+        )
+        before = mgr.get_lock_info(f"{_TMP}/repo1")
+        assert before is not None
+
+        time.sleep(0.001)
+        mgr.touch(
+            f"{_TMP}/repo1",
+            "chat_A",
+            owner_id="run-2",
+        )
+        mgr.release(
+            f"{_TMP}/repo1",
+            "chat_A",
+            owner_id="run-2",
+        )
+
+        after = mgr.get_lock_info(f"{_TMP}/repo1")
+        assert after is not None
+        assert after.refcount == 1
+        assert after.last_active_time == before.last_active_time
+
+    def test_late_old_request_cannot_mutate_new_same_chat_holder(
+        self,
+        mgr: RepoLockManager,
+    ):
+        path = f"{_TMP}/repo1"
+        mgr.acquire(path, "chat_A", owner_id="run-old")
+        mgr.release(path, "chat_A", owner_id="run-old")
+        mgr.acquire(path, "chat_A", owner_id="run-new")
+        before = mgr.get_lock_info(path)
+        assert before is not None
+
+        time.sleep(0.001)
+        mgr.touch(path, "chat_A", owner_id="run-old")
+        mgr.release(path, "chat_A", owner_id="run-old")
+
+        after = mgr.get_lock_info(path)
+        assert after is not None
+        assert after.refcount == 1
+        assert after.last_active_time == before.last_active_time
+
     def test_acquire_conflict(self, mgr: RepoLockManager):
         mgr.acquire(f"{_TMP}/repo1", "chat_A")
         result = mgr.acquire(f"{_TMP}/repo1", "chat_B")
@@ -200,13 +288,17 @@ class TestRepoLockAcquire:
         assert result.success is False  # still held by chat_A
 
     def test_cleanup_hard_timeout_evicts_active_lock(self, mgr: RepoLockManager, caplog):
-        """H-1 safety valve: refcount > 0 but held > hard_timeout → force evict."""
+        """Leaked active lock with an expired lease is eventually reclaimed."""
         import logging
 
         mgr._idle_timeout = 999999  # idle won't trigger
-        mgr._hard_timeout = 0  # everything exceeds hard_timeout
+        mgr._hard_timeout = 10
         mgr.acquire(f"{_TMP}/repo1", "chat_A")
         mgr.acquire(f"{_TMP}/repo1", "chat_A")  # refcount = 2
+        with mgr._mu:
+            entry = mgr._locks[f"{_TMP}/repo1"]
+            entry.acquired_at -= 20
+            entry.last_active_time -= 20
 
         with caplog.at_level(logging.CRITICAL, logger="src.repo_lock"):
             mgr._cleanup_idle()
@@ -219,6 +311,50 @@ class TestRepoLockAcquire:
         # Verify CRITICAL log emitted for hard-timeout force-reclaim
         critical_msgs = [r for r in caplog.records if r.levelno == logging.CRITICAL]
         assert any("hard-timeout force-reclaimed" in r.message for r in critical_msgs)
+
+    def test_hard_timeout_does_not_reclaim_renewed_long_running_lock(
+        self,
+        mgr: RepoLockManager,
+    ):
+        """A heartbeat renews the lease even after total runtime exceeds the cap."""
+        mgr._idle_timeout = 300
+        mgr._hard_timeout = 3600
+        path = f"{_TMP}/repo-long-running"
+        mgr.acquire(path, "chat_A", owner_id="run-long")
+        with mgr._mu:
+            entry = mgr._locks[path]
+            entry.acquired_at -= 7200
+            entry.last_active_time = time.monotonic()
+
+        mgr._cleanup_idle()
+
+        lock = mgr.get_lock_info(path)
+        assert lock is not None
+        assert lock.refcount == 1
+        conflict = mgr.acquire(
+            path,
+            "chat_B",
+            owner_id="run-other",
+        )
+        assert conflict.success is False
+
+    def test_heartbeat_interval_is_bounded_by_one_third_of_lease(self):
+        short_lease = RepoLockManager(
+            idle_timeout=300,
+            cleanup_interval=9999,
+            hard_timeout=3,
+        )
+        default_lease = RepoLockManager(
+            idle_timeout=300,
+            cleanup_interval=9999,
+            hard_timeout=3600,
+        )
+        try:
+            assert 0 < short_lease.heartbeat_interval <= 1
+            assert default_lease.heartbeat_interval == 30
+        finally:
+            short_lease.shutdown()
+            default_lease.shutdown()
 
     def test_cleanup_phase3_warning_log(self, mgr: RepoLockManager, caplog):
         """Phase 3: active lock idle without touch emits WARNING but is NOT evicted."""

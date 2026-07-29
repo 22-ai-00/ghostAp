@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 
 from src.card.render.atoms import RenderAtom, estimate_atom_size
 from src.card.state.models import ContentBlock
 from src.card.themes import PANEL_STYLES
+from src.card.tool_display import (
+    is_unhelpful_display_label,
+    sanitize_tool_failure_detail,
+)
 from src.card.ui_text import UI_TEXT
 
 _MAX_OUTPUT_CHARS = 2000
@@ -48,6 +53,34 @@ _SUBAGENT_STATUS_ICONS = {
     "failed": "❌",
     "cancelled": "⚪",
 }
+_SUBAGENT_SEQUENCE_RE = re.compile(
+    r"^[1-9]\d{0,5}(?:\.[A-Za-z0-9]{1,8}){0,4}$"
+)
+
+
+def _safe_subagent_metadata(
+    value: object,
+    *,
+    fallback: str,
+    max_chars: int,
+) -> str:
+    raw = str(value or "").strip()
+    if (
+        not raw
+        or "![" in raw
+        or is_unhelpful_display_label(raw)
+    ):
+        return fallback
+    return sanitize_tool_failure_detail(
+        raw,
+        fallback=fallback,
+        max_chars=max_chars,
+    )
+
+
+def _safe_subagent_sequence(value: object) -> str:
+    sequence = str(value or "").strip()
+    return sequence if _SUBAGENT_SEQUENCE_RE.fullmatch(sequence) else ""
 
 
 def _is_empty_data(value) -> bool:
@@ -122,21 +155,55 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
     status_counts: dict[str, int] = {}
     lines: list[str] = []
     for idx, item in enumerate(subagents, start=1):
-        status = str(item.get("status") or "running")
+        status = str(item.get("status") or "running").strip().lower()
         status_counts[status] = status_counts.get(status, 0) + 1
         icon = _SUBAGENT_STATUS_ICONS.get(status, "🟠")
-        label = item.get("label") or item.get("branch") or item.get("name") or f"子任务 {idx}"
-        tool = item.get("tool") or item.get("tool_name") or "tool"
-        model = item.get("model") or item.get("model_name") or ""
-        seq = item.get("sequence") or item.get("card_sequence") or ""
+        raw_label = (
+            item.get("label")
+            or item.get("branch")
+            or item.get("name")
+            or f"子任务 {idx}"
+        )
+        label = sanitize_tool_failure_detail(
+            raw_label,
+            fallback=f"子任务 {idx}",
+            max_chars=60,
+        )
+        tool = _safe_subagent_metadata(
+            item.get("tool") or item.get("tool_name"),
+            fallback="tool",
+            max_chars=24,
+        )
+        model = _safe_subagent_metadata(
+            item.get("model") or item.get("model_name"),
+            fallback="",
+            max_chars=60,
+        )
+        seq = _safe_subagent_sequence(
+            item.get("sequence") or item.get("card_sequence")
+        )
         seq_part = f" · #{seq}" if seq else ""
         model_part = f" · {model}" if model else ""
         lines.append(f"- {icon} {label}{seq_part} · {tool}{model_part}")
+        if status == "failed" and item.get("error"):
+            error_detail = sanitize_tool_failure_detail(
+                item["error"],
+                fallback="",
+            )
+            if error_detail:
+                lines.append(f"  - 原因：{error_detail}")
 
     running_count = status_counts.get("running", 0) + status_counts.get("active", 0)
     completed_count = status_counts.get("completed", 0)
     failed_count = status_counts.get("failed", 0)
     cancelled_count = status_counts.get("cancelled", 0)
+    known_count = (
+        running_count
+        + completed_count
+        + failed_count
+        + cancelled_count
+    )
+    unknown_count = max(0, len(subagents) - known_count)
     summary_parts: list[str] = []
     if running_count:
         summary_parts.append(f"运行中 {running_count}")
@@ -146,12 +213,18 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
         summary_parts.append(f"失败 {failed_count}")
     if cancelled_count:
         summary_parts.append(f"取消 {cancelled_count}")
+    if unknown_count:
+        summary_parts.append(f"未知 {unknown_count}")
     summary = " / ".join(summary_parts) if summary_parts else "暂无状态"
-    header_icon = "❌" if failed_count else ("🟠" if running_count else "✅")
+    header_icon = (
+        "❌"
+        if failed_count
+        else ("🟠" if running_count or unknown_count else "✅")
+    )
 
     return {
         "tag": "collapsible_panel",
-        "expanded": bool(running_count or failed_count),
+        "expanded": bool(running_count or failed_count or unknown_count),
         "header": {
             "title": {"tag": "markdown", "content": f"{header_icon} **并行子任务** · {len(subagents)} 个 · {summary}"},
             "vertical_align": "center",
@@ -163,7 +236,14 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
             "icon_position": "follow_text",
             "icon_expanded_angle": -180,
         },
-        "border": {"color": "orange", "corner_radius": PANEL_STYLES["corner_radius"]},
+        "border": {
+            "color": (
+                PANEL_STYLES["border_failed"]
+                if failed_count
+                else "orange"
+            ),
+            "corner_radius": PANEL_STYLES["corner_radius"],
+        },
         "vertical_spacing": PANEL_STYLES["vertical_spacing"],
         "padding": PANEL_STYLES["padding_standard"],
         "elements": [{"tag": "markdown", "content": "\n".join(lines)}],

@@ -24,6 +24,7 @@ from src.card.tool_display import (
     extract_agent_tool_name,
     extract_tool_call_label,
     is_unhelpful_display_label,
+    sanitize_tool_failure_detail,
 )
 
 if TYPE_CHECKING:
@@ -44,6 +45,8 @@ _MODE_DISPLAY: dict[str, tuple[str, str]] = {
 
 _AGENT_TOOL_TITLES = {"agent", "subagent", "task"}
 _GENERIC_TASK_LABELS = {"", "agent", "subagent", "task", "子任务"}
+_TERMINAL_AGENT_STATUSES = {"completed", "failed", "cancelled"}
+_GENERIC_AGENT_FAILURE_DETAIL = "子任务执行失败"
 
 
 def build_programming_metadata(
@@ -260,7 +263,12 @@ class ProgrammingCardSession:
                 finally:
                     self._flush_lock_holder.held = False
 
-    def finish(self, *, fallback_text: str = "") -> None:
+    def finish(
+        self,
+        *,
+        fallback_text: str = "",
+        unfinished_subagent_status: str = "completed",
+    ) -> None:
         """Complete the session normally.
 
         Args:
@@ -273,7 +281,12 @@ class ProgrammingCardSession:
             self._close_reasoning_blocks()
         if self._text_active:
             self._close_text_blocks()
-        self._finish_agent_summaries(failed=False)
+        terminal_status = (
+            unfinished_subagent_status
+            if unfinished_subagent_status in {"completed", "failed", "cancelled"}
+            else "completed"
+        )
+        self._finish_agent_summaries(terminal_status=terminal_status)
         # If no text was streamed into the card, use fallback_text as completion
         # summary so the user sees the answer instead of a blank card.
         summary = ""
@@ -285,7 +298,12 @@ class ProgrammingCardSession:
         self._rotator.dispatch(CardEvent.completed(summary=summary))
         self._stop_ticker()
 
-    def fail(self, error: str = "") -> None:
+    def fail(
+        self,
+        error: str = "",
+        *,
+        unfinished_subagent_status: str = "failed",
+    ) -> None:
         """Mark the session as failed."""
         self._cancel_timer()
         if self._text_active:
@@ -293,7 +311,12 @@ class ProgrammingCardSession:
             self._close_text_blocks()
         if self._reasoning_active:
             self._close_reasoning_blocks()
-        self._finish_agent_summaries(failed=True)
+        terminal_status = (
+            unfinished_subagent_status
+            if unfinished_subagent_status in {"failed", "cancelled"}
+            else "failed"
+        )
+        self._finish_agent_summaries(terminal_status=terminal_status)
         self._rotator.dispatch(CardEvent.failed(error))
         self._stop_ticker()
 
@@ -594,11 +617,25 @@ class ProgrammingCardSession:
             return False
 
         event_name = getattr(acp_event, "event_type", None).name if getattr(acp_event, "event_type", None) else ""
+        existing = self._agent_summaries.get(tool_call.id)
+        existing_status = str(
+            (existing or {}).get("status") or ""
+        ).strip().lower()
+        incoming_status = (
+            "failed"
+            if event_name == "TOOL_CALL_DONE"
+            and str(tool_call.status or "").strip().lower() == "failed"
+            else "completed"
+            if event_name == "TOOL_CALL_DONE"
+            else "running"
+        )
+        if existing_status in _TERMINAL_AGENT_STATUSES:
+            if existing_status == incoming_status == "failed":
+                self._refresh_failed_agent_error(tool_call)
+            return True
+
         if event_name == "TOOL_CALL_DONE":
-            if tool_call.status == "failed":
-                self._update_agent_summary(tool_call, status="failed")
-            else:
-                self._update_agent_summary(tool_call, status="completed")
+            self._update_agent_summary(tool_call, status=incoming_status)
         else:
             self._update_agent_summary(tool_call, status="running")
         return True
@@ -635,21 +672,35 @@ class ProgrammingCardSession:
         status: str,
     ) -> None:
         existing = self._agent_summaries.get(tool_call.id, {})
-        label = self._extract_agent_task_label(tool_call)
         existing_label = str(existing.get("label") or "").strip()
-        if (
-            existing_label
-            and not self._is_generic_task_label(existing_label)
-            and not is_unhelpful_display_label(existing_label)
-            and (self._is_generic_task_label(label) or is_unhelpful_display_label(label))
-        ):
-            label = existing_label
+        is_terminal = status in _TERMINAL_AGENT_STATUSES
+        if is_terminal:
+            label = existing_label or self._terminal_agent_label(tool_call)
+        else:
+            label = self._extract_agent_task_label(tool_call)
+            if (
+                existing_label
+                and not self._is_generic_task_label(existing_label)
+                and not is_unhelpful_display_label(existing_label)
+                and (
+                    self._is_generic_task_label(label)
+                    or is_unhelpful_display_label(label)
+                )
+            ):
+                label = existing_label
+        tool_name = self._extract_agent_tool_name(tool_call)
+        if is_terminal and existing.get("tool"):
+            tool_name = existing["tool"]
         summary = {
             **existing,
             "label": label,
-            "tool": self._extract_agent_tool_name(tool_call),
+            "tool": tool_name,
             "status": status,
         }
+        if status == "failed":
+            summary["error"] = self._agent_failure_detail(tool_call)
+        else:
+            summary.pop("error", None)
         summary.setdefault(
             "sequence",
             f"{self._rotator.current.sequence}.{chr(ord('a') + len(self._agent_summaries))}",
@@ -660,9 +711,68 @@ class ProgrammingCardSession:
         if not self._rotator.current.closed:
             self._rotator.dispatch(CardEvent.tool_model_changed(subagents=tuple(self._agent_summaries.values())))
 
-    def _finish_agent_summaries(self, *, failed: bool) -> None:
+    def _refresh_failed_agent_error(self, tool_call: "ToolCallInfo") -> None:
+        existing = self._agent_summaries.get(tool_call.id)
+        if existing is None:
+            return
+        existing_detail = str(existing.get("error") or "").strip()
+        if (
+            existing_detail
+            and existing_detail != _GENERIC_AGENT_FAILURE_DETAIL
+        ):
+            return
+        detail = self._agent_failure_detail(tool_call, fallback="")
+        if not detail or detail == existing_detail:
+            return
+        self._agent_summaries[tool_call.id] = {
+            **existing,
+            "error": detail,
+        }
+        if not self._rotator.current.closed:
+            self._rotator.dispatch(
+                CardEvent.tool_model_changed(
+                    subagents=tuple(self._agent_summaries.values())
+                )
+            )
+
+    @staticmethod
+    def _agent_failure_detail(
+        tool_call: "ToolCallInfo",
+        *,
+        fallback: str = _GENERIC_AGENT_FAILURE_DETAIL,
+    ) -> str:
+        opaque_ids = (tool_call.id,)
+        result = getattr(tool_call, "result", None)
+        if result is not None:
+            detail = sanitize_tool_failure_detail(
+                result,
+                fallback="",
+                opaque_ids=opaque_ids,
+                allow_unstructured=False,
+            )
+            if detail:
+                return detail
+        return sanitize_tool_failure_detail(
+            tool_call.content,
+            fallback=fallback,
+            opaque_ids=opaque_ids,
+            allow_unstructured=False,
+        )
+
+    @classmethod
+    def _terminal_agent_label(cls, tool_call: "ToolCallInfo") -> str:
+        title = str(tool_call.title or "").strip()
+        if cls._is_generic_task_label(title) or is_unhelpful_display_label(title):
+            return "子任务"
+        return sanitize_tool_failure_detail(
+            title,
+            fallback="子任务",
+            max_chars=60,
+            opaque_ids=(tool_call.id,),
+        )
+
+    def _finish_agent_summaries(self, *, terminal_status: str) -> None:
         summary_changed = False
-        terminal_status = "failed" if failed else "completed"
         for tool_id, existing in list(self._agent_summaries.items()):
             if existing.get("status") in {"completed", "failed", "cancelled"}:
                 continue

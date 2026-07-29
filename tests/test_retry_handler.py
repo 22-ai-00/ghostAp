@@ -171,8 +171,16 @@ class TestProbeRepoLock:
         result = handler._probe_repo_lock("mid_2", "chat_2", "/run", project, 0)
 
         assert result is False
-        mock_lock_mgr.acquire.assert_called_once_with("/tmp/repo", "chat_2")
-        mock_lock_mgr.release.assert_called_once_with("/tmp/repo", "chat_2")
+        mock_lock_mgr.acquire.assert_called_once_with(
+            "/tmp/repo",
+            "chat_2",
+            owner_id=None,
+        )
+        mock_lock_mgr.release.assert_called_once_with(
+            "/tmp/repo",
+            "chat_2",
+            owner_id=None,
+        )
 
     def test_probe_fail_sends_conflict_card(self):
         handler, dispatch = _make_handler()

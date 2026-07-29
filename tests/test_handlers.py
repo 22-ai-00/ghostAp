@@ -8,6 +8,7 @@ import ast
 import inspect
 import json
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -32,7 +33,7 @@ from src.feishu.handlers.workflow import WorkflowHandler
 from src.feishu.handlers.worktree import WorktreeHandler
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.mode.manager import InteractionMode
-from src.project.context import SessionSnapshot
+from src.project.context import ProjectContext, SessionSnapshot
 from src.ttadk.models import TTADKModel, TTADKTool
 
 # ======================================================================
@@ -1360,6 +1361,223 @@ class TestProgrammingModeEnterExit:
         h.reply_text.assert_called_once()
         assert "已经在" in str(h.reply_text.call_args)
 
+    def test_retirement_failure_tombstones_matching_project_snapshot(self):
+        handler = ProgrammingModeHandler.__new__(ProgrammingModeHandler)
+        handler.mode_key = "coco"
+        manager = MagicMock()
+        manager.retire_session.side_effect = RuntimeError(
+            "retirement lock unavailable"
+        )
+        handler._get_session_manager = MagicMock(return_value=manager)
+        project = ProjectContext(
+            project_id="project-1",
+            project_name="project",
+            root_path="/tmp",
+        )
+        project.set_programming_mode("coco", True, "retiring-session", 1)
+        active = MagicMock()
+        active.session_id = "retiring-session"
+
+        with pytest.raises(RuntimeError, match="retirement lock unavailable"):
+            handler._retire_finalization_session(
+                chat_id="chat-1",
+                project=project,
+                thread_id=None,
+                active_session=active,
+            )
+
+        assert project.coco_session_snapshot is None
+
+    def test_late_retirement_preserves_concurrent_replacement_snapshot(self):
+        handler = ProgrammingModeHandler.__new__(ProgrammingModeHandler)
+        handler.mode_key = "coco"
+        manager = MagicMock()
+        manager.retire_session.return_value = None
+        handler._get_session_manager = MagicMock(return_value=manager)
+        project = ProjectContext(
+            project_id="project-1",
+            project_name="project",
+            root_path="/tmp",
+        )
+        project.set_programming_mode("coco", True, "replacement-session", 1)
+        old = MagicMock()
+        old.session_id = "retiring-session"
+
+        handler._retire_finalization_session(
+            chat_id="chat-1",
+            project=project,
+            thread_id=None,
+            active_session=old,
+        )
+
+        assert project.coco_session_snapshot is not None
+        assert project.coco_session_snapshot.session_id == "replacement-session"
+
+    def test_dead_session_replacement_never_reuses_concurrent_healthy_session(
+        self,
+    ):
+        from src.acp.manager import SessionReplacementResult
+
+        handler = ProgrammingModeHandler.__new__(ProgrammingModeHandler)
+        handler.mode_key = "coco"
+        handler._clear_snapshot_for_session = MagicMock()
+        handler._get_agent_type_override = MagicMock(return_value=None)
+        handler._get_model_name_override = MagicMock(return_value=None)
+        handler._register_thread_context = MagicMock()
+        concurrent = MagicMock()
+        concurrent.session_id = "new-user-session"
+        manager = MagicMock()
+        manager.replace_session.return_value = SessionReplacementResult(
+            session=concurrent,
+            created=False,
+        )
+        handler._get_session_manager = MagicMock(return_value=manager)
+        timed_out = MagicMock()
+        timed_out.session_id = "old-task-session"
+
+        with pytest.raises(RuntimeError, match="并发新会话"):
+            handler._replace_timed_out_session(
+                chat_id="chat-1",
+                project=None,
+                cwd="/tmp",
+                thread_id=None,
+                timed_out_session=timed_out,
+                startup_budget_s=30,
+            )
+
+        handler._register_thread_context.assert_not_called()
+        assert concurrent._force_dead is not True
+
+    def test_dead_session_replacement_rejects_already_removed_session(self):
+        from src.acp.manager import SessionReplacementResult
+
+        handler = ProgrammingModeHandler.__new__(ProgrammingModeHandler)
+        handler.mode_key = "coco"
+        handler._clear_snapshot_for_session = MagicMock()
+        handler._get_agent_type_override = MagicMock(return_value=None)
+        handler._get_model_name_override = MagicMock(return_value=None)
+        handler._register_thread_context = MagicMock()
+        manager = MagicMock()
+        manager.replace_session.return_value = SessionReplacementResult(
+            session=None,
+            created=False,
+        )
+        handler._get_session_manager = MagicMock(return_value=manager)
+        timed_out = MagicMock()
+        timed_out.session_id = "already-removed-session"
+
+        with pytest.raises(RuntimeError, match="原会话已被移除"):
+            handler._replace_timed_out_session(
+                chat_id="chat-1",
+                project=None,
+                cwd="/tmp",
+                thread_id=None,
+                timed_out_session=timed_out,
+                startup_budget_s=30,
+            )
+
+        handler._register_thread_context.assert_not_called()
+
+    def test_retirement_persists_matching_snapshot_tombstone(self):
+        handler = ProgrammingModeHandler.__new__(ProgrammingModeHandler)
+        handler.mode_key = "coco"
+        manager = MagicMock()
+        manager.retire_session.return_value = None
+        project_manager = MagicMock()
+        handler.ctx = SimpleNamespace(project_manager=project_manager)
+        handler._get_session_manager = MagicMock(return_value=manager)
+        project = ProjectContext(
+            project_id="project-1",
+            project_name="project",
+            root_path="/tmp",
+        )
+        project.set_programming_mode("coco", True, "retiring-session", 1)
+        active = MagicMock()
+        active.session_id = "retiring-session"
+
+        handler._retire_finalization_session(
+            chat_id="chat-1",
+            project=project,
+            thread_id=None,
+            active_session=active,
+        )
+
+        assert project.coco_session_snapshot is None
+        project_manager.persist_project_context.assert_called_once_with(project)
+
+    def test_snapshot_persistence_cannot_consume_retirement_budget(self):
+        handler = ProgrammingModeHandler.__new__(ProgrammingModeHandler)
+        handler.mode_key = "coco"
+        allow_persist = threading.Event()
+        persist_started = threading.Event()
+        project_manager = MagicMock()
+
+        def blocking_persist(_project):
+            persist_started.set()
+            allow_persist.wait(timeout=2)
+            return True
+
+        project_manager.persist_project_context.side_effect = blocking_persist
+        handler.ctx = SimpleNamespace(project_manager=project_manager)
+        manager = MagicMock()
+        handler._get_session_manager = MagicMock(return_value=manager)
+        project = ProjectContext(
+            project_id="project-1",
+            project_name="project",
+            root_path="/tmp",
+        )
+        project.set_programming_mode("coco", True, "retiring-session", 1)
+        active = MagicMock()
+        active.session_id = "retiring-session"
+        started = time.monotonic()
+        try:
+            handler._retire_finalization_session(
+                chat_id="chat-1",
+                project=project,
+                thread_id=None,
+                active_session=active,
+                retirement_budget_s=0.2,
+            )
+            elapsed = time.monotonic() - started
+            assert persist_started.wait(timeout=0.1)
+            assert elapsed < 0.2
+            passed_timeout = manager.retire_session.call_args.kwargs["timeout"]
+            assert 0 < passed_timeout < 0.2
+        finally:
+            allow_persist.set()
+
+    @patch("src.thread.get_current_thread_id", return_value=None)
+    def test_active_mode_without_live_session_starts_fresh_session(self, _mock_tid):
+        h, ctx = self._make_coco()
+        ctx.mode_manager.get_mode.return_value = InteractionMode.COCO
+        ctx.coco_manager.get_session.return_value = None
+        fresh_session = MagicMock()
+        fresh_session.session_id = "fresh-after-retirement"
+        fresh_session.is_resumed = False
+        ctx.coco_manager.ensure_session.return_value = fresh_session
+        project = MagicMock()
+        project.project_id = "project-1"
+        project.project_name = "project"
+        project.root_path = "/tmp"
+        project.coco_session_snapshot = None
+
+        result = h.enter_mode(
+            "m1",
+            "c1",
+            project=project,
+            silent=True,
+        )
+
+        assert result is True
+        ctx.coco_manager.ensure_session.assert_called_once()
+        assert ctx.coco_manager.ensure_session.call_args.kwargs["session_id"] is None
+        project.set_programming_mode.assert_called_once_with(
+            "coco",
+            True,
+            "fresh-after-retirement",
+            0,
+        )
+
     def test_enter_mode_with_project_no_snapshot(self):
         h, ctx = self._make_coco()
         project = MagicMock()
@@ -1533,6 +1751,7 @@ class TestTopLevelProgrammingState:
     def test_enter_mode_thread_enabled_already_in_mode(self, mock_tid):
         h, ctx = self._make_coco_pending()
         ctx.mode_manager.get_mode.return_value = InteractionMode.COCO
+        ctx.coco_manager.get_session.return_value = MagicMock()
 
         h.enter_mode("m1", "c1")
 

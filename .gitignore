@@ -63,6 +63,8 @@ Thumbs.db
 # Project specific
 *.pid
 .ghostap.pid
+# Legacy in-checkout restart-gate state; new gates live outside the checkout.
+.ghostap-restart/
 
 # Spec engine runtime artifacts
 .spec_engine/

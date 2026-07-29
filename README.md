@@ -115,6 +115,32 @@ uv run python -m src.main
 
 首次启动后，可在飞书私聊机器人发送 `/setadmin` 设置管理员。`ADMIN_USER_IDS` 为空时允许首次设置；设置后只有管理员可以替换管理员配置。
 
+### 安全远程重启
+
+从 Bot 任务中需要重启当前 checkout 时使用：
+
+```bash
+./restart.sh rr
+```
+
+`rr` 会在同步预检时固定当前服务 generation；预检成功后，跨进程门禁先阻止新
+任务进入，再等待正在运行的任务完成终态记账，最后才执行停止、启动和 readiness
+检查。同一 generation 上的并发请求只会执行一次重启。默认 7200 秒预算从独立
+worker 启动后计算，覆盖延迟、任务排空、重启操作和超时进程组清理；超时以非零
+状态退出，不会留下失控的重启子进程。同步预检本身不计入该预算，以便配置、门禁
+和 generation 错误直接返回给调用方。新进程只有在飞书 WebSocket 已连接、精确
+PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就绪的进程会被清理，
+不会被报告为启动成功。停止阶段默认给主进程 30 秒优雅退出时间，之后才会强制
+终止进程组；发生强制终止时会明确返回降级的非零状态。
+
+门禁目录默认位于 checkout 外的同级
+`.ghostap-restart-gates/<checkout-hash>/gate`，因此清理或替换 checkout 不会
+替换仍被运行任务持有的 lock inode。如用
+`GHOSTAP_RESTART_GATE_DIR` 指定覆盖目录，它必须是私有、专用的绝对目录，且既有
+目录须归当前用户所有并禁止 group/other 访问；`/`、`/tmp`、用户主目录或 checkout
+根目录等宽泛路径会被拒绝。首次绑定后 locator 会固定门禁身份，运行中修改覆盖
+目录会 fail-closed。`GHOSTAP_RESTART_GATE_TIMEOUT` 可调整共享预算秒数。
+
 ## 常用命令
 
 ### 模式与模型

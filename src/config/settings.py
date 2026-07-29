@@ -3,10 +3,12 @@
 import base64
 import binascii
 import logging as _logging
+import math
 import os
 import re
 import shlex
 import warnings
+from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -97,13 +99,22 @@ class Settings(BaseSettings):
         os.path.expanduser("~/work"),
     ]
 
-    coco_execution_timeout: int = 7200
+    coco_execution_timeout: int = Field(default=7200, gt=0)
     coco_session_timeout: int = 86400
     coco_max_output_length: int = 30000
 
-    claude_execution_timeout: int = 7200
+    claude_execution_timeout: int = Field(default=7200, gt=0)
     claude_session_timeout: int = 86400
     claude_max_output_length: int = 30000
+    programming_finalization_reserve_s: int = Field(
+        default=600,
+        ge=0,
+        le=3600,
+        description=(
+            "Seconds reserved from ordinary programming execution time for a "
+            "separate bounded finalization prompt; 0 disables the reserve."
+        ),
+    )
 
     # ACP session history directory (empty = default ~/.ghostap/acp_history)
     acp_history_dir: str = ""
@@ -572,6 +583,58 @@ class Settings(BaseSettings):
     # Task scheduler (thread-based) settings
     task_scheduler_max_concurrent: int = 20
     task_scheduler_per_key_concurrency: int = 1
+    # Cross-process restart gate. Empty means the checkout's stable locator
+    # chooses a private gate under the checkout parent's registry; an override
+    # must be an absolute dedicated directory.
+    restart_gate_dir: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "restart_gate_dir",
+            "GHOSTAP_RESTART_GATE_DIR",
+        ),
+    )
+    restart_gate_timeout: float = Field(
+        default=7200.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            "restart_gate_timeout",
+            "GHOSTAP_RESTART_GATE_TIMEOUT",
+        ),
+    )
+
+    @field_validator("restart_gate_dir")
+    @classmethod
+    def _validate_restart_gate_dir(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            return ""
+        path = Path(value)
+        if not path.is_absolute():
+            raise ValueError("restart gate directory must be absolute")
+        normalized = Path(os.path.abspath(path))
+        if (
+            normalized
+            in {
+                Path("/"),
+                Path("/tmp"),
+                Path("/var/tmp"),
+                Path("/private/tmp"),
+                Path("/dev/shm"),
+            }
+            or len(normalized.parts) <= 2
+            or normalized == Path.home()
+        ):
+            raise ValueError(
+                "restart gate directory must be a dedicated private directory"
+            )
+        return str(normalized)
+
+    @field_validator("restart_gate_timeout")
+    @classmethod
+    def _validate_restart_gate_timeout(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("restart gate timeout must be finite and > 0")
+        return value
 
     # 消息回复模式配置
     # - direct: 直接回复（消息显示在被回复消息下方）
@@ -593,7 +656,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     repo_lock_idle_timeout: int = 300  # 锁空闲超时（秒），超时自动释放（仅 refcount=0 时生效）
     repo_lock_cleanup_interval: int = 60  # 清理线程扫描间隔（秒）
-    repo_lock_hard_timeout: int = 3600  # 锁绝对持有上限（秒），refcount>0 超此时长强制回收
+    repo_lock_hard_timeout: int = 3600  # 活跃锁续租超时（秒），无心跳超时后强制回收
 
     # ChatLockManager — 群锁 TTL
     chat_lock_max_duration: int = 86400  # 群锁最大持续时间（秒，默认 24h），超时自动释放

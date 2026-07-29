@@ -17,15 +17,15 @@ from src.card.types import RenderedCard
 logger = logging.getLogger(__name__)
 
 _PAGE_CREATE_NAMESPACE = uuid.UUID("4388eebc-b0bc-5d6a-9c65-6ac058db0324")
-_ERRMSG_RE = re.compile(r"ErrMsg:\s*([^;]+)")
 _EMAIL_ADDRESS_RE = re.compile(
     r"(?<![\w.+-])[\w.+-]+@(?:[\w-]+\.)+[A-Za-z]{2,}(?![\w.-])"
 )
-_FEISHU_IMAGE_KEY_RE = re.compile(
-    r"^img_[A-Za-z0-9][A-Za-z0-9_-]{0,255}$"
+_MARKDOWN_IMAGE_REMOVED_TEXT = "（图片引用已移除）"
+_SAFE_INVALID_REASON_PATTERNS = (
+    ("invalid image key", "invalid image key"),
+    ("content parse failed", "content parse failed"),
+    ("card table number over limit", "card table number over limit"),
 )
-_MARKDOWN_LABEL_UNSAFE_RE = re.compile(r"[\x00-\x1f\x7f`*_{}\[\]<>]+")
-_MAX_MARKDOWN_IMAGE_LABEL_CHARS = 80
 
 
 def sanitize_card_text_for_audit(text: str) -> str:
@@ -35,17 +35,8 @@ def sanitize_card_text_for_audit(text: str) -> str:
     return _EMAIL_ADDRESS_RE.sub("[redacted:email]", text)
 
 
-def _bounded_plain_image_label(alt: str) -> str:
-    label = _MARKDOWN_LABEL_UNSAFE_RE.sub(" ", alt)
-    label = " ".join(label.split())
-    if len(label) > _MAX_MARKDOWN_IMAGE_LABEL_CHARS:
-        label = (
-            label[: _MAX_MARKDOWN_IMAGE_LABEL_CHARS - 1].rstrip()
-            + "…"
-        )
-    if not label:
-        return "（图片引用已移除）"
-    return f"（图片：{label}）"
+def _bounded_plain_image_label(_alt: str) -> str:
+    return _MARKDOWN_IMAGE_REMOVED_TEXT
 
 
 def sanitize_markdown_image_references(text: str) -> str:
@@ -91,19 +82,9 @@ def sanitize_markdown_image_references(text: str) -> str:
             cursor = start + 2
             continue
 
-        target = text[alt_end + 2 : target_end].strip()
-        if (
-            len(target) >= 2
-            and target.startswith("<")
-            and target.endswith(">")
-        ):
-            target = target[1:-1].strip()
-        if _FEISHU_IMAGE_KEY_RE.fullmatch(target):
-            output.append(text[start : target_end + 1])
-        else:
-            output.append(
-                _bounded_plain_image_label(text[start + 2 : alt_end])
-            )
+        output.append(
+            _bounded_plain_image_label(text[start + 2 : alt_end])
+        )
         cursor = target_end + 1
     return "".join(output)
 
@@ -244,9 +225,16 @@ def _format_invalid_card_reason(error: TransportError) -> str:
     parts: list[str] = []
     if error.code:
         parts.append(f"code={error.code}")
-    match = _ERRMSG_RE.search(str(error))
-    if match:
-        parts.append(match.group(1).strip())
+    error_text = str(error).lower()
+    safe_reason = next(
+        (
+            label
+            for marker, label in _SAFE_INVALID_REASON_PATTERNS
+            if marker in error_text
+        ),
+        "card_content_invalid",
+    )
+    parts.append(safe_reason)
     return "；".join(parts) or "card_content_invalid"
 
 
@@ -542,7 +530,14 @@ class PageMutator:
         try:
             seq = self._sequences.next_sequence(page.card_id)
             reason = _format_invalid_card_reason(error)
-            self._client.update_card(page.card_id, _fallback_invalid_card(reason), sequence=seq)
+            fallback_payload = _guard_payload(
+                _fallback_invalid_card(reason)
+            )
+            self._client.update_card(
+                page.card_id,
+                fallback_payload,
+                sequence=seq,
+            )
             self._bindings.update_signature(session_id, page.page_index, card.structure_signature)
             self._bindings.update_text(session_id, page.page_index, "card_content_invalid")
             return MutationOutcome(kind="applied", message=f"fallback_content_invalid:{error.code}")

@@ -561,7 +561,7 @@ class TestUpdatePage:
         assert binding.pages[0].last_text == "old_text"
         assert len(calls) == 2
 
-    def test_update_page_sanitizes_only_markdown_image_references(self):
+    def test_update_page_neutralizes_all_untrusted_markdown_images(self):
         client = MockClient()
         bindings = BindingStore()
         sequences = SequenceManager()
@@ -577,9 +577,10 @@ class TestUpdatePage:
         )
         page = bindings.get("sess_1").pages[0]
         long_alt = "evidence" * 100
+        secret = "sk-0123456789abcdef"
         content = (
             f"before ![{long_alt}](/tmp/private/final.png) "
-            "valid ![uploaded](img_v3_evidence)"
+            f"untrusted ![API_TOKEN={secret}](img_v3_evidence)"
         )
         native_image = {
             "tag": "img",
@@ -611,11 +612,14 @@ class TestUpdatePage:
         sent = client.updates[0]["card_json"]["body"]["elements"]
         safe_markdown = sent[0]["content"]
         assert "/tmp/private/final.png" not in safe_markdown
-        assert "![uploaded](img_v3_evidence)" in safe_markdown
+        assert "img_v3_evidence" not in safe_markdown
+        assert long_alt not in safe_markdown
+        assert secret not in safe_markdown
+        assert "（图片引用已移除）" in safe_markdown
         assert len(safe_markdown) < 300
         assert sent[1] == native_image
 
-    def test_stream_element_sanitizes_invalid_markdown_image_reference(self):
+    def test_stream_element_neutralizes_even_image_key_shaped_markdown(self):
         client = MockClient()
         bindings = BindingStore()
         sequences = SequenceManager()
@@ -632,7 +636,7 @@ class TestUpdatePage:
         page = bindings.get("sess_1").pages[0]
         text = (
             "done ![local](/tmp/private.png) "
-            "![uploaded](img_v3_uploaded)"
+            "![untrusted](img_v3_uploaded)"
         )
 
         outcome = mutator.stream_element(
@@ -644,7 +648,61 @@ class TestUpdatePage:
         assert outcome.kind == "applied"
         sent = client.elements[0]["content"]
         assert "/tmp/private.png" not in sent
-        assert "![uploaded](img_v3_uploaded)" in sent
+        assert "img_v3_uploaded" not in sent
+        assert "local" not in sent
+        assert "untrusted" not in sent
+        assert sent.count("（图片引用已移除）") == 2
+
+    def test_content_invalid_fallback_never_exposes_raw_transport_detail(self):
+        client = MockClient()
+        bindings = BindingStore()
+        sequences = SequenceManager()
+        mutator = PageMutator(client, bindings, sequences)
+        bindings.create("sess_1", "chat_1")
+        bindings.set_page(
+            "sess_1",
+            0,
+            "msg_1",
+            "card_1",
+            "old_sig",
+            "old_text",
+        )
+        page = bindings.get("sess_1").pages[0]
+        calls = []
+        secret = "sk-0123456789abcdef"
+
+        def update_card(card_id, card_json, *, sequence=0):
+            calls.append(
+                {
+                    "card_id": card_id,
+                    "card_json": card_json,
+                    "sequence": sequence,
+                }
+            )
+            if len(calls) == 1:
+                raise TransportError(
+                    "Patch failed: code=230099; ErrMsg: invalid image key "
+                    f"/tmp/private.png request_private_123 API_TOKEN={secret} "
+                    "![](/tmp/second-private.png)",
+                    code=230099,
+                )
+
+        client.update_card = update_card
+
+        outcome = mutator.update_page(
+            "sess_1",
+            page,
+            _make_card(signature="new_sig"),
+        )
+
+        assert outcome.kind == "applied"
+        fallback = calls[1]["card_json"]["body"]["elements"][0]["content"]
+        assert "invalid image key" in fallback
+        assert "/tmp/private.png" not in fallback
+        assert "/tmp/second-private.png" not in fallback
+        assert "request_private_123" not in fallback
+        assert secret not in fallback
+        assert "![](" not in fallback
 
     def test_invalid_image_key_message_is_content_invalid_without_code(self):
         error = TransportError(

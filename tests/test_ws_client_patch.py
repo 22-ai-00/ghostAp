@@ -822,6 +822,150 @@ class TestCardActionHandler(unittest.TestCase):
             client._deep_engine_manager.cleanup_all.assert_called_once()
             client._spec_engine_manager.cleanup_all.assert_called_once()
 
+    def test_close_fences_and_cancels_before_runtime_and_acp_cleanup(self):
+        events: list[str] = []
+        client = object.__new__(FeishuWSClient)
+        client._closed = False
+        client._ws_health_monitor = SimpleNamespace(
+            disconnect=lambda: events.append("primary-intake-stop"),
+            stop_watchdog=lambda: events.append("watchdog-stop")
+        )
+        client._channel_client = SimpleNamespace(
+            stop=lambda: events.append("intake-stop")
+        )
+
+        class FakeScheduler:
+            def __init__(self):
+                self._idle_results = iter((False, True))
+
+            def fence_admission(self):
+                events.append("scheduler-fence")
+
+            def wait_for_idle(self, timeout):
+                events.append(f"scheduler-drain:{timeout:g}")
+                return next(self._idle_results)
+
+            def cancel_active(self):
+                events.append("scheduler-cancel")
+                return 1
+
+            def stop(self, **_kwargs):
+                events.append("scheduler-stop")
+
+        client._scheduler = FakeScheduler()
+        client._employee_department_runtime = SimpleNamespace(
+            close=lambda: events.append("employee-close")
+        )
+        client._chat_lock_gate = SimpleNamespace(
+            close=lambda: events.append("chat-gate-close")
+        )
+        client._control_plane = SimpleNamespace(
+            stop=lambda: events.append("control-stop")
+        )
+
+        class FakeManager:
+            def __init__(self, name, engines=()):
+                self.name = name
+                self.engines = list(engines)
+
+            def list_engines(self):
+                return list(self.engines)
+
+            def cleanup_all(self):
+                events.append(f"{self.name}-cleanup")
+
+        slock_engine = SimpleNamespace(
+            is_running=True,
+            pause=lambda: events.append("slock-pause"),
+            _executor=SimpleNamespace(
+                pending_count=0,
+                shutdown=lambda **kwargs: events.append(
+                    f"slock-executor-shutdown:{kwargs}"
+                ),
+            ),
+        )
+        client._slock_engine_manager = FakeManager("slock", [slock_engine])
+        client._deep_engine_manager = FakeManager("deep")
+        client._spec_engine_manager = FakeManager("spec")
+        client._workflow_engine_manager = FakeManager("workflow")
+        client._handler_ctx = SimpleNamespace(
+            managers={
+                "coco": SimpleNamespace(
+                    cleanup_all=lambda: events.append("acp-cleanup")
+                )
+            }
+        )
+        client._message_cache = SimpleNamespace(stop_cleanup_thread=lambda: None)
+        client._card_event_cache = SimpleNamespace(stop_cleanup_thread=lambda: None)
+        client._card_action_dedup_cache = SimpleNamespace(
+            stop_cleanup_thread=lambda: None
+        )
+        client._thread_manager = SimpleNamespace(close=lambda: None)
+
+        with (
+            patch("src.chat_lock.shutdown_if_active", lambda: events.append("chat-lock-close")),
+            patch("src.repo_lock.shutdown_if_active", lambda: events.append("repo-lock-close")),
+            patch(
+                "src.card.delivery.registry.delivery_registry.drain_in_flight",
+                lambda **_kwargs: events.append("card-drain") or True,
+            ),
+        ):
+            assert client.close() is True
+
+        assert events.index("primary-intake-stop") < events.index("scheduler-fence")
+        assert events.index("intake-stop") < events.index("scheduler-fence")
+        assert events.index("scheduler-fence") < events.index("scheduler-cancel")
+        assert events.index("scheduler-cancel") < events.index("slock-pause")
+        assert any(
+            item
+            == "slock-executor-shutdown:{'wait': False, 'cancel_futures': True}"
+            for item in events
+        )
+        assert events.index("slock-pause") < events.index("employee-close")
+        assert events.index("employee-close") < events.index("card-drain")
+        assert events.index("card-drain") < events.index("acp-cleanup")
+        assert events.index("acp-cleanup") < events.index("scheduler-stop")
+        assert events.index("scheduler-stop") < events.index("chat-lock-close")
+        assert events.index("scheduler-stop") < events.index("repo-lock-close")
+
+    def test_close_does_not_destroy_dependencies_when_scheduler_cannot_drain(self):
+        events: list[str] = []
+        client = object.__new__(FeishuWSClient)
+        client._closed = False
+        client._ws_health_monitor = SimpleNamespace(
+            disconnect=lambda: events.append("intake-stop"),
+            stop_watchdog=lambda: None,
+        )
+        client._channel_client = None
+        client._control_plane = SimpleNamespace(stop=lambda: None)
+
+        class NeverIdleScheduler:
+            def fence_admission(self):
+                events.append("fence")
+
+            def wait_for_idle(self, _timeout):
+                events.append("drain")
+                return False
+
+            def cancel_active(self):
+                events.append("cancel")
+                return 1
+
+            def stop(self, **_kwargs):
+                events.append("scheduler-stop")
+
+        client._scheduler = NeverIdleScheduler()
+
+        assert client.close() is False
+        assert events == [
+            "intake-stop",
+            "fence",
+            "drain",
+            "cancel",
+            "drain",
+            "scheduler-stop",
+        ]
+
     def test_process_with_intent_routes_acp_command_to_system_handler(self):
         with (
             patch("src.feishu.ws_client.get_settings") as mock_get_settings,

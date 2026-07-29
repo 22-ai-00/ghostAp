@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import inspect
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -11,6 +12,97 @@ from src.feishu.ws_client import (
     _employee_hire_status_text,
     _employee_hire_status_uuid,
 )
+
+
+def test_scheduler_factory_does_not_publish_service_identity_during_construction(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from contextlib import nullcontext
+
+    from src.feishu import ws_client as ws
+
+    events = []
+
+    class FakeGate:
+        def task_guard(self):
+            return nullcontext()
+
+        def publish_participation(self, *, service_pid):
+            events.append(("participating", service_pid))
+            return "I" * 24
+
+    gate = FakeGate()
+
+    class FakeScheduler:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(
+        ws.RestartGate,
+        "for_project",
+        lambda *_args, **_kwargs: gate,
+    )
+    monkeypatch.setattr(ws, "TaskScheduler", FakeScheduler)
+    settings = SimpleNamespace(
+        task_scheduler_max_concurrent=1,
+        task_scheduler_per_key_concurrency=1,
+        system_command_concurrency=1,
+        restart_gate_dir="",
+    )
+
+    scheduler = ws._build_task_scheduler(settings, project_dir=tmp_path)
+
+    assert events == []
+    assert scheduler._restart_gate is gate
+    assert scheduler.kwargs["run_guard"].__self__ is gate
+
+
+def test_service_start_phase_publishes_participation_once() -> None:
+    from src.feishu import ws_client as ws
+
+    events = []
+
+    class FakeGate:
+        def publish_participation(self, *, service_pid):
+            events.append(("participating", service_pid))
+            return "I" * 24
+
+    client = object.__new__(ws.FeishuWSClient)
+    client._restart_gate = FakeGate()
+    client._restart_participation_id = None
+
+    assert client._publish_restart_participation() == "I" * 24
+    assert client._publish_restart_participation() == "I" * 24
+    assert events == [("participating", os.getpid())]
+
+
+def test_connected_activity_marks_the_participating_instance_ready() -> None:
+    from src.feishu import ws_client as ws
+
+    events = []
+
+    class FakeHealthMonitor:
+        def record_activity(self, kind):
+            events.append(("activity", kind))
+
+    class FakeGate:
+        def mark_ready(self, *, service_pid):
+            events.append(("ready", service_pid))
+            return "G" * 24
+
+    client = object.__new__(ws.FeishuWSClient)
+    client._ws_health_monitor = FakeHealthMonitor()
+    client._restart_gate = FakeGate()
+
+    client._record_ws_activity("pong")
+    client._record_ws_activity("connected")
+
+    assert events == [
+        ("activity", "pong"),
+        ("activity", "connected"),
+        ("ready", os.getpid()),
+    ]
 
 
 def test_pending_employee_notification_does_not_claim_ready() -> None:

@@ -13,9 +13,11 @@
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import lark_oapi as lark
@@ -65,6 +67,7 @@ from ..thread import (
 from ..utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpenException
 from ..utils.errors import get_error_detail
 from ..utils.rate_limit import RateLimiter, RateLimitExceededException
+from ..utils.restart_gate import RestartGate
 from ..utils.trace import TraceContext, configure_logging_with_trace
 from ..worktree_engine.manager import WorktreeManager
 from .action_dispatcher import ActionDispatcher
@@ -213,6 +216,38 @@ _SILENT_DEDUP_ACTIONS = {
     "slock_new_role_select_tool_dropdown",
 }
 
+_CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
+_SHUTDOWN_SCHEDULER_DRAIN_S = 5.0
+_SHUTDOWN_DELEGATED_DRAIN_S = 5.0
+
+
+def _build_task_scheduler(
+    settings: Any,
+    *,
+    project_dir: Path | None = None,
+) -> TaskScheduler:
+    """Build the production scheduler with a checkout-scoped restart guard."""
+
+    configured_gate_dir = getattr(settings, "restart_gate_dir", "")
+    # A number of focused tests and integrations use partial proxy settings
+    # objects.  Only the Settings contract's concrete string is meaningful;
+    # an auto-created MagicMock attribute must not become a filesystem path.
+    if not isinstance(configured_gate_dir, str):
+        configured_gate_dir = ""
+    gate = RestartGate.for_project(
+        project_dir or _CHECKOUT_ROOT,
+        override=configured_gate_dir or None,
+    )
+    scheduler = TaskScheduler(
+        max_concurrent=settings.task_scheduler_max_concurrent,
+        per_key_concurrency=settings.task_scheduler_per_key_concurrency,
+        system_concurrency=settings.system_command_concurrency,
+        thread_name_prefix="ghost_worker",
+        run_guard=gate.task_guard,
+    )
+    scheduler._restart_gate = gate
+    return scheduler
+
 
 class FeishuWSClient:
     """Feishu WS Client 的服务端运行态。
@@ -318,12 +353,10 @@ class FeishuWSClient:
         self._card_action_dedup_cache = MessageCache(ttl=self.settings.card.action_dedup_ttl, max_size=self.settings.card.action_dedup_max_size, cleanup_interval=30)
         # Chat lock gate: initialized after handler_ctx is available (see below).
         self._chat_lock_gate = None  # type: ignore[assignment]
-        self._scheduler = TaskScheduler(
-            max_concurrent=self.settings.task_scheduler_max_concurrent,
-            per_key_concurrency=self.settings.task_scheduler_per_key_concurrency,
-            system_concurrency=self.settings.system_command_concurrency,
-            thread_name_prefix="ghost_worker",
-        )
+        self._scheduler = _build_task_scheduler(self.settings)
+        self._restart_gate = self._scheduler._restart_gate
+        self._restart_participation_id: str | None = None
+        self._restart_generation: str | None = None
         # Spec Engine limits: e.g. 50 calls per second, max 100 capacity
         self._scheduler.register_policy(
             "spec_command",
@@ -732,37 +765,130 @@ class FeishuWSClient:
         """Register a card action handler."""
         self._action_dispatcher.register(handler, exact, prefix)
 
-    def close(self):
-        """Best-effort cleanup for background resources."""
+    def close(self) -> bool:
+        """Fence intake, drain work, then clean up dependencies.
+
+        ``False`` means a worker or card delivery did not drain within the
+        bounded shutdown budget. In that case shared dependencies are left
+        intact for the still-running callback and the process-level caller must
+        not tear down lock managers underneath it.
+        """
         self._closed = True
 
         self._ws_health_monitor.stop_watchdog()
 
+        # Stop external intake before fencing the in-process scheduler.  This
+        # prevents a reconnect callback from admitting fresh work during drain.
         try:
-            if self._employee_department_runtime is not None:
-                self._employee_department_runtime.close()
+            self._ws_health_monitor.disconnect()
         except Exception:
-            logger.debug("Employee Department shutdown skipped", exc_info=True)
-        # Stop chat lock gate dedup cache cleanup
+            logger.debug("failed to disconnect primary WS intake", exc_info=True)
         try:
-            self._chat_lock_gate.close()
+            if self._channel_client is not None:
+                self._channel_client.stop()
+        except Exception as e:
+            logger.debug("停止普通模式 Channel SDK 客户端失败: %s", get_error_detail(e))
+
+        try:
+            self._scheduler.fence_admission()
         except Exception:
-            logger.debug("failed to close chat_lock_gate", exc_info=True)
+            logger.debug("failed to fence scheduler admission", exc_info=True)
 
         try:
             self._control_plane.stop()
         except Exception:
             logger.debug("failed to stop control_plane", exc_info=True)
 
-        # 1) Stop long-running engines first (they may hold ACP subprocesses)
+        scheduler_idle = False
+        try:
+            scheduler_idle = self._scheduler.wait_for_idle(
+                _SHUTDOWN_SCHEDULER_DRAIN_S
+            )
+            if not scheduler_idle:
+                self._scheduler.cancel_active()
+                scheduler_idle = self._scheduler.wait_for_idle(
+                    _SHUTDOWN_SCHEDULER_DRAIN_S
+                )
+        except Exception:
+            logger.debug("failed to drain scheduler before cleanup", exc_info=True)
+            scheduler_idle = False
+
+        if not scheduler_idle:
+            logger.error(
+                "scheduler did not reach idle; preserving callback dependencies"
+            )
+            try:
+                self._scheduler.stop(wait=True, shutdown_executor=False)
+            except Exception:
+                logger.debug("failed to stop scheduler dispatcher", exc_info=True)
+            return False
+
+        # Ask every delegated execution surface to stop before destroying ACP
+        # sessions.  Employee runtime close waits for its Team executor; Slock
+        # tasks are delegated to a separate bounded executor, so explicitly
+        # pause their sessions and observe that executor as well.
         deep_resources = EngineResourceGroup("deep_engine", self._deep_engine_manager)
         spec_resources = EngineResourceGroup("spec_engine", self._spec_engine_manager)
+        workflow_resources = EngineResourceGroup(
+            "workflow_engine",
+            self._workflow_engine_manager,
+        )
         deep_engines = deep_resources.stop_running_engines()
         spec_engines = spec_resources.stop_running_engines()
+        workflow_engines = workflow_resources.stop_running_engines()
+        slock_engines = self._quiesce_slock_activities()
 
-        # Give running engines a short grace period to exit run loops before hard cleanup.
-        EngineResourceGroup.wait_stopped(deep_engines)
-        EngineResourceGroup.wait_stopped(spec_engines)
+        delegated_idle = True
+        try:
+            if self._employee_department_runtime is not None:
+                self._employee_department_runtime.close()
+        except Exception:
+            logger.debug("Employee Department shutdown skipped", exc_info=True)
+            delegated_idle = False
+
+        delegated_idle = (
+            EngineResourceGroup.wait_stopped(deep_engines)
+            and delegated_idle
+        )
+        delegated_idle = (
+            EngineResourceGroup.wait_stopped(spec_engines)
+            and delegated_idle
+        )
+        delegated_idle = (
+            EngineResourceGroup.wait_stopped(workflow_engines)
+            and delegated_idle
+        )
+        delegated_idle = (
+            self._wait_slock_activities(
+                slock_engines,
+                timeout_s=_SHUTDOWN_DELEGATED_DRAIN_S,
+            )
+            and delegated_idle
+        )
+
+        if not delegated_idle:
+            logger.error(
+                "delegated engine work did not drain; preserving shared dependencies"
+            )
+            try:
+                self._scheduler.stop(wait=True, shutdown_executor=False)
+            except Exception:
+                logger.debug("failed to stop scheduler dispatcher", exc_info=True)
+            return False
+
+        from ..card.delivery.registry import delivery_registry
+
+        if not delivery_registry.drain_in_flight(
+            timeout=_SHUTDOWN_DELEGATED_DRAIN_S
+        ):
+            logger.error(
+                "card delivery did not drain; preserving shared dependencies"
+            )
+            try:
+                self._scheduler.stop(wait=True, shutdown_executor=False)
+            except Exception:
+                logger.debug("failed to stop scheduler dispatcher", exc_info=True)
+            return False
 
         try:
             self._message_cache.stop_cleanup_thread()
@@ -779,37 +905,37 @@ class FeishuWSClient:
         except Exception as e:
             logger.debug("停止card_action_dedup_cache清理线程失败: %s", get_error_detail(e))
 
-        # 2) Close per-chat programming sessions (kills ACP agent subprocesses)
+        deep_resources.cleanup_all()
+        spec_resources.cleanup_all()
+        workflow_resources.cleanup_all()
+        try:
+            self._slock_engine_manager.cleanup_all()
+        except Exception as e:
+            logger.debug("清理slock_engine_manager失败: %s", get_error_detail(e))
+
+        # Only after execution surfaces have quiesced may their shared ACP
+        # sessions be destroyed.
         for name, mgr in self._handler_ctx.managers.items():
             try:
                 mgr.cleanup_all()
             except Exception as e:
                 logger.debug("清理%s_session_manager失败: %s", name, get_error_detail(e))
 
-        deep_resources.cleanup_all()
-        spec_resources.cleanup_all()
-
         try:
             self._thread_manager.close()
         except Exception as e:
             logger.debug("清理thread_manager失败: %s", get_error_detail(e))
-
-        # Workflow engine cleanup
-        try:
-            self._workflow_engine_manager.cleanup_all()
-        except Exception as e:
-            logger.debug("清理workflow_engine_manager失败: %s", get_error_detail(e))
 
         try:
             self._scheduler.stop(wait=True, shutdown_executor=True)
         except Exception as e:
             logger.debug("停止scheduler失败: %s", get_error_detail(e))
 
+        # Stop chat-lock dedup only after callbacks can no longer use it.
         try:
-            if self._channel_client is not None:
-                self._channel_client.stop()
-        except Exception as e:
-            logger.debug("停止普通模式 Channel SDK 客户端失败: %s", get_error_detail(e))
+            self._chat_lock_gate.close()
+        except Exception:
+            logger.debug("failed to close chat_lock_gate", exc_info=True)
 
         # Best-effort shutdown lock-manager daemon threads so non-Application
         # callers (e.g. tests) do not leak background threads.
@@ -823,6 +949,72 @@ class FeishuWSClient:
             _repo_sd()
         except Exception:
             logger.debug("RepoLockManager shutdown in close() skipped", exc_info=True)
+        return True
+
+    def _quiesce_slock_activities(self) -> list[Any]:
+        """Cancel Slock work delegated beyond the message scheduler."""
+
+        try:
+            engines = list(self._slock_engine_manager.list_engines())
+        except Exception:
+            logger.debug("failed to list Slock engines during shutdown", exc_info=True)
+            return []
+        for engine in engines:
+            try:
+                pause = getattr(engine, "pause", None)
+                stop = getattr(engine, "stop", None)
+                if callable(pause):
+                    pause()
+                elif callable(stop):
+                    stop()
+            except Exception:
+                logger.debug("failed to quiesce Slock engine", exc_info=True)
+            seen_executors: set[int] = set()
+            for name in ("_executor", "_discussion_executor"):
+                executor = getattr(engine, name, None)
+                if executor is None or id(executor) in seen_executors:
+                    continue
+                seen_executors.add(id(executor))
+                shutdown = getattr(executor, "shutdown", None)
+                if not callable(shutdown):
+                    continue
+                try:
+                    shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    logger.debug(
+                        "failed to fence Slock executor %s",
+                        name,
+                        exc_info=True,
+                    )
+        return engines
+
+    @staticmethod
+    def _wait_slock_activities(
+        engines: list[Any],
+        *,
+        timeout_s: float,
+    ) -> bool:
+        """Boundedly observe Slock delegated executors after cancellation."""
+
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            pending = 0
+            for engine in engines:
+                for name in ("_executor", "_discussion_executor"):
+                    executor = getattr(engine, name, None)
+                    count = getattr(executor, "pending_count", 0)
+                    if isinstance(count, int) and count > 0:
+                        pending += count
+            if pending == 0:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error(
+                    "Slock delegated activities did not drain pending=%s",
+                    pending,
+                )
+                return False
+            time.sleep(min(0.05, remaining))
 
     def _on_thread_evicted(self, ctx) -> None:
         for mgr in self._handler_ctx.managers.values():
@@ -2919,11 +3111,37 @@ class FeishuWSClient:
     # ==================================================================
     # WebSocket lifecycle
     # ==================================================================
+    def _record_ws_activity(self, kind: str) -> None:
+        """Record transport health and publish readiness on a real connection."""
+
+        self._ws_health_monitor.record_activity(kind)
+        if kind != "connected":
+            return
+        self._restart_generation = self._restart_gate.mark_ready(
+            service_pid=os.getpid()
+        )
+        logger.info(
+            "GhostAP restart readiness published generation=%s",
+            self._restart_generation,
+        )
+
+    def _publish_restart_participation(self) -> str:
+        """Bind restart identity only when the real service starts intake."""
+
+        if self._restart_participation_id is None:
+            self._restart_participation_id = (
+                self._restart_gate.publish_participation(
+                    service_pid=os.getpid(),
+                )
+            )
+        return self._restart_participation_id
+
     def start(self):
         """启动 WS 长连接并进入重连循环。
 
         注意：该方法是阻塞的；通常在主线程调用。
         """
+        self._publish_restart_participation()
         event_builder = (
             ChannelEventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._handle_message)
@@ -2998,7 +3216,7 @@ class FeishuWSClient:
                 # ticket query parameters.
                 log_level=ChannelLogLevel.WARNING,
                 source="ghostap",
-                on_activity=self._ws_health_monitor.record_activity,
+                on_activity=self._record_ws_activity,
             )
             try:
                 self._client.start()

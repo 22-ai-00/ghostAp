@@ -277,6 +277,7 @@ class TestEnsureSessionModelMismatch(unittest.TestCase):
         import threading
         mgr._lock = threading.Lock()
         mgr._sessions = {}
+        mgr._closing_sessions = {}
         mgr._agent_type = "coco"
         mgr._session_timeout = 3600
         mgr._max_sessions = 10

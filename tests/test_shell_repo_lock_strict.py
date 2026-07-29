@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +14,7 @@ import pytest
 from src.feishu.handlers.lock_helper import LockHelper
 from src.feishu.handlers.system import SystemHandler
 from src.repo_lock import LockConflictError, RepoLockManager
+from src.tasking import TaskScheduler, TaskSpec, TaskStatus
 from src.thread import set_current_is_p2p
 from src.utils.signing import VerifyResult, verify_command_sig
 
@@ -36,6 +39,86 @@ def test_strict_repo_lock_rejects_second_p2p_chat(tmp_path) -> None:
         body.assert_not_called()
     finally:
         set_current_is_p2p(False)
+        manager.shutdown()
+
+
+def test_strict_shell_same_chat_cannot_overlap_programming_run(tmp_path) -> None:
+    """Different scheduler runs in one chat must not be lock-reentrant."""
+    manager = RepoLockManager(idle_timeout=300, cleanup_interval=9999)
+    helper = LockHelper(_LockHandler(manager))
+    scheduler = TaskScheduler(max_concurrent=2, per_key_concurrency=1)
+    programming_started = threading.Event()
+    release_programming = threading.Event()
+    shell_body = MagicMock()
+
+    def programming(_ctx):
+        def body():
+            programming_started.set()
+            assert release_programming.wait(timeout=2)
+
+        return helper._with_repo_lock_strict(str(tmp_path), "same-chat", body)
+
+    programming_handle = scheduler.submit(
+        TaskSpec(
+            chat_id="same-chat",
+            name="programming",
+            queue_key="same-chat:project",
+        ),
+        programming,
+    )
+    assert programming_started.wait(timeout=1)
+
+    def shell(_ctx):
+        with pytest.raises(LockConflictError):
+            helper._with_repo_lock_strict(
+                str(tmp_path),
+                "same-chat",
+                shell_body,
+            )
+        return "blocked"
+
+    shell_handle = scheduler.submit(
+        TaskSpec(
+            chat_id="same-chat",
+            name="shell-fast",
+            is_system_command=True,
+        ),
+        shell,
+    )
+
+    try:
+        assert shell_handle.wait(timeout=2).status == TaskStatus.SUCCEEDED
+        shell_body.assert_not_called()
+    finally:
+        release_programming.set()
+        programming_handle.wait(timeout=2)
+        scheduler.stop(wait=True, shutdown_executor=True)
+        manager.shutdown()
+
+
+def test_short_repo_lease_is_renewed_while_strict_task_is_active(
+    tmp_path,
+) -> None:
+    manager = RepoLockManager(
+        idle_timeout=300,
+        cleanup_interval=0.02,
+        hard_timeout=0.6,
+    )
+    helper = LockHelper(_LockHandler(manager))
+    lock_still_held: list[bool] = []
+
+    def active_body() -> None:
+        time.sleep(1.1)
+        lock_still_held.append(manager.get_lock_info(str(tmp_path)) is not None)
+
+    try:
+        helper._with_repo_lock_strict(
+            str(tmp_path),
+            "short-lease-chat",
+            active_body,
+        )
+        assert lock_still_held == [True]
+    finally:
         manager.shutdown()
 
 

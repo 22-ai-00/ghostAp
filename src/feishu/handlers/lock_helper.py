@@ -174,23 +174,28 @@ class LockHelper:
         if not repo_lock_mgr or not root_path:
             return body_func()
 
+        from ...repo_lock import get_repo_lock_heartbeat_interval
+        from ...tasking import get_current_task_run_id
         from ...utils.heartbeat import RepoLockHeartbeat
 
-        _TOUCH_INTERVAL = 30
-        try:
-            _hard_timeout = self._h.settings.repo_lock_hard_timeout
-        except Exception:
-            _hard_timeout = 3600
-        _max_beats = max(1, int(_hard_timeout // _TOUCH_INTERVAL))
-
+        _TOUCH_INTERVAL = get_repo_lock_heartbeat_interval(repo_lock_mgr)
+        owner_id = get_current_task_run_id()
         stop_event = threading.Event()
 
-        with repo_lock_mgr.hold(root_path, chat_id, is_p2p=is_p2p):
+        with repo_lock_mgr.hold(
+            root_path,
+            chat_id,
+            is_p2p=is_p2p,
+            owner_id=owner_id,
+        ):
             hb = RepoLockHeartbeat(
                 stop_event,
-                lambda: repo_lock_mgr.touch(root_path, chat_id),
+                lambda: repo_lock_mgr.touch(
+                    root_path,
+                    chat_id,
+                    owner_id=owner_id,
+                ),
                 interval=_TOUCH_INTERVAL,
-                max_beats=_max_beats,
                 name=f"lock-helper-{root_path}",
             )
             hb.start()
@@ -210,6 +215,7 @@ class LockHelper:
         Returns ``(AcquireResult | None, repo_lock_mgr, needs_release)``.
         """
         from ...repo_lock import LockConflictError
+        from ...tasking import get_current_task_run_id
         from ...thread import get_current_is_p2p
 
         repo_lock_mgr = getattr(self._h.ctx, "repo_lock_manager", None)
@@ -220,7 +226,12 @@ class LockHelper:
         if is_p2p:
             return None, None, False
 
-        result = repo_lock_mgr.acquire(root_path, chat_id, is_p2p=False)
+        result = repo_lock_mgr.acquire(
+            root_path,
+            chat_id,
+            is_p2p=False,
+            owner_id=get_current_task_run_id(),
+        )
         if not result.success:
             raise LockConflictError(
                 f"Repo lock conflict for {root_path!r} (held by another chat)",
@@ -234,7 +245,13 @@ class LockHelper:
     def _release_repo_lock(self, root_path: str | None, chat_id: str, repo_lock_mgr=None) -> None:
         """Release a repo lock previously acquired via :meth:`_acquire_repo_lock`."""
         if repo_lock_mgr and root_path:
-            repo_lock_mgr.release(root_path, chat_id)
+            from ...tasking import get_current_task_run_id
+
+            repo_lock_mgr.release(
+                root_path,
+                chat_id,
+                owner_id=get_current_task_run_id(),
+            )
 
     # ------------------------------------------------------------------
     # Repo lock: single entry point for lock-guarded execution

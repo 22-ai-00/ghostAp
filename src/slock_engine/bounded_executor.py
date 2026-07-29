@@ -99,17 +99,28 @@ class BoundedExecutor:
         future.add_done_callback(self._done_callback)
         return future
 
-    def shutdown(self, wait: bool = True) -> None:
+    def shutdown(
+        self,
+        wait: bool = True,
+        *,
+        cancel_futures: bool = False,
+    ) -> None:
         """Shut down the underlying thread pool executor.
 
         Parameters
         ----------
         wait:
             If *True* (default), block until all pending futures complete.
+        cancel_futures:
+            Cancel work that has not started. Running callables remain
+            cooperative and are observed through ``pending_count``.
         """
         with self._lock:
             self._shutdown = True
-        self._executor.shutdown(wait=wait)
+        self._executor.shutdown(
+            wait=wait,
+            cancel_futures=cancel_futures,
+        )
 
     @property
     def is_shutdown(self) -> bool:

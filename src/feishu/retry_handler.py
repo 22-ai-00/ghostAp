@@ -197,7 +197,14 @@ class RetryCommandHandler:
         if not repo_lock_mgr or not project or not getattr(project, "root_path", None):
             return False
 
-        probe = repo_lock_mgr.acquire(project.root_path, cid)
+        from ..tasking import get_current_task_run_id
+
+        owner_id = get_current_task_run_id()
+        probe = repo_lock_mgr.acquire(
+            project.root_path,
+            cid,
+            owner_id=owner_id,
+        )
         if not probe.success:
             self._send_probe_conflict_card(
                 mid,
@@ -210,7 +217,11 @@ class RetryCommandHandler:
             return True
 
         # Probe succeeded — release immediately; real lock acquired downstream.
-        repo_lock_mgr.release(project.root_path, cid)
+        repo_lock_mgr.release(
+            project.root_path,
+            cid,
+            owner_id=owner_id,
+        )
         return False
 
     def _dispatch_intent(

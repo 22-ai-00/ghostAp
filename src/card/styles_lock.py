@@ -118,7 +118,7 @@ LOCK_UI_TEXT: dict[str, str] = {
     "lock_force_release_success": "**🔓 仓库锁已强制释放**\n\n仓库 `{repo_name}` 的锁已被 Bot 管理员强制释放。",
     "lock_force_release_holder_changed": "⚠️ 该仓库锁状态已变化，请重新查看后再操作",
     "lock_force_release_notify_holder": "**🔓 仓库锁已被释放**\n\n仓库 `{repo_name}` 的锁已被 Bot 管理员从另一个群聊中强制释放。\n如需继续操作，请重新发送命令。",
-    "lock_hard_timeout_reclaim_notify": "**🔓 仓库锁已被系统回收**\n\n仓库 `{repo_name}` 的锁因超时（超过系统最大持有时限 {max_hours} 小时）被自动回收。\n如需继续操作，请重新发送命令。",
+    "lock_hard_timeout_reclaim_notify": "**🔓 仓库锁已被系统回收**\n\n仓库 `{repo_name}` 的锁因续租超时（超过 {max_hours} 小时未收到活动心跳）被自动回收。\n如需继续操作，请重新发送命令。",
     "lock_cmd_cancel_force_release": "❌ 已取消强制释放操作",
     "lock_project_not_found_hint": "⚠️ 未找到该项目，项目可能已删除。请发送 /projects 查看项目列表",
     # ── Diagnostics Lock Status ──

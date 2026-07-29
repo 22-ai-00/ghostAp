@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
 
-from ...acp import ACPEventRenderer
+from ...acp import ACPEventRenderer, run_prompt_with_finalization
 from ...acp.manager import ACPSessionManager
 from ...acp.outcome import PromptOutcome, classify_prompt_result
 from ...acp.providers import normalize_acp_model_name
@@ -42,6 +42,13 @@ def _append_execution_notice(text: str, notice: str) -> str:
     if not notice or notice in content:
         return content
     return f"{content}\n\n{notice}" if content else notice
+
+
+def _configured_finalization_reserve(settings: object) -> int:
+    raw = getattr(settings, "programming_finalization_reserve_s", 0)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0
+    return max(0, int(raw))
 
 
 def build_programming_session_callbacks(
@@ -99,6 +106,166 @@ class ProgrammingModeHandler(BaseHandler):
     def _get_session_manager(self) -> ACPSessionManager:
         return getattr(self.ctx, f"{self.mode_key}_manager")
 
+    def _replace_timed_out_session(
+        self,
+        *,
+        chat_id: str,
+        project,
+        cwd: str,
+        thread_id: str | None,
+        timed_out_session: SyncSession,
+        startup_budget_s: float,
+    ) -> SyncSession:
+        """Replace an ACP session whose timed-out prompt could not be drained."""
+        project_id = project.project_id if project else None
+        manager = self._get_session_manager()
+        replacement_deadline = time.monotonic() + max(0.0, startup_budget_s)
+        self._clear_snapshot_for_session(
+            project,
+            timed_out_session,
+            persistence_timeout_s=min(1.0, max(0.0, startup_budget_s / 4)),
+        )
+        remaining_budget = replacement_deadline - time.monotonic()
+        if remaining_budget <= 0:
+            raise TimeoutError("ACP 安全收尾会话重建预算已耗尽")
+        outcome = manager.replace_session(
+            chat_id,
+            cwd=cwd,
+            expected_session=timed_out_session,
+            startup_timeout=remaining_budget,
+            project_id=project_id,
+            agent_type_override=self._get_agent_type_override(project),
+            model_name=self._get_model_name_override(project),
+            thread_id=thread_id,
+        )
+        if not outcome.created:
+            if outcome.session is None:
+                raise RuntimeError(
+                    "原会话已被移除；旧任务停止收尾，避免复活已结束任务"
+                )
+            raise RuntimeError(
+                "并发新会话已接管；旧任务停止收尾，避免干扰新任务"
+            )
+        replacement = outcome.session
+        if thread_id and project:
+            self._register_thread_context(thread_id, chat_id, project, replacement)
+        return replacement
+
+    def _retire_finalization_session(
+        self,
+        *,
+        chat_id: str,
+        project,
+        thread_id: str | None,
+        active_session: SyncSession,
+        retirement_budget_s: float = 30.0,
+    ) -> None:
+        """Prevent a timed-out session and any late child work from being reused."""
+        project_id = project.project_id if project else None
+        retirement_deadline = (
+            time.monotonic() + max(0.0, retirement_budget_s)
+        )
+        self._clear_snapshot_for_session(
+            project,
+            active_session,
+            persistence_timeout_s=min(
+                1.0,
+                max(0.0, retirement_budget_s / 4),
+            ),
+        )
+        remaining_budget = retirement_deadline - time.monotonic()
+        if remaining_budget <= 0:
+            raise TimeoutError("ACP 安全收尾会话退休预算已耗尽")
+        self._get_session_manager().retire_session(
+            chat_id,
+            project_id=project_id,
+            thread_id=thread_id,
+            expected_session=active_session,
+            timeout=remaining_budget,
+        )
+
+    def _clear_snapshot_for_session(
+        self,
+        project,
+        session: SyncSession,
+        persistence_timeout_s: float | None = None,
+    ) -> None:
+        """Clear only a snapshot that still points at the retiring session."""
+        if project is None:
+            return
+        session_id = str(getattr(session, "session_id", "") or "")
+        compare_and_clear = getattr(
+            type(project),
+            "clear_programming_snapshot_if_matches",
+            None,
+        )
+        if callable(compare_and_clear):
+            cleared = bool(compare_and_clear(project, self.mode_key, session_id))
+        else:
+            snapshot = self._get_snapshot(project)
+            snapshot_id = str(getattr(snapshot, "session_id", "") or "")
+            cleared = bool(
+                snapshot_id
+                and session_id
+                and snapshot_id == session_id
+            )
+            if cleared:
+                setattr(project, f"{self.mode_key}_session_snapshot", None)
+        if cleared:
+            self._persist_project_context(
+                project,
+                timeout_s=persistence_timeout_s,
+            )
+
+    def _persist_project_context(
+        self,
+        project: "ProjectContext",
+        *,
+        timeout_s: float | None = None,
+    ) -> bool:
+        """Best-effort persistence for session snapshot tombstones."""
+        result = [False]
+        completed = threading.Event()
+
+        def _persist() -> None:
+            try:
+                persist = getattr(
+                    self.project_manager,
+                    "persist_project_context",
+                    None,
+                )
+                if callable(persist):
+                    result[0] = bool(persist(project))
+                    if not result[0]:
+                        logger.error(
+                            "programming session snapshot tombstone was not persisted"
+                        )
+            except Exception:
+                logger.warning(
+                    "failed to persist programming session snapshot",
+                    exc_info=True,
+                )
+            finally:
+                completed.set()
+
+        if timeout_s is None:
+            _persist()
+            return result[0]
+        worker = threading.Thread(
+            target=_persist,
+            daemon=True,
+            name=f"persist-session-tombstone-{project.project_id}",
+        )
+        worker.start()
+        if not completed.wait(timeout=max(0.0, timeout_s)):
+            logger.warning(
+                "programming session snapshot persistence exceeded %.3fs; "
+                "continuing retirement while persistence finishes",
+                timeout_s,
+            )
+            return False
+        return result[0]
+
     def _is_in_this_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         return self.mode_manager.get_mode(chat_id, project_id) == self.interaction_mode
 
@@ -124,6 +291,9 @@ class ProgrammingModeHandler(BaseHandler):
         )
 
     def _get_snapshot(self, project: "ProjectContext"):
+        getter = getattr(type(project), "get_programming_snapshot", None)
+        if callable(getter):
+            return getter(project, self.mode_key)
         return getattr(project, f"{self.mode_key}_session_snapshot")
 
     def _set_mode_on_project(self, project: "ProjectContext", active: bool, session_id: str = "", count: int = 0):
@@ -138,7 +308,18 @@ class ProgrammingModeHandler(BaseHandler):
         project.update_programming_snapshot(self.mode_key, query, count, session_id)
 
     def _clear_snapshot_on_project(self, project: "ProjectContext"):
-        setattr(project, f"{self.mode_key}_session_snapshot", None)
+        clear = getattr(type(project), "clear_programming_snapshot", None)
+        if callable(clear):
+            changed = bool(clear(project, self.mode_key))
+        else:
+            changed = getattr(
+                project,
+                f"{self.mode_key}_session_snapshot",
+                None,
+            ) is not None
+            setattr(project, f"{self.mode_key}_session_snapshot", None)
+        if changed:
+            self._persist_project_context(project)
 
     def _get_model_name_override(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
         if project and getattr(project, "acp_tool_name", "") == self.mode_key:
@@ -226,19 +407,33 @@ class ProgrammingModeHandler(BaseHandler):
         if thread_id is None:
             thread_id = get_current_thread_id()
         if not thread_id and self._is_in_this_mode(chat_id, project_id=project_id):
-            if not silent:
-                info = self._get_session_manager().get_session_info(chat_id, project_id=project_id)
-                self.reply_text(
-                    message_id,
-                    fmt.format_warning(
-                        UI_TEXT["mode_already_in_msg"].format(name=self.mode_name, info=info)
-                    ),
-                )
-            return bool(
-                self._get_session_manager().get_session(
-                    chat_id,
-                    project_id=project_id,
-                )
+            manager = self._get_session_manager()
+            live_session = manager.get_session(
+                chat_id,
+                project_id=project_id,
+            )
+            if live_session is not None:
+                if not silent:
+                    info = manager.get_session_info(
+                        chat_id,
+                        project_id=project_id,
+                    )
+                    self.reply_text(
+                        message_id,
+                        fmt.format_warning(
+                            UI_TEXT["mode_already_in_msg"].format(
+                                name=self.mode_name,
+                                info=info,
+                            )
+                        ),
+                    )
+                return True
+            logger.warning(
+                "[%s] mode is active but its session is missing; starting a fresh session: "
+                "chat=%s project=%s",
+                self.mode_name,
+                chat_id[:12] if chat_id else "?",
+                project_id or "-",
             )
 
         previous_mode = self.mode_manager.get_mode(chat_id, project_id=project_id)
@@ -784,6 +979,7 @@ class ProgrammingModeHandler(BaseHandler):
                 )
                 return
 
+        raw_task_text = text
         text = self.inject_bridge_context(text, project, chat_id=chat_id)
         global_working_dir = self.get_working_dir(chat_id)
         cwd = project.root_path if project else global_working_dir
@@ -810,8 +1006,18 @@ class ProgrammingModeHandler(BaseHandler):
             return
 
         try:
-            self.handle_response(message_id, chat_id, text, session, project, cwd, global_working_dir,
-                                 _repo_lock_mgr=repo_lock_mgr, _root_path=root_path)
+            self.handle_response(
+                message_id,
+                chat_id,
+                text,
+                session,
+                project,
+                cwd,
+                global_working_dir,
+                _repo_lock_mgr=repo_lock_mgr,
+                _root_path=root_path,
+                _finalization_task_text=raw_task_text,
+            )
         finally:
             if needs_release:
                 self._release_repo_lock(root_path, chat_id, repo_lock_mgr)
@@ -822,6 +1028,7 @@ class ProgrammingModeHandler(BaseHandler):
     def handle_response(
         self, message_id: str, chat_id: str, text: str, session: SyncSession, project, cwd: str, global_working_dir: str,
         *, _repo_lock_mgr=None, _root_path: str | None = None,
+        _finalization_task_text: str | None = None,
     ):
         from ...acp.models import ACPEvent
         from ...card.delivery.channel_client import LarkChannelCardAPIClient
@@ -866,6 +1073,7 @@ class ProgrammingModeHandler(BaseHandler):
             self._handle_response_non_streaming(
                 message_id, chat_id, text, session, project, global_working_dir,
                 _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
+                _finalization_task_text=_finalization_task_text,
             )
             return
 
@@ -889,6 +1097,7 @@ class ProgrammingModeHandler(BaseHandler):
             self._handle_response_non_streaming(
                 message_id, chat_id, text, session, project, global_working_dir,
                 _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
+                _finalization_task_text=_finalization_task_text,
             )
             return
 
@@ -924,6 +1133,7 @@ class ProgrammingModeHandler(BaseHandler):
             self._handle_response_non_streaming(
                 message_id, chat_id, text, session, project, global_working_dir,
                 _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
+                _finalization_task_text=_finalization_task_text,
             )
             return
 
@@ -940,6 +1150,7 @@ class ProgrammingModeHandler(BaseHandler):
             self._handle_response_non_streaming(
                 message_id, chat_id, text, session, project, global_working_dir,
                 _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
+                _finalization_task_text=_finalization_task_text,
             )
             return
 
@@ -959,22 +1170,26 @@ class ProgrammingModeHandler(BaseHandler):
         timeout = self.settings.coco_execution_timeout if self.is_coco else self.settings.claude_execution_timeout
         update_count = [0]
         _last_touch = [time.monotonic()]
-        _TOUCH_INTERVAL = 30
+        from ...repo_lock import get_repo_lock_heartbeat_interval
+
+        _TOUCH_INTERVAL = get_repo_lock_heartbeat_interval(_repo_lock_mgr)
+        from ...tasking import get_current_task_run_id
+
+        _repo_lock_owner_id = get_current_task_run_id()
 
         # Heartbeat for repo lock
         _streaming_hb_stop = threading.Event()
-        try:
-            _streaming_max_beats = max(1, int(self.settings.repo_lock_hard_timeout // _TOUCH_INTERVAL))
-        except Exception:
-            _streaming_max_beats = 120
 
         if _repo_lock_mgr and _root_path:
             from ...utils.heartbeat import RepoLockHeartbeat
             _streaming_hb = RepoLockHeartbeat(
                 _streaming_hb_stop,
-                lambda: _repo_lock_mgr.touch(_root_path, chat_id),
+                lambda: _repo_lock_mgr.touch(
+                    _root_path,
+                    chat_id,
+                    owner_id=_repo_lock_owner_id,
+                ),
                 interval=_TOUCH_INTERVAL,
-                max_beats=_streaming_max_beats,
                 name=f"prog-stream-{_root_path}",
             )
             _streaming_hb.start()
@@ -987,7 +1202,11 @@ class ProgrammingModeHandler(BaseHandler):
             if _repo_lock_mgr and _root_path:
                 now = time.monotonic()
                 if now - _last_touch[0] >= _TOUCH_INTERVAL:
-                    _repo_lock_mgr.touch(_root_path, chat_id)
+                    _repo_lock_mgr.touch(
+                        _root_path,
+                        chat_id,
+                        owner_id=_repo_lock_owner_id,
+                    )
                     _last_touch[0] = now
             # Dispatch to new card session
             try:
@@ -998,8 +1217,64 @@ class ProgrammingModeHandler(BaseHandler):
         final_response = ""
         prompt_outcome = PromptOutcome.INCOMPLETE
         prompt_stop_reason = "exception"
+        active_session = [session]
+        entered_finalization = [False]
+        retirement_completed = [False]
+
+        def _start_finalization() -> None:
+            entered_finalization[0] = True
+            logger.warning(
+                "%s ACP任务进入安全收尾阶段: total_timeout=%ss reserve=%ss",
+                self.mode_name,
+                timeout,
+                _configured_finalization_reserve(self.settings),
+            )
+
+        def _replace_dead_session(startup_budget_s: float) -> SyncSession:
+            replacement = self._replace_timed_out_session(
+                chat_id=chat_id,
+                project=project,
+                cwd=cwd,
+                thread_id=_thread_id,
+                timed_out_session=active_session[0],
+                startup_budget_s=startup_budget_s,
+            )
+            active_session[0] = replacement
+            return replacement
+
+        def _retire_session(
+            active: SyncSession,
+            retirement_budget_s: float = 0.001,
+        ) -> None:
+            if retirement_completed[0]:
+                return
+            try:
+                setattr(active, "_force_dead", True)
+            except Exception:
+                logger.warning("failed to poison-mark timed-out ACP session")
+            self._retire_finalization_session(
+                chat_id=chat_id,
+                project=project,
+                thread_id=_thread_id,
+                active_session=active,
+                retirement_budget_s=retirement_budget_s,
+            )
+            retirement_completed[0] = True
+
         try:
-            result = session.send_prompt(text, on_event=on_event, timeout=timeout)
+            result = run_prompt_with_finalization(
+                session,
+                text,
+                on_event=on_event,
+                timeout_s=timeout,
+                finalization_reserve_s=_configured_finalization_reserve(
+                    self.settings
+                ),
+                finalization_task_text=_finalization_task_text,
+                on_finalization_start=_start_finalization,
+                replace_dead_session=_replace_dead_session,
+                retire_finalization_session=_retire_session,
+            )
             assessment = classify_prompt_result(result)
             prompt_outcome = assessment.outcome
             prompt_stop_reason = assessment.stop_reason
@@ -1007,7 +1282,12 @@ class ProgrammingModeHandler(BaseHandler):
             result_text = (getattr(result, "text", None) or "").strip()
             response_text = streamed_response or result_text
             if assessment.outcome is PromptOutcome.COMPLETED:
-                prog_session.finish(fallback_text=result_text)
+                prog_session.finish(
+                    fallback_text=result_text,
+                    unfinished_subagent_status=(
+                        "cancelled" if entered_finalization[0] else "completed"
+                    ),
+                )
                 final_response = (
                     prog_session.get_final_text()
                     or result_text
@@ -1024,17 +1304,47 @@ class ProgrammingModeHandler(BaseHandler):
                     reason=assessment.detail,
                 )
                 final_response = _append_execution_notice(response_text, notice)
-                prog_session.fail(notice)
+                prog_session.fail(
+                    notice,
+                    unfinished_subagent_status=(
+                        "cancelled" if entered_finalization[0] else "failed"
+                    ),
+                )
         except TimeoutError as e:
+            try:
+                _retire_session(active_session[0])
+            except Exception:
+                logger.error(
+                    "%s ACP超时会话退休失败；会话已标记为不可复用",
+                    self.mode_name,
+                    exc_info=True,
+                )
             prompt_stop_reason = "timeout"
             final_response = UI_TEXT["mode_exec_timeout_msg"].format(error=get_error_detail(e))
             log_exception(logger, f"{self.mode_name} ACP执行超时", e, level=logging.WARNING)
-            prog_session.fail(final_response)
+            prog_session.fail(
+                final_response,
+                unfinished_subagent_status="cancelled",
+            )
         except Exception as e:
+            if entered_finalization[0] and not retirement_completed[0]:
+                try:
+                    _retire_session(active_session[0])
+                except Exception:
+                    logger.error(
+                        "%s ACP安全收尾会话退休失败",
+                        self.mode_name,
+                        exc_info=True,
+                    )
             prompt_stop_reason = "exception"
             final_response = UI_TEXT["mode_exec_exception_msg"].format(error=get_error_detail(e))
             log_exception(logger, f"{self.mode_name} ACP执行异常", e)
-            prog_session.fail(final_response)
+            prog_session.fail(
+                final_response,
+                unfinished_subagent_status=(
+                    "cancelled" if entered_finalization[0] else "failed"
+                ),
+            )
             if self.interaction_mode == InteractionMode.TUI2ACP and self._is_terminal_state_error(e):
                 try:
                     self._get_session_manager().end_session(
@@ -1081,7 +1391,17 @@ class ProgrammingModeHandler(BaseHandler):
         # Post-processing (non-critical, must not block emoji reaction)
         try:
             if project:
-                self._update_snapshot_on_project(project, text, session.message_count, session.session_id)
+                final_session = active_session[0]
+                if entered_finalization[0]:
+                    self._clear_snapshot_for_session(project, session)
+                    self._clear_snapshot_for_session(project, final_session)
+                else:
+                    self._update_snapshot_on_project(
+                        project,
+                        text,
+                        final_session.message_count,
+                        final_session.session_id,
+                    )
                 project.add_conversation("user", text, message_id)
                 project.add_conversation("assistant", final_response)
                 source = self.mode_name.lower()
@@ -1109,25 +1429,54 @@ class ProgrammingModeHandler(BaseHandler):
     def _handle_response_non_streaming(
         self, message_id: str, chat_id: str, text: str, session: SyncSession, project, global_working_dir: str,
         *, _repo_lock_mgr=None, _root_path: str | None = None,
+        _finalization_task_text: str | None = None,
     ):
         """Fallback: handle response in non-streaming text mode."""
         timeout = self.settings.coco_execution_timeout if self.is_coco else self.settings.claude_execution_timeout
+        from ...thread import get_current_thread_id
+
+        thread_id = get_current_thread_id()
+        cwd = project.root_path if project else global_working_dir
+        retirement_completed = [False]
+
+        def _retire_session(
+            active: SyncSession,
+            retirement_budget_s: float = 0.001,
+        ) -> None:
+            if retirement_completed[0]:
+                return
+            try:
+                setattr(active, "_force_dead", True)
+            except Exception:
+                logger.warning("failed to poison-mark timed-out ACP session")
+            self._retire_finalization_session(
+                chat_id=chat_id,
+                project=project,
+                thread_id=thread_id,
+                active_session=active,
+                retirement_budget_s=retirement_budget_s,
+            )
+            retirement_completed[0] = True
 
         # Heartbeat
-        _TOUCH_INTERVAL = 30
+        from ...repo_lock import get_repo_lock_heartbeat_interval
+
+        _TOUCH_INTERVAL = get_repo_lock_heartbeat_interval(_repo_lock_mgr)
         _hb_stop = threading.Event()
-        try:
-            _max_beats = max(1, int(self.settings.repo_lock_hard_timeout // _TOUCH_INTERVAL))
-        except Exception:
-            _max_beats = 120
+        from ...tasking import get_current_task_run_id
+
+        _repo_lock_owner_id = get_current_task_run_id()
 
         if _repo_lock_mgr and _root_path:
             from ...utils.heartbeat import RepoLockHeartbeat
             _hb = RepoLockHeartbeat(
                 _hb_stop,
-                lambda: _repo_lock_mgr.touch(_root_path, chat_id),
+                lambda: _repo_lock_mgr.touch(
+                    _root_path,
+                    chat_id,
+                    owner_id=_repo_lock_owner_id,
+                ),
                 interval=_TOUCH_INTERVAL,
-                max_beats=_max_beats,
                 name=f"prog-nonstream-{_root_path}",
             )
             _hb.start()
@@ -1156,7 +1505,31 @@ class ProgrammingModeHandler(BaseHandler):
                     return
                 renderer.process_event(event)
 
-            result = session.send_prompt(text, on_event=on_event, timeout=timeout)
+            result = run_prompt_with_finalization(
+                session,
+                text,
+                on_event=on_event,
+                timeout_s=timeout,
+                finalization_reserve_s=_configured_finalization_reserve(
+                    self.settings
+                ),
+                finalization_task_text=_finalization_task_text,
+                on_finalization_start=lambda: logger.warning(
+                    "%s ACP任务进入安全收尾阶段: total_timeout=%ss reserve=%ss",
+                    self.mode_name,
+                    timeout,
+                    _configured_finalization_reserve(self.settings),
+                ),
+                replace_dead_session=lambda startup_budget_s: self._replace_timed_out_session(
+                    chat_id=chat_id,
+                    project=project,
+                    cwd=cwd,
+                    thread_id=thread_id,
+                    timed_out_session=session,
+                    startup_budget_s=startup_budget_s,
+                ),
+                retire_finalization_session=_retire_session,
+            )
             assessment = classify_prompt_result(result)
             final_response = (
                 (getattr(result, "text", None) or "").strip()
@@ -1205,6 +1578,14 @@ class ProgrammingModeHandler(BaseHandler):
                     EmojiHook.SUCCESS_EMOJI_DEFAULT,
                 )
         except TimeoutError as e:
+            try:
+                _retire_session(session)
+            except Exception:
+                logger.error(
+                    "%s ACP超时会话退休失败；会话已标记为不可复用",
+                    self.mode_name,
+                    exc_info=True,
+                )
             log_exception(logger, f"{self.mode_name} ACP执行超时", e, level=logging.WARNING)
             msg_type, content = CardBuilder.build_error_card(e, title=UI_TEXT["mode_exec_timeout_title"], project=project)
             self.reply_card(message_id, content)

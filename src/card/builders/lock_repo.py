@@ -253,7 +253,8 @@ def build_lock_reclaim_notify_card(
     repo_name : str
         Display name of the repository whose lock was reclaimed.
     reason : str
-        ``"hard_timeout"`` — system auto-reclaim due to exceeding max hold time.
+        ``"hard_timeout"`` — system auto-reclaim after the renewable lease
+        stops receiving activity heartbeats.
         ``"force_release"`` — admin force-released the lock from another chat.
 
     Returns a Markdown string suitable for ``send_message()``.

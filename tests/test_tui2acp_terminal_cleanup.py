@@ -31,7 +31,7 @@ class _FakeProgrammingCardSession:
     def on_event(self, _event):
         return None
 
-    def fail(self, text):
+    def fail(self, text, **_kwargs):
         self.failed_text = text
 
 
@@ -208,6 +208,7 @@ def test_programming_handle_response_falls_back_when_channel_is_unavailable():
         "/tmp",
         _repo_lock_mgr=None,
         _root_path=None,
+        _finalization_task_text=None,
     )
     session.send_prompt.assert_not_called()
 

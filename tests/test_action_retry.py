@@ -186,8 +186,16 @@ class TestRetryCommandRepoLockProbe:
         })
 
         # Verify acquire was called, then release, then _process_with_intent
-        mock_repo_lock.acquire.assert_called_once_with("/tmp/repo", "chat_5")
-        mock_repo_lock.release.assert_called_once_with("/tmp/repo", "chat_5")
+        mock_repo_lock.acquire.assert_called_once_with(
+            "/tmp/repo",
+            "chat_5",
+            owner_id=None,
+        )
+        mock_repo_lock.release.assert_called_once_with(
+            "/tmp/repo",
+            "chat_5",
+            owner_id=None,
+        )
         client._process_with_intent.assert_called_once()
 
     @patch("src.thread.get_current_sender_id", return_value="sender_1")

@@ -4,18 +4,19 @@ SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
 PROJECT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)"
 LOG_FILE="$PROJECT_DIR/logs.log"
 PID_FILE="$PROJECT_DIR/.ghostap.pid"
-RESTART_SCRIPT="$PROJECT_DIR/.restart_worker.sh"
 PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
 
 RESTART_GRACE_DELAY="${GHOSTAP_RESTART_GRACE_DELAY:-1}"
-TERM_GRACE_DELAY="${GHOSTAP_TERM_GRACE_DELAY:-0.8}"
-RESIDUAL_GRACE_DELAY="${GHOSTAP_RESIDUAL_GRACE_DELAY:-0.2}"
-START_CHECK_DELAY="${GHOSTAP_START_CHECK_DELAY:-0.3}"
+TERM_GRACE_DELAY="${GHOSTAP_TERM_GRACE_DELAY:-30}"
+RESIDUAL_GRACE_DELAY="${GHOSTAP_RESIDUAL_GRACE_DELAY:-10}"
+READINESS_TIMEOUT="${GHOSTAP_READINESS_TIMEOUT:-60}"
+READINESS_POLL_INTERVAL="${GHOSTAP_READINESS_POLL_INTERVAL:-1}"
+START_FAILURE_GRACE_DELAY="${GHOSTAP_START_FAILURE_GRACE_DELAY:-5}"
 LOG_MODE="${GHOSTAP_LOG_MODE:-truncate}"
 STARTED_PID=""
+RESTART_REQUEST_SEQUENCE=0
 PROJECT_LAUNCHCTL_ID=$(printf '%s' "$PROJECT_DIR" | cksum | awk '{print $1}')
 LAUNCHCTL_LABEL="${GHOSTAP_LAUNCHCTL_LABEL:-com.ghostap.local.${PROJECT_LAUNCHCTL_ID}}"
-RESTART_LAUNCHCTL_LABEL="${GHOSTAP_RESTART_LAUNCHCTL_LABEL:-${LAUNCHCTL_LABEL}.restart}"
 CODEX_ACP_NPM_PACKAGE="${GHOSTAP_CODEX_ACP_NPM_PACKAGE:-@agentclientprotocol/codex-acp@1.1.2}"
 PREPARE_CODEX_ACP="${GHOSTAP_PREPARE_CODEX_ACP:-1}"
 TUI2ACP_NPM_PACKAGE="${GHOSTAP_TUI2ACP_NPM_PACKAGE:-tui2acp}"
@@ -89,6 +90,34 @@ log_restart() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [RESTART] $*" >> "$LOG_FILE"
 }
 
+build_restart_python_command() {
+    if [ -x "$PYTHON_BIN" ]; then
+        RESTART_PYTHON_COMMAND=("$PYTHON_BIN")
+    else
+        RESTART_PYTHON_COMMAND=(uv run --project "$PROJECT_DIR" python)
+    fi
+}
+
+verify_service_readiness() {
+    local service_pid="$1"
+    build_restart_python_command
+    "${RESTART_PYTHON_COMMAND[@]}" -m src.utils.restart_gate ready \
+        --project-dir "$PROJECT_DIR" \
+        --service-pid "$service_pid"
+}
+
+publish_restart_generation() {
+    local service_pid="${1:-${PID:-}}"
+    [ -n "$service_pid" ] || return 1
+    verify_service_readiness "$service_pid" >/dev/null
+}
+
+snapshot_restart_generation() {
+    build_restart_python_command
+    "${RESTART_PYTHON_COMMAND[@]}" -m src.utils.restart_gate snapshot \
+        --project-dir "$PROJECT_DIR"
+}
+
 start_service_process() {
     local mode="${1:-truncate}"
     local detach_cmd=()
@@ -98,9 +127,13 @@ start_service_process() {
         launchctl remove "$LAUNCHCTL_LABEL" >/dev/null 2>&1 || true
         unset VIRTUAL_ENV
         if [ -x "$PYTHON_BIN" ]; then
-            launchctl submit -l "$LAUNCHCTL_LABEL" -- /bin/bash -lc "cd '$PROJECT_DIR' && exec '$PYTHON_BIN' -m src.main >> '$LOG_FILE' 2>&1"
+            launchctl submit -l "$LAUNCHCTL_LABEL" -- /bin/bash -lc \
+                'cd "$1" && exec "$2" -m src.main >>"$3" 2>&1' \
+                bash "$PROJECT_DIR" "$PYTHON_BIN" "$LOG_FILE"
         else
-            launchctl submit -l "$LAUNCHCTL_LABEL" -- /bin/bash -lc "cd '$PROJECT_DIR' && exec uv run python -m src.main >> '$LOG_FILE' 2>&1"
+            launchctl submit -l "$LAUNCHCTL_LABEL" -- /bin/bash -lc \
+                'cd "$1" && exec uv run python -m src.main >>"$2" 2>&1' \
+                bash "$PROJECT_DIR" "$LOG_FILE"
         fi
         STARTED_PID=""
         return
@@ -122,6 +155,47 @@ start_service_process() {
     fi
     STARTED_PID=$!
     disown "$STARTED_PID" 2>/dev/null || true
+}
+
+wait_for_service_readiness() {
+    local preferred_pid="${1:-}"
+    local previous_pids="${2:-}"
+    local deadline=$((SECONDS + READINESS_TIMEOUT))
+    local candidates candidate generation previous
+
+    while :; do
+        if [ -n "$preferred_pid" ]; then
+            candidates="$preferred_pid"
+        else
+            candidates=$(get_running_pids)
+        fi
+        for candidate in $candidates; do
+            previous=0
+            for prior_pid in $previous_pids; do
+                if [ "$candidate" = "$prior_pid" ]; then
+                    previous=1
+                    break
+                fi
+            done
+            [ "$previous" = "0" ] || continue
+            if generation=$(verify_service_readiness "$candidate" 2>/dev/null) &&
+                [[ "$generation" =~ ^[A-Za-z0-9_-]{20,64}$ ]]; then
+                PID="$candidate"
+                READY_GENERATION="$generation"
+                RUNNING_PIDS=$(get_running_pids)
+                [ -n "$RUNNING_PIDS" ] || RUNNING_PIDS="$candidate"
+                return 0
+            fi
+        done
+
+        if [ -n "$preferred_pid" ] && ! kill -0 "$preferred_pid" 2>/dev/null; then
+            return 1
+        fi
+        if (( SECONDS >= deadline )); then
+            return 1
+        fi
+        sleep "$READINESS_POLL_INTERVAL"
+    done
 }
 
 service_command_label() {
@@ -306,90 +380,138 @@ prepare_tui2acp_dependency() {
     fi
 }
 
+wait_for_pid_exit() {
+    local target_pid="$1"
+    local timeout="$2"
+    local deadline=$((SECONDS + timeout))
+
+    while kill -0 "$target_pid" 2>/dev/null; do
+        if (( SECONDS >= deadline )); then
+            return 1
+        fi
+        sleep 1
+    done
+    return 0
+}
+
+terminate_service_pid() {
+    local target_pid="$1"
+    local grace_delay="$2"
+
+    kill "$target_pid" 2>/dev/null || true
+    if wait_for_pid_exit "$target_pid" "$grace_delay"; then
+        return 0
+    fi
+
+    echo "进程 $target_pid 未在宽限期内退出，正在强制终止..."
+    kill -9 "$target_pid" 2>/dev/null || true
+    kill -9 -- -"$target_pid" 2>/dev/null || true
+    return 2
+}
+
+cleanup_failed_start() {
+    local target_pid="${1:-}"
+
+    [ -n "$target_pid" ] || return 0
+    if kill -0 "$target_pid" 2>/dev/null && pid_is_ghostap_service "$target_pid"; then
+        terminate_service_pid "$target_pid" "$START_FAILURE_GRACE_DELAY" || true
+    fi
+    if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$target_pid" ]; then
+        rm -f "$PID_FILE"
+    fi
+}
+
 stop_service() {
+    local forced=0
+    local target_pid=""
+    local residual_pids=""
+    local p=""
+
     echo "正在停止 GhostAP 服务..."
     log_restart "stop begin"
-    
+
     if [ -f "$PID_FILE" ]; then
-        PID=$(cat "$PID_FILE")
-        if kill -0 "$PID" 2>/dev/null && pid_is_ghostap_service "$PID"; then
-            # 先尝试优雅停止（进程本身 + 进程组，确保子进程(ACP agent等)不残留）
-            kill "$PID" 2>/dev/null || true
-            kill -- -"$PID" 2>/dev/null || true
-            sleep "$TERM_GRACE_DELAY"
-            if kill -0 "$PID" 2>/dev/null; then
-                echo "进程未响应，强制终止..."
-                kill -9 "$PID" 2>/dev/null || true
-                kill -9 -- -"$PID" 2>/dev/null || true
+        target_pid=$(cat "$PID_FILE")
+        if kill -0 "$target_pid" 2>/dev/null &&
+            pid_is_ghostap_service "$target_pid"; then
+            if ! terminate_service_pid "$target_pid" "$TERM_GRACE_DELAY"; then
+                forced=1
             fi
-            echo "已停止进程 PID: $PID"
-        elif kill -0 "$PID" 2>/dev/null; then
-            echo "忽略不属于当前项目的 PID 文件记录: $PID"
-            log_restart "stale pid file ignored pid=$PID"
+            echo "已停止进程 PID: $target_pid"
+        elif kill -0 "$target_pid" 2>/dev/null; then
+            echo "忽略不属于当前项目的 PID 文件记录: $target_pid"
+            log_restart "stale pid file ignored pid=$target_pid"
         fi
         rm -f "$PID_FILE"
     fi
     if command -v launchctl >/dev/null 2>&1; then
         launchctl remove "$LAUNCHCTL_LABEL" >/dev/null 2>&1 || true
     fi
-    
-    PIDS=$(get_running_pids)
-    if [ -n "$PIDS" ]; then
-        echo "发现残留进程: $(echo $PIDS | tr '\n' ' ')，正在清理..."
-        # 同时杀进程本身与进程组，避免遗留子进程
-        echo "$PIDS" | xargs kill 2>/dev/null || true
-        for p in $PIDS; do
-            kill -- -"$p" 2>/dev/null || true
+
+    residual_pids=$(get_running_pids)
+    if [ -n "$residual_pids" ]; then
+        echo "发现残留进程: $(echo "$residual_pids" | tr '\n' ' ')，正在清理..."
+        for p in $residual_pids; do
+            if pid_is_ghostap_service "$p" &&
+                ! terminate_service_pid "$p" "$RESIDUAL_GRACE_DELAY"; then
+                forced=1
+            fi
         done
-        sleep "$RESIDUAL_GRACE_DELAY"
-        PIDS=$(get_running_pids)
-        if [ -n "$PIDS" ]; then
-            echo "$PIDS" | xargs kill -9 2>/dev/null || true
-            for p in $PIDS; do
-                kill -9 -- -"$p" 2>/dev/null || true
-            done
-        fi
     fi
-    
+
+    if [ "$forced" = "1" ]; then
+        echo "⚠️  服务已强制停止；本次停止为降级完成"
+        log_restart "stop degraded forced termination"
+        return 2
+    fi
+
     echo "✅ 服务已停止"
-    log_restart "stop done"
+    log_restart "stop done graceful"
+    return 0
 }
 
 start_service() {
+    local previous_running_pids=""
     echo "正在启动 GhostAP 服务..."
     local start_log_mode="$LOG_MODE"
     if [ "$start_log_mode" != "append" ]; then
         : > "$LOG_FILE"
         start_log_mode="append"
     fi
-    prepare_python_dependencies || exit 1
+    prepare_python_dependencies || return 1
     prepare_employee_sandbox_dependency
     prepare_codex_acp_dependency
     prepare_tui2acp_dependency
     log_restart "start begin cmd=$(service_command_label)"
+    previous_running_pids=$(get_running_pids)
     start_service_process "$start_log_mode"
     PID="$STARTED_PID"
     if [ -n "$PID" ]; then
-        echo $PID > "$PID_FILE"
+        echo "$PID" > "$PID_FILE"
     fi
-    sleep "$START_CHECK_DELAY"
-    
-    RUNNING_PIDS=$(get_running_pids)
-    if [ -n "$RUNNING_PIDS" ]; then
-        if [ -z "$PID" ]; then
-            PID=$(echo "$RUNNING_PIDS" | awk 'NR==1 {print $1}')
-            echo $PID > "$PID_FILE"
-        fi
-        echo "✅ GhostAP 服务已启动"
-        echo "   进程: $RUNNING_PIDS"
-        echo "   启动命令: $(service_command_label)"
-        echo "   日志: $LOG_FILE"
-        log_restart "start spawned pid=$PID running=$RUNNING_PIDS"
-    else
-        echo "❌ 启动失败，请检查日志: $LOG_FILE"
-        log_restart "start failed pid=$PID"
-        exit 1
+
+    if ! wait_for_service_readiness "$PID" "$previous_running_pids"; then
+        echo "❌ 启动失败：服务未在 ${READINESS_TIMEOUT}s 内通过 readiness 检查"
+        log_restart "start failed readiness pid=$PID"
+        cleanup_failed_start "$PID"
+        return 1
     fi
+    if [ -z "$PID" ]; then
+        PID=$(echo "$RUNNING_PIDS" | awk 'NR==1 {print $1}')
+    fi
+    echo "$PID" > "$PID_FILE"
+    if ! publish_restart_generation "$PID"; then
+        echo "❌ 服务 readiness 已通过，但无法确认安全重启 generation"
+        log_restart "start failed generation publish pid=$PID"
+        cleanup_failed_start "$PID"
+        return 1
+    fi
+    echo "✅ GhostAP 服务已启动且 readiness 已通过"
+    echo "   进程: $RUNNING_PIDS"
+    echo "   启动命令: $(service_command_label)"
+    echo "   日志: $LOG_FILE"
+    log_restart "start ready pid=$PID running=$RUNNING_PIDS generation=${READY_GENERATION:-verified}"
+    return 0
 }
 
 show_status() {
@@ -407,44 +529,78 @@ show_status() {
 
 remote_restart() {
     echo "🔄 触发远程重启..."
-    
-    cat > "$RESTART_SCRIPT" << WORKER_EOF
-#!/bin/bash
-PROJECT_DIR="$PROJECT_DIR"
-LOG_FILE="$LOG_FILE"
-PID_FILE="$PID_FILE"
-RESTART_GRACE_DELAY="$RESTART_GRACE_DELAY"
 
-cd "\$PROJECT_DIR"
-
-sleep "\$RESTART_GRACE_DELAY"
-
-echo "\$(date '+%Y-%m-%d %H:%M:%S') [RESTART] remote worker begin" >> "\$LOG_FILE"
-GHOSTAP_LOG_MODE=append "\$PROJECT_DIR/restart.sh" restart >> "\$LOG_FILE" 2>&1
-STATUS=\$?
-NEW_PID="-"
-[ -f "\$PID_FILE" ] && NEW_PID=\$(cat "\$PID_FILE")
-echo "\$(date '+%Y-%m-%d %H:%M:%S') [RESTART] remote worker done status=\$STATUS pid=\$NEW_PID" >> "\$LOG_FILE"
-
-rm -f "\$0"
-exit "\$STATUS"
-WORKER_EOF
-
-    chmod +x "$RESTART_SCRIPT"
-    
-    if command -v setsid >/dev/null 2>&1; then
-        setsid "$RESTART_SCRIPT" </dev/null >/dev/null 2>&1 &
-    elif command -v launchctl >/dev/null 2>&1; then
-        launchctl remove "$RESTART_LAUNCHCTL_LABEL" >/dev/null 2>&1 || true
-        launchctl submit -l "$RESTART_LAUNCHCTL_LABEL" -- /bin/bash "$RESTART_SCRIPT" >/dev/null 2>&1 &
-    else
-        nohup "$RESTART_SCRIPT" </dev/null >/dev/null 2>&1 &
+    build_restart_python_command
+    local expected_generation=""
+    if ! expected_generation="$(snapshot_restart_generation)"; then
+        echo "❌ 安全重启预检失败，未启动重启 worker"
+        log_restart "remote worker preflight failed"
+        return 1
     fi
-    WORKER_PID=$!
-    disown "$WORKER_PID" 2>/dev/null || true
+    if [[ ! "$expected_generation" =~ ^[A-Za-z0-9_-]{20,64}$ ]]; then
+        echo "❌ 安全重启预检返回了无效 generation"
+        log_restart "remote worker preflight invalid generation"
+        return 1
+    fi
+    local worker_command=(
+        "${RESTART_PYTHON_COMMAND[@]}"
+        -m src.utils.restart_gate worker
+        --project-dir "$PROJECT_DIR"
+        --expected-generation "$expected_generation"
+        --restart-script "$PROJECT_DIR/restart.sh"
+        --log-file "$LOG_FILE"
+        --delay "$RESTART_GRACE_DELAY"
+    )
+    local worker_pid=""
+
+    case "$(uname -s)" in
+        Linux)
+            if ! command -v setsid >/dev/null 2>&1; then
+                echo "❌ 当前 Linux 缺少 setsid，拒绝启动不安全的远程重启"
+                log_restart "remote worker rejected missing setsid"
+                return 1
+            fi
+            setsid "${worker_command[@]}" </dev/null >/dev/null 2>&1 &
+            worker_pid=$!
+            ;;
+        Darwin)
+            if ! command -v launchctl >/dev/null 2>&1; then
+                echo "❌ 当前 macOS 缺少 launchctl，拒绝启动不安全的远程重启"
+                log_restart "remote worker rejected missing launchctl"
+                return 1
+            fi
+            RESTART_REQUEST_SEQUENCE=$((RESTART_REQUEST_SEQUENCE + 1))
+            local request_label
+            request_label="${LAUNCHCTL_LABEL}.restart.$$.$RESTART_REQUEST_SEQUENCE.$RANDOM"
+            worker_command=(
+                "${RESTART_PYTHON_COMMAND[@]}"
+                -m src.utils.restart_gate launch-wrapper
+                --project-dir "$PROJECT_DIR"
+                --expected-generation "$expected_generation"
+                --restart-script "$PROJECT_DIR/restart.sh"
+                --log-file "$LOG_FILE"
+                --delay "$RESTART_GRACE_DELAY"
+                --launchd-label "$request_label"
+            )
+            if ! launchctl submit -l "$request_label" -- \
+                "${worker_command[@]}" >/dev/null 2>&1; then
+                echo "❌ launchctl 无法启动安全重启 worker"
+                log_restart "remote worker launch failed label=$request_label"
+                return 1
+            fi
+            ;;
+        *)
+            echo "❌ 当前平台不支持安全远程重启"
+            log_restart "remote worker rejected unsupported platform=$(uname -s)"
+            return 1
+            ;;
+    esac
+    if [ -n "$worker_pid" ]; then
+        disown "$worker_pid" 2>/dev/null || true
+    fi
     
     echo "✅ 远程重启已触发"
-    echo "   服务将在 ${RESTART_GRACE_DELAY} 秒后重新启动"
+    echo "   服务将在当前任务安全结束后重新启动"
     echo "   查看日志: tail -f $LOG_FILE"
 }
 
@@ -460,9 +616,13 @@ case "${1:-restart}" in
         stop_service
         ;;
     restart)
-        stop_service
+        stop_status=0
+        stop_service || stop_status=$?
         LOG_MODE="${GHOSTAP_LOG_MODE:-append}"
-        start_service
+        if ! start_service; then
+            exit 1
+        fi
+        exit "$stop_status"
         ;;
     remote-restart|rr)
         remote_restart

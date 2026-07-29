@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
 import re as _re
 import shlex as _shlex
 import subprocess
@@ -22,8 +23,27 @@ from ..ttadk.env_sandbox import build_ttadk_subprocess_env, resolve_ttadk_execut
 from ..utils.errors import get_error_detail
 from ..utils.retry import RetryPolicy, prompt_with_retry
 from .employee_cli_sandbox import EmployeeCLISandbox
+from .process_cleanup import terminate_and_reap_process_tree
 
 logger = logging.getLogger(__name__)
+
+_CLI_TERMINATE_GRACE_S = 5.0
+_CLI_KILL_GRACE_S = 3.0
+
+
+def _terminate_and_reap_process(
+    proc: subprocess.Popen,
+    *,
+    process_group_id: int | None = None,
+) -> bool:
+    """Bounded TERM→KILL cleanup for one TTADK subprocess tree."""
+    return terminate_and_reap_process_tree(
+        proc,
+        process_group_id=process_group_id,
+        terminate_grace=_CLI_TERMINATE_GRACE_S,
+        kill_grace=_CLI_KILL_GRACE_S,
+        label="TTADK:CLI",
+    )
 
 
 class SyncTTADKCLISession:
@@ -54,7 +74,9 @@ class SyncTTADKCLISession:
         self.last_query: str = ""
         self.is_resumed: bool = False
         self._cancel_event = threading.Event()
+        self._force_dead = False
         self._proc: Optional[subprocess.Popen] = None
+        self._proc_group_id: int | None = None
         self._tool_filter = None
         self._employee_sandbox = (
             EmployeeCLISandbox(cwd=cwd, process_env=employee_process_env)
@@ -120,7 +142,19 @@ class SyncTTADKCLISession:
                 logger.debug("SyncTTADKCLISession.cancel: terminate failed", exc_info=True)
 
     def close(self) -> None:
-        return
+        proc = self._proc
+        if proc is None:
+            return
+        if _terminate_and_reap_process(
+            proc,
+            process_group_id=self._proc_group_id,
+        ):
+            self._proc = None
+            self._proc_group_id = None
+            return
+        self._force_dead = True
+        self._proc = proc
+        raise RuntimeError("TTADK CLI failed to terminate subprocess")
 
     def to_snapshot(self) -> dict:
         return {
@@ -191,6 +225,7 @@ class SyncTTADKCLISession:
             except Exception:
                 logger.debug("_read_stderr: pipe read failed", exc_info=True)
 
+        ensure_process_stopped: Callable[[], bool] | None = None
         try:
             # Use unified environment sandbox for consistency and safety
             # This ensures PATH, PYTHONPATH, and other critical vars are set correctly
@@ -221,6 +256,12 @@ class SyncTTADKCLISession:
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,  # Line buffered
+                start_new_session=(os.name == "posix"),
+            )
+            self._proc_group_id = (
+                getattr(self._proc, "pid", None)
+                if os.name == "posix"
+                else None
             )
 
             # Start stderr reader thread to prevent deadlock
@@ -230,28 +271,46 @@ class SyncTTADKCLISession:
             deadline = (time.monotonic() + timeout) if timeout else None
             terminated_reason: list[str] = []
             proc_ref = self._proc
+            proc_group_id = self._proc_group_id
+            cleanup_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+            cleanup_done = threading.Event()
+            cleanup_succeeded = [False]
+
+            def _ensure_process_stopped() -> bool:
+                with cleanup_lock:
+                    if cleanup_done.is_set():
+                        return cleanup_succeeded[0]
+                    cleanup_succeeded[0] = _terminate_and_reap_process(
+                        proc_ref,
+                        process_group_id=proc_group_id,
+                    )
+                    cleanup_done.set()
+                    if not cleanup_succeeded[0]:
+                        self._force_dead = True
+                    return cleanup_succeeded[0]
+
+            ensure_process_stopped = _ensure_process_stopped
 
             def _watchdog() -> None:
                 while True:
-                    try:
-                        if proc_ref.poll() is not None:
-                            return
-                    except Exception:
-                        return
                     if self._cancel_event.is_set():
                         terminated_reason.append("cancelled")
-                        try:
-                            proc_ref.terminate()
-                        except Exception:
-                            logger.debug("[TTADK:CLI] cancel terminate failed", exc_info=True)
+                        _ensure_process_stopped()
+                        return
+                    try:
+                        leader_exited = proc_ref.poll() is not None
+                    except Exception:
+                        _ensure_process_stopped()
+                        return
+                    if leader_exited:
+                        # The leader can finish while a descendant keeps the
+                        # inherited pipes open. Reap the complete process group.
+                        _ensure_process_stopped()
                         return
                     now = time.monotonic()
                     if deadline and now >= deadline:
                         terminated_reason.append("timeout")
-                        try:
-                            proc_ref.terminate()
-                        except Exception:
-                            logger.debug("[TTADK:CLI] timeout terminate failed", exc_info=True)
+                        _ensure_process_stopped()
                         return
                     wait_timeout = 0.1
                     if deadline:
@@ -267,16 +326,28 @@ class SyncTTADKCLISession:
                     if terminated_reason:
                         break
                     if self._cancel_event.is_set():
-                        self._proc.terminate()
-                        self._proc.wait(timeout=5)
+                        _ensure_process_stopped()
                         current = "".join(json_chunks if json_mode else (visible_chunks or raw_chunks))
                         return PromptResult(stop_reason="cancelled", text=current)
 
                     if deadline and time.monotonic() > deadline:
-                        self._proc.terminate()
-                        self._proc.wait(timeout=5)
-                        current = "".join(json_chunks if json_mode else (visible_chunks or raw_chunks))
-                        return PromptResult(stop_reason="timeout", text=(current + "\n❌ TTADK 执行超时").strip())
+                        try:
+                            leader_running = proc_ref.poll() is None
+                        except Exception:
+                            leader_running = True
+                        if leader_running:
+                            _ensure_process_stopped()
+                            current = "".join(
+                                json_chunks
+                                if json_mode
+                                else (visible_chunks or raw_chunks)
+                            )
+                            return PromptResult(
+                                stop_reason="timeout",
+                                text=(
+                                    current + "\n❌ TTADK 执行超时"
+                                ).strip(),
+                            )
 
                     clean_line = _strip_ansi(line)
                     raw_chunks.append(clean_line)
@@ -305,7 +376,19 @@ class SyncTTADKCLISession:
                     if on_event:
                         on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=clean_line))
 
-            self._proc.wait(timeout=30)
+            if terminated_reason:
+                _ensure_process_stopped()
+            else:
+                try:
+                    self._proc.wait(timeout=_CLI_TERMINATE_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    reaped = _ensure_process_stopped()
+                    if not reaped:
+                        self._force_dead = True
+                    if deadline and time.monotonic() >= deadline:
+                        terminated_reason.append("timeout")
+                    else:
+                        raise
             stderr_thread.join(timeout=1)
             watchdog_thread.join(timeout=1)
 
@@ -343,20 +426,26 @@ class SyncTTADKCLISession:
             return PromptResult(stop_reason="error", text=f"❌ TTADK 执行异常: {get_error_detail(e)}")
         finally:
             proc = self._proc
-            self._proc = None
+            proc_group_id = getattr(self, "_proc_group_id", None)
             # Ensure subprocess is terminated even on unexpected exceptions
             # (e.g. KeyboardInterrupt, SystemExit) to prevent zombie processes
-            if proc is not None and proc.poll() is None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5)
-                except Exception:
-                    logger.debug("Failed to terminate TTADK subprocess", exc_info=True)
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=3)
-                    except Exception:
-                        logger.debug("Failed to kill TTADK subprocess", exc_info=True)
+            if proc is None:
+                self._proc = None
+                self._proc_group_id = None
+            elif (
+                ensure_process_stopped()
+                if ensure_process_stopped is not None
+                else _terminate_and_reap_process(
+                    proc,
+                    process_group_id=proc_group_id,
+                )
+            ):
+                self._proc = None
+                self._proc_group_id = None
+            else:
+                self._force_dead = True
+                self._proc = proc
+                self._proc_group_id = proc_group_id
             if on_event is not None:
                 try:
                     emit_referenced_changed_local_image_events(

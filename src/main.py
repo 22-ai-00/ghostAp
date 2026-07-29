@@ -246,21 +246,32 @@ class Application:
             logger.error("服务异常: %s", get_error_detail(e))
             sys.exit(1)
         finally:
-            # Shut down lock-manager cleanup daemons before closing the WS client
-            # so that background threads do not fire callbacks on a half-torn-down
-            # Feishu client.
-            for _shutdown_fn in (
-                self._shutdown_lock_managers,
-            ):
-                try:
-                    _shutdown_fn()
-                except Exception:
-                    logger.debug("lock manager shutdown error", exc_info=True)
+            # The client first fences intake and drains task callbacks that may
+            # still release or touch chat/repository locks.  Global lock
+            # managers are leaf resources and must outlive those callbacks.
+            client_drained = self.feishu_client is None
             try:
                 if self.feishu_client:
-                    self.feishu_client.close()
+                    client_drained = self.feishu_client.close() is not False
             except Exception:
                 logger.debug("failed to close feishu client", exc_info=True)
+                client_drained = False
+            if client_drained:
+                for _shutdown_fn in (
+                    self._shutdown_lock_managers,
+                ):
+                    try:
+                        _shutdown_fn()
+                    except Exception:
+                        logger.debug(
+                            "lock manager shutdown error",
+                            exc_info=True,
+                        )
+            else:
+                logger.error(
+                    "client work did not drain; preserving lock managers for "
+                    "live callbacks"
+                )
 
 
 def main(argv: Optional[list[str]] = None) -> None:

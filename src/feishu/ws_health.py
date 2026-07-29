@@ -135,3 +135,8 @@ class WSHealthMonitor:
         if self._watchdog_thread and self._watchdog_thread.is_alive():
             self._watchdog_thread.join(timeout=2)
         self._watchdog_thread = None
+
+    def disconnect(self) -> bool:
+        """Stop primary WebSocket intake before application task draining."""
+
+        return self._trigger_disconnect(reason="application shutdown")

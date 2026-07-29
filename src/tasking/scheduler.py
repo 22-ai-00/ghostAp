@@ -1,12 +1,14 @@
 import contextvars
 import logging
+import sys
 import threading
 import time
 import uuid
 from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from enum import Enum, IntEnum
-from typing import Any, Callable, Deque, Optional
+from typing import Any, Callable, ContextManager, Deque, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -37,6 +39,18 @@ class TaskPriority(IntEnum):
 
 SYSTEM_QUEUE_SUFFIX = ":SYSTEM"
 DEFAULT_QUEUE_SUFFIX = ":DEFAULT"
+_CURRENT_TASK_RUN_ID: contextvars.ContextVar[str | None] = (
+    contextvars.ContextVar(
+        "ghostap_current_task_run_id",
+        default=None,
+    )
+)
+
+
+def get_current_task_run_id() -> str | None:
+    """Return the scheduler run owning the current callback, if any."""
+
+    return _CURRENT_TASK_RUN_ID.get()
 
 
 class TaskSpec(BaseModel):
@@ -247,6 +261,8 @@ class TaskScheduler:
         worker_executor: Optional[ThreadPoolExecutor] = None,
         system_executor: Optional[ThreadPoolExecutor] = None,
         thread_name_prefix: str = "task_worker",
+        run_guard: Optional[Callable[[], ContextManager[Any]]] = None,
+        run_guard_cancel: Optional[Callable[[], None]] = None,
     ):
         if max_concurrent <= 0:
             raise ValueError("max_concurrent must be > 0")
@@ -256,6 +272,13 @@ class TaskScheduler:
         self._max_concurrent = max_concurrent
         self._per_key = per_key_concurrency
         self._system_concurrency = system_concurrency
+        self._run_guard = run_guard or nullcontext
+        guard_owner = getattr(run_guard, "__self__", None)
+        self._run_guard_cancel = run_guard_cancel or getattr(
+            guard_owner,
+            "cancel_waiters",
+            None,
+        )
 
         # Two executors:
         # - normal executor: bounded by max_concurrent
@@ -291,6 +314,7 @@ class TaskScheduler:
         self._by_chat: dict[str, Deque[str]] = defaultdict(deque)  # chat_id -> run_ids
         self._by_project: dict[str, Deque[str]] = defaultdict(deque)  # project_id -> run_ids
         self._by_task_id: dict[str, str] = {}  # task_id -> run_id
+        self._admission_fenced = False
         self._stopped = False
         self._dispatcher = threading.Thread(
             target=self._dispatch_loop,
@@ -372,8 +396,8 @@ class TaskScheduler:
         )
 
         with self._cv:
-            if self._stopped:
-                raise RuntimeError("TaskScheduler is stopped")
+            if self._stopped or self._admission_fenced:
+                raise RuntimeError("TaskScheduler admission is fenced")
             self._states[run_id] = state
             if spec.task_id:
                 self._by_task_id[spec.task_id] = run_id
@@ -582,7 +606,7 @@ class TaskScheduler:
                 try:
                     # future should already be done; keep it best-effort
                     value = st.future.result(timeout=0)
-                except Exception:
+                except BaseException:
                     value = None
 
             return TaskResult(
@@ -600,9 +624,9 @@ class TaskScheduler:
         - `wait=True`：等待 dispatcher thread 退出（短超时）。
         - `shutdown_executor=True`：关闭线程池（不会强杀运行中的任务）。
         """
+        self.fence_admission()
         with self._cv:
             self._stopped = True
-            self._drain_queued_tasks_unlocked()
             self._cv.notify_all()
         if wait or shutdown_executor:
             self._dispatcher.join(timeout=2)
@@ -617,6 +641,54 @@ class TaskScheduler:
                 self._system_executor.shutdown(wait=False, cancel_futures=True)
             except Exception:
                 logger.debug("failed to shutdown system executor", exc_info=True)
+
+    def fence_admission(self) -> None:
+        """Reject new work and cancel work that has not entered its callback.
+
+        The cross-process restart writer may already be holding the admission
+        lock.  Canceling local guard waiters lets those reserved worker slots
+        converge to ``CANCELED`` instead of remaining falsely ``RUNNING`` while
+        shutdown proceeds.
+        """
+
+        with self._cv:
+            if not self._admission_fenced:
+                self._admission_fenced = True
+                self._drain_queued_tasks_unlocked()
+                self._cv.notify_all()
+        if callable(self._run_guard_cancel):
+            try:
+                self._run_guard_cancel()
+            except Exception:
+                logger.exception("failed to cancel run-guard waiters")
+
+    def cancel_active(self) -> int:
+        """Request cooperative cancellation for every non-terminal worker."""
+
+        canceled = 0
+        with self._cv:
+            for state in self._states.values():
+                if state.status != TaskStatus.RUNNING:
+                    continue
+                if not state.cancellation.is_canceled:
+                    state.cancellation.cancel()
+                    canceled += 1
+            self._cv.notify_all()
+        return canceled
+
+    def wait_for_idle(self, timeout: float) -> bool:
+        """Wait up to *timeout* seconds for all reserved worker slots to drain."""
+
+        if timeout < 0:
+            raise ValueError("timeout must be >= 0")
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            while self._running_total_normal or self._running_total_system:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(timeout=remaining)
+            return True
 
     # ------------------------ internal ------------------------
 
@@ -783,7 +855,100 @@ class TaskScheduler:
 
     def _run_wrapper(self, task: _QueuedTask):
         """Wrapper to run the task in its captured context."""
-        return task.context.run(self._do_run, task)
+        return task.context.run(self._run_in_task_context, task)
+
+    def _run_in_task_context(self, task: _QueuedTask):
+        """Publish this run id while executing guard, callback, and terminal work."""
+        token = _CURRENT_TASK_RUN_ID.set(task.run_id)
+        try:
+            return self._run_with_guard(task)
+        finally:
+            _CURRENT_TASK_RUN_ID.reset(token)
+
+    def _run_with_guard(self, task: _QueuedTask):
+        """Keep the process-wide run guard around callback + terminal accounting.
+
+        The callback outcome is the scheduler's single terminal truth.  A guard
+        release error is logged after the guard has had its close opportunity,
+        but never rewrites or re-emits an already-published terminal state.
+        """
+
+        try:
+            guard = self._run_guard()
+            guard.__enter__()
+        except BaseException as exc:
+            with self._cv:
+                state = self._states.get(task.run_id)
+                # The dispatcher reserved a running slot before the worker
+                # attempted admission.  A fail-closed admission must converge
+                # that reservation exactly once.
+                if state:
+                    canceled = (
+                        self._admission_fenced
+                        or state.cancellation.is_canceled
+                    )
+                    state.status = (
+                        TaskStatus.CANCELED if canceled else TaskStatus.FAILED
+                    )
+                    state.error = None if canceled else get_error_detail(exc)
+                    state.ended_at = time.time()
+                    self._emit(
+                        task.run_id,
+                        state.status,
+                        error=state.error,
+                    )
+                self._release_running_slot_unlocked(task)
+                self._cv.notify_all()
+            raise
+
+        try:
+            value = self._do_run(task)
+        except BaseException:
+            exc_type, exc, traceback = sys.exc_info()
+            try:
+                suppressed = guard.__exit__(exc_type, exc, traceback)
+            except BaseException:
+                logger.exception(
+                    "run guard release failed after task terminal accounting "
+                    "run_id=%s",
+                    task.run_id,
+                )
+                suppressed = False
+            if suppressed:
+                return None
+            raise
+
+        try:
+            guard.__exit__(None, None, None)
+        except BaseException:
+            # RestartGate.task_guard always attempts close(2), which releases
+            # flock ownership.  Treat a release error as an operational alert:
+            # changing SUCCEEDED to FAILED here would expose two contradictory
+            # terminal events to callers.
+            logger.exception(
+                "run guard release failed after task terminal accounting "
+                "run_id=%s",
+                task.run_id,
+            )
+        return value
+
+    def _release_running_slot_unlocked(self, task: _QueuedTask) -> None:
+        state = self._states.get(task.run_id)
+        key = (
+            state.assigned_queue_key
+            if state and state.assigned_queue_key
+            else task.spec.get_effective_queue_key()
+        )
+        if self._is_system_queue(key):
+            self._running_total_system = max(0, self._running_total_system - 1)
+        else:
+            self._running_total_normal = max(0, self._running_total_normal - 1)
+        self._running_by_key[key] = max(0, self._running_by_key[key] - 1)
+        if state and state.project_serial_key:
+            self._running_by_project[state.project_serial_key] = max(
+                0,
+                self._running_by_project[state.project_serial_key] - 1,
+            )
 
     def _do_run(self, task: _QueuedTask):
         """执行任务并维护状态（运行在 worker thread 中）。"""
@@ -823,7 +988,7 @@ class TaskScheduler:
                 self._cv.notify_all()
             return None
 
-        except Exception as e:
+        except BaseException as e:
             with self._cv:
                 st = self._states.get(run_id)
                 if st:
@@ -836,15 +1001,7 @@ class TaskScheduler:
 
         finally:
             with self._cv:
-                st = self._states.get(run_id)
-                key = st.assigned_queue_key if st and st.assigned_queue_key else spec.get_effective_queue_key()
-                if self._is_system_queue(key):
-                    self._running_total_system = max(0, self._running_total_system - 1)
-                else:
-                    self._running_total_normal = max(0, self._running_total_normal - 1)
-                self._running_by_key[key] = max(0, self._running_by_key[key] - 1)
-                if st and st.project_serial_key:
-                    self._running_by_project[st.project_serial_key] = max(0, self._running_by_project[st.project_serial_key] - 1)
+                self._release_running_slot_unlocked(task)
                 self._cv.notify_all()
 
     def _emit(
