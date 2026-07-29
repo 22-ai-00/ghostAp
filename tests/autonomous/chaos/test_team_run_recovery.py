@@ -412,3 +412,42 @@ def test_recover_does_not_repeat_committed_final_notification(tmp_path) -> None:
     second.close()
     blobs.close()
     writer.close()
+
+
+def test_restart_after_final_notify_commit_completes_without_resend(
+    tmp_path,
+) -> None:
+    writer, blobs = make_team_storage(tmp_path)
+    first_backend = _RetryableNotifyBackend()
+    first = _actor(writer, blobs, first_backend)
+    original_commit = first._commit  # noqa: SLF001
+
+    def crash_before_run_completion(event):
+        if event.event_type == "team.v2.run.completed":
+            raise SystemExit("simulated crash after final notify commit")
+        return original_commit(event)
+
+    first._commit = crash_before_run_completion  # type: ignore[method-assign] # noqa: SLF001
+    run = first.start_task(
+        tenant_key="tenant_1",
+        message_id="om_notify_committed_before_completion",
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="通知提交后恢复完成",
+    )
+    first.drain()
+    projection = first.projection()
+    assert projection.runs[run.run_id].phase is TeamRunPhase.REVISING
+    assert projection.effects[(f"{run.run_id}:notify", "notify")] == "committed"
+    assert len(first_backend.notifications) == 1
+    first.close()
+
+    recovered_backend = _RetryableNotifyBackend()
+    second = _actor(writer, blobs, recovered_backend)
+    assert second.recover() == 1
+    second.drain()
+    assert second.projection().runs[run.run_id].phase is TeamRunPhase.COMPLETED
+    assert recovered_backend.notifications == []
+    second.close()
+    blobs.close()
+    writer.close()
