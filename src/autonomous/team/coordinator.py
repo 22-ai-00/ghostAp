@@ -9,6 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from types import SimpleNamespace
 from typing import Callable
 
@@ -40,7 +41,14 @@ class _FinalNotificationExhausted(TeamCoordinatorError):
     pass
 
 
+class _BlockNotificationOutcome(Enum):
+    COMMITTED = "committed"
+    RETRY = "retry"
+    EXHAUSTED = "exhausted"
+
+
 _MAX_FINAL_NOTIFICATION_ATTEMPTS = 3
+_MAX_BLOCK_NOTIFICATION_ATTEMPTS = 3
 
 
 DecisionProvider = Callable[[TeamRunV2, tuple[object, ...], str], CoordinatorDecision]
@@ -1024,30 +1032,37 @@ class TeamCoordinatorActor:
                 TeamRunPhase.CANCELED,
             }:
                 return
-            notify_prefix = self._blocked_notify_prefix(run_id)
-            for (aggregate, effect_type), state in projection.effects.items():
-                belongs_to_run = aggregate == run_id or aggregate.startswith(run_id + ":")
-                is_block_notification = (
-                    aggregate.startswith(notify_prefix) and effect_type == "notify"
+            if run.phase is TeamRunPhase.BLOCKING:
+                blocking = run
+            else:
+                notify_prefix = self._blocked_notify_prefix(run_id)
+                for (aggregate, effect_type), state in projection.effects.items():
+                    belongs_to_run = (
+                        aggregate == run_id
+                        or aggregate.startswith(run_id + ":")
+                    )
+                    is_block_notification = (
+                        aggregate.startswith(notify_prefix)
+                        and effect_type == "notify"
+                    )
+                    if (
+                        belongs_to_run
+                        and not is_block_notification
+                        and state in {"prepared", "executing"}
+                    ):
+                        self._effect(
+                            aggregate,
+                            effect_type,
+                            "action_required",
+                        )
+                safe_error = self._public_block_reason(error_code)
+                self._phase(
+                    run,
+                    TeamRunPhase.BLOCKING,
+                    error=safe_error,
                 )
-                if (
-                    belongs_to_run
-                    and not is_block_notification
-                    and state in {"prepared", "executing"}
-                ):
-                    self._effect(aggregate, effect_type, "action_required")
-            safe_error = self._public_block_reason(error_code)
-
-        self._deliver_block_notification(run, safe_error)
-
-        with self._lock:
-            current = self.projection().runs[run_id]
-            if current.phase not in {
-                TeamRunPhase.COMPLETED,
-                TeamRunPhase.BLOCKED,
-                TeamRunPhase.CANCELED,
-            }:
-                self._phase(current, TeamRunPhase.BLOCKED, error=safe_error)
+                blocking = self.projection().runs[run_id]
+        self._resume_block_notification(blocking)
 
     def _resume_block_notification(self, run: TeamRunV2) -> None:
         if run.phase is not TeamRunPhase.BLOCKING:
@@ -1055,7 +1070,8 @@ class TeamCoordinatorActor:
                 "durable block notification repair is incomplete"
             )
         safe_error = self._public_block_reason(run.error_code)
-        if not self._deliver_block_notification(run, safe_error):
+        outcome = self._deliver_block_notification(run, safe_error)
+        if outcome is _BlockNotificationOutcome.RETRY:
             return
         with self._lock:
             current = self.projection().runs[run.run_id]
@@ -1212,26 +1228,29 @@ class TeamCoordinatorActor:
 
     @classmethod
     def _blocked_notification_pending(cls, projection, run_id: str) -> bool:
+        attempts = cls._blocked_notification_attempts(
+            projection,
+            run_id,
+        )
         return not any(
-            state == "committed"
-            for _ordinal, _aggregate, state in cls._blocked_notification_attempts(
-                projection,
-                run_id,
-            )
+            state in {"committed", "abandoned"}
+            for _ordinal, _aggregate, state in attempts
         )
 
     def _deliver_block_notification(
         self,
         run: TeamRunV2,
         safe_error: str,
-    ) -> bool:
+    ) -> _BlockNotificationOutcome:
         """Deliver or durably retry the terminal notice using one logical key."""
 
         with self._lock:
             projection = self.projection()
             attempts = self._blocked_notification_attempts(projection, run.run_id)
             if any(state == "committed" for _ordinal, _aggregate, state in attempts):
-                return True
+                return _BlockNotificationOutcome.COMMITTED
+            if any(state == "abandoned" for _ordinal, _aggregate, state in attempts):
+                return _BlockNotificationOutcome.EXHAUSTED
             replayable = next(
                 (
                     (aggregate, state)
@@ -1241,6 +1260,15 @@ class TeamCoordinatorActor:
                 None,
             )
             if replayable is None:
+                if len(attempts) >= _MAX_BLOCK_NOTIFICATION_ATTEMPTS:
+                    aggregate = attempts[-1][1]
+                    if attempts[-1][2] == "action_required":
+                        self._effect(
+                            aggregate,
+                            "notify",
+                            "abandoned",
+                        )
+                    return _BlockNotificationOutcome.EXHAUSTED
                 ordinal = attempts[-1][0] + 1 if attempts else 1
                 aggregate = f"{self._blocked_notify_prefix(run.run_id)}{ordinal}"
                 self._effect(aggregate, "notify", "prepared")
@@ -1261,12 +1289,29 @@ class TeamCoordinatorActor:
                 projection = self.projection()
                 if projection.effects.get((aggregate, "notify")) == "executing":
                     self._effect(aggregate, "notify", "action_required")
-            return False
+                attempts = self._blocked_notification_attempts(
+                    self.projection(),
+                    run.run_id,
+                )
+                if len(attempts) >= _MAX_BLOCK_NOTIFICATION_ATTEMPTS:
+                    if (
+                        self.projection().effects.get(
+                            (aggregate, "notify")
+                        )
+                        == "action_required"
+                    ):
+                        self._effect(
+                            aggregate,
+                            "notify",
+                            "abandoned",
+                        )
+                    return _BlockNotificationOutcome.EXHAUSTED
+            return _BlockNotificationOutcome.RETRY
         with self._lock:
             projection = self.projection()
             if projection.effects.get((aggregate, "notify")) == "executing":
                 self._effect(aggregate, "notify", "committed")
-        return True
+        return _BlockNotificationOutcome.COMMITTED
 
     def _phase(
         self,

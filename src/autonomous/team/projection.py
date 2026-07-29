@@ -26,24 +26,38 @@ class TeamProjectionError(RuntimeError):
 _PHASE_EDGES = {
     TeamRunPhase.CREATED: {
         TeamRunPhase.PLANNING,
+        TeamRunPhase.BLOCKING,
         TeamRunPhase.BLOCKED,
         TeamRunPhase.CANCELED,
     },
-    TeamRunPhase.PLANNING: {TeamRunPhase.DISPATCHING, TeamRunPhase.BLOCKED, TeamRunPhase.CANCELED},
-    TeamRunPhase.DISPATCHING: {TeamRunPhase.REVIEWING, TeamRunPhase.BLOCKED, TeamRunPhase.CANCELED},
+    TeamRunPhase.PLANNING: {
+        TeamRunPhase.DISPATCHING,
+        TeamRunPhase.BLOCKING,
+        TeamRunPhase.BLOCKED,
+        TeamRunPhase.CANCELED,
+    },
+    TeamRunPhase.DISPATCHING: {
+        TeamRunPhase.REVIEWING,
+        TeamRunPhase.BLOCKING,
+        TeamRunPhase.BLOCKED,
+        TeamRunPhase.CANCELED,
+    },
     TeamRunPhase.REVIEWING: {
         TeamRunPhase.REVISING,
         TeamRunPhase.COMPLETED,
+        TeamRunPhase.BLOCKING,
         TeamRunPhase.BLOCKED,
         TeamRunPhase.CANCELED,
     },
     TeamRunPhase.REVISING: {
         TeamRunPhase.REVIEWING,
         TeamRunPhase.COMPLETED,
+        TeamRunPhase.BLOCKING,
         TeamRunPhase.BLOCKED,
         TeamRunPhase.CANCELED,
     },
     TeamRunPhase.FINALIZING: {
+        TeamRunPhase.BLOCKING,
         TeamRunPhase.BLOCKED,
         TeamRunPhase.CANCELED,
     },
@@ -104,10 +118,51 @@ def _has_pending_block_notification(
 ) -> bool:
     prefix = f"{run_id}:blocked-notify:"
     return not any(
-        state == "committed"
+        state in {"committed", "abandoned"}
         for (aggregate, effect_type), state in effects.items()
         if effect_type == "notify" and aggregate.startswith(prefix)
     )
+
+
+def _effect_owner(
+    runs: dict[str, TeamRunV2],
+    aggregate_id: str,
+) -> tuple[str, TeamRunV2] | None:
+    matches = [
+        (run_id, run)
+        for run_id, run in runs.items()
+        if aggregate_id == run_id or aggregate_id.startswith(run_id + ":")
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda item: len(item[0]))
+
+
+def _legacy_notification_repair_phase(
+    run: TeamRunV2,
+    aggregate_id: str,
+    effect_type: str,
+) -> TeamRunPhase | None:
+    if effect_type != "notify":
+        return None
+    if aggregate_id.startswith(f"{run.run_id}:blocked-notify:"):
+        if run.phase not in {
+            TeamRunPhase.COMPLETED,
+            TeamRunPhase.CANCELED,
+        }:
+            return TeamRunPhase.BLOCKING
+        return None
+    if (
+        run.phase is TeamRunPhase.COMPLETED
+        and run.final_result_ref is not None
+        and run.final_done_checks
+        and (
+            aggregate_id == f"{run.run_id}:notify"
+            or aggregate_id.startswith(f"{run.run_id}:final-notify:")
+        )
+    ):
+        return TeamRunPhase.FINALIZING
+    return None
 
 
 def rebuild_team_projection(frames: Iterable[object]) -> TeamProjection:
@@ -153,15 +208,17 @@ def _apply_event(
     if event.event_type.startswith("team.v2.effect."):
         effect_type = str(payload["effect_type"])
         state = event.event_type.rsplit(".", 1)[-1]
-        owner = next(
-            (
-                run
-                for run_id, run in runs.items()
-                if event.aggregate_id == run_id
-                or event.aggregate_id.startswith(run_id + ":")
-            ),
-            None,
-        )
+        owner_entry = _effect_owner(runs, event.aggregate_id)
+        owner = owner_entry[1] if owner_entry is not None else None
+        if owner_entry is not None and state in {"prepared", "executing"}:
+            repair_phase = _legacy_notification_repair_phase(
+                owner,
+                event.aggregate_id,
+                effect_type,
+            )
+            if repair_phase is not None and owner.phase is not repair_phase:
+                owner = replace(owner, phase=repair_phase)
+                runs[owner_entry[0]] = owner
         if (
             owner is not None
             and _terminal(owner.phase)
@@ -173,6 +230,7 @@ def _apply_event(
             None: {"prepared"},
             "prepared": {"executing", "action_required"},
             "executing": {"committed", "action_required"},
+            "action_required": {"abandoned"},
         }
         if state not in allowed.get(previous, set()):
             raise TeamProjectionError("invalid team effect transition")

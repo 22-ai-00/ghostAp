@@ -119,7 +119,7 @@ def test_completed_run_requires_durable_evidence_for_every_done_criterion() -> N
         _apply_event({run.run_id: run}, {}, {}, {}, event)
 
 
-def test_terminal_run_rejects_new_open_effect() -> None:
+def test_terminal_run_rejects_unrelated_new_open_effect() -> None:
     run = TeamRunV2(
         "teamrun2_terminal",
         "tenant_1",
@@ -137,9 +137,91 @@ def test_terminal_run_rejects_new_open_effect() -> None:
     )
     event = JournalEvent(
         "team.v2.effect.prepared",
-        f"{run.run_id}:final-notify:1",
-        {"effect_type": "notify"},
+        f"{run.run_id}:assignment:late",
+        {"effect_type": "employee_dispatch"},
     )
 
     with pytest.raises(TeamProjectionError, match="terminal"):
         _apply_event({run.run_id: run}, {}, {}, {}, event)
+
+
+@pytest.mark.parametrize(
+    ("terminal_phase", "aggregate_suffix", "repair_phase"),
+    [
+        (
+            TeamRunPhase.COMPLETED,
+            "final-notify:1",
+            TeamRunPhase.FINALIZING,
+        ),
+        (
+            TeamRunPhase.BLOCKED,
+            "blocked-notify:1",
+            TeamRunPhase.BLOCKING,
+        ),
+    ],
+)
+def test_legacy_terminal_notification_effect_replays_into_repair_phase(
+    terminal_phase,
+    aggregate_suffix,
+    repair_phase,
+) -> None:
+    run = TeamRunV2(
+        f"teamrun2_legacy_{terminal_phase.value}",
+        "tenant_1",
+        "oc_team",
+        "",
+        "om_1",
+        "ou_1",
+        _ref(),
+        "goal",
+        ("deliverable_non_empty",),
+        "session",
+        phase=terminal_phase,
+        final_result_ref=(
+            _ref()
+            if terminal_phase is TeamRunPhase.COMPLETED
+            else None
+        ),
+        final_done_checks=(
+            {"deliverable_non_empty": True}
+            if terminal_phase is TeamRunPhase.COMPLETED
+            else {}
+        ),
+        error_code=(
+            "team_task_failed"
+            if terminal_phase is TeamRunPhase.BLOCKED
+            else ""
+        ),
+    )
+    runs = {run.run_id: run}
+    effects = {}
+    aggregate = f"{run.run_id}:{aggregate_suffix}"
+
+    _apply_event(
+        runs,
+        {},
+        effects,
+        {},
+        JournalEvent(
+            "team.v2.effect.prepared",
+            aggregate,
+            {"effect_type": "notify"},
+        ),
+    )
+    assert runs[run.run_id].phase is repair_phase
+    assert effects[(aggregate, "notify")] == "prepared"
+
+    for state in ("executing", "committed"):
+        _apply_event(
+            runs,
+            {},
+            effects,
+            {},
+            JournalEvent(
+                f"team.v2.effect.{state}",
+                aggregate,
+                {"effect_type": "notify"},
+            ),
+        )
+    assert runs[run.run_id].phase is repair_phase
+    assert effects[(aggregate, "notify")] == "committed"

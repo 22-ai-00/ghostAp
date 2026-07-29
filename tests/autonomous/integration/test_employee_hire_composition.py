@@ -4004,7 +4004,7 @@ def test_recovered_team_notification_crosses_main_bot_audit_boundary_once(
     )
     first_actor.drain()
     first_projection = first_actor.projection()
-    assert first_projection.runs[run.run_id].phase is TeamRunPhase.BLOCKED
+    assert first_projection.runs[run.run_id].phase is TeamRunPhase.BLOCKING
     assert (
         first_projection.effects[
             (f"{run.run_id}:blocked-notify:1", "notify")
@@ -4078,6 +4078,11 @@ def test_recovered_team_notification_crosses_main_bot_audit_boundary_once(
         reopened_actor.drain()
 
         projection = reopened_actor.projection()
+        assert projection.runs[run.run_id].phase is (
+            TeamRunPhase.BLOCKED
+            if transport_success
+            else TeamRunPhase.BLOCKING
+        )
         assert (
             projection.effects[
                 (f"{run.run_id}:blocked-notify:2", "notify")

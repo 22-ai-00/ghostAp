@@ -224,6 +224,25 @@ class _FinalFailingBlockSuccessBackend(_RetryableNotifyBackend):
         raise RuntimeError("simulated persistent final delivery failure")
 
 
+class _PersistentBlockNotificationFailureBackend(ImmediateTeamBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.targets = ()
+        self.notification_attempts: list[str] = []
+
+    def notify(
+        self,
+        _message_id,
+        _chat_id,
+        _result,
+        *,
+        idempotency_key,
+        **_scope,
+    ):
+        self.notification_attempts.append(idempotency_key)
+        raise RuntimeError("simulated persistent blocked notification failure")
+
+
 def _seed_final_notification_action_required(
     writer,
     blobs,
@@ -253,6 +272,94 @@ def _seed_final_notification_action_required(
     actor.drain()
     original_effect(f"{run.run_id}:notify", "notify", "action_required")
     return actor, run
+
+
+def test_initial_block_notification_commit_precedes_only_terminal_transition(
+    tmp_path,
+) -> None:
+    writer, blobs = make_team_storage(tmp_path)
+    first_backend = ImmediateTeamBackend()
+    first_backend.targets = ()
+    first = _actor(writer, blobs, first_backend)
+    original_phase = first._phase  # noqa: SLF001
+
+    def crash_before_blocked(run, phase, **kwargs):
+        if phase is TeamRunPhase.BLOCKED:
+            raise SystemExit("simulated crash after blocked notification")
+        return original_phase(run, phase, **kwargs)
+
+    first._phase = crash_before_blocked  # type: ignore[method-assign] # noqa: SLF001
+    run = first.start_task(
+        tenant_key="tenant_1",
+        message_id="om_initial_block_crash",
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="首次失败通知崩溃窗",
+    )
+    first.drain()
+
+    projection = first.projection()
+    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKING
+    assert (
+        projection.effects[
+            (f"{run.run_id}:blocked-notify:1", "notify")
+        ]
+        == "committed"
+    )
+    assert len(first_backend.notifications) == 1
+    first.close()
+
+    recovered_backend = ImmediateTeamBackend()
+    second = _actor(writer, blobs, recovered_backend)
+    assert second.recover() == 1
+    second.drain()
+
+    projection = second.projection()
+    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKED
+    assert recovered_backend.notifications == []
+    assert second.recover() == 0
+    second.close()
+    blobs.close()
+    writer.close()
+
+
+def test_block_notification_failures_are_bounded_and_abandoned(
+    tmp_path,
+) -> None:
+    writer, blobs = make_team_storage(tmp_path)
+    backend = _PersistentBlockNotificationFailureBackend()
+    actor = _actor(writer, blobs, backend)
+    run = actor.start_task(
+        tenant_key="tenant_1",
+        message_id="om_block_notify_persistent",
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="失败通知持续不可用",
+    )
+    actor.drain()
+    assert actor.projection().runs[run.run_id].phase is TeamRunPhase.BLOCKING
+    assert actor.recover() == 1
+    actor.drain()
+    assert actor.projection().runs[run.run_id].phase is TeamRunPhase.BLOCKING
+    assert actor.recover() == 1
+    actor.drain()
+
+    projection = actor.projection()
+    attempts = [
+        (aggregate, state)
+        for (aggregate, effect_type), state in projection.effects.items()
+        if effect_type == "notify"
+        and aggregate.startswith(f"{run.run_id}:blocked-notify:")
+    ]
+    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKED
+    assert len(attempts) == 3
+    assert sum(state == "abandoned" for _aggregate, state in attempts) == 1
+    assert len(backend.notification_attempts) == 3
+    assert len(set(backend.notification_attempts)) == 1
+    assert actor.recover() == 0
+    actor.close()
+    blobs.close()
+    writer.close()
 
 
 def test_restart_from_final_notify_executing_converges_without_duplicate(tmp_path) -> None:

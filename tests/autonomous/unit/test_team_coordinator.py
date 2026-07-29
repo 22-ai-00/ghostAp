@@ -556,7 +556,7 @@ def test_failed_block_notification_retries_after_reopen_with_same_key(tmp_path) 
     first_actor.drain()
 
     projection = first_actor.projection()
-    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKED
+    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKING
     assert (
         projection.effects[(f"{run.run_id}:blocked-notify:1", "notify")]
         == "action_required"
@@ -623,7 +623,7 @@ def test_notification_type_error_is_not_mistaken_for_legacy_signature(
     actor.drain()
 
     projection = actor.projection()
-    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKED
+    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKING
     assert len(backend.notification_attempts) == 1
     assert (
         projection.effects[(f"{run.run_id}:blocked-notify:1", "notify")]
@@ -669,7 +669,7 @@ def test_executing_block_notification_is_replayed_after_process_crash(tmp_path) 
     first_actor.drain()
 
     projection = first_actor.projection()
-    assert projection.runs[run.run_id].phase is TeamRunPhase.DISPATCHING
+    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKING
     assert (
         projection.effects[(f"{run.run_id}:blocked-notify:1", "notify")]
         == "executing"
