@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from unittest.mock import MagicMock, PropertyMock, patch
 
+from src.acp.models import PlanEntryInfo, PlanInfo, PromptResult
 from src.feishu.handlers.programming import ClaudeModeHandler, Tui2acpModeHandler
 
 
 class _FakeProgrammingCardSession:
+    last = None
+
     def __init__(self, *_args, **_kwargs):
         self.failed_text = None
+        self.finished = False
+        self.waiting_reason = None
+        self.cancelled_reason = None
+        self.continuation_boundaries = 0
+        type(self).last = self
 
     def start(self):
         return None
@@ -31,8 +39,62 @@ class _FakeProgrammingCardSession:
     def on_event(self, _event):
         return None
 
+    def get_final_text(self):
+        return ""
+
+    def finish(self, **_kwargs):
+        self.finished = True
+
     def fail(self, text, **_kwargs):
         self.failed_text = text
+
+    def cancel(self, *, reason):
+        self.cancelled_reason = reason
+
+    def begin_continuation_turn(self):
+        self.continuation_boundaries += 1
+
+    def wait_for_user_confirmation(self, reason):
+        self.waiting_reason = reason
+
+
+class _QueuedPromptSession:
+    def __init__(self, *results: PromptResult):
+        self._results = list(results)
+        self.calls: list[tuple[str, object, float | int | None]] = []
+        self._force_dead = False
+        self.session_id = "queued-session"
+        self.message_count = 1
+
+    def send_prompt(self, text, on_event=None, timeout=None):
+        self.calls.append((text, on_event, timeout))
+        return self._results.pop(0)
+
+
+def _pending_result(text: str = "partial") -> PromptResult:
+    return PromptResult(
+        stop_reason="end_turn",
+        text=text,
+        plan=PlanInfo(
+            entries=[
+                PlanEntryInfo(content="implementation", status="completed"),
+                PlanEntryInfo(content="verification", status="pending"),
+            ]
+        ),
+    )
+
+
+def _completed_result(text: str = "done") -> PromptResult:
+    return PromptResult(
+        stop_reason="end_turn",
+        text=text,
+        plan=PlanInfo(
+            entries=[
+                PlanEntryInfo(content="implementation", status="completed"),
+                PlanEntryInfo(content="verification", status="completed"),
+            ]
+        ),
+    )
 
 
 def _make_handler():
@@ -63,12 +125,131 @@ def _make_handler():
     return handler
 
 
+@contextmanager
+def _streaming_environment():
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "src.card.delivery.factory.create_card_delivery",
+                return_value=MagicMock(),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "src.card.delivery.channel_client.LarkChannelCardAPIClient",
+                return_value=MagicMock(),
+            )
+        )
+        stack.enter_context(
+            patch("src.card.session.CardSession", return_value=MagicMock())
+        )
+        stack.enter_context(
+            patch(
+                "src.card.programming_adapter.ProgrammingCardSession",
+                _FakeProgrammingCardSession,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "src.feishu.handlers.programming.classify_prompt_result",
+                side_effect=AssertionError(
+                    "handler must consume continuation assessment directly"
+                ),
+                create=True,
+            )
+        )
+        yield
+
+
 def _make_claude_handler():
     handler = _make_handler()
     handler.__class__ = ClaudeModeHandler
     handler.mode_name = "Claude"
     handler.interaction_mode = ClaudeModeHandler.interaction_mode
     return handler
+
+
+def test_streaming_pending_plan_continues_on_same_session_and_finishes():
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = _QueuedPromptSession(_pending_result(), _completed_result())
+
+    with _streaming_environment():
+        handler.handle_response(
+            "msg-1",
+            "chat-1",
+            "finish the task",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    adapter = _FakeProgrammingCardSession.last
+    assert len(session.calls) == 2
+    assert session.calls[0][0] == "finish the task"
+    assert "自动续做指令" in session.calls[1][0]
+    assert adapter.continuation_boundaries == 1
+    assert adapter.finished is True
+    assert adapter.failed_text is None
+    assert adapter.waiting_reason is None
+
+
+def test_streaming_second_pending_plan_waits_without_failing():
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = _QueuedPromptSession(
+        _pending_result("first partial"),
+        _pending_result("second partial"),
+    )
+
+    with _streaming_environment():
+        handler.handle_response(
+            "msg-1",
+            "chat-1",
+            "finish the task",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    adapter = _FakeProgrammingCardSession.last
+    assert len(session.calls) == 2
+    assert adapter.continuation_boundaries == 1
+    assert adapter.finished is False
+    assert adapter.failed_text is None
+    assert adapter.waiting_reason is not None
+    assert "确认" in adapter.waiting_reason
+
+
+def test_non_streaming_pending_plan_continues_and_replies_with_success():
+    handler = _make_handler()
+    handler.reply_card = MagicMock()
+    handler.upload_acp_image = MagicMock()
+    session = _QueuedPromptSession(_pending_result(), _completed_result())
+
+    with patch(
+        "src.feishu.handlers.programming.classify_prompt_result",
+        side_effect=AssertionError(
+            "handler must consume continuation assessment directly"
+        ),
+        create=True,
+    ):
+        handler._handle_response_non_streaming(
+            "msg-1",
+            "chat-1",
+            "finish the task",
+            session,
+            None,
+            "/tmp",
+        )
+
+    assert len(session.calls) == 2
+    handler.reply_card.assert_not_called()
+    handler.reply_text.assert_called_once()
+    assert "done" in handler.reply_text.call_args.args[1]
+    handler.add_reaction.assert_called_once()
 
 
 def test_tui2acp_terminal_state_prompt_error_ends_manager_session():

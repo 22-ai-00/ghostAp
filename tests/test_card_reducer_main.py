@@ -272,6 +272,27 @@ class TestBlockedReducer:
         s = reduce_card_state(s, CardEvent.blocked("quota exceeded"))
         assert s.terminal == "blocked"
 
+    def test_blocked_sets_terminal_reason_for_late_event_fence(self):
+        from threading import Event
+        from types import SimpleNamespace
+
+        from src.card.session import CardSession
+
+        s = reduce_card_state(None, CardEvent.started(), metadata=_meta())
+
+        s = reduce_card_state(s, CardEvent.blocked("waiting for confirmation"))
+
+        assert s.terminal_reason == "blocked"
+        logical_session = SimpleNamespace(
+            _closed=Event(),
+            _state=s,
+            _session_id="blocked-session",
+        )
+        assert CardSession._should_ignore_dispatch_locked(
+            logical_session,
+            CardEvent.text_started("late-stream-block"),
+        )
+
     def test_blocked_has_restart_button(self):
         s = reduce_card_state(None, CardEvent.started(), metadata=_meta())
         s = reduce_card_state(s, CardEvent.blocked("quota exceeded"))

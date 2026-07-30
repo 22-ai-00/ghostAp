@@ -263,6 +263,18 @@ class ProgrammingCardSession:
                 finally:
                     self._flush_lock_holder.held = False
 
+    def begin_continuation_turn(self) -> None:
+        """Close active stream blocks before a same-card continuation turn."""
+        self._flush_now()
+        if self._reasoning_blocks_by_source:
+            self._close_reasoning_blocks(retire=True)
+        if self._text_active:
+            self._close_text_blocks()
+        self._last_tool_boundary_seq = max(
+            self._last_tool_boundary_seq,
+            self._text_turn_seq,
+        )
+
     def finish(
         self,
         *,
@@ -318,6 +330,18 @@ class ProgrammingCardSession:
         )
         self._finish_agent_summaries(terminal_status=terminal_status)
         self._rotator.dispatch(CardEvent.failed(error))
+        self._stop_ticker()
+
+    def wait_for_user_confirmation(self, reason: str) -> None:
+        """Close the card as blocked after bounded automatic continuation."""
+        self._cancel_timer()
+        self._flush_now()
+        if self._reasoning_active:
+            self._close_reasoning_blocks()
+        if self._text_active:
+            self._close_text_blocks()
+        self._finish_agent_summaries(terminal_status="cancelled")
+        self._rotator.dispatch(CardEvent.blocked(reason))
         self._stop_ticker()
 
     def cancel(self, *, reason: str = "cancelled") -> None:

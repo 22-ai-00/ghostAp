@@ -398,7 +398,8 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                     action_id=_RETRY_ACTIONS[engine_type],
                     type="primary",
                 ),)
-            return replace(state, terminal="blocked", header=header,
+            return replace(state, terminal="blocked", terminal_reason="blocked",
+                           header=header,
                            footer=footer, buttons=blocked_buttons, engine_ext=ext)
 
         case CardEventType.MODE_TOGGLED:

@@ -13,9 +13,9 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
 
-from ...acp import ACPEventRenderer, run_prompt_with_finalization
+from ...acp import ACPEventRenderer, run_prompt_with_continuation
 from ...acp.manager import ACPSessionManager
-from ...acp.outcome import PromptOutcome, classify_prompt_result
+from ...acp.outcome import PromptOutcome
 from ...acp.providers import normalize_acp_model_name
 from ...agent_session import SyncSession
 from ...card import CardBuilder
@@ -1262,7 +1262,7 @@ class ProgrammingModeHandler(BaseHandler):
             retirement_completed[0] = True
 
         try:
-            result = run_prompt_with_finalization(
+            execution = run_prompt_with_continuation(
                 session,
                 text,
                 on_event=on_event,
@@ -1272,10 +1272,12 @@ class ProgrammingModeHandler(BaseHandler):
                 ),
                 finalization_task_text=_finalization_task_text,
                 on_finalization_start=_start_finalization,
+                on_continuation_start=prog_session.begin_continuation_turn,
                 replace_dead_session=_replace_dead_session,
                 retire_finalization_session=_retire_session,
             )
-            assessment = classify_prompt_result(result)
+            result = execution.result
+            assessment = execution.assessment
             prompt_outcome = assessment.outcome
             prompt_stop_reason = assessment.stop_reason
             streamed_response = prog_session.get_final_text()
@@ -1299,6 +1301,12 @@ class ProgrammingModeHandler(BaseHandler):
                 )
                 final_response = _append_execution_notice(response_text, notice)
                 prog_session.cancel(reason=assessment.stop_reason)
+            elif execution.awaiting_user_input:
+                notice = UI_TEXT["mode_exec_waiting_msg"].format(
+                    reason=assessment.detail,
+                )
+                final_response = _append_execution_notice(response_text, notice)
+                prog_session.wait_for_user_confirmation(notice)
             else:
                 notice = UI_TEXT["mode_exec_incomplete_msg"].format(
                     reason=assessment.detail,
@@ -1437,7 +1445,20 @@ class ProgrammingModeHandler(BaseHandler):
 
         thread_id = get_current_thread_id()
         cwd = project.root_path if project else global_working_dir
+        active_session = [session]
         retirement_completed = [False]
+
+        def _replace_dead_session(startup_budget_s: float) -> SyncSession:
+            replacement = self._replace_timed_out_session(
+                chat_id=chat_id,
+                project=project,
+                cwd=cwd,
+                thread_id=thread_id,
+                timed_out_session=active_session[0],
+                startup_budget_s=startup_budget_s,
+            )
+            active_session[0] = replacement
+            return replacement
 
         def _retire_session(
             active: SyncSession,
@@ -1505,7 +1526,7 @@ class ProgrammingModeHandler(BaseHandler):
                     return
                 renderer.process_event(event)
 
-            result = run_prompt_with_finalization(
+            execution = run_prompt_with_continuation(
                 session,
                 text,
                 on_event=on_event,
@@ -1520,17 +1541,11 @@ class ProgrammingModeHandler(BaseHandler):
                     timeout,
                     _configured_finalization_reserve(self.settings),
                 ),
-                replace_dead_session=lambda startup_budget_s: self._replace_timed_out_session(
-                    chat_id=chat_id,
-                    project=project,
-                    cwd=cwd,
-                    thread_id=thread_id,
-                    timed_out_session=session,
-                    startup_budget_s=startup_budget_s,
-                ),
+                replace_dead_session=_replace_dead_session,
                 retire_finalization_session=_retire_session,
             )
-            assessment = classify_prompt_result(result)
+            result = execution.result
+            assessment = execution.assessment
             final_response = (
                 (getattr(result, "text", None) or "").strip()
                 or renderer.get_final_content()
@@ -1547,6 +1562,16 @@ class ProgrammingModeHandler(BaseHandler):
                 )
                 response_title = (
                     f"{self.mode_name} · {UI_TEXT['mode_exec_cancelled_title']}"
+                )
+            elif execution.awaiting_user_input:
+                final_response = _append_execution_notice(
+                    final_response,
+                    UI_TEXT["mode_exec_waiting_msg"].format(
+                        reason=assessment.detail,
+                    ),
+                )
+                response_title = (
+                    f"{self.mode_name} · {UI_TEXT['mode_exec_waiting_title']}"
                 )
             else:
                 final_response = _append_execution_notice(
@@ -1579,7 +1604,7 @@ class ProgrammingModeHandler(BaseHandler):
                 )
         except TimeoutError as e:
             try:
-                _retire_session(session)
+                _retire_session(active_session[0])
             except Exception:
                 logger.error(
                     "%s ACP超时会话退休失败；会话已标记为不可复用",

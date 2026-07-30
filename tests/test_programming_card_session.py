@@ -272,6 +272,50 @@ class TestProgrammingCardSession:
         assert pcs.closed
         assert pcs.session.state.terminal == "failed"
 
+    def test_waiting_for_user_confirmation_closes_as_blocked_and_preserves_reason(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_text("已完成自动续做，")
+        pcs.on_event(
+            ACPEvent(
+                event_type=ACPEventType.THOUGHT_CHUNK,
+                text="仍需用户确认。",
+            )
+        )
+        pcs.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="agent-waiting",
+                    title="Agent",
+                    kind="other",
+                    status="in_progress",
+                    content="等待确认前整理结果\n子代理：Explore",
+                ),
+            )
+        )
+
+        reason = "自动续做已完成，仍需用户确认后继续"
+        pcs.wait_for_user_confirmation(reason)
+
+        state = pcs.session.state
+        assert pcs.closed
+        assert state.terminal == "blocked"
+        assert state.terminal_reason == "blocked"
+        assert state.engine_ext.blocked_reason == reason
+        assert any(
+            block.kind == "text" and "已完成自动续做" in block.content
+            for block in state.blocks
+        )
+        assert all(
+            block.status == "completed"
+            for block in state.blocks
+            if block.kind == "reasoning"
+        )
+        assert state.metadata.subagents[0]["status"] == "cancelled"
+
     def test_update_tool_model(self):
         pcs, _ = _make_programming_session()
         pcs.start()
@@ -376,6 +420,67 @@ class TestProgrammingCardSession:
         text_blocks = [b for b in pcs.session.state.blocks if b.kind == "text"]
         assert [b.content for b in text_blocks] == ["第一轮。", "第二轮。", "第三轮。"]
         assert len({b.block_id for b in text_blocks}) == 3
+
+    def test_continuation_boundary_closes_stream_blocks_without_new_card(self):
+        from src.acp.models import ACPEvent, ACPEventType
+
+        pcs, client = _make_programming_session()
+        pcs.start()
+        pcs.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="第一轮答复。",
+            )
+        )
+        pcs.on_event(
+            ACPEvent(
+                event_type=ACPEventType.THOUGHT_CHUNK,
+                text="第一轮推理。",
+            )
+        )
+
+        pcs.begin_continuation_turn()
+        pcs.on_event(
+            ACPEvent(
+                event_type=ACPEventType.THOUGHT_CHUNK,
+                text="续做推理。",
+            )
+        )
+        pcs.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="续做答复。",
+            )
+        )
+        pcs._flush_now()
+
+        state = pcs.session.state
+        text_blocks = [
+            block for block in state.blocks
+            if block.kind == "text" and block.content
+        ]
+        reasoning_blocks = [
+            block for block in state.blocks
+            if block.kind == "reasoning" and block.content
+        ]
+        assert len(client.creates) == 1
+        assert [block.content for block in text_blocks] == [
+            "第一轮答复。",
+            "续做答复。",
+        ]
+        assert [block.block_id for block in text_blocks] == [
+            "_active_text",
+            "_turn_2_text",
+        ]
+        assert [block.content for block in reasoning_blocks] == [
+            "第一轮推理。",
+            "续做推理。",
+        ]
+        assert [block.block_id for block in reasoning_blocks] == [
+            "_active_reasoning",
+            "_turn_2_reasoning",
+        ]
+        assert all(block.status == "completed" for block in reasoning_blocks)
 
     def test_tool_calls_split_reasoning_into_chronological_turns(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
@@ -1188,7 +1293,7 @@ class TestNonStreamingFallback:
         session = MagicMock()
 
         def send_prompt(_text, *, on_event, timeout):
-            assert timeout == 33
+            assert timeout == pytest.approx(33, abs=0.1)
             on_event(ACPEvent(event_type=ACPEventType.IMAGE_CHUNK, image=image))
             return PromptResult(stop_reason="end_turn", text="图片已生成")
 
@@ -1281,7 +1386,8 @@ class TestNonStreamingFallback:
             _finalization_task_text="完成并提交原任务",
         )
 
-        assert [timeout for _, timeout in calls] == [60, 30]
+        assert calls[0][1] == pytest.approx(60, abs=0.1)
+        assert calls[1][1] == pytest.approx(30, abs=0.1)
         assert "不要创建新的子代理" in calls[1][0]
         assert "完成并提交原任务" in calls[1][0]
         assert "BRIDGE CONTEXT" not in calls[1][0]

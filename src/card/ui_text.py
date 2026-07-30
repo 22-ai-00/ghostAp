@@ -675,6 +675,8 @@ UI_TEXT = {
     "mode_exec_cancelled_msg": "⏹️ 任务已取消：{reason}",
     "mode_exec_incomplete_title": "执行未完成",
     "mode_exec_incomplete_msg": "⚠️ 任务未完成：{reason}",
+    "mode_exec_waiting_title": "等待用户确认",
+    "mode_exec_waiting_msg": "⏸️ 自动续做已完成，仍需你的确认后才能继续：{reason}",
     "mode_exec_timeout_title": "执行超时",
     "mode_exec_exception_title": "执行异常",
     "mode_exec_timeout_msg": "⏳ 执行超时: {error}",
