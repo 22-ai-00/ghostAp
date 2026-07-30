@@ -348,8 +348,9 @@ class TestValidateNoTombstoneTrigger:
         # Provide minimum required config for --validate to succeed
         env["APP_ID"] = "smoke_test_app_id"
         env["APP_SECRET"] = "smoke_test_app_secret"
-        # Prevent loading any local .env that might have invalid values
-        env["DOTENV_PATH"] = "/dev/null"
+        # Pin the supported opt-out explicitly so a caller/CI environment with
+        # configured roles cannot make the stderr regression vacuously pass.
+        env["SLOCK_DEFAULT_ROLES"] = ""
 
         result = subprocess.run(
             [sys.executable, "-m", "src.main", "--validate"],

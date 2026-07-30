@@ -44,8 +44,8 @@ class TestSlockDefaultRolesLogLevel:
         )
         assert matching_records[0].levelno == logging.INFO
 
-    def test_slock_default_roles_set_via_env_no_warning(self, caplog, monkeypatch):
-        """Setting SLOCK_DEFAULT_ROLES env var prevents warning log."""
+    def test_slock_default_roles_set_via_env_emits_no_empty_notice(self, caplog, monkeypatch):
+        """A configured role set must not emit the empty-setting notice."""
         monkeypatch.setenv(
             "SLOCK_DEFAULT_ROLES",
             "planner:claude,coder:codex,reviewer:claude,tester:codex",
@@ -53,15 +53,15 @@ class TestSlockDefaultRolesLogLevel:
 
         from src.config.settings import Settings
 
-        with caplog.at_level(logging.WARNING, logger="src.config.settings"):
+        with caplog.at_level(logging.INFO, logger="src.config.settings"):
             Settings(_env_file=None)
 
-        warning_records = [
+        matching_records = [
             r for r in caplog.records
-            if r.levelno == logging.WARNING and "slock_default_roles is empty" in r.message
+            if "slock_default_roles is empty" in r.message
         ]
-        assert len(warning_records) == 0, (
-            f"Expected no WARNING log when SLOCK_DEFAULT_ROLES is set. "
+        assert matching_records == [], (
+            f"Expected no empty-setting notice when SLOCK_DEFAULT_ROLES is set. "
             f"Records: {[r.message for r in caplog.records]}"
         )
 
