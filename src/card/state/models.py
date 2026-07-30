@@ -22,7 +22,9 @@ TerminalStatus = Literal[
     "running", "completed", "failed", "cancelled", "paused", "awaiting_approval", "archived", "blocked"
 ]
 
-TerminalReason = Literal["completed", "cancelled", "ttl_expired", "failed", "archived"]
+TerminalReason = Literal[
+    "completed", "cancelled", "ttl_expired", "failed", "archived", "blocked"
+]
 
 BlockStatus = Literal["active", "completed", "failed"]
 

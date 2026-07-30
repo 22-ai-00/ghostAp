@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
 from contextlib import ExitStack, contextmanager, nullcontext
 from unittest.mock import MagicMock, PropertyMock, patch
 
-from src.acp.models import PlanEntryInfo, PlanInfo, PromptResult
+from src.acp.models import (
+    ACPEvent,
+    ACPEventType,
+    ACPImageInfo,
+    PlanEntryInfo,
+    PlanInfo,
+    PromptResult,
+)
 from src.feishu.handlers.programming import ClaudeModeHandler, Tui2acpModeHandler
 
 
@@ -59,8 +67,13 @@ class _FakeProgrammingCardSession:
 
 
 class _QueuedPromptSession:
-    def __init__(self, *results: PromptResult):
+    def __init__(
+        self,
+        *results: PromptResult,
+        first_event: ACPEvent | None = None,
+    ):
         self._results = list(results)
+        self._first_event = first_event
         self.calls: list[tuple[str, object, float | int | None]] = []
         self._force_dead = False
         self.session_id = "queued-session"
@@ -68,6 +81,8 @@ class _QueuedPromptSession:
 
     def send_prompt(self, text, on_event=None, timeout=None):
         self.calls.append((text, on_event, timeout))
+        if len(self.calls) == 1 and self._first_event is not None:
+            on_event(self._first_event)
         return self._results.pop(0)
 
 
@@ -250,6 +265,51 @@ def test_non_streaming_pending_plan_continues_and_replies_with_success():
     handler.reply_text.assert_called_once()
     assert "done" in handler.reply_text.call_args.args[1]
     handler.add_reaction.assert_called_once()
+
+
+def test_non_streaming_second_pending_plan_renders_waiting_without_success():
+    handler = _make_handler()
+    handler.reply_card = MagicMock()
+    handler.upload_acp_image = MagicMock(return_value="img-waiting")
+    image = ACPImageInfo(
+        image_id="waiting-image",
+        mime_type="image/png",
+        data="unused-by-mocked-uploader",
+        name="waiting.png",
+    )
+    session = _QueuedPromptSession(
+        _pending_result("first partial"),
+        _pending_result("second partial"),
+        first_event=ACPEvent(
+            event_type=ACPEventType.IMAGE_CHUNK,
+            image=image,
+        ),
+    )
+
+    handler._handle_response_non_streaming(
+        "msg-1",
+        "chat-1",
+        "finish the task",
+        session,
+        None,
+        "/tmp",
+    )
+
+    assert len(session.calls) == 2
+    assert "自动续做指令" in session.calls[1][0]
+    handler.upload_acp_image.assert_called_once_with(image)
+    handler.reply_text.assert_not_called()
+    handler.reply_card.assert_called_once()
+    card = json.loads(handler.reply_card.call_args.args[1])
+    markdown = "\n".join(
+        str(element.get("content") or "")
+        for element in card["body"]["elements"]
+        if element.get("tag") == "markdown"
+    )
+    assert "Tui2ACP · 等待用户确认" in markdown
+    assert "自动续做已完成，仍需你的确认后才能继续" in markdown
+    assert "仍有 1 个计划项未完成" in markdown
+    handler.add_reaction.assert_not_called()
 
 
 def test_tui2acp_terminal_state_prompt_error_ends_manager_session():

@@ -1443,6 +1443,68 @@ class TestNonStreamingFallback:
         assert retire_call.kwargs["active_session"] is session
         assert 0 < retire_call.kwargs["retirement_budget_s"] <= 60
 
+    def test_timeout_after_replacement_retires_active_replacement(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from src.feishu.handlers.programming import ProgrammingModeHandler
+
+        class Session:
+            _force_dead = False
+
+        original = Session()
+        replacement = Session()
+        retire = MagicMock()
+        replace_session = MagicMock(return_value=replacement)
+        handler = SimpleNamespace(
+            settings=SimpleNamespace(
+                coco_execution_timeout=90,
+                claude_execution_timeout=90,
+                programming_finalization_reserve_s=30,
+                repo_lock_hard_timeout=120,
+            ),
+            is_coco=True,
+            mode_name="Coco",
+            upload_acp_image=MagicMock(),
+            reply_card=MagicMock(),
+            reply_text=MagicMock(),
+            add_reaction=MagicMock(),
+            _replace_timed_out_session=replace_session,
+            _retire_finalization_session=retire,
+        )
+
+        def replace_then_timeout(
+            active,
+            _text,
+            *,
+            replace_dead_session,
+            **_kwargs,
+        ):
+            assert active is original
+            assert replace_dead_session(12.5) is replacement
+            raise TimeoutError("deadline after replacement")
+
+        with patch(
+            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            side_effect=replace_then_timeout,
+        ):
+            ProgrammingModeHandler._handle_response_non_streaming(
+                handler,
+                "message-1",
+                "chat-1",
+                "replacement-timeout task",
+                original,
+                None,
+                "/workspace",
+            )
+
+        assert replace_session.call_args.kwargs["timed_out_session"] is original
+        retire.assert_called_once()
+        assert retire.call_args.kwargs["active_session"] is replacement
+        assert replacement._force_dead is True
+        assert original._force_dead is False
+        handler.reply_card.assert_called_once()
+
     def test_retirement_failure_still_returns_timeout_error_card(self):
         from types import SimpleNamespace
         from unittest.mock import MagicMock
