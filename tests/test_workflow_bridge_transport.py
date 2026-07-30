@@ -1127,6 +1127,13 @@ def test_race_cancel_real_node_process(tmp_path):
         label = params.label or ""
         if label == "fast":
             fast_called.set()
+            # This integration test exercises cancellation of an in-flight
+            # loser. Without this condition wait, the immediate winner can
+            # legally cancel slow while its future is still queued, which is
+            # the separate pending-future path covered above.
+            assert slow_called.wait(timeout=3.0), (
+                "slow agent should start before the in-flight cancel check"
+            )
             # Fast agent returns immediately
             return AgentCallResult(
                 output="fast-wins",
