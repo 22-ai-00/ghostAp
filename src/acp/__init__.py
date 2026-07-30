@@ -5,6 +5,10 @@ over stdio, replacing the previous subprocess-based CLI interaction.
 """
 
 from .client import GhostAPClient
+from .continuation import (
+    PromptContinuationResult,
+    run_prompt_with_continuation,
+)
 from .finalization import run_prompt_with_finalization
 from .models import (
     ACPEvent,
@@ -50,6 +54,8 @@ __all__ = [
     "ACPSession",
     "SyncACPSession",
     "start_session_with_retry",
+    "PromptContinuationResult",
+    "run_prompt_with_continuation",
     "run_prompt_with_finalization",
     "ACPEventRenderer",
     "ACPSessionManager",

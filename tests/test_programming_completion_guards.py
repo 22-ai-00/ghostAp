@@ -760,6 +760,8 @@ def test_end_turn_with_pending_plan_is_incomplete() -> None:
     assessment = classify_prompt_result(result)
 
     assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.pending_plan_entries == 1
+    assert assessment.incomplete_tool_calls == 0
     assert "计划" in assessment.detail
 
 
@@ -779,7 +781,49 @@ def test_end_turn_with_active_tool_is_incomplete() -> None:
     assessment = classify_prompt_result(result)
 
     assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.pending_plan_entries == 0
+    assert assessment.incomplete_tool_calls == 1
     assert "工具" in assessment.detail
+
+
+def test_assessment_counts_plan_and_tool_incompleteness_before_diagnostic() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        plan=PlanInfo(
+            entries=[
+                PlanEntryInfo(content="已完成", status="completed"),
+                PlanEntryInfo(content="仍需实现", status="pending"),
+                PlanEntryInfo(content="仍需验证", status="in_progress"),
+            ]
+        ),
+        tool_calls=[
+            ToolCallInfo(
+                id="tool-combined-contract-1",
+                title="pytest",
+                kind="execute",
+                status="in_progress",
+            ),
+            ToolCallInfo(
+                id="tool-combined-contract-2",
+                title="ruff",
+                kind="execute",
+                status="pending",
+            ),
+            ToolCallInfo(
+                id="tool-combined-contract-3",
+                title="read",
+                kind="read",
+                status="completed",
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.pending_plan_entries == 2
+    assert assessment.incomplete_tool_calls == 2
+    assert "计划" in assessment.detail
 
 
 @pytest.mark.parametrize(
