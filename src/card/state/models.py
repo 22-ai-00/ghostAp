@@ -64,6 +64,7 @@ class CardMetadata:
     bridge_phrase: str | None = None
     live_ticker_frame: str | None = None
     subagents: tuple[dict, ...] = ()
+    programming_text_sections: bool = False
 
     def __post_init__(self) -> None:
         if self.continuation_seq > 0 and self.card_sequence == 1:
@@ -130,6 +131,10 @@ class TextBlock:
     content: str = ""
     element_id: str | None = None
     status: BlockStatus = "active"
+    source_kind: Literal["main", "subagent"] = "main"
+    source_sequence: str | None = None
+    source_label: str | None = None
+    source_ref: str = "main"
 
 
 @dataclass(frozen=True)

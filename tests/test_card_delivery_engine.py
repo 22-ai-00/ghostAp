@@ -9,9 +9,10 @@ import pytest
 
 from src.card.delivery.engine import CardDelivery, SequenceConflictError, TransportError
 from src.card.delivery.types import MutationOutcome as MutationOutcomeType
+from src.card.programming_adapter import build_programming_metadata
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import render_card
-from src.card.state.models import CardState, ImageBlock
+from src.card.state.models import CardState, ContentBlock, ImageBlock
 from src.card.types import ActiveElement, RenderedCard
 from tests.helpers.delivery_internals import DeliveryInspector
 
@@ -179,6 +180,55 @@ class TestCardDeliveryUpdate:
         assert outcomes[0].kind == "applied"
         assert len(client.elements) == 1
         assert client.elements[0]["content"] == "hello world"
+
+    def test_nested_programming_section_uses_element_content_update(self):
+        client = MockCardClient()
+        delivery = CardDelivery(client)
+        metadata = build_programming_metadata("codex")
+        initial_state = CardState(
+            blocks=(
+                ContentBlock(
+                    kind="text",
+                    block_id="stream",
+                    content="正在检查",
+                    element_id="el_stream",
+                    status="active",
+                ),
+            ),
+            metadata=metadata,
+        )
+        updated_state = dataclasses.replace(
+            initial_state,
+            blocks=(
+                dataclasses.replace(
+                    initial_state.blocks[0],
+                    content="正在检查流式投递",
+                ),
+            ),
+        )
+
+        initial = render_card(initial_state, RenderBudget())
+        updated = render_card(updated_state, RenderBudget())
+        delivery.deliver("programming-section", "chat_abc", initial)
+        outcomes = delivery.deliver(
+            "programming-section",
+            "chat_abc",
+            updated,
+        )
+
+        assert initial[0].structure_signature == updated[0].structure_signature
+        assert outcomes[0].kind == "applied"
+        assert len(client.streaming_creates) == 1
+        assert len(client.card_references) == 1
+        assert client.updates == []
+        assert client.elements == [
+            {
+                "card_id": "stream_card_1",
+                "element_id": "el_stream",
+                "content": "正在检查流式投递",
+                "sequence": 1,
+            },
+        ]
 
     def test_no_change_skips(self):
         client = MockCardClient()

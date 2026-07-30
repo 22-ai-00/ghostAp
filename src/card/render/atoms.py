@@ -10,6 +10,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from src.card.render.budget import RenderBudget
+from src.card.render.programming_sections import is_programming_thought_block
 from src.card.state.models import ContentBlock
 from src.card.ui_text import UI_TEXT
 from src.utils.text import sanitize_single_line_label, utf8_replace_bytes
@@ -38,6 +39,7 @@ class RenderAtom:
     splittable: bool = False  # Whether this atom can be split across pages
     block_id: str = ""
     content: str = ""  # Raw content (for split operations)
+    structural_overhead: int = 0  # Estimated wrapper bytes not present in content
 
 
 def estimate_atom_size(atom: RenderAtom) -> int:
@@ -48,9 +50,18 @@ def estimate_atom_size(atom: RenderAtom) -> int:
     """
     if atom.elements:
         return len(utf8_replace_bytes(json.dumps(atom.elements)))
-    # Estimate: content bytes + structural overhead
-    overhead = 100  # JSON object structure overhead
-    return len(utf8_replace_bytes(atom.content)) * 3 + overhead
+    overhead = 100 + max(0, atom.structural_overhead)
+    if atom.structural_overhead <= 0:
+        # Preserve the established conservative estimate for engine/tool atoms
+        # whose eventual panel structure is not represented here.
+        return len(utf8_replace_bytes(atom.content)) * 3 + overhead
+    # Segmented programming text has an explicit worst-case wrapper reserve, so
+    # its content can match the production ensure_ascii=False serializer.
+    encoded_content = json.dumps(
+        atom.content,
+        ensure_ascii=False,
+    )
+    return len(utf8_replace_bytes(encoded_content)) + overhead
 
 
 def flatten_to_atoms(
@@ -59,6 +70,7 @@ def flatten_to_atoms(
     *,
     unified_execution: bool = False,
     terminal: bool = False,
+    segmented_text: bool = False,
 ) -> list[RenderAtom]:
     """Convert ContentBlocks into a flat list of RenderAtoms.
 
@@ -184,7 +196,28 @@ def flatten_to_atoms(
             _flush_pending()
             handler = handlers.get(block.kind)
             if handler is not None:
+                if (
+                    segmented_text
+                    and block.kind == "text"
+                    and not str(block.content or "").strip()
+                ):
+                    i += 1
+                    continue
                 atom = handler(block)
+                if (
+                    segmented_text
+                    and block.kind == "text"
+                    and is_programming_thought_block(block)
+                ):
+                    # collapsible_panel + header markdown + body markdown.
+                    # The byte overhead covers the static Card 2.0 wrapper so
+                    # pagination remains conservative before actual rendering.
+                    atom.node_count = 3
+                    # Worst-case static wrapper includes a sanitized 60-char
+                    # Chinese subagent title. Keep this conservative while
+                    # avoiding the old UTF-8 double multiplication.
+                    atom.structural_overhead = 720
+                    atom.byte_size = estimate_atom_size(atom)
                 atoms.append(atom)
             else:
                 logger.warning("flatten_to_atoms: unknown block kind %r (block_id=%s), skipping", block.kind, block.block_id)

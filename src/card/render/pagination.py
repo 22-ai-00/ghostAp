@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 from src.card.render.atoms import RenderAtom, estimate_atom_size
+from src.utils.text import utf8_replace_bytes
 
 # Approximate overhead for card config/header/footer skeleton
 BASE_OVERHEAD = 500
@@ -43,7 +45,7 @@ def split_atom(atom: RenderAtom, remaining_bytes: int) -> list[RenderAtom] | Non
         return parts
 
     # Strategy 3: Split by 1600 character chunks
-    parts = _try_split_by_chars(atom, content, 1600, remaining_bytes)
+    parts = _try_split_by_chars(atom, content, remaining_bytes)
     if parts is not None:
         return parts
 
@@ -62,7 +64,7 @@ def _try_split_by_separator(
     first_part_segments: list[str] = []
     for seg in segments:
         candidate = separator.join(first_part_segments + [seg])
-        candidate_size = _estimate_content_bytes(candidate)
+        candidate_size = _estimate_content_bytes(atom, candidate)
         if candidate_size > remaining_bytes and first_part_segments:
             break
         first_part_segments.append(seg)
@@ -76,34 +78,44 @@ def _try_split_by_separator(
     first_content = separator.join(first_part_segments)
     rest_content = separator.join(segments[len(first_part_segments):])
 
-    return _make_split_atoms(atom, first_content, rest_content)
+    parts = _make_split_atoms(atom, first_content, rest_content)
+    if parts[0].byte_size <= remaining_bytes:
+        return parts
+    return None
 
 
 def _try_split_by_chars(
-    atom: RenderAtom, content: str, chunk_size: int, remaining_bytes: int
+    atom: RenderAtom,
+    content: str,
+    remaining_bytes: int,
 ) -> list[RenderAtom] | None:
-    """Split content into character chunks."""
-    if len(content) <= chunk_size:
+    """Split at the largest character boundary that fits the current page."""
+    if len(content) <= 1 or remaining_bytes <= 0:
         return None
 
-    # Determine how many chars fit in remaining_bytes
-    # Use a conservative estimate: each char ~3 bytes in JSON
-    chars_for_remaining = max(remaining_bytes // 3, chunk_size)
-    split_point = min(chars_for_remaining, len(content) - 1)
+    best_split = 0
+    low = 1
+    high = len(content) - 1
+    while low <= high:
+        split_point = (low + high) // 2
+        parts = _make_split_atoms(
+            atom,
+            content[:split_point],
+            content[split_point:],
+        )
+        if parts[0].byte_size <= remaining_bytes:
+            best_split = split_point
+            low = split_point + 1
+        else:
+            high = split_point - 1
 
-    if split_point <= 0:
-        split_point = chunk_size
-
-    # Ensure we don't exceed content length
-    split_point = min(split_point, len(content) - 1)
-
-    first_content = content[:split_point]
-    rest_content = content[split_point:]
-
-    if not first_content or not rest_content:
+    if best_split <= 0:
         return None
-
-    return _make_split_atoms(atom, first_content, rest_content)
+    return _make_split_atoms(
+        atom,
+        content[:best_split],
+        content[best_split:],
+    )
 
 
 def _make_split_atoms(
@@ -119,6 +131,7 @@ def _make_split_atoms(
         content=first_content,
         splittable=True,
         node_count=atom.node_count,
+        structural_overhead=atom.structural_overhead,
     )
     first_atom.byte_size = estimate_atom_size(first_atom)
 
@@ -128,6 +141,7 @@ def _make_split_atoms(
         content=rest_content,
         splittable=True,
         node_count=atom.node_count,
+        structural_overhead=atom.structural_overhead,
     )
     rest_atom.byte_size = estimate_atom_size(rest_atom)
 
@@ -196,7 +210,10 @@ def _iter_unescaped_inline_backtick_runs(text: str):
         i = j
 
 
-def _estimate_content_bytes(content: str) -> int:
+def _estimate_content_bytes(atom: RenderAtom, content: str) -> int:
     """Estimate JSON byte size for content."""
-    overhead = 100
-    return len(content.encode("utf-8")) * 3 + overhead
+    overhead = 100 + max(0, atom.structural_overhead)
+    if atom.structural_overhead <= 0:
+        return len(utf8_replace_bytes(content)) * 3 + overhead
+    encoded_content = json.dumps(content, ensure_ascii=False)
+    return len(utf8_replace_bytes(encoded_content)) + overhead

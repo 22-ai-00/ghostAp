@@ -1,11 +1,26 @@
 """Text block sub-reducer."""
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import replace
 
 from ...events import CardEvent, CardEventType
 from ...text_stream import append_stream_text
 from ..models import CardState, TextBlock
+
+_VALID_ELEMENT_ID = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,19}$")
+
+
+def _text_element_id(block_id: str) -> str:
+    """Build a stable Card 2.0 element_id (letter-first, at most 20 chars)."""
+    candidate = f"el_{block_id}"
+    if _VALID_ELEMENT_ID.fullmatch(candidate):
+        return candidate
+    digest = hashlib.sha256(
+        str(block_id).encode("utf-8", errors="replace")
+    ).hexdigest()
+    return f"el_{digest[:16]}"
 
 
 def reduce_text(state: CardState, event: CardEvent) -> CardState:
@@ -13,7 +28,27 @@ def reduce_text(state: CardState, event: CardEvent) -> CardState:
     match event.type:
         case CardEventType.TEXT_STARTED:
             block_id = event.payload.get("block_id", "")
-            new_block = TextBlock(block_id=block_id, status="active", element_id=f"el_{block_id}")
+            source_kind = event.payload.get("source_kind", "main")
+            if source_kind not in {"main", "subagent"}:
+                source_kind = "main"
+            source_sequence = str(
+                event.payload.get("source_sequence") or ""
+            ).strip() or None
+            source_label = str(
+                event.payload.get("source_label") or ""
+            ).strip() or None
+            source_ref = str(
+                event.payload.get("source_ref") or "main"
+            ).strip() or "main"
+            new_block = TextBlock(
+                block_id=block_id,
+                status="active",
+                element_id=_text_element_id(block_id),
+                source_kind=source_kind,
+                source_sequence=source_sequence,
+                source_label=source_label,
+                source_ref=source_ref,
+            )
             return replace(state, blocks=state.blocks + (new_block,),
                            footer=replace(state.footer, status="thinking", status_text="💭 正在思考..."))
 
@@ -30,7 +65,7 @@ def reduce_text(state: CardState, event: CardEvent) -> CardState:
             # Auto-create block for convenience (from_acp uses "_active_text").
             text = text.lstrip("\n")
             new_block = TextBlock(block_id=block_id, status="active",
-                                     element_id=f"el_{block_id}", content=text)
+                                     element_id=_text_element_id(block_id), content=text)
             return replace(state, blocks=state.blocks + (new_block,),
                            footer=replace(state.footer, status="thinking", status_text="💭 正在思考..."))
 

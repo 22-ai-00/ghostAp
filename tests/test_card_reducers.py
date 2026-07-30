@@ -1,7 +1,7 @@
 """Tests for sub-reducers."""
 import pytest
 
-from src.card.events import CardEvent
+from src.card.events import CardEvent, CardEventType
 from src.card.state.models import CardMetadata, CardState
 from src.card.state.reducer import reduce_card_state
 from src.card.state.reducers.lifecycle import reduce_lifecycle
@@ -55,6 +55,39 @@ class TestTextReducer:
         assert s.blocks[0].kind == "text"
         assert s.blocks[0].block_id == "b1"
         assert s.blocks[0].status == "active"
+
+    def test_text_attribution_survives_delta_and_done(self):
+        started = CardEvent(
+            type=CardEventType.TEXT_STARTED,
+            payload={
+                "block_id": "b1",
+                "source_kind": "subagent",
+                "source_sequence": "1.a",
+                "source_label": "核查后半计划",
+                "source_ref": "src_1234",
+            },
+        )
+
+        s = reduce_text(_base_state(), started)
+        s = reduce_text(s, CardEvent.text_delta("b1", "发现两处矛盾。"))
+        s = reduce_text(s, CardEvent.text_done("b1"))
+
+        block = s.blocks[0]
+        assert block.source_kind == "subagent"
+        assert block.source_sequence == "1.a"
+        assert block.source_label == "核查后半计划"
+        assert block.source_ref == "src_1234"
+        assert block.content == "发现两处矛盾。"
+        assert block.status == "completed"
+
+    def test_auto_created_text_uses_safe_main_attribution(self):
+        s = reduce_text(_base_state(), CardEvent.text_delta("b1", "hi"))
+
+        block = s.blocks[0]
+        assert block.source_kind == "main"
+        assert block.source_sequence is None
+        assert block.source_label is None
+        assert block.source_ref == "main"
 
     def test_text_delta_appends(self):
         s = _base_state()

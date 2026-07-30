@@ -213,15 +213,36 @@ class CardEvent(Generic[P]):
         return cls(type=CardEventType.BLOCKED, payload=payload)
 
     @classmethod
-    def text_started(cls, block_id: str) -> CardEvent[TextBlockPayload]:
+    def text_started(
+        cls,
+        block_id: str,
+        *,
+        source_kind: str = "main",
+        source_sequence: str | None = None,
+        source_label: str | None = None,
+        source_ref: str = "main",
+    ) -> CardEvent[TextBlockPayload]:
         """Signal the start of a new text content block.
 
-        Payload: {block_id: str} — unique identifier for the text block.
+        Payload: {block_id, source_kind?, source_sequence?, source_label?,
+        source_ref?}. Source attribution is optional and defaults to the main
+        Agent so existing engine/static callers remain unchanged.
         Triggered when: Engine begins streaming a new text segment.
         """
         if not block_id:
             raise ValueError("block_id is required for text_started")
-        return cls(type=CardEventType.TEXT_STARTED, payload={"block_id": block_id})
+        if source_kind not in {"main", "subagent"}:
+            raise ValueError("source_kind must be 'main' or 'subagent'")
+        payload: TextBlockPayload = {"block_id": block_id}
+        if source_kind != "main":
+            payload["source_kind"] = "subagent"
+        if source_sequence:
+            payload["source_sequence"] = source_sequence
+        if source_label:
+            payload["source_label"] = source_label
+        if source_ref != "main":
+            payload["source_ref"] = source_ref
+        return cls(type=CardEventType.TEXT_STARTED, payload=payload)
 
     @classmethod
     def text_delta(cls, block_id: str, text: str) -> CardEvent[TextBlockPayload]:

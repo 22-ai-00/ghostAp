@@ -18,6 +18,10 @@ from src.card.render.footer import render_footer
 from src.card.render.header import render_header
 from src.card.render.layout import SectionLayout, paginate_layout
 from src.card.render.plan import render_plan_panel
+from src.card.render.programming_sections import (
+    is_programming_thought_block,
+    render_programming_text_section,
+)
 from src.card.render.reasoning import render_reasoning_panel, truncate_reasoning_for_compact
 from src.card.render.review import render_review_role_panel
 from src.card.render.spec_artifacts import render_spec_plan_panel, render_spec_task_panel
@@ -131,18 +135,23 @@ def render_card(
 
     # 1. Flatten blocks to atoms and build SectionLayout skeleton.
     is_programming_card = state.metadata.engine_type is None
+    segmented_text = bool(
+        state.metadata.programming_text_sections
+        and is_programming_card
+    )
     atoms = flatten_to_atoms(
         state.blocks,
         budget,
         unified_execution=is_programming_card,
         terminal=state.terminal != "running",
+        segmented_text=segmented_text,
     )
     if state.metadata and state.metadata.compact:
         atoms = _compact_reasoning_atoms(atoms)
     subagent_atom = build_subagent_dispatch_atom(list(state.metadata.subagents)) if state.metadata.subagents else None
     if subagent_atom is not None:
         atoms.insert(0, subagent_atom)
-    atoms = _coalesce_adjacent_text_fragments(atoms)
+    atoms = _coalesce_adjacent_text_fragments(atoms, block_index)
     layout = _build_section_layout(state, atoms)
 
     # 2. Paginate via SectionLayout (sticky_head/status/body/appendix SSOT)
@@ -216,38 +225,17 @@ def render_card(
         # Compute per-page structure signature from body content
         # This ensures only pages with actual changes trigger API updates
         page_sig_parts = [global_sig, f"page:{page_idx}"]
+        streaming_element_id = (
+            active_element.element_id
+            if active_element is not None
+            else None
+        )
         for elem in body_elements:
-            tag = elem.get("tag", "")
-            page_sig_parts.append(tag)
-            if tag == "markdown":
-                # Skip content of streaming elements — their text is delivered
-                # via element_content API and should not trigger full card updates.
-                # Including it causes repeated full patches while content[:64] changes,
-                # then a jarring switch to stream_element that produces a visual newline
-                # artifact in Feishu CardKit.
-                element_id = elem.get("element_id")
-                if element_id:
-                    # The target element itself is structural. If it changes,
-                    # delivery must PATCH the card before sending element_content.
-                    page_sig_parts.append(f"element_id:{element_id}")
-                else:
-                    page_sig_parts.append(_content_signature(elem.get("content", "")))
-            elif tag == "collapsible_panel":
-                header = elem.get("header")
-                if isinstance(header, dict):
-                    title_obj = header.get("title", {})
-                    page_sig_parts.append(str(title_obj.get("content", ""))[:32])
-                elif isinstance(header, str):
-                    page_sig_parts.append(header[:32])
-                for item in elem.get("elements", []) or []:
-                    if isinstance(item, dict) and item.get("tag") == "markdown":
-                        page_sig_parts.append(_content_signature(item.get("content", "")))
-            elif tag == "column_set":
-                for col in elem.get("columns", []):
-                    for item in col.get("elements", []):
-                        if item.get("tag") == "markdown":
-                            page_sig_parts.append(_content_signature(item.get("content", "")))
-                            break
+            _append_element_structure_signature(
+                page_sig_parts,
+                elem,
+                streaming_element_id=streaming_element_id,
+            )
         page_signature = hashlib.md5(
             utf8_replace_bytes("|".join(page_sig_parts))
         ).hexdigest()
@@ -292,6 +280,13 @@ def compute_structure_signature(state: CardState) -> str:
         parts.append(f"{block.kind}:{block.block_id}:{block.status}")
         if block.kind == "tool_call":
             parts.append(f"tn:{block.tool_name}")
+        elif block.kind == "text":
+            parts.append(
+                "text-source:"
+                f"{getattr(block, 'source_kind', 'main')}:"
+                f"{getattr(block, 'source_sequence', '') or ''}:"
+                f"{getattr(block, 'source_ref', 'main')}"
+            )
         elif block.kind == "image":
             parts.append(f"image_key:{block.image_key or ''}")
             parts.append(f"image_alt:{block.alt}")
@@ -303,6 +298,8 @@ def compute_structure_signature(state: CardState) -> str:
         parts.append(f"tool:{state.metadata.tool_name}")
     if state.metadata.model_name:
         parts.append(f"model:{state.metadata.model_name}")
+    if state.metadata.programming_text_sections:
+        parts.append("programming-text-sections:v1")
     if state.metadata.iteration_index:
         parts.append(f"iter:{state.metadata.iteration_index}/{state.metadata.iteration_total or ''}")
     if state.metadata.unit_label:
@@ -375,7 +372,21 @@ def _render_atom_text(atom: RenderAtom, state: CardState, budget: RenderBudget, 
             detail_content=_normalize_text_markdown(atom.content),
             full_content=str(getattr(block, "content", "") or atom.content),
         )
-    return _render_text_element(atom, block_index)
+    body = _render_text_element(atom, block_index)
+    block = block_index.get(atom.block_id)
+    if (
+        state.metadata.programming_text_sections
+        and state.metadata.engine_type is None
+        and block is not None
+        and block.kind == "text"
+        and is_programming_thought_block(block)
+    ):
+        return render_programming_text_section(
+            body_markdown=body,
+            block=block,
+            state=state,
+        )
+    return body
 
 
 def _render_atom_tool_panel(atom: RenderAtom, state: CardState, budget: RenderBudget, block_index: dict) -> dict | None:
@@ -589,13 +600,17 @@ def _compact_reasoning_atoms(atoms: list[RenderAtom]) -> list[RenderAtom]:
             content=compact_content,
             splittable=False,
             node_count=atom.node_count,
+            structural_overhead=atom.structural_overhead,
         )
         compact_atom.byte_size = estimate_atom_size(compact_atom)
         compacted.append(compact_atom)
     return compacted
 
 
-def _coalesce_adjacent_text_fragments(atoms: list[RenderAtom]) -> list[RenderAtom]:
+def _coalesce_adjacent_text_fragments(
+    atoms: list[RenderAtom],
+    block_index: dict[str, ContentBlock],
+) -> list[RenderAtom]:
     """Merge pathological one-character text fragments into the next text atom.
 
     ACP streams can briefly split a Chinese word across text block boundaries
@@ -616,6 +631,10 @@ def _coalesce_adjacent_text_fragments(atoms: list[RenderAtom]) -> list[RenderAto
             and _visible_text_len(merged[-1].content) == 1
             and atom.content
             and not atom.content[0].isspace()
+            and _is_programming_thought_atom(merged[-1], block_index)
+            and _is_programming_thought_atom(atom, block_index)
+            and _text_source_ref(merged[-1], block_index)
+            == _text_source_ref(atom, block_index)
         ):
             previous = merged.pop()
             content = soft_join_text_fragments(previous.content, atom.content)
@@ -628,13 +647,39 @@ def _coalesce_adjacent_text_fragments(atoms: list[RenderAtom]) -> list[RenderAto
                 block_id=atom.block_id or previous.block_id,
                 content=content,
                 splittable=previous.splittable or atom.splittable,
-                node_count=1,
+                node_count=max(previous.node_count, atom.node_count),
+                structural_overhead=max(
+                    previous.structural_overhead,
+                    atom.structural_overhead,
+                ),
             )
             stitched.byte_size = estimate_atom_size(stitched)
             merged.append(stitched)
             continue
         merged.append(atom)
     return merged
+
+
+def _is_programming_thought_atom(
+    atom: RenderAtom,
+    block_index: dict[str, ContentBlock],
+) -> bool:
+    block = block_index.get(atom.block_id)
+    return bool(
+        block is not None
+        and block.kind == "text"
+        and is_programming_thought_block(block)
+    )
+
+
+def _text_source_ref(
+    atom: RenderAtom,
+    block_index: dict[str, ContentBlock],
+) -> str:
+    block = block_index.get(atom.block_id)
+    if block is None or block.kind != "text":
+        return f"block:{atom.block_id}"
+    return str(getattr(block, "source_ref", "main") or "main")
 
 
 def _visible_text_len(text: str) -> int:
@@ -926,6 +971,55 @@ def _strip_streaming_element_ids(nodes: list[dict]) -> None:
 
 def _content_signature(content: object) -> str:
     return hashlib.md5(utf8_replace_bytes(content)).hexdigest()
+
+
+def _append_element_structure_signature(
+    parts: list[str],
+    node: object,
+    *,
+    streaming_element_id: str | None,
+) -> None:
+    """Recursively fingerprint Card 2.0 structure and static text.
+
+    Only the selected streaming element excludes its content; CardKit can
+    deliver that element through the element-content API. Other active text
+    elements must retain a content fingerprint so concurrent source updates
+    trigger a full card patch instead of being silently skipped.
+    """
+    if isinstance(node, list):
+        for item in node:
+            _append_element_structure_signature(
+                parts,
+                item,
+                streaming_element_id=streaming_element_id,
+            )
+        return
+    if not isinstance(node, dict):
+        return
+
+    tag = str(node.get("tag") or "")
+    if tag:
+        parts.append(tag)
+    if tag in {"markdown", "plain_text"}:
+        element_id = str(node.get("element_id") or "")
+        if element_id:
+            parts.append(f"element_id:{element_id}")
+            if element_id != streaming_element_id:
+                parts.append(
+                    _content_signature(node.get("content", ""))
+                )
+        else:
+            parts.append(_content_signature(node.get("content", "")))
+
+    for key, value in node.items():
+        if key in {"tag", "content", "element_id"}:
+            continue
+        if isinstance(value, (dict, list)):
+            _append_element_structure_signature(
+                parts,
+                value,
+                streaming_element_id=streaming_element_id,
+            )
 
 
 def _assemble_card_json(

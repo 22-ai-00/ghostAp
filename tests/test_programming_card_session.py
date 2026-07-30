@@ -1,6 +1,7 @@
 """Tests for Programming Mode card session adapter."""
 
 import json
+import re
 
 import pytest
 
@@ -387,6 +388,180 @@ class TestProgrammingCardSession:
         text_blocks = [b for b in pcs.session.state.blocks if b.kind == "text" and b.content]
         assert [b.content for b in text_blocks] == ["Alpha Beta", "甲乙"]
         assert len({b.block_id for b in text_blocks}) == 2
+
+    def test_subagent_text_captures_task_attribution_without_opaque_source_id(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.render.budget import RenderBudget
+        from src.card.render.renderer import render_card
+
+        source_id = "call_private_subagent_123"
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id=source_id,
+                title="Agent",
+                kind="other",
+                status="in_progress",
+                content="核查后半计划\n子代理：Explore",
+            ),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="发现两处生命周期矛盾。",
+            source_id=source_id,
+        ))
+        pcs._flush_now()
+
+        block = next(
+            item
+            for item in pcs.session.state.blocks
+            if item.kind == "text" and item.content
+        )
+        assert block.source_kind == "subagent"
+        assert block.source_sequence == "1.a"
+        assert block.source_label == "核查后半计划"
+        assert block.source_ref != source_id
+        assert source_id not in block.block_id
+        assert re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{0,19}",
+            block.element_id or "",
+        )
+
+        card_json = render_card(
+            pcs.session.state,
+            RenderBudget(),
+        )[0]._card_json
+        rendered = json.dumps(card_json, ensure_ascii=False)
+        assert "子代理 · 核查后半计划" in rendered
+        assert source_id not in rendered
+
+    def test_unregistered_provider_source_is_not_labeled_as_subagent(self):
+        from src.acp.models import ACPEvent, ACPEventType
+        from src.card.render.budget import RenderBudget
+        from src.card.render.renderer import render_card
+
+        source_id = "provider-main-agent-id"
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="主 Agent 带来源标识的输出。",
+            source_id=source_id,
+        ))
+        pcs._flush_now()
+
+        block = next(
+            item
+            for item in pcs.session.state.blocks
+            if item.kind == "text" and item.content
+        )
+        assert block.source_kind == "main"
+        assert block.source_label is None
+        assert block.source_ref != "main"
+
+        rendered = json.dumps(
+            render_card(
+                pcs.session.state,
+                RenderBudget(),
+            )[0]._card_json,
+            ensure_ascii=False,
+        )
+        assert "子代理 ·" not in rendered
+        assert source_id not in rendered
+
+    def test_subagent_only_output_keeps_main_fallback_as_final_answer(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.render.budget import RenderBudget
+        from src.card.render.renderer import render_card
+
+        source_id = "subagent-only-output"
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id=source_id,
+                title="Agent",
+                kind="other",
+                status="in_progress",
+                content="检查分页边界",
+            ),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="子代理完成了分页核查。",
+            source_id=source_id,
+        ))
+        pcs._flush_now()
+
+        pcs.finish(fallback_text="主 Agent 最终交付总结。")
+
+        main_text = [
+            block.content
+            for block in pcs.session.state.blocks
+            if block.kind == "text"
+            and block.source_kind == "main"
+            and block.content
+        ]
+        assert main_text == ["主 Agent 最终交付总结。"]
+
+        rendered = json.dumps(
+            render_card(
+                pcs.session.state,
+                RenderBudget(),
+            )[0]._card_json,
+            ensure_ascii=False,
+        )
+        assert "子代理 · 检查分页边界" in rendered
+        assert "最终答复" in rendered
+        assert "主 Agent · 进展" not in rendered
+
+    def test_late_subagent_description_updates_existing_section_heading(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.render.budget import RenderBudget
+        from src.card.render.renderer import render_card
+
+        source_id = "late-subagent-description"
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id=source_id,
+                title="task",
+                kind="other",
+                status="in_progress",
+                content="",
+            ),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="先开始核查。",
+            source_id=source_id,
+        ))
+        pcs._flush_now()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id=source_id,
+                title="task",
+                kind="other",
+                status="in_progress",
+                content="检查移动端分段布局",
+            ),
+        ))
+
+        rendered = json.dumps(
+            render_card(
+                pcs.session.state,
+                RenderBudget(),
+            )[0]._card_json,
+            ensure_ascii=False,
+        )
+        assert "子代理 · 检查移动端分段布局" in rendered
+        assert "子代理 · 子任务" not in rendered
 
     def test_acp_turn_text_block_ids_are_monotonic_after_renderer_reset(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo

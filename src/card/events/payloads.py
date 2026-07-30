@@ -33,6 +33,10 @@ class TextBlockPayload(TypedDict):
     """Payload for TEXT_STARTED/TEXT_DELTA/TEXT_DONE events."""
     block_id: str
     text: NotRequired[str]
+    source_kind: NotRequired[Literal["main", "subagent"]]
+    source_sequence: NotRequired[str | None]
+    source_label: NotRequired[str | None]
+    source_ref: NotRequired[str]
 
 
 class ReasoningBlockPayload(TypedDict):

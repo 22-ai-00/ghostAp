@@ -7,8 +7,8 @@ Coco/Claude/Aiden/Codex/Gemini/Traex/TTADK.
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import re
 import threading
 import time
 from dataclasses import replace
@@ -77,6 +77,7 @@ def build_programming_metadata(
         model_name=model_name,
         engine_type=None,  # Programming mode is not an engine
         working_dir=working_dir,
+        programming_text_sections=True,
     )
 
 
@@ -299,13 +300,22 @@ class ProgrammingCardSession:
             else "completed"
         )
         self._finish_agent_summaries(terminal_status=terminal_status)
-        # If no text was streamed into the card, use fallback_text as completion
-        # summary so the user sees the answer instead of a blank card.
+        # If the main Agent did not stream an answer, use fallback_text as its
+        # completion summary. Subagent prose does not replace the parent answer.
         summary = ""
         if fallback_text:
             state = self._rotator.current.state
-            has_text = any(b.kind == "text" and b.content for b in state.blocks) if state else False
-            if not has_text:
+            has_main_text = (
+                any(
+                    block.kind == "text"
+                    and getattr(block, "source_kind", "main") == "main"
+                    and bool(str(block.content or "").strip())
+                    for block in state.blocks
+                )
+                if state
+                else False
+            )
+            if not has_main_text:
                 summary = fallback_text
         self._rotator.dispatch(CardEvent.completed(summary=summary))
         self._stop_ticker()
@@ -470,7 +480,30 @@ class ProgrammingCardSession:
         block_id = self._current_text_block_id(source_key)
         self._active_text_block_id = block_id
         self._text_blocks_by_source[source_key] = block_id
-        self._rotator.dispatch(CardEvent.text_started(block_id))
+        source_kind = "main"
+        source_sequence = None
+        source_label = None
+        source_ref = "main"
+        if source_key != "main":
+            source_ref = self._safe_source_suffix(source_key)
+            summary = self._agent_summaries.get(source_key)
+            if summary is not None:
+                source_kind = "subagent"
+                source_sequence = str(
+                    summary.get("sequence") or ""
+                ).strip() or None
+                source_label = str(
+                    summary.get("label") or ""
+                ).strip() or None
+        self._rotator.dispatch(
+            CardEvent.text_started(
+                block_id,
+                source_kind=source_kind,
+                source_sequence=source_sequence,
+                source_label=source_label,
+                source_ref=source_ref,
+            )
+        )
         self._active_text_sources.add(source_key)
         self._text_active = True
         return block_id
@@ -539,8 +572,13 @@ class ProgrammingCardSession:
 
     @staticmethod
     def _safe_source_suffix(source_key: str) -> str:
-        suffix = re.sub(r"[^a-zA-Z0-9_-]+", "_", source_key).strip("_")
-        return suffix[:40] or "main"
+        """Return a stable non-reversible source token for block identity."""
+        if source_key == "main":
+            return "main"
+        digest = hashlib.sha256(
+            source_key.encode("utf-8", errors="replace")
+        ).hexdigest()
+        return f"src_{digest[:12]}"
 
     def _block_id(self, kind: str, seq: int, source_key: str) -> str:
         if source_key == "main":

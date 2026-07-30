@@ -63,38 +63,60 @@ def paginate_layout(layout: SectionLayout, budget: RenderBudget) -> list[tuple[R
         extra = status_nodes if is_first_page else 0
         return base_node - extra - cur_nodes
 
-    for atom in layout.body:
-        atom_size = _atom_size(atom)
-        if atom_size <= remaining_byte() and atom.node_count <= remaining_node():
-            body_pages[-1].append(atom)
-            cur_bytes += atom_size
-            cur_nodes += atom.node_count
-            continue
+    def start_new_page() -> None:
+        nonlocal is_first_page, cur_bytes, cur_nodes
+        body_pages.append([])
+        is_first_page = False
+        cur_bytes = 0
+        cur_nodes = 0
 
-        split_result = split_atom(atom, max(remaining_byte(), 0))
-        if split_result is not None and len(split_result) > 1:
-            first_part, *rest = split_result
-            body_pages[-1].append(first_part)
-            cur_bytes += _atom_size(first_part)
-            cur_nodes += first_part.node_count
-            for part in rest:
-                body_pages.append([])
-                is_first_page = False
-                cur_bytes = 0
-                cur_nodes = 0
-                body_pages[-1].append(part)
-                cur_bytes += _atom_size(part)
-                cur_nodes += part.node_count
-            continue
-
-        if body_pages[-1]:
-            body_pages.append([])
-            is_first_page = False
-            cur_bytes = 0
-            cur_nodes = 0
+    def append_atom(atom: RenderAtom) -> None:
+        nonlocal cur_bytes, cur_nodes
         body_pages[-1].append(atom)
-        cur_bytes += atom_size
+        cur_bytes += _atom_size(atom)
         cur_nodes += atom.node_count
+
+    def fits(atom: RenderAtom) -> bool:
+        return (
+            _atom_size(atom) <= remaining_byte()
+            and atom.node_count <= remaining_node()
+        )
+
+    for original_atom in layout.body:
+        atom = original_atom
+        while True:
+            if fits(atom):
+                append_atom(atom)
+                break
+
+            split_result = None
+            if atom.node_count <= remaining_node():
+                split_result = split_atom(
+                    atom,
+                    max(remaining_byte(), 0),
+                )
+            if (
+                split_result is not None
+                and len(split_result) == 2
+                and fits(split_result[0])
+            ):
+                first_part, atom = split_result
+                append_atom(first_part)
+                start_new_page()
+                continue
+
+            page_has_reserved_content = (
+                is_first_page
+                and (status_size > 0 or status_nodes > 0)
+            )
+            if body_pages[-1] or page_has_reserved_content:
+                start_new_page()
+                continue
+
+            # An unsplittable atom larger than an otherwise empty page is left
+            # intact for the delivery-layer truncation guard.
+            append_atom(atom)
+            break
 
     if not body_pages or (len(body_pages) == 1 and not body_pages[0]):
         body_pages = [[]]
