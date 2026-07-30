@@ -368,6 +368,10 @@ class TestValidateNoTombstoneTrigger:
         assert "ImportError" not in result.stderr, (
             f"Tombstone ImportError detected in stderr:\n{result.stderr}"
         )
+        assert "slock_default_roles is empty" not in result.stderr, (
+            "Supported empty SLOCK_DEFAULT_ROLES configuration leaked a startup "
+            f"warning to stderr:\n{result.stderr}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-"""Tests for slock_default_roles configuration and warning logging."""
+"""Tests for slock_default_roles configuration and logging."""
 
 from __future__ import annotations
 
@@ -22,26 +22,27 @@ class TestSlockDefaultRolesDefaultValue:
         assert s.slock_default_roles == ""
 
 
-class TestSlockDefaultRolesWarningLog:
-    """Test warning log when slock_default_roles is empty."""
+class TestSlockDefaultRolesLogLevel:
+    """Test that the supported empty configuration is not treated as an error."""
 
-    def test_empty_slock_default_roles_emits_warning(self, caplog, monkeypatch):
-        """Creating Settings instance with empty slock_default_roles outputs WARNING log."""
+    def test_empty_slock_default_roles_is_informational(self, caplog, monkeypatch):
+        """Disabling automatic role provisioning should emit INFO, not WARNING."""
         monkeypatch.delenv("SLOCK_DEFAULT_ROLES", raising=False)
 
         from src.config.settings import Settings
 
-        with caplog.at_level(logging.WARNING, logger="src.config.settings"):
+        with caplog.at_level(logging.INFO, logger="src.config.settings"):
             Settings(_env_file=None)
 
-        warning_records = [
+        matching_records = [
             r for r in caplog.records
-            if r.levelno == logging.WARNING and "slock_default_roles is empty" in r.message
+            if "slock_default_roles is empty" in r.message
         ]
-        assert len(warning_records) == 1, (
-            f"Expected 1 WARNING log for empty slock_default_roles. "
+        assert len(matching_records) == 1, (
+            f"Expected 1 INFO log for empty slock_default_roles. "
             f"Records: {[r.message for r in caplog.records]}"
         )
+        assert matching_records[0].levelno == logging.INFO
 
     def test_slock_default_roles_set_via_env_no_warning(self, caplog, monkeypatch):
         """Setting SLOCK_DEFAULT_ROLES env var prevents warning log."""

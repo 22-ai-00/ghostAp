@@ -1417,10 +1417,10 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _warn_slock_default_roles_empty(self) -> "Settings":
-        """Warn if slock_default_roles is empty (no preset roles will be auto-created)."""
+    def _log_slock_default_roles_empty(self) -> "Settings":
+        """Note when optional automatic role provisioning is disabled."""
         if not self.slock_default_roles:
-            _logging.getLogger(__name__).warning(
+            _logging.getLogger(__name__).info(
                 "slock_default_roles is empty. No preset roles will be auto-created when creating new slock groups. "
                 "Configure SLOCK_DEFAULT_ROLES in .env if you want automatic role provisioning "
                 "(e.g., 'planner:claude,coder:codex,reviewer:claude,tester:codex')."
