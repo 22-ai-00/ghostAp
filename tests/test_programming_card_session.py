@@ -437,6 +437,76 @@ class TestProgrammingCardSession:
         assert "子代理 · 核查后半计划" in rendered
         assert source_id not in rendered
 
+    @pytest.mark.parametrize(
+        ("source_id", "unsafe_title", "unsafe_prefix"),
+        [
+            (
+                "123e4567-e89b-12d3-a456-426614174000",
+                "123e4567-e89b-12d3-a456-426614174000",
+                "123e4567",
+            ),
+            (
+                "call_gitlab_secret",
+                "".join(("gl", "pat-", "0123456789abcdefghij")),
+                "glpat-",
+            ),
+            (
+                "call_slack_secret",
+                "".join(("xo", "xb-", "1234567890-", "abcdefghijklmnop")),
+                "xoxb-",
+            ),
+            (
+                "opaque_provider_identifier_" + "A" * 80,
+                "opaque_provider_identifier_" + "A" * 80,
+                "opaque_provider_identifier_",
+            ),
+        ],
+    )
+    def test_subagent_heading_redacts_opaque_ids_and_provider_tokens(
+        self,
+        source_id,
+        unsafe_title,
+        unsafe_prefix,
+    ):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.render.budget import RenderBudget
+        from src.card.render.renderer import render_card
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id=source_id,
+                title=unsafe_title,
+                kind="agent",
+                status="in_progress",
+                content="",
+            ),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="完成安全核查。",
+            source_id=source_id,
+        ))
+        pcs._flush_now()
+
+        summary = pcs.session.state.metadata.subagents[0]
+        assert unsafe_prefix not in str(summary.get("label") or "")
+        assert unsafe_prefix not in str(summary.get("tool") or "")
+
+        rendered = json.dumps(
+            render_card(
+                pcs.session.state,
+                RenderBudget(),
+            )[0]._card_json,
+            ensure_ascii=False,
+        )
+        assert "子代理 ·" in rendered
+        assert unsafe_title not in rendered
+        assert source_id not in rendered
+        assert unsafe_prefix not in rendered
+
     def test_unregistered_provider_source_is_not_labeled_as_subagent(self):
         from src.acp.models import ACPEvent, ACPEventType
         from src.card.render.budget import RenderBudget

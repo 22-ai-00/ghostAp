@@ -865,11 +865,20 @@ class ProgrammingCardSession:
 
     @staticmethod
     def _extract_agent_task_label(tool_call: "ToolCallInfo") -> str:
-        return extract_tool_call_label(
+        raw_limit = ProgrammingCardSession._raw_agent_metadata_limit(
             tool_call,
-            generic_labels=_GENERIC_TASK_LABELS,
+            minimum=60,
+        )
+        return sanitize_tool_failure_detail(
+            extract_tool_call_label(
+                tool_call,
+                generic_labels=_GENERIC_TASK_LABELS,
+                fallback="子任务",
+                max_chars=raw_limit,
+            ),
             fallback="子任务",
             max_chars=60,
+            opaque_ids=(tool_call.id,),
         )
 
     @staticmethod
@@ -878,4 +887,30 @@ class ProgrammingCardSession:
 
     @staticmethod
     def _extract_agent_tool_name(tool_call: "ToolCallInfo") -> str:
-        return extract_agent_tool_name(tool_call)
+        raw_limit = ProgrammingCardSession._raw_agent_metadata_limit(
+            tool_call,
+            minimum=24,
+        )
+        return sanitize_tool_failure_detail(
+            extract_agent_tool_name(
+                tool_call,
+                max_chars=raw_limit,
+            ),
+            fallback="子代理",
+            max_chars=24,
+            opaque_ids=(tool_call.id,),
+        )
+
+    @staticmethod
+    def _raw_agent_metadata_limit(
+        tool_call: "ToolCallInfo",
+        *,
+        minimum: int,
+    ) -> int:
+        """Keep raw candidates intact until ID/credential redaction runs."""
+        return max(
+            minimum,
+            len(str(tool_call.id or "")),
+            len(str(tool_call.title or "")),
+            len(str(tool_call.content or "")),
+        )

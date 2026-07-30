@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from src.card.state.models import CardState, ContentBlock
 from src.card.text_stream import soft_join_text_fragments
-from src.card.tool_display import sanitize_tool_failure_detail
+from src.card.tool_display import (
+    is_unhelpful_display_label,
+    sanitize_tool_failure_detail,
+)
 
 _SYSTEM_TEXT_BLOCK_IDS = frozenset({
     "_error",
@@ -117,11 +120,14 @@ def _latest_subagent_label(
         raw_label = str(
             getattr(block, "source_label", "") or ""
         )
-    return sanitize_tool_failure_detail(
+    safe_label = sanitize_tool_failure_detail(
         raw_label,
         fallback="子任务",
         max_chars=60,
     )
+    if is_unhelpful_display_label(safe_label):
+        return "子任务"
+    return safe_label
 
 
 def _main_text_position(

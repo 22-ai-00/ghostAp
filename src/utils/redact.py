@@ -38,6 +38,21 @@ _AWS_KEY_RE = re.compile(r"\b(AKIA[0-9A-Z]{16})\b")
 # Pattern: OpenAI-style API keys (sk-...)
 _OPENAI_API_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b")
 
+# Pattern: GitLab personal/project/group access tokens (glpat-...)
+_GITLAB_TOKEN_RE = re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b", re.IGNORECASE)
+
+# Pattern: Slack bot/app/user tokens (xoxb-/xoxa-/xoxp-/xoxr-/xoxs-...)
+_SLACK_TOKEN_RE = re.compile(
+    r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b",
+    re.IGNORECASE,
+)
+
+# Pattern: GitHub fine/classic token families (ghp_/gho_/ghu_/ghs_/ghr_...)
+_GITHUB_TOKEN_RE = re.compile(
+    r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
+    re.IGNORECASE,
+)
+
 
 def redact_sensitive(text: str) -> str:
     """Redact sensitive information from text.
@@ -61,6 +76,9 @@ def redact_sensitive(text: str) -> str:
     result = _COOKIE_RE.sub(r"\1=<redacted>", result)
     result = _AWS_KEY_RE.sub("<redacted:aws_key>", result)
     result = _OPENAI_API_KEY_RE.sub("<redacted:api_key>", result)
+    result = _GITLAB_TOKEN_RE.sub("<redacted:gitlab_token>", result)
+    result = _SLACK_TOKEN_RE.sub("<redacted:slack_token>", result)
+    result = _GITHUB_TOKEN_RE.sub("<redacted:github_token>", result)
     result = _SECRET_ASSIGNMENT_RE.sub(r"\1=<redacted>", result)
 
     return result

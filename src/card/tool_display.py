@@ -14,6 +14,11 @@ _MAX_LABEL_CHARS = 80
 _JSON_EDGE_LINES = {"{", "}", "[", "]"}
 _AGENT_TOOL_TITLES = {"agent", "subagent", "task"}
 _OPAQUE_CALL_ID_RE = re.compile(r"(?<!\w)call_[A-Za-z0-9_-]+", re.IGNORECASE)
+_UUID_LIKE_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 _LITERAL_ESCAPE_RE = re.compile(r"""\\(?:["'nrtbfv0])""")
 _CONTROL_SEPARATOR_RE = re.compile(r"(?:\\[nrtbfv0]|[\x00-\x1f\x7f])")
 _INLINE_STRUCTURED_RE = re.compile(
@@ -264,6 +269,8 @@ def is_unhelpful_display_label(value: str) -> bool:
     if text in _JSON_EDGE_LINES:
         return True
     if _OPAQUE_CALL_ID_RE.search(text):
+        return True
+    if _UUID_LIKE_RE.fullmatch(text):
         return True
     if _LITERAL_ESCAPE_RE.search(text):
         return True
