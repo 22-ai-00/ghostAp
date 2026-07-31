@@ -4,11 +4,254 @@ Worktree dispatcher timeout 测试
 """
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import MagicMock
 
+from src.agent_session.claude_cli import SyncClaudeCLISession
 from src.worktree_engine.dispatcher import WorktreeDispatcher
-from src.worktree_engine.models import WorktreeSelectionItem, WorktreeUnit
+from src.worktree_engine.models import (
+    WorktreeSelectionItem,
+    WorktreeUnit,
+    WorktreeUnitStatus,
+)
+
+
+def test_pool_timeout_returns_within_bound_and_cancels_session():
+    """Pool timeout must not wait for a worker that ignores cancellation."""
+    prompt_started = threading.Event()
+    release_prompt = threading.Event()
+    cancel_called = threading.Event()
+    returned = threading.Event()
+    captured: dict[str, object] = {}
+
+    class BlockingSession:
+        def start(self):
+            return None
+
+        def send_prompt(self, *_args, **_kwargs):
+            prompt_started.set()
+            release_prompt.wait(timeout=5)
+            return MagicMock(text="late result", stop_reason="end_turn")
+
+        def cancel(self, *, wait=False, timeout=0):
+            del wait, timeout
+            cancel_called.set()
+            return True
+
+        def close(self):
+            return None
+
+    dispatcher = WorktreeDispatcher(session_factory=lambda **_kwargs: BlockingSession())
+    unit = WorktreeUnit(
+        unit_id="blocked",
+        provider="acp",
+        tool_name="coco",
+        worktree_path="/tmp/blocked-wt",
+        task_prompt="run forever",
+        status=WorktreeUnitStatus.PLANNED,
+    )
+
+    def _execute() -> None:
+        started_at = time.monotonic()
+        captured["units"] = dispatcher.execute_units(
+            [unit],
+            pool_timeout=0.05,
+            cancel_grace=0.05,
+        )
+        captured["elapsed"] = time.monotonic() - started_at
+        returned.set()
+
+    caller = threading.Thread(target=_execute, daemon=True)
+    caller.start()
+    assert prompt_started.wait(timeout=0.5)
+    try:
+        assert returned.wait(timeout=0.3), "execute_units waited for the blocked worker"
+        assert cancel_called.is_set()
+        assert float(captured["elapsed"]) <= 0.2
+        assert unit.status is WorktreeUnitStatus.CANCELLED
+        assert unit.cancellation_acknowledged is True
+    finally:
+        release_prompt.set()
+        caller.join(timeout=1)
+
+
+def test_cancel_ack_wait_is_bounded_when_session_cancel_hangs():
+    prompt_started = threading.Event()
+    release_prompt = threading.Event()
+    release_cancel = threading.Event()
+    returned = threading.Event()
+    captured: dict[str, object] = {}
+
+    class UnresponsiveCancelSession:
+        def start(self):
+            return None
+
+        def send_prompt(self, *_args, **_kwargs):
+            prompt_started.set()
+            release_prompt.wait(timeout=5)
+            return MagicMock(text="late result", stop_reason="end_turn")
+
+        def cancel(self, *, wait=False, timeout=0):
+            del wait, timeout
+            release_cancel.wait(timeout=5)
+
+        def close(self):
+            return None
+
+    dispatcher = WorktreeDispatcher(
+        session_factory=lambda **_kwargs: UnresponsiveCancelSession()
+    )
+    unit = WorktreeUnit(
+        unit_id="hung-cancel",
+        provider="acp",
+        tool_name="coco",
+        worktree_path="/tmp/hung-cancel-wt",
+        task_prompt="run forever",
+        status=WorktreeUnitStatus.PLANNED,
+    )
+
+    def _execute() -> None:
+        started_at = time.monotonic()
+        dispatcher.execute_units(
+            [unit],
+            pool_timeout=0.05,
+            cancel_grace=0.05,
+        )
+        captured["elapsed"] = time.monotonic() - started_at
+        returned.set()
+
+    caller = threading.Thread(target=_execute, daemon=True)
+    caller.start()
+    assert prompt_started.wait(timeout=0.5)
+    try:
+        assert returned.wait(timeout=0.3), "cancel acknowledgment exceeded grace"
+        assert float(captured["elapsed"]) <= 0.2
+        assert unit.status is WorktreeUnitStatus.CANCELLED
+        assert unit.cancellation_acknowledged is False
+        assert unit.metadata["cancellation_error"] == "cancel_ack_timeout"
+    finally:
+        release_cancel.set()
+        release_prompt.set()
+        caller.join(timeout=1)
+
+
+def test_pool_timeout_cancels_every_bound_session():
+    release_prompt = threading.Event()
+    both_started = threading.Barrier(3)
+    cancel_calls: list[str] = []
+    returned = threading.Event()
+
+    class BoundSession:
+        def __init__(self, name: str):
+            self.name = name
+
+        def start(self):
+            return None
+
+        def send_prompt(self, *_args, **_kwargs):
+            both_started.wait(timeout=1)
+            release_prompt.wait(timeout=5)
+            return MagicMock(text="late result", stop_reason="end_turn")
+
+        def cancel(self, *, wait=False, timeout=0):
+            del wait, timeout
+            cancel_calls.append(self.name)
+            return True
+
+        def close(self):
+            return None
+
+    created = iter([BoundSession("first"), BoundSession("second")])
+    dispatcher = WorktreeDispatcher(
+        session_factory=lambda **_kwargs: next(created)
+    )
+    units = [
+        WorktreeUnit(
+            unit_id=f"bound-{index}",
+            provider="acp",
+            tool_name="coco",
+            worktree_path=f"/tmp/bound-{index}",
+            task_prompt="run forever",
+            status=WorktreeUnitStatus.PLANNED,
+        )
+        for index in range(2)
+    ]
+
+    caller = threading.Thread(
+        target=lambda: (
+            dispatcher.execute_units(
+                units,
+                pool_timeout=0.05,
+                cancel_grace=0.05,
+            ),
+            returned.set(),
+        ),
+        daemon=True,
+    )
+    caller.start()
+    both_started.wait(timeout=1)
+    try:
+        assert returned.wait(timeout=0.3)
+        assert sorted(cancel_calls) == ["first", "second"]
+        assert all(unit.status is WorktreeUnitStatus.CANCELLED for unit in units)
+    finally:
+        release_prompt.set()
+        caller.join(timeout=1)
+
+
+def test_legacy_cancel_none_is_requested_but_not_acknowledged():
+    prompt_started = threading.Event()
+    release_prompt = threading.Event()
+    returned = threading.Event()
+
+    class LegacyCancelSession(SyncClaudeCLISession):
+        def __init__(self):
+            super().__init__(cwd="/tmp/legacy-cancel-wt")
+
+        def start(self):
+            return None
+
+        def send_prompt(self, *_args, **_kwargs):
+            prompt_started.set()
+            release_prompt.wait(timeout=5)
+            return MagicMock(text="late result", stop_reason="end_turn")
+
+        def close(self):
+            return None
+
+    unit = WorktreeUnit(
+        unit_id="legacy-cancel",
+        provider="cli",
+        tool_name="claude",
+        worktree_path="/tmp/legacy-cancel-wt",
+        task_prompt="run forever",
+        status=WorktreeUnitStatus.PLANNED,
+    )
+    dispatcher = WorktreeDispatcher(
+        session_factory=lambda **_kwargs: LegacyCancelSession()
+    )
+    caller = threading.Thread(
+        target=lambda: (
+            dispatcher.execute_units(
+                [unit],
+                pool_timeout=0.05,
+                cancel_grace=0.05,
+            ),
+            returned.set(),
+        ),
+        daemon=True,
+    )
+    caller.start()
+    assert prompt_started.wait(timeout=0.5)
+    try:
+        assert returned.wait(timeout=0.3)
+        assert unit.cancellation_requested is True
+        assert unit.cancellation_acknowledged is False
+        assert unit.metadata["cancellation_error"] == "cancel_ack_unknown"
+    finally:
+        release_prompt.set()
+        caller.join(timeout=1)
 
 
 def test_worktree_dispatcher_pool_timeout():
@@ -177,7 +420,7 @@ def test_worktree_dispatcher_fast_path():
 
 
 def test_worktree_dispatcher_pool_timeout_status_not_overwritten():
-    """测试 pool timeout 时 _run_single_unit 不会覆盖 failed 状态"""
+    """测试 pool timeout 后迟到 worker 不会覆盖 cancelled 状态。"""
     unit = WorktreeUnit(unit_id="test", worktree_path="/tmp/test")
     tools = [
         WorktreeSelectionItem(provider="acp", tool_name="coco", display_name="Coco"),
@@ -206,5 +449,5 @@ def test_worktree_dispatcher_pool_timeout_status_not_overwritten():
     # 设置非常短的 pool timeout
     executed = dispatcher.execute_units(planned, pool_timeout=0.2)
 
-    assert executed[0].status == "failed"
-    # 即使 _run_single_unit 可能被调用，状态守卫会防止覆盖
+    assert executed[0].status == "cancelled"
+    # 即使 _run_single_unit 迟到抛错，generation fence 也会保留取消终态。

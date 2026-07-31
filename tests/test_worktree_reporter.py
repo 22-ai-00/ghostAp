@@ -2,10 +2,50 @@ from unittest.mock import MagicMock
 
 from src.project.context import ProjectContext
 from src.worktree_engine.manager import WorktreeManager
-from src.worktree_engine.models import WorktreeSelectionItem, WorktreeUnit
+from src.worktree_engine.models import (
+    WorktreeJourneyStatus,
+    WorktreeSelectionItem,
+    WorktreeUnit,
+)
 from src.worktree_engine.reporter import WorktreeReporter
-from src.worktree_engine.review_adapter import WorktreeReviewAdapter
+from src.worktree_engine.review_adapter import (
+    WorktreeReviewAdapter,
+    WorktreeReviewOutcome,
+    WorktreeReviewVerdict,
+)
 from src.worktree_engine.selection import WorktreeToolOption
+
+
+def _passing_review_adapter() -> MagicMock:
+    adapter = MagicMock()
+    adapter.plan_roles.side_effect = WorktreeReviewAdapter().plan_roles
+    adapter.review_units.return_value = WorktreeReviewOutcome(
+        verdict=WorktreeReviewVerdict.PASS,
+        summary="review passed",
+        findings=[
+            {
+                "severity": "observation",
+                "message": "verified",
+                "evidence": "targeted tests passed",
+            }
+        ],
+        tests=[
+            {
+                "command": "uv run pytest -q",
+                "passed": True,
+                "verified": True,
+                "evidence": "passed",
+            }
+        ],
+        observations=[
+            {
+                "severity": "observation",
+                "message": "verified",
+                "evidence": "targeted tests passed",
+            }
+        ],
+    )
+    return adapter
 
 
 def test_reporter_builds_unit_summary_and_merge_notes():
@@ -42,6 +82,8 @@ def test_reporter_builds_unit_summary_and_merge_notes():
             has_changes=False,
         ),
     ]
+    state.journey.status = WorktreeJourneyStatus.COMPLETED
+    state.review_outcome = {"verdict": "PASS", "passed": True}
 
     reporter = WorktreeReporter()
     refreshed = reporter.refresh_state(state)
@@ -61,6 +103,7 @@ def test_execute_goal_refreshes_summary_lines_and_merge_notes(tmp_path):
     project_root.mkdir()
     project = ProjectContext(project_id="p2", project_name="P2", root_path=str(project_root))
     manager = WorktreeManager(project_manager=None)
+    manager._review_adapter = _passing_review_adapter()
 
     manager.start_selection(project)
     manager.select_tool(project, WorktreeToolOption(provider="acp", tool_name="coco", display_name="Coco"))
@@ -225,31 +268,42 @@ def test_review_adapter_derives_programming_roles_from_goal_and_diff():
     assert {"architect", "tester", "integration", "product"} <= role_ids
 
 
-def test_review_adapter_downgrades_blocker_without_evidence():
+def test_review_adapter_keeps_blocker_without_evidence_fail_closed():
     adapter = WorktreeReviewAdapter()
 
     outcome = adapter.aggregate([
         {"role_id": "tester", "severity": "blocker", "evidence": "", "message": "bad"}
     ])
 
-    assert outcome.blockers == []
-    assert outcome.observations
+    assert outcome.verdict is WorktreeReviewVerdict.FAIL
+    assert outcome.blockers
+    assert outcome.passed is False
 
 
 def test_execute_goal_records_worktree_review_metadata():
     project = ProjectContext("p-review", "Review", "/tmp/review")
     manager = WorktreeManager(project_manager=None)
     state = manager.get_state(project)
-    state.units = [WorktreeUnit(unit_id="u1", worktree_path="/tmp/review-wt", has_changes=True)]
+    state.units = [
+        WorktreeUnit(
+            unit_id="u1",
+            worktree_path="/tmp/review-wt",
+            has_changes=True,
+        )
+    ]
     state.selection.selected_items = [
         WorktreeSelectionItem(provider="acp", tool_name="coco", display_name="Coco")
     ]
     manager._dispatcher = MagicMock()
     manager._dispatcher.plan_user_goal.side_effect = lambda goal, units, items: units
-    manager._dispatcher.execute_units.side_effect = lambda units, **kwargs: units
+    manager._dispatcher.execute_units.side_effect = lambda units, **kwargs: [
+        setattr(unit, "status", "completed") or unit for unit in units
+    ]
+    manager._review_adapter = _passing_review_adapter()
 
     state = manager.execute_goal(project, "修复 auth token 检查")
 
     role_ids = {role["role_id"] for role in state.review_plan["roles"]}
     assert "security" in role_ids
-    assert state.review_outcome == {"blockers": [], "observations": []}
+    assert state.review_outcome["verdict"] == "PASS"
+    assert state.review_outcome["passed"] is True

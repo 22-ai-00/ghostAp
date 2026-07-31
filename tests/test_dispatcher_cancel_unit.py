@@ -4,7 +4,10 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from src.worktree_engine.dispatcher import WorktreeDispatcher
 from src.worktree_engine.models import WorktreeUnit, WorktreeUnitStatus
@@ -205,8 +208,8 @@ class TestStopReasonMapping:
         assert len(results) == 1
         assert results[0].status == WorktreeUnitStatus.FAILED
 
-    def test_stop_reason_cancelled_maps_to_failed(self, tmp_path):
-        """send_prompt returning stop_reason='cancelled' → unit FAILED."""
+    def test_stop_reason_cancelled_maps_to_cancelled(self, tmp_path):
+        """send_prompt returning stop_reason='cancelled' preserves cancellation truth."""
         unit = _make_unit(tmp_path, 0)
 
         class CancelledSession:
@@ -223,6 +226,62 @@ class TestStopReasonMapping:
         results = dispatcher.execute_units([unit], pool_timeout=10)
 
         assert len(results) == 1
+        assert results[0].status == WorktreeUnitStatus.CANCELLED
+
+    @pytest.mark.parametrize("stop_reason", ["", "unknown", "timeout", "max_tokens"])
+    def test_unknown_or_incomplete_stop_reason_fails_closed(
+        self,
+        tmp_path,
+        stop_reason,
+    ):
+        unit = _make_unit(tmp_path, 0)
+
+        class IncompleteSession:
+            def __init__(self, **kw):
+                pass
+
+            def start(self, startup_timeout=60):
+                pass
+
+            def send_prompt(self, text, on_event=None, timeout=None):
+                return FakePromptResult(stop_reason=stop_reason, text="partial")
+
+            def close(self):
+                pass
+
+        results = WorktreeDispatcher(
+            session_factory=IncompleteSession
+        ).execute_units([unit], pool_timeout=10)
+
+        assert results[0].status == WorktreeUnitStatus.FAILED
+
+    def test_end_turn_with_pending_plan_fails_closed(self, tmp_path):
+        unit = _make_unit(tmp_path, 0)
+
+        class PendingPlanSession:
+            def __init__(self, **kw):
+                pass
+
+            def start(self, startup_timeout=60):
+                pass
+
+            def send_prompt(self, text, on_event=None, timeout=None):
+                return SimpleNamespace(
+                    stop_reason="end_turn",
+                    text="partial",
+                    plan=SimpleNamespace(
+                        entries=[SimpleNamespace(status="pending")]
+                    ),
+                    tool_calls=[],
+                )
+
+            def close(self):
+                pass
+
+        results = WorktreeDispatcher(
+            session_factory=PendingPlanSession
+        ).execute_units([unit], pool_timeout=10)
+
         assert results[0].status == WorktreeUnitStatus.FAILED
 
     def test_stop_reason_end_turn_maps_to_completed(self, tmp_path):
@@ -234,6 +293,50 @@ class TestStopReasonMapping:
 
         assert len(results) == 1
         assert results[0].status == WorktreeUnitStatus.COMPLETED
+
+    def test_completed_unit_records_structured_command_provenance(self, tmp_path):
+        unit = _make_unit(tmp_path, 0)
+
+        class ProvenanceSession:
+            def __init__(self, **kw):
+                pass
+
+            def start(self, startup_timeout=60):
+                pass
+
+            def send_prompt(self, text, on_event=None, timeout=None):
+                return SimpleNamespace(
+                    stop_reason="end_turn",
+                    text="verified",
+                    plan=None,
+                    tool_calls=[],
+                    tool_results=[
+                        {
+                            "kind": "execute",
+                            "data": {
+                                "command": "uv run pytest -q",
+                                "exit_code": 0,
+                                "stdout": "12 passed",
+                            },
+                        }
+                    ],
+                )
+
+            def close(self):
+                pass
+
+        result = WorktreeDispatcher(
+            session_factory=ProvenanceSession
+        ).execute_units([unit], pool_timeout=10)[0]
+
+        assert result.metadata["test_provenance"] == [
+            {
+                "source": "worktree_dispatcher",
+                "command": "uv run pytest -q",
+                "exit_code": 0,
+                "evidence": "12 passed",
+            }
+        ]
 
 
 class TestTTADKProcKillEscalation:
@@ -305,7 +408,7 @@ class TestCancelUnitSkipsCompleted:
         assert not unit._cancel_event.is_set()
 
     def test_cancel_unit_does_not_overwrite_failed(self, tmp_path):
-        """_cancel_unit does not skip FAILED units (only COMPLETED is protected)."""
+        """A timeout racing a recorded failure must preserve the first terminal fact."""
         unit = _make_unit(tmp_path, 0)
         unit.status = WorktreeUnitStatus.FAILED
         unit.error = "original error"
@@ -313,6 +416,6 @@ class TestCancelUnitSkipsCompleted:
         dispatcher = WorktreeDispatcher(session_factory=FastSession)
         dispatcher._cancel_unit(unit, "pool_timeout")
 
-        # FAILED units ARE overwritten by cancel (only COMPLETED is protected)
-        assert unit.status == WorktreeUnitStatus.CANCELLED
-        assert unit._cancel_event.is_set()
+        assert unit.status == WorktreeUnitStatus.FAILED
+        assert unit.error == "original error"
+        assert not unit._cancel_event.is_set()

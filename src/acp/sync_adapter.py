@@ -2001,7 +2001,7 @@ class SyncACPSession:
         """Return the currently installed tool filter, or None."""
         return getattr(self, "_tool_filter", None)
 
-    def cancel(self, wait: bool = False, timeout: float = 2.0) -> None:
+    def cancel(self, wait: bool = False, timeout: float = 2.0) -> bool | None:
         """Cancel current prompt.
 
         When wait=True, block (up to `timeout` s) until the agent has acknowledged
@@ -2010,17 +2010,19 @@ class SyncACPSession:
         rejection because the session is still mid-cancel.
         """
         if not (self._acp_session and self._loop):
-            return
+            return False
         fut = asyncio.run_coroutine_threadsafe(
             self._acp_session.cancel(),
             self._loop,
         )
         if not wait:
-            return
+            return None
         try:
             fut.result(timeout=timeout)
+            return True
         except (TimeoutError, OSError, RuntimeError) as e:
             logger.debug("[ACP] cancel wait skipped: %s", get_error_detail(e))
+            return False
 
     def close(self) -> None:
         """Close session and stop event loop."""

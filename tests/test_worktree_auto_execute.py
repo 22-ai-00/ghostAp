@@ -26,6 +26,11 @@ from src.worktree_engine.models import (
     WorktreeUnit,
     transition_journey_state,
 )
+from src.worktree_engine.review_adapter import (
+    WorktreeReviewOutcome,
+    WorktreeReviewPlan,
+    WorktreeReviewVerdict,
+)
 from src.worktree_engine.selection import WorktreeToolOption
 
 # ---------------------------------------------------------------------------
@@ -648,7 +653,34 @@ def test_execute_goal_emits_execution_events_on_success_and_failure():
     # plan_user_goal 直接返回现有 units
     mgr._dispatcher.plan_user_goal.side_effect = lambda goal, units, items: units
     # execute_units 在第一次调用成功返回，在第二次调用抛出异常
-    mgr._dispatcher.execute_units.side_effect = [state.units, Exception("boom")]  # type: ignore[list-item]
+    def _successful_dispatch(units, **_kwargs):
+        for unit in units:
+            unit.status = "completed"
+        return units
+
+    mgr._dispatcher.execute_units.side_effect = [_successful_dispatch(state.units), Exception("boom")]
+
+    mgr._review_adapter = MagicMock()
+    mgr._review_adapter.plan_roles.return_value = WorktreeReviewPlan()
+    mgr._review_adapter.review_units.return_value = WorktreeReviewOutcome(
+        verdict=WorktreeReviewVerdict.PASS,
+        summary="verified",
+        findings=[
+            {
+                "severity": "observation",
+                "message": "verified",
+                "evidence": "targeted test passed",
+            }
+        ],
+        tests=[
+            {
+                "command": "fake test",
+                "passed": True,
+                "verified": True,
+                "evidence": "passed",
+            }
+        ],
+    )
 
     mgr._reporter = MagicMock()
     mgr._reporter.refresh_state.side_effect = lambda s: s

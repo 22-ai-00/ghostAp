@@ -329,6 +329,10 @@ class WorktreeUnit:
     has_changes: bool = False
     summary: str = ""
     error: str = ""
+    generation: int = 0
+    stop_reason: str = ""
+    cancellation_requested: bool = False
+    cancellation_acknowledged: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
     # Per-unit cancellation signal: set by pool-timeout to notify the worker thread.
     # Provides a memory-barrier-backed check (threading.Event is thread-safe) instead
@@ -352,6 +356,10 @@ class WorktreeUnit:
             "has_changes": self.has_changes,
             "summary": self.summary,
             "error": self.error,
+            "generation": int(self.generation),
+            "stop_reason": self.stop_reason,
+            "cancellation_requested": bool(self.cancellation_requested),
+            "cancellation_acknowledged": bool(self.cancellation_acknowledged),
             "metadata": dict(self.metadata),
             "cancelled": (self.status == WorktreeUnitStatus.CANCELLED),
         }
@@ -384,6 +392,14 @@ class WorktreeUnit:
             has_changes=bool(data.get("has_changes", False)),
             summary=_clean_str(data.get("summary")),
             error=_clean_str(data.get("error")),
+            generation=_clean_int(data.get("generation")),
+            stop_reason=_clean_str(data.get("stop_reason")),
+            cancellation_requested=bool(
+                data.get("cancellation_requested", False)
+            ),
+            cancellation_acknowledged=bool(
+                data.get("cancellation_acknowledged", False)
+            ),
             metadata=dict(data.get("metadata") or {}),
         )
         return unit

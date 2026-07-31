@@ -17,6 +17,41 @@ from src.acp import sync_adapter as sa
 from src.acp.models import PromptResult
 
 
+def _cancel_test_session() -> sa.SyncACPSession:
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._acp_session = SimpleNamespace(cancel=lambda: asyncio.sleep(0))
+    session._loop = object()
+    return session
+
+
+def test_cancel_wait_returns_explicit_transport_ack(monkeypatch):
+    session = _cancel_test_session()
+
+    def submit(coro, _loop):
+        coro.close()
+        future: concurrent.futures.Future[None] = concurrent.futures.Future()
+        future.set_result(None)
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+
+    assert session.cancel(wait=True, timeout=0.1) is True
+
+
+def test_cancel_wait_timeout_returns_not_acknowledged(monkeypatch):
+    session = _cancel_test_session()
+
+    def submit(coro, _loop):
+        coro.close()
+        future: concurrent.futures.Future[None] = concurrent.futures.Future()
+        future.set_exception(TimeoutError("cancel ack timeout"))
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+
+    assert session.cancel(wait=True, timeout=0.1) is False
+
+
 def test_send_prompt_rejects_concurrent_threads_before_replacing_active_future(
     tmp_path: Path,
     monkeypatch,

@@ -4,7 +4,13 @@ import logging
 
 from ..utils.constants import STATUS_DISPLAY_MAP
 from ..utils.ui_text import SPEC_UI_TEXT
-from .models import WorktreeInfo, WorktreeRuntimeState, WorktreeUnit, WorktreeUnitStatus
+from .models import (
+    WorktreeInfo,
+    WorktreeJourneyStatus,
+    WorktreeRuntimeState,
+    WorktreeUnit,
+    WorktreeUnitStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +26,14 @@ class WorktreeReporter:
     def refresh_state(self, state: WorktreeRuntimeState) -> WorktreeRuntimeState:
         state.summary_lines = self.build_unit_summary_lines(state.units)
         state.merge_notes = self.build_merge_notes(state.units, state.base_branch)
-        # Allow merge when at least one unit completed (partial success is mergeable)
-        state.merge_entry_ready = bool(state.units) and any(
+        all_required_completed = bool(state.units) and all(
             unit.status == WorktreeUnitStatus.COMPLETED for unit in state.units
+        )
+        review_passed = bool((state.review_outcome or {}).get("passed"))
+        state.merge_entry_ready = (
+            all_required_completed
+            and review_passed
+            and state.journey.status == WorktreeJourneyStatus.COMPLETED
         )
         if state.last_error:
             state.summary_lines.insert(0, f"- 总体错误：{state.last_error}")
@@ -80,10 +91,20 @@ class WorktreeReporter:
         for unit in units:
             display_name = WorktreeReporter._get_unit_display_name(unit)
             branch = unit.branch_name or "(未创建)"
+            ready = unit.status == WorktreeUnitStatus.COMPLETED
+            conflict_disclosure = (
+                "冲突时自动优先采用 Worktree 分支变更"
+                if ready
+                else "单元未完成，禁止合并"
+            )
             notes.append({
                 "branch": branch,
-                "status": "ready",
-                "summary": f"`{display_name}` → 分支 `{branch}` → 建议合并回 `{target}`",
+                "status": "ready" if ready else "blocked",
+                "conflict_policy": "worktree_branch_wins",
+                "summary": (
+                    f"`{display_name}` → 分支 `{branch}` → 建议合并回 `{target}`；"
+                    f"{conflict_disclosure}"
+                ),
             })
         return notes
 

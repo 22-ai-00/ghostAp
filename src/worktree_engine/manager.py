@@ -387,25 +387,75 @@ class WorktreeManager(BaseEngineManager):
             state.units = self._dispatcher.execute_units(
                 state.units, timeout=timeout, on_unit_update=on_unit_update,
             )
-            state.last_error = ""
-            changed_files = [
-                str(unit.worktree_path or unit.branch_name or unit.unit_id)
-                for unit in state.units
-                if getattr(unit, "has_changes", False)
-            ]
-            review_plan = self._review_adapter.plan_roles(
-                goal=state.journey.goal,
-                changed_files=changed_files,
-            )
-            state.review_plan = review_plan.to_dict()
-            state.review_outcome = self._review_adapter.aggregate([]).to_dict()
-            self.apply_journey_event(state, event="execution_succeeded")
+            self._finalize_execution_truth(state)
         except Exception as exc:
             from ..utils.errors import get_error_detail
 
             state.last_error = get_error_detail(exc)
             self.apply_journey_event(state, event="execution_failed", error=state.last_error)
         return self._reporter.refresh_state(state)
+
+    @staticmethod
+    def _incomplete_required_units(
+        state: WorktreeRuntimeState,
+    ) -> list:
+        return [
+            unit
+            for unit in state.units
+            if unit.status != WorktreeUnitStatus.COMPLETED
+        ]
+
+    def _finalize_execution_truth(self, state: WorktreeRuntimeState) -> None:
+        incomplete = self._incomplete_required_units(state)
+        if incomplete:
+            detail = ", ".join(
+                f"{unit.unit_id}:{getattr(unit.status, 'value', unit.status)}"
+                for unit in incomplete
+            )
+            state.last_error = f"必要 Worktree 单元未成功完成: {detail}"
+            state.review_plan = {}
+            state.review_outcome = {
+                "verdict": "INCONCLUSIVE",
+                "passed": False,
+                "error_code": "required_units_incomplete",
+                "unit_outcomes": [],
+            }
+            self.apply_journey_event(
+                state,
+                event="execution_failed",
+                error=state.last_error,
+            )
+            return
+
+        changed_files = [
+            str(unit.worktree_path or unit.branch_name or unit.unit_id)
+            for unit in state.units
+            if getattr(unit, "has_changes", False)
+        ]
+        review_plan = self._review_adapter.plan_roles(
+            goal=state.journey.goal,
+            changed_files=changed_files,
+        )
+        state.review_plan = review_plan.to_dict()
+        review_outcome = self._review_adapter.review_units(
+            goal=state.journey.goal,
+            units=state.units,
+            base_branch=state.base_branch or None,
+        )
+        state.review_outcome = review_outcome.to_dict()
+        if not review_outcome.passed:
+            verdict = getattr(review_outcome.verdict, "value", review_outcome.verdict)
+            reason = review_outcome.error_code or str(verdict or "inconclusive")
+            state.last_error = f"Worktree 独立评审未通过: {reason}"
+            self.apply_journey_event(
+                state,
+                event="execution_failed",
+                error=state.last_error,
+            )
+            return
+
+        state.last_error = ""
+        self.apply_journey_event(state, event="execution_succeeded")
 
     # ------------------------------------------------------------------
     # Retry failed units
@@ -455,14 +505,29 @@ class WorktreeManager(BaseEngineManager):
         )
 
         # Execute only the re-planned (previously-failed) units
+        self.apply_journey_event(
+            state,
+            event="goal_created",
+            goal=state.journey.goal,
+        )
+        self.apply_journey_event(
+            state,
+            event="execution_started",
+            goal=state.journey.goal,
+        )
         try:
             self._dispatcher.execute_units(
                 failed_units, timeout=timeout, on_unit_update=on_unit_update,
             )
-            state.last_error = ""
+            self._finalize_execution_truth(state)
         except Exception as exc:
             from ..utils.errors import get_error_detail
             state.last_error = get_error_detail(exc)
+            self.apply_journey_event(
+                state,
+                event="execution_failed",
+                error=state.last_error,
+            )
 
         return self._reporter.refresh_state(state)
 
@@ -480,6 +545,29 @@ class WorktreeManager(BaseEngineManager):
         if not state.units or not state.base_branch:
             state.last_error = "没有可合并的 worktree 或基础分支未设置"
             return self._reporter.refresh_state(state), []
+
+        review_passed = bool((state.review_outcome or {}).get("passed"))
+        all_required_completed = not self._incomplete_required_units(state)
+        terminal_completed = state.journey.status == WorktreeJourneyStatus.COMPLETED
+        if not (
+            state.merge_entry_ready
+            and review_passed
+            and all_required_completed
+            and terminal_completed
+        ):
+            state.merge_entry_ready = False
+            state.last_error = "Worktree 终态或独立评审未满足，已阻止自动合并"
+            blocked_results = [
+                {
+                    "display_name": unit.display_name,
+                    "branch": unit.branch_name,
+                    "branch_name": unit.branch_name,
+                    "success": False,
+                    "detail": state.last_error,
+                }
+                for unit in state.units
+            ]
+            return self._reporter.refresh_state(state), blocked_results
 
         merge_results: list[dict] = []
         for unit in state.units:

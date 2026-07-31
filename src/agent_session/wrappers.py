@@ -99,9 +99,12 @@ class RateLimitAwareSession:
     def load_local_history(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict]:
         return self._inner.load_local_history(session_id=session_id, limit=limit)
 
-    def cancel(self) -> None:
+    def cancel(self, wait: bool = False, timeout: float = 2.0) -> bool | None:
         self._cancel_event.set()
-        self._inner.cancel()
+        try:
+            return self._inner.cancel(wait=wait, timeout=timeout)
+        except TypeError:
+            return self._inner.cancel()
 
     def close(self) -> None:
         self._inner.close()
@@ -305,9 +308,12 @@ class ModelFailureAwareSession:
     def load_local_history(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict]:
         return self._inner.load_local_history(session_id=session_id, limit=limit)
 
-    def cancel(self) -> None:
+    def cancel(self, wait: bool = False, timeout: float = 2.0) -> bool | None:
         self._cancel_event.set()
-        self._inner.cancel()
+        try:
+            return self._inner.cancel(wait=wait, timeout=timeout)
+        except TypeError:
+            return self._inner.cancel()
 
     def close(self) -> None:
         self._inner.close()

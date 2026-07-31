@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING, Callable, Iterable, Optional
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Optional
 
+from ..acp.outcome import PromptOutcome, classify_prompt_result
 from ..config import get_settings
 from ..ttadk.models import is_invalid_model_error
 from ..utils.callbacks import safe_invoke
@@ -17,6 +20,32 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..agent_session import SyncSession
+
+
+DEFAULT_CANCEL_GRACE_SECONDS = 2.0
+
+
+@dataclass
+class UnitExecutionControl:
+    """Thread-safe cancellation binding for one Worktree unit generation."""
+
+    generation: int
+    cancel_event: threading.Event
+    cancel_done: threading.Event = field(default_factory=threading.Event)
+    cancel_requested: threading.Event = field(default_factory=threading.Event)
+    cancel_ack: threading.Event = field(default_factory=threading.Event)
+    cancel_error: str = ""
+    terminal_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _session: Any = field(default=None, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def bind_session(self, session: Any) -> None:
+        with self._lock:
+            self._session = session
+
+    def bound_session(self) -> Any:
+        with self._lock:
+            return self._session
 
 
 def _detect_worktree_changes(worktree_path: str) -> bool:
@@ -33,6 +62,41 @@ def _detect_worktree_changes(worktree_path: str) -> bool:
         return bool((result.stdout or "").strip())
     except Exception:
         return False
+
+
+def _command_provenance(result: object) -> list[dict[str, Any]]:
+    """Extract structured command facts emitted by the execution transport."""
+    provenance: list[dict[str, Any]] = []
+    for item in getattr(result, "tool_results", None) or ():
+        if not isinstance(item, dict) or item.get("kind") != "execute":
+            continue
+        data = item.get("data") if isinstance(item.get("data"), dict) else {}
+        command = str(data.get("command") or "").strip()
+        if not command:
+            continue
+        raw_exit_code = data.get("exit_code")
+        if isinstance(raw_exit_code, bool):
+            exit_code = None
+        else:
+            try:
+                exit_code = int(raw_exit_code)
+            except (TypeError, ValueError):
+                exit_code = None
+        output = str(
+            data.get("output")
+            or data.get("stdout")
+            or data.get("stderr")
+            or ""
+        ).strip()
+        provenance.append(
+            {
+                "source": "worktree_dispatcher",
+                "command": command,
+                "exit_code": exit_code,
+                "evidence": output[:4_000],
+            }
+        )
+    return provenance
 
 
 class WorktreeDispatcher:
@@ -130,6 +194,7 @@ class WorktreeDispatcher:
         unit: WorktreeUnit,
         reason: str,
         *,
+        generation: Optional[int] = None,
         on_unit_update: Optional[Callable[[WorktreeUnit], None]] = None,
     ) -> None:
         """Mark a unit as cancelled (e.g. pool-level timeout).
@@ -138,14 +203,125 @@ class WorktreeDispatcher:
         result.  Sets _cancel_event *before* mutating status so that the worker
         thread can observe the signal via a memory-barrier-backed Event check.
         """
-        if unit.status == WorktreeUnitStatus.COMPLETED:
-            return  # unit finished before cancel could take effect — keep result
+        if generation is not None and unit.generation != generation:
+            return
+        if unit.status in {
+            WorktreeUnitStatus.COMPLETED,
+            WorktreeUnitStatus.FAILED,
+            WorktreeUnitStatus.CANCELLED,
+        }:
+            return
         unit._cancel_event.set()
-        unit.status = WorktreeUnitStatus.CANCELLED  # relies on GIL for atomic ref-write
-        unit.error = reason  # keeps raw reason code for programmatic use
-        unit.summary = REASON_DISPLAY_MAP.get(reason, reason)  # human-friendly display text
+        unit.status = WorktreeUnitStatus.CANCELLED
+        unit.error = reason
+        unit.stop_reason = reason
+        unit.cancellation_requested = False
+        unit.cancellation_acknowledged = False
+        unit.summary = REASON_DISPLAY_MAP.get(reason, reason)
         logger.warning("[Worktree] 单元取消: unit=%s, reason=%s", unit.unit_id, reason)
         safe_invoke(on_unit_update, unit, label="on_unit_update")
+
+    @staticmethod
+    def _invoke_session_cancel(
+        control: UnitExecutionControl,
+        *,
+        timeout: float,
+    ) -> None:
+        """Invoke the bound session cancel API and record its acknowledgment."""
+        session = control.bound_session()
+        if session is None:
+            control.cancel_error = "session_not_bound"
+            control.cancel_done.set()
+            return
+        try:
+            cancel = getattr(session, "cancel")
+            control.cancel_requested.set()
+            try:
+                result = cancel(wait=True, timeout=max(0.0, timeout))
+            except TypeError:
+                result = cancel()
+            acknowledged = result is True or (
+                getattr(result, "acknowledged", None) is True
+            )
+            if acknowledged:
+                control.cancel_ack.set()
+            else:
+                control.cancel_error = (
+                    "cancel_not_acknowledged"
+                    if result is False
+                    else "cancel_ack_unknown"
+                )
+        except Exception as exc:
+            control.cancel_error = get_error_detail(exc)
+            logger.warning(
+                "[Worktree] session cancel 未确认: generation=%s error=%s",
+                control.generation,
+                control.cancel_error,
+            )
+        finally:
+            control.cancel_done.set()
+
+    def _cancel_active_futures(
+        self,
+        future_map: dict[Future, tuple[WorktreeUnit, UnitExecutionControl]],
+        active_futures: set[Future],
+        *,
+        cancel_grace: float,
+        on_unit_update: Optional[Callable[[WorktreeUnit], None]],
+    ) -> None:
+        controls: list[tuple[WorktreeUnit, UnitExecutionControl]] = []
+        for future in active_futures:
+            unit, control = future_map[future]
+            with control.terminal_lock:
+                if unit.generation != control.generation or unit.status in {
+                    WorktreeUnitStatus.COMPLETED,
+                    WorktreeUnitStatus.FAILED,
+                    WorktreeUnitStatus.CANCELLED,
+                }:
+                    continue
+                self._cancel_unit(
+                    unit,
+                    "pool_timeout",
+                    generation=control.generation,
+                    on_unit_update=None,
+                )
+            future.cancel()
+            controls.append((unit, control))
+
+        grace = max(0.0, float(cancel_grace))
+        deadline = time.monotonic() + grace
+        for _unit, control in controls:
+            cancel_thread = threading.Thread(
+                target=self._invoke_session_cancel,
+                kwargs={"control": control, "timeout": grace},
+                name=f"wt-cancel-{control.generation}",
+                daemon=True,
+            )
+            cancel_thread.start()
+
+        for unit, control in controls:
+            remaining = max(0.0, deadline - time.monotonic())
+            control.cancel_done.wait(timeout=remaining)
+            if unit.generation != control.generation:
+                continue
+            requested = control.cancel_requested.is_set()
+            acknowledged = control.cancel_ack.is_set()
+            unit.cancellation_requested = requested
+            unit.cancellation_acknowledged = acknowledged
+            unit.metadata["cancellation_requested"] = requested
+            unit.metadata["cancellation_acknowledged"] = acknowledged
+            if control.cancel_error:
+                unit.metadata["cancellation_error"] = control.cancel_error
+            elif not control.cancel_done.is_set():
+                unit.metadata["cancellation_error"] = "cancel_ack_timeout"
+            if on_unit_update is not None:
+                threading.Thread(
+                    target=safe_invoke,
+                    args=(on_unit_update, unit),
+                    kwargs={"label": "on_unit_update"},
+                    name=f"wt-cancel-notify-{control.generation}",
+                    daemon=True,
+                ).start()
 
     def execute_units(
         self,
@@ -155,6 +331,7 @@ class WorktreeDispatcher:
         max_workers: Optional[int] = None,
         on_unit_update: Optional[Callable[[WorktreeUnit], None]] = None,
         pool_timeout: Optional[int] = None,
+        cancel_grace: float = DEFAULT_CANCEL_GRACE_SECONDS,
     ) -> list[WorktreeUnit]:
         planned_units = list(units)
         if not planned_units:
@@ -165,32 +342,72 @@ class WorktreeDispatcher:
             pool_timeout = getattr(settings, "worktree_pool_timeout", 600)
 
         workers = max(1, min(max_workers or len(planned_units), len(planned_units)))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {executor.submit(self._run_single_unit, unit, timeout=timeout, on_unit_update=on_unit_update): unit for unit in planned_units}
-            processed_futures = set()
+        executor = ThreadPoolExecutor(max_workers=workers)
+        future_map: dict[Future, tuple[WorktreeUnit, UnitExecutionControl]] = {}
+        for unit in planned_units:
+            unit.generation += 1
+            unit._cancel_event.clear()
+            unit.cancellation_requested = False
+            unit.cancellation_acknowledged = False
+            unit.stop_reason = ""
+            control = UnitExecutionControl(
+                generation=unit.generation,
+                cancel_event=unit._cancel_event,
+            )
+            future = executor.submit(
+                self._run_single_unit,
+                unit,
+                timeout=timeout,
+                on_unit_update=on_unit_update,
+                control=control,
+            )
+            future_map[future] = (unit, control)
+
+        done, not_done = wait(
+            future_map,
+            timeout=max(0.0, float(pool_timeout)),
+        )
+        for future in done:
+            unit, control = future_map[future]
             try:
-                for future in as_completed(future_map, timeout=pool_timeout):
-                    unit = future_map[future]
-                    processed_futures.add(future)
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        # 使用 classify_timeout 区分超时和其他错误
-                        err_msg = get_error_detail(exc)
-                        log_level = logging.WARNING if classify_timeout(exc) else logging.ERROR
-                        self._fail_unit(unit, err_msg, log_level=log_level, on_unit_update=on_unit_update)
-            except TimeoutError:
-                # 处理 pool-level timeout
-                unprocessed_futures = set(future_map.keys()) - processed_futures
-                # 使用结构化 reason code，显示层 reporter 负责映射为人类友好文案
-                err = "pool_timeout"
-                for fut in unprocessed_futures:
-                    unit = future_map[fut]
-                    fut.cancel()
-                    self._cancel_unit(unit, err, on_unit_update=on_unit_update)
+                future.result()
+            except Exception as exc:
+                if control.cancel_event.is_set() or unit.generation != control.generation:
+                    continue
+                err_msg = get_error_detail(exc)
+                log_level = logging.WARNING if classify_timeout(exc) else logging.ERROR
+                self._fail_unit(
+                    unit,
+                    err_msg,
+                    log_level=log_level,
+                    on_unit_update=on_unit_update,
+                )
+
+        if not_done:
+            self._cancel_active_futures(
+                future_map,
+                set(not_done),
+                cancel_grace=cancel_grace,
+                on_unit_update=on_unit_update,
+            )
+            executor.shutdown(wait=False, cancel_futures=True)
+        else:
+            executor.shutdown(wait=True)
         return planned_units
 
-    def _run_single_unit(self, unit: WorktreeUnit, *, timeout: Optional[int] = None, on_unit_update: Optional[Callable[[WorktreeUnit], None]] = None) -> None:
+    def _run_single_unit(
+        self,
+        unit: WorktreeUnit,
+        *,
+        timeout: Optional[int] = None,
+        on_unit_update: Optional[Callable[[WorktreeUnit], None]] = None,
+        control: Optional[UnitExecutionControl] = None,
+    ) -> None:
+        if control is None:
+            control = UnitExecutionControl(
+                generation=unit.generation,
+                cancel_event=unit._cancel_event,
+            )
         # 防止 pool-level timeout 设置的 failed/cancelled 状态被覆盖
         if unit.status in (WorktreeUnitStatus.FAILED, WorktreeUnitStatus.CANCELLED):
             return
@@ -204,34 +421,101 @@ class WorktreeDispatcher:
             return
 
         try:
-            session = self._start_session_with_recovery(unit)
+            session = self._start_session_with_recovery(
+                unit,
+                on_session_created=control.bind_session,
+                is_cancelled=control.cancel_event.is_set,
+            )
         except Exception as exc:
-            self._fail_unit(unit, f"启动失败: {get_error_detail(exc)}", log_level=logging.ERROR, on_unit_update=on_unit_update)
+            with control.terminal_lock:
+                if control.cancel_event.is_set() or unit.generation != control.generation:
+                    return
+                self._fail_unit(
+                    unit,
+                    f"启动失败: {get_error_detail(exc)}",
+                    log_level=logging.ERROR,
+                    on_unit_update=None,
+                )
+            safe_invoke(on_unit_update, unit, label="on_unit_update")
             return
 
         try:
+            if control.cancel_event.is_set() or unit.generation != control.generation:
+                return
             result = session.send_prompt(unit.task_prompt or unit.task_title, timeout=timeout)
             # Respect cancellation set by pool-timeout while this unit was running.
             # Uses _cancel_event (threading.Event) for memory-barrier guarantee instead
             # of bare status read which relies on GIL atomicity.
-            if unit._cancel_event.is_set():
+            if control.cancel_event.is_set() or unit.generation != control.generation:
                 return
-            unit.summary = (getattr(result, "text", "") or "").strip()  # relies on GIL
-            unit.status = WorktreeUnitStatus.COMPLETED if getattr(result, "stop_reason", "") not in {"failed", "error", "cancelled"} else WorktreeUnitStatus.FAILED  # relies on GIL
-            unit.error = "" if unit.status == WorktreeUnitStatus.COMPLETED else unit.summary  # relies on GIL
-            unit.has_changes = _detect_worktree_changes(unit.worktree_path)
+            assessment = classify_prompt_result(result)
+            has_changes = _detect_worktree_changes(unit.worktree_path)
+            with control.terminal_lock:
+                if (
+                    control.cancel_event.is_set()
+                    or unit.generation != control.generation
+                    or unit.status in {
+                        WorktreeUnitStatus.COMPLETED,
+                        WorktreeUnitStatus.FAILED,
+                        WorktreeUnitStatus.CANCELLED,
+                    }
+                ):
+                    return
+                unit.summary = (getattr(result, "text", "") or "").strip()
+                unit.stop_reason = assessment.stop_reason
+                unit.metadata["pending_plan_entries"] = assessment.pending_plan_entries
+                unit.metadata["incomplete_tool_calls"] = assessment.incomplete_tool_calls
+                unit.metadata["test_provenance"] = _command_provenance(result)
+                if assessment.outcome is PromptOutcome.COMPLETED:
+                    unit.status = WorktreeUnitStatus.COMPLETED
+                    unit.error = ""
+                elif assessment.outcome is PromptOutcome.CANCELLED:
+                    unit.status = WorktreeUnitStatus.CANCELLED
+                    unit.error = unit.summary or assessment.detail
+                    unit.cancellation_requested = False
+                    unit.cancellation_acknowledged = True
+                    unit.metadata["cancellation_requested"] = False
+                    unit.metadata["cancellation_acknowledged"] = True
+                else:
+                    unit.status = WorktreeUnitStatus.FAILED
+                    unit.error = unit.summary or assessment.detail
+                unit.has_changes = has_changes
             safe_invoke(on_unit_update, unit, label="on_unit_update")
         except TimeoutError as te:
-            self._fail_unit(unit, f"执行超时: {get_error_detail(te)}", log_level=logging.WARNING, on_unit_update=on_unit_update)
+            with control.terminal_lock:
+                if control.cancel_event.is_set() or unit.generation != control.generation:
+                    return
+                self._fail_unit(
+                    unit,
+                    f"执行超时: {get_error_detail(te)}",
+                    log_level=logging.WARNING,
+                    on_unit_update=None,
+                )
+            safe_invoke(on_unit_update, unit, label="on_unit_update")
         except Exception as exc:
-            self._fail_unit(unit, f"执行异常: {get_error_detail(exc)}", log_level=logging.ERROR, on_unit_update=on_unit_update)
+            with control.terminal_lock:
+                if control.cancel_event.is_set() or unit.generation != control.generation:
+                    return
+                self._fail_unit(
+                    unit,
+                    f"执行异常: {get_error_detail(exc)}",
+                    log_level=logging.ERROR,
+                    on_unit_update=None,
+                )
+            safe_invoke(on_unit_update, unit, label="on_unit_update")
         finally:
             try:
                 session.close()
             except Exception:
                 logger.debug("failed to close session", exc_info=True)
 
-    def _start_session_with_recovery(self, unit: WorktreeUnit) -> "SyncSession":
+    def _start_session_with_recovery(
+        self,
+        unit: WorktreeUnit,
+        *,
+        on_session_created: Optional[Callable[["SyncSession"], None]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> "SyncSession":
         """Start a session with TTADK-specific recovery on failure.
 
         Recovery flow (TTADK only):
@@ -246,6 +530,9 @@ class WorktreeDispatcher:
             working_dir=unit.worktree_path,
             model_name=unit.model_name,
         )
+        safe_invoke(on_session_created, session, label="on_session_created")
+        if is_cancelled and is_cancelled():
+            return session
         try:
             session.start()
             return session
@@ -272,6 +559,9 @@ class WorktreeDispatcher:
                         working_dir=unit.worktree_path,
                         model_name=None,
                     )
+                    safe_invoke(on_session_created, session, label="on_session_created")
+                    if is_cancelled and is_cancelled():
+                        return session
                     session.start()
                     logger.info("[Worktree] TTADK recovery succeeded with auto model: unit=%s", unit.unit_id)
                     return session

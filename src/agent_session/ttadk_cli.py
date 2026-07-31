@@ -132,7 +132,8 @@ class SyncTTADKCLISession:
             writable_roots=writable_roots,
         )
 
-    def cancel(self) -> None:
+    def cancel(self, wait: bool = False, timeout: float = 2.0) -> None:
+        del wait, timeout  # CLI transport has no acknowledgment protocol.
         self._cancel_event.set()
         proc = self._proc
         if proc:

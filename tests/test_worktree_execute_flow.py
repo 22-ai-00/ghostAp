@@ -5,11 +5,17 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from src.project.context import ProjectContext
 from src.worktree_engine.dispatcher import WorktreeDispatcher
 from src.worktree_engine.manager import WorktreeManager
 from src.worktree_engine.models import WorktreeUnit
+from src.worktree_engine.review_adapter import (
+    WorktreeReviewOutcome,
+    WorktreeReviewPlan,
+    WorktreeReviewVerdict,
+)
 
 # ---------------------------------------------------------------------------
 # Fake session for testing
@@ -37,6 +43,30 @@ class FakeSession:
 
     def close(self):
         return None
+
+
+def _enable_passing_review(manager: WorktreeManager) -> None:
+    manager._review_adapter = MagicMock()
+    manager._review_adapter.plan_roles.return_value = WorktreeReviewPlan()
+    manager._review_adapter.review_units.return_value = WorktreeReviewOutcome(
+        verdict=WorktreeReviewVerdict.PASS,
+        summary="verified",
+        findings=[
+            {
+                "severity": "observation",
+                "message": "verified",
+                "evidence": "fake test evidence",
+            }
+        ],
+        tests=[
+            {
+                "command": "fake tests",
+                "passed": True,
+                "verified": True,
+                "evidence": "passed",
+            }
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +99,7 @@ def test_execute_goal_creates_sessions_and_runs_parallel(tmp_path):
 
     manager = WorktreeManager(project_manager=None)
     manager._dispatcher = WorktreeDispatcher(session_factory=lambda **kw: FakeSession(**kw))
+    _enable_passing_review(manager)
 
     state = manager.execute_goal(project, "实现 worktree 功能")
 
@@ -119,6 +150,7 @@ def test_execute_goal_progress_callback_fires_per_unit(tmp_path):
 
     manager = WorktreeManager(project_manager=None)
     manager._dispatcher = WorktreeDispatcher(session_factory=lambda **kw: FakeSession(**kw))
+    _enable_passing_review(manager)
 
     manager.execute_goal(project, "测试回调", on_unit_update=on_update)
 
