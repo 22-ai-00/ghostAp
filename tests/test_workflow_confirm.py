@@ -9,6 +9,7 @@ Validates:
 
 import json
 import os
+import threading
 import unittest
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -606,6 +607,94 @@ class TestWorkflowHandlerConfirmFlow(unittest.TestCase):
         self.assertEqual(engine.project.status, WorkflowStatus.RUNNING)
         handler._submit_engine_task.assert_called_once()
 
+    @patch("src.thread.get_current_sender_id", return_value="user_123")
+    def test_stop_after_submit_prevents_queued_workflow_from_starting(self, mock_sender):
+        """A stop acknowledged before the queued task claims the engine must be final."""
+        import hashlib
+        import tempfile
+
+        from src.workflow_engine.engine import WorkflowEngine
+
+        handler, ctx = self._make_handler()
+        handler._reply_workflow_error = MagicMock()
+        handler._resolve_origin = MagicMock(return_value="origin_msg")
+        handler._show_initial_workflow_progress_card = MagicMock(return_value="progress_msg")
+        ctx.settings.admin_user_ids = []
+
+        script_content = (
+            "export const meta = {\n"
+            "  name: 'test',\n"
+            "  description: 'test workflow',\n"
+            "  tools: ['coco'],\n"
+            "};\n"
+            "export default async function workflow() {\n"
+            "  const result = await agent('do work', { tool: 'coco', label: 'work', timeout: 120 });\n"
+            "  if (result && result.error) return result;\n"
+            "  return result;\n"
+            "}\n"
+        )
+        temp_dir = tempfile.TemporaryDirectory()
+        script_path = os.path.join(temp_dir.name, "generated.js")
+        with open(script_path, "w", encoding="utf-8") as script_file:
+            script_file.write(script_content)
+        script_hash = hashlib.sha256(script_content.encode("utf-8")).hexdigest()
+
+        engine = WorkflowEngine(chat_id="chat_1", root_path=temp_dir.name)
+        engine._project = WorkflowProject(
+            status=WorkflowStatus.AWAITING_CONFIRM,
+            pending=PendingConfirmation(
+                script_path=script_path,
+                requirement="do X",
+                meta={"name": "x", "tools": ["coco"]},
+                initiator_user_id="user_123",
+                engine_session_key="test_session_key",
+                selected_tools=["coco"],
+                script_hash=script_hash,
+            ),
+        )
+        ctx.workflow_engine_manager.get.return_value = engine
+        handler._get_root_path = MagicMock(return_value=temp_dir.name)
+        project_mock = MagicMock(
+            project_id="proj_1",
+            project_name="test",
+            root_path=temp_dir.name,
+        )
+        handler._resolve_project_from_id = MagicMock(return_value=project_mock)
+        queued: dict[str, object] = {}
+        handler._submit_engine_task = MagicMock(
+            side_effect=lambda run_fn, *_args, **_kwargs: queued.setdefault("run", run_fn)
+        )
+
+        handler.handle_workflow_confirm_start(
+            "msg_1",
+            "chat_1",
+            "proj_1",
+            {
+                "action": WORKFLOW_CONFIRM_START,
+                "engine_session_key": "test_session_key",
+            },
+        )
+        immutable_script_path = engine.project.script_path
+        engine.execute_workflow = MagicMock()
+        handler._safe_execute_engine = MagicMock(
+            side_effect=lambda *, executor_func, **_kwargs: executor_func()
+        )
+
+        handler.stop_workflow("stop_msg", "chat_1", project_mock)
+        queued["run"]()
+
+        self.assertEqual(engine.project.status, WorkflowStatus.IDLE)
+        engine.execute_workflow.assert_not_called()
+        handler.reply_text.assert_called_once_with("stop_msg", "Workflow 任务已停止。")
+        handler._reply_workflow_error.assert_not_called()
+
+        if immutable_script_path:
+            try:
+                os.unlink(immutable_script_path)
+            except OSError:
+                pass
+        temp_dir.cleanup()
+
     def test_workflow_callbacks_send_renderer_cards_directly(self):
         """Progress/done callbacks should pass renderer cards to update_card without build_info_card."""
         handler, _ctx = self._make_handler()
@@ -793,11 +882,11 @@ class TestWorkflowHandlerConfirmFlow(unittest.TestCase):
             audit_aliases=(),
         )
 
-    def test_workflow_callbacks_fallback_card_updates_future_message_id(self):
-        """If progress patching fails, callbacks should send a full card and update the target id."""
+    def test_workflow_callbacks_do_not_create_new_cards_when_progress_patch_keeps_failing(self):
+        """Periodic progress must not turn persistent PATCH failures into a new-card loop."""
         handler, _ctx = self._make_handler()
-        handler.update_card.side_effect = [False, True]
-        handler.send_card_to_chat.return_value = "fallback_msg"
+        handler.update_card.return_value = False
+        handler._resolve_origin = MagicMock(return_value="origin_msg")
         callbacks = handler._build_workflow_callbacks("progress_msg", "chat_1", None)
 
         first_progress = {
@@ -820,16 +909,119 @@ class TestWorkflowHandlerConfirmFlow(unittest.TestCase):
             callbacks.on_progress(second_progress)
 
         self.assertEqual(handler.update_card.call_args_list[0].args[0], "progress_msg")
-        handler.send_card_to_chat.assert_called_once()
-        sent_card = handler.send_card_to_chat.call_args.args[1]
-        self.assertEqual(sent_card["schema"], "2.0")
-        self.assertEqual(sent_card["body"]["elements"], first_progress["elements"])
-        self.assertNotIn("elements", sent_card)
-
-        self.assertEqual(handler.update_card.call_args_list[1].args[0], "fallback_msg")
+        self.assertEqual(handler.update_card.call_args_list[1].args[0], "progress_msg")
         patched_card = handler.update_card.call_args_list[1].args[1]
         self.assertEqual(patched_card["schema"], "2.0")
         self.assertEqual(patched_card["body"]["elements"], second_progress["elements"])
+        handler.send_card_to_chat.assert_not_called()
+
+    def test_workflow_completion_fallback_card_preserves_trusted_origin(self):
+        """A terminal replacement card must remain patchable under outbound audit."""
+        handler, _ctx = self._make_handler()
+        handler.update_card.return_value = False
+        handler._resolve_origin = MagicMock(return_value="origin_msg")
+        handler.send_card_to_chat.return_value = "terminal_fallback"
+        callbacks = handler._build_workflow_callbacks("progress_msg", "chat_1", None)
+        done_project = WorkflowProject(
+            name="done workflow",
+            requirement="do X",
+            status=WorkflowStatus.COMPLETED,
+            result='{"final_report": "finished"}',
+        )
+
+        callbacks.on_done(done_project)
+
+        handler.send_card_to_chat.assert_called_once()
+        self.assertEqual(
+            handler.send_card_to_chat.call_args.kwargs.get("origin_message_id"),
+            "origin_msg",
+        )
+
+    def test_workflow_done_fences_progress_before_report_delivery(self):
+        """Report generation must not leave a window for heartbeat progress updates."""
+        handler, _ctx = self._make_handler()
+        handler._resolve_origin = MagicMock(return_value="origin_msg")
+        callbacks = handler._build_workflow_callbacks("progress_msg", "chat_1", None)
+        late_progress = {
+            "header": {
+                "title": {"tag": "plain_text", "content": "Workflow running"},
+                "template": "blue",
+            },
+            "elements": [{"tag": "markdown", "content": "late heartbeat"}],
+        }
+
+        def report_with_reentrant_progress(**_kwargs):
+            callbacks.on_progress(late_progress)
+            return {"generated": True, "attachment_sent": True}
+
+        handler._send_workflow_completion_report = MagicMock(
+            side_effect=report_with_reentrant_progress
+        )
+        done_project = WorkflowProject(
+            name="done workflow",
+            requirement="do X",
+            status=WorkflowStatus.COMPLETED,
+            result='{"final_report": "finished"}',
+        )
+
+        callbacks.on_done(done_project)
+
+        self.assertEqual(handler.update_card.call_count, 1)
+        self.assertNotIn("late heartbeat", str(handler.update_card.call_args.args[1]))
+
+    def test_workflow_done_waits_for_inflight_progress_before_terminal_delivery(self):
+        """An in-flight progress PATCH must finish before the terminal card is delivered."""
+        handler, _ctx = self._make_handler()
+        handler._resolve_origin = MagicMock(return_value="origin_msg")
+        progress_entered = threading.Event()
+        release_progress = threading.Event()
+        terminal_delivery_started = threading.Event()
+        delivery_order: list[str] = []
+
+        def update_card(_message_id, card):
+            if "in-flight progress" in str(card):
+                progress_entered.set()
+                if not release_progress.wait(timeout=2):
+                    raise AssertionError("timed out waiting to release progress delivery")
+                delivery_order.append("progress")
+            else:
+                terminal_delivery_started.set()
+                delivery_order.append("terminal")
+            return True
+
+        handler.update_card = MagicMock(side_effect=update_card)
+        handler._send_workflow_completion_report = MagicMock(
+            return_value={"generated": True, "attachment_sent": True}
+        )
+        callbacks = handler._build_workflow_callbacks("progress_msg", "chat_1", None)
+        progress_card = {
+            "header": {
+                "title": {"tag": "plain_text", "content": "Workflow running"},
+                "template": "blue",
+            },
+            "elements": [{"tag": "markdown", "content": "in-flight progress"}],
+        }
+        done_project = WorkflowProject(
+            name="done workflow",
+            requirement="do X",
+            status=WorkflowStatus.COMPLETED,
+            result='{"final_report": "finished"}',
+        )
+
+        progress_thread = threading.Thread(target=callbacks.on_progress, args=(progress_card,))
+        done_thread = threading.Thread(target=callbacks.on_done, args=(done_project,))
+        progress_thread.start()
+        self.assertTrue(progress_entered.wait(timeout=1))
+        done_thread.start()
+        terminal_overtook_progress = terminal_delivery_started.wait(timeout=0.2)
+        release_progress.set()
+        progress_thread.join(timeout=2)
+        done_thread.join(timeout=2)
+
+        self.assertFalse(progress_thread.is_alive())
+        self.assertFalse(done_thread.is_alive())
+        self.assertFalse(terminal_overtook_progress)
+        self.assertEqual(delivery_order, ["progress", "terminal"])
 
     def test_workflow_callbacks_route_validation_error_to_workflow_error_card(self):
         """Execution-time validation failures should not be hidden behind the generic error card."""
@@ -1359,7 +1551,7 @@ class TestWorkflowToolSelectionFirstFlow(unittest.TestCase):
     def test_handle_workflow_confirm_tools_transitions_state(
         self, mock_gen, mock_sender
     ):
-        """Verify handle_workflow_confirm_tools() transitions from AWAITING_TOOL_SELECT to AWAITING_CONFIRM."""
+        """Tool confirmation must enter owned background script generation."""
         handler, ctx = self._make_handler()
 
         # Set up engine in AWAITING_TOOL_SELECT state
@@ -1395,16 +1587,13 @@ class TestWorkflowToolSelectionFirstFlow(unittest.TestCase):
             {"action": "workflow_confirm_tools", "engine_session_key": "valid_session_key"}
         )
 
-        # After confirm_tools, engine should be in AWAITING_CONFIRM (script generated directly)
-        self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_CONFIRM)
-        self.assertIsNotNone(engine.project.pending.script_path if engine.project.pending else None)
-        self.assertIsNotNone(engine.project.pending.meta if engine.project.pending else None)
-        # _generate_script_via_ai should have been called with selected_tools
-        mock_gen.assert_called_once()
-        call_args = mock_gen.call_args[0]
-        self.assertIn("do code review", call_args)
-        # Third arg should be selected_tools
-        self.assertEqual(call_args[2], ["coco", "claude"])
+        self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
+        self.assertEqual(
+            engine.project.pending.engine_session_key,
+            "valid_session_key",
+        )
+        handler._submit_engine_task.assert_called_once()
+        mock_gen.assert_not_called()
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     def test_handle_workflow_confirm_tools_validates_session_key(self, mock_sender):
@@ -1552,16 +1741,24 @@ class TestWorkflowRegenerateScript(unittest.TestCase):
     def test_handle_workflow_regenerate_script_regenerates(
         self, mock_gen, mock_sender
     ):
-        """Verify handle_workflow_regenerate_script() calls _generate_script_via_ai again and updates the card."""
+        """Regeneration must use the cancellable background generation path."""
         import tempfile
 
         handler, ctx = self._make_handler()
 
-        # Create a real temp file for the old script
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False, encoding="utf-8")
-        tmp.write("old script")
-        tmp.close()
-        old_script_path = tmp.name
+        temp_dir = tempfile.TemporaryDirectory()
+        script_dir = os.path.join(
+            temp_dir.name,
+            ".ghostap",
+            "workflow_scripts",
+        )
+        os.makedirs(script_dir)
+        old_script_path = os.path.join(
+            script_dir,
+            "generated-workflow-old.js",
+        )
+        with open(old_script_path, "w", encoding="utf-8") as old_script:
+            old_script.write("old script")
 
         engine = MagicMock()
         engine.is_running = False
@@ -1580,7 +1777,7 @@ class TestWorkflowRegenerateScript(unittest.TestCase):
         ctx.workflow_engine_manager.get_or_create.return_value = engine
 
         project_mock = MagicMock()
-        project_mock.root_path = "/tmp/project"
+        project_mock.root_path = temp_dir.name
         project_mock.project_id = "proj_1"
         project_mock.project_name = "test"
         handler._resolve_project_from_id = MagicMock(return_value=project_mock)
@@ -1598,22 +1795,13 @@ class TestWorkflowRegenerateScript(unittest.TestCase):
             {"action": "workflow_regenerate_script", "engine_session_key": "valid_session_key"}
         )
 
-        # _generate_script_via_ai should have been called again
-        self.assertEqual(mock_gen.call_count, 1)
-        call_args = mock_gen.call_args[0]
-        self.assertEqual(call_args[2], ["coco", "claude"])  # selected_tools passed
-
-        # Should have sent generating card then auto-started execution.
-        handler.send_card_to_chat.assert_called_once()
-        handler.update_card.assert_not_called()
-        handler._start_pending_workflow_execution.assert_called_once()
-
-        # Pending meta should be updated with new script
-        self.assertEqual(engine.project.pending.meta["name"] if engine.project.pending and engine.project.pending.meta else None, "regenerated-wf")
-        self.assertEqual(engine.project.pending.script_path if engine.project.pending else None, "/tmp/project/.ghostap/workflow_scripts/regenerated_workflow.js")
-
-        # Old script file should have been removed
+        self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
+        handler._submit_engine_task.assert_called_once()
+        mock_gen.assert_not_called()
+        handler.send_card_to_chat.assert_not_called()
+        handler._start_pending_workflow_execution.assert_not_called()
         self.assertFalse(os.path.exists(old_script_path))
+        temp_dir.cleanup()
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     def test_handle_workflow_regenerate_script_wrong_state_rejected(self, mock_sender):

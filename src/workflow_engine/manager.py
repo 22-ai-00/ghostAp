@@ -52,12 +52,14 @@ class WorkflowEngineManager(BaseEngineManager["WorkflowEngine"]):
         """Remove and cleanup a workflow engine instance."""
         key = f"{chat_id}:{root_path}"
         with self._lock:
-            engine = self._engines.pop(key, None)
-            if engine:
-                self._remove_index(chat_id, key)
-
-        if engine:
+            engine = self._engines.get(key)
+            if not engine:
+                return
             try:
-                engine.cleanup()
+                quiesced = engine.cleanup()
             except Exception as e:
                 logger.debug("Cleanup failed for %s: %s", key, repr(e))
+                quiesced = False
+            if quiesced is not False:
+                self._engines.pop(key, None)
+                self._remove_index(chat_id, key)

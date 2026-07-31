@@ -432,7 +432,9 @@ class BaseEngineManager(Generic[T]):
                     or getattr(existing, "_model_name", None) != resolved_model_name
                 )
                 if should_replace and not existing.is_running:
-                    existing.cleanup()
+                    cleanup_result = existing.cleanup()
+                    if cleanup_result is False:
+                        return existing
                     engine = self._create_engine(
                         chat_id=chat_id,
                         root_path=root_path,
@@ -492,8 +494,8 @@ class BaseEngineManager(Generic[T]):
         with self._lock:
             next_engines: dict[str, T] = {}
             for key, engine in self._engines.items():
-                engine.cleanup()
-                if engine.is_running:
+                cleanup_result = engine.cleanup()
+                if cleanup_result is False or engine.is_running:
                     next_engines[key] = engine
             self._engines = next_engines
             self._chat_keys.clear()

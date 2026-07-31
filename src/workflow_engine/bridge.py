@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from typing import Any, Callable, Optional
 
 from .constants import (
@@ -108,6 +109,7 @@ class RuntimeBridge:
 
         # Subprocess handle
         self._process: Optional[subprocess.Popen] = None
+        self._process_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
 
         # Thread-safe stdin writes
         self._write_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
@@ -165,6 +167,7 @@ class RuntimeBridge:
 
         # Shutdown flag to make stop() / cleanup() idempotent
         self._shutdown_done = False
+        self._shutdown_started = threading.Event()
 
         # Terminal state
         self._done = False
@@ -191,6 +194,21 @@ class RuntimeBridge:
         # rather than the (often much smaller) timeout baked into the script.
         # 0 means unlimited per-agent (JS relies on the total deadline / stop).
         self._workflow_agent_call_timeout_s: int = AGENT_CALL_TIMEOUT_S
+
+    def _shutdown_requested(self) -> bool:
+        """Return cancellation state, including for lightweight test doubles."""
+        shutdown_event = vars(self).get("_shutdown_started")
+        cancel_event = vars(self).get("_cancel_event")
+        return bool(
+            (
+                shutdown_event is not None
+                and shutdown_event.is_set() is True
+            )
+            or (
+                cancel_event is not None
+                and cancel_event.is_set() is True
+            )
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -280,9 +298,6 @@ class RuntimeBridge:
         Raises RuntimeError if the process fails to start or doesn't send
         the ready notification within a reasonable time.
         """
-        if self._process is not None:
-            raise RuntimeError("RuntimeBridge already started")
-
         # Resolve paths
         runtime_path = os.path.join(self._cwd, RUNTIME_JS_PATH)
         if not os.path.isfile(runtime_path):
@@ -296,48 +311,63 @@ class RuntimeBridge:
         cmd = [node_bin, "--experimental-vm-modules", runtime_path, self._script_path]
         logger.info("Starting Node.js runtime: %s", " ".join(cmd))
 
-        try:
-            # Minimal environment for Node.js runtime — excludes secrets and
-            # API keys from the parent process to enforce sandbox isolation.
-            safe_env = {
-                "PATH": os.environ.get("PATH", ""),
-                "HOME": os.environ.get("HOME", ""),
-                "NODE_PATH": os.environ.get("NODE_PATH", ""),
-                "LANG": os.environ.get("LANG", "en_US.UTF-8"),
-                "TERM": os.environ.get("TERM", "xterm"),
-            }
-            # Allow explicit NODE_OPTIONS if set (for debugging/flags)
-            if os.environ.get("NODE_OPTIONS"):
-                safe_env["NODE_OPTIONS"] = os.environ["NODE_OPTIONS"]
+        with self._process_lock:
+            if self._process is not None:
+                raise RuntimeError("RuntimeBridge already started")
+            if self._shutdown_requested():
+                raise RuntimeError("RuntimeBridge cancelled before start")
+            try:
+                # Minimal environment for Node.js runtime — excludes secrets
+                # and API keys from the parent process.
+                safe_env = {
+                    "PATH": os.environ.get("PATH", ""),
+                    "HOME": os.environ.get("HOME", ""),
+                    "NODE_PATH": os.environ.get("NODE_PATH", ""),
+                    "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+                    "TERM": os.environ.get("TERM", "xterm"),
+                }
+                # Allow explicit NODE_OPTIONS if set (for debugging/flags)
+                if os.environ.get("NODE_OPTIONS"):
+                    safe_env["NODE_OPTIONS"] = os.environ["NODE_OPTIONS"]
 
-            self._process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=self._cwd,
-                text=True,
-                bufsize=1,  # Line-buffered
-                env=safe_env,
+                self._process = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=self._cwd,
+                    text=True,
+                    bufsize=1,  # Line-buffered
+                    env=safe_env,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to spawn Node.js process: {exc}"
+                ) from exc
+
+        # Serialize reader publication with stop(). If cancellation landed in
+        # the narrow gap after Popen, no transport thread may appear after the
+        # stop acknowledgement.
+        with self._process_lock:
+            if self._shutdown_requested() or self._process is None:
+                self._kill_process()
+                raise RuntimeError("RuntimeBridge cancelled during start")
+
+            # Start the reader thread (daemon so it dies with the process)
+            self._reader_thread = threading.Thread(
+                target=self._read_loop,
+                name="RuntimeBridge-reader",
+                daemon=True,
             )
-        except OSError as exc:
-            raise RuntimeError(f"Failed to spawn Node.js process: {exc}") from exc
+            self._reader_thread.start()
 
-        # Start the reader thread (daemon so it dies with the process)
-        self._reader_thread = threading.Thread(
-            target=self._read_loop,
-            name="RuntimeBridge-reader",
-            daemon=True,
-        )
-        self._reader_thread.start()
-
-        # Start stderr drain thread to prevent pipe buffer deadlock (NFR-3)
-        self._stderr_thread = threading.Thread(
-            target=self._stderr_reader,
-            name="RuntimeBridge-stderr",
-            daemon=True,
-        )
-        self._stderr_thread.start()
+            # Start stderr drain thread to prevent pipe deadlock (NFR-3)
+            self._stderr_thread = threading.Thread(
+                target=self._stderr_reader,
+                name="RuntimeBridge-stderr",
+                daemon=True,
+            )
+            self._stderr_thread.start()
 
         # Wait for the 'ready' notification
         ready = self._wait_for_notification("ready", timeout=30.0)
@@ -369,17 +399,22 @@ class RuntimeBridge:
             }
         )
 
-        # Create executor for agent calls
-        self._executor = ThreadPoolExecutor(
-            max_workers=self._max_concurrent,
-            thread_name_prefix="RuntimeBridge-agent",
-        )
+        # Publish both pools through the same submission gate used by stop().
+        # If cancellation won while Node was becoming ready, no executor may
+        # appear after the stop acknowledgement.
+        with self._futures_lock:
+            if self._shutdown_requested():
+                raise RuntimeError("RuntimeBridge cancelled during start")
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._max_concurrent,
+                thread_name_prefix="RuntimeBridge-agent",
+            )
 
-        # Separate executor for sub-workflow calls (max 2 concurrent sub-workflows)
-        self._workflow_executor = ThreadPoolExecutor(
-            max_workers=2,
-            thread_name_prefix="RuntimeBridge-subwf",
-        )
+            # Separate pool for sub-workflows (avoids agent-pool starvation).
+            self._workflow_executor = ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="RuntimeBridge-subwf",
+            )
 
         logger.info("Node.js runtime ready and initialized")
 
@@ -510,6 +545,10 @@ class RuntimeBridge:
         the ThreadPoolExecutors. Idempotent — calling it more than once is
         safe and does nothing after the first successful call.
         """
+        # Close the submission gate before touching either executor. A request
+        # already being dispatched must either publish its Future under
+        # ``_futures_lock`` first or observe this event and fail closed.
+        self._shutdown_started.set()
         if self._shutdown_done:
             return
 
@@ -557,29 +596,32 @@ class RuntimeBridge:
 
         # Cancel all pending futures and shut down executors without waiting
         # (process is already dead, in-flight calls will fail with BrokenPipe)
-        if self._executor is not None:
+        with self._futures_lock:
+            futures_to_cancel = list(self._active_futures)
+            executor = self._executor
+            workflow_executor = self._workflow_executor
+            self._executor = None
+            self._workflow_executor = None
+
+        if executor is not None:
             try:
                 # Snapshot active futures under the lock, then cancel outside
                 # to avoid deadlock: cancel() invokes done callbacks which
                 # call _discard_future, which itself acquires _futures_lock.
-                with self._futures_lock:
-                    futures_to_cancel = list(self._active_futures)
                 for future in futures_to_cancel:
                     future.cancel()
-                self._executor.shutdown(wait=False, cancel_futures=True)
+                executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
-                self._executor.shutdown(wait=False)
+                executor.shutdown(wait=False)
             except Exception:
                 logger.debug("RuntimeBridge executor shutdown failed")
-            self._executor = None
-        if self._workflow_executor is not None:
+        if workflow_executor is not None:
             try:
-                self._workflow_executor.shutdown(wait=False, cancel_futures=True)
+                workflow_executor.shutdown(wait=False, cancel_futures=True)
             except TypeError:
-                self._workflow_executor.shutdown(wait=False)
+                workflow_executor.shutdown(wait=False)
             except Exception:
                 logger.debug("RuntimeBridge subwf executor shutdown failed")
-            self._workflow_executor = None
 
         # Clear request futures map
         with self._request_futures_lock:
@@ -590,11 +632,40 @@ class RuntimeBridge:
         self._shutdown_done = True
         logger.info("RuntimeBridge stopped")
 
+    def wait_for_workers(self, timeout: float | None = None) -> bool:
+        """Wait until every submitted agent/sub-workflow callback is quiet.
+
+        ``stop()`` intentionally remains non-blocking for responsive user
+        cancellation. The execution owner calls this method before releasing
+        its WorkflowEngine run claim, so callbacks from a retired bridge can
+        never observe the component fields of a later run.
+        """
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._futures_lock:
+                active = tuple(
+                    future
+                    for future in self._active_futures
+                    if not future.done()
+                )
+            if not active:
+                return True
+
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+            _, not_done = wait_futures(active, timeout=remaining)
+            if not_done:
+                return False
+
     def cleanup(self) -> None:
         """Alias for stop(); ensures all resources including thread pools
         are released. Safe to call multiple times.
         """
         self.stop()
+        self.wait_for_workers()
 
     # Context manager protocol
 
@@ -612,7 +683,7 @@ class RuntimeBridge:
 
         Does not suppress exceptions (returns False).
         """
-        self.stop()
+        self.cleanup()
         return False
 
     def __del__(self) -> None:
@@ -870,7 +941,8 @@ class RuntimeBridge:
 
     def _handle_agent_call(self, params: dict[str, Any], request_id: Any) -> None:
         """Submit an agent call to the thread pool and send response on completion."""
-        if self._executor is None:
+        executor = self._executor
+        if executor is None or self._shutdown_requested():
             self._send_error_response(
                 request_id,
                 code=-32603,
@@ -994,9 +1066,24 @@ class RuntimeBridge:
         with self._request_cancel_events_lock:
             self._request_cancel_events[request_id] = per_call_cancel
 
-        future = self._executor.submit(_execute)
         with self._futures_lock:
-            self._active_futures.add(future)
+            if (
+                self._shutdown_requested()
+                or self._executor is not executor
+            ):
+                future = None
+            else:
+                future = executor.submit(_execute)
+                self._active_futures.add(future)
+        if future is None:
+            with self._request_cancel_events_lock:
+                self._request_cancel_events.pop(request_id, None)
+            self._send_error_response(
+                request_id,
+                code=-32603,
+                message="Executor not available",
+            )
+            return
         with self._request_futures_lock:
             self._request_futures[request_id] = future
         future.add_done_callback(lambda f: self._discard_future(f))
@@ -1013,6 +1100,13 @@ class RuntimeBridge:
         agent_call handler.
         Accepts either `script_path` (absolute/relative file) or `name` (template name).
         """
+        if self._shutdown_requested():
+            self._send_error_response(
+                request_id,
+                code=-32603,
+                message="Workflow cancelled",
+            )
+            return
         if self._nesting_depth >= MAX_NESTING_DEPTH:
             self._send_error_response(
                 request_id,
@@ -1136,6 +1230,8 @@ class RuntimeBridge:
 
         def _execute_sub_workflow() -> None:
             try:
+                if self._shutdown_requested():
+                    raise RuntimeError("Workflow cancelled")
                 # Independent cancel_event for sub-workflow isolation
                 # Parent will cascade set() on stop()
                 sub_cancel_event = threading.Event()
@@ -1161,16 +1257,18 @@ class RuntimeBridge:
                 # Link parent-child for cascade cancellation
                 sub_bridge._parent = self
                 with self._children_lock:
+                    if self._shutdown_requested():
+                        raise RuntimeError("Workflow cancelled")
                     self._children.append(sub_bridge)
 
                 try:
                     sub_bridge.start()
                     result = sub_bridge.run()
-                    sub_bridge.stop()
-
                     response_data: dict[str, Any] = {"data": result}
                     self._send_response(request_id, response_data)
                 finally:
+                    sub_bridge.stop()
+                    sub_bridge.wait_for_workers()
                     with self._children_lock:
                         if sub_bridge in self._children:
                             self._children.remove(sub_bridge)
@@ -1182,7 +1280,8 @@ class RuntimeBridge:
                     message=sanitize_for_reply(str(exc), ErrorCategory.INTERNAL_ERROR),
                 )
 
-        if self._workflow_executor is None:
+        workflow_executor = self._workflow_executor
+        if workflow_executor is None or self._shutdown_requested():
             self._send_error_response(
                 request_id,
                 code=-32603,
@@ -1190,9 +1289,22 @@ class RuntimeBridge:
             )
             return
 
-        future = self._workflow_executor.submit(_execute_sub_workflow)
         with self._futures_lock:
-            self._active_futures.add(future)
+            if (
+                self._shutdown_requested()
+                or self._workflow_executor is not workflow_executor
+            ):
+                future = None
+            else:
+                future = workflow_executor.submit(_execute_sub_workflow)
+                self._active_futures.add(future)
+        if future is None:
+            self._send_error_response(
+                request_id,
+                code=-32603,
+                message="Executor not available for sub-workflow",
+            )
+            return
         future.add_done_callback(lambda f: self._discard_future(f))
 
     # ------------------------------------------------------------------
@@ -1367,6 +1479,8 @@ class RuntimeBridge:
         stash: list[dict[str, Any]] = []
 
         while time.monotonic() < deadline:
+            if self._shutdown_requested():
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -1402,29 +1516,34 @@ class RuntimeBridge:
 
     def _kill_process(self) -> None:
         """Terminate and clean up the subprocess."""
-        if self._process is None:
-            return
+        with self._process_lock:
+            if self._process is None:
+                return
 
-        try:
-            if self._process.poll() is None:
-                self._process.terminate()
-                try:
-                    self._process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._process.kill()
-                    self._process.wait(timeout=5)
-        except OSError:
-            pass
+            try:
+                if self._process.poll() is None:
+                    self._process.terminate()
+                    try:
+                        self._process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self._process.kill()
+                        self._process.wait(timeout=5)
+            except OSError:
+                pass
 
-        # Close handles
-        for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
-            if stream:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
+            # Close handles
+            for stream in (
+                self._process.stdin,
+                self._process.stdout,
+                self._process.stderr,
+            ):
+                if stream:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
-        self._process = None
+            self._process = None
 
     def _describe_unexpected_exit(self) -> str:
         """Build a diagnostic error string for an unexpected runtime exit.

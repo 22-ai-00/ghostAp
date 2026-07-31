@@ -105,7 +105,10 @@ class WorkflowSelectionMixin:
             return
 
         # Use SelectionFlowController
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(1)
         if "model_page" in value:
             try:
@@ -210,7 +213,10 @@ class WorkflowSelectionMixin:
         else:
             selection["model_name"] = model_name
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(1)
         # Orchestrator is single-select: clear before adding.
         ctrl.clear_selections(is_review=False)
@@ -273,7 +279,10 @@ class WorkflowSelectionMixin:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(1)
         ctrl.remove_selection(selection_key, is_review=False)
         self._persist_selection_controller(project, ctrl)
@@ -329,7 +338,10 @@ class WorkflowSelectionMixin:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(1)
         ctrl.clear_selections(is_review=False)
         self._persist_selection_controller(project, ctrl)
@@ -391,7 +403,10 @@ class WorkflowSelectionMixin:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(1)
 
         ok, err_msg = ctrl.validate_non_empty(is_review=False)
@@ -490,7 +505,10 @@ class WorkflowSelectionMixin:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(2)
         if "model_page" in value:
             try:
@@ -595,7 +613,10 @@ class WorkflowSelectionMixin:
         else:
             selection["model_name"] = model_name
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(2)
         ctrl.add_or_update_selection(selection, is_review=True, keep_panel_open=True)
         self._persist_selection_controller(project, ctrl)
@@ -657,7 +678,10 @@ class WorkflowSelectionMixin:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(2)
         ctrl.remove_selection(selection_key, is_review=True)
         self._persist_selection_controller(project, ctrl)
@@ -713,7 +737,10 @@ class WorkflowSelectionMixin:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(2)
         ctrl.clear_selections(is_review=True)
         self._persist_selection_controller(project, ctrl)
@@ -769,7 +796,10 @@ class WorkflowSelectionMixin:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(2)
         ctrl.set_review_auto_mode(not ctrl.review_auto_mode)
         self._persist_selection_controller(project, ctrl)
@@ -832,7 +862,10 @@ class WorkflowSelectionMixin:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
+        ctrl = self._get_selection_controller(
+            project,
+            session_key=stored_session_key,
+        )
         ctrl.set_step(2)
 
         ok, err_msg = ctrl.validate_non_empty(is_review=True)
@@ -894,8 +927,11 @@ class WorkflowSelectionMixin:
 
         # Proceed to script generation without blocking the Feishu callback
         # thread on a long-running ACP/CLI model call.
-        requirement = engine.project.pending.requirement if engine.project.pending else ""
-        engine.project.status = WorkflowStatus.GENERATING_SCRIPT
+        with engine._lock:
+            if not engine.project or not engine.project.pending:
+                return
+            requirement = engine.project.pending.requirement
+            engine.project.status = WorkflowStatus.GENERATING_SCRIPT
         self._schedule_generate_and_show_confirm_card(
             message_id=message_id,
             chat_id=chat_id,
@@ -904,4 +940,5 @@ class WorkflowSelectionMixin:
             root_path=root_path,
             selected_tools=all_selected if all_selected else None,
             engine=engine,
+            expected_session_key=stored_session_key,
         )

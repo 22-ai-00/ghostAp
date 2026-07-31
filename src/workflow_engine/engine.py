@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
 import uuid
@@ -36,6 +38,32 @@ from .renderer import WorkflowProgressRenderer
 from .state_manager import WorkflowStateManager
 
 logger = logging.getLogger(__name__)
+
+
+def _remove_owned_script_artifact(path: str | None, root_path: str) -> None:
+    """Remove only Workflow's generated source or immutable temp copy."""
+    if not path:
+        return
+    candidate = os.path.realpath(os.path.abspath(path))
+    basename = os.path.basename(candidate)
+    generated_dir = os.path.realpath(os.path.join(root_path, ".ghostap", "workflow_scripts"))
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    generated_source = bool(
+        os.path.dirname(candidate) == generated_dir
+        and basename.endswith(".js")
+        and (basename.startswith("generated-workflow-") or basename == "generated_workflow.js")
+    )
+    execution_copy = bool(
+        basename.startswith("ghostap-confirmed-")
+        and basename.endswith(".js")
+        and os.path.commonpath((candidate, temp_root)) == temp_root
+    )
+    if not (generated_source or execution_copy):
+        return
+    try:
+        os.remove(candidate)
+    except OSError:
+        pass
 
 
 def _node_version_required_text() -> str:
@@ -87,9 +115,7 @@ def _terminal_failure_from_result(result_text: str) -> str | None:
     # Scripts that catch sub-agent errors and include them in a report (e.g.,
     # {"final_report": "...", "error": "agent X failed"}) are NOT failures.
     has_meaningful_output = any(
-        k not in ("error", "message", "status", "stage", "fallback")
-        and bool(v)
-        for k, v in parsed.items()
+        k not in ("error", "message", "status", "stage", "fallback") and bool(v) for k, v in parsed.items()
     )
 
     if has_meaningful_output:
@@ -203,6 +229,18 @@ class WorkflowEngine(BaseEngine):
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: Optional[threading.Thread] = None
 
+        # Handler-owned lifecycle tokens. They make script generation and the
+        # scheduler hand-off cancellable before execute_workflow() claims the
+        # engine, without weakening the runtime cancel_event reuse contract.
+        self._workflow_selection_owner: Any = None
+        self._script_generation_owner: Any = None
+        self._workflow_start_owner: Any = None
+        self._retired_lifecycle_owners: list[Any] = []
+        self._closing = False
+        self._run_done_event = threading.Event()
+        self._run_done_event.set()
+        self._run_thread_id: int | None = None
+
         # Counters for safety fuse
         self._agent_call_count: int = 0
 
@@ -257,21 +295,89 @@ class WorkflowEngine(BaseEngine):
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _retire_lifecycle_owner_locked(self, owner: Any) -> None:
+        """Keep a revoked owner visible until cleanup proves quiescence."""
+        if owner is None:
+            return
+        if any(existing is owner for existing in self._retired_lifecycle_owners):
+            return
+        self._retired_lifecycle_owners.append(owner)
+
+    def retire_lifecycle_owner(self, owner: Any) -> None:
+        """Persist a revoked lifecycle owner across cleanup retries."""
+        with self._lock:
+            self._retire_lifecycle_owner_locked(owner)
+
     def cleanup(self):
         """Override to remove orphaned pending script files and release
         thread-pool resources (executor + bridge). Safe to call more than
-        once; shutdown is idempotent.
+        once; shutdown is idempotent. Returns whether workers quiesced.
         """
-        project = self._project
-        if project and project.pending:
-            pending_path = project.pending.script_path
-            if pending_path:
-                import os
-
-                try:
-                    os.remove(pending_path)
-                except OSError:
-                    pass
+        deadline = time.monotonic() + 30.0
+        quiesced = True
+        with self._lock:
+            self._closing = True
+            run_was_active = not self._run_done_event.is_set()
+            run_thread_id = self._run_thread_id
+            live_lifecycle_owners = tuple(
+                owner
+                for owner in (
+                    self._workflow_selection_owner,
+                    self._script_generation_owner,
+                    self._workflow_start_owner,
+                )
+                if owner is not None
+            )
+            for owner in live_lifecycle_owners:
+                self._retire_lifecycle_owner_locked(owner)
+            lifecycle_owners = tuple(self._retired_lifecycle_owners)
+            for owner in lifecycle_owners:
+                stop_event = getattr(owner, "stop_event", None)
+                if stop_event is not None:
+                    stop_event.set()
+                heartbeat_stop_event = getattr(owner, "heartbeat_stop_event", None)
+                if heartbeat_stop_event is not None:
+                    heartbeat_stop_event.set()
+            self._workflow_selection_owner = None
+            self._script_generation_owner = None
+            self._workflow_start_owner = None
+            project = self._project
+            artifact_paths = [
+                path
+                for owner in lifecycle_owners
+                for path in (
+                    getattr(owner, "source_script_path", None),
+                    getattr(owner, "execution_script_path", None),
+                )
+                if path
+            ]
+            if project is not None:
+                if project.script_path:
+                    artifact_paths.append(project.script_path)
+                if project.pending and project.pending.script_path:
+                    artifact_paths.append(project.pending.script_path)
+        for owner in lifecycle_owners:
+            delivery_lock = getattr(owner, "delivery_lock", None)
+            if delivery_lock is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                acquired = delivery_lock.acquire(timeout=remaining)
+                if acquired:
+                    delivery_lock.release()
+                else:
+                    quiesced = False
+            done_event = getattr(owner, "done_event", None)
+            claimed_event = getattr(owner, "claimed_event", None)
+            worker_started_event = getattr(
+                owner,
+                "worker_started_event",
+                None,
+            )
+            if (
+                done_event is not None
+                and (claimed_event is None or not claimed_event.is_set())
+                and (worker_started_event is None or not worker_started_event.is_set())
+            ):
+                done_event.set()
 
         # Ensure any lingering heartbeat thread is stopped (best-effort).
         try:
@@ -279,27 +385,94 @@ class WorkflowEngine(BaseEngine):
         except Exception as e:
             logger.debug("Heartbeat stop during cleanup failed: %s", str(e))
 
+        # For an active run, only request cancellation here. Its execution
+        # owner is the sole thread allowed to drain/null the bridge and publish
+        # IDLE. This keeps manager cleanup bounded even if an ACP worker ignores
+        # cancellation. An orphaned bridge without an execution owner can be
+        # drained directly within the shared cleanup deadline.
+        bridge = self._bridge
+        if bridge is not None:
+            try:
+                bridge.stop()
+                if not run_was_active:
+                    wait_for_workers = getattr(
+                        bridge,
+                        "wait_for_workers",
+                        None,
+                    )
+                    if callable(wait_for_workers):
+                        remaining = max(
+                            0.0,
+                            deadline - time.monotonic(),
+                        )
+                        if wait_for_workers(timeout=remaining) is False:
+                            quiesced = False
+            except Exception:
+                logger.debug(
+                    "WorkflowEngine bridge stop failed",
+                    exc_info=True,
+                )
+                quiesced = False
+            if not run_was_active and quiesced and self._bridge is bridge:
+                self._bridge = None
+
         # Release AgentExecutor thread pool (prevents thread leak across runs).
-        if self._executor is not None:
+        if not run_was_active and quiesced and self._executor is not None:
             try:
                 self._executor.shutdown(wait=False)
             except Exception:
                 logger.debug("WorkflowEngine executor shutdown failed")
             self._executor = None
 
-        # Release bridge thread pools (agent calls + sub-workflow calls).
-        if self._bridge is not None:
-            try:
-                self._bridge.stop()
-            except Exception:
-                logger.debug("WorkflowEngine bridge stop failed")
-            self._bridge = None
+        for artifact_path in dict.fromkeys(artifact_paths):
+            _remove_owned_script_artifact(artifact_path, self.root_path)
 
         # Clear request_id → label mapping to prevent cross-run leaks
         with self._request_to_label_lock:
             self._request_to_label.clear()
 
         super().cleanup()
+
+        current_thread_id = threading.get_ident()
+        for owner in lifecycle_owners:
+            claimed_event = getattr(owner, "claimed_event", None)
+            worker_started_event = getattr(
+                owner,
+                "worker_started_event",
+                None,
+            )
+            done_event = getattr(owner, "done_event", None)
+            worker_thread_id = getattr(owner, "worker_thread_id", None)
+            has_worker = bool(
+                (claimed_event is not None and claimed_event.is_set())
+                or (worker_started_event is not None and worker_started_event.is_set())
+            )
+            if not has_worker or done_event is None:
+                continue
+            if worker_thread_id == current_thread_id:
+                quiesced = False
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            if not done_event.wait(timeout=remaining):
+                quiesced = False
+
+        if run_was_active:
+            if run_thread_id == current_thread_id:
+                quiesced = False
+            else:
+                remaining = max(0.0, deadline - time.monotonic())
+                if not self._run_done_event.wait(timeout=remaining):
+                    quiesced = False
+        if not quiesced:
+            logger.warning("WorkflowEngine cleanup timed out before worker quiescence")
+        else:
+            with self._lock:
+                self._retired_lifecycle_owners = [
+                    owner
+                    for owner in self._retired_lifecycle_owners
+                    if not any(owner is cleaned_owner for cleaned_owner in lifecycle_owners)
+                ]
+        return quiesced
 
     # ------------------------------------------------------------------
     # Main execution entry point
@@ -313,6 +486,8 @@ class WorkflowEngine(BaseEngine):
         *,
         selected_tools: Optional[list[str]] = None,
         initiator_user_id: Optional[str] = None,
+        start_owner: Any = None,
+        source_script_path: Optional[str] = None,
     ) -> WorkflowProject:
         """Execute a workflow script end-to-end.
 
@@ -321,6 +496,8 @@ class WorkflowEngine(BaseEngine):
             script_path: Absolute path to the .js workflow script.
             callbacks: Optional event callbacks for progress/completion.
             selected_tools: Optional tool whitelist; agents may only use these tools.
+            start_owner: Optional handler lifecycle token for a queued start.
+            source_script_path: Stable generated source retained for save/reuse.
 
         Returns:
             The final WorkflowProject with status, metrics, and result.
@@ -328,15 +505,7 @@ class WorkflowEngine(BaseEngine):
         Raises:
             RuntimeError: If Node.js is unavailable or the bridge fails fatally.
         """
-        self._callbacks = callbacks or WorkflowEngineCallbacks()
-        # WorkflowEngine instances are intentionally reused by the manager for
-        # the same chat/root path. A previous stop() leaves the event set; every
-        # new run must start with a clean cancellation boundary. Clear under
-        # self._lock to establish happens-before with _on_stop() which also
-        # acquires self._lock before setting the event.
-        with self._lock:
-            self._cancel_event.clear()
-            self._agent_call_count = 0
+        run_callbacks = callbacks or WorkflowEngineCallbacks()
 
         # Parse meta from the generated script so we can honor meta.maxConcurrent
         # before the bridge / executor thread pools are created.
@@ -367,7 +536,7 @@ class WorkflowEngine(BaseEngine):
             workflow_id=workflow_id,
             status=WorkflowStatus.RUNNING,
             requirement=requirement,
-            script_path=script_path,
+            script_path=source_script_path or script_path,
             meta=script_meta,
             metrics=WorkflowMetrics(),
             started_at=time.time(),
@@ -375,51 +544,172 @@ class WorkflowEngine(BaseEngine):
             initiator_user_id=initiator_user_id,
         )
 
+        # Claim a queued start and publish runtime state in one critical
+        # section. If /stop_wf won the race, do not clear its cancellation or
+        # replace the IDLE project with a new RUNNING one.
+        start_rejected = False
+        rejected_active_owner = False
+        rejected_due_running = False
+        rejected_project: Optional[WorkflowProject] = None
+        previous_source_path: str | None = None
         with self._lock:
-            self._project = project
-            self._run_state = EngineRunState.RUNNING
+            if self._closing:
+                logger.info("[WorkflowEngine] Dropping start while engine is closing")
+                start_rejected = True
+                rejected_project = self._project or WorkflowProject()
+            elif self._run_state != EngineRunState.IDLE:
+                logger.info("[WorkflowEngine] Dropping duplicate/concurrent start")
+                start_rejected = True
+                rejected_due_running = True
+                rejected_active_owner = bool(
+                    start_owner is not None
+                    and self._workflow_start_owner is start_owner
+                    and start_owner.claimed_event.is_set()
+                )
+                rejected_project = self._project or WorkflowProject()
+            elif start_owner is not None:
+                current_owner = self._workflow_start_owner
+                if (
+                    current_owner is not start_owner
+                    or start_owner.stop_event.is_set()
+                    or start_owner.claimed_event.is_set()
+                ):
+                    if current_owner is start_owner:
+                        self._retire_lifecycle_owner_locked(
+                            start_owner,
+                        )
+                        self._workflow_start_owner = None
+                    logger.info("[WorkflowEngine] Dropping cancelled queued start")
+                    start_rejected = True
+                    rejected_project = self._project or WorkflowProject()
+                else:
+                    start_owner.claimed_event.set()
+                    worker_started_event = getattr(
+                        start_owner,
+                        "worker_started_event",
+                        None,
+                    )
+                    if worker_started_event is not None:
+                        worker_started_event.set()
+                    try:
+                        object.__setattr__(
+                            start_owner,
+                            "worker_thread_id",
+                            threading.get_ident(),
+                        )
+                    except Exception:
+                        pass
+            if not start_rejected:
+                # WorkflowEngine instances are reused for the same chat/root
+                # path. A prior completed/cancelled run leaves this event set;
+                # only the lifecycle winner may establish the new boundary.
+                previous_project = self._project
+                if (
+                    previous_project is not None
+                    and previous_project.status
+                    in {
+                        WorkflowStatus.COMPLETED,
+                        WorkflowStatus.FAILED,
+                        WorkflowStatus.CANCELLED,
+                    }
+                    and previous_project.script_path != project.script_path
+                ):
+                    previous_source_path = previous_project.script_path
+                self._cancel_event.clear()
+                self._agent_call_count = 0
+                # Per-run components must never leak into constructor-error
+                # handling for the next run.
+                self._bridge = None
+                self._journal = None
+                self._executor = None
+                self._renderer_wf = None
+                self._state_manager = None
+                self._progress_coalescer = None
+                self._callbacks = run_callbacks
+                self._project = project
+                self._run_state = EngineRunState.RUNNING
+                self._run_thread_id = threading.get_ident()
+                self._run_done_event.clear()
 
-        # Initialize components
-        self._journal = WorkflowJournal(self.root_path, workflow_id)
-        self._executor = AgentExecutor(
-            cwd=self.root_path,
-            cancel_event=self._cancel_event,
-            max_workers=max_concurrent,
-            on_activity=self._handle_agent_activity,
+        if start_rejected:
+            if not rejected_active_owner and not (rejected_due_running and start_owner is None):
+                _remove_owned_script_artifact(script_path, self.root_path)
+                done_event = getattr(start_owner, "done_event", None)
+                if done_event is not None:
+                    done_event.set()
+            return rejected_project or WorkflowProject()
+
+        _remove_owned_script_artifact(
+            previous_source_path,
+            self.root_path,
         )
-        self._state_manager = WorkflowStateManager(project)
-        self._renderer_wf = WorkflowProgressRenderer(project)
-
-        # Initialize progress coalescer (debounced card updates)
-        if self._callbacks and self._callbacks.on_progress:
-            self._progress_coalescer = ProgressCoalescer(
-                on_progress=self._callbacks.on_progress,
-            )
+        with self._request_to_label_lock:
+            self._request_to_label.clear()
 
         try:
+            # Initialize components inside the lifecycle guard so constructor
+            # failures cannot strand RUNNING state or a queued-start owner.
+            self._journal = WorkflowJournal(self.root_path, workflow_id)
+            self._executor = AgentExecutor(
+                cwd=self.root_path,
+                cancel_event=self._cancel_event,
+                max_workers=max_concurrent,
+                on_activity=self._handle_agent_activity,
+            )
+            self._state_manager = WorkflowStateManager(project)
+            self._renderer_wf = WorkflowProgressRenderer(project)
+
+            # Initialize progress coalescer (debounced card updates)
+            if self._callbacks and self._callbacks.on_progress:
+                self._progress_coalescer = ProgressCoalescer(
+                    on_progress=self._callbacks.on_progress,
+                )
+
             # Check Node.js availability
             if not RuntimeBridge.check_node_available():
                 raise RuntimeError(_node_version_required_text())
 
-            # Create and start the bridge
-            self._bridge = RuntimeBridge(
-                script_path=script_path,
-                cwd=self.root_path,
-                max_concurrent=max_concurrent,
-                on_agent_call=self._handle_agent_call,
-                on_agent_aborted=self._handle_agent_aborted,
-                on_phase=self._handle_phase,
-                on_log=self._handle_log,
-                cancel_event=self._cancel_event,
-                allowed_tools=selected_tools,
-                initiator_user_id=project.initiator_user_id,
-            )
-            self._bridge.start()
+            # Publish the bridge under the engine lock, then let its own
+            # lifecycle gate protect the potentially slow Node readiness wait.
+            # stop() can therefore cancel a hung start without waiting for
+            # this engine lock, while RuntimeBridge guarantees no post-stop
+            # subprocess or executor publication.
+            with self._lock:
+                if self._cancel_event.is_set() or (
+                    start_owner is not None
+                    and (self._workflow_start_owner is not start_owner or start_owner.stop_event.is_set())
+                ):
+                    raise RuntimeError("Workflow cancelled")
+                self._bridge = RuntimeBridge(
+                    script_path=script_path,
+                    cwd=self.root_path,
+                    max_concurrent=max_concurrent,
+                    on_agent_call=self._handle_agent_call,
+                    on_agent_aborted=self._handle_agent_aborted,
+                    on_phase=self._handle_phase,
+                    on_log=self._handle_log,
+                    cancel_event=self._cancel_event,
+                    allowed_tools=selected_tools,
+                    initiator_user_id=project.initiator_user_id,
+                )
+                bridge = self._bridge
 
-            # Start the progress heartbeat so the card (and the new elapsed
-            # counters) keep refreshing while the bridge blocks on a long
-            # agent() call. Stopped in the finally: block below.
-            self._start_heartbeat()
+            bridge.start()
+
+            with self._lock:
+                if (
+                    self._bridge is not bridge
+                    or self._cancel_event.is_set()
+                    or (
+                        start_owner is not None
+                        and (self._workflow_start_owner is not start_owner or start_owner.stop_event.is_set())
+                    )
+                ):
+                    raise RuntimeError("Workflow cancelled")
+                # Start the heartbeat before releasing the same lifecycle
+                # lock. stop() can therefore either cancel both resources or
+                # win before either one is started.
+                self._start_heartbeat()
 
             # Run the event loop (blocks until done/error/timeout)
             result_text = self._bridge.run()
@@ -427,12 +717,41 @@ class WorkflowEngine(BaseEngine):
             terminal_failure = _terminal_failure_from_result(result_text)
             if terminal_failure is None and self._state_manager is not None:
                 terminal_failure = _terminal_failure_from_project(self._state_manager.snapshot())
-            if terminal_failure:
+
+            # The terminal state commit shares the same engine lock as
+            # stop(). Exactly one side wins: a stopped owner cannot publish a
+            # later COMPLETED/FAILED state.
+            with self._lock:
+                owner_cancelled = bool(
+                    self._cancel_event.is_set()
+                    or (
+                        start_owner is not None
+                        and (self._workflow_start_owner is not start_owner or start_owner.stop_event.is_set())
+                    )
+                )
+                if owner_cancelled:
+                    project.status = WorkflowStatus.CANCELLED
+                    project.error = "Workflow cancelled"
+                    project.finished_at = time.time()
+                    terminal_outcome = "cancelled"
+                elif terminal_failure:
+                    sanitized_error = _strip_internal_details(terminal_failure)
+                    project.result = result_text
+                    project.status = WorkflowStatus.FAILED
+                    project.error = sanitized_error
+                    project.finished_at = time.time()
+                    terminal_outcome = "failed"
+                else:
+                    project.result = result_text
+                    project.status = WorkflowStatus.COMPLETED
+                    project.finished_at = time.time()
+                    terminal_outcome = "completed"
+
+            if terminal_outcome == "cancelled":
+                self._state_manager.on_workflow_cancelled("Workflow cancelled")
+                return project
+            if terminal_outcome == "failed":
                 sanitized_error = _strip_internal_details(terminal_failure)
-                project.result = result_text
-                project.status = WorkflowStatus.FAILED
-                project.error = sanitized_error
-                project.finished_at = time.time()
                 self._state_manager.on_workflow_failed(terminal_failure)
 
                 logger.error("[WorkflowEngine:%s] Failed: %s", workflow_id, terminal_failure)
@@ -443,9 +762,6 @@ class WorkflowEngine(BaseEngine):
                 return project
 
             # Success path
-            project.result = result_text
-            project.status = WorkflowStatus.COMPLETED
-            project.finished_at = time.time()
             # AC4: 仅最终汇总结果计入主 context 增量（字符估算（以字符数作为 token 的近似）。
             # 中间 agent 输出不得通过其他路径进入主 context。
             if self._state_manager:
@@ -466,16 +782,28 @@ class WorkflowEngine(BaseEngine):
         except RuntimeError as e:
             error_msg = str(e)
             sanitized_error = _strip_internal_details(error_msg)
-            if self._cancel_event.is_set():
-                project.status = WorkflowStatus.CANCELLED
-                project.error = "Workflow cancelled"
-                project.finished_at = time.time()
-                self._state_manager.on_workflow_cancelled("Workflow cancelled")
+            with self._lock:
+                runtime_cancelled = bool(
+                    self._cancel_event.is_set()
+                    or (
+                        start_owner is not None
+                        and (self._workflow_start_owner is not start_owner or start_owner.stop_event.is_set())
+                    )
+                )
+                if runtime_cancelled:
+                    project.status = WorkflowStatus.CANCELLED
+                    project.error = "Workflow cancelled"
+                    project.finished_at = time.time()
+                else:
+                    project.status = WorkflowStatus.FAILED
+                    project.error = sanitized_error
+                    project.finished_at = time.time()
+            if runtime_cancelled:
+                if self._state_manager:
+                    self._state_manager.on_workflow_cancelled("Workflow cancelled")
             else:
-                project.status = WorkflowStatus.FAILED
-                project.error = sanitized_error
-                project.finished_at = time.time()
-                self._state_manager.on_workflow_failed(error_msg)
+                if self._state_manager:
+                    self._state_manager.on_workflow_failed(error_msg)
 
             logger.error("[WorkflowEngine:%s] Failed: %s", workflow_id, error_msg)
 
@@ -486,11 +814,27 @@ class WorkflowEngine(BaseEngine):
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
             sanitized_error = _strip_internal_details(error_msg)
-            project.status = WorkflowStatus.FAILED
-            project.error = sanitized_error
-            project.finished_at = time.time()
+            with self._lock:
+                runtime_cancelled = bool(
+                    self._cancel_event.is_set()
+                    or (
+                        start_owner is not None
+                        and (self._workflow_start_owner is not start_owner or start_owner.stop_event.is_set())
+                    )
+                )
+                if runtime_cancelled:
+                    project.status = WorkflowStatus.CANCELLED
+                    project.error = "Workflow cancelled"
+                    project.finished_at = time.time()
+                else:
+                    project.status = WorkflowStatus.FAILED
+                    project.error = sanitized_error
+                    project.finished_at = time.time()
             if self._state_manager:
-                self._state_manager.on_workflow_failed(error_msg)
+                if runtime_cancelled:
+                    self._state_manager.on_workflow_cancelled("Workflow cancelled")
+                else:
+                    self._state_manager.on_workflow_failed(error_msg)
 
             logger.exception("[WorkflowEngine:%s] Unexpected error", workflow_id)
 
@@ -499,6 +843,7 @@ class WorkflowEngine(BaseEngine):
                 self._callbacks.on_error(sanitized_error)
 
         finally:
+            bridge_quiesced = True
             # Stop the progress heartbeat before flushing the final card so no
             # stray re-render races the terminal render below.
             self._stop_heartbeat()
@@ -508,20 +853,48 @@ class WorkflowEngine(BaseEngine):
                 self._progress_coalescer.stop()
 
             # Cleanup bridge
-            if self._bridge:
+            bridge = self._bridge
+            if bridge:
                 try:
-                    self._bridge.stop()
+                    bridge.stop()
+                    wait_for_workers = getattr(
+                        bridge,
+                        "wait_for_workers",
+                        None,
+                    )
+                    if callable(wait_for_workers):
+                        if wait_for_workers() is False:
+                            bridge_quiesced = False
                 except Exception:
-                    pass
-                self._bridge = None
+                    bridge_quiesced = False
+                    logger.debug(
+                        "WorkflowEngine bridge quiescence failed",
+                        exc_info=True,
+                    )
+                if bridge_quiesced and self._bridge is bridge:
+                    self._bridge = None
 
             # Release AgentExecutor thread pool (prevents thread leak across runs)
-            if self._executor:
+            if bridge_quiesced and self._executor:
                 try:
-                    self._executor.shutdown(wait=False)
+                    self._executor.shutdown(wait=True)
                 except Exception:
+                    bridge_quiesced = False
                     logger.debug("WorkflowEngine executor shutdown (finally) failed")
-                self._executor = None
+                if bridge_quiesced:
+                    self._executor = None
+
+            source_path = getattr(start_owner, "source_script_path", None)
+            if source_path and project.status in {
+                WorkflowStatus.CANCELLED,
+                WorkflowStatus.FAILED,
+            }:
+                _remove_owned_script_artifact(
+                    source_path,
+                    self.root_path,
+                )
+                if project.script_path == source_path:
+                    project.script_path = None
 
             # Persist state
             try:
@@ -536,8 +909,49 @@ class WorkflowEngine(BaseEngine):
             except Exception as hist_err:
                 logger.debug("Failed to record workflow history: %s", hist_err)
 
+            execution_path = getattr(
+                start_owner,
+                "execution_script_path",
+                None,
+            )
+            if execution_path and execution_path == script_path:
+                _remove_owned_script_artifact(
+                    execution_path,
+                    self.root_path,
+                )
+            done_event = getattr(start_owner, "done_event", None)
+            if done_event is not None:
+                done_event.set()
+            if not bridge_quiesced and start_owner is not None:
+                stop_event = getattr(start_owner, "stop_event", None)
+                if stop_event is not None:
+                    stop_event.set()
+                heartbeat_stop_event = getattr(
+                    start_owner,
+                    "heartbeat_stop_event",
+                    None,
+                )
+                if heartbeat_stop_event is not None:
+                    heartbeat_stop_event.set()
             with self._lock:
-                self._run_state = EngineRunState.IDLE
+                if bridge_quiesced and (start_owner is not None and self._workflow_start_owner is start_owner):
+                    self._workflow_start_owner = None
+                self._run_thread_id = None
+                self._run_done_event.set()
+                if bridge_quiesced:
+                    # Publish IDLE last: a new run cannot claim shared
+                    # component fields until prior cleanup is complete.
+                    self._run_state = EngineRunState.IDLE
+                else:
+                    # Fail closed. cleanup() can retry the bounded bridge
+                    # drain later, but this instance must never be reused.
+                    self._closing = True
+                    self._run_state = EngineRunState.STOPPING
+            if not bridge_quiesced:
+                logger.error(
+                    "[WorkflowEngine:%s] Worker quiescence failed; engine retained as a closing tombstone",
+                    workflow_id,
+                )
 
         return project
 
@@ -548,8 +962,9 @@ class WorkflowEngine(BaseEngine):
     def _on_stop(self) -> None:
         """Cancel workflow execution when stop() is called.
 
-        Also shuts down the AgentExecutor's shared thread pool to avoid
-        lingering threads after a cancelled run.
+        The owning execute thread drains the bridge and AgentExecutor before
+        publishing IDLE; this method only signals cancellation so stop()
+        remains responsive.
         """
         self._cancel_event.set()
         # Best-effort: ensure the heartbeat cannot outlive a stop() call.
@@ -557,11 +972,6 @@ class WorkflowEngine(BaseEngine):
         if self._bridge:
             try:
                 self._bridge.stop()
-            except Exception:
-                pass
-        if self._executor:
-            try:
-                self._executor.shutdown(wait=False)
             except Exception:
                 pass
 

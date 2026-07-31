@@ -693,6 +693,123 @@ def test_stop_is_idempotent(tmp_path):
     assert bridge._shutdown_done is True
 
 
+def test_wait_for_workers_drains_futures_after_nonblocking_stop(tmp_path):
+    """The execution owner can turn stop() into a true quiescence barrier."""
+    bridge = _make_bridge(tmp_path)
+    bridge._executor = ThreadPoolExecutor(max_workers=1)
+    bridge._workflow_executor = ThreadPoolExecutor(max_workers=1)
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    wait_started = threading.Event()
+    wait_done = threading.Event()
+
+    def blocking_worker():
+        worker_started.set()
+        assert release_worker.wait(timeout=2)
+
+    future = bridge._executor.submit(blocking_worker)
+    with bridge._futures_lock:
+        bridge._active_futures.add(future)
+    future.add_done_callback(bridge._discard_future)
+    assert worker_started.wait(timeout=1)
+
+    bridge.stop()
+
+    def wait_for_workers():
+        wait_started.set()
+        bridge.wait_for_workers()
+        wait_done.set()
+
+    waiter = threading.Thread(target=wait_for_workers)
+    waiter.start()
+    assert wait_started.wait(timeout=1)
+    assert not wait_done.wait(timeout=0.05)
+
+    release_worker.set()
+    waiter.join(timeout=1)
+
+    assert not waiter.is_alive()
+    assert wait_done.is_set()
+
+
+def test_start_after_stop_never_spawns_node(tmp_path, monkeypatch):
+    """A pre-stopped child bridge must fail before subprocess creation."""
+    bridge = _make_bridge(tmp_path)
+    popen = MagicMock()
+    monkeypatch.setattr(bridge_mod.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(bridge_mod.subprocess, "Popen", popen)
+
+    bridge.stop()
+
+    with pytest.raises(RuntimeError, match="cancelled before start"):
+        bridge.start()
+
+    popen.assert_not_called()
+
+
+def test_parent_drain_waits_for_failed_subworkflow_cleanup(
+    tmp_path,
+    monkeypatch,
+):
+    """A child exception cannot let the parent release its run boundary."""
+    template_dir = tmp_path / ".ghostap" / "workflows"
+    template_dir.mkdir(parents=True)
+    (template_dir / "failing-child.js").write_text(
+        'export const meta = {"tools": []};\n',
+        encoding="utf-8",
+    )
+    parent = _make_bridge(tmp_path)
+    parent._workflow_executor = ThreadPoolExecutor(max_workers=1)
+    child_wait_started = threading.Event()
+    release_child = threading.Event()
+    parent_wait_done = threading.Event()
+    child = None
+
+    class FailingChild:
+        def __init__(self, *args, **kwargs):
+            nonlocal child
+            child = self
+            self.stop_called = False
+
+        def start(self):
+            return None
+
+        def run(self):
+            raise RuntimeError("child exploded")
+
+        def stop(self):
+            self.stop_called = True
+
+        def wait_for_workers(self):
+            child_wait_started.set()
+            assert release_child.wait(timeout=2)
+
+    monkeypatch.setattr(bridge_mod, "RuntimeBridge", FailingChild)
+    parent._send = MagicMock()
+    parent._handle_workflow_call(
+        {"name": "failing-child"},
+        request_id="sub-1",
+    )
+    assert child_wait_started.wait(timeout=1)
+
+    def drain_parent():
+        parent.wait_for_workers()
+        parent_wait_done.set()
+
+    waiter = threading.Thread(target=drain_parent)
+    waiter.start()
+    assert not parent_wait_done.wait(timeout=0.05)
+    assert child is not None
+    assert child.stop_called is True
+
+    release_child.set()
+    waiter.join(timeout=1)
+    parent.stop()
+
+    assert not waiter.is_alive()
+    assert parent_wait_done.is_set()
+
+
 # ---------------------------------------------------------------------------
 # 8. Backpressure rejects when active futures exceed pressure cap
 # ---------------------------------------------------------------------------

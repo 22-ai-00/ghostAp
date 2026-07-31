@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 from src.card.render.buttons import build_responsive_button_row
@@ -24,6 +27,32 @@ logger = logging.getLogger(__name__)
 _WORKFLOW_MODEL_CACHE_TTL_S = 5 * 60
 _WORKFLOW_MODEL_PREHEAT_LIMIT = 2
 _WORKFLOW_ACP_MODEL_TOOLS = {"coco", "claude", "aiden", "codex", "gemini", "traex"}
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkflowLifecycleOwner:
+    """Linearization token shared by generation, card delivery, and queued start."""
+
+    session_key: str
+    initiator_user_id: str = ""
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    heartbeat_stop_event: threading.Event = field(default_factory=threading.Event)
+    delivery_lock: Any = field(default_factory=threading.RLock)
+    source_script_path: str | None = None
+    execution_script_path: str | None = None
+    done_event: threading.Event = field(default_factory=threading.Event)
+    claimed_event: threading.Event = field(default_factory=threading.Event)
+    worker_started_event: threading.Event = field(
+        default_factory=threading.Event,
+    )
+    worker_thread_id: int | None = field(
+        default=None,
+        compare=False,
+    )
+
+
+class _WorkflowGenerationCancelled(RuntimeError):
+    """Internal control flow: a superseded generator must not write fallback."""
 
 
 def _workflow_pending_statuses():
@@ -63,9 +92,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
     # ------------------------------------------------------------------
     # Topic-engine free-text entry point
     # ------------------------------------------------------------------
-    def handle_message(
-        self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None
-    ):
+    def handle_message(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
         """Handle free-text messages when auto_enter_mode == 'workflow'.
 
         Treats the entire text as a workflow requirement and starts generation.
@@ -157,8 +184,6 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             "tag": "markdown",
             "content": f"**{header}**\n" + "\n".join(lines),
         }
-
-
 
     def _get_task_type(self) -> str:
         return "workflow_engine"
@@ -294,17 +319,19 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         project_id = project.project_id if project else ""
 
         elements: list[dict[str, Any]] = []
-        elements.append({
-            "tag": "markdown",
-            "content": (
-                "**请在下方聊天框中直接输入你想让 Workflow 完成的任务描述**\n\n"
-                "本聊天已切换到 Workflow 编排模式，下一条消息会被当作需求描述自动进入编排流程。\n\n"
-                "示例：\n"
-                "• `审查 src/handlers 目录中的错误处理一致性`\n"
-                "• `为 feature-checkout 分支生成端到端集成测试`\n\n"
-                "也可以直接发送：\n`/wf <你的任务描述>`"
-            ),
-        })
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": (
+                    "**请在下方聊天框中直接输入你想让 Workflow 完成的任务描述**\n\n"
+                    "本聊天已切换到 Workflow 编排模式，下一条消息会被当作需求描述自动进入编排流程。\n\n"
+                    "示例：\n"
+                    "• `审查 src/handlers 目录中的错误处理一致性`\n"
+                    "• `为 feature-checkout 分支生成端到端集成测试`\n\n"
+                    "也可以直接发送：\n`/wf <你的任务描述>`"
+                ),
+            }
+        )
         elements.append({"tag": "hr"})
 
         cancel_value = {
@@ -365,40 +392,19 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         # Check for existing running workflow
         existing = self.ctx.workflow_engine_manager.get(chat_id, root_path)
-        if existing and existing.is_running:
+        if existing and existing.is_running is True:
             self._reply_workflow_error(
                 message_id,
                 "invalid_state",
                 detail="当前项目已有 Workflow 任务在执行中。发送 `/wf_status` 查看进度，或 `/stop_wf` 停止任务。",
             )
             return
-        import time as _time
 
-        from ...workflow_engine.models import WorkflowStatus
-
-        _STALE_THRESHOLD_S = 30 * 60
-        if existing and existing.project and existing.project.status in _workflow_pending_statuses():
-            pending = existing.project.pending
-            created_at = getattr(pending, "created_at", 0) if pending else 0
-            if _time.time() - created_at > _STALE_THRESHOLD_S:
-                logger.info(
-                    "[Workflow] Auto-resetting stale pending state (status=%s, age=%.0fs) in menu handler",
-                    existing.project.status.value, _time.time() - created_at,
-                )
-                existing.project.status = WorkflowStatus.IDLE
-                existing.project.pending = None
-            else:
-                self._reply_workflow_error(
-                    message_id,
-                    "invalid_state",
-                    detail="已有 Workflow 等待操作。请先完成或取消当前流程后再开始新任务。",
-                )
-                return
-
-        # Check if requirement is already provided
+        # Merely opening the requirement prompt does not own a Workflow
+        # lifecycle yet.  Admission happens only once a concrete requirement
+        # exists, so an abandoned entry card cannot block another user.
         has_requirement = bool(value and isinstance(value, dict) and (value.get("requirement") or "").strip())
         if not has_requirement:
-            # Prompt user to enter requirement inline via structured input
             self._show_requirement_input_card(
                 message_id=message_id,
                 chat_id=chat_id,
@@ -407,13 +413,49 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             )
             return
 
+        from ...thread import get_current_sender_id
+
+        admission_engine = existing or self.ctx.workflow_engine_manager.get_or_create(
+            chat_id,
+            root_path,
+            engine_name=self.get_engine_name(
+                chat_id,
+                project_id=(project.project_id if project else None),
+            ),
+        )
+        (
+            takeover_ok,
+            takeover_error,
+            admission_owner,
+        ) = self._supersede_incomplete_workflow(
+            admission_engine,
+            root_path=root_path,
+            current_user=get_current_sender_id() or "",
+        )
+        if not takeover_ok:
+            if takeover_error == "forbidden":
+                self._reply_workflow_error(
+                    message_id,
+                    "forbidden",
+                    detail="只能替换自己发起的未完成 Workflow；管理员可代为处理。",
+                )
+            else:
+                self._reply_workflow_error(
+                    message_id,
+                    "invalid_state",
+                    detail=("当前项目已有 Workflow 任务在执行中。发送 `/wf_status` 查看进度，或 `/stop_wf` 停止任务。"),
+                )
+            return
+
         requirement = (value.get("requirement") or "").strip()
 
         self._show_agent_selection_card(
+            message_id=message_id,
             chat_id=chat_id,
             requirement=requirement,
             project=project,
             root_path=root_path,
+            admission_owner=admission_owner,
         )
 
     def handle_workflow_list_templates(
@@ -468,40 +510,13 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         # Check for existing running workflow
         existing = self.ctx.workflow_engine_manager.get(chat_id, root_path)
-        if existing and existing.is_running:
+        if existing and existing.is_running is True:
             self._reply_workflow_error(
                 message_id,
                 "invalid_state",
                 detail="当前项目已有 Workflow 任务在执行中。发送 `/wf_status` 查看进度，或 `/stop_wf` 停止任务。",
             )
             return
-
-        # Auto-reset stale pending state (>30 min) so user can start fresh;
-        # recent pending states are blocked so users don't accidentally discard
-        # an in-progress selection flow.
-        import time as _time
-
-        from ...workflow_engine.models import WorkflowStatus
-
-        _STALE_THRESHOLD_S = 30 * 60
-        _AWAITING_STATES = _workflow_pending_statuses()
-        if existing and existing.project and existing.project.status in _AWAITING_STATES:
-            pending = existing.project.pending
-            created_at = getattr(pending, "created_at", 0) if pending else 0
-            if _time.time() - created_at > _STALE_THRESHOLD_S:
-                logger.info(
-                    "[Workflow] Auto-resetting stale pending state (status=%s, age=%.0fs) for %s",
-                    existing.project.status.value, _time.time() - created_at, root_path,
-                )
-                existing.project.status = WorkflowStatus.IDLE
-                existing.project.pending = None
-            else:
-                self._reply_workflow_error(
-                    message_id,
-                    "invalid_state",
-                    detail="已有 Workflow 等待操作。请先完成或取消当前流程后再开始新任务。",
-                )
-                return
 
         # Check Node.js availability
         from ...workflow_engine.bridge import RuntimeBridge
@@ -532,6 +547,43 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             )
             return
 
+        # Newest-wins applies only before the runtime thread has claimed the
+        # reusable engine. The same initiator (or an admin) may discard an old
+        # selection/generation/queued start; another user's task is protected.
+        from ...thread import get_current_sender_id
+
+        admission_engine = existing or self.ctx.workflow_engine_manager.get_or_create(
+            chat_id,
+            root_path,
+            engine_name=self.get_engine_name(
+                chat_id,
+                project_id=(project.project_id if project else None),
+            ),
+        )
+        (
+            takeover_ok,
+            takeover_error,
+            admission_owner,
+        ) = self._supersede_incomplete_workflow(
+            admission_engine,
+            root_path=root_path,
+            current_user=get_current_sender_id() or "",
+        )
+        if not takeover_ok:
+            if takeover_error == "forbidden":
+                self._reply_workflow_error(
+                    message_id,
+                    "forbidden",
+                    detail="只能替换自己发起的未完成 Workflow；管理员可代为处理。",
+                )
+            else:
+                self._reply_workflow_error(
+                    message_id,
+                    "invalid_state",
+                    detail=("当前项目已有 Workflow 任务在执行中。发送 `/wf_status` 查看进度，或 `/stop_wf` 停止任务。"),
+                )
+            return
+
         self.add_reaction(message_id, EmojiReaction.on_multi_task_start())
 
         # Bind engine mode to topic for auto-routing
@@ -558,39 +610,39 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         template_name = parts[0] if parts else ""
         try:
             templates = discover_templates(root_path, user_id=sender_id)
-            template_names = {t.name for t in templates}
-            is_template = template_name in template_names
+            is_template = template_name in {t.name for t in templates}
         except Exception:
             # Template discovery failure should not block the workflow;
             # just treat this as an AI generation path.
-            template_names = set()
             is_template = False
 
         # Initialize pending state early so we can mark this as a
         # template launch (needed for default tool selection hint).
-        engine_name = self.get_engine_name(
-            chat_id, project_id=(project.project_id if project else None)
-        )
-        pre_engine = self.ctx.workflow_engine_manager.get_or_create(
-            chat_id,
-            root_path,
-            engine_name=engine_name,
-        )
-        if is_template and pre_engine.project:
-            pending = pre_engine.project.pending
-            if pending is None:
-                from ...workflow_engine.models import PendingConfirmation
+        pre_engine = admission_engine
+        if is_template:
+            with pre_engine._lock:
+                if (
+                    vars(pre_engine).get("_workflow_selection_owner") is not admission_owner
+                    or admission_owner is None
+                    or admission_owner.stop_event.is_set()
+                ):
+                    return
+                pending = pre_engine.project.pending if pre_engine.project else None
+                if pending is None:
+                    from ...workflow_engine.models import PendingConfirmation
 
-                pending = PendingConfirmation()
-                pre_engine.project.pending = pending
-            pending.is_template_hint = template_name
+                    pending = PendingConfirmation()
+                    pre_engine.project.pending = pending
+                pending.is_template_hint = template_name
 
         # Standard three-step flow regardless of template vs AI path.
         self._show_agent_selection_card(
+            message_id=message_id,
             chat_id=chat_id,
             requirement=requirement,
             project=project,
             root_path=root_path,
+            admission_owner=admission_owner,
         )
 
     # ------------------------------------------------------------------
@@ -676,6 +728,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         card_message_id: str | None,
         chat_id: str,
         card: dict[str, Any],
+        origin_message_id: str | None = None,
     ) -> None:
         """Replace an existing workflow card, falling back to a new card.
 
@@ -684,7 +737,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         """
         if card_message_id and self.update_card(card_message_id, card):
             return
-        self.send_card_to_chat(chat_id, card)
+        self.send_card_to_chat(
+            chat_id,
+            card,
+            origin_message_id=origin_message_id,
+        )
 
     @staticmethod
     def _build_workflow_card_from_renderer_data(card_data: dict[str, Any]) -> dict[str, Any]:
@@ -738,6 +795,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         card_message_id: str | None,
         chat_id: str,
         card_data: dict[str, Any],
+        origin_message_id: str | None = None,
+        fallback_to_new: bool = True,
     ) -> str | None:
         """Replace a Workflow renderer card, falling back to a new card.
 
@@ -746,7 +805,13 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         card = self._build_workflow_card_from_renderer_data(card_data)
         if card_message_id and self.update_card(card_message_id, card):
             return card_message_id
-        return self.send_card_to_chat(chat_id, card)
+        if not fallback_to_new:
+            return card_message_id
+        return self.send_card_to_chat(
+            chat_id,
+            card,
+            origin_message_id=origin_message_id,
+        )
 
     def _show_initial_workflow_progress_card(
         self,
@@ -754,6 +819,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         card_message_id: str,
         chat_id: str,
         wf_project: Any,
+        origin_message_id: str | None = None,
     ) -> str:
         """Switch the confirmation card to a running progress card immediately."""
         try:
@@ -765,6 +831,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     card_message_id=card_message_id,
                     chat_id=chat_id,
                     card_data=card_data,
+                    origin_message_id=origin_message_id,
                 )
                 or card_message_id
             )
@@ -818,9 +885,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         from ...workflow_engine.models import PendingConfirmation, WorkflowStatus
 
         # Store pending state
-        engine_name = self.get_engine_name(
-            chat_id, project_id=(project.project_id if project else None)
-        )
+        engine_name = self.get_engine_name(chat_id, project_id=(project.project_id if project else None))
         engine = self.ctx.workflow_engine_manager.get_or_create(
             chat_id,
             root_path,
@@ -828,6 +893,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         )
         if not engine.project:
             from ...workflow_engine.models import WorkflowProject
+
             engine._project = WorkflowProject()
 
         existing_pending = engine.project.pending
@@ -840,7 +906,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 from ...workflow_engine.templates import load_template
 
                 template_content = load_template(
-                    root_path, template_hint,
+                    root_path,
+                    template_hint,
                     user_id=get_current_sender_id() or None,
                 )
                 if template_content:
@@ -909,28 +976,35 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         elements.append(self._build_workflow_stepper(current=2))
 
         # Requirement
-        elements.append({
-            "tag": "markdown",
-            "content": f"**需求**:\n> {requirement[:200]}",
-        })
-        elements.append({
-            "tag": "markdown",
-            "content": "**请选择此 Workflow 允许使用的工具**（脚本生成时将优先使用选中的工具）：",
-        })
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": f"**需求**:\n> {requirement[:200]}",
+            }
+        )
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": "**请选择此 Workflow 允许使用的工具**（脚本生成时将优先使用选中的工具）：",
+            }
+        )
         elements.append({"tag": "hr"})
 
         # Recommended tools section
-        active_tools = set(engine.project.pending.selected_tools) if engine.project and engine.project.pending else set(default_selected)
+        active_tools = (
+            set(engine.project.pending.selected_tools)
+            if engine.project and engine.project.pending
+            else set(default_selected)
+        )
 
         if recommended_tools:
-            rec_display = " | ".join(
-                f"**[✓ `{t}`]**" if t in active_tools else f"`{t}`"
-                for t in recommended_tools
+            rec_display = " | ".join(f"**[✓ `{t}`]**" if t in active_tools else f"`{t}`" for t in recommended_tools)
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": f"⭐ **推荐工具**: {rec_display}",
+                }
             )
-            elements.append({
-                "tag": "markdown",
-                "content": f"⭐ **推荐工具**: {rec_display}",
-            })
 
             rec_buttons = []
             for t in recommended_tools:
@@ -942,21 +1016,20 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     "project_id": project_id,
                     "engine_session_key": session_key,
                 }
-                rec_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": f"{'✓ ' if is_selected else '○ '}{t}"},
-                    "type": "primary" if is_selected else "default",
-                    "value": btn_value,
-                    "behaviors": [{"type": "callback", "value": btn_value}],
-                })
+                rec_buttons.append(
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": f"{'✓ ' if is_selected else '○ '}{t}"},
+                        "type": "primary" if is_selected else "default",
+                        "value": btn_value,
+                        "behaviors": [{"type": "callback", "value": btn_value}],
+                    }
+                )
             elements.extend(build_responsive_button_row(rec_buttons, mobile_force_vertical=True))
 
         # Other tools section
         if other_tools:
-            other_display = " | ".join(
-                f"**[✓ `{t}`]**" if t in active_tools else f"`{t}`"
-                for t in other_tools
-            )
+            other_display = " | ".join(f"**[✓ `{t}`]**" if t in active_tools else f"`{t}`" for t in other_tools)
             other_buttons = []
             for t in other_tools:
                 is_selected = t in active_tools
@@ -967,27 +1040,31 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     "project_id": project_id,
                     "engine_session_key": session_key,
                 }
-                other_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": f"{'✓ ' if is_selected else '○ '}{t}"},
-                    "type": "primary" if is_selected else "default",
-                    "value": btn_value,
-                    "behaviors": [{"type": "callback", "value": btn_value}],
-                })
-            elements.append({
-                "tag": "collapsible_panel",
-                "expanded": False,
-                "header": {
-                    "title": {
-                        "tag": "plain_text",
-                        "content": f"🔧 更多工具 ({len(other_tools)})",
+                other_buttons.append(
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": f"{'✓ ' if is_selected else '○ '}{t}"},
+                        "type": "primary" if is_selected else "default",
+                        "value": btn_value,
+                        "behaviors": [{"type": "callback", "value": btn_value}],
+                    }
+                )
+            elements.append(
+                {
+                    "tag": "collapsible_panel",
+                    "expanded": False,
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": f"🔧 更多工具 ({len(other_tools)})",
+                        },
                     },
-                },
-                "elements": [
-                    {"tag": "markdown", "content": other_display},
-                    *build_responsive_button_row(other_buttons, mobile_force_vertical=True),
-                ],
-            })
+                    "elements": [
+                        {"tag": "markdown", "content": other_display},
+                        *build_responsive_button_row(other_buttons, mobile_force_vertical=True),
+                    ],
+                }
+            )
 
         elements.append({"tag": "hr"})
 
@@ -1027,6 +1104,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         elements.extend(build_responsive_button_row(action_buttons, mobile_force_vertical=True))
 
         from ...card.ui_text import UI_TEXT
+
         tool_select_card = CardBuilder._wrap_card(
             header_title="🔧 Workflow — 选择工具",
             header_template=UI_TEXT["workflow_header_colors"].get("tool_select", "turquoise"),
@@ -1036,10 +1114,13 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
     def _show_agent_selection_card(
         self,
+        message_id: str,
         chat_id: str,
         requirement: str,
         project: Optional["ProjectContext"],
         root_path: str,
+        *,
+        admission_owner: _WorkflowLifecycleOwner | None = None,
     ) -> None:
         """Show orchestrator tool selection card (Step 1 of 2-step flow).
 
@@ -1051,58 +1132,110 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         from ...workflow_engine.models import PendingConfirmation, WorkflowStatus
         from ...workflow_engine.selection_flow import SelectionFlowController
 
-        engine_name = self.get_engine_name(
-            chat_id, project_id=(project.project_id if project else None)
-        )
+        engine_name = self.get_engine_name(chat_id, project_id=(project.project_id if project else None))
         engine = self.ctx.workflow_engine_manager.get_or_create(
             chat_id,
             root_path,
             engine_name=engine_name,
         )
 
-        session_key = uuid.uuid4().hex
-        previous_hint: Optional[str] = None
-        if engine.project and engine.project.pending:
-            previous_hint = getattr(engine.project.pending, "is_template_hint", None)
-
-        if not engine.project:
-            from ...workflow_engine.models import WorkflowProject
-            engine._project = WorkflowProject()
-
-        engine.project.status = WorkflowStatus.AWAITING_AGENT_SELECT
-        engine.project.pending = PendingConfirmation(
-            requirement=requirement,
-            initiator_user_id=get_current_sender_id() or "",
-            engine_session_key=session_key,
-            is_template_hint=previous_hint,
+        current_sender = get_current_sender_id() or ""
+        selection_owner = admission_owner or _WorkflowLifecycleOwner(
+            session_key=uuid.uuid4().hex,
+            initiator_user_id=current_sender,
         )
-
-        # Initialize orchestrator selection controller
+        session_key = selection_owner.session_key
+        previous_owner: _WorkflowLifecycleOwner | None = None
         ctrl = SelectionFlowController()
-        if project is not None:
-            # A fresh /wf must not inherit the previous card's selections.
-            # Selection snapshots are valid only within one pending session.
-            project._wf_selection_controller = ctrl
-            project._wf_selection_snapshot = ctrl.snapshot()
+        with engine._lock:
+            current_owner = vars(engine).get("_workflow_selection_owner")
+            if admission_owner is not None and (
+                current_owner is not admission_owner or admission_owner.stop_event.is_set()
+            ):
+                return
+            if (
+                admission_owner is None
+                and isinstance(current_owner, _WorkflowLifecycleOwner)
+                and current_owner is not selection_owner
+            ):
+                current_owner.stop_event.set()
+                current_owner.heartbeat_stop_event.set()
+                previous_owner = current_owner
+                self._retire_workflow_owner(engine, current_owner)
+            previous_hint: Optional[str] = None
+            if engine.project and engine.project.pending:
+                previous_hint = getattr(
+                    engine.project.pending,
+                    "is_template_hint",
+                    None,
+                )
+
+            if not engine.project:
+                from ...workflow_engine.models import WorkflowProject
+
+                engine._project = WorkflowProject()
+
+            engine.project.status = WorkflowStatus.AWAITING_AGENT_SELECT
+            engine.project.pending = PendingConfirmation(
+                requirement=requirement,
+                initiator_user_id=(selection_owner.initiator_user_id or current_sender),
+                engine_session_key=session_key,
+                is_template_hint=previous_hint,
+            )
+            engine._workflow_selection_owner = selection_owner
+
+            if project is not None:
+                # Selection state belongs to exactly one engine session.  Keep
+                # this write under the engine CAS lock so an older request
+                # cannot overwrite a newer request's controller snapshot.
+                selection_lock = getattr(
+                    project,
+                    "_wf_selection_lock",
+                    None,
+                )
+                if selection_lock is None:
+                    selection_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+                    project._wf_selection_lock = selection_lock
+                with selection_lock:
+                    project._wf_selection_controller = ctrl
+                    project._wf_selection_snapshot = ctrl.snapshot()
+                    project._wf_selection_session_key = session_key
+
+        if previous_owner is not None:
+            with previous_owner.delivery_lock:
+                pass
+            previous_owner.done_event.set()
 
         project_id = project.project_id if project else ""
 
         # Build tool list from available workflow tools
         all_tools, recommended_tools, other_tools, _default = self._resolve_tool_lists()
         if not all_tools:
-            self.send_text_to_chat(chat_id, "当前环境未检测到可用的 Workflow 编程工具，请安装 Traex/Claude/Codex 等 CLI 后重试。")
+            with selection_owner.delivery_lock:
+                with engine._lock:
+                    owner_is_current = bool(
+                        vars(engine).get("_workflow_selection_owner") is selection_owner
+                        and not selection_owner.stop_event.is_set()
+                    )
+                if owner_is_current:
+                    self.send_text_to_chat(
+                        chat_id,
+                        ("当前环境未检测到可用的 Workflow 编程工具，请安装 Traex/Claude/Codex 等 CLI 后重试。"),
+                    )
             return
 
         # Format tools for controller
         available_tools = []
         for tool_name in recommended_tools + other_tools:
-            available_tools.append({
-                "tool_name": tool_name,
-                "display_name": tool_name,
-                "description": all_tools.get(tool_name, ""),
-                "supports_model": True,
-                "provider": "workflow",
-            })
+            available_tools.append(
+                {
+                    "tool_name": tool_name,
+                    "display_name": tool_name,
+                    "description": all_tools.get(tool_name, ""),
+                    "supports_model": True,
+                    "provider": "workflow",
+                }
+            )
 
         # Get available models for the pending tool
         available_models = None
@@ -1119,10 +1252,23 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             chat_id=chat_id,
             project_id=project_id,
         )
-        self.send_card_to_chat(chat_id, card)
+        with selection_owner.delivery_lock:
+            with engine._lock:
+                pending = engine.project.pending if engine.project else None
+                owner_is_current = bool(
+                    vars(engine).get("_workflow_selection_owner") is selection_owner
+                    and not selection_owner.stop_event.is_set()
+                    and engine.project.status == WorkflowStatus.AWAITING_AGENT_SELECT
+                    and pending
+                    and pending.engine_session_key == session_key
+                )
+            if owner_is_current:
+                self.send_card_to_chat(
+                    chat_id,
+                    card,
+                    origin_message_id=self._resolve_origin(message_id),
+                )
         self._preheat_workflow_models(root_path, recommended_tools)
-
-
 
     def _show_tool_selection_card(
         self,
@@ -1142,7 +1288,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         """
         all_tools, recommended_tools, other_tools, default_selected = self._resolve_tool_lists()
         if not all_tools:
-            self.send_text_to_chat(chat_id, "当前环境未检测到可用的 Workflow 编程工具，请安装 Traex/Claude/Codex 等 CLI 后重试。")
+            self.send_text_to_chat(
+                chat_id, "当前环境未检测到可用的 Workflow 编程工具，请安装 Traex/Claude/Codex 等 CLI 后重试。"
+            )
             return
 
         engine, project_id, session_key = self._init_tool_selection_state(
@@ -1165,13 +1313,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             other_tools=other_tools,
             default_selected=default_selected,
         )
-        self.send_card_to_chat(chat_id, card)
+        self.send_card_to_chat(
+            chat_id,
+            card,
+            origin_message_id=self._resolve_origin(message_id),
+        )
 
     @staticmethod
     def _is_current_generation_session(engine: Any | None, expected_session_key: str | None) -> bool:
         """Return True if an async script-generation task still owns the session."""
         if not expected_session_key:
-            return True
+            return False
         if not engine or not getattr(engine, "project", None):
             return False
 
@@ -1185,6 +1337,41 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             and bool(stored_session_key)
             and stored_session_key == expected_session_key
         )
+
+    @classmethod
+    def _generation_owner_is_active(
+        cls,
+        engine: Any,
+        owner: _WorkflowLifecycleOwner,
+    ) -> bool:
+        """Check generation ownership under the engine's lifecycle lock."""
+        with engine._lock:
+            return bool(
+                vars(engine).get("_script_generation_owner") is owner
+                and not owner.stop_event.is_set()
+                and cls._is_current_generation_session(engine, owner.session_key)
+            )
+
+    @classmethod
+    def _commit_generation_result_if_current(
+        cls,
+        engine: Any,
+        owner: _WorkflowLifecycleOwner,
+        pending: Any,
+    ) -> bool:
+        """CAS a prepared generation result into the still-owned session."""
+        from ...workflow_engine.models import WorkflowStatus
+
+        with engine._lock:
+            if (
+                vars(engine).get("_script_generation_owner") is not owner
+                or owner.stop_event.is_set()
+                or not cls._is_current_generation_session(engine, owner.session_key)
+            ):
+                return False
+            engine.project.status = WorkflowStatus.AWAITING_CONFIRM
+            engine.project.pending = pending
+            return True
 
     def _generate_and_show_confirm_card(
         self,
@@ -1202,244 +1389,399 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         Called after tool selection is confirmed, or directly for templates.
         """
         from ...card import CardBuilder
-
-        # --- Guard: requirement must be non-empty and meet minimum length.
-        # start_workflow already validates the happy path; this line keeps the
-        # second check prevents bypasses via direct handler-calling paths.
-        if not requirement or len(requirement.strip()) < 4:
-            self._reply_workflow_error(
-                message_id,
-                "invalid_argument",
-                detail="需求描述过短（至少 4 个字符），请重新发送 `/wf <需求描述>` 并提供更清晰的任务目标。",
-            )
-            return
-
-        # Send transitional "generating" card
         from ...card.ui_text import UI_TEXT
         from ...thread import get_current_sender_id
         from ...workflow_engine.constants import DEFAULT_ORCHESTRATOR_AGENT
         from ...workflow_engine.models import PendingConfirmation, WorkflowStatus
         from ...workflow_engine.script_gen import extract_meta_from_script
         from ...workflow_engine.templates import discover_templates, load_template
-        gen_card = CardBuilder._wrap_card(
-            header_title="🔄 Workflow — 生成脚本中...",
-            header_template=UI_TEXT["workflow_header_colors"].get("generating", "blue"),
-            elements=[{
-                "tag": "markdown",
-                "content": f"正在基于选定工具生成编排脚本，请稍候...\n\n**需求**: {requirement[:200]}",
-            }],
-        )
-        gen_msg_id = self.send_card_to_chat(chat_id, gen_card)
 
-        # Heartbeat timer: updates the "generating" card every 8 seconds with elapsed time
-        import threading as _threading
-        import time as _time
+        if not expected_session_key:
+            logger.error("[workflow] Refusing script generation without a session owner")
+            return
 
-        _heartbeat_start = _time.time()
-        _heartbeat_stop_event = _threading.Event()
-
-        def _heartbeat_update(status_hint: str = "") -> None:
-            """Update the generating card with elapsed time."""
-            elapsed = int(_time.time() - _heartbeat_start)
-            status = status_hint or "正在生成编排脚本..."
-            progress_content = (
-                f"{status}\n\n"
-                f"**需求**: {requirement[:200]}\n\n"
-                f"⏱ 已等待 {elapsed} 秒"
-            )
-            progress_card = CardBuilder._wrap_card(
-                header_title="🔄 Workflow — 生成脚本中...",
-                header_template=UI_TEXT["workflow_header_colors"].get("generating", "blue"),
-                elements=[{"tag": "markdown", "content": progress_content}],
-            )
-            target_id = gen_msg_id
-            if target_id:
-                self.update_card(target_id, progress_card)
-
-        def _heartbeat_loop() -> None:
-            while not _heartbeat_stop_event.is_set():
-                _heartbeat_stop_event.wait(8.0)
-                if not _heartbeat_stop_event.is_set():
-                    try:
-                        _heartbeat_update()
-                    except Exception:
-                        pass
-
-        _heartbeat_thread = _threading.Thread(
-            target=_heartbeat_loop, name="wf-gen-heartbeat", daemon=True
-        )
-        _heartbeat_thread.start()
-
-        def _stop_heartbeat() -> None:
-            _heartbeat_stop_event.set()
-            _heartbeat_thread.join(timeout=2.0)
-
-        # Create engine first so we can access pending.orchestrator_agent for script generation
-        engine_name = self.get_engine_name(
-            chat_id, project_id=(project.project_id if project else None)
-        )
+        engine_name = self.get_engine_name(chat_id, project_id=(project.project_id if project else None))
         engine = self.ctx.workflow_engine_manager.get_or_create(
             chat_id,
             root_path,
             engine_name=engine_name,
         )
-        if not self._is_current_generation_session(engine, expected_session_key):
-            logger.info(
-                "[workflow] Dropping stale script generation before model call (expected_session=%s)",
-                (expected_session_key or "")[:8],
+        owner = _WorkflowLifecycleOwner(
+            session_key=expected_session_key,
+            source_script_path=self._new_workflow_script_path(root_path),
+        )
+        previous_owner: _WorkflowLifecycleOwner | None = None
+        selection_owner: _WorkflowLifecycleOwner | None = None
+        generation_context: dict[str, Any] = {}
+        with engine._lock:
+            if not self._is_current_generation_session(engine, expected_session_key):
+                logger.info(
+                    "[workflow] Dropping stale script generation before delivery (expected_session=%s)",
+                    expected_session_key[:8],
+                )
+                return
+            current_owner = vars(engine).get("_script_generation_owner")
+            if isinstance(current_owner, _WorkflowLifecycleOwner) and not current_owner.stop_event.is_set():
+                if current_owner.session_key == expected_session_key:
+                    logger.info(
+                        "[workflow] Dropping duplicate script generation (session=%s)",
+                        expected_session_key[:8],
+                    )
+                    return
+                previous_owner = current_owner
+            current_selection_owner = vars(engine).get("_workflow_selection_owner")
+            if isinstance(
+                current_selection_owner,
+                _WorkflowLifecycleOwner,
+            ):
+                if (
+                    current_selection_owner.session_key != expected_session_key
+                    or current_selection_owner.stop_event.is_set()
+                ):
+                    logger.info(
+                        "[workflow] Dropping generation with stale selection owner (session=%s)",
+                        expected_session_key[:8],
+                    )
+                    return
+                selection_owner = current_selection_owner
+                self._retire_workflow_owner(
+                    engine,
+                    current_selection_owner,
+                )
+                engine._workflow_selection_owner = None
+            if previous_owner is not None:
+                self._retire_workflow_owner(engine, previous_owner)
+            owner.claimed_event.set()
+            object.__setattr__(
+                owner,
+                "worker_thread_id",
+                threading.get_ident(),
             )
-            _stop_heartbeat()
-            return
+            engine._script_generation_owner = owner
+            existing_pending = engine.project.pending
+            generation_context = {
+                "initiator_user_id": (
+                    existing_pending.initiator_user_id
+                    if existing_pending and getattr(existing_pending, "initiator_user_id", None)
+                    else get_current_sender_id() or ""
+                ),
+                "orchestrator_agent": (
+                    existing_pending.orchestrator_agent
+                    if existing_pending and getattr(existing_pending, "orchestrator_agent", None)
+                    else DEFAULT_ORCHESTRATOR_AGENT
+                ),
+                "is_template_hint": (
+                    existing_pending.is_template_hint
+                    if existing_pending and getattr(existing_pending, "is_template_hint", None)
+                    else None
+                ),
+                "orchestrator_binding": (
+                    existing_pending.orchestrator_binding
+                    if existing_pending and getattr(existing_pending, "orchestrator_binding", None)
+                    else None
+                ),
+                "review_agents": (
+                    existing_pending.review_agents
+                    if existing_pending and getattr(existing_pending, "review_agents", None)
+                    else None
+                ),
+            }
 
-        parts = requirement.strip().split(None, 1)
-        template_name = parts[0] if parts else ""
-        sender_id = get_current_sender_id() or ""
-        templates = discover_templates(root_path, user_id=sender_id)
-        template_names = {t.name for t in templates}
+        if previous_owner is not None:
+            previous_owner.stop_event.set()
+            previous_owner.heartbeat_stop_event.set()
+            with previous_owner.delivery_lock:
+                pass
+        if selection_owner is not None:
+            selection_owner.stop_event.set()
+            selection_owner.heartbeat_stop_event.set()
+            with selection_owner.delivery_lock:
+                pass
+            selection_owner.done_event.set()
+
+        heartbeat_thread: threading.Thread | None = None
+        try:
+            try:
+                origin_message_id = self._resolve_origin(message_id)
+            except Exception:
+                logger.debug(
+                    "Workflow origin resolution failed; using inbound message",
+                    exc_info=True,
+                )
+                origin_message_id = message_id
+        except Exception:
+            logger.debug(
+                "Workflow origin resolution failed; using inbound message",
+                exc_info=True,
+            )
+            origin_message_id = message_id
+        gen_msg_id: str | None = None
+        heartbeat_start = time.time()
+
+        def _owner_can_deliver() -> bool:
+            return self._generation_owner_is_active(engine, owner)
+
+        def _heartbeat_update(status_hint: str = "") -> None:
+            """Update the generating card only while this owner is live."""
+            with owner.delivery_lock:
+                if not _owner_can_deliver():
+                    return
+                elapsed = int(time.time() - heartbeat_start)
+                status = status_hint or "正在生成编排脚本..."
+                progress_content = f"{status}\n\n**需求**: {requirement[:200]}\n\n⏱ 已等待 {elapsed} 秒"
+                progress_card = CardBuilder._wrap_card(
+                    header_title="🔄 Workflow — 生成脚本中...",
+                    header_template=UI_TEXT["workflow_header_colors"].get("generating", "blue"),
+                    elements=[{"tag": "markdown", "content": progress_content}],
+                )
+                if gen_msg_id:
+                    self.update_card(gen_msg_id, progress_card)
+
+        def _heartbeat_loop() -> None:
+            while not owner.stop_event.is_set() and not owner.heartbeat_stop_event.is_set():
+                owner.heartbeat_stop_event.wait(8.0)
+                if not owner.stop_event.is_set() and not owner.heartbeat_stop_event.is_set():
+                    try:
+                        _heartbeat_update()
+                    except Exception:
+                        pass
+
+        def _stop_heartbeat() -> None:
+            owner.heartbeat_stop_event.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=2.0)
 
         script_path: str
         meta: dict[str, Any] | None = None
         is_fallback = False
+        try:
+            # Guard direct/legacy handler calls only after ownership is proven,
+            # so a stale queued task cannot publish even an error card.
+            if not requirement or len(requirement.strip()) < 4:
+                with owner.delivery_lock:
+                    if _owner_can_deliver():
+                        with engine._lock:
+                            engine.project.status = WorkflowStatus.IDLE
+                            engine.project.pending = None
+                        self._reply_workflow_error(
+                            message_id,
+                            "invalid_argument",
+                            detail=(
+                                "需求描述过短（至少 4 个字符），请重新发送 `/wf <需求描述>` 并提供更清晰的任务目标。"
+                            ),
+                        )
+                return
 
-        if template_name in template_names:
-            # Template path — resolve directly
-            content = load_template(root_path, template_name, user_id=sender_id)
-            if content:
-                # Validate template content
-                from ...workflow_engine.script_gen import validate_generated_script
-
-                is_valid, errors = validate_generated_script(content)
-                if not is_valid:
-                    logger.warning("Template '%s' failed validation: %s", template_name, errors)
-                    if engine.project:
-                        engine.project.status = WorkflowStatus.IDLE
-                        engine.project.pending = None
-                    error_card = self._build_error_card(
-                        "invalid_argument",
-                        detail=(
-                            f"模板 `{template_name}` 未通过安全校验:\n"
-                            + "\n".join(f"• {e}" for e in errors[:5])
-                        ),
-                    )
-                    self._replace_or_send_workflow_card(
-                        card_message_id=gen_msg_id,
-                        chat_id=chat_id,
-                        card=error_card,
-                    )
+            gen_card = CardBuilder._wrap_card(
+                header_title="🔄 Workflow — 生成脚本中...",
+                header_template=UI_TEXT["workflow_header_colors"].get("generating", "blue"),
+                elements=[
+                    {
+                        "tag": "markdown",
+                        "content": (f"正在基于选定工具生成编排脚本，请稍候...\n\n**需求**: {requirement[:200]}"),
+                    }
+                ],
+            )
+            with owner.delivery_lock:
+                if not _owner_can_deliver():
                     return
-
-                script_dir = os.path.join(root_path, ".ghostap", "workflow_scripts")
-                os.makedirs(script_dir, exist_ok=True)
-                script_path = os.path.join(script_dir, f"{template_name}.js")
-
-                if len(parts) > 1:
-                    from ...workflow_engine.templates import inject_args
-                    args = self._parse_template_args(parts[1])
-                    content = inject_args(content, args)
-
-                with open(script_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                meta = extract_meta_from_script(content)
-            else:
-                # Template load failed — fallback to AI
-                script_path, meta, is_fallback = self._generate_script_via_ai(
-                    requirement, root_path, selected_tools, engine,
-                    progress_callback=_heartbeat_update,
+                gen_msg_id = self.send_card_to_chat(
+                    chat_id,
+                    gen_card,
+                    origin_message_id=origin_message_id,
                 )
-        else:
-            # AI generation path with selected tools
-            script_path, meta, is_fallback = self._generate_script_via_ai(
-                requirement, root_path, selected_tools, engine,
-                progress_callback=_heartbeat_update,
+            if not _owner_can_deliver():
+                return
+
+            heartbeat_thread = threading.Thread(
+                target=_heartbeat_loop,
+                name="wf-gen-heartbeat",
+                daemon=True,
             )
-        # Stop the heartbeat timer
-        _stop_heartbeat()
-        if not self._is_current_generation_session(engine, expected_session_key):
-            logger.info(
-                "[workflow] Dropping stale script generation result (expected_session=%s)",
-                (expected_session_key or "")[:8],
-            )
-            return
-        if engine.project:
-            engine.project.status = WorkflowStatus.AWAITING_CONFIRM
-            # Preserve fields from the existing pending state so that
-            # regenerating the script (e.g. via "重新生成脚本") keeps the
-            # user's chosen orchestrator agent rather than resetting to defaults.
-            existing_pending = engine.project.pending
-            preserved_initiator = (
-                existing_pending.initiator_user_id
-                if existing_pending and getattr(existing_pending, "initiator_user_id", None)
-                else get_current_sender_id() or ""
-            )
-            preserved_orchestrator = (
-                existing_pending.orchestrator_agent
-                if existing_pending and getattr(existing_pending, "orchestrator_agent", None)
-                else DEFAULT_ORCHESTRATOR_AGENT
-            )
-            preserved_template_hint = (
-                existing_pending.is_template_hint
-                if existing_pending and getattr(existing_pending, "is_template_hint", None)
-                else None
-            )
-            # Preserve new selection flow fields across re-generations
-            preserved_orchestrator_binding = (
-                existing_pending.orchestrator_binding
-                if existing_pending and getattr(existing_pending, "orchestrator_binding", None)
-                else None
-            )
-            preserved_review_agents = (
-                existing_pending.review_agents
-                if existing_pending and getattr(existing_pending, "review_agents", None)
-                else None
-            )
-            # Keep selected tools as the allow list; meta.tools is what script plans to use
+            heartbeat_thread.start()
+
+            parts = requirement.strip().split(None, 1)
+            template_name = parts[0] if parts else ""
+            sender_id = get_current_sender_id() or ""
+            templates = discover_templates(root_path, user_id=sender_id)
+            template_names = {t.name for t in templates}
+
+            if template_name in template_names:
+                # Template path — resolve directly
+                content = load_template(root_path, template_name, user_id=sender_id)
+                if content:
+                    # Validate template content
+                    from ...workflow_engine.script_gen import validate_generated_script
+
+                    is_valid, errors = validate_generated_script(content)
+                    if not is_valid:
+                        logger.warning("Template '%s' failed validation: %s", template_name, errors)
+                        error_card = self._build_error_card(
+                            "invalid_argument",
+                            detail=(
+                                f"模板 `{template_name}` 未通过安全校验:\n" + "\n".join(f"• {e}" for e in errors[:5])
+                            ),
+                        )
+                        with owner.delivery_lock:
+                            if _owner_can_deliver():
+                                with engine._lock:
+                                    engine.project.status = WorkflowStatus.IDLE
+                                    engine.project.pending = None
+                                self._replace_or_send_workflow_card(
+                                    card_message_id=gen_msg_id,
+                                    chat_id=chat_id,
+                                    card=error_card,
+                                    origin_message_id=origin_message_id,
+                                )
+                        return
+
+                    script_path = owner.source_script_path
+                    if not script_path:
+                        raise RuntimeError("Workflow generation owner has no script path")
+
+                    if len(parts) > 1:
+                        from ...workflow_engine.templates import inject_args
+
+                        args = self._parse_template_args(parts[1])
+                        content = inject_args(content, args)
+
+                    with owner.delivery_lock:
+                        if not _owner_can_deliver():
+                            raise _WorkflowGenerationCancelled("Workflow generation cancelled")
+                        with open(script_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                    meta = extract_meta_from_script(content)
+                else:
+                    # Template load failed — fallback to AI
+                    script_path, meta, is_fallback = self._generate_script_via_ai(
+                        requirement,
+                        root_path,
+                        selected_tools,
+                        engine,
+                        progress_callback=_heartbeat_update,
+                        output_path=owner.source_script_path,
+                        cancel_event=owner.stop_event,
+                        artifact_lock=owner.delivery_lock,
+                    )
+            else:
+                # AI generation path with selected tools
+                script_path, meta, is_fallback = self._generate_script_via_ai(
+                    requirement,
+                    root_path,
+                    selected_tools,
+                    engine,
+                    progress_callback=_heartbeat_update,
+                    output_path=owner.source_script_path,
+                    cancel_event=owner.stop_event,
+                    artifact_lock=owner.delivery_lock,
+                )
+            _stop_heartbeat()
+
             if selected_tools is not None:
                 sel_tools = list(selected_tools)
             else:
-                # For templates, initialize from meta
                 sel_tools = list((meta or {}).get("tools", selected_tools or []))
-            # Track tools mismatch for warning
             script_tools = set((meta or {}).get("tools", []))
             allowed_tools = set(sel_tools or [])
             tools_mismatch = bool(script_tools - allowed_tools)
-            # Compute a SHA-256 of the script content right after writing so
-            # the confirm-time TOCTOU check can detect on-disk tampering.
             script_hash = None
             if script_path:
                 try:
                     with open(script_path, "rb") as f:
                         import hashlib
+
                         script_hash = hashlib.sha256(f.read()).hexdigest()
                 except OSError:
                     script_hash = None
-            engine.project.pending = PendingConfirmation(
+
+            prepared_pending = PendingConfirmation(
                 script_path=script_path,
                 requirement=requirement,
                 meta=meta,
                 is_fallback=is_fallback,
-                # Security: bind confirmation to initiator and session key
-                initiator_user_id=preserved_initiator,
+                initiator_user_id=generation_context["initiator_user_id"],
                 engine_session_key=uuid.uuid4().hex,
                 selected_tools=sel_tools,
                 tools_mismatch=tools_mismatch,
-                orchestrator_agent=preserved_orchestrator,
-                is_template_hint=preserved_template_hint,
-                # Preserve new selection flow bindings across re-generations
-                orchestrator_binding=preserved_orchestrator_binding,
-                review_agents=preserved_review_agents,
+                orchestrator_agent=generation_context["orchestrator_agent"],
+                is_template_hint=generation_context["is_template_hint"],
+                orchestrator_binding=generation_context["orchestrator_binding"],
+                review_agents=generation_context["review_agents"],
                 script_hash=script_hash,
             )
+            if not self._commit_generation_result_if_current(
+                engine,
+                owner,
+                prepared_pending,
+            ):
+                logger.info(
+                    "[workflow] Dropping stale script generation result (expected_session=%s)",
+                    expected_session_key[:8],
+                )
+                return
 
-        project_id = project.project_id if project else ""
-        self._start_pending_workflow_execution(
-            message_id=gen_msg_id or message_id,
-            chat_id=chat_id,
-            project_id=project_id,
-            project=project,
-            root_path=root_path,
-            engine=engine,
-            allow_server_side_start=True,
-        )
+            project_id = project.project_id if project else ""
+            self._start_pending_workflow_execution(
+                message_id=gen_msg_id or message_id,
+                chat_id=chat_id,
+                project_id=project_id,
+                project=project,
+                root_path=root_path,
+                engine=engine,
+                allow_server_side_start=True,
+                generation_owner=owner,
+            )
+        except Exception as exc:
+            logger.error(
+                "Workflow script generation failed: %s",
+                exc,
+                exc_info=True,
+            )
+            with owner.delivery_lock:
+                if _owner_can_deliver():
+                    with engine._lock:
+                        if not self._is_current_generation_session(
+                            engine,
+                            owner.session_key,
+                        ):
+                            return
+                        engine.project.status = WorkflowStatus.IDLE
+                        engine.project.pending = None
+                    if gen_msg_id:
+                        error_card = self._build_error_card(
+                            "internal_error",
+                            detail=f"脚本生成失败: {exc}",
+                        )
+                        self._replace_or_send_workflow_card(
+                            card_message_id=gen_msg_id,
+                            chat_id=chat_id,
+                            card=error_card,
+                            origin_message_id=origin_message_id,
+                        )
+                    else:
+                        self._reply_workflow_error(
+                            message_id,
+                            "internal_error",
+                            detail=f"脚本生成失败: {exc}",
+                        )
+        finally:
+            _stop_heartbeat()
+            with engine._lock:
+                if vars(engine).get("_script_generation_owner") is owner:
+                    self._retire_workflow_owner(engine, owner)
+                    engine._script_generation_owner = None
+                current_project = engine.project
+                current_pending = current_project.pending if current_project is not None else None
+                retained_paths = {
+                    getattr(current_pending, "script_path", None),
+                    getattr(current_project, "script_path", None),
+                }
+            if owner.source_script_path not in retained_paths:
+                self._remove_owned_workflow_artifact(
+                    owner.source_script_path,
+                    root_path=root_path,
+                )
+            owner.done_event.set()
 
     def _schedule_generate_and_show_confirm_card(
         self,
@@ -1450,6 +1792,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         project: Optional["ProjectContext"],
         root_path: str,
         selected_tools: list[str] | None,
+        expected_session_key: str,
         engine: Any | None = None,
     ) -> None:
         """Submit script generation to the task scheduler.
@@ -1458,12 +1801,68 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         Feishu callback handling short so the websocket receive loop remains
         healthy while the loading card is replaced from the background task.
         """
+        from ...workflow_engine.models import WorkflowStatus
 
         project_name = (getattr(project, "project_name", "") if project else "") or os.path.basename(root_path)
         task_id = generate_task_id(project_name or "workflow")
-        expected_session_key = None
-        if engine and getattr(engine, "project", None) and engine.project.pending:
-            expected_session_key = engine.project.pending.engine_session_key
+        if engine is not None:
+            with engine._lock:
+                current_session_key = (
+                    engine.project.pending.engine_session_key if engine.project and engine.project.pending else ""
+                )
+                if not (
+                    engine.project
+                    and engine.project.pending
+                    and engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+                    and current_session_key == expected_session_key
+                ):
+                    logger.info(
+                        "[workflow] Refusing stale generation schedule (expected_session=%s, current_session=%s)",
+                        (expected_session_key or "")[:8],
+                        (current_session_key or "")[:8],
+                    )
+                    return
+        if not expected_session_key or engine is None:
+            logger.error("[workflow] Refusing to schedule generation without a session owner")
+            return
+
+        def report_schedule_failure(
+            exc: Exception,
+            *,
+            next_status: WorkflowStatus,
+            detail_prefix: str,
+        ) -> None:
+            with engine._lock:
+                lifecycle_owner = vars(engine).get("_script_generation_owner") or vars(engine).get(
+                    "_workflow_selection_owner"
+                )
+            if not isinstance(
+                lifecycle_owner,
+                _WorkflowLifecycleOwner,
+            ):
+                return
+            with lifecycle_owner.delivery_lock:
+                with engine._lock:
+                    pending = engine.project.pending if engine.project else None
+                    should_report = bool(
+                        (
+                            vars(engine).get("_script_generation_owner") is lifecycle_owner
+                            or vars(engine).get("_workflow_selection_owner") is lifecycle_owner
+                        )
+                        and not lifecycle_owner.stop_event.is_set()
+                        and engine.project
+                        and engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+                        and pending
+                        and pending.engine_session_key == expected_session_key
+                    )
+                    if should_report:
+                        engine.project.status = next_status
+                if should_report:
+                    self._reply_workflow_error(
+                        message_id,
+                        "internal_error",
+                        detail=f"{detail_prefix}: {exc}",
+                    )
 
         def run_generate() -> None:
             try:
@@ -1484,26 +1883,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     expected_session_key=expected_session_key,
                 )
             except Exception as exc:
-                from ...workflow_engine.models import WorkflowStatus
-
-                try:
-                    task_engine = self.ctx.workflow_engine_manager.get(chat_id, root_path)
-                    if (
-                        task_engine
-                        and task_engine.project
-                        and task_engine.project.status == WorkflowStatus.GENERATING_SCRIPT
-                        and self._is_current_generation_session(task_engine, expected_session_key)
-                    ):
-                        task_engine.project.status = WorkflowStatus.IDLE
-                        task_engine.project.pending = None
-                except Exception:
-                    logger.debug("Failed to reset workflow state after script generation error", exc_info=True)
-
                 logger.error("Workflow script generation task failed: %s", exc, exc_info=True)
-                self._reply_workflow_error(
-                    message_id,
-                    "internal_error",
-                    detail=f"脚本生成失败: {exc}",
+                report_schedule_failure(
+                    exc,
+                    next_status=WorkflowStatus.IDLE,
+                    detail_prefix="脚本生成失败",
                 )
 
         try:
@@ -1517,64 +1901,352 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 name_suffix="generate_script",
             )
         except Exception as exc:
-            from ...workflow_engine.models import WorkflowStatus
-
-            if (
-                engine
-                and engine.project
-                and engine.project.status == WorkflowStatus.GENERATING_SCRIPT
-                and self._is_current_generation_session(engine, expected_session_key)
-            ):
-                engine.project.status = WorkflowStatus.AWAITING_TOOL_SELECT
             logger.error("Workflow script generation task submission failed: %s", exc, exc_info=True)
-            self._reply_workflow_error(
-                message_id,
-                "internal_error",
-                detail=f"脚本生成任务提交失败: {exc}",
+            report_schedule_failure(
+                exc,
+                next_status=WorkflowStatus.AWAITING_TOOL_SELECT,
+                detail_prefix="脚本生成任务提交失败",
             )
 
     # ------------------------------------------------------------------
     # Stop workflow
     # ------------------------------------------------------------------
 
-
-    def _get_selection_controller(self, project: Any) -> "SelectionFlowController":
+    def _get_selection_controller(
+        self,
+        project: Any,
+        *,
+        session_key: str | None = None,
+    ) -> "SelectionFlowController":
         """Get or create a SelectionFlowController for the given project context.
 
         Stores the controller state in ``project._wf_selection_snapshot`` so it
         survives between button clicks. Callers can modify the returned
-        controller and the changes are persisted automatically via its
-        snapshot/restore protocol.
+        controller and persist changes via its snapshot/restore protocol.
+        A callback's session key fences that snapshot from newer workflows.
         """
         from ...workflow_engine.selection_flow import SelectionFlowController
 
         controller = SelectionFlowController()
-        snapshot = getattr(project, "_wf_selection_snapshot", None)
-        if snapshot:
-            try:
-                controller.restore(snapshot)
-            except Exception:
-                pass
-        project._wf_selection_controller = controller
+        selection_lock = getattr(project, "_wf_selection_lock", None)
+        if selection_lock is None:
+            selection_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+            project._wf_selection_lock = selection_lock
+        with selection_lock:
+            current_session_key = getattr(
+                project,
+                "_wf_selection_session_key",
+                None,
+            )
+            if not isinstance(current_session_key, str):
+                current_session_key = None
+            if current_session_key is None and session_key:
+                current_session_key = session_key
+                project._wf_selection_session_key = session_key
+            is_current_session = bool(not session_key or not current_session_key or session_key == current_session_key)
+            snapshot = getattr(project, "_wf_selection_snapshot", None) if is_current_session else None
+            if not isinstance(snapshot, dict):
+                snapshot = None
+            if snapshot is not None:
+                try:
+                    controller.restore(snapshot)
+                except Exception:
+                    pass
+            controller._workflow_session_key = session_key or current_session_key or ""
+            if is_current_session:
+                project._wf_selection_controller = controller
         return controller
 
-    def _persist_selection_controller(self, project: Any, controller: "SelectionFlowController") -> None:
-        """Persist the controller's state back to the project context."""
-        project._wf_selection_snapshot = controller.snapshot()
+    def _persist_selection_controller(
+        self,
+        project: Any,
+        controller: "SelectionFlowController",
+    ) -> bool:
+        """Persist state only while the controller still owns this session."""
+        selection_lock = getattr(project, "_wf_selection_lock", None)
+        if selection_lock is None:
+            selection_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+            project._wf_selection_lock = selection_lock
+        with selection_lock:
+            controller_session_key = getattr(
+                controller,
+                "_workflow_session_key",
+                "",
+            )
+            current_session_key = getattr(
+                project,
+                "_wf_selection_session_key",
+                "",
+            )
+            if not isinstance(current_session_key, str):
+                current_session_key = ""
+            if controller_session_key and current_session_key and controller_session_key != current_session_key:
+                return False
+            project._wf_selection_snapshot = controller.snapshot()
+        return True
+
+    @staticmethod
+    def _retire_workflow_owner(engine: Any, owner: Any) -> None:
+        """Keep a revoked owner discoverable by later cleanup retries."""
+        retire = getattr(engine, "retire_lifecycle_owner", None)
+        if callable(retire):
+            retire(owner)
+
+    @contextmanager
+    def _selection_controller_transaction(
+        self,
+        project: Any,
+        *,
+        session_key: str,
+        engine: Any | None = None,
+        expected_status: Any = None,
+        initiator_user_id: str = "",
+    ):
+        """Atomically validate, mutate, and persist one selection snapshot.
+
+        When an engine is supplied, keep the established engine -> selection
+        lock order and hold both locks through the mutation.  This makes a
+        finish/status transition linearizable with concurrent button clicks:
+        either the click is included in the finished snapshot, or it observes
+        the new status and is discarded.
+        """
+        selection_lock = getattr(project, "_wf_selection_lock", None)
+        if selection_lock is None:
+            selection_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+            project._wf_selection_lock = selection_lock
+        engine_lock = engine._lock if engine is not None else nullcontext()
+        with engine_lock:
+            if engine is not None:
+                current_project = engine.project
+                pending = current_project.pending if current_project is not None else None
+                if isinstance(expected_status, (set, frozenset, tuple, list)):
+                    valid_status = bool(current_project is not None and current_project.status in expected_status)
+                else:
+                    valid_status = bool(
+                        current_project is not None
+                        and (expected_status is None or current_project.status == expected_status)
+                    )
+                if (
+                    not valid_status
+                    or pending is None
+                    or pending.engine_session_key != session_key
+                    or (initiator_user_id and pending.initiator_user_id != initiator_user_id)
+                ):
+                    yield None
+                    return
+            with selection_lock:
+                controller = self._get_selection_controller(
+                    project,
+                    session_key=session_key,
+                )
+                yield controller
+                self._persist_selection_controller(project, controller)
 
     def _build_available_tools(self) -> list[dict]:
         """Build the available tool list for the controller (all tools, with descriptions)."""
         all_tools, recommended_tools, other_tools, _ = self._resolve_tool_lists()
         available = []
         for t in list(recommended_tools) + list(other_tools):
-            available.append({
-                "tool_name": t,
-                "display_name": t,
-                "description": all_tools.get(t, "") or "",
-                "supports_model": True,
-                "provider": "workflow",
-            })
+            available.append(
+                {
+                    "tool_name": t,
+                    "display_name": t,
+                    "description": all_tools.get(t, "") or "",
+                    "supports_model": True,
+                    "provider": "workflow",
+                }
+            )
         return available
+
+    def _reply_pending_error_if_current(
+        self,
+        engine: Any,
+        message_id: str,
+        *,
+        session_key: str,
+        initiator_user_id: str,
+        valid_statuses: Any,
+        category: str,
+        detail: str = "",
+    ) -> bool:
+        """Deliver a callback error only before its lifecycle is superseded."""
+        statuses = valid_statuses if isinstance(valid_statuses, (tuple, list, set, frozenset)) else (valid_statuses,)
+
+        def matches_current() -> bool:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            return bool(
+                current_project
+                and current_project.status in statuses
+                and pending
+                and pending.engine_session_key == session_key
+                and pending.initiator_user_id == initiator_user_id
+            )
+
+        with engine._lock:
+            owners = tuple(
+                owner
+                for owner in (
+                    vars(engine).get("_workflow_selection_owner"),
+                    vars(engine).get("_script_generation_owner"),
+                    vars(engine).get("_workflow_start_owner"),
+                )
+                if isinstance(owner, _WorkflowLifecycleOwner) and not owner.stop_event.is_set()
+            )
+            owner = owners[0] if owners else None
+
+        if owner is not None:
+            with owner.delivery_lock:
+                with engine._lock:
+                    owner_is_current = any(
+                        vars(engine).get(attr_name) is owner
+                        for attr_name in (
+                            "_workflow_selection_owner",
+                            "_script_generation_owner",
+                            "_workflow_start_owner",
+                        )
+                    )
+                    if not owner_is_current or owner.stop_event.is_set() or not matches_current():
+                        return False
+                self._reply_workflow_error(
+                    message_id,
+                    category,
+                    detail=detail,
+                )
+                return True
+
+        # Legacy sessions may have no owner token. Holding the engine CAS lock
+        # through this rare error delivery still prevents a stop/new request
+        # from acknowledging before the reply completes.
+        with engine._lock:
+            if not matches_current():
+                return False
+            self._reply_workflow_error(
+                message_id,
+                category,
+                detail=detail,
+            )
+            return True
+
+    def _safe_execute_engine(
+        self,
+        executor_func: callable,
+        task_id: str,
+        chat_id: str,
+        message_id: str,
+        project: Optional["ProjectContext"],
+        engine_name: str,
+        reporter: Any,
+        request_id: Optional[str],
+        action_prefix: str = "deep",
+        command_text: str = "",
+        *,
+        lifecycle_owner: _WorkflowLifecycleOwner | None = None,
+        lifecycle_engine: Any = None,
+    ):
+        """Fence Workflow repo-lock/error cards with the queued-start owner."""
+        if lifecycle_owner is None or lifecycle_engine is None:
+            return super()._safe_execute_engine(
+                executor_func=executor_func,
+                task_id=task_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                project=project,
+                engine_name=engine_name,
+                reporter=reporter,
+                request_id=request_id,
+                action_prefix=action_prefix,
+                command_text=command_text,
+            )
+
+        import asyncio
+
+        from ...repo_lock import LockConflictError
+        from ...utils.errors import get_error_detail
+
+        root_path = getattr(project, "root_path", None) if project else None
+
+        def owner_is_current() -> bool:
+            with lifecycle_engine._lock:
+                return bool(
+                    vars(lifecycle_engine).get("_workflow_start_owner") is lifecycle_owner
+                    and getattr(lifecycle_engine, "_closing", False) is not True
+                    and not lifecycle_owner.stop_event.is_set()
+                )
+
+        def deliver_if_current(delivery: callable) -> None:
+            with lifecycle_owner.delivery_lock:
+                if owner_is_current():
+                    delivery()
+
+        def body() -> None:
+            try:
+                executor_func()
+            except NotImplementedError:
+                logger.error(
+                    "%s Engine: NotImplementedError in executor_func (task_id=%s)",
+                    self._get_engine_name_prefix(),
+                    task_id,
+                )
+                deliver_if_current(
+                    lambda: self.reply_text(
+                        message_id,
+                        "系统升级中，请重试",
+                    )
+                )
+            except LockConflictError:
+                raise
+            except Exception as exc:
+                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                    logger.warning(
+                        "%s Engine 执行超时 (task_id=%s): %s",
+                        self._get_engine_name_prefix(),
+                        task_id,
+                        get_error_detail(exc),
+                    )
+                else:
+                    logger.error(
+                        "%s Engine 执行异常: %s",
+                        self._get_engine_name_prefix(),
+                        get_error_detail(exc),
+                        exc_info=True,
+                    )
+                deliver_if_current(
+                    lambda caught=exc: self._on_engine_error(
+                        error=caught,
+                        task_id=task_id,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        project=project,
+                        engine_name=engine_name,
+                        reporter=reporter,
+                        request_id=request_id,
+                        action_prefix=action_prefix,
+                    )
+                )
+
+        # Request-id resolution and scheduler latency happen before this
+        # method. Recheck ownership before touching the repository lock so a
+        # cleanup/supersede winner retires the stale queued closure quietly.
+        if not owner_is_current():
+            return None
+
+        try:
+            return self.lock_helper._with_repo_lock(
+                root_path,
+                chat_id,
+                body,
+            )
+        except LockConflictError as exc:
+            deliver_if_current(
+                lambda caught=exc: self.lock_helper.send_lock_conflict_card(
+                    caught,
+                    message_id,
+                    command_text,
+                    chat_id=chat_id,
+                )
+            )
+            return None
 
     def _send_combined_selection_card(
         self,
@@ -1592,7 +2264,18 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         1 (orchestrator) or 2 (review) by the caller.
         """
 
-        ctrl = self._get_selection_controller(project)
+        selection_lock = getattr(project, "_wf_selection_lock", None)
+        if selection_lock is None:
+            selection_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+            project._wf_selection_lock = selection_lock
+        with selection_lock:
+            ctrl = self._get_selection_controller(
+                project,
+                session_key=session_key,
+            )
+            rendered_snapshot = ctrl.snapshot()
+            if getattr(project, "_wf_selection_snapshot", None) is None:
+                project._wf_selection_snapshot = rendered_snapshot
         available_tools = self._build_available_tools()
 
         # Get available models for the pending tool
@@ -1621,10 +2304,49 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 project_id=project_id,
             )
 
-        if message_id and message_id != chat_id:
-            self.update_card(message_id, card)
-        else:
-            self.send_card_to_chat(chat_id, card)
+        from ...workflow_engine.models import WorkflowStatus
+
+        root_path = (
+            project.root_path
+            if project
+            else self._get_root_path(
+                chat_id,
+                None,
+            )
+        )
+        engine = self.ctx.workflow_engine_manager.get(chat_id, root_path)
+        expected_status = WorkflowStatus.AWAITING_TOOL_SELECT if is_review else WorkflowStatus.AWAITING_AGENT_SELECT
+        if not engine:
+            return
+        with engine._lock:
+            # Delivery is the second half of the render transaction. Hold the
+            # selection lock through the Feishu update and compare snapshots:
+            # a slower S1 render must never overwrite an already-delivered S2.
+            with selection_lock:
+                pending = engine.project.pending if engine.project else None
+                if (
+                    not engine.project
+                    or engine.project.status != expected_status
+                    or not pending
+                    or pending.engine_session_key != session_key
+                    or getattr(
+                        project,
+                        "_wf_selection_session_key",
+                        "",
+                    )
+                    != session_key
+                    or getattr(
+                        project,
+                        "_wf_selection_snapshot",
+                        None,
+                    )
+                    != rendered_snapshot
+                ):
+                    return
+                if message_id and message_id != chat_id:
+                    self.update_card(message_id, card)
+                else:
+                    self.send_card_to_chat(chat_id, card)
 
     def _handle_workflow_model_cascade_select(
         self,
@@ -1651,11 +2373,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
-        expected_status = (
-            WorkflowStatus.AWAITING_TOOL_SELECT
-            if is_review
-            else WorkflowStatus.AWAITING_AGENT_SELECT
-        )
+        expected_status = WorkflowStatus.AWAITING_TOOL_SELECT if is_review else WorkflowStatus.AWAITING_AGENT_SELECT
         if engine.project.status != expected_status:
             self._reply_workflow_error(message_id, "invalid_state")
             return
@@ -1684,27 +2402,58 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         _kept, rejected = self._validate_tools_against_registry([tool_name])
         if rejected:
-            self._reply_workflow_error(message_id, "invalid_argument", detail=f"无效的工具名称: {tool_name}")
+            self._reply_pending_error_if_current(
+                engine,
+                message_id,
+                session_key=stored_session_key,
+                initiator_user_id=stored_initiator,
+                valid_statuses=expected_status,
+                category="invalid_argument",
+                detail=f"无效的工具名称: {tool_name}",
+            )
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(2 if is_review else 1)
-        if dimension == "model_group":
-            ctrl.set_model_group(tool_name, selected, is_review=is_review)
-        elif dimension == "model_profile":
-            if value.get("model_group"):
-                ctrl.pending_model_group = value.get("model_group")
-            ctrl.set_model_profile(tool_name, selected, is_review=is_review)
-        elif dimension == "model_effort":
-            if value.get("model_group"):
-                ctrl.pending_model_group = value.get("model_group")
-            if value.get("model_profile"):
-                ctrl.pending_model_profile = value.get("model_profile")
-            ctrl.set_model_effort(tool_name, selected, is_review=is_review)
-        else:
-            self._reply_workflow_error(message_id, "invalid_argument", detail="未知模型选择维度")
-            return
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=expected_status,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(2 if is_review else 1)
+            if dimension == "model_group":
+                ctrl.set_model_group(
+                    tool_name,
+                    selected,
+                    is_review=is_review,
+                )
+            elif dimension == "model_profile":
+                if value.get("model_group"):
+                    ctrl.pending_model_group = value.get("model_group")
+                ctrl.set_model_profile(
+                    tool_name,
+                    selected,
+                    is_review=is_review,
+                )
+            elif dimension == "model_effort":
+                if value.get("model_group"):
+                    ctrl.pending_model_group = value.get("model_group")
+                if value.get("model_profile"):
+                    ctrl.pending_model_profile = value.get("model_profile")
+                ctrl.set_model_effort(
+                    tool_name,
+                    selected,
+                    is_review=is_review,
+                )
+            else:
+                self._reply_workflow_error(
+                    message_id,
+                    "invalid_argument",
+                    detail="未知模型选择维度",
+                )
+                return
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -1827,40 +2576,150 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         from ...workflow_engine.models import WorkflowStatus
 
-        is_generating = bool(
-            engine
-            and engine.project
-            and engine.project.status == WorkflowStatus.GENERATING_SCRIPT
-        )
-        if not engine or (not engine.is_running and not is_generating):
+        if not engine:
             self._reply_workflow_error(message_id, "invalid_state", detail="当前没有运行中的 Workflow 任务")
             return
 
-        # Validate: only initiator or admin can stop — fail-closed
         from ...thread import get_current_sender_id
 
         current_user = get_current_sender_id()
-        pending = getattr(engine.project, "pending", None) if engine.project else None
-        stored_initiator = (
-            getattr(engine.project, "initiator_user_id", None)
-            or (getattr(pending, "initiator_user_id", None) if pending else None)
-        )
         admin_ids: list[str] = getattr(self.ctx.settings, "admin_user_ids", []) or []
+        error: tuple[str, str] | None = None
+        delivery_owners: list[_WorkflowLifecycleOwner] = []
+        artifacts_to_remove: list[str] = []
+        runtime_active = False
+        with engine._lock:
+            wf_project = engine.project
+            pending = getattr(wf_project, "pending", None) if wf_project else None
+            status = getattr(wf_project, "status", WorkflowStatus.IDLE)
+            pending_lifecycle = status in _workflow_pending_statuses()
+            stored_initiator = (
+                getattr(pending, "initiator_user_id", None) if pending_lifecycle and pending else None
+            ) or getattr(wf_project, "initiator_user_id", None)
+            selection_owner = vars(engine).get("_workflow_selection_owner")
+            generation_owner = vars(engine).get("_script_generation_owner")
+            start_owner = vars(engine).get("_workflow_start_owner")
+            live_selection_owner = (
+                selection_owner
+                if isinstance(selection_owner, _WorkflowLifecycleOwner) and not selection_owner.stop_event.is_set()
+                else None
+            )
+            live_generation_owner = (
+                generation_owner
+                if isinstance(generation_owner, _WorkflowLifecycleOwner) and not generation_owner.stop_event.is_set()
+                else None
+            )
+            live_start_owner = (
+                start_owner
+                if isinstance(start_owner, _WorkflowLifecycleOwner) and not start_owner.stop_event.is_set()
+                else None
+            )
+            stored_initiator = (
+                stored_initiator
+                or getattr(
+                    live_selection_owner,
+                    "initiator_user_id",
+                    None,
+                )
+                or getattr(
+                    live_generation_owner,
+                    "initiator_user_id",
+                    None,
+                )
+                or getattr(
+                    live_start_owner,
+                    "initiator_user_id",
+                    None,
+                )
+            )
+            terminal_committed = status in {
+                WorkflowStatus.COMPLETED,
+                WorkflowStatus.FAILED,
+                WorkflowStatus.CANCELLED,
+            }
+            if terminal_committed:
+                live_start_owner = None
+            runtime_active = bool(engine.is_running) and not terminal_committed
+            lifecycle_active = bool(
+                runtime_active
+                or live_selection_owner is not None
+                or live_generation_owner is not None
+                or live_start_owner is not None
+                or status in _workflow_pending_statuses()
+            )
 
-        # Fail-closed: missing initiator or operator → deny
-        if not stored_initiator or not current_user:
-            self._reply_workflow_error(message_id, "forbidden", detail="无法验证操作者身份，停止请求被拒绝")
+            if not lifecycle_active:
+                error = ("invalid_state", "当前没有运行中的 Workflow 任务")
+            elif not stored_initiator or not current_user:
+                error = ("forbidden", "无法验证操作者身份，停止请求被拒绝")
+            elif current_user != stored_initiator and current_user not in admin_ids:
+                error = ("forbidden", "只有 Workflow 发起者或管理员才能停止此任务")
+            else:
+                for lifecycle_owner in (
+                    live_selection_owner,
+                    live_generation_owner,
+                    live_start_owner,
+                ):
+                    if lifecycle_owner is None:
+                        continue
+                    lifecycle_owner.stop_event.set()
+                    lifecycle_owner.heartbeat_stop_event.set()
+                    self._retire_workflow_owner(
+                        engine,
+                        lifecycle_owner,
+                    )
+                    if lifecycle_owner not in delivery_owners:
+                        delivery_owners.append(lifecycle_owner)
+                    for artifact in (
+                        lifecycle_owner.source_script_path,
+                        lifecycle_owner.execution_script_path,
+                    ):
+                        if artifact:
+                            artifacts_to_remove.append(artifact)
+                if live_selection_owner is not None:
+                    engine._workflow_selection_owner = None
+                if live_generation_owner is not None:
+                    engine._script_generation_owner = None
+                if live_start_owner is not None and not runtime_active:
+                    engine._workflow_start_owner = None
+                if pending and pending.script_path:
+                    artifacts_to_remove.append(pending.script_path)
+                if live_start_owner is not None and wf_project is not None and wf_project.script_path:
+                    artifacts_to_remove.append(wf_project.script_path)
+
+                if runtime_active:
+                    engine.stop()
+                elif wf_project is not None:
+                    wf_project.status = WorkflowStatus.IDLE
+                    wf_project.pending = None
+                    wf_project.script_path = None
+
+        if error is not None:
+            self._reply_workflow_error(
+                message_id,
+                error[0],
+                detail=error[1],
+            )
             return
 
-        if current_user != stored_initiator and current_user not in admin_ids:
-            self._reply_workflow_error(message_id, "forbidden", detail="只有 Workflow 发起者或管理员才能停止此任务")
-            return
+        # A delivery that had already passed its ownership check may finish,
+        # but it must do so before the stop acknowledgement is sent.
+        for lifecycle_owner in delivery_owners:
+            with lifecycle_owner.delivery_lock:
+                pass
+            if (
+                not runtime_active
+                and not lifecycle_owner.claimed_event.is_set()
+                and not lifecycle_owner.worker_started_event.is_set()
+            ):
+                lifecycle_owner.done_event.set()
 
-        if is_generating:
-            engine.project.status = WorkflowStatus.IDLE
-            engine.project.pending = None
-        else:
-            engine.stop()
+        for artifact in dict.fromkeys(artifacts_to_remove):
+            self._remove_owned_workflow_artifact(
+                artifact,
+                root_path=root_path,
+            )
+
         self.reply_text(message_id, "Workflow 任务已停止。")
 
     def handle_workflow_stop_running(
@@ -1889,7 +2748,6 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
     # ------------------------------------------------------------------
     # Confirm / Cancel actions (card button callbacks)
     # ------------------------------------------------------------------
-
 
     def handle_workflow_orchestrator_select_tool(
         self,
@@ -1941,9 +2799,18 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         # Security: validate tool_name against allowed list
         from ...workflow_engine.tool_registry import get_available_tools
+
         available_tools = get_available_tools(require_available=True)
         if tool_name not in available_tools:
-            self._reply_workflow_error(message_id, "invalid_argument", detail=f"不支持的工具: {tool_name}")
+            self._reply_pending_error_if_current(
+                engine,
+                message_id,
+                session_key=stored_session_key,
+                initiator_user_id=stored_initiator,
+                valid_statuses=WorkflowStatus.AWAITING_AGENT_SELECT,
+                category="invalid_argument",
+                detail=f"不支持的工具: {tool_name}",
+            )
             return
 
         if project is None:
@@ -1951,19 +2818,30 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             return
 
         # Use SelectionFlowController
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(1)
-        if "model_page" in value:
-            try:
-                model_page = int(value.get("model_page", 0) or 0)
-            except (TypeError, ValueError):
-                model_page = 0
-            ctrl.set_model_page(tool_name, model_page, is_review=False)
-        elif value.get("_option"):
-            ctrl.select_tool(tool_name, is_review=False)
-        else:
-            ctrl.toggle_tool_expand(tool_name, is_review=False)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_AGENT_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(1)
+            if "model_page" in value:
+                try:
+                    model_page = int(value.get("model_page", 0) or 0)
+                except (TypeError, ValueError):
+                    model_page = 0
+                ctrl.set_model_page(
+                    tool_name,
+                    model_page,
+                    is_review=False,
+                )
+            elif value.get("_option"):
+                ctrl.select_tool(tool_name, is_review=False)
+            else:
+                ctrl.toggle_tool_expand(tool_name, is_review=False)
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2031,7 +2909,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 "[workflow] Rejected unknown tool_name=%s at handle_workflow_orchestrator_select_model",
                 tool_name,
             )
-            self._reply_workflow_error(message_id, "invalid_argument", detail=f"无效的工具名称: {tool_name}")
+            self._reply_pending_error_if_current(
+                engine,
+                message_id,
+                session_key=stored_session_key,
+                initiator_user_id=stored_initiator,
+                valid_statuses=WorkflowStatus.AWAITING_AGENT_SELECT,
+                category="invalid_argument",
+                detail=f"无效的工具名称: {tool_name}",
+            )
             return
 
         # Validate model_name against allowed models for this tool
@@ -2043,7 +2929,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     model_name,
                     tool_name,
                 )
-                self._reply_workflow_error(message_id, "invalid_argument", detail=f"无效的模型名称: {model_name}")
+                self._reply_pending_error_if_current(
+                    engine,
+                    message_id,
+                    session_key=stored_session_key,
+                    initiator_user_id=stored_initiator,
+                    valid_statuses=WorkflowStatus.AWAITING_AGENT_SELECT,
+                    category="invalid_argument",
+                    detail=f"无效的模型名称: {model_name}",
+                )
                 return
 
         selection = {
@@ -2058,12 +2952,19 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         else:
             selection["model_name"] = model_name
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(1)
-        # Orchestrator is single-select: clear before adding.
-        ctrl.clear_selections(is_review=False)
-        ctrl.add_or_update_selection(selection, is_review=False)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_AGENT_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(1)
+            # Orchestrator is single-select: clear before adding.
+            ctrl.clear_selections(is_review=False)
+            ctrl.add_or_update_selection(selection, is_review=False)
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2121,10 +3022,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(1)
-        ctrl.remove_selection(selection_key, is_review=False)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_AGENT_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(1)
+            ctrl.remove_selection(selection_key, is_review=False)
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2177,10 +3085,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(1)
-        ctrl.clear_selections(is_review=False)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_AGENT_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(1)
+            ctrl.clear_selections(is_review=False)
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2239,50 +3154,58 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(1)
-
-        ok, err_msg = ctrl.validate_non_empty(is_review=False)
-        if not ok:
-            ctrl.error_message = err_msg
-            self._persist_selection_controller(project, ctrl)
-            requirement = engine.project.pending.requirement if engine.project.pending else ""
-            self._send_combined_selection_card(
-                message_id=message_id,
-                chat_id=chat_id,
-                project=project,
-                requirement=requirement,
-                session_key=stored_session_key,
-                is_review=False,
-            )
-            return
-
-        # Save orchestrator selection to pending state
         from src.spec_engine.review_agents import ReviewAgentBinding
 
-        snapshot = ctrl.snapshot()
-        orchestrator_items = list(snapshot.get("orchestrator_selections", {}).values())
-        if orchestrator_items:
-            first = orchestrator_items[0]
-            engine.project.pending.orchestrator_binding = ReviewAgentBinding.from_dict(first)
-            engine.project.pending.orchestrator_agent = first.get("tool_name", "")
+        requirement = ""
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_AGENT_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(1)
+            ok, err_msg = ctrl.validate_non_empty(is_review=False)
+            current_pending = engine.project.pending if engine.project else None
+            if (
+                engine.project is None
+                or engine.project.status != WorkflowStatus.AWAITING_AGENT_SELECT
+                or current_pending is None
+                or current_pending.engine_session_key != stored_session_key
+                or current_pending.initiator_user_id != current_user
+            ):
+                return
+            if not ok:
+                ctrl.error_message = err_msg
+            else:
+                snapshot = ctrl.snapshot()
+                orchestrator_items = list(
+                    snapshot.get(
+                        "orchestrator_selections",
+                        {},
+                    ).values()
+                )
+                first = orchestrator_items[0]
+                current_pending = engine.project.pending
+                current_pending.orchestrator_binding = ReviewAgentBinding.from_dict(first)
+                current_pending.orchestrator_agent = first.get(
+                    "tool_name",
+                    "",
+                )
+                engine.project.status = WorkflowStatus.AWAITING_TOOL_SELECT
+                ctrl.set_step(2)
+            requirement = engine.project.pending.requirement or ""
 
-        # Transition to review step
-        engine.project.status = WorkflowStatus.AWAITING_TOOL_SELECT
-        ctrl.set_step(2)
-        self._persist_selection_controller(project, ctrl)
-
-        requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
             message_id=message_id,
             chat_id=chat_id,
             project=project,
             requirement=requirement,
             session_key=stored_session_key,
-            is_review=True,
+            is_review=ok,
         )
-
-
 
     def handle_workflow_review_select_tool(
         self,
@@ -2306,20 +3229,24 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
-        if engine.project.status != WorkflowStatus.AWAITING_TOOL_SELECT:
-            self._reply_workflow_error(message_id, "invalid_state")
-            return
-
-        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
         button_session_key = value.get("engine_session_key", "")
-        if not stored_session_key or button_session_key != stored_session_key:
-            self._reply_workflow_error(message_id, "session_expired")
-            return
-
         current_user = get_current_sender_id() or ""
-        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
-        if not stored_initiator or not current_user or current_user != stored_initiator:
-            self._reply_workflow_error(message_id, "forbidden")
+        validation_error: str | None = None
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            stored_session_key = pending.engine_session_key if pending else ""
+            stored_initiator = pending.initiator_user_id if pending else ""
+            requirement = pending.requirement if pending else ""
+            if current_project is None or current_project.status != WorkflowStatus.AWAITING_TOOL_SELECT:
+                validation_error = "invalid_state"
+            elif not stored_session_key or button_session_key != stored_session_key:
+                validation_error = "session_expired"
+            elif not stored_initiator or not current_user or current_user != stored_initiator:
+                validation_error = "forbidden"
+
+        if validation_error is not None:
+            self._reply_workflow_error(message_id, validation_error)
             return
 
         tool_name = value.get("_option") or value.get("tool_name", "")
@@ -2329,28 +3256,48 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         # Security: validate tool_name against allowed list
         from ...workflow_engine.tool_registry import get_available_tools
+
         available_tools = get_available_tools(require_available=True)
         if tool_name not in available_tools:
-            self._reply_workflow_error(message_id, "invalid_argument", detail=f"不支持的工具: {tool_name}")
+            self._reply_pending_error_if_current(
+                engine,
+                message_id,
+                session_key=stored_session_key,
+                initiator_user_id=stored_initiator,
+                valid_statuses=WorkflowStatus.AWAITING_TOOL_SELECT,
+                category="invalid_argument",
+                detail=f"不支持的工具: {tool_name}",
+            )
             return
 
         if project is None:
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(2)
-        if "model_page" in value:
-            try:
-                model_page = int(value.get("model_page", 0) or 0)
-            except (TypeError, ValueError):
-                model_page = 0
-            ctrl.set_model_page(tool_name, model_page, is_review=True)
-        elif value.get("_option"):
-            ctrl.select_tool(tool_name, is_review=True)
-        else:
-            ctrl.toggle_tool_expand(tool_name, is_review=True)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_TOOL_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(2)
+            if "model_page" in value:
+                try:
+                    model_page = int(value.get("model_page", 0) or 0)
+                except (TypeError, ValueError):
+                    model_page = 0
+                ctrl.set_model_page(
+                    tool_name,
+                    model_page,
+                    is_review=True,
+                )
+            elif value.get("_option"):
+                ctrl.select_tool(tool_name, is_review=True)
+            else:
+                ctrl.toggle_tool_expand(tool_name, is_review=True)
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2384,20 +3331,24 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
-        if engine.project.status != WorkflowStatus.AWAITING_TOOL_SELECT:
-            self._reply_workflow_error(message_id, "invalid_state")
-            return
-
-        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
         button_session_key = value.get("engine_session_key", "")
-        if not stored_session_key or button_session_key != stored_session_key:
-            self._reply_workflow_error(message_id, "session_expired")
-            return
-
         current_user = get_current_sender_id() or ""
-        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
-        if not stored_initiator or not current_user or current_user != stored_initiator:
-            self._reply_workflow_error(message_id, "forbidden")
+        validation_error: str | None = None
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            stored_session_key = pending.engine_session_key if pending else ""
+            stored_initiator = pending.initiator_user_id if pending else ""
+            requirement = pending.requirement if pending else ""
+            if current_project is None or current_project.status != WorkflowStatus.AWAITING_TOOL_SELECT:
+                validation_error = "invalid_state"
+            elif not stored_session_key or button_session_key != stored_session_key:
+                validation_error = "session_expired"
+            elif not stored_initiator or not current_user or current_user != stored_initiator:
+                validation_error = "forbidden"
+
+        if validation_error is not None:
+            self._reply_workflow_error(message_id, validation_error)
             return
 
         if project is None:
@@ -2418,7 +3369,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 "[workflow] Rejected unknown tool_name=%s at handle_workflow_review_select_model",
                 tool_name,
             )
-            self._reply_workflow_error(message_id, "invalid_argument", detail=f"无效的工具名称: {tool_name}")
+            self._reply_pending_error_if_current(
+                engine,
+                message_id,
+                session_key=stored_session_key,
+                initiator_user_id=stored_initiator,
+                valid_statuses=WorkflowStatus.AWAITING_TOOL_SELECT,
+                category="invalid_argument",
+                detail=f"无效的工具名称: {tool_name}",
+            )
             return
 
         # Validate model_name against allowed models for this tool
@@ -2430,7 +3389,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     model_name,
                     tool_name,
                 )
-                self._reply_workflow_error(message_id, "invalid_argument", detail=f"无效的模型名称: {model_name}")
+                self._reply_pending_error_if_current(
+                    engine,
+                    message_id,
+                    session_key=stored_session_key,
+                    initiator_user_id=stored_initiator,
+                    valid_statuses=WorkflowStatus.AWAITING_TOOL_SELECT,
+                    category="invalid_argument",
+                    detail=f"无效的模型名称: {model_name}",
+                )
                 return
 
         selection = {
@@ -2445,10 +3412,21 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         else:
             selection["model_name"] = model_name
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(2)
-        ctrl.add_or_update_selection(selection, is_review=True, keep_panel_open=True)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_TOOL_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(2)
+            ctrl.add_or_update_selection(
+                selection,
+                is_review=True,
+                keep_panel_open=True,
+            )
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2459,7 +3437,6 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             session_key=stored_session_key,
             is_review=True,
         )
-
 
     def handle_workflow_review_remove(
         self,
@@ -2507,10 +3484,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(2)
-        ctrl.remove_selection(selection_key, is_review=True)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_TOOL_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(2)
+            ctrl.remove_selection(selection_key, is_review=True)
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2563,10 +3547,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(2)
-        ctrl.clear_selections(is_review=True)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_TOOL_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(2)
+            ctrl.clear_selections(is_review=True)
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2619,10 +3610,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(2)
-        ctrl.set_review_auto_mode(not ctrl.review_auto_mode)
-        self._persist_selection_controller(project, ctrl)
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_TOOL_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(2)
+            ctrl.set_review_auto_mode(not ctrl.review_auto_mode)
 
         requirement = engine.project.pending.requirement if engine.project.pending else ""
         self._send_combined_selection_card(
@@ -2633,6 +3631,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             session_key=stored_session_key,
             is_review=True,
         )
+
     def handle_workflow_review_finish(
         self,
         message_id: str,
@@ -2661,35 +3660,108 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         if not engine or not engine.project:
             self._reply_workflow_error(message_id, "session_expired")
             return
-
-        if engine.project.status != WorkflowStatus.AWAITING_TOOL_SELECT:
-            self._reply_workflow_error(message_id, "invalid_state")
-            return
-
-        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
-        button_session_key = value.get("engine_session_key", "")
-        if not stored_session_key or button_session_key != stored_session_key:
-            self._reply_workflow_error(message_id, "session_expired")
-            return
-
-        current_user = get_current_sender_id() or ""
-        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
-        if not stored_initiator or not current_user or current_user != stored_initiator:
-            self._reply_workflow_error(message_id, "forbidden")
-            return
-
         if project is None:
-            self._reply_workflow_error(message_id, "invalid_state", detail="缺少项目上下文")
+            self._reply_workflow_error(
+                message_id,
+                "invalid_state",
+                detail="缺少项目上下文",
+            )
             return
 
-        ctrl = self._get_selection_controller(project)
-        ctrl.set_step(2)
+        button_session_key = value.get("engine_session_key", "")
+        current_user = get_current_sender_id() or ""
+        validation_error: str | None = None
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            stored_session_key = pending.engine_session_key if pending else ""
+            stored_initiator = pending.initiator_user_id if pending else ""
+            requirement = pending.requirement if pending else ""
+            if current_project is None or current_project.status != WorkflowStatus.AWAITING_TOOL_SELECT:
+                validation_error = "invalid_state"
+            elif not stored_session_key or button_session_key != stored_session_key:
+                validation_error = "session_expired"
+            elif not stored_initiator or not current_user or current_user != stored_initiator:
+                validation_error = "forbidden"
+        if validation_error is not None:
+            self._reply_workflow_error(message_id, validation_error)
+            return
 
-        ok, err_msg = ctrl.validate_non_empty(is_review=True)
+        from src.spec_engine.review_agents import ReviewAgentBinding
+
+        from ...card import CardBuilder
+
+        all_selected: list[str] = []
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=WorkflowStatus.AWAITING_TOOL_SELECT,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            ctrl.set_step(2)
+            ok, err_msg = ctrl.validate_non_empty(is_review=True)
+            current_pending = engine.project.pending if engine.project else None
+            if (
+                engine.project is None
+                or engine.project.status != WorkflowStatus.AWAITING_TOOL_SELECT
+                or current_pending is None
+                or current_pending.engine_session_key != stored_session_key
+                or current_pending.initiator_user_id != current_user
+            ):
+                return
+            if not ok:
+                ctrl.error_message = err_msg
+                requirement = engine.project.pending.requirement or ""
+            else:
+                snapshot = ctrl.snapshot()
+                review_items = list(snapshot.get("review_selections", {}).values())
+                review_agents = [ReviewAgentBinding.from_dict(item) for item in review_items]
+                current_project = engine.project
+                current_pending = current_project.pending
+
+                current_pending.review_agents = review_agents
+                orchestrator_tool = current_pending.orchestrator_agent or ""
+                for tool_name in [
+                    orchestrator_tool,
+                    *(agent.tool_name for agent in review_agents),
+                ]:
+                    if tool_name and tool_name not in all_selected:
+                        all_selected.append(tool_name)
+                if all_selected:
+                    current_pending.selected_tools = all_selected
+
+                selections_summary = []
+                orch_binding = current_pending.orchestrator_binding
+                orch_model = getattr(orch_binding, "model_name", "") or "(默认)" if orch_binding else ""
+                selections_summary.append(f"**主编排 Agent**: `{orchestrator_tool}` {orch_model}")
+                if review_agents:
+                    review_lines = [
+                        (f"  {index + 1}. `{agent.tool_name}` {agent.model_name or '(默认)'}")
+                        for index, agent in enumerate(review_agents)
+                    ]
+                    selections_summary.append("**评审 Agent**:\n" + "\n".join(review_lines))
+                elif ctrl.review_auto_mode:
+                    selections_summary.append("**评审 Agent**: Auto（沿用主 Agent）")
+                locked_card = CardBuilder._wrap_card(
+                    header_title="✅ Workflow — 工具选择完成",
+                    header_template="green",
+                    elements=[
+                        {
+                            "tag": "markdown",
+                            "content": "\n\n".join(selections_summary),
+                        }
+                    ],
+                )
+                requirement = current_pending.requirement or ""
+                # Keep card order consistent with the state CAS: a newer
+                # request waits for this update and therefore publishes last.
+                self.update_card(message_id, locked_card)
+                current_project.status = WorkflowStatus.GENERATING_SCRIPT
+
         if not ok:
-            ctrl.error_message = err_msg
-            self._persist_selection_controller(project, ctrl)
-            requirement = engine.project.pending.requirement if engine.project.pending else ""
             self._send_combined_selection_card(
                 message_id=message_id,
                 chat_id=chat_id,
@@ -2700,52 +3772,6 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             )
             return
 
-        from src.spec_engine.review_agents import ReviewAgentBinding
-
-        # Save review selections
-        snapshot = ctrl.snapshot()
-        review_items = list(snapshot.get("review_selections", {}).values())
-        if review_items:
-            engine.project.pending.review_agents = [ReviewAgentBinding.from_dict(item) for item in review_items]
-        else:
-            engine.project.pending.review_agents = []
-
-        # Derive selected_tools from orchestrator + review selections
-        orchestrator_tool = engine.project.pending.orchestrator_agent or ""
-        review_tools = [a.tool_name for a in (engine.project.pending.review_agents or [])]
-        all_selected = []
-        for t in [orchestrator_tool] + review_tools:
-            if t and t not in all_selected:
-                all_selected.append(t)
-        if all_selected:
-            engine.project.pending.selected_tools = all_selected
-
-        # Replace the selection card with a locked summary so it can't be re-clicked
-        from ...card import CardBuilder
-        selections_summary = []
-        orch_agent = engine.project.pending.orchestrator_agent or ""
-        orch_binding = engine.project.pending.orchestrator_binding
-        orch_model = ""
-        if orch_binding:
-            orch_model = getattr(orch_binding, "model_name", "") or "(默认)"
-        selections_summary.append(f"**主编排 Agent**: `{orch_agent}` {orch_model}")
-        review_agents_list = engine.project.pending.review_agents or []
-        if review_agents_list:
-            review_lines = [f"  {i+1}. `{a.tool_name}` {a.model_name or '(默认)'}" for i, a in enumerate(review_agents_list)]
-            selections_summary.append("**评审 Agent**:\n" + "\n".join(review_lines))
-        elif ctrl.review_auto_mode:
-            selections_summary.append("**评审 Agent**: Auto（沿用主 Agent）")
-        locked_card = CardBuilder._wrap_card(
-            header_title="✅ Workflow — 工具选择完成",
-            header_template="green",
-            elements=[{"tag": "markdown", "content": "\n\n".join(selections_summary)}],
-        )
-        self.update_card(message_id, locked_card)
-
-        # Proceed to script generation without blocking the Feishu callback
-        # thread on a long-running ACP/CLI model call.
-        requirement = engine.project.pending.requirement if engine.project.pending else ""
-        engine.project.status = WorkflowStatus.GENERATING_SCRIPT
         self._schedule_generate_and_show_confirm_card(
             message_id=message_id,
             chat_id=chat_id,
@@ -2754,6 +3780,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             root_path=root_path,
             selected_tools=all_selected if all_selected else None,
             engine=engine,
+            expected_session_key=stored_session_key,
         )
 
     def _get_workflow_models_for_tool(self, tool_name: str, root_path: str = "") -> list[dict]:
@@ -2775,15 +3802,10 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             for item in items:
                 clone = dict(item)
                 if "reasoning_efforts" in clone:
-                    clone["reasoning_efforts"] = list(
-                        clone.get("reasoning_efforts") or []
-                    )
+                    clone["reasoning_efforts"] = list(clone.get("reasoning_efforts") or [])
                 if "selection_variants" in clone:
                     clone["selection_variants"] = [
-                        dict(variant or {})
-                        for variant in (
-                            clone.get("selection_variants") or []
-                        )
+                        dict(variant or {}) for variant in (clone.get("selection_variants") or [])
                     ]
                 copied.append(clone)
             return copied
@@ -2818,10 +3840,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     cached_tool, cached_root, _cached_provider = cache_key
                     cached_generation = -1
                 if cached_tool == tool_name and cached_root == root_path:
-                    if (
-                        cached_generation == generation
-                        and now - cached_at <= _WORKFLOW_MODEL_CACHE_TTL_S
-                    ):
+                    if cached_generation == generation and now - cached_at <= _WORKFLOW_MODEL_CACHE_TTL_S:
                         logger.info(
                             "[workflow] model_lookup tool=%s provider=%s count=%d duration_ms=%.1f cached=true",
                             tool_name,
@@ -2845,7 +3864,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 force_refresh=False,
             )
             normalized = []
-            for model in (models or []):
+            for model in models or []:
                 if not model.get("name"):
                     continue
                 item = {
@@ -2860,15 +3879,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 if reasoning_efforts:
                     item["is_default"] = bool(model.get("is_default"))
                     item["reasoning_efforts"] = reasoning_efforts
-                    item["adapted_reasoning_effort"] = model.get(
-                        "adapted_reasoning_effort"
-                    )
-                selection_variants = [
-                    dict(variant or {})
-                    for variant in (
-                        model.get("selection_variants") or []
-                    )
-                ]
+                    item["adapted_reasoning_effort"] = model.get("adapted_reasoning_effort")
+                selection_variants = [dict(variant or {}) for variant in (model.get("selection_variants") or [])]
                 if selection_variants:
                     item["is_default"] = bool(model.get("is_default"))
                     item["selection_variants"] = selection_variants
@@ -2949,6 +3961,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Strip unknown fields from button callback to prevent forged fields
         # (e.g. a client-side ``value.confirmed`` bypass).
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         project_id = project_id or value.get("project_id", "")
@@ -2960,46 +3973,56 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
+        from ...thread import get_current_sender_id
         from ...workflow_engine.models import WorkflowStatus
 
-        if engine.project.status != WorkflowStatus.AWAITING_TOOL_SELECT:
-            self._reply_workflow_error(message_id, "invalid_state")
-            return
-
-        # --- Security validation (fail-closed) ---
-        from ...thread import get_current_sender_id
-
-        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
         button_session_key = value.get("engine_session_key", "")
-        if not stored_session_key or button_session_key != stored_session_key:
-            self._reply_workflow_error(message_id, "session_expired")
-            return
-
         current_user = get_current_sender_id() or ""
-        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
-        if not stored_initiator or not current_user or current_user != stored_initiator:
-            self._reply_workflow_error(message_id, "forbidden")
+        stored_session_key = ""
+        selected_tools: list[str] = []
+        requirement = ""
+        error: tuple[str, str] | None = None
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            stored_session_key = pending.engine_session_key if pending else ""
+            stored_initiator = pending.initiator_user_id if pending else ""
+            if current_project is None or current_project.status != WorkflowStatus.AWAITING_TOOL_SELECT:
+                error = ("invalid_state", "")
+            elif not stored_session_key or button_session_key != stored_session_key:
+                error = ("session_expired", "")
+            elif not stored_initiator or not current_user or current_user != stored_initiator:
+                error = ("forbidden", "")
+            elif not pending.selected_tools:
+                error = ("invalid_argument", "请至少选择一个工具")
+            else:
+                # Snapshot and status transition share the same CAS as a
+                # concurrent legacy selection click.
+                selected_tools = list(pending.selected_tools)
+                requirement = pending.requirement or ""
+                current_project.status = WorkflowStatus.GENERATING_SCRIPT
+
+        if error is not None:
+            self._reply_workflow_error(
+                message_id,
+                error[0],
+                detail=error[1],
+            )
             return
 
-        # Get selected tools and requirement
-        selected_tools = list(engine.project.pending.selected_tools or []) if engine.project.pending else []
-        requirement = engine.project.pending.requirement if engine.project.pending else ""
-
-        if not selected_tools:
-            self._reply_workflow_error(message_id, "invalid_argument", detail="请至少选择一个工具")
-            return
-
-        # Go directly to script generation (roles are already set from the
-        # combined selection card).
-        self._generate_and_show_confirm_card(
+        # Enter the same owned/scheduled generation path as the combined
+        # selector. A required session key makes /stop_wf and stale-task drops
+        # work for this compatibility action too.
+        self._schedule_generate_and_show_confirm_card(
             message_id=message_id,
             chat_id=chat_id,
             requirement=requirement,
             project=project,
             root_path=root_path,
             selected_tools=selected_tools,
+            engine=engine,
+            expected_session_key=stored_session_key,
         )
-
 
     def handle_workflow_regenerate_script(
         self,
@@ -3016,6 +4039,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Strip unknown fields from button callback to prevent forged fields
         # (e.g. a client-side ``value.confirmed`` bypass).
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         project_id = project_id or value.get("project_id", "")
@@ -3027,51 +4051,60 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
-        from ...workflow_engine.models import WorkflowStatus
-
-        if engine.project.status != WorkflowStatus.AWAITING_CONFIRM:
-            self._reply_workflow_error(message_id, "invalid_state")
-            return
-
         # --- Security validation (fail-closed) ---
         from ...thread import get_current_sender_id
+        from ...workflow_engine.models import WorkflowStatus
 
-        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
         button_session_key = value.get("engine_session_key", "")
-        if not stored_session_key or button_session_key != stored_session_key:
-            self._reply_workflow_error(message_id, "session_expired")
-            return
-
         current_user = get_current_sender_id() or ""
-        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
-        if not stored_initiator or not current_user or current_user != stored_initiator:
-            self._reply_workflow_error(message_id, "forbidden")
+        error: tuple[str, str] | None = None
+        selected_tools: list[str] = []
+        requirement = ""
+        old_script_path: str | None = None
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            stored_session_key = pending.engine_session_key if pending else ""
+            stored_initiator = pending.initiator_user_id if pending else ""
+            if current_project is None or current_project.status != WorkflowStatus.AWAITING_CONFIRM:
+                error = ("invalid_state", "")
+            elif not stored_session_key or button_session_key != stored_session_key:
+                error = ("session_expired", "")
+            elif not stored_initiator or not current_user or current_user != stored_initiator:
+                error = ("forbidden", "")
+            elif pending is None or not pending.selected_tools:
+                error = ("invalid_argument", "请至少选择一个工具")
+            else:
+                selected_tools = list(pending.selected_tools)
+                requirement = pending.requirement or ""
+                old_script_path = pending.script_path
+                pending.script_path = None
+                pending.script_hash = None
+                current_project.status = WorkflowStatus.GENERATING_SCRIPT
+
+        if error is not None:
+            self._reply_workflow_error(
+                message_id,
+                error[0],
+                detail=error[1],
+            )
             return
 
-        # Get current state
-        selected_tools = list(engine.project.pending.selected_tools or []) if engine.project.pending else []
-        requirement = engine.project.pending.requirement if engine.project.pending else ""
+        self._remove_owned_workflow_artifact(
+            old_script_path,
+            root_path=root_path,
+        )
 
-        if not selected_tools:
-            self._reply_workflow_error(message_id, "invalid_argument", detail="请至少选择一个工具")
-            return
-
-        # Clean up old script file
-        old_script_path = engine.project.pending.script_path if engine.project.pending else None
-        if old_script_path:
-            try:
-                os.remove(old_script_path)
-            except OSError:
-                pass
-
-        # Regenerate script with current tool selection
-        self._generate_and_show_confirm_card(
+        # Regenerate through the cancellable background path.
+        self._schedule_generate_and_show_confirm_card(
             message_id=message_id,
             chat_id=chat_id,
             requirement=requirement,
             project=project,
             root_path=root_path,
             selected_tools=selected_tools,
+            engine=engine,
+            expected_session_key=stored_session_key,
         )
 
     def _start_pending_workflow_execution(
@@ -3084,23 +4117,42 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         root_path: str,
         engine: Any,
         allow_server_side_start: bool = False,
+        generation_owner: _WorkflowLifecycleOwner | None = None,
     ) -> bool:
         """Start a generated pending workflow through the existing confirm path."""
         from ...thread import get_current_sender_id, set_current_sender_id
         from ...workflow_engine.models import WorkflowStatus
 
         _ = (project, root_path)
-        if not engine or not getattr(engine, "project", None) or not engine.project.pending:
-            self._reply_workflow_error(message_id, "session_expired")
+        if generation_owner is not None and generation_owner.stop_event.is_set():
             return False
-        if engine.project.status != WorkflowStatus.AWAITING_CONFIRM:
-            self._reply_workflow_error(message_id, "invalid_state")
+        if not engine:
+            if generation_owner is None:
+                self._reply_workflow_error(message_id, "session_expired")
             return False
-
-        pending = engine.project.pending
+        with engine._lock:
+            wf_project = engine.project
+            pending = wf_project.pending if wf_project else None
+            valid_owner = bool(
+                generation_owner is None
+                or (
+                    vars(engine).get("_script_generation_owner") is generation_owner
+                    and not generation_owner.stop_event.is_set()
+                )
+            )
+            valid_status = bool(wf_project and wf_project.status == WorkflowStatus.AWAITING_CONFIRM)
+        if pending is None or not valid_owner:
+            if generation_owner is None:
+                self._reply_workflow_error(message_id, "session_expired")
+            return False
+        if not valid_status:
+            if generation_owner is None:
+                self._reply_workflow_error(message_id, "invalid_state")
+            return False
         session_key = pending.engine_session_key or ""
         if not session_key:
-            self._reply_workflow_error(message_id, "session_expired")
+            if generation_owner is None:
+                self._reply_workflow_error(message_id, "session_expired")
             return False
 
         previous_sender = get_current_sender_id()
@@ -3118,6 +4170,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     "project_id": project_id,
                     "engine_session_key": session_key,
                 },
+                _generation_owner=generation_owner,
             )
         finally:
             if should_bind_sender:
@@ -3131,6 +4184,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         chat_id: str,
         project_id: str,
         value: dict[str, Any],
+        *,
+        _generation_owner: _WorkflowLifecycleOwner | None = None,
     ) -> None:
         """Handle confirm button click — start workflow execution.
 
@@ -3140,6 +4195,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Strip unknown fields from button callback to prevent forged fields
         # (e.g. a client-side ``value.confirmed`` bypass).
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         # Route to correct project using project_id from button value
@@ -3154,16 +4210,52 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         from ...workflow_engine.models import WorkflowStatus
 
-        if engine.project.status != WorkflowStatus.AWAITING_CONFIRM:
-            self._reply_workflow_error(message_id, "invalid_state")
+        def _reply_start_error(
+            category: str,
+            *,
+            detail: str = "",
+        ) -> None:
+            if _generation_owner is None:
+                self._reply_workflow_error(
+                    message_id,
+                    category,
+                    detail=detail,
+                )
+                return
+            with _generation_owner.delivery_lock:
+                with engine._lock:
+                    owner_is_current = bool(
+                        vars(engine).get("_script_generation_owner") is _generation_owner
+                        and not _generation_owner.stop_event.is_set()
+                    )
+                if owner_is_current:
+                    self._reply_workflow_error(
+                        message_id,
+                        category,
+                        detail=detail,
+                    )
+
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            if current_project is None or current_project.status != WorkflowStatus.AWAITING_CONFIRM:
+                pending = None
+            if _generation_owner is not None and (
+                vars(engine).get("_script_generation_owner") is not _generation_owner
+                or _generation_owner.stop_event.is_set()
+            ):
+                return
+
+        if pending is None:
+            _reply_start_error("invalid_state")
             return
 
         # --- Security validation ---
         from ...thread import get_current_sender_id
 
         current_user = get_current_sender_id() or ""
-        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
-        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
+        stored_initiator = pending.initiator_user_id or ""
+        stored_session_key = pending.engine_session_key or ""
         button_session_key = value.get("engine_session_key", "")
 
         # Fail-closed: reject if session key missing or mismatched
@@ -3173,7 +4265,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 button_session_key[:8],
                 stored_session_key[:8],
             )
-            self._reply_workflow_error(message_id, "session_expired")
+            _reply_start_error("session_expired")
             return
 
         # Fail-closed: reject if initiator unknown or user mismatch
@@ -3183,22 +4275,21 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 current_user[:8],
                 stored_initiator[:8],
             )
-            self._reply_workflow_error(message_id, "forbidden")
+            _reply_start_error("forbidden")
             return
 
         # Retrieve pending state
-        script_path = engine.project.pending.script_path if engine.project.pending else None
-        requirement = engine.project.pending.requirement if engine.project.pending else ""
-        selected_tools = list(engine.project.pending.selected_tools or []) if engine.project.pending else []
-        expected_script_hash = (
-            engine.project.pending.script_hash
-            if engine.project and engine.project.pending
-            else None
-        )
-        pending_meta = engine.project.pending.meta if engine.project.pending else None
+        script_path = pending.script_path
+        requirement = pending.requirement or ""
+        selected_tools = list(pending.selected_tools or [])
+        expected_script_hash = pending.script_hash
+        pending_meta = pending.meta
 
         if not script_path:
-            self._reply_workflow_error(message_id, "invalid_state", detail="无法获取待执行脚本，请重新发送 `/wf`")
+            _reply_start_error(
+                "invalid_state",
+                detail="无法获取待执行脚本，请重新发送 `/wf`",
+            )
             return
 
         # --- TOCTOU hardening (check-then-re-read-verify) ---
@@ -3211,16 +4302,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 script_bytes = f.read()
         except OSError:
             # Note: script_path is not exposed to user for security reasons
-            self._reply_workflow_error(
-                message_id, "internal_error", detail="脚本文件读取失败，请重新发送 `/wf` 生成"
+            _reply_start_error(
+                "internal_error",
+                detail="脚本文件读取失败，请重新发送 `/wf` 生成",
             )
             return
         script_text = script_bytes.decode("utf-8", errors="strict")
         import hashlib
+
         current_script_hash = hashlib.sha256(script_bytes).hexdigest()
         if expected_script_hash and current_script_hash != expected_script_hash:
-            self._reply_workflow_error(
-                message_id,
+            _reply_start_error(
                 "internal_error",
                 detail="脚本内容与生成时不一致，疑似被篡改。请重新发送 `/wf` 生成。",
             )
@@ -3231,8 +4323,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         is_valid, validation_errors = validate_generated_script(script_text)
         if not is_valid:
-            self._reply_workflow_error(
-                message_id,
+            _reply_start_error(
                 "internal_error",
                 detail="脚本验证失败：" + "; ".join(validation_errors[:3]),
             )
@@ -3256,19 +4347,16 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 # Rewrite tool references in script to use only allowed tools
                 primary_tool = (selected_tools or ["coco"])[0]
                 for bad_tool in unmatched:
-                    script_text = script_text.replace(
-                        f'tool: "{bad_tool}"', f'tool: "{primary_tool}"'
-                    )
-                    script_text = script_text.replace(
-                        f"tool: '{bad_tool}'", f"tool: '{primary_tool}'"
-                    )
+                    script_text = script_text.replace(f'tool: "{bad_tool}"', f'tool: "{primary_tool}"')
+                    script_text = script_text.replace(f"tool: '{bad_tool}'", f"tool: '{primary_tool}'")
                 # Update meta.tools in the script
                 import re as _re
+
                 kept_tools = sorted(fresh_script_tools & allowed_tools) or list(selected_tools or [])
                 tools_json = str(kept_tools).replace("'", '"')
                 script_text = _re.sub(
-                    r'tools:\s*\[[^\]]*\]',
-                    f'tools: {tools_json}',
+                    r"tools:\s*\[[^\]]*\]",
+                    f"tools: {tools_json}",
                     script_text,
                     count=1,
                 )
@@ -3283,16 +4371,13 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             if isinstance(candidate_refs, list):
                 refs_for_injection = [r for r in candidate_refs if isinstance(r, dict)]
         if refs_for_injection:
-            script_text = self._inject_workflow_refs_into_script(
-                script_text, refs_for_injection
-            )
+            script_text = self._inject_workflow_refs_into_script(script_text, refs_for_injection)
             # Revalidate after injection so a broken ref payload cannot
             # silently bypass the dangerous-pattern / structural checks.
             is_valid, validation_errors = validate_generated_script(script_text)
             if not is_valid:
                 joined = "; ".join(validation_errors)[:500]
-                self._reply_workflow_error(
-                    message_id,
+                _reply_start_error(
                     "invalid_argument",
                     detail=f"workflow refs 注入后脚本未通过校验: {joined}",
                 )
@@ -3304,79 +4389,235 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # concurrent sessions and test suites; we additionally append the
         # script hash so accidental inspection can trace the source.
         import tempfile
+
         temp_fd, immutable_script_path = tempfile.mkstemp(
             prefix="ghostap-confirmed-",
             suffix=f"-{current_script_hash}.js",
         )
+
+        def _discard_immutable_script() -> None:
+            self._remove_owned_workflow_artifact(
+                immutable_script_path,
+                root_path=root_path,
+            )
+
         try:
             with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
                 f.write(script_text)
         except OSError as exc:
-            self._reply_workflow_error(
-                message_id, "internal_error",
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+            _discard_immutable_script()
+            _reply_start_error(
+                "internal_error",
                 detail=f"无法创建执行用临时脚本副本: {exc}",
             )
             return
 
-        # Clear pending state and set running
-        engine.project.start_execution()
-        import time as _time
-
-        engine.project.status = WorkflowStatus.RUNNING
-        engine.project.requirement = requirement
-        engine.project.script_path = immutable_script_path
-        engine.project.started_at = _time.time()
-        engine.project.selected_tools = selected_tools or None
-        progress_card_message_id = self._show_initial_workflow_progress_card(
-            card_message_id=message_id,
-            chat_id=chat_id,
-            wf_project=engine.project,
-        )
-
-        # Use project already resolved above for engine_name
-        engine_name = self.get_engine_name(
-            chat_id, project_id=project_id or None
-        )
-
-        project_name = (project.project_name if project else "") or os.path.basename(root_path)
-        task_id = generate_task_id(project_name or "workflow")
-
-        def run_workflow():
-            def _executor():
-                callbacks = self._build_workflow_callbacks(progress_card_message_id, chat_id, project)
-                engine.execute_workflow(
-                    requirement=requirement,
-                    script_path=immutable_script_path,
-                    callbacks=callbacks,
-                    selected_tools=selected_tools or None,
-                    initiator_user_id=stored_initiator or None,
-                )
-
-            self._safe_execute_engine(
-                executor_func=_executor,
-                task_id=task_id,
-                chat_id=chat_id,
-                message_id=message_id,
-                project=project,
-                engine_name=engine_name,
-                reporter=self.ctx.progress_reporter,
-                request_id=self.ensure_request_id(
-                    message_id,
-                    chat_id=chat_id,
-                    project_id=project_id or None,
-                ),
-                action_prefix="workflow",
-                command_text=f"/wf {requirement}",
+        if _generation_owner is not None:
+            start_owner = _WorkflowLifecycleOwner(
+                session_key=stored_session_key,
+                stop_event=_generation_owner.stop_event,
+                heartbeat_stop_event=_generation_owner.heartbeat_stop_event,
+                delivery_lock=_generation_owner.delivery_lock,
+                source_script_path=script_path,
+                execution_script_path=immutable_script_path,
+            )
+        else:
+            start_owner = _WorkflowLifecycleOwner(
+                session_key=stored_session_key,
+                source_script_path=script_path,
+                execution_script_path=immutable_script_path,
             )
 
-        self._submit_engine_task(
-            run_workflow,
-            chat_id,
-            message_id,
-            project,
-            request_id=None,
-            task_id=task_id,
-        )
+        def _abandon_start(*, remove_source: bool = True) -> None:
+            start_owner.stop_event.set()
+            _discard_immutable_script()
+            if remove_source:
+                self._remove_owned_workflow_artifact(
+                    start_owner.source_script_path,
+                    root_path=root_path,
+                )
+            with engine._lock:
+                if vars(engine).get("_workflow_start_owner") is start_owner:
+                    self._retire_workflow_owner(
+                        engine,
+                        start_owner,
+                    )
+                    engine._workflow_start_owner = None
+                    if engine.project is not None:
+                        engine.project.status = WorkflowStatus.IDLE
+                        engine.project.script_path = None
+            start_owner.done_event.set()
+
+        # Linearize the generated-session handoff against /stop_wf. All
+        # expensive validation above is speculative; this is the authoritative
+        # state/session check immediately before publishing RUNNING.
+        with start_owner.delivery_lock:
+            with engine._lock:
+                current_project = engine.project
+                current_pending = current_project.pending if current_project is not None else None
+                current_session_key = current_pending.engine_session_key if current_pending else ""
+                generation_owner_matches = bool(
+                    _generation_owner is None or vars(engine).get("_script_generation_owner") is _generation_owner
+                )
+                if (
+                    current_project is None
+                    or current_project.status != WorkflowStatus.AWAITING_CONFIRM
+                    or current_session_key != stored_session_key
+                    or not generation_owner_matches
+                    or start_owner.stop_event.is_set()
+                ):
+                    _discard_immutable_script()
+                    return
+
+                current_project.start_execution()
+                current_project.status = WorkflowStatus.RUNNING
+                current_project.requirement = requirement
+                current_project.script_path = script_path
+                current_project.started_at = time.time()
+                current_project.selected_tools = selected_tools or None
+                engine._workflow_start_owner = start_owner
+                if _generation_owner is not None:
+                    self._retire_workflow_owner(
+                        engine,
+                        _generation_owner,
+                    )
+                    engine._script_generation_owner = None
+
+            if start_owner.stop_event.is_set():
+                _abandon_start()
+                return
+
+            origin_message_id = self._resolve_origin(message_id)
+            progress_card_message_id = self._show_initial_workflow_progress_card(
+                card_message_id=message_id,
+                chat_id=chat_id,
+                wf_project=engine.project,
+                origin_message_id=origin_message_id,
+            )
+            if start_owner.stop_event.is_set():
+                _abandon_start()
+                return
+
+            try:
+                # Use project already resolved above for engine_name.
+                engine_name = self.get_engine_name(
+                    chat_id,
+                    project_id=project_id or None,
+                )
+                project_name = (project.project_name if project else "") or os.path.basename(root_path)
+                task_id = generate_task_id(project_name or "workflow")
+            except Exception as exc:
+                error_card = self._build_error_card(
+                    "internal_error",
+                    detail=f"Workflow 任务准备失败: {exc}",
+                )
+                try:
+                    self._replace_or_send_workflow_card(
+                        card_message_id=progress_card_message_id,
+                        chat_id=chat_id,
+                        card=error_card,
+                        origin_message_id=origin_message_id,
+                    )
+                finally:
+                    _abandon_start()
+                return
+
+            def run_workflow():
+                # Register the scheduler worker in the same engine critical
+                # section that cleanup uses to revoke the owner. Cleanup can
+                # now distinguish "never started" from "started, pre-claim"
+                # without forging completion for the latter.
+                with engine._lock:
+                    worker_admitted = bool(
+                        vars(engine).get("_workflow_start_owner") is start_owner
+                        and getattr(engine, "_closing", False) is not True
+                        and not start_owner.stop_event.is_set()
+                    )
+                    if worker_admitted:
+                        start_owner.worker_started_event.set()
+                        object.__setattr__(
+                            start_owner,
+                            "worker_thread_id",
+                            threading.get_ident(),
+                        )
+                if not worker_admitted:
+                    _abandon_start()
+                    return
+
+                def _executor():
+                    callbacks = self._build_workflow_callbacks(
+                        progress_card_message_id,
+                        chat_id,
+                        project,
+                        lifecycle_owner=start_owner,
+                    )
+                    engine.execute_workflow(
+                        requirement=requirement,
+                        script_path=immutable_script_path,
+                        callbacks=callbacks,
+                        selected_tools=selected_tools or None,
+                        initiator_user_id=stored_initiator or None,
+                        start_owner=start_owner,
+                        source_script_path=script_path,
+                    )
+
+                try:
+                    self._safe_execute_engine(
+                        executor_func=_executor,
+                        task_id=task_id,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        project=project,
+                        engine_name=engine_name,
+                        reporter=self.ctx.progress_reporter,
+                        request_id=self.ensure_request_id(
+                            message_id,
+                            chat_id=chat_id,
+                            project_id=project_id or None,
+                        ),
+                        action_prefix="workflow",
+                        command_text=f"/wf {requirement}",
+                        lifecycle_owner=start_owner,
+                        lifecycle_engine=engine,
+                    )
+                finally:
+                    if not start_owner.claimed_event.is_set():
+                        _abandon_start()
+
+            try:
+                self._submit_engine_task(
+                    run_workflow,
+                    chat_id,
+                    message_id,
+                    project,
+                    request_id=None,
+                    task_id=task_id,
+                )
+            except Exception as exc:
+                with start_owner.delivery_lock:
+                    with engine._lock:
+                        should_report = bool(
+                            vars(engine).get("_workflow_start_owner") is start_owner
+                            and not start_owner.stop_event.is_set()
+                        )
+                    try:
+                        if should_report:
+                            error_card = self._build_error_card(
+                                "internal_error",
+                                detail=f"Workflow 任务提交失败: {exc}",
+                            )
+                            self._replace_or_send_workflow_card(
+                                card_message_id=progress_card_message_id,
+                                chat_id=chat_id,
+                                card=error_card,
+                                origin_message_id=origin_message_id,
+                            )
+                    finally:
+                        _abandon_start()
 
     def handle_workflow_cancel(
         self,
@@ -3397,6 +4638,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Strip unknown fields from button callback to prevent forged fields
         # (e.g. a client-side ``value.confirmed`` bypass).
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         button_session_key = value.get("engine_session_key", "")
@@ -3427,16 +4669,18 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             cancel_card = CardBuilder._wrap_card(
                 header_title="🔄 Workflow — 已取消",
                 header_template="grey",
-                elements=[{
-                    "tag": "markdown",
-                    "content": (
-                        "已取消输入。当前对话已退出 Workflow 模式。\n"
-                        "若需开始新任务，请显式发送：\n"
-                        "• `/wf <你的任务描述>` — 基于需求开始编排\n"
-                        "• `/wf` — 重新查看入口卡片\n"
-                        "（自由文本将走原有路由，不再被当作 Workflow 需求）"
-                    ),
-                }],
+                elements=[
+                    {
+                        "tag": "markdown",
+                        "content": (
+                            "已取消输入。当前对话已退出 Workflow 模式。\n"
+                            "若需开始新任务，请显式发送：\n"
+                            "• `/wf <你的任务描述>` — 基于需求开始编排\n"
+                            "• `/wf` — 重新查看入口卡片\n"
+                            "（自由文本将走原有路由，不再被当作 Workflow 需求）"
+                        ),
+                    }
+                ],
             )
             self.update_card(message_id, cancel_card)
             return
@@ -3450,39 +4694,57 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
+        from ...thread import get_current_sender_id
         from ...workflow_engine.models import WorkflowStatus
 
-        valid_statuses = _workflow_pending_statuses()
-        if engine.project.status not in valid_statuses:
-            self._reply_workflow_error(message_id, "invalid_state")
-            return
-
-        # Security: validate session key (fail-closed)
-        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
-        if not stored_session_key or button_session_key != stored_session_key:
-            self._reply_workflow_error(message_id, "session_expired")
-            return
-
-        # Security: validate initiator (fail-closed)
-        from ...thread import get_current_sender_id
-
         current_user = get_current_sender_id() or ""
-        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
-        if not stored_initiator or not current_user or current_user != stored_initiator:
-            self._reply_workflow_error(message_id, "forbidden")
+        error_category: str | None = None
+        owners_to_drain: list[_WorkflowLifecycleOwner] = []
+        script_path: str | None = None
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            stored_session_key = pending.engine_session_key if pending else ""
+            stored_initiator = pending.initiator_user_id if pending else ""
+            if current_project is None or current_project.status not in _workflow_pending_statuses():
+                error_category = "invalid_state"
+            elif not stored_session_key or button_session_key != stored_session_key:
+                error_category = "session_expired"
+            elif not stored_initiator or not current_user or current_user != stored_initiator:
+                error_category = "forbidden"
+            else:
+                script_path = pending.script_path if pending else None
+                for attr_name in (
+                    "_workflow_selection_owner",
+                    "_script_generation_owner",
+                    "_workflow_start_owner",
+                ):
+                    candidate = vars(engine).get(attr_name)
+                    if isinstance(candidate, _WorkflowLifecycleOwner):
+                        candidate.stop_event.set()
+                        candidate.heartbeat_stop_event.set()
+                        self._retire_workflow_owner(
+                            engine,
+                            candidate,
+                        )
+                        if candidate not in owners_to_drain:
+                            owners_to_drain.append(candidate)
+                        setattr(engine, attr_name, None)
+                current_project.status = WorkflowStatus.IDLE
+                current_project.pending = None
+
+        if error_category is not None:
+            self._reply_workflow_error(message_id, error_category)
             return
-
-        # Clean up pending script file
-        script_path = engine.project.pending.script_path if engine.project.pending else None
-        if script_path:
-            try:
-                os.remove(script_path)
-            except OSError:
+        for owner_to_drain in owners_to_drain:
+            with owner_to_drain.delivery_lock:
                 pass
-
-        # Reset state
-        engine.project.status = WorkflowStatus.IDLE
-        engine.project.pending = None
+            if not owner_to_drain.claimed_event.is_set() and not owner_to_drain.worker_started_event.is_set():
+                owner_to_drain.done_event.set()
+        self._remove_owned_workflow_artifact(
+            script_path,
+            root_path=root_path,
+        )
 
         # Update card to show cancelled
         from ...card import CardBuilder
@@ -3490,10 +4752,12 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         cancel_card = CardBuilder._wrap_card(
             header_title="🔄 Workflow — 已取消",
             header_template="grey",
-            elements=[{
-                "tag": "markdown",
-                "content": "Workflow 已取消。如需重新开始，请发送 `/wf <需求>`。",
-            }],
+            elements=[
+                {
+                    "tag": "markdown",
+                    "content": "Workflow 已取消。如需重新开始，请发送 `/wf <需求>`。",
+                }
+            ],
         )
         self.update_card(message_id, cancel_card)
 
@@ -3551,6 +4815,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Strip unknown fields from button callback to prevent forged fields
         # (e.g. a client-side ``value.confirmed`` bypass).
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         project_id = project_id or value.get("project_id", "")
@@ -3562,9 +4827,13 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
-        from ...workflow_engine.models import PendingConfirmation, WorkflowStatus
+        from ...workflow_engine.models import WorkflowStatus
 
-        valid_statuses = (WorkflowStatus.AWAITING_CONFIRM, WorkflowStatus.AWAITING_TOOL_SELECT, WorkflowStatus.AWAITING_AGENT_SELECT)
+        valid_statuses = (
+            WorkflowStatus.AWAITING_CONFIRM,
+            WorkflowStatus.AWAITING_TOOL_SELECT,
+            WorkflowStatus.AWAITING_AGENT_SELECT,
+        )
         if engine.project.status not in valid_statuses:
             self._reply_workflow_error(message_id, "invalid_state")
             return
@@ -3598,51 +4867,75 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 "[workflow] Rejected unknown tool_name=%s at handle_workflow_select_tool",
                 tool_name,
             )
-            self._reply_workflow_error(
+            self._reply_pending_error_if_current(
+                engine,
                 message_id,
-                "invalid_argument",
+                session_key=stored_session_key,
+                initiator_user_id=stored_initiator,
+                valid_statuses=valid_statuses,
+                category="invalid_argument",
                 detail=f"工具「{tool_name}」不在当前可用工具列表中，已被过滤；可用工具：{', '.join(sorted(_kept)) or '(空)'}",
             )
             return
 
-        # Initialize selected tools from meta if not yet set (only for AWAITING_CONFIRM)
-        if engine.project.pending is None:
-            engine.project.pending = PendingConfirmation()
-        if engine.project.pending.selected_tools is None:
-            if engine.project.status == WorkflowStatus.AWAITING_CONFIRM:
-                meta_tools = (engine.project.pending.meta or {}).get("tools", engine.project.pending.selected_tools or [])
-                engine.project.pending.selected_tools = list(meta_tools)
+        if project is None:
+            self._reply_workflow_error(
+                message_id,
+                "invalid_state",
+                detail="缺少项目上下文",
+            )
+            return
+
+        # Pending state and the controller snapshot form one logical selection
+        # record. Mutate both under engine -> selection locks so a concurrent
+        # finish cannot commit a snapshot from between the two writes.
+        with self._selection_controller_transaction(
+            project,
+            session_key=stored_session_key,
+            engine=engine,
+            expected_status=valid_statuses,
+            initiator_user_id=current_user,
+        ) as ctrl:
+            if ctrl is None:
+                return
+            current_project = engine.project
+            current_pending = current_project.pending
+            selected = list(current_pending.selected_tools or [])
+            if not selected and current_project.status == WorkflowStatus.AWAITING_CONFIRM:
+                selected = list((current_pending.meta or {}).get("tools", []))
+            if tool_name in selected:
+                selected.remove(tool_name)
             else:
-                engine.project.pending.selected_tools = []
+                selected.append(tool_name)
+            if not selected:
+                return
+            current_pending.selected_tools = selected
+            current_status = current_project.status
+            requirement = current_pending.requirement or ""
+            if current_status in (
+                WorkflowStatus.AWAITING_TOOL_SELECT,
+                WorkflowStatus.AWAITING_AGENT_SELECT,
+            ):
+                ctrl.add_or_update_selection(
+                    {
+                        "tool_name": tool_name,
+                        "provider": value.get("provider", "workflow"),
+                        "display_name": (value.get("display_name") or tool_name),
+                        "supports_model": bool(value.get("supports_model", True)),
+                        "use_default_model": True,
+                    },
+                    is_review=(current_status == WorkflowStatus.AWAITING_TOOL_SELECT),
+                )
+            else:
+                script_tools = set((current_pending.meta or {}).get("tools", []))
+                current_pending.tools_mismatch = bool(script_tools - set(selected))
 
-        # Toggle
-        if tool_name in engine.project.pending.selected_tools:
-            engine.project.pending.selected_tools.remove(tool_name)
-        else:
-            engine.project.pending.selected_tools.append(tool_name)
-
-        # Ensure at least one tool is selected
-        if not engine.project.pending.selected_tools:
-            engine.project.pending.selected_tools.append(tool_name)
-            return  # No change — don't re-render
-
-        # Re-render based on current state
-        if engine.project.status in (WorkflowStatus.AWAITING_TOOL_SELECT, WorkflowStatus.AWAITING_AGENT_SELECT):
-
-            ctrl = self._get_selection_controller(project)
-            # Determine if we're in review step (AWAITING_TOOL_SELECT) or orchestrator step (AWAITING_AGENT_SELECT)
-            is_review = engine.project.status == WorkflowStatus.AWAITING_TOOL_SELECT
-            # Add a default-model selection for this tool
-            ctrl.add_or_update_selection({
-                "tool_name": tool_name,
-                "provider": value.get("provider", "workflow"),
-                "display_name": value.get("display_name") or tool_name,
-                "supports_model": bool(value.get("supports_model", True)),
-                "use_default_model": True,
-            }, is_review=is_review)
-            self._persist_selection_controller(project, ctrl)
-
-            requirement = engine.project.pending.requirement if engine.project.pending else ""
+        # Re-render based on the session state captured by the CAS.
+        if current_status in (
+            WorkflowStatus.AWAITING_TOOL_SELECT,
+            WorkflowStatus.AWAITING_AGENT_SELECT,
+        ):
+            is_review = current_status == WorkflowStatus.AWAITING_TOOL_SELECT
             self._send_combined_selection_card(
                 message_id=message_id,
                 chat_id=chat_id,
@@ -3652,26 +4945,29 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 is_review=is_review,
             )
         else:
-            # AWAITING_CONFIRM: mark tools as dirty and re-render confirm card
-            script_tools = set((engine.project.pending.meta or {}).get("tools", []))
-            allowed_tools = set(engine.project.pending.selected_tools or [])
-            engine.project.pending.tools_mismatch = bool(script_tools - allowed_tools)
-
             _script_content = self._read_pending_script(engine)
-            pending = engine.project.pending
-            confirm_card = self._build_confirm_card(
-                meta=pending.meta,
-                requirement=pending.requirement or "",
-                engine_session_key=pending.engine_session_key or "",
-                chat_id=chat_id,
-                project_id=project_id,
-                is_fallback=pending.is_fallback,
-                selected_tools=pending.selected_tools,
-                script_content=_script_content,
-                orchestrator_binding=pending.orchestrator_binding,
-                review_agents=pending.review_agents,
-            )
-            self.update_card(message_id, confirm_card)
+            with engine._lock:
+                pending = engine.project.pending if engine.project else None
+                if (
+                    not engine.project
+                    or engine.project.status != WorkflowStatus.AWAITING_CONFIRM
+                    or not pending
+                    or pending.engine_session_key != stored_session_key
+                ):
+                    return
+                confirm_card = self._build_confirm_card(
+                    meta=pending.meta,
+                    requirement=pending.requirement or "",
+                    engine_session_key=pending.engine_session_key or "",
+                    chat_id=chat_id,
+                    project_id=project_id,
+                    is_fallback=pending.is_fallback,
+                    selected_tools=pending.selected_tools,
+                    script_content=_script_content,
+                    orchestrator_binding=pending.orchestrator_binding,
+                    review_agents=pending.review_agents,
+                )
+                self.update_card(message_id, confirm_card)
 
     def handle_workflow_fill_missing_tools(
         self,
@@ -3688,6 +4984,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Strip unknown fields from button callback to prevent forged fields
         # (e.g. a client-side ``value.confirmed`` bypass).
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         project_id = project_id or value.get("project_id", "")
@@ -3725,47 +5022,64 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # selected_tools. ``kept`` contains only names present in the
         # authoritative registry; ``rejected`` is surfaced to the user.
         _kept, _rejected = WorkflowHandler._validate_tools_against_registry(script_tools)
-        current = list(engine.project.pending.selected_tools or [])
-        # Merge existing selected tools (already validated at selection time)
-        # with the registry-validated script-declared tools.
-        merged_set: set[str] = set(current) | set(_kept)
-        merged = sorted(merged_set)
-        engine.project.pending.selected_tools = merged
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            if (
+                current_project is None
+                or current_project.status != WorkflowStatus.AWAITING_CONFIRM
+                or pending is None
+                or pending.engine_session_key != stored_session_key
+                or pending.initiator_user_id != current_user
+            ):
+                return
+            current = list(pending.selected_tools or [])
+            # Merge existing selected tools (already validated at selection
+            # time) with registry-validated script-declared tools.
+            merged = sorted(set(current) | set(_kept))
+            pending.selected_tools = merged
 
         _script_content = self._read_pending_script(engine)
 
-        if _rejected:
-            logger.warning(
-                "[workflow] fill_missing_tools dropped unknown tool names: %s",
-                _rejected,
-            )
-            # Surface a visible notice on the confirm card via the inline
-            # warning text. We route this through the unified error surface
-            # so the presentation is consistent with other workflow errors.
-            self._reply_workflow_error(
-                message_id,
-                "invalid_argument",
-                detail=(
-                    "⚠️ 补齐工具时发现脚本声明的工具中存在未知名称，已被过滤。\n"
-                    f"已过滤: {', '.join(_rejected)}\n"
-                    f"已保留: {', '.join(merged) or '(空)'}"
-                ),
-            )
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            if (
+                current_project is None
+                or current_project.status != WorkflowStatus.AWAITING_CONFIRM
+                or pending is None
+                or pending.engine_session_key != stored_session_key
+            ):
+                return
+            if _rejected:
+                logger.warning(
+                    "[workflow] fill_missing_tools dropped unknown tool names: %s",
+                    _rejected,
+                )
+                self._reply_workflow_error(
+                    message_id,
+                    "invalid_argument",
+                    detail=(
+                        "⚠️ 补齐工具时发现脚本声明的工具中存在未知名称，"
+                        "已被过滤。\n"
+                        f"已过滤: {', '.join(_rejected)}\n"
+                        f"已保留: {', '.join(merged) or '(空)'}"
+                    ),
+                )
 
-        pending = engine.project.pending
-        confirm_card = self._build_confirm_card(
-            meta=pending.meta,
-            requirement=pending.requirement or "",
-            engine_session_key=stored_session_key,
-            chat_id=chat_id,
-            project_id=project_id,
-            is_fallback=pending.is_fallback,
-            selected_tools=merged,
-            script_content=_script_content,
-            orchestrator_binding=pending.orchestrator_binding,
-            review_agents=pending.review_agents,
-        )
-        self.update_card(message_id, confirm_card)
+            confirm_card = self._build_confirm_card(
+                meta=pending.meta,
+                requirement=pending.requirement or "",
+                engine_session_key=stored_session_key,
+                chat_id=chat_id,
+                project_id=project_id,
+                is_fallback=pending.is_fallback,
+                selected_tools=merged,
+                script_content=_script_content,
+                orchestrator_binding=pending.orchestrator_binding,
+                review_agents=pending.review_agents,
+            )
+            self.update_card(message_id, confirm_card)
 
     def handle_workflow_back_to_tools(
         self,
@@ -3791,6 +5105,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Strip unknown fields from button callback to prevent forged fields
         # (e.g. a client-side ``value.confirmed`` bypass).
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         project = self._resolve_project_from_id(project_id, chat_id)
@@ -3810,49 +5125,48 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # --- Security validation (session key + sender) ---
         from ...thread import get_current_sender_id
 
-        stored_session_key = (
-            engine.project.pending.engine_session_key if engine.project.pending else ""
-        )
+        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
         button_session_key = value.get("engine_session_key", "")
         if not stored_session_key or button_session_key != stored_session_key:
             self._reply_workflow_error(message_id, "session_expired")
             return
 
         current_user = get_current_sender_id() or ""
-        stored_initiator = (
-            engine.project.pending.initiator_user_id if engine.project.pending else ""
-        )
+        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
         if not stored_initiator or not current_user or current_user != stored_initiator:
             self._reply_workflow_error(message_id, "forbidden")
             return
 
-        # --- Transit state back to tool-selection WITHOUT resetting session key ---
-        engine.project.status = WorkflowStatus.AWAITING_TOOL_SELECT
-        # Keep existing pending intact (selected_tools, meta, script_path,
-        # initiator_user_id, engine_session_key, etc.).
+        all_tools, recommended_tools, other_tools, default_selected = self._resolve_tool_lists()
 
-        # --- Build card (pure rendering — no state mutation beyond status) ---
-        all_tools, recommended_tools, other_tools, default_selected = (
-            self._resolve_tool_lists()
-        )
-
-        resolved_project_id = (
-            project.project_id if project is not None else (project_id or "")
-        )
-        card = self._build_tool_selection_card(
-            engine=engine,
-            requirement=(
-                engine.project.pending.requirement if engine.project.pending else ""
-            ),
-            chat_id=chat_id,
-            project_id=resolved_project_id,
-            session_key=stored_session_key,
-            all_tools=all_tools,
-            recommended_tools=recommended_tools,
-            other_tools=other_tools,
-            default_selected=default_selected,
-        )
-        self.update_card(message_id, card)
+        resolved_project_id = project.project_id if project is not None else (project_id or "")
+        # The slow tool discovery above is speculative.  Revalidate and
+        # transition under one lock so an old callback cannot move the newest
+        # session backwards.
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            if (
+                current_project is None
+                or current_project.status != WorkflowStatus.AWAITING_CONFIRM
+                or pending is None
+                or pending.engine_session_key != stored_session_key
+                or pending.initiator_user_id != current_user
+            ):
+                return
+            current_project.status = WorkflowStatus.AWAITING_TOOL_SELECT
+            card = self._build_tool_selection_card(
+                engine=engine,
+                requirement=pending.requirement or "",
+                chat_id=chat_id,
+                project_id=resolved_project_id,
+                session_key=stored_session_key,
+                all_tools=all_tools,
+                recommended_tools=recommended_tools,
+                other_tools=other_tools,
+                default_selected=default_selected,
+            )
+            self.update_card(message_id, card)
 
     # ------------------------------------------------------------------
     # Workflow ref (sub-workflow) handlers
@@ -3872,6 +5186,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         state — this is purely informational.
         """
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         project = self._resolve_project_from_id(project_id, chat_id)
@@ -3897,18 +5212,14 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Session key + sender validation
         from ...thread import get_current_sender_id
 
-        stored_session_key = (
-            engine.project.pending.engine_session_key if engine.project.pending else ""
-        )
+        stored_session_key = engine.project.pending.engine_session_key if engine.project.pending else ""
         button_session_key = value.get("engine_session_key", "")
         if not stored_session_key or button_session_key != stored_session_key:
             self._reply_workflow_error(message_id, "session_expired")
             return
 
         current_user = get_current_sender_id() or ""
-        stored_initiator = (
-            engine.project.pending.initiator_user_id if engine.project.pending else ""
-        )
+        stored_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
         if not stored_initiator or not current_user or current_user != stored_initiator:
             self._reply_workflow_error(message_id, "forbidden")
             return
@@ -3919,11 +5230,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         except (TypeError, ValueError):
             ref_index = -1
 
-        workflow_refs = (
-            (engine.project.pending.meta or {}).get("workflow_refs", [])
-            if engine.project.pending
-            else []
-        )
+        workflow_refs = (engine.project.pending.meta or {}).get("workflow_refs", []) if engine.project.pending else []
 
         if not isinstance(workflow_refs, list) or ref_index < 0 or ref_index >= len(workflow_refs):
             self._reply_workflow_error(message_id, "invalid_argument", detail="子 Workflow 引用索引无效")
@@ -3960,21 +5267,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             from ...workflow_engine.templates import resolve_template_path
 
             try:
-                script_body_from_name = load_template(
-                    root_path, ref_name, user_id=sender_id
-                )
+                script_body_from_name = load_template(root_path, ref_name, user_id=sender_id)
             except Exception:
                 script_body_from_name = None
 
             if script_body_from_name:
                 script_body = script_body_from_name
-                resolved_path = resolve_template_path(
-                    root_path, ref_name, user_id=sender_id
-                )
+                resolved_path = resolve_template_path(root_path, ref_name, user_id=sender_id)
             else:
-                resolved_path = resolve_template_path(
-                    root_path, ref_name, user_id=sender_id
-                )
+                resolved_path = resolve_template_path(root_path, ref_name, user_id=sender_id)
                 if resolved_path:
                     try:
                         with open(resolved_path, "r", encoding="utf-8") as f:
@@ -4011,9 +5312,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         parent_tools: set[str] = set()
         if engine.project.pending and engine.project.pending.selected_tools:
             parent_tools = set(engine.project.pending.selected_tools)
-        ref_tools: set[str] = set(
-            (meta_extract or {}).get("tools", []) or []
-        )
+        ref_tools: set[str] = set((meta_extract or {}).get("tools", []) or [])
         missing = sorted(ref_tools - parent_tools)
         if missing:
             preview_lines.append(
@@ -4030,15 +5329,18 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         if script_body:
             from ...workflow_engine.renderer import render_script_preview
+
             preview = render_script_preview(script_body) or ""
             if preview:
-                elements.append({
-                    "tag": "collapsible_panel",
-                    "header": {"title": {"tag": "plain_text", "content": "📜 脚本内容"}},
-                    "border": {"color": "grey", "corner_radius": "8px"},
-                    "expanded": False,
-                    "elements": [{"tag": "markdown", "content": preview}],
-                })
+                elements.append(
+                    {
+                        "tag": "collapsible_panel",
+                        "header": {"title": {"tag": "plain_text", "content": "📜 脚本内容"}},
+                        "border": {"color": "grey", "corner_radius": "8px"},
+                        "expanded": False,
+                        "elements": [{"tag": "markdown", "content": preview}],
+                    }
+                )
 
         # Build a Feishu card directly (header + element list).
         # The builtin helpers on CardBuilder do not accept an `elements`
@@ -4071,6 +5373,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         AWAITING_AGENT_SELECT. After mutation, re-renders the confirm card.
         """
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         project = self._resolve_project_from_id(project_id, chat_id)
@@ -4081,7 +5384,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
-        from ...workflow_engine.models import PendingConfirmation, WorkflowStatus
+        from ...workflow_engine.models import WorkflowStatus
 
         valid_statuses = (
             WorkflowStatus.AWAITING_CONFIRM,
@@ -4091,9 +5394,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         if engine.project.status not in valid_statuses:
             self._reply_workflow_error(message_id, "invalid_state")
             return
-
         if engine.project.pending is None:
-            engine.project.pending = PendingConfirmation()
+            self._reply_workflow_error(message_id, "invalid_state")
+            return
 
         # Session key + sender validation
         from ...thread import get_current_sender_id
@@ -4116,19 +5419,39 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         except (TypeError, ValueError):
             ref_index = -1
 
-        current_meta = engine.project.pending.meta or {}
-        workflow_refs = current_meta.get("workflow_refs", []) or []
-        if not isinstance(workflow_refs, list) or ref_index < 0 or ref_index >= len(workflow_refs):
-            self._reply_workflow_error(message_id, "invalid_argument", detail="子 Workflow 引用索引无效")
-            return
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            if (
+                current_project is None
+                or current_project.status not in valid_statuses
+                or pending is None
+                or pending.engine_session_key != stored_session_key
+                or pending.initiator_user_id != current_user
+            ):
+                return
+            current_meta = pending.meta or {}
+            workflow_refs = current_meta.get("workflow_refs", []) or []
+            if not isinstance(workflow_refs, list) or ref_index < 0 or ref_index >= len(workflow_refs):
+                self._reply_workflow_error(
+                    message_id,
+                    "invalid_argument",
+                    detail="子 Workflow 引用索引无效",
+                )
+                return
 
-        new_refs = [ref for i, ref in enumerate(workflow_refs) if i != ref_index]
-        new_meta = dict(current_meta)
-        new_meta["workflow_refs"] = new_refs
-        engine.project.pending.meta = new_meta
+            new_refs = [ref for index, ref in enumerate(workflow_refs) if index != ref_index]
+            new_meta = dict(current_meta)
+            new_meta["workflow_refs"] = new_refs
+            pending.meta = new_meta
 
-        # Re-render the confirm card so the user sees the updated refs list.
-        self._rerender_confirm_or_tool_card(message_id, chat_id, project_id, engine)
+            # Keep the final session CAS held through delivery.
+            self._rerender_confirm_or_tool_card(
+                message_id,
+                chat_id,
+                project_id,
+                engine,
+            )
 
     def handle_workflow_add_workflow_ref(
         self,
@@ -4144,6 +5467,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         confirm card.
         """
         from ...card.events.payloads import filter_workflow_button_value
+
         value = filter_workflow_button_value(value)
 
         project = self._resolve_project_from_id(project_id, chat_id)
@@ -4154,7 +5478,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             self._reply_workflow_error(message_id, "session_expired")
             return
 
-        from ...workflow_engine.models import PendingConfirmation, WorkflowStatus
+        from ...workflow_engine.models import WorkflowStatus
         from ...workflow_engine.templates import TemplateInfo, discover_templates
 
         valid_statuses = (
@@ -4167,7 +5491,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             return
 
         if engine.project.pending is None:
-            engine.project.pending = PendingConfirmation()
+            self._reply_workflow_error(message_id, "invalid_state")
+            return
 
         # Session key + sender validation
         from ...thread import get_current_sender_id
@@ -4197,6 +5522,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 template_name=str(template_name),
                 root_path=root_path,
                 sender_id=current_user,
+                expected_session_key=stored_session_key,
+                expected_initiator=current_user,
             )
             return
 
@@ -4208,24 +5535,32 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         except Exception:
             templates = []
 
-        existing_refs: list[Any] = []
-        current_meta = engine.project.pending.meta or {}
-        existing_refs = current_meta.get("workflow_refs", []) or []
-        existing_names = {
-            ref.get("name") if isinstance(ref, dict) else str(ref)
-            for ref in existing_refs
-        }
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            if (
+                current_project is None
+                or current_project.status not in valid_statuses
+                or pending is None
+                or pending.engine_session_key != stored_session_key
+                or pending.initiator_user_id != current_user
+            ):
+                return
+            current_meta = pending.meta or {}
+            existing_refs: list[Any] = current_meta.get("workflow_refs", []) or []
+        existing_names = {ref.get("name") if isinstance(ref, dict) else str(ref) for ref in existing_refs}
 
         from ...card.actions.dispatch import WORKFLOW_ADD_WORKFLOW_REF
 
         elements: list[dict[str, Any]] = []
-        elements.append({
-            "tag": "markdown",
-            "content": (
-                "**选择要添加为子 Workflow 引用的模板**\n\n"
-                "已引用的模板会在下方显示为「已添加」状态，避免重复。"
-            ),
-        })
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": (
+                    "**选择要添加为子 Workflow 引用的模板**\n\n已引用的模板会在下方显示为「已添加」状态，避免重复。"
+                ),
+            }
+        )
 
         if not templates:
             elements.append({"tag": "markdown", "content": "_当前没有可用的 Workflow 模板_。"})
@@ -4238,13 +5573,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 elements.append({"tag": "markdown", "content": "\n".join(tpl_lines)})
 
                 if is_added:
-                    elements.append({
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "✓ 已添加"},
-                        "type": "primary",
-                        "value": {"action": "__noop__"},
-                        "disabled": True,
-                    })
+                    elements.append(
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "✓ 已添加"},
+                            "type": "primary",
+                            "value": {"action": "__noop__"},
+                            "disabled": True,
+                        }
+                    )
                     continue
 
                 pick_value = {
@@ -4254,13 +5591,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     "project_id": project_id,
                     "engine_session_key": stored_session_key,
                 }
-                pick_button = [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "➕ 添加"},
-                    "type": "default",
-                    "value": pick_value,
-                    "behaviors": [{"type": "callback", "value": pick_value}],
-                }]
+                pick_button = [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "➕ 添加"},
+                        "type": "default",
+                        "value": pick_value,
+                        "behaviors": [{"type": "callback", "value": pick_value}],
+                    }
+                ]
                 elements.extend(build_responsive_button_row(pick_button, mobile_force_vertical=True))
 
         card = {
@@ -4275,7 +5614,18 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             },
             "body": {"elements": elements},
         }
-        self.update_card(message_id, card)
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            if (
+                current_project is None
+                or current_project.status not in valid_statuses
+                or pending is None
+                or pending.engine_session_key != stored_session_key
+                or pending.initiator_user_id != current_user
+            ):
+                return
+            self.update_card(message_id, card)
 
     def _apply_add_workflow_ref(
         self,
@@ -4286,6 +5636,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         template_name: str,
         root_path: str,
         sender_id: str,
+        expected_session_key: str,
+        expected_initiator: str,
     ) -> None:
         """Append a template reference to ``meta.workflow_refs`` and re-render
         the confirm card so the new reference is visible to the user.
@@ -4303,12 +5655,41 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         ``discover_templates``, and resolved via ``resolve_template_path``
         so forged path-traversal names are rejected before touching disk.
         """
+        from ...workflow_engine.models import WorkflowStatus
         from ...workflow_engine.script_gen import extract_meta_from_script
         from ...workflow_engine.templates import (
             discover_templates,
             resolve_template_path,
             validate_template_name,
         )
+
+        valid_statuses = (
+            WorkflowStatus.AWAITING_CONFIRM,
+            WorkflowStatus.AWAITING_TOOL_SELECT,
+            WorkflowStatus.AWAITING_AGENT_SELECT,
+        )
+
+        def reply_error_if_current(
+            category: str,
+            *,
+            detail: str,
+        ) -> None:
+            with engine._lock:
+                current_project = engine.project
+                pending = current_project.pending if current_project else None
+                if (
+                    current_project is None
+                    or current_project.status not in valid_statuses
+                    or pending is None
+                    or pending.engine_session_key != expected_session_key
+                    or pending.initiator_user_id != expected_initiator
+                ):
+                    return
+                self._reply_workflow_error(
+                    message_id,
+                    category,
+                    detail=detail,
+                )
 
         # 1) Reject invalid / path-traversal names (fail-closed).
         ok, reason = validate_template_name(template_name)
@@ -4318,8 +5699,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 template_name,
                 reason,
             )
-            self._reply_workflow_error(
-                message_id, "invalid_argument", detail=f"非法模板名称: {template_name}"
+            reply_error_if_current(
+                "invalid_argument",
+                detail=f"非法模板名称: {template_name}",
             )
             return
 
@@ -4328,13 +5710,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             discoverable = {t.name for t in discover_templates(root_path, user_id=sender_id)}
         except Exception as exc:
             logger.warning("Cannot enumerate templates for add-workflow-ref: %s", repr(exc))
-            self._reply_workflow_error(
-                message_id, "invalid_argument", detail="无法枚举可用模板"
+            reply_error_if_current(
+                "invalid_argument",
+                detail="无法枚举可用模板",
             )
             return
         if template_name not in discoverable:
-            self._reply_workflow_error(
-                message_id, "invalid_argument", detail=f"模板不在可用列表中: {template_name}"
+            reply_error_if_current(
+                "invalid_argument",
+                detail=f"模板不在可用列表中: {template_name}",
             )
             return
 
@@ -4348,8 +5732,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 "Template '%s' could not be resolved during add-workflow-ref",
                 template_name,
             )
-            self._reply_workflow_error(
-                message_id, "invalid_argument", detail=f"模板无法加载: {template_name}"
+            reply_error_if_current(
+                "invalid_argument",
+                detail=f"模板无法加载: {template_name}",
             )
             return
 
@@ -4362,34 +5747,44 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         except Exception:
             description = ""
 
-        current_meta = engine.project.pending.meta or {}
-        workflow_refs = list(current_meta.get("workflow_refs", []) or [])
+        with engine._lock:
+            current_project = engine.project
+            pending = current_project.pending if current_project else None
+            if (
+                current_project is None
+                or current_project.status not in valid_statuses
+                or pending is None
+                or pending.engine_session_key != expected_session_key
+                or pending.initiator_user_id != expected_initiator
+            ):
+                return
+            current_meta = pending.meta or {}
+            workflow_refs = list(current_meta.get("workflow_refs", []) or [])
 
-        # De-duplicate by name so users don't see identical references twice.
-        already_present = False
-        for ref in workflow_refs:
-            existing_name = ref.get("name") if isinstance(ref, dict) else str(ref)
-            if existing_name == template_name:
-                already_present = True
-                break
+            # De-duplicate by name so users don't see identical references.
+            already_present = any(
+                (ref.get("name") if isinstance(ref, dict) else str(ref)) == template_name for ref in workflow_refs
+            )
 
-        # Contract: ref carries `{name, description?, args?, failure_policy?}`
-        # matching WorkflowRefItem. `path` / `hash` are intentionally not stored
-        # — execution-side code resolves names through the templates module at
-        # execution time, so a stored path cannot be forged or become stale.
-        if not already_present:
-            ref_entry: dict[str, Any] = {"name": template_name}
-            if description:
-                ref_entry["description"] = description
-            ref_entry["args"] = {}
-            ref_entry["failure_policy"] = "skip"
-            workflow_refs.append(ref_entry)
+            # WorkflowRefItem intentionally stores no resolved path/hash.
+            if not already_present:
+                ref_entry: dict[str, Any] = {"name": template_name}
+                if description:
+                    ref_entry["description"] = description
+                ref_entry["args"] = {}
+                ref_entry["failure_policy"] = "skip"
+                workflow_refs.append(ref_entry)
 
-        new_meta = dict(current_meta)
-        new_meta["workflow_refs"] = workflow_refs
-        engine.project.pending.meta = new_meta
+            new_meta = dict(current_meta)
+            new_meta["workflow_refs"] = workflow_refs
+            pending.meta = new_meta
 
-        self._rerender_confirm_or_tool_card(message_id, chat_id, project_id, engine)
+            self._rerender_confirm_or_tool_card(
+                message_id,
+                chat_id,
+                project_id,
+                engine,
+            )
 
     def _rerender_confirm_or_tool_card(
         self,
@@ -4437,10 +5832,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         )
         self.update_card(message_id, confirm_card)
 
-
-    def _resolve_project_from_id(
-        self, project_id: str, chat_id: str
-    ) -> Optional["ProjectContext"]:
+    def _resolve_project_from_id(self, project_id: str, chat_id: str) -> Optional["ProjectContext"]:
         """Resolve a ProjectContext from project_id, scoped to the chat.
 
         Uses ``project_manager.get_project_for_chat`` so that a forged
@@ -4533,21 +5925,23 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             {"tag": "hr"},
         ]
         for index, (title, body) in enumerate(sections):
-            elements.append({
-                "tag": "collapsible_panel",
-                "expanded": index == 0,
-                "header": {
-                    "title": {"tag": "markdown", "content": f"**{title}**"},
-                    "vertical_align": "center",
-                },
-                "border": {
-                    "color": PANEL_STYLES["border_normal"],
-                    "corner_radius": PANEL_STYLES["corner_radius"],
-                },
-                "vertical_spacing": PANEL_STYLES["vertical_spacing"],
-                "padding": PANEL_STYLES["padding_standard"],
-                "elements": [{"tag": "markdown", "content": body}],
-            })
+            elements.append(
+                {
+                    "tag": "collapsible_panel",
+                    "expanded": index == 0,
+                    "header": {
+                        "title": {"tag": "markdown", "content": f"**{title}**"},
+                        "vertical_align": "center",
+                    },
+                    "border": {
+                        "color": PANEL_STYLES["border_normal"],
+                        "corner_radius": PANEL_STYLES["corner_radius"],
+                    },
+                    "vertical_spacing": PANEL_STYLES["vertical_spacing"],
+                    "padding": PANEL_STYLES["padding_standard"],
+                    "elements": [{"tag": "markdown", "content": body}],
+                }
+            )
 
         card = CardBuilder._wrap_card(
             header_title="⚡ Workflow 使用帮助",
@@ -4560,9 +5954,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
     # Template management commands
     # ------------------------------------------------------------------
 
-    def _handle_wf_save(
-        self, message_id: str, chat_id: str, args: str, project: Optional["ProjectContext"]
-    ) -> None:
+    def _handle_wf_save(self, message_id: str, chat_id: str, args: str, project: Optional["ProjectContext"]) -> None:
         """Save the last executed/pending workflow script as a named template.
 
         Usage: /wf_save <name> [--global]
@@ -4615,9 +6007,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 return
 
         # 安全 3: 目标路径必须位于模板根目录内
-        safe_path, path_err = resolve_safe_template_path(
-            root_path, name, global_scope=global_scope
-        )
+        safe_path, path_err = resolve_safe_template_path(root_path, name, global_scope=global_scope)
         if safe_path is None:
             self._reply_workflow_error(message_id, "invalid_argument", detail=path_err or "模板路径不合法")
             return
@@ -4635,19 +6025,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         admin_ids_checked = getattr(getattr(self.ctx, "settings", None), "admin_user_ids", None) or []
         stored_initiator = ""
         if engine and engine.project:
-            pending_initiator = (
-                engine.project.pending.initiator_user_id
-                if engine.project.pending
-                else ""
-            )
-            stored_initiator = pending_initiator or getattr(
-                engine.project, "initiator_user_id", ""
-            )
-        if (
-            stored_initiator
-            and caller_id != stored_initiator
-            and not is_admin_user(caller_id, admin_ids_checked)
-        ):
+            pending_initiator = engine.project.pending.initiator_user_id if engine.project.pending else ""
+            stored_initiator = pending_initiator or getattr(engine.project, "initiator_user_id", "")
+        if stored_initiator and caller_id != stored_initiator and not is_admin_user(caller_id, admin_ids_checked):
             self._reply_workflow_error(
                 message_id,
                 "forbidden",
@@ -4657,9 +6037,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         if engine and engine.project:
             script_path = (
-                (engine.project.pending.script_path if engine.project.pending else None)
-                or engine.project.script_path
-            )
+                engine.project.pending.script_path if engine.project.pending else None
+            ) or engine.project.script_path
             if script_path:
                 try:
                     with open(script_path, "r", encoding="utf-8") as f:
@@ -4668,7 +6047,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     pass
 
         if not script_content:
-            self._reply_workflow_error(message_id, "invalid_state", detail="没有可保存的 Workflow 脚本，请先执行 `/wf` 生成脚本")
+            self._reply_workflow_error(
+                message_id, "invalid_state", detail="没有可保存的 Workflow 脚本，请先执行 `/wf` 生成脚本"
+            )
             return
 
         # 权限：项目级模板若已存在，仅允许原 owner 或 admin 覆盖；
@@ -4687,8 +6068,12 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             _target_path, _ = _rsp(root_path, name, global_scope=False)
             if _target_path and _Path(_target_path).is_file() and name not in BUILTIN_TEMPLATES:
                 _allowed, _reason, _ = can_delete_template(
-                    root_path, name, False, None,
-                    sender_id=sender_id, admin_user_ids=admin_ids,
+                    root_path,
+                    name,
+                    False,
+                    None,
+                    sender_id=sender_id,
+                    admin_user_ids=admin_ids,
                 )
                 if not _allowed:
                     self._reply_workflow_error(
@@ -4724,9 +6109,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 detail=_strip_internal_details(f"保存失败: {exc}"),
             )
 
-    def _handle_wf_list(
-        self, message_id: str, chat_id: str, project: Optional["ProjectContext"]
-    ) -> None:
+    def _handle_wf_list(self, message_id: str, chat_id: str, project: Optional["ProjectContext"]) -> None:
         """List available workflow templates."""
         root_path = self._get_root_path(chat_id, project)
 
@@ -4752,9 +6135,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         lines.append("\n使用: `/wf <模板名> [key=value ...]`")
         self.reply_text(message_id, "\n".join(lines))
 
-    def _handle_wf_delete(
-        self, message_id: str, chat_id: str, args: str, project: Optional["ProjectContext"]
-    ) -> None:
+    def _handle_wf_delete(self, message_id: str, chat_id: str, args: str, project: Optional["ProjectContext"]) -> None:
         """Delete a saved workflow template.
 
         Usage: /wf_delete <name> [--global]
@@ -4801,9 +6182,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 return
 
         # 安全 3: 目标路径必须位于模板根目录内
-        safe_path, path_err = resolve_safe_template_path(
-            root_path, name, global_scope=global_scope
-        )
+        safe_path, path_err = resolve_safe_template_path(root_path, name, global_scope=global_scope)
         if safe_path is None:
             self._reply_workflow_error(message_id, "invalid_argument", detail=path_err or "模板路径不合法")
             return
@@ -4816,8 +6195,12 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         admin_ids = getattr(getattr(self.ctx, "settings", None), "admin_user_ids", None) or []
 
         allowed, reason, _tp = can_delete_template(
-            root_path, name, global_scope, None,
-            sender_id=sender_id, admin_user_ids=admin_ids,
+            root_path,
+            name,
+            global_scope,
+            None,
+            sender_id=sender_id,
+            admin_user_ids=admin_ids,
         )
         if not allowed:
             self.reply_text(message_id, f"删除失败: {reason}。请联系模板创建者或管理员。")
@@ -4832,9 +6215,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         except (OSError, ValueError) as exc:
             self._reply_workflow_error(message_id, "internal_error", detail=f"删除失败: {exc}")
 
-    def _handle_wf_history(
-        self, message_id: str, chat_id: str, project: Optional["ProjectContext"]
-    ) -> None:
+    def _handle_wf_history(self, message_id: str, chat_id: str, project: Optional["ProjectContext"]) -> None:
         """Show workflow execution history."""
         import time as _time
 
@@ -4847,16 +6228,13 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         if not entries:
             self.reply_text(
                 message_id,
-                "📜 **执行历史**\n\n暂无历史记录。\n\n"
-                "执行 `/wf <需求>` 启动第一个 Workflow。",
+                "📜 **执行历史**\n\n暂无历史记录。\n\n执行 `/wf <需求>` 启动第一个 Workflow。",
             )
             return
 
         lines: list[str] = ["📜 **执行历史** (最近 10 次)\n"]
         for entry in entries:
-            status_icon = {"completed": "✅", "failed": "❌", "running": "🔄"}.get(
-                entry.status, "⏸️"
-            )
+            status_icon = {"completed": "✅", "failed": "❌", "running": "🔄"}.get(entry.status, "⏸️")
             # Format timestamp
             ts = _time.strftime("%m-%d %H:%M", _time.localtime(entry.started_at))
             # Duration
@@ -4878,10 +6256,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     tokens = f" {entry.total_tokens} tok"
 
             err_suffix = f" — {entry.error[:40]}" if entry.error else ""
-            lines.append(
-                f"{status_icon} `{entry.name}` {ts}{dur}{tokens}"
-                f" ({entry.total_agents} agents){err_suffix}"
-            )
+            lines.append(f"{status_icon} `{entry.name}` {ts}{dur}{tokens} ({entry.total_agents} agents){err_suffix}")
 
         self.reply_text(message_id, "\n".join(lines))
 
@@ -4895,6 +6270,166 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             return project.root_path
         return self.get_working_dir(chat_id)
 
+    @staticmethod
+    def _new_workflow_script_path(root_path: str) -> str:
+        """Allocate a generation-owned script path without sharing file state."""
+        script_dir = os.path.join(root_path, ".ghostap", "workflow_scripts")
+        os.makedirs(script_dir, exist_ok=True)
+        return os.path.join(
+            script_dir,
+            f"generated-workflow-{uuid.uuid4().hex}.js",
+        )
+
+    @staticmethod
+    def _remove_owned_workflow_artifact(
+        path: str | None,
+        *,
+        root_path: str,
+    ) -> None:
+        """Remove only files created as disposable Workflow artifacts.
+
+        Saved templates live in ``.ghostap/workflows`` and are deliberately
+        outside this allowlist. This helper therefore cannot delete a user's
+        reusable Workflow merely because stale lifecycle state was corrupted.
+        """
+        if not path:
+            return
+
+        import tempfile
+
+        candidate = os.path.realpath(os.path.abspath(path))
+        basename = os.path.basename(candidate)
+        script_dir = os.path.realpath(os.path.join(root_path, ".ghostap", "workflow_scripts"))
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        candidate_dir = os.path.dirname(candidate)
+
+        generated_source = (
+            candidate_dir == script_dir
+            and (basename.startswith("generated-workflow-") or basename == "generated_workflow.js")
+            and basename.endswith(".js")
+        )
+        confirmed_copy = (
+            basename.startswith("ghostap-confirmed-")
+            and basename.endswith(".js")
+            and os.path.commonpath((candidate, temp_root)) == temp_root
+        )
+        if not (generated_source or confirmed_copy):
+            logger.warning(
+                "[workflow] Refusing to remove non-owned workflow artifact: %s",
+                basename,
+            )
+            return
+        try:
+            os.remove(candidate)
+        except OSError:
+            pass
+
+    def _supersede_incomplete_workflow(
+        self,
+        engine: Any,
+        *,
+        root_path: str,
+        current_user: str,
+    ) -> tuple[bool, str | None, _WorkflowLifecycleOwner | None]:
+        """Atomically cancel the old lifecycle and admit the newest request.
+
+        A real runtime is never replaced in-place because ``WorkflowEngine``
+        resources are shared until its execution thread fully unwinds.
+        """
+        from ...workflow_engine.models import WorkflowProject, WorkflowStatus
+
+        admission_owner = _WorkflowLifecycleOwner(
+            session_key=uuid.uuid4().hex,
+            initiator_user_id=current_user,
+        )
+        owners: list[_WorkflowLifecycleOwner] = []
+        artifacts: list[str] = []
+        with engine._lock:
+            if getattr(engine, "_closing", False) is True:
+                return False, "running", None
+            if engine.is_running is True:
+                return False, "running", None
+
+            wf_project = engine.project
+            if wf_project is None:
+                wf_project = WorkflowProject()
+                engine._project = wf_project
+            pending = wf_project.pending
+            selection_owner = vars(engine).get("_workflow_selection_owner")
+            generation_owner = vars(engine).get("_script_generation_owner")
+            start_owner = vars(engine).get("_workflow_start_owner")
+            incomplete = bool(
+                wf_project.status in _workflow_pending_statuses()
+                or isinstance(selection_owner, _WorkflowLifecycleOwner)
+                or isinstance(generation_owner, _WorkflowLifecycleOwner)
+                or isinstance(start_owner, _WorkflowLifecycleOwner)
+                or wf_project.status == WorkflowStatus.RUNNING
+            )
+            if incomplete:
+                stored_initiator = (
+                    (getattr(pending, "initiator_user_id", None) if pending is not None else None)
+                    or getattr(
+                        selection_owner,
+                        "initiator_user_id",
+                        None,
+                    )
+                    or getattr(wf_project, "initiator_user_id", None)
+                )
+                admin_ids = set(getattr(self.ctx.settings, "admin_user_ids", []) or [])
+                if not current_user or not stored_initiator:
+                    return False, "forbidden", None
+                if current_user != stored_initiator and current_user not in admin_ids:
+                    return False, "forbidden", None
+
+                for owner in (
+                    selection_owner,
+                    generation_owner,
+                    start_owner,
+                ):
+                    if not isinstance(owner, _WorkflowLifecycleOwner):
+                        continue
+                    owner.stop_event.set()
+                    owner.heartbeat_stop_event.set()
+                    self._retire_workflow_owner(engine, owner)
+                    owners.append(owner)
+                    for artifact in (
+                        owner.source_script_path,
+                        owner.execution_script_path,
+                    ):
+                        if artifact:
+                            artifacts.append(artifact)
+
+                if pending and pending.script_path:
+                    artifacts.append(pending.script_path)
+                if isinstance(start_owner, _WorkflowLifecycleOwner) and wf_project.script_path:
+                    artifacts.append(wf_project.script_path)
+
+                engine._script_generation_owner = None
+                engine._workflow_start_owner = None
+                engine._project = WorkflowProject()
+            else:
+                # Starting a new lifecycle retires the previous terminal
+                # source.  It remains saveable until this exact boundary,
+                # then is no longer the "latest" script for /wf_save.
+                if wf_project.script_path:
+                    artifacts.append(wf_project.script_path)
+                engine._project = WorkflowProject()
+
+            engine._workflow_selection_owner = admission_owner
+
+        # An already-authorized card delivery may finish, but always before
+        # the new request publishes its first card.
+        for owner in owners:
+            with owner.delivery_lock:
+                pass
+            if not owner.claimed_event.is_set() and not owner.worker_started_event.is_set():
+                owner.done_event.set()
+        for artifact in dict.fromkeys(artifacts):
+            self._remove_owned_workflow_artifact(
+                artifact,
+                root_path=root_path,
+            )
+        return True, None, admission_owner
 
     def _generate_script_via_ai(
         self,
@@ -4903,6 +6438,10 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         selected_tools: list[str] | None = None,
         engine: Any = None,
         progress_callback: Any = None,
+        *,
+        output_path: str | None = None,
+        cancel_event: threading.Event | None = None,
+        artifact_lock: Any = None,
     ) -> tuple[str, dict[str, Any] | None, bool]:
         """Generate a workflow script via AI with fallback to simple generation.
 
@@ -4937,7 +6476,32 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         script_dir = os.path.join(root_path, ".ghostap", "workflow_scripts")
         os.makedirs(script_dir, exist_ok=True)
-        script_path = os.path.join(script_dir, "generated_workflow.js")
+        script_path = output_path or self._new_workflow_script_path(root_path)
+        if os.path.realpath(os.path.dirname(script_path)) != os.path.realpath(script_dir) or not os.path.basename(
+            script_path
+        ).endswith(".js"):
+            raise ValueError("Workflow generation output must stay in the script staging directory")
+
+        def ensure_not_cancelled() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _WorkflowGenerationCancelled("Workflow generation cancelled")
+
+        def write_generated_content(content: str) -> None:
+            lock_context = artifact_lock if artifact_lock is not None else nullcontext()
+            with lock_context:
+                ensure_not_cancelled()
+                with open(script_path, "w", encoding="utf-8") as file:
+                    file.write(content)
+
+        def write_fallback() -> str:
+            lock_context = artifact_lock if artifact_lock is not None else nullcontext()
+            with lock_context:
+                ensure_not_cancelled()
+                return self._write_fallback_script(
+                    script_path,
+                    requirement,
+                    selected_tools,
+                )
 
         # Resolve available tools via dynamic registry
         from ...workflow_engine.tool_registry import get_available_tools
@@ -4945,17 +6509,14 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         available_tools = get_available_tools(require_available=True)
         if not available_tools:
             logger.warning("No executable workflow tools detected; using fallback script")
-            return self._write_fallback_script(script_path, requirement, selected_tools), None, True
+            return write_fallback(), None, True
 
         # Filter available tools to selected ones if provided
         if selected_tools:
-            available_tools = {
-                k: v for k, v in available_tools.items()
-                if k in selected_tools
-            }
+            available_tools = {k: v for k, v in available_tools.items() if k in selected_tools}
             if not available_tools:
                 logger.warning("Selected workflow tools are unavailable; using fallback script")
-                return self._write_fallback_script(script_path, requirement, selected_tools), None, True
+                return write_fallback(), None, True
 
         # Get orchestrator binding and review agents from pending state
         orchestrator_binding = None
@@ -4986,6 +6547,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # script later in the workflow card.
         session = None
         try:
+            ensure_not_cancelled()
             session = create_engine_session(
                 agent_type=agent_type,
                 cwd=root_path,
@@ -4993,10 +6555,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 auto_approve=False,
                 require_tool_filter=True,
                 model_name=selected_model_name,
+                cancel_event=cancel_event,
             )
             if session is None:
                 logger.warning("Failed to create script-gen session; using fallback")
-                return self._write_fallback_script(script_path, requirement, selected_tools), None, True
+                return write_fallback(), None, True
 
             if progress_callback:
                 progress_callback("已创建 AI 会话，正在发送生成请求...")
@@ -5006,34 +6569,36 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             # introspection. Mutation tools (write, shell, network, code
             # execution) are rejected so a compromised model cannot bypass
             # the user confirmation step.
-            _MUTATING_TOOLS: frozenset[str] = frozenset([
-                "execute_command",
-                "create_terminal",
-                "run_terminal",
-                "run_shell",
-                "shell",
-                "bash",
-                "write_file",
-                "write_text_file",
-                "delete_file",
-                "remove_file",
-                "mkdir",
-                "patch_file",
-                "apply_diff",
-                "edit_file",
-                "write_to_file",
-                "http_request",
-                "http_get",
-                "http_post",
-                "fetch",
-                "download",
-                "upload",
-                "network_request",
-                "url_open",
-                "send_message",
-                "send_email",
-                "create_issue",
-            ])
+            _MUTATING_TOOLS: frozenset[str] = frozenset(
+                [
+                    "execute_command",
+                    "create_terminal",
+                    "run_terminal",
+                    "run_shell",
+                    "shell",
+                    "bash",
+                    "write_file",
+                    "write_text_file",
+                    "delete_file",
+                    "remove_file",
+                    "mkdir",
+                    "patch_file",
+                    "apply_diff",
+                    "edit_file",
+                    "write_to_file",
+                    "http_request",
+                    "http_get",
+                    "http_post",
+                    "fetch",
+                    "download",
+                    "upload",
+                    "network_request",
+                    "url_open",
+                    "send_message",
+                    "send_email",
+                    "create_issue",
+                ]
+            )
 
             def _script_gen_tool_filter(tool_name: str, _params: dict | None) -> bool:
                 if not isinstance(tool_name, str):
@@ -5042,7 +6607,21 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 if norm in _MUTATING_TOOLS:
                     return False
                 # Reject any tool whose name hints at a mutation.
-                if any(token in norm for token in ("write", "delete", "remove", "exec", "run", "patch", "post", "upload", "send", "create")):
+                if any(
+                    token in norm
+                    for token in (
+                        "write",
+                        "delete",
+                        "remove",
+                        "exec",
+                        "run",
+                        "patch",
+                        "post",
+                        "upload",
+                        "send",
+                        "create",
+                    )
+                ):
                     return False
                 return True
 
@@ -5062,17 +6641,16 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     type(exc).__name__,
                 )
                 from ...workflow_engine.script_gen import FALLBACK_SCRIPT
-                with open(script_path, "w", encoding="utf-8") as f:
-                    f.write(FALLBACK_SCRIPT)
+
+                write_generated_content(FALLBACK_SCRIPT)
                 if session is not None:
                     close_session_safely(session)
                 meta = {"name": "fallback-orchestration"}
                 return script_path, meta, True
 
-            script_gen_timeout_s = getattr(
-                self.settings, "workflow_script_gen_timeout_s", SCRIPT_GEN_TIMEOUT_S
-            )
+            script_gen_timeout_s = getattr(self.settings, "workflow_script_gen_timeout_s", SCRIPT_GEN_TIMEOUT_S)
             result = session.send_prompt(prompt, timeout=script_gen_timeout_s)
+            ensure_not_cancelled()
 
             if progress_callback:
                 progress_callback("收到模型响应，正在验证脚本...")
@@ -5082,8 +6660,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
                 is_valid, errors = validate_generated_script(script_content, review_agents=review_agents)
                 if is_valid:
-                    with open(script_path, "w", encoding="utf-8") as f:
-                        f.write(script_content)
+                    write_generated_content(script_content)
                     meta = extract_meta_from_script(script_content)
                     if meta is None:
                         meta = {}
@@ -5093,6 +6670,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             else:
                 logger.warning("AI returned empty script content")
 
+        except _WorkflowGenerationCancelled:
+            raise
         except Exception as exc:
             logger.error("Script generation via AI failed: %s", exc, exc_info=True)
         finally:
@@ -5100,7 +6679,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 close_session_safely(session)
 
         # Fallback
-        return self._write_fallback_script(script_path, requirement, selected_tools), None, True
+        return write_fallback(), None, True
 
     @staticmethod
     def _strip_markdown_fences(content: str) -> str:
@@ -5118,7 +6697,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # This handles cases like: "Here's the script:\n```javascript\n...code...\n```"
         fence_match = re.search(r"```\s*(?:javascript|js|)\s*\n", content, re.IGNORECASE)
         if fence_match:
-            after_fence = content[fence_match.end():]
+            after_fence = content[fence_match.end() :]
             # Find the closing fence (last occurrence to handle nested fences in strings)
             close_idx = after_fence.rfind("```")
             if close_idx >= 0:
@@ -5321,18 +6900,13 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
             if policy == "fail_fast":
                 call = f"  await workflow('{name}', {args_json});"
-                header = (
-                    f"  // ref: {name}{(' -- ' + safe_desc) if safe_desc else ''}"
-                    f"  (failure_policy=fail_fast)"
-                )
+                header = f"  // ref: {name}{(' -- ' + safe_desc) if safe_desc else ''}  (failure_policy=fail_fast)"
             else:
                 call = (
                     f"  try {{ await workflow('{name}', {args_json}); }} "
                     f"catch (e) {{ console.log('sub-workflow {name} skipped:', e); }}"
                 )
-                header = (
-                    f"  // ref: {name}{(' -- ' + safe_desc) if safe_desc else ''}"
-                )
+                header = f"  // ref: {name}{(' -- ' + safe_desc) if safe_desc else ''}"
             generated_lines.append(header)
             generated_lines.append(call)
 
@@ -5351,7 +6925,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     + "\n"
                     + block
                     + marker_end
-                    + script_content[idx_e + len(marker_end):]
+                    + script_content[idx_e + len(marker_end) :]
                 )
 
         # Strategy 2: find the default export function body (supporting both
@@ -5401,7 +6975,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 body_open = script_content.find("{", close_paren + 1)
                 if body_open != -1:
                     insert_at = WorkflowHandler._find_function_close_brace(
-                        script_content, body_open,
+                        script_content,
+                        body_open,
                     )
                     if insert_at is not None:
                         return (
@@ -5416,9 +6991,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         return script_content.rstrip() + "\n\n" + block
 
     @staticmethod
-    def _write_fallback_script(
-        script_path: str, requirement: str, selected_tools: list[str] | None = None
-    ) -> str:
+    def _write_fallback_script(script_path: str, requirement: str, selected_tools: list[str] | None = None) -> str:
         """Write a simple fallback script and return its path."""
         from ...workflow_engine.script_gen import generate_simple_script
 
@@ -5467,7 +7040,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         if orchestrator_binding:
             tool_name = orchestrator_binding.tool_name
             model_name = orchestrator_binding.model_name
-            use_default = getattr(orchestrator_binding, 'use_default_model', True)
+            use_default = getattr(orchestrator_binding, "use_default_model", True)
             orchestrator_display = f"**主编排 Agent**: `{tool_name}`"
             if use_default:
                 orchestrator_display += f" (默认: {orchestrator_binding.model_display_name or '默认模型'})"
@@ -5481,8 +7054,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             for i, agent in enumerate(review_agents):
                 tool_name = agent.tool_name
                 model_name = agent.model_name
-                use_default = getattr(agent, 'use_default_model', True)
-                line = f"{i+1}. `{tool_name}`"
+                use_default = getattr(agent, "use_default_model", True)
+                line = f"{i + 1}. `{tool_name}`"
                 if use_default:
                     line += f" (默认: {agent.model_display_name or '默认模型'})"
                 elif model_name:
@@ -5522,17 +7095,21 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         elements.append(self._build_workflow_stepper(current=3, total=3))
 
         if is_fallback:
-            elements.append({
-                "tag": "markdown",
-                "content": "⚠️ AI 脚本生成失败，已使用默认模板。结果可能不完全匹配需求。",
-            })
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "⚠️ AI 脚本生成失败，已使用默认模板。结果可能不完全匹配需求。",
+                }
+            )
 
         # --- 2. Requirement summary (first screen) ---
         req_trim = requirement[:300] if len(requirement) > 300 else requirement
-        elements.append({
-            "tag": "markdown",
-            "content": f"**需求**\n> {req_trim}",
-        })
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": f"**需求**\n> {req_trim}",
+            }
+        )
 
         # --- 2b. Agent selection display ---
         agent_info_lines = []
@@ -5542,47 +7119,52 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             agent_info_lines.append(review_display)
         if agent_info_lines:
             elements.append({"tag": "hr"})
-            elements.append({
-                "tag": "markdown",
-                "content": "\n".join(agent_info_lines),
-            })
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "\n".join(agent_info_lines),
+                }
+            )
 
         # --- 3. Stats: phases / tools (one-line pair) ---
-        elements.append({
-            "tag": "column_set",
-            "flex_mode": "bisect",
-            "background_style": "default",
-            "columns": [
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [
-                        {"tag": "markdown", "content": f"**{phase_count}**\n<font color='grey'>阶段数</font>"},
-                    ],
-                },
-                {
-                    "tag": "column",
-                    "width": "weighted",
-                    "weight": 1,
-                    "elements": [
-                        {"tag": "markdown", "content": f"**{tool_count}**\n<font color='grey'>工具数</font>"},
-                    ],
-                },
-            ],
-        })
+        elements.append(
+            {
+                "tag": "column_set",
+                "flex_mode": "bisect",
+                "background_style": "default",
+                "columns": [
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [
+                            {"tag": "markdown", "content": f"**{phase_count}**\n<font color='grey'>阶段数</font>"},
+                        ],
+                    },
+                    {
+                        "tag": "column",
+                        "width": "weighted",
+                        "weight": 1,
+                        "elements": [
+                            {"tag": "markdown", "content": f"**{tool_count}**\n<font color='grey'>工具数</font>"},
+                        ],
+                    },
+                ],
+            }
+        )
 
         # --- 4. Tool-mismatch status bar + single primary fix action ---
         if has_mismatch:
             missing = sorted(script_tools - allowed_tools)
             missing_display = ", ".join(f"`{m}`" for m in missing)
-            elements.append({
-                "tag": "markdown",
-                "content": (
-                    f"⚠️ 脚本需要这些工具但尚未启用：{missing_display}。"
-                    " 点击下方『一键补齐缺失工具』即可放行执行。"
-                ),
-            })
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"⚠️ 脚本需要这些工具但尚未启用：{missing_display}。 点击下方『一键补齐缺失工具』即可放行执行。"
+                    ),
+                }
+            )
 
         # --- 5. Primary CTA block — confirm start / cancel / mismatch fix ---
         # Visible on the first screen. Users do NOT need to open any
@@ -5617,27 +7199,27 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 "project_id": project_id,
                 "engine_session_key": engine_session_key,
             }
-            primary_buttons.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "➕ 一键补齐缺失工具"},
-                "type": "primary",
-                "value": fill_missing_value,
-                "behaviors": [{"type": "callback", "value": fill_missing_value}],
-            })
-            primary_buttons.append({
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": "↩️ 返回工具选择"},
-                "type": "default",
-                "value": back_tools_value,
-                "behaviors": [{"type": "callback", "value": back_tools_value}],
-            })
+            primary_buttons.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "➕ 一键补齐缺失工具"},
+                    "type": "primary",
+                    "value": fill_missing_value,
+                    "behaviors": [{"type": "callback", "value": fill_missing_value}],
+                }
+            )
+            primary_buttons.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "↩️ 返回工具选择"},
+                    "type": "default",
+                    "value": back_tools_value,
+                    "behaviors": [{"type": "callback", "value": back_tools_value}],
+                }
+            )
 
         confirm_disabled = has_mismatch
-        confirm_disabled_tips = (
-            "脚本需要的工具尚未全部启用，请先点击『一键补齐缺失工具』"
-            if confirm_disabled
-            else None
-        )
+        confirm_disabled_tips = "脚本需要的工具尚未全部启用，请先点击『一键补齐缺失工具』" if confirm_disabled else None
         confirm_btn: dict = {
             "tag": "button",
             "text": {"tag": "plain_text", "content": "✅ 确认执行"},
@@ -5653,17 +7235,19 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             }
         primary_buttons.append(confirm_btn)
 
-        primary_buttons.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "❌ 取消"},
-            "type": "danger",
-            "value": cancel_value,
-            "behaviors": [{"type": "callback", "value": cancel_value}],
-            "confirm": {
-                "title": {"tag": "plain_text", "content": UI_TEXT["workflow_btn_confirm_cancel_title"]},
-                "text": {"tag": "plain_text", "content": UI_TEXT["workflow_btn_confirm_cancel_body"]},
-            },
-        })
+        primary_buttons.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "❌ 取消"},
+                "type": "danger",
+                "value": cancel_value,
+                "behaviors": [{"type": "callback", "value": cancel_value}],
+                "confirm": {
+                    "title": {"tag": "plain_text", "content": UI_TEXT["workflow_btn_confirm_cancel_title"]},
+                    "text": {"tag": "plain_text", "content": UI_TEXT["workflow_btn_confirm_cancel_body"]},
+                },
+            }
+        )
 
         elements.extend(build_responsive_button_row(primary_buttons, mobile_force_vertical=True))
 
@@ -5680,17 +7264,21 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         )
 
         ref_count = len(workflow_refs) if isinstance(workflow_refs, list) else 0
-        elements.append({
-            "tag": "markdown",
-            "content": f"**🔗 子 Workflow 引用（{ref_count}）**",
-        })
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": f"**🔗 子 Workflow 引用（{ref_count}）**",
+            }
+        )
 
         if not workflow_refs:
             # Empty state chip so the "add" entry point is still obvious.
-            elements.append({
-                "tag": "markdown",
-                "content": "<font color='grey'>暂无子 Workflow 引用。点击下方按钮可添加。</font>",
-            })
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "<font color='grey'>暂无子 Workflow 引用。点击下方按钮可添加。</font>",
+                }
+            )
         else:
             for idx, ref in enumerate(workflow_refs):
                 if isinstance(ref, dict):
@@ -5703,10 +7291,12 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 chip_lines = [f"`{ref_name}`"]
                 if ref_desc:
                     chip_lines.append(f"  <font color='grey' size='10'>{ref_desc[:80]}</font>")
-                elements.append({
-                    "tag": "markdown",
-                    "content": "\n".join(chip_lines),
-                })
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "content": "\n".join(chip_lines),
+                    }
+                )
 
                 ref_buttons: list[dict] = []
                 view_value = {
@@ -5716,13 +7306,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     "project_id": project_id,
                     "engine_session_key": engine_session_key,
                 }
-                ref_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "👁 预览"},
-                    "type": "default",
-                    "value": view_value,
-                    "behaviors": [{"type": "callback", "value": view_value}],
-                })
+                ref_buttons.append(
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "👁 预览"},
+                        "type": "default",
+                        "value": view_value,
+                        "behaviors": [{"type": "callback", "value": view_value}],
+                    }
+                )
                 remove_value = {
                     "action": WORKFLOW_REMOVE_WORKFLOW_REF,
                     "ref_index": idx,
@@ -5730,17 +7322,19 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     "project_id": project_id,
                     "engine_session_key": engine_session_key,
                 }
-                ref_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "🗑 移除"},
-                    "type": "default",
-                    "value": remove_value,
-                    "behaviors": [{"type": "callback", "value": remove_value}],
-                    "confirm": {
-                        "title": {"tag": "plain_text", "content": "移除子 Workflow 引用？"},
-                        "text": {"tag": "plain_text", "content": f"确定移除「{ref_name}」？"},
-                    },
-                })
+                ref_buttons.append(
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "🗑 移除"},
+                        "type": "default",
+                        "value": remove_value,
+                        "behaviors": [{"type": "callback", "value": remove_value}],
+                        "confirm": {
+                            "title": {"tag": "plain_text", "content": "移除子 Workflow 引用？"},
+                            "text": {"tag": "plain_text", "content": f"确定移除「{ref_name}」？"},
+                        },
+                    }
+                )
                 elements.extend(build_responsive_button_row(ref_buttons, mobile_force_vertical=True))
 
         # "Add reference" main button — primary entry point.
@@ -5750,13 +7344,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             "project_id": project_id,
             "engine_session_key": engine_session_key,
         }
-        add_button = [{
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "➕ 添加子 Workflow 引用"},
-            "type": "default",
-            "value": add_value,
-            "behaviors": [{"type": "callback", "value": add_value}],
-        }]
+        add_button = [
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "➕ 添加子 Workflow 引用"},
+                "type": "default",
+                "value": add_value,
+                "behaviors": [{"type": "callback", "value": add_value}],
+            }
+        ]
         elements.extend(build_responsive_button_row(add_button, mobile_force_vertical=True))
 
         # --- 6. Phases panel (top-level collapsible) ---
@@ -5773,20 +7369,24 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     tool_tags = ", ".join(f"`{t}`" for t in phase_tools)
                     line += f"\n   工具: {tool_tags}"
                 phase_elements.append({"tag": "markdown", "content": line})
-            elements.append({
-                "tag": "collapsible_panel",
-                "header": {
-                    "title": {"tag": "plain_text", "content": f"📋 阶段列表 ({len(phases)})"},
-                },
-                "border": {"color": "blue", "corner_radius": "8px"},
-                "expanded": False,
-                "elements": phase_elements,
-            })
+            elements.append(
+                {
+                    "tag": "collapsible_panel",
+                    "header": {
+                        "title": {"tag": "plain_text", "content": f"📋 阶段列表 ({len(phases)})"},
+                    },
+                    "border": {"color": "blue", "corner_radius": "8px"},
+                    "expanded": False,
+                    "elements": phase_elements,
+                }
+            )
         else:
-            elements.append({
-                "tag": "markdown",
-                "content": "📋 **执行阶段**: Planning → Execution",
-            })
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "📋 **执行阶段**: Planning → Execution",
+                }
+            )
 
         # --- 7. Script preview panel (top-level collapsible) ---
         if script_content:
@@ -5794,15 +7394,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
             preview = render_script_preview(script_content)
             if preview:
-                elements.append({
-                    "tag": "collapsible_panel",
-                    "expanded": False,
-                    "header": {
-                        "title": {"tag": "plain_text", "content": "📜 编排脚本预览"},
-                    },
-                    "border": {"color": "grey", "corner_radius": "8px"},
-                    "elements": [{"tag": "markdown", "content": preview}],
-                })
+                elements.append(
+                    {
+                        "tag": "collapsible_panel",
+                        "expanded": False,
+                        "header": {
+                            "title": {"tag": "plain_text", "content": "📜 编排脚本预览"},
+                        },
+                        "border": {"color": "grey", "corner_radius": "8px"},
+                        "elements": [{"tag": "markdown", "content": preview}],
+                    }
+                )
 
         # --- 8. Collapsible: Advanced options (tools / regen) ---
         # Everything below here is truly secondary; users open this only for
@@ -5816,14 +7418,18 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         tier2_tools = [t for t in sorted(allowed_tools) if t not in recommended_order]
 
         tool_detail_elements: list[dict] = []
-        tool_detail_elements.append({
-            "tag": "markdown",
-            "content": "📝 **脚本计划使用**: " + (" | ".join(f"`{t}`" for t in sorted(script_tools))),
-        })
-        tool_detail_elements.append({
-            "tag": "markdown",
-            "content": "✅ **允许执行的工具**（点击切换，脚本只能使用勾选的工具）：",
-        })
+        tool_detail_elements.append(
+            {
+                "tag": "markdown",
+                "content": "📝 **脚本计划使用**: " + (" | ".join(f"`{t}`" for t in sorted(script_tools))),
+            }
+        )
+        tool_detail_elements.append(
+            {
+                "tag": "markdown",
+                "content": "✅ **允许执行的工具**（点击切换，脚本只能使用勾选的工具）：",
+            }
+        )
 
         if tier1_tools:
             for tool in tier1_tools:
@@ -5840,13 +7446,15 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     "project_id": project_id,
                     "engine_session_key": engine_session_key,
                 }
-                tool_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": f"{'✓ ' if is_selected else '○ '}{t}"},
-                    "type": "primary" if is_selected else "default",
-                    "value": btn_value,
-                    "behaviors": [{"type": "callback", "value": btn_value}],
-                })
+                tool_buttons.append(
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": f"{'✓ ' if is_selected else '○ '}{t}"},
+                        "type": "primary" if is_selected else "default",
+                        "value": btn_value,
+                        "behaviors": [{"type": "callback", "value": btn_value}],
+                    }
+                )
             if tool_buttons:
                 tool_detail_elements.extend(build_responsive_button_row(tool_buttons, mobile_force_vertical=True))
 
@@ -5865,51 +7473,59 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     "project_id": project_id,
                     "engine_session_key": engine_session_key,
                 }
-                other_buttons.append({
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": f"{'✓ ' if is_selected else '○ '}{t}"},
-                    "type": "primary" if is_selected else "default",
-                    "value": btn_value,
-                    "behaviors": [{"type": "callback", "value": btn_value}],
-                })
-            tool_detail_elements.append({
-                "tag": "collapsible_panel",
-                "header": {
-                    "title": {"tag": "plain_text", "content": f"🔧 更多工具 ({len(tier2_tools)})"},
-                },
-                "border": {"color": "grey", "corner_radius": "8px"},
-                "expanded": False,
-                "elements": [
-                    *tier2_elements,
-                    *build_responsive_button_row(other_buttons, mobile_force_vertical=True),
-                ],
-            })
+                other_buttons.append(
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": f"{'✓ ' if is_selected else '○ '}{t}"},
+                        "type": "primary" if is_selected else "default",
+                        "value": btn_value,
+                        "behaviors": [{"type": "callback", "value": btn_value}],
+                    }
+                )
+            tool_detail_elements.append(
+                {
+                    "tag": "collapsible_panel",
+                    "header": {
+                        "title": {"tag": "plain_text", "content": f"🔧 更多工具 ({len(tier2_tools)})"},
+                    },
+                    "border": {"color": "grey", "corner_radius": "8px"},
+                    "expanded": False,
+                    "elements": [
+                        *tier2_elements,
+                        *build_responsive_button_row(other_buttons, mobile_force_vertical=True),
+                    ],
+                }
+            )
 
         # 6e. Regenerate script (advanced)
         from ...card.actions.dispatch import WORKFLOW_REGENERATE_SCRIPT
 
         regen_elements: list[dict] = []
         regen_buttons: list[dict] = []
-        regen_buttons.append({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "🔄 重新生成编排"},
-            "type": "default",
-            "value": {
-                "action": WORKFLOW_REGENERATE_SCRIPT,
-                "chat_id": chat_id,
-                "project_id": project_id,
-                "engine_session_key": engine_session_key,
-            },
-            "behaviors": [{
-                "type": "callback",
+        regen_buttons.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "🔄 重新生成编排"},
+                "type": "default",
                 "value": {
                     "action": WORKFLOW_REGENERATE_SCRIPT,
                     "chat_id": chat_id,
                     "project_id": project_id,
                     "engine_session_key": engine_session_key,
                 },
-            }],
-        })
+                "behaviors": [
+                    {
+                        "type": "callback",
+                        "value": {
+                            "action": WORKFLOW_REGENERATE_SCRIPT,
+                            "chat_id": chat_id,
+                            "project_id": project_id,
+                            "engine_session_key": engine_session_key,
+                        },
+                    }
+                ],
+            }
+        )
         regen_elements.extend(build_responsive_button_row(regen_buttons, mobile_force_vertical=True))
 
         # --- Combine all advanced sections into one collapsed panel ---
@@ -5923,15 +7539,17 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         combined_panel_elements.append({"tag": "hr"})
         combined_panel_elements.extend(regen_elements)
 
-        elements.append({
-            "tag": "collapsible_panel",
-            "header": {
-                "title": {"tag": "plain_text", "content": "⚙️ 查看详细信息 / 更多操作（阶段 / 工具 / 脚本）"},
-            },
-            "border": {"color": "grey", "corner_radius": "8px"},
-            "expanded": False,
-            "elements": combined_panel_elements,
-        })
+        elements.append(
+            {
+                "tag": "collapsible_panel",
+                "header": {
+                    "title": {"tag": "plain_text", "content": "⚙️ 查看详细信息 / 更多操作（阶段 / 工具 / 脚本）"},
+                },
+                "border": {"color": "grey", "corner_radius": "8px"},
+                "expanded": False,
+                "elements": combined_panel_elements,
+            }
+        )
 
         return CardBuilder._wrap_card(
             header_title="🔄 Workflow 确认",
@@ -5963,94 +7581,130 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         message_id: str,
         chat_id: str,
         project: Optional["ProjectContext"],
+        *,
+        lifecycle_owner: _WorkflowLifecycleOwner | None = None,
     ):
         """Build WorkflowEngineCallbacks that update the Feishu card."""
         from ...workflow_engine.engine import WorkflowEngineCallbacks
 
         card_message_id: list[str] = [message_id]  # Mutable ref for card updates
         terminal_sent: list[bool] = [False]
+        delivery_lock = (
+            lifecycle_owner.delivery_lock
+            if lifecycle_owner is not None
+            else threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+        )
         project_id = getattr(project, "project_id", "") or ""
+        origin_message_id = self._resolve_origin(message_id)
 
         def on_progress(card_data: dict[str, Any]) -> None:
             """Update the progress card in Feishu."""
-            if terminal_sent[0]:
-                logger.debug("Ignored workflow progress update after terminal card was sent")
-                return
-            try:
-                # Keep runtime progress cards aligned with the mixin
-                # implementation: users can stop active workflows from the card,
-                # but terminal completion cards are delivered separately.
-                self._inject_workflow_stop_button(card_data, chat_id, project_id)
-                new_id = self._replace_or_send_workflow_rendered_card(
-                    card_message_id=card_message_id[0],
-                    chat_id=chat_id,
-                    card_data=card_data,
-                )
-                if new_id:
-                    card_message_id[0] = new_id
-            except Exception:
-                logger.debug("Failed to update workflow progress card", exc_info=True)
+            with delivery_lock:
+                if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
+                    logger.debug("Ignored workflow progress update after terminal card was sent")
+                    return
+                try:
+                    # Keep runtime progress cards aligned with the mixin
+                    # implementation: users can stop active workflows from the card,
+                    # but terminal completion cards are delivered separately.
+                    self._inject_workflow_stop_button(
+                        card_data,
+                        chat_id,
+                        project_id,
+                    )
+                    new_id = self._replace_or_send_workflow_rendered_card(
+                        card_message_id=card_message_id[0],
+                        chat_id=chat_id,
+                        card_data=card_data,
+                        origin_message_id=origin_message_id,
+                        # Heartbeats are periodic. Turning every PATCH failure
+                        # into a new message creates an unbounded card stream
+                        # during persistent transport or provenance failures.
+                        fallback_to_new=False,
+                    )
+                    if new_id:
+                        card_message_id[0] = new_id
+                except Exception:
+                    logger.debug(
+                        "Failed to update workflow progress card",
+                        exc_info=True,
+                    )
 
         def on_done(wf_project) -> None:
             """Final completion — send a structured completion card."""
-            report_status: dict[str, Any] | None = None
-            try:
-                from ...workflow_engine.renderer import render_completion_card
-
-                report_status = self._send_workflow_completion_report(
-                    wf_project=wf_project,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    project=project,
-                )
-                card_data = render_completion_card(wf_project, report_status=report_status)
-                new_id = self._replace_or_send_workflow_rendered_card(
-                    card_message_id=card_message_id[0],
-                    chat_id=chat_id,
-                    card_data=card_data,
-                )
-                if new_id:
-                    card_message_id[0] = new_id
-                    terminal_sent[0] = True
-                else:
-                    # Card delivery returned None — try text fallback
-                    raise RuntimeError("Card delivery returned None")
-            except Exception:
-                self._reply_workflow_completion_fallback(
-                    message_id=message_id,
-                    report_status=report_status,
-                )
+            # Wait for an in-flight PATCH, then fence every later progress
+            # callback before report generation/upload and terminal delivery.
+            with delivery_lock:
+                if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
+                    return
                 terminal_sent[0] = True
+                report_status: dict[str, Any] | None = None
+                try:
+                    from ...workflow_engine.renderer import render_completion_card
+
+                    report_status = self._send_workflow_completion_report(
+                        wf_project=wf_project,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        project=project,
+                    )
+                    if lifecycle_owner is not None and lifecycle_owner.stop_event.is_set():
+                        return
+                    card_data = render_completion_card(
+                        wf_project,
+                        report_status=report_status,
+                    )
+                    new_id = self._replace_or_send_workflow_rendered_card(
+                        card_message_id=card_message_id[0],
+                        chat_id=chat_id,
+                        card_data=card_data,
+                        origin_message_id=origin_message_id,
+                    )
+                    if new_id:
+                        card_message_id[0] = new_id
+                    else:
+                        # Card delivery returned None — try text fallback
+                        raise RuntimeError("Card delivery returned None")
+                except Exception:
+                    if lifecycle_owner is not None and lifecycle_owner.stop_event.is_set():
+                        return
+                    self._reply_workflow_completion_fallback(
+                        message_id=message_id,
+                        report_status=report_status,
+                    )
 
         def on_error(error_msg: str) -> None:
             """Error notification — sanitize before showing to user."""
-            terminal_sent[0] = True
-            from ...workflow_engine.errors import (
-                ErrorCategory,
-                _strip_internal_details,
-                categorize_error,
-            )
+            with delivery_lock:
+                if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
+                    return
+                terminal_sent[0] = True
+                from ...workflow_engine.errors import (
+                    ErrorCategory,
+                    _strip_internal_details,
+                    categorize_error,
+                )
 
-            category = categorize_error(error_msg)
-            if category == ErrorCategory.TOOL_NOT_ALLOWED:
-                workflow_category = "forbidden"
-            elif category == ErrorCategory.SCRIPT_VALIDATION:
-                workflow_category = "invalid_argument"
-            elif category == ErrorCategory.RUNTIME_TIMEOUT:
-                workflow_category = "runtime_timeout"
-            elif category in (
-                ErrorCategory.AGENT_LIMIT,
-                ErrorCategory.CANCELLED,
-            ):
-                workflow_category = "invalid_state"
-            else:
-                workflow_category = "internal_error"
+                category = categorize_error(error_msg)
+                if category == ErrorCategory.TOOL_NOT_ALLOWED:
+                    workflow_category = "forbidden"
+                elif category == ErrorCategory.SCRIPT_VALIDATION:
+                    workflow_category = "invalid_argument"
+                elif category == ErrorCategory.RUNTIME_TIMEOUT:
+                    workflow_category = "runtime_timeout"
+                elif category in (
+                    ErrorCategory.AGENT_LIMIT,
+                    ErrorCategory.CANCELLED,
+                ):
+                    workflow_category = "invalid_state"
+                else:
+                    workflow_category = "internal_error"
 
-            self._reply_workflow_error(
-                message_id,
-                workflow_category,
-                detail=_strip_internal_details(error_msg or ""),
-            )
+                self._reply_workflow_error(
+                    message_id,
+                    workflow_category,
+                    detail=_strip_internal_details(error_msg or ""),
+                )
 
         def on_log(msg: str) -> None:
             logger.debug("[WorkflowHandler] log: %s", msg)

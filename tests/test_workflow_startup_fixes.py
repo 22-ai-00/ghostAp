@@ -4,7 +4,7 @@ Covers:
 - vertical_spacing NOT emitted on column_set by build_responsive_button_row
 - PendingConfirmation.created_at timestamp for stale detection
 - engine.project auto-init when None
-- Stale pending state auto-recovery (>30 min)
+- Newest-wins replacement of owned pending state
 """
 
 import time
@@ -141,8 +141,8 @@ class TestEngineProjectAutoInit(unittest.TestCase):
         self.assertIsNotNone(engine.project.pending)
 
 
-class TestStalePendingAutoReset(unittest.TestCase):
-    """Stale pending state (>30 min) should be auto-cleared in start_workflow."""
+class TestPendingNewestWins(unittest.TestCase):
+    """The same initiator's newest request replaces any pending selection."""
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     @patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True)
@@ -154,6 +154,7 @@ class TestStalePendingAutoReset(unittest.TestCase):
         ctx.workflow_engine_manager = MagicMock()
         ctx.project_manager = MagicMock()
         ctx.progress_reporter = MagicMock()
+        ctx.settings.admin_user_ids = []
 
         handler = WorkflowHandler.__new__(WorkflowHandler)
         handler.ctx = ctx
@@ -178,6 +179,7 @@ class TestStalePendingAutoReset(unittest.TestCase):
         stale_pending = PendingConfirmation(
             requirement="old task",
             created_at=time.time() - 31 * 60,
+            initiator_user_id="user_123",
         )
         engine.project = WorkflowProject(
             status=WorkflowStatus.AWAITING_TOOL_SELECT,
@@ -196,13 +198,14 @@ class TestStalePendingAutoReset(unittest.TestCase):
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     @patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True)
     @patch("src.workflow_engine.templates.discover_templates", return_value=[])
-    def test_recent_state_blocks_new_workflow(self, mock_templates, mock_node, mock_sender):
+    def test_recent_state_is_replaced_by_new_workflow(self, mock_templates, mock_node, mock_sender):
         from src.feishu.handlers.workflow import WorkflowHandler
 
         ctx = MagicMock()
         ctx.workflow_engine_manager = MagicMock()
         ctx.project_manager = MagicMock()
         ctx.progress_reporter = MagicMock()
+        ctx.settings.admin_user_ids = []
 
         handler = WorkflowHandler.__new__(WorkflowHandler)
         handler.ctx = ctx
@@ -224,7 +227,10 @@ class TestStalePendingAutoReset(unittest.TestCase):
         engine = MagicMock()
         engine.is_running = False
         engine.root_path = "/tmp/project"
-        fresh_pending = PendingConfirmation(requirement="current task")
+        fresh_pending = PendingConfirmation(
+            requirement="current task",
+            initiator_user_id="user_123",
+        )
         engine.project = WorkflowProject(
             status=WorkflowStatus.AWAITING_TOOL_SELECT,
             pending=fresh_pending,
@@ -234,10 +240,8 @@ class TestStalePendingAutoReset(unittest.TestCase):
 
         handler.start_workflow("msg_1", "chat_1", "new task", project)
 
-        # Should block with invalid_state error
-        handler._reply_workflow_error.assert_called_once()
-        call_args = handler._reply_workflow_error.call_args
-        self.assertEqual(call_args[0][1], "invalid_state")
+        handler._reply_workflow_error.assert_not_called()
+        handler.send_card_to_chat.assert_called()
 
 
 if __name__ == "__main__":

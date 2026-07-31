@@ -308,13 +308,7 @@ class TestScriptSaving(unittest.TestCase):
             self.assertEqual(parsed_meta.tools, ["coco", "claude"])
 
     def test_script_filename_contains_timestamp_or_hash(self):
-        """Verify that generated scripts have unique filenames to avoid overwrites.
-
-        Note: The current implementation uses a fixed filename 'generated_workflow.js'
-        for AI-generated scripts. This test verifies the filename pattern and
-        ensures the file is written correctly. For template-based workflows,
-        the filename is the template name.
-        """
+        """Concurrent generations use distinct files and cannot overwrite each other."""
         with tempfile.TemporaryDirectory() as tmpdir:
             handler, ctx = self._make_handler(tmpdir)
 
@@ -348,7 +342,7 @@ class TestScriptSaving(unittest.TestCase):
             with patch("src.agent_session.create_engine_session") as mock_create2:
                 mock_session2 = MagicMock()
                 mock_create2.return_value = mock_session2
-                mock_session2.send_prompt.return_value = MagicMock(text=SAMPLE_SCRIPT)
+                mock_session2.send_prompt.return_value = MagicMock(text=SIMPLE_SCRIPT)
                 mock_session2.close = MagicMock()
 
                 with patch("src.agent_session.close_session_safely"):
@@ -356,9 +350,14 @@ class TestScriptSaving(unittest.TestCase):
                         "second requirement", tmpdir, ["claude"]
                     )
 
-            # Both scripts should be valid files
+            # Both generations retain their own immutable source artifact.
+            self.assertNotEqual(script_path, script_path2)
             self.assertTrue(os.path.isfile(script_path))
             self.assertTrue(os.path.isfile(script_path2))
+            with open(script_path, encoding="utf-8") as first_file:
+                self.assertIn('name: "test-workflow"', first_file.read())
+            with open(script_path2, encoding="utf-8") as second_file:
+                self.assertIn('name: "simple-workflow"', second_file.read())
 
 
 # ---------------------------------------------------------------------------

@@ -105,6 +105,7 @@ def _build_handler_for_regen():
 def test_regenerate_script_preserves_orchestrator_agent():
     """点击"重新生成脚本"后，pending.orchestrator_agent 必须保持为 claude（不会被重置为 coco）。"""
     handler = _build_handler_for_regen()
+    handler._schedule_generate_and_show_confirm_card = MagicMock()
 
     mock_project = MagicMock()
     mock_project.project_id = "test_proj"
@@ -131,40 +132,25 @@ def test_regenerate_script_preserves_orchestrator_agent():
     handler.ctx.project_manager.get_project = MagicMock(return_value=mock_project)
     handler._start_pending_workflow_execution = MagicMock(return_value=True)
 
-    with patch("src.feishu.handlers.workflow.os.path.exists", return_value=True):
-        with patch("src.feishu.handlers.workflow.os.remove"):
-            # Stub _generate_script_via_ai — only check the orchestrator that is
-            # resolved inside the function.
-            captured_agent = {"value": None}
+    with (
+        patch("src.feishu.handlers.workflow.os.path.exists", return_value=True),
+        patch("src.feishu.handlers.workflow.os.remove"),
+        patch("src.thread.get_current_sender_id", return_value="test_user"),
+    ):
+        handler.handle_workflow_regenerate_script(
+            message_id="msg_regen",
+            chat_id="test_chat",
+            project_id="test_proj",
+            value={
+                "action": "workflow_regenerate_script",
+                "engine_session_key": "session_abc",
+                "project_id": "test_proj",
+            },
+        )
 
-
-            def fake_gen(requirement, root_path, selected_tools, engine, **kwargs):
-                # Inspect what orchestrator agent the function actually resolves
-                # from `engine.project.pending`.
-                if engine and engine.project and engine.project.pending:
-                    captured_agent["value"] = engine.project.pending.orchestrator_agent
-                return ("/tmp/test_proj/.ghostap/workflow_scripts/generated_workflow.js", {"tools": ["coco"]}, False)
-
-            handler._generate_script_via_ai = fake_gen
-
-            with patch("src.thread.get_current_sender_id", return_value="test_user"):
-                handler.handle_workflow_regenerate_script(
-                    message_id="msg_regen",
-                    chat_id="test_chat",
-                    project_id="test_proj",
-                    value={
-                        "action": "workflow_regenerate_script",
-                        "engine_session_key": "session_abc",
-                        "project_id": "test_proj",
-                    },
-                )
-
-    # 关键断言：_generate_script_via_ai 中读取到的 orchestrator agent 必须是 claude
-    assert captured_agent["value"] == "claude", (
-        f"重新生成脚本时 orchestrator agent 被重置了，期望 claude，实际 {captured_agent['value']!r}"
-    )
-    # 同时 pending 里也必须保留 claude
     assert mock_engine.project.pending.orchestrator_agent == "claude"
+    assert mock_engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+    handler._schedule_generate_and_show_confirm_card.assert_called_once()
     handler._reply_workflow_error.assert_not_called()
 
 
@@ -175,7 +161,7 @@ def test_generate_and_show_confirm_card_preserves_orchestrator_agent():
     mock_engine = MagicMock()
     mock_engine.project = WorkflowProject(
         workflow_id="test_wf",
-        status=WorkflowStatus.AWAITING_TOOL_SELECT,
+        status=WorkflowStatus.GENERATING_SCRIPT,
         pending=PendingConfirmation(
             requirement="some requirement",
             initiator_user_id="test_user",
@@ -201,6 +187,7 @@ def test_generate_and_show_confirm_card_preserves_orchestrator_agent():
                 project=MagicMock(project_id="test_proj"),
                 root_path="/tmp/test_proj",
                 selected_tools=["coco"],
+                expected_session_key="session_xyz",
             )
 
     assert mock_engine.project.pending is not None
@@ -216,8 +203,13 @@ def test_generate_and_show_confirm_card_defaults_orchestrator_when_missing():
     mock_engine = MagicMock()
     mock_engine.project = WorkflowProject(
         workflow_id="test_wf",
-        status=WorkflowStatus.IDLE,
-        pending=None,
+        status=WorkflowStatus.GENERATING_SCRIPT,
+        pending=PendingConfirmation(
+            requirement="some requirement",
+            initiator_user_id="test_user",
+            engine_session_key="session_xyz",
+            selected_tools=["coco"],
+        ),
     )
     handler.ctx.workflow_engine_manager.get_or_create = MagicMock(return_value=mock_engine)
 
@@ -234,6 +226,7 @@ def test_generate_and_show_confirm_card_defaults_orchestrator_when_missing():
                 project=MagicMock(project_id="test_proj"),
                 root_path="/tmp/test_proj",
                 selected_tools=["coco"],
+                expected_session_key="session_xyz",
             )
 
     assert mock_engine.project.pending.orchestrator_agent == DEFAULT_ORCHESTRATOR_AGENT
@@ -243,6 +236,7 @@ def test_generate_and_show_confirm_card_auto_starts_without_confirm_card():
     """脚本生成完成后应直接启动执行，而不是停在确认卡。"""
     handler = _build_handler_for_regen()
     handler.send_card_to_chat = MagicMock(return_value="generating_card")
+    handler._resolve_origin = MagicMock(return_value="origin_msg")
     handler._replace_or_send_workflow_card = MagicMock()
     handler._start_pending_workflow_execution = MagicMock(return_value=True)
 
@@ -285,6 +279,7 @@ def test_generate_and_show_confirm_card_auto_starts_without_confirm_card():
 
     handler._build_confirm_card.assert_not_called()
     handler._replace_or_send_workflow_card.assert_not_called()
+    assert handler.send_card_to_chat.call_args.kwargs.get("origin_message_id") == "origin_msg"
     handler._start_pending_workflow_execution.assert_called_once_with(
         message_id="generating_card",
         chat_id="test_chat",
@@ -293,6 +288,9 @@ def test_generate_and_show_confirm_card_auto_starts_without_confirm_card():
         root_path="/tmp/test_proj",
         engine=mock_engine,
         allow_server_side_start=True,
+        generation_owner=handler._start_pending_workflow_execution.call_args.kwargs[
+            "generation_owner"
+        ],
     )
     assert mock_engine.project.pending.initiator_user_id == "test_user"
 
@@ -308,7 +306,7 @@ def test_generate_and_show_confirm_card_starts_from_loading_card_without_confirm
     mock_engine = MagicMock()
     mock_engine.project = WorkflowProject(
         workflow_id="test_wf",
-        status=WorkflowStatus.AWAITING_TOOL_SELECT,
+        status=WorkflowStatus.GENERATING_SCRIPT,
         pending=PendingConfirmation(
             requirement="some requirement",
             initiator_user_id="test_user",
@@ -336,6 +334,7 @@ def test_generate_and_show_confirm_card_starts_from_loading_card_without_confirm
                 project=MagicMock(project_id="test_proj"),
                 root_path="/tmp/test_proj",
                 selected_tools=["coco"],
+                expected_session_key="session_xyz",
             )
 
     handler._build_confirm_card.assert_not_called()
@@ -353,7 +352,7 @@ def test_generate_and_show_confirm_card_replaces_loading_card_on_template_valida
     mock_engine = MagicMock()
     mock_engine.project = WorkflowProject(
         workflow_id="test_wf",
-        status=WorkflowStatus.AWAITING_TOOL_SELECT,
+        status=WorkflowStatus.GENERATING_SCRIPT,
         pending=PendingConfirmation(
             requirement="bad-template",
             initiator_user_id="test_user",
@@ -378,6 +377,7 @@ def test_generate_and_show_confirm_card_replaces_loading_card_on_template_valida
                     project=MagicMock(project_id="test_proj"),
                     root_path="/tmp/test_proj",
                     selected_tools=["coco"],
+                    expected_session_key="session_xyz",
                 )
 
     handler.reply_error.assert_not_called()
@@ -387,6 +387,71 @@ def test_generate_and_show_confirm_card_replaces_loading_card_on_template_valida
     assert "模板" in str(updated_card)
     assert mock_engine.project.status == WorkflowStatus.IDLE
     assert mock_engine.project.pending is None
+
+
+def test_invalid_template_stops_generation_heartbeat_before_return():
+    """An early validation return must not leave the 8-second updater alive."""
+    handler = _build_handler_for_regen()
+    handler.send_card_to_chat.return_value = "loading_msg"
+    handler.update_card.return_value = True
+
+    class FakeThread:
+        def __init__(self, *, target, name, daemon):
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+            self.started = False
+            self.joined = False
+
+        def start(self):
+            self.started = True
+
+        def join(self, timeout=None):
+            self.joined = True
+
+    created_threads = []
+
+    def make_thread(**kwargs):
+        thread = FakeThread(**kwargs)
+        created_threads.append(thread)
+        return thread
+
+    mock_engine = MagicMock()
+    mock_engine.project = WorkflowProject(
+        workflow_id="test_wf",
+        status=WorkflowStatus.GENERATING_SCRIPT,
+        pending=PendingConfirmation(
+            requirement="bad-template",
+            initiator_user_id="test_user",
+            engine_session_key="session_xyz",
+            selected_tools=["coco"],
+            orchestrator_agent="claude",
+        ),
+    )
+    handler.ctx.workflow_engine_manager.get_or_create = MagicMock(return_value=mock_engine)
+
+    with (
+        patch("threading.Thread", side_effect=make_thread),
+        patch(
+            "src.workflow_engine.templates.discover_templates",
+            return_value=[SimpleNamespace(name="bad-template")],
+        ),
+        patch("src.workflow_engine.templates.load_template", return_value="not valid workflow js"),
+        patch("src.thread.get_current_sender_id", return_value="test_user"),
+    ):
+        handler._generate_and_show_confirm_card(
+            message_id="msg",
+            chat_id="test_chat",
+            requirement="bad-template",
+            project=MagicMock(project_id="test_proj"),
+            root_path="/tmp/test_proj",
+            selected_tools=["coco"],
+            expected_session_key="session_xyz",
+        )
+
+    assert len(created_threads) == 1
+    assert created_threads[0].started is True
+    assert created_threads[0].joined is True
 
 
 # ---------------------------------------------------------------------------

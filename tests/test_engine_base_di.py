@@ -4,7 +4,12 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock, patch
 
-from src.engine_base import BaseEngine, EngineRunState, ReviewPerspective
+from src.engine_base import (
+    BaseEngine,
+    BaseEngineManager,
+    EngineRunState,
+    ReviewPerspective,
+)
 
 
 class TestBaseEngineDI:
@@ -354,3 +359,31 @@ class TestReviewPerspectiveDisplayName:
         assert imports == [], (
             f"engine_base.py still imports spec_engine: {imports}"
         )
+
+
+def test_cleanup_all_retains_engine_that_has_not_quiesced():
+    """An explicit False cleanup result is a manager tombstone."""
+
+    class DummyManager(BaseEngineManager[BaseEngine]):
+        def _create_engine(
+            self,
+            chat_id,
+            root_path,
+            agent_type,
+            engine_name,
+            model_name,
+        ):
+            raise AssertionError("test installs its engine directly")
+
+    manager = DummyManager()
+    engine = MagicMock()
+    engine.cleanup.return_value = False
+    engine.is_running = False
+    key = "chat_1:/repo"
+    manager._engines[key] = engine
+    manager._chat_keys["chat_1"] = {key}
+
+    manager.cleanup_all()
+
+    assert manager.get("chat_1", "/repo") is engine
+    assert manager.list_engines("chat_1") == [engine]
