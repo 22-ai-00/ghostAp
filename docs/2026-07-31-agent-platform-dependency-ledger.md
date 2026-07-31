@@ -138,7 +138,7 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 | Task | 状态 | 处置 | 硬验收 |
 | --- | --- | --- | --- |
 | 0.1 执行通道产品合同 | complete | evidence-only | maturity/health/visibility；Owner 无完成度门禁，显式保护命令不被 Slock 截获 |
-| 0.2 Direct 纵向合同 | missing | active | 单目标 prompt、零 planner hop、真实 cancel/retry/session |
+| 0.2 Direct 纵向合同 | complete | evidence-only | 单目标 prompt、零 planner hop、真实 cancel/retry/session |
 | 0.3 Claude CLI 模型真实性 | partial | active | argv/env 真正绑定 model/1M；失败不污染选择 |
 | 0.4 Workflow binding/reviewer | complete (`ffeb2e82`) | evidence-only | immutable RunSpec、真实 binding/reviewer；Workflow 全集 945 passed |
 | 0.5 Worktree 终态/超时/评审 | complete (`9054d221`) | evidence-only | hard timeout、cancel ack、证据 review、无部分自动 merge |
@@ -170,6 +170,34 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   as a tenant or manual delivery pass.  This task does not change recovery,
   cancel, unknown-effect, or permission-prompt behavior; their runtime/manual
   evidence remains outside this narrow catalog task.
+
+### Task 0.2 evidence
+
+- Production wiring: `SystemHandler` slash entry plus current programming-mode
+  text reaches `ProgrammingModeHandler` and `ACPSessionManager`. Scheduled
+  ACP activation now owns a request-scoped token, starts before persisting,
+  and commits tool/model/mode/snapshot through `ProjectManager` atomically.
+  Threaded `/exit` natively cancels its selected session before retirement.
+- TDD RED: a real scheduled activation wrote the requested tool/model before
+  startup. The transactional path now preserves the prior project selection on
+  failure and native threaded `/exit` cancels before session retirement.
+- GREEN: direct contracts prove failed startup leaves the full previous
+  selection intact, a stale callback cannot overwrite a later selection, a
+  released token cannot alias a later request, and no-project entry retains
+  normal activation. They also record factory/prompt topology, actual factory
+  model, cwd, manager-observed chat/project/thread key, and native thread exit.
+- Protected contracts drive real Deep and Spec factory calls through cancel and
+  resume, retaining provider/model and their existing provider-local retry
+  counts.  `benchmark_direct_lane.py --runs 20` recorded
+  `factory:codex -> prompt:codex` in all 20 samples; it has no wall-clock gate.
+- Validation: direct/protected plus SystemHandler model selection, handler,
+  ACP manager and Spec suites were `308 passed`; benchmark had 20 exact
+  `factory:codex -> prompt:codex` samples; touched-file Ruff and
+  `git diff --check` passed. Claude CLI's actual factory model is `null`.
+  Binding that selected model is a Task 0.3 prerequisite, not Task 0.2 proof.
+- Real Feishu/mobile and managed-project permission-prompt evidence:
+  `not_tested`; the recorder is a local transport boundary and this task does
+  not make a tenant or mobile-delivery claim.
 
 ## Phase A disposition
 

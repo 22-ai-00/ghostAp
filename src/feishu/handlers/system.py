@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -69,6 +70,10 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         # Keyed by f"{chat_id}:{tool_name}".
         self._pending_prompts: "OrderedDict[str, str]" = OrderedDict()
         self._PENDING_PROMPTS_MAX_SIZE = 256
+        # ACP model cards can be answered out of order.  Ownership is scoped
+        # to this handler request, never inferred from mutable project choice.
+        self._acp_activation_lock = threading.RLock()
+        self._acp_activation_tokens: dict[str, object] = {}
         self.help_commands = _SystemSubcommands(self, ("show_help", "show_full_help", "handle_help_category", "handle_menu_command"))
         self.shell_commands = _SystemSubcommands(self, ("submit_shell_command", "execute_shell_and_reply", "change_directory"))
         self.acp_commands = _SystemSubcommands(self, ("handle_acp_command", "handle_select_acp_tool", "handle_select_acp_model", "handle_refresh_acp_models", "handle_model_command"))
@@ -98,6 +103,51 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             return None
         key = self._pending_prompt_key(chat_id, tool_name)
         return self._pending_prompts.pop(key, None)
+
+    @staticmethod
+    def _acp_activation_scope(chat_id: str, project_id: Optional[str]) -> str:
+        return f"{chat_id}:{project_id or '-'}"
+
+    def _claim_acp_activation(self, chat_id: str, project_id: Optional[str]) -> tuple[str, object]:
+        scope = self._acp_activation_scope(chat_id, project_id)
+        token = object()
+        with self._acp_activation_lock:
+            self._acp_activation_tokens[scope] = token
+        return scope, token
+
+    def _owns_acp_activation(self, scope: str, token: object) -> bool:
+        with self._acp_activation_lock:
+            return self._acp_activation_tokens.get(scope) is token
+
+    def _release_acp_activation(self, scope: str, token: object) -> None:
+        with self._acp_activation_lock:
+            if self._acp_activation_tokens.get(scope) is token:
+                del self._acp_activation_tokens[scope]
+
+    def _commit_acp_activation_if_owned(
+        self,
+        scope: str,
+        token: object,
+        project: "ProjectContext",
+        *,
+        tool_name: str,
+        model_name: Optional[str],
+        session_id: str,
+        query_count: int,
+        activate_mode: bool,
+    ) -> bool:
+        """CAS the request token and project commit under one lock boundary."""
+        with self._acp_activation_lock:
+            if self._acp_activation_tokens.get(scope) is not token:
+                return False
+            return bool(self.project_manager.commit_acp_programming_activation(
+                project,
+                tool_name=tool_name,
+                model_name=model_name,
+                session_id=session_id,
+                query_count=query_count,
+                activate_mode=activate_mode,
+            ))
 
     def _init_command_registry(self):
         """Initialize the command dispatch registry."""
@@ -833,9 +883,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         thread_id: Optional[str] = None,
     ) -> bool:
         target_project = project or self.project_manager.get_active_project(chat_id)
-        if target_project:
-            target_project.acp_tool_name = tool_name
-            target_project.acp_model_name = model_name
 
         _TOOL_HANDLER_MAP = [
             ("coco",   "is_coco_mode"),
@@ -868,10 +915,14 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
                 )
             else:
                 # silent=True: model selection card already informs the user, no need for redundant "已开启" notification
-                enter_kwargs = {
-                    "project": target_project,
-                    "silent": True,
-                }
+                enter_kwargs = {"project": target_project, "silent": True}
+                if target_project is not None:
+                    enter_kwargs.update(
+                        model_override=model_name,
+                        commit_project_state=False,
+                        activate_mode=False,
+                        exit_opposite_mode=False,
+                    )
                 if thread_id is not None:
                     enter_kwargs["thread_id"] = thread_id
                 return bool(handler.enter_mode(message_id, chat_id, **enter_kwargs))
@@ -1140,6 +1191,8 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         tool_name: str,
         model_name: Optional[str],
         project: Optional["ProjectContext"] = None,
+        *,
+        run_immediately: bool = False,
     ) -> None:
         tool = (tool_name or "").strip().lower()
         use_default_model = model_name is None
@@ -1149,22 +1202,17 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             return
 
         target_project = project or self.project_manager.get_active_project(chat_id)
-        pending = self._pop_pending_prompt(chat_id, tool)
         handler = self.get_handler(tool)
-
-        if target_project:
-            target_project.acp_tool_name = tool
-            target_project.acp_model_name = model
-            if tool in {"coco", "claude", "aiden", "codex", "gemini", "traex"}:
-                setattr(target_project, f"{tool}_session_snapshot", None)
-        if handler and hasattr(handler, "current_model"):
-            handler.current_model = model
 
         from ...thread import get_current_thread_id
 
         raw_thread_id = get_current_thread_id()
         thread_root_id = raw_thread_id.strip() if isinstance(raw_thread_id, str) and raw_thread_id.strip() else None
         project_id = self._project_id(target_project)
+        activation_scope, activation_token = self._claim_acp_activation(
+            chat_id,
+            project_id,
+        )
         _, initializing_card = CardBuilder.build_acp_programming_initializing_card(
             tool,
             model,
@@ -1183,8 +1231,8 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             priority=TaskPriority.HIGH,
         )
 
-        def _run_activation(_ctx) -> bool:
-            if not self._is_current_acp_selection(target_project, tool, model):
+        def _run_activation_impl(_ctx) -> bool:
+            if not self._owns_acp_activation(activation_scope, activation_token):
                 logger.info(
                     "[ACP] skip stale model activation chat=%s project=%s tool=%s model=%s",
                     chat_id,
@@ -1192,8 +1240,20 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
                     tool,
                     model or "<default>",
                 )
+                self._release_acp_activation(activation_scope, activation_token)
                 return False
 
+            previous_handler_model = (
+                handler.current_model
+                if handler and hasattr(handler, "current_model")
+                else None
+            )
+            if handler and hasattr(handler, "current_model"):
+                # ``enter_mode`` receives the same explicit override.  This
+                # assignment keeps existing handler display/context behavior
+                # while the explicit input prevents a later selection from
+                # changing an already-running callback's startup model.
+                handler.current_model = model
             try:
                 entered = self._enter_mode_with_acp_model(
                     message_id,
@@ -1217,10 +1277,13 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
 
             # A later selection owns the card and project state. Never let this
             # older task overwrite it or forward a prompt under the wrong model.
-            if not self._is_current_acp_selection(target_project, tool, model):
+            if not self._owns_acp_activation(activation_scope, activation_token):
+                self._release_acp_activation(activation_scope, activation_token)
                 return False
 
             if not entered:
+                if handler and hasattr(handler, "current_model"):
+                    handler.current_model = previous_handler_model
                 _, failed_card = CardBuilder.build_acp_programming_failed_card(
                     tool,
                     model,
@@ -1229,7 +1292,50 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
                     thread_root_id=thread_root_id,
                 )
                 self.update_card(message_id, failed_card)
+                self._release_acp_activation(activation_scope, activation_token)
                 return False
+
+            if target_project:
+                manager = getattr(handler, "_get_session_manager", lambda: None)()
+                session = manager.get_session(
+                    chat_id,
+                    project_id=project_id,
+                    thread_id=thread_root_id,
+                ) if manager else None
+                if session is None:
+                    if handler and hasattr(handler, "current_model"):
+                        handler.current_model = previous_handler_model
+                    self._release_acp_activation(activation_scope, activation_token)
+                    return False
+                try:
+                    committed = self._commit_acp_activation_if_owned(
+                        activation_scope,
+                        activation_token,
+                        target_project,
+                        tool_name=tool,
+                        model_name=model,
+                        session_id=session.session_id,
+                        query_count=session.message_count,
+                        activate_mode=thread_root_id is None,
+                    )
+                except Exception:
+                    self._release_acp_activation(activation_scope, activation_token)
+                    raise
+                if not committed:
+                    if handler and hasattr(handler, "current_model"):
+                        handler.current_model = previous_handler_model
+                    self._release_acp_activation(activation_scope, activation_token)
+                    return False
+                if not thread_root_id:
+                    # Preserve the normal successful-switch cleanup only after
+                    # the project selection is durably committed.
+                    handler._exit_opposite_mode(
+                        message_id,
+                        chat_id,
+                        project=target_project,
+                        silent=True,
+                    )
+                    handler._enter_mode_on_manager(chat_id, project_id=project_id)
 
             _, ready_card = CardBuilder.build_acp_programming_ready_card(
                 tool,
@@ -1242,6 +1348,7 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             # Project-chat selection may carry the user's first requirement.
             # The activation task owns the popped value and forwards it once,
             # only after the selected session is actually ready.
+            pending = self._pop_pending_prompt(chat_id, tool)
             if pending and handler and hasattr(handler, "handle_message"):
                 try:
                     handler.handle_message(
@@ -1252,7 +1359,18 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
                     )
                 except Exception:
                     logger.exception("forwarding pending prompt failed after ACP activation")
+            self._release_acp_activation(activation_scope, activation_token)
             return True
+
+        def _run_activation(_ctx) -> bool:
+            try:
+                return _run_activation_impl(_ctx)
+            finally:
+                self._release_acp_activation(activation_scope, activation_token)
+
+        if run_immediately:
+            _run_activation(None)
+            return
 
         try:
             self.scheduler.submit(spec, _run_activation)
@@ -1271,20 +1389,7 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
                 thread_root_id=thread_root_id,
             )
             self.update_card(message_id, failed_card)
-
-    @staticmethod
-    def _is_current_acp_selection(
-        project: Optional["ProjectContext"],
-        tool_name: str,
-        model_name: Optional[str],
-    ) -> bool:
-        """Return whether an activation task still owns the project selection."""
-        if project is None:
-            return True
-        current_tool = str(getattr(project, "acp_tool_name", "") or "").strip().lower()
-        current_model_value = getattr(project, "acp_model_name", None)
-        current_model = str(current_model_value).strip() if current_model_value is not None else None
-        return current_tool == tool_name and current_model == model_name
+            self._release_acp_activation(activation_scope, activation_token)
 
     # ------------------------------------------------------------------
     # /model command — list/switch models for current ACP tool
@@ -1376,7 +1481,14 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             )
             return
 
-        self._enter_mode_with_acp_model(message_id, chat_id, tool_name, model_name, project)
+        self.handle_select_acp_model(
+            message_id,
+            chat_id,
+            tool_name,
+            model_name,
+            project,
+            run_immediately=True,
+        )
 
     # ------------------------------------------------------------------
     # Exit current mode

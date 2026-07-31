@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from ...project import ProjectContext
 
 logger = logging.getLogger(__name__)
+_MODEL_OVERRIDE_UNSET = object()
 
 
 def _append_execution_notice(text: str, notice: str) -> str:
@@ -399,6 +400,11 @@ class ProgrammingModeHandler(BaseHandler):
     def enter_mode(
         self, message_id: str, chat_id: str, silent: bool = False, project: Optional["ProjectContext"] = None,
         thread_id: Optional[str] = None,
+        *,
+        model_override: object = _MODEL_OVERRIDE_UNSET,
+        commit_project_state: bool = True,
+        activate_mode: bool = True,
+        exit_opposite_mode: bool = True,
     ) -> bool:
         from ...thread import get_current_thread_id
 
@@ -438,7 +444,11 @@ class ProgrammingModeHandler(BaseHandler):
 
         previous_mode = self.mode_manager.get_mode(chat_id, project_id=project_id)
 
-        if not thread_id and self._is_in_opposite_mode(chat_id, project_id=project_id):
+        if (
+            exit_opposite_mode
+            and not thread_id
+            and self._is_in_opposite_mode(chat_id, project_id=project_id)
+        ):
             self._exit_opposite_mode(message_id, chat_id, project=project, silent=True)
 
         if not project:
@@ -469,7 +479,11 @@ class ProgrammingModeHandler(BaseHandler):
 
         try:
             agent_type_override = self._get_agent_type_override(project)
-            model_name = self._get_model_name_override(project)
+            model_name = (
+                self._get_model_name_override(project)
+                if model_override is _MODEL_OVERRIDE_UNSET
+                else model_override
+            )
             if snapshot and snapshot.is_resumable and not thread_id:
                 if model_name:
                     snapshot = None
@@ -620,7 +634,7 @@ class ProgrammingModeHandler(BaseHandler):
         if is_ttadk_degraded:
             return False
 
-        if not thread_id:
+        if activate_mode and not thread_id:
             self._enter_mode_on_manager(chat_id, project_id=project_id)
         self.add_reaction(message_id, EmojiReaction.on_coco_enter())
 
@@ -628,11 +642,11 @@ class ProgrammingModeHandler(BaseHandler):
         # clear the stale snapshot so we don't retry on next entry.
         if target_session_id and not session.is_resumed:
             snapshot = None
-            if project:
+            if project and commit_project_state:
                 self._clear_snapshot_on_project(project)
 
         if project and snapshot and snapshot.is_resumable:
-            if not thread_id:
+            if not thread_id and commit_project_state:
                 self._deactivate_other_project_modes(project)
                 self._set_mode_on_project(project, True, snapshot.session_id, snapshot.query_count)
             if not silent:
@@ -654,7 +668,7 @@ class ProgrammingModeHandler(BaseHandler):
                 if response_id:
                     self.register_message_project(response_id, project)
         elif project:
-            if not thread_id:
+            if not thread_id and commit_project_state:
                 self._deactivate_other_project_modes(project)
                 self._set_mode_on_project(project, True, session.session_id)
             if not silent:
@@ -684,7 +698,7 @@ class ProgrammingModeHandler(BaseHandler):
                         UI_TEXT["mode_enter_no_project_msg"].format(emoji=self.mode_emoji, name=self.mode_name),
                     )
 
-        if project:
+        if project and commit_project_state:
             self.record_mode_transition(
                 project.project_id,
                 previous_mode,
@@ -876,7 +890,17 @@ class ProgrammingModeHandler(BaseHandler):
             self.mode_manager.exit_to_smart(chat_id, project_id=project_id)
 
         try:
-            has_session = self._get_session_manager().end_session(chat_id, project_id=project_id, thread_id=thread_id)
+            manager = self._get_session_manager()
+            if session:
+                # Ask the live backend to stop before retiring its transport.
+                # ``end_session`` still owns close/removal and is deliberately
+                # not replaced by cancellation.
+                manager.cancel_session(
+                    chat_id,
+                    project_id=project_id,
+                    thread_id=thread_id,
+                )
+            has_session = manager.end_session(chat_id, project_id=project_id, thread_id=thread_id)
             if silent:
                 # Silent mode: skip all user-facing messages (used for automatic mode switching)
                 if has_session or is_pending_slot or is_mode_only_exit:

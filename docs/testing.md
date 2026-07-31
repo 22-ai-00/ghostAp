@@ -23,6 +23,16 @@ uv run python scripts/test_inventory.py tests/
 
 `slow` 不是跳过标签。验证真实超时、跨进程故障、断线重放、ACK 边界或外部运行时的测试仍是发布门禁，只是不应阻塞每次本地快速反馈。预计超过 1 秒且确实依赖真实等待/进程的测试应标记 `slow`；能用 Event、假时钟或注入超时值稳定验证的，优先消除真实等待。
 
+## 执行通道纵向合同
+
+`tests/contracts/test_direct_programming_lane.py` 从显式 Slash 命令或当前 programming mode 一直覆盖到真实 session-manager/factory 请求。测试侧 recorder 只替换进程/远端传输边界，并记录 backend、实际 factory model、cwd、chat/project/thread session key、tool filter 与 prompt；它不以 mocks 重建路由。显式 Direct 请求的准入是一个目标 factory 加一个目标 prompt，且没有 classifier、planner、reviewer 或 coordinator 调用。
+
+`tests/contracts/test_protected_execution_lanes.py` 固定 Deep/Spec 的 provider/model、
+同 session 的真实首尝试超时后重试、factory 与 process-local pause/resume 路径。
+它不宣称 durable recovery，也不要求两条引擎改为同一内部算法。
+
+运行 `uv run python scripts/benchmark_direct_lane.py --runs 20` 会输出 Direct 远端调用拓扑分布。它只拒绝多出的 factory/prompt hop，不设置墙钟毫秒阈值；本地调度、CPU 与缓存差异不应改变该合同。当前 Claude CLI 的实际 factory model 记录为 `null`，是 Task 0.3 需要收紧的既知事实，不得在此合同中伪装成已绑定模型。
+
 ## 准入与删减规则
 
 | 类别 | 决策 | 例子 |

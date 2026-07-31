@@ -168,6 +168,38 @@ class ProjectManager:
                 return False
             return self._save_projects()
 
+    def commit_acp_programming_activation(
+        self,
+        project: ProjectContext,
+        *,
+        tool_name: str,
+        model_name: Optional[str],
+        session_id: str,
+        query_count: int = 0,
+        activate_mode: bool = True,
+    ) -> bool:
+        """Persist one successful ACP selection and its project-mode snapshot.
+
+        Startup runs before this method.  Therefore an unavailable backend, a
+        rejected scheduler task, or a stale selection cannot partially replace
+        the prior tool, model, mode flags, or resumable snapshot.
+        """
+        with self._lock:
+            if self._projects.get(project.project_id) is not project:
+                return False
+            previous = project.commit_acp_programming_activation(
+                tool_name,
+                tool_name,
+                model_name,
+                session_id,
+                query_count,
+                activate_mode,
+            )
+            if self._save_projects():
+                return True
+            project.restore_acp_programming_activation(previous)
+            return False
+
     @staticmethod
     def _is_visible(ctx: ProjectContext, chat_id: Optional[str]) -> bool:
         """Check if a project is visible to the given chat_id.

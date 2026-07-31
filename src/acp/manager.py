@@ -1010,6 +1010,31 @@ class ACPSessionManager:
                     return current
         return session
 
+    def cancel_session(
+        self,
+        chat_id: str,
+        *,
+        project_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        wait: bool = False,
+        timeout: float = 2.0,
+    ) -> bool:
+        """Cancel the currently selected session without changing mode state.
+
+        This is intentionally narrower than ``end_session``: the caller keeps
+        the session routing key and lifecycle ownership while the underlying
+        transport receives its native cancellation request.
+        """
+        session = self.get_session(
+            chat_id,
+            project_id=project_id,
+            thread_id=thread_id,
+        )
+        if session is None:
+            return False
+        result = session.cancel(wait=wait, timeout=timeout)
+        return result is not False
+
     def _end_session_unlocked(self, key: str, *, remove_key_lock: bool = False) -> Optional[dict]:
         """End a session without acquiring lock (caller must hold _lock)."""
         if key in self._sessions:

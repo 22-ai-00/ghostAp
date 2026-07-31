@@ -330,18 +330,32 @@ class TestHandleSelectAcpModelPendingPrompt(unittest.TestCase):
         assert len(submitted) == 1
         return submitted[0][1](MagicMock())
 
+    def test_activation_exception_releases_request_token(self):
+        submitted = self._capture_activation()
+        project = MagicMock()
+        project.project_id = "ghostap"
+        codex = self.handler.get_handler("codex")
+        codex.enter_mode.return_value = True
+        self.handler.project_manager.commit_acp_programming_activation.side_effect = RuntimeError("disk")
+
+        self.handler.handle_select_acp_model("msg", "chat1", "codex", "gpt", project)
+
+        with self.assertRaisesRegex(RuntimeError, "disk"):
+            self._run_activation(submitted)
+        self.assertEqual(self.handler._acp_activation_tokens, {})
+
     def test_default_model_selection_does_not_store_fixed_model(self):
         self.handler.settings.thread_programming_enabled = False
         submitted = self._capture_activation()
         project = MagicMock()
         project.project_id = "ghostap"
         codex_handler = self.handler.get_handler("codex")
+        codex_handler.current_model = None
         codex_handler.enter_mode.return_value = True
 
         self.handler.handle_select_acp_model("msg1", "chat1", "codex", None, project)
 
-        self.assertEqual(project.acp_tool_name, "codex")
-        self.assertIsNone(project.acp_model_name)
+        self.assertNotEqual(project.acp_tool_name, "codex")
         self.assertIsNone(codex_handler.current_model)
         codex_handler.enter_mode.assert_not_called()
         self.assertEqual(submitted[0][0].task_type, "acp_model_activation")
@@ -352,8 +366,16 @@ class TestHandleSelectAcpModelPendingPrompt(unittest.TestCase):
         self._run_activation(submitted)
 
         codex_handler.enter_mode.assert_called_once_with(
-            "msg1", "chat1", project=project, silent=True
+            "msg1",
+            "chat1",
+            project=project,
+            silent=True,
+            model_override=None,
+            commit_project_state=False,
+            activate_mode=False,
+            exit_opposite_mode=False,
         )
+        self.handler.project_manager.commit_acp_programming_activation.assert_called_once()
         ready_card = json.loads(self.handler.update_card.call_args_list[-1].args[1])
         self.assertIn("编程模式已就绪", ready_card["header"]["title"]["content"])
         self.assertIn("使用默认模型", json.dumps(ready_card, ensure_ascii=False))
@@ -364,26 +386,33 @@ class TestHandleSelectAcpModelPendingPrompt(unittest.TestCase):
         project = MagicMock()
         project.project_id = "ghostap"
         traex_handler = self.handler.get_handler("traex")
+        traex_handler.current_model = None
         traex_handler.enter_mode.return_value = True
 
         self.handler.handle_select_acp_model("msg1", "chat1", "traex", None, project)
 
-        self.assertEqual(project.acp_tool_name, "traex")
-        self.assertIsNone(project.acp_model_name)
+        self.assertNotEqual(project.acp_tool_name, "traex")
         self.assertIsNone(traex_handler.current_model)
         traex_handler.enter_mode.assert_not_called()
 
         self._run_activation(submitted)
 
         traex_handler.enter_mode.assert_called_once_with(
-            "msg1", "chat1", project=project, silent=True
+            "msg1",
+            "chat1",
+            project=project,
+            silent=True,
+            model_override=None,
+            commit_project_state=False,
+            activate_mode=False,
+            exit_opposite_mode=False,
         )
         self.assertIn(
             "编程模式已就绪",
             json.loads(self.handler.update_card.call_args_list[-1].args[1])["header"]["title"]["content"],
         )
 
-    def test_default_model_selection_clears_stale_tool_snapshot(self):
+    def test_default_model_selection_keeps_stale_snapshot_until_startup_succeeds(self):
         self._capture_activation()
         project = SimpleNamespace(
             project_id="ghostap",
@@ -399,7 +428,7 @@ class TestHandleSelectAcpModelPendingPrompt(unittest.TestCase):
 
         self.handler.handle_select_acp_model("msg1", "chat1", "coco", None, project)
 
-        self.assertIsNone(project.coco_session_snapshot)
+        self.assertIsNotNone(project.coco_session_snapshot)
 
     def test_model_selection_patches_model_card_to_ready_state(self):
         submitted = self._capture_activation()
@@ -446,6 +475,10 @@ class TestHandleSelectAcpModelPendingPrompt(unittest.TestCase):
             "chat1",
             project=project,
             silent=True,
+            model_override="gpt-5.2",
+            commit_project_state=False,
+            activate_mode=False,
+            exit_opposite_mode=False,
         )
         coco_handler.handle_message.assert_called_once_with(
             "msg1",
@@ -483,6 +516,10 @@ class TestHandleSelectAcpModelPendingPrompt(unittest.TestCase):
             "chat1",
             project=project,
             silent=True,
+            model_override="doubao",
+            commit_project_state=False,
+            activate_mode=False,
+            exit_opposite_mode=False,
             thread_id="existing_thread",
         )
         coco_handler.handle_message.assert_called_once_with(
@@ -578,9 +615,9 @@ class TestHandleSelectAcpModelPendingPrompt(unittest.TestCase):
 
         with patch.object(self.handler, "_enter_mode_with_acp_model") as enter:
             self.handler.handle_select_acp_model("card1", "chat1", "codex", "old", project)
-            project.acp_model_name = "new"
+            self.handler.handle_select_acp_model("card2", "chat1", "codex", "new", project)
             update_count = self.handler.update_card.call_count
-            result = self._run_activation(submitted)
+            result = submitted[0][1](MagicMock())
 
         assert result is False
         enter.assert_not_called()

@@ -301,6 +301,65 @@ class ProjectContext:
             setattr(self, snap_attr, None)
             return True
 
+    def commit_acp_programming_activation(
+        self,
+        mode_type: str,
+        tool_name: str,
+        model_name: Optional[str],
+        session_id: str,
+        query_count: int = 0,
+        activate_mode: bool = True,
+    ) -> dict[str, object]:
+        """Atomically select an ACP backend and activate its project mode.
+
+        The returned state is private rollback data for ``ProjectManager`` if
+        persistence fails.  Callers must hold the manager lock before invoking
+        this method so a persisted activation cannot interleave with another
+        project-wide commit.
+        """
+        if mode_type not in self._MODE_ATTRS:
+            raise ValueError(f"unsupported programming mode: {mode_type}")
+        with self._chat_lock:
+            previous = {
+                "acp_tool_name": self.acp_tool_name,
+                "acp_model_name": self.acp_model_name,
+                "last_active": self.last_active,
+                "modes": {
+                    name: (getattr(self, flag), getattr(self, snapshot))
+                    for name, (flag, snapshot) in self._MODE_ATTRS.items()
+                },
+            }
+            if activate_mode:
+                for flag, _snapshot in self._MODE_ATTRS.values():
+                    setattr(self, flag, False)
+                mode_flag, snapshot_attr = self._MODE_ATTRS[mode_type]
+                setattr(self, mode_flag, True)
+                setattr(
+                    self,
+                    snapshot_attr,
+                    SessionSnapshot(
+                        session_id=session_id,
+                        query_count=query_count,
+                        last_query="",
+                        is_resumable=True,
+                    ),
+                )
+            self.acp_tool_name = tool_name
+            self.acp_model_name = model_name
+            self.touch()
+            return previous
+
+    def restore_acp_programming_activation(self, previous: dict[str, object]) -> None:
+        """Restore rollback data from a failed persisted ACP activation."""
+        with self._chat_lock:
+            self.acp_tool_name = previous["acp_tool_name"]  # type: ignore[assignment]
+            self.acp_model_name = previous["acp_model_name"]  # type: ignore[assignment]
+            self.last_active = float(previous["last_active"])
+            for name, (mode_flag, snapshot_attr) in self._MODE_ATTRS.items():
+                enabled, snapshot = previous["modes"][name]  # type: ignore[index]
+                setattr(self, mode_flag, enabled)
+                setattr(self, snapshot_attr, snapshot)
+
     # ── Backward-compatible delegates ──
 
     def set_coco_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
