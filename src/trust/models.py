@@ -45,6 +45,12 @@ class ActionDecision(StrEnum):
     DENY = "deny"
 
 
+class TriggerControlScope(StrEnum):
+    DRAFT = "draft"
+    CURRENT_RUN = "current_run"
+    PERMANENT = "permanent"
+
+
 class ManagedGroupStatus(StrEnum):
     ACTIVE = "active"
     TOMBSTONED = "tombstoned"
@@ -120,6 +126,7 @@ class ActionRequest:
     backend_binding_id: str | None = None
     connected_target_ref: str | None = None
     owner_explicit: bool = False
+    trigger_control_scope: TriggerControlScope | None = None
     employee_assignment: EmployeeAssignment | None = None
     employee_causal_context: EmployeeCausalContext | None = None
 
@@ -132,3 +139,13 @@ class ActionRequest:
             raise TypeError("target must be a runtime-confirmed ActionTargetKind")
         if not isinstance(self.owner_explicit, bool):
             raise TypeError("owner_explicit must be bool")
+        if (
+            self.trigger_control_scope is not None
+            and not isinstance(
+                self.trigger_control_scope,
+                TriggerControlScope,
+            )
+        ):
+            raise TypeError(
+                "trigger_control_scope must be TriggerControlScope"
+            )

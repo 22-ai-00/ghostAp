@@ -12,6 +12,7 @@ from .models import (
     EmployeeAssignment,
     EmployeeCausalContext,
     ProjectGrant,
+    TriggerControlScope,
     TrustZone,
 )
 
@@ -20,7 +21,6 @@ _PROJECT_ACTIONS = frozenset(
         ActionKind.PROJECT_READ,
         ActionKind.PROJECT_WRITE,
         ActionKind.LOCAL_GIT,
-        ActionKind.TRIGGER_CONTROL,
     }
 )
 _OWNER_P2P_ACTIONS = frozenset(
@@ -55,6 +55,24 @@ class ActionMatrix:
     @staticmethod
     def _decide_owner_p2p(request: ActionRequest) -> ActionDecision:
         if (
+            request.action in _PROJECT_ACTIONS
+            and request.target is ActionTargetKind.CURRENT_PROJECT
+        ):
+            return ActionDecision.ALLOW
+        if (
+            request.action is ActionKind.PROJECT_TOOL
+            and request.target is ActionTargetKind.CURRENT_PROJECT
+            and bool(request.canonical_root_ref)
+            and bool(request.backend_binding_id)
+        ):
+            return ActionDecision.ALLOW
+        if (
+            request.action is ActionKind.TRIGGER_CONTROL
+            and request.target is ActionTargetKind.CURRENT_PROJECT
+            and request.trigger_control_scope is not None
+        ):
+            return ActionDecision.ALLOW
+        if (
             request.action in _OWNER_P2P_ACTIONS
             and request.target is ActionTargetKind.HOST_GLOBAL
         ):
@@ -77,6 +95,21 @@ class ActionMatrix:
                 request.target is ActionTargetKind.CURRENT_PROJECT
                 and request.canonical_root_ref == grant.canonical_root_ref
             ):
+                return ActionDecision.ALLOW
+            return ActionDecision.DENY
+        if request.action is ActionKind.TRIGGER_CONTROL:
+            if (
+                request.target is not ActionTargetKind.CURRENT_PROJECT
+                or request.canonical_root_ref != grant.canonical_root_ref
+                or request.trigger_control_scope is None
+            ):
+                return ActionDecision.DENY
+            if request.trust.actor is ActorKind.OWNER:
+                return ActionDecision.ALLOW
+            if request.trigger_control_scope in {
+                TriggerControlScope.DRAFT,
+                TriggerControlScope.CURRENT_RUN,
+            }:
                 return ActionDecision.ALLOW
             return ActionDecision.DENY
         if request.action is ActionKind.PROJECT_TOOL:

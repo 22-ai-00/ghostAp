@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from src.trust import models as trust_models
 from src.trust.action_matrix import ActionMatrix, can_dispatch
 from src.trust.models import (
     ActionDecision,
@@ -18,6 +19,7 @@ from src.trust.models import (
     ManagedGroupRecord,
     ManagedGroupStatus,
     ProjectGrant,
+    TriggerControlScope,
     TrustZone,
 )
 
@@ -125,7 +127,6 @@ def test_action_matrix_has_only_allow_or_deny_never_ask() -> None:
         ActionKind.PROJECT_READ,
         ActionKind.PROJECT_WRITE,
         ActionKind.LOCAL_GIT,
-        ActionKind.TRIGGER_CONTROL,
     ],
 )
 def test_managed_project_actions_need_no_approval(action: ActionKind) -> None:
@@ -151,6 +152,162 @@ def test_configured_managed_project_tool_is_allowed() -> None:
     )
 
     assert decision is ActionDecision.ALLOW
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        ActionKind.PROJECT_READ,
+        ActionKind.PROJECT_WRITE,
+        ActionKind.LOCAL_GIT,
+    ],
+)
+def test_owner_p2p_current_project_actions_are_zero_prompt(
+    action: ActionKind,
+) -> None:
+    decision = ActionMatrix().decide(
+        ActionRequest(
+            trust=_owner_p2p(),
+            action=action,
+            target=ActionTargetKind.CURRENT_PROJECT,
+            canonical_root_ref="/work/project-1",
+        )
+    )
+
+    assert decision is ActionDecision.ALLOW
+
+
+def test_owner_p2p_project_tool_requires_resolved_project_and_backend() -> None:
+    matrix = ActionMatrix()
+
+    resolved = matrix.decide(
+        ActionRequest(
+            trust=_owner_p2p(),
+            action=ActionKind.PROJECT_TOOL,
+            target=ActionTargetKind.CURRENT_PROJECT,
+            canonical_root_ref="/work/project-1",
+            backend_binding_id="codex-main",
+        )
+    )
+    missing_root = matrix.decide(
+        ActionRequest(
+            trust=_owner_p2p(),
+            action=ActionKind.PROJECT_TOOL,
+            target=ActionTargetKind.CURRENT_PROJECT,
+            backend_binding_id="codex-main",
+        )
+    )
+    missing_backend = matrix.decide(
+        ActionRequest(
+            trust=_owner_p2p(),
+            action=ActionKind.PROJECT_TOOL,
+            target=ActionTargetKind.CURRENT_PROJECT,
+            canonical_root_ref="/work/project-1",
+        )
+    )
+
+    assert resolved is ActionDecision.ALLOW
+    assert missing_root is ActionDecision.DENY
+    assert missing_backend is ActionDecision.DENY
+
+
+def test_trigger_control_scope_is_typed_without_approval_state() -> None:
+    scope_type = getattr(trust_models, "TriggerControlScope", None)
+
+    assert scope_type is not None
+    assert {scope.value for scope in scope_type} == {
+        "draft",
+        "current_run",
+        "permanent",
+    }
+
+
+@pytest.mark.parametrize("scope", list(TriggerControlScope))
+def test_owner_p2p_can_control_current_project_triggers(
+    scope: TriggerControlScope,
+) -> None:
+    decision = ActionMatrix().decide(
+        ActionRequest(
+            trust=_owner_p2p(),
+            action=ActionKind.TRIGGER_CONTROL,
+            target=ActionTargetKind.CURRENT_PROJECT,
+            canonical_root_ref="/work/project-1",
+            trigger_control_scope=scope,
+        )
+    )
+
+    assert decision is ActionDecision.ALLOW
+
+
+def test_managed_owner_can_manage_permanent_trigger() -> None:
+    decision = ActionMatrix().decide(
+        _request(
+            ActionKind.TRIGGER_CONTROL,
+            ActionTargetKind.CURRENT_PROJECT,
+            canonical_root_ref="/work/project-1",
+            trigger_control_scope=TriggerControlScope.PERMANENT,
+        )
+    )
+
+    assert decision is ActionDecision.ALLOW
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [TriggerControlScope.DRAFT, TriggerControlScope.CURRENT_RUN],
+)
+def test_employee_trigger_control_is_limited_to_assigned_work(
+    scope: TriggerControlScope,
+) -> None:
+    decision = ActionMatrix().decide(
+        _request(
+            ActionKind.TRIGGER_CONTROL,
+            ActionTargetKind.CURRENT_PROJECT,
+            trust=_trust(ActorKind.EMPLOYEE),
+            canonical_root_ref="/work/project-1",
+            trigger_control_scope=scope,
+            employee_assignment=EmployeeAssignment(
+                run_id="run-1",
+                assignment_id="assignment-1",
+            ),
+            employee_causal_context=EmployeeCausalContext(
+                run_id="run-1",
+                assignment_id="assignment-1",
+                causal_event_id="event-1",
+            ),
+        )
+    )
+
+    assert decision is ActionDecision.ALLOW
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [TriggerControlScope.PERMANENT, None],
+)
+def test_employee_cannot_manage_permanent_or_unscoped_triggers(
+    scope: TriggerControlScope | None,
+) -> None:
+    decision = ActionMatrix().decide(
+        _request(
+            ActionKind.TRIGGER_CONTROL,
+            ActionTargetKind.CURRENT_PROJECT,
+            trust=_trust(ActorKind.EMPLOYEE),
+            canonical_root_ref="/work/project-1",
+            trigger_control_scope=scope,
+            employee_assignment=EmployeeAssignment(
+                run_id="run-1",
+                assignment_id="assignment-1",
+            ),
+            employee_causal_context=EmployeeCausalContext(
+                run_id="run-1",
+                assignment_id="assignment-1",
+                causal_event_id="event-1",
+            ),
+        )
+    )
+
+    assert decision is ActionDecision.DENY
 
 
 def test_owner_explicit_external_action_in_managed_group_is_not_reconfirmed() -> None:
