@@ -62,6 +62,12 @@ def mock_ws_client(tmp_path: Path):
 
         client = FeishuWSClient(message_callback=dummy_callback)
 
+        # This fixture exercises the legacy downstream router in isolation.
+        # Production startup performs durable recovery before opening WS, and
+        # a real Registry is covered by managed-group ingress tests.
+        client._recover_employee_runtime_after_handler_binding()
+        client._managed_group_registry = None
+
         # Patch the intent recognizer dynamically for tests
         client._intent_recognizer = MagicMock()
 

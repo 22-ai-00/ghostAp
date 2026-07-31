@@ -355,6 +355,20 @@ class ManagedGroupRegistry:
                 return None
             return self._grants.get(record.project_grant_id)
 
+    def trust_snapshot(
+        self,
+        chat_id: str,
+    ) -> tuple[ManagedGroupRecord | None, ProjectGrant | None]:
+        """Read one current group/grant pair in a single disk transaction."""
+
+        with self._disk_transaction():
+            if self._commit_uncertain or chat_id in self._revokes:
+                return None, None
+            record = self._records.get(chat_id)
+            if record is None or record.status is not ManagedGroupStatus.ACTIVE:
+                return None, None
+            return record, self._grants.get(record.project_grant_id)
+
     def begin_provision(
         self,
         *,

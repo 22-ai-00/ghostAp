@@ -91,6 +91,7 @@ def try_passive_activation(
     get_chat_lock_fn: Any,
     slock_handler: _SlockHandlerLike,
     card_sender: _CardSenderLike,
+    effective_trust: Any = None,
 ) -> tuple[bool, str]:
     """Attempt passive slock activation for an unmanaged chat.
 
@@ -134,7 +135,12 @@ def try_passive_activation(
     # Permission and rate-limit gate
     guard = get_activation_guard()
     sender_id = get_current_sender_id() or ""
-    allowed, reason = guard.can_auto_activate(sender_id, chat_id, settings)
+    allowed, reason = guard.can_auto_activate(
+        sender_id,
+        chat_id,
+        settings,
+        effective_trust=effective_trust,
+    )
     if not allowed:
         logger.debug(
             "Auto-activate blocked by guard for user=%s chat=%s: reason=%s",

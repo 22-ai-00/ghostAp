@@ -17,6 +17,9 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Callable, Mapping, Protocol
 
+from ...trust.models import TrustZone
+from ...trust.registry import ManagedGroupRegistry
+from ...trust.resolver import TrustZoneResolver
 from ..context.models import AuthorizedContextRequest
 from ..domain import EmployeeState, WorkerType
 from ..journal.blob_store import BlobRef
@@ -611,6 +614,9 @@ class DurableEmployeeIngressRouter:
         context_retry_max_seconds: float = 30.0,
         clock: Callable[[], datetime] | None = None,
         requester_principal_resolver: Callable[..., str | None] | None = None,
+        managed_group_registry_provider: Callable[[], ManagedGroupRegistry] | None = None,
+        managed_group_owner_id: str = "",
+        employee_bot_ids_provider: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         if not isinstance(writer, JournalWriter):
             raise TypeError("writer must be JournalWriter")
@@ -626,6 +632,14 @@ class DurableEmployeeIngressRouter:
             requester_principal_resolver
         ):
             raise TypeError("requester_principal_resolver is invalid")
+        if managed_group_registry_provider is not None and not callable(
+            managed_group_registry_provider
+        ):
+            raise TypeError("managed_group_registry_provider is invalid")
+        if employee_bot_ids_provider is not None and not callable(
+            employee_bot_ids_provider
+        ):
+            raise TypeError("employee_bot_ids_provider is invalid")
         if not callable(getattr(membership_health, "is_degraded", None)):
             raise TypeError("membership_health is invalid")
         # Reuse the request contract for strict trusted reserve validation.
@@ -654,6 +668,9 @@ class DurableEmployeeIngressRouter:
         self._requester_principal_resolver = (
             requester_principal_resolver or _same_app_requester_principal
         )
+        self._managed_group_registry_provider = managed_group_registry_provider
+        self._managed_group_owner_id = managed_group_owner_id
+        self._employee_bot_ids_provider = employee_bot_ids_provider
         self._limits = queue_limits
         self._attachment_staging = attachment_staging
         self._membership_health = membership_health
@@ -1526,6 +1543,42 @@ class DurableEmployeeIngressRouter:
         )
         if not remote_chat_id:
             return None, "sender_invalid"
+        if self._managed_group_registry_provider is not None:
+            try:
+                managed_registry = self._managed_group_registry_provider()
+                if type(managed_registry) is not ManagedGroupRegistry:
+                    return None, "authority_denied"
+                employee_bot_ids = (
+                    self._employee_bot_ids_provider()
+                    if self._employee_bot_ids_provider is not None
+                    else frozenset()
+                )
+                if type(employee_bot_ids) is not frozenset:
+                    return None, "authority_denied"
+                sender_id = part.get("sender_id")
+                if not isinstance(sender_id, str) or not sender_id:
+                    return None, "sender_invalid"
+                managed_group, project_grant = managed_registry.trust_snapshot(
+                    remote_chat_id
+                )
+                trust = TrustZoneResolver(
+                    owner_id=self._managed_group_owner_id,
+                    managed_groups=(
+                        () if managed_group is None else (managed_group,)
+                    ),
+                    project_grants=(
+                        () if project_grant is None else (project_grant,)
+                    ),
+                    employee_bot_ids=employee_bot_ids,
+                ).resolve(
+                    sender_id=sender_id,
+                    chat_id=remote_chat_id,
+                    chat_type=str(part.get("chat_type") or "group"),
+                )
+                if trust.zone is not TrustZone.MANAGED_AGENT_GROUP:
+                    return None, "authority_denied"
+            except Exception:
+                return None, "authority_denied"
         try:
             registry = self._registry_provider()
             if type(registry) is not ProjectedAgentRegistry:

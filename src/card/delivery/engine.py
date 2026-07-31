@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import re
 import threading
+from collections.abc import Callable
 
 from src.card.delivery.binding import BindingStore, PageBinding
 from src.card.delivery.lock_pool import SessionLockPool
@@ -58,12 +59,14 @@ class CardDelivery:
         session_lock_ttl: float = 600.0,
         eviction_interval: float = 30.0,
         registry: "DeliveryRegistry | None" = None,
+        payload_transform: Callable[[str, dict], dict] | None = None,
     ) -> None:
         self._client = client
         self._bindings = BindingStore()
         self._sequences = SequenceManager()
         self._closed_sessions = TTLSet(ttl=3600.0, max_size=50_000)
         self._mutator = PageMutator(client, self._bindings, self._sequences)
+        self._payload_transform = payload_transform
 
         # Delegate lock pool management
         self._lock_pool = SessionLockPool(
@@ -196,6 +199,11 @@ class CardDelivery:
         binding = self._bindings.get(session_id)
         outcomes: list[MutationOutcome] = []
         ordered = sorted(rendered, key=lambda card: card.page_index)
+        if self._payload_transform is not None:
+            ordered = [
+                self._transform_rendered_payload(chat_id, card)
+                for card in ordered
+            ]
         if not ordered:
             return outcomes
         latest_rendered_idx = ordered[-1].page_index
@@ -389,6 +397,42 @@ class CardDelivery:
                 )
 
         return outcomes
+
+    def _transform_rendered_payload(
+        self,
+        chat_id: str,
+        card: RenderedCard,
+    ) -> RenderedCard:
+        payload = self._payload_transform(chat_id, card.to_feishu_json())
+        if not isinstance(payload, dict):
+            raise TypeError("card payload transform must return dict")
+        revisions: set[tuple[int, int]] = set()
+
+        def collect(node) -> None:
+            if isinstance(node, dict):
+                group_revision = node.get("group_revision")
+                grant_revision = node.get("grant_revision")
+                if type(group_revision) is int and type(grant_revision) is int:
+                    revisions.add((group_revision, grant_revision))
+                for value in node.values():
+                    collect(value)
+            elif isinstance(node, list):
+                for value in node:
+                    collect(value)
+
+        collect(payload)
+        revision_suffix = ""
+        if revisions:
+            revision_suffix = ":trust:" + ",".join(
+                f"{group_revision}/{grant_revision}"
+                for group_revision, grant_revision in sorted(revisions)
+            )
+        return dataclasses.replace(
+            card,
+            _card_json=payload,
+            structure_signature=card.structure_signature + revision_suffix,
+            content_hash=card.content_hash + revision_suffix,
+        )
 
     @staticmethod
     def _latest_page_for_source(binding, source_page_index: int) -> PageBinding | None:

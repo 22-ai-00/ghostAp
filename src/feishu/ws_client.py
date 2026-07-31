@@ -76,7 +76,20 @@ from ..thread import (
     get_thread_manager,
     set_current_tenant_key,
 )
+from ..trust.action_matrix import ActionMatrix, can_dispatch
+from ..trust.models import (
+    ActionDecision as TrustActionDecision,
+)
+from ..trust.models import (
+    ActionKind,
+    ActionRequest,
+    ActionTargetKind,
+    ActorKind,
+    EffectiveTrust,
+    TrustZone,
+)
 from ..trust.registry import ManagedGroupRegistry, single_owner_id
+from ..trust.resolver import TrustZoneResolver
 from ..utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpenException
 from ..utils.errors import get_error_detail
 from ..utils.rate_limit import RateLimiter, RateLimitExceededException
@@ -476,6 +489,8 @@ class FeishuWSClient:
 
             self._employee_department_runtime = EmployeeDepartmentRuntime.from_settings(
                 self.settings,
+                managed_group_registry=self._managed_group_registry,
+                managed_group_owner_id=self._managed_group_owner_id,
                 slock_engine_manager=self._slock_engine_manager,
                 employee_environment_provider=lambda authority: local_employee_environment(
                     authority,
@@ -760,7 +775,6 @@ class FeishuWSClient:
         # Bind forwarding methods directly on instance (replaces __getattr__ dispatch)
         from .router import bind_forwarding_methods
         bind_forwarding_methods(self, self._handler_ctx)
-        self._recover_employee_runtime_after_handler_binding()
 
         # ------------------------------------------------------------------
         # Control-plane (deferred /exit, system command gate)
@@ -1406,7 +1420,15 @@ class FeishuWSClient:
 
         Guarded by ActivationGuard for permission and rate-limit checks.
         """
+        from ..thread.manager import get_current_sender_id
         from .slock_dispatch import try_passive_activation
+
+        sender_id = get_current_sender_id() or ""
+        effective_trust = self._resolve_effective_trust(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            chat_type="group",
+        )
 
         return try_passive_activation(
             chat_id,
@@ -1417,6 +1439,7 @@ class FeishuWSClient:
             get_chat_lock_fn=lambda: self._get_chat_lock(chat_id),
             slock_handler=self._slock_handler,
             card_sender=self._system_handler,
+            effective_trust=effective_trust,
         )
 
     @staticmethod
@@ -1570,6 +1593,208 @@ class FeishuWSClient:
             )
         return decision
 
+    def _resolve_effective_trust(
+        self,
+        *,
+        sender_id: str,
+        chat_id: str,
+        chat_type: str,
+        message_id: str = "",
+    ) -> EffectiveTrust | None:
+        """Resolve current Registry trust, or ``None`` for legacy test wiring.
+
+        A real Registry is authoritative.  Runtime lookup failure only removes
+        Employee actors; it can never turn an unknown sender into an Owner.
+        """
+
+        registry = getattr(self, "_managed_group_registry", None)
+        if type(registry) is not ManagedGroupRegistry:
+            return None
+        employee_bot_ids: frozenset[str] = frozenset()
+        runtime = getattr(self, "_employee_department_runtime", None)
+        employee_ids = getattr(runtime, "trusted_employee_bot_open_ids", None)
+        if callable(employee_ids):
+            try:
+                resolved = employee_ids()
+                if isinstance(resolved, (tuple, frozenset)) and all(
+                    isinstance(value, str) and value.startswith("ou_")
+                    for value in resolved
+                ):
+                    employee_bot_ids = frozenset(resolved)
+            except Exception:
+                logger.warning(
+                    "managed ingress Employee identity snapshot unavailable",
+                    exc_info=True,
+                )
+        try:
+            groups = registry.managed_groups()
+            group = next(
+                (record for record in groups if record.chat_id == chat_id),
+                None,
+            )
+            if group is not None:
+                current_group, current_grant = registry.trust_snapshot(chat_id)
+                groups = (() if current_group is None else (current_group,))
+                grants = (() if current_grant is None else (current_grant,))
+            else:
+                grants = ()
+            resolver = TrustZoneResolver(
+                owner_id=getattr(self, "_managed_group_owner_id", ""),
+                managed_groups=groups,
+                project_grants=grants,
+                employee_bot_ids=employee_bot_ids,
+            )
+        except Exception:
+            logger.critical(
+                "MANAGED_INGRESS_REGISTRY_SNAPSHOT_FAILED",
+                exc_info=True,
+            )
+            resolver = TrustZoneResolver(
+                owner_id=getattr(self, "_managed_group_owner_id", ""),
+                managed_groups=(),
+                project_grants=(),
+                employee_bot_ids=frozenset(),
+            )
+        trust = resolver.resolve(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+        )
+        if trust.actor is ActorKind.EMPLOYEE:
+            validator = getattr(runtime, "is_valid_employee_continuation", None)
+            if not message_id or not callable(validator):
+                return resolver.resolve(
+                    sender_id="",
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                )
+            try:
+                valid = validator(
+                    sender_open_id=sender_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+            except Exception:
+                valid = False
+            if valid is not True:
+                return resolver.resolve(
+                    sender_id="",
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                )
+        return trust
+
+    @staticmethod
+    def _managed_trust_access_decision(
+        trust: EffectiveTrust | None,
+    ) -> AccessDecision | None:
+        """Return an authoritative decision for group trust zones.
+
+        Owner P2P and clients without the durable Registry retain the existing
+        access-policy path.  Managed actors bypass legacy enrollment; unknown
+        group actors are denied before content parsing.
+        """
+
+        if trust is None:
+            return None
+        if trust.zone is TrustZone.OWNER_P2P:
+            return AccessDecision(
+                allowed=True,
+                operation=AccessOperation.NORMAL_MESSAGE,
+                reason_code="owner_p2p_trust",
+                prospective_allowed=True,
+                effective_trust=trust,
+            )
+        allowed = (
+            trust.zone is TrustZone.MANAGED_AGENT_GROUP
+            and trust.actor in {ActorKind.OWNER, ActorKind.EMPLOYEE}
+        )
+        return AccessDecision(
+            allowed=allowed,
+            operation=AccessOperation.NORMAL_MESSAGE,
+            reason_code=("managed_trust" if allowed else "external_or_unknown"),
+            prospective_allowed=allowed,
+            effective_trust=trust,
+        )
+
+    def _managed_ingress_action_allowed(
+        self,
+        trust: EffectiveTrust | None,
+        *,
+        text: str,
+        command_match: CommandMatch | None,
+    ) -> bool:
+        if trust is None:
+            return True
+        action: ActionKind | None = None
+        if self._is_known_host_shell_invocation(text):
+            action = ActionKind.HOST_SHELL
+        elif command_match is not None and command_match.command in {
+            "/access",
+            "/setadmin",
+            "/hire",
+            "/fire",
+        }:
+            action = ActionKind.GRANT_ADMIN
+        if action is None:
+            return trust.zone is not TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
+        return ActionMatrix().decide(
+            ActionRequest(
+                trust=trust,
+                action=action,
+                target=ActionTargetKind.HOST_GLOBAL,
+            )
+        ) is TrustActionDecision.ALLOW
+
+    @staticmethod
+    def _is_known_host_shell_invocation(text: str) -> bool:
+        """Recognize only deterministic shell forms at the intake fence.
+
+        The broader SMART heuristic intentionally treats unknown English verbs
+        as possible executables.  It is useful for routing but is not an
+        authorization fact, so managed ingress only rejects the explicit
+        command whitelist and local executable paths here.  The Dispatcher
+        applies the ActionMatrix again when intent recognition confirms Shell.
+        """
+
+        from ..agent.intent_recognizer import IntentRecognizer
+
+        normalized = (text or "").strip().lower()
+        if not normalized:
+            return False
+        first_word = normalized.split()[0]
+        return (
+            first_word == "cd"
+            or first_word in IntentRecognizer.SHELL_COMMANDS
+            or IntentRecognizer._looks_like_local_executable_path(first_word)
+        )
+
+    def _current_trust_can_dispatch(self, trust: EffectiveTrust | None) -> bool:
+        if trust is None:
+            return True
+        current_group_revision = None
+        current_grant_revision = None
+        if trust.managed_group is not None:
+            registry = getattr(self, "_managed_group_registry", None)
+            if type(registry) is not ManagedGroupRegistry:
+                return False
+            current_group, current_grant = registry.trust_snapshot(
+                trust.managed_group.chat_id
+            )
+            current_group_revision = (
+                current_group.revision if current_group is not None else None
+            )
+            current_grant_revision = (
+                current_grant.revision if current_grant is not None else None
+            )
+        return can_dispatch(
+            trust,
+            current_group_revision=current_group_revision,
+            current_grant_revision=current_grant_revision,
+            killed=False,
+            paused=False,
+        ) is TrustActionDecision.ALLOW
+
     @staticmethod
     def _extract_canonical_ingress_facts(
         data: P2ImMessageReceiveV1,
@@ -1602,6 +1827,22 @@ class FeishuWSClient:
         message_id, chat_id, chat_type, _sender_id = ingress_facts
         is_p2p = chat_type == "p2p"
 
+        message = data.event.message
+        causal_message_id = (
+            getattr(message, "parent_id", None)
+            or getattr(message, "root_id", None)
+            or ""
+        )
+        effective_trust = self._resolve_effective_trust(
+            sender_id=_sender_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            message_id=causal_message_id,
+        )
+        trust_decision = self._managed_trust_access_decision(effective_trust)
+        if trust_decision is not None and not trust_decision.allowed:
+            return
+
         _raw_sender_union_id = getattr(
             getattr(getattr(data.event, "sender", None), "sender_id", None),
             "union_id", None,
@@ -1617,7 +1858,7 @@ class FeishuWSClient:
         # scheduler submission, image download, Shell, and all handlers.
         text = self._extract_text_from_message(data)
         command_match = SlashCommandParser.parse(text)
-        ingress_decision = self._decide_ingress_access(
+        ingress_decision = trust_decision or self._decide_ingress_access(
             message_id=message_id,
             sender_id=_sender_id,
             chat_id=chat_id,
@@ -1626,8 +1867,20 @@ class FeishuWSClient:
         )
         if not ingress_decision.allowed:
             return
+        if not self._managed_ingress_action_allowed(
+            effective_trust,
+            text=text,
+            command_match=command_match,
+        ):
+            return
 
-        project_id = None
+        managed_group = (
+            effective_trust.managed_group
+            if effective_trust is not None
+            and effective_trust.zone is TrustZone.MANAGED_AGENT_GROUP
+            else None
+        )
+        project_id = managed_group.project_id if managed_group is not None else None
         thread_root_id = None
         try:
             parent_id = getattr(data.event.message, "parent_id", None)
@@ -1635,7 +1888,7 @@ class FeishuWSClient:
             thread_root_id = root_id
             thread_ctx = None
 
-            if root_id and self.settings.thread_programming_enabled:
+            if managed_group is None and root_id and self.settings.thread_programming_enabled:
                 thread_ctx = self._thread_manager.get(root_id)
                 if thread_ctx:
                     project_id = thread_ctx.project_id
@@ -1647,7 +1900,7 @@ class FeishuWSClient:
                 else:
                     logger.debug("[Thread] _handle_message miss: msg_root=%s", root_id[:12] if root_id else "N")
 
-            if not project_id:
+            if managed_group is None and not project_id:
                 for ref in (parent_id, root_id):
                     if ref:
                         project_id = self._message_mapper.get_project_id(ref)
@@ -1658,7 +1911,7 @@ class FeishuWSClient:
         except (AttributeError, KeyError, TypeError):
             project_id = None
 
-        if not project_id:
+        if managed_group is None and not project_id:
             try:
                 active = self._project_manager.get_active_project(chat_id)
                 project_id = active.project_id if active else None
@@ -1737,10 +1990,11 @@ class FeishuWSClient:
             try:
                 handle = self._scheduler.submit(
                     spec,
-                    lambda ctx, _sf=is_shell_fast: self._process_message_async(
+                    lambda ctx, _sf=is_shell_fast, _trust=effective_trust: self._process_message_async(
                         data,
                         task_ctx=ctx,
                         shell_fast_tracked=_sf,
+                        effective_trust=_trust,
                     ),
                 )
             except (RateLimitExceededException, CircuitBreakerOpenException) as e:
@@ -1810,6 +2064,7 @@ class FeishuWSClient:
         data: P2ImMessageReceiveV1,
         task_ctx=None,
         shell_fast_tracked: bool = False,
+        effective_trust: EffectiveTrust | None = None,
     ):
         """消息处理主逻辑（运行在 scheduler 线程池中）。
 
@@ -1857,6 +2112,27 @@ class FeishuWSClient:
                 event_tenant_key if isinstance(event_tenant_key, str) else ""
             )
 
+            causal_message_id = (
+                getattr(message, "parent_id", None)
+                or getattr(message, "root_id", None)
+                or ""
+            )
+            current_trust = self._resolve_effective_trust(
+                sender_id=_sender_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                message_id=causal_message_id,
+            )
+            trust_decision = self._managed_trust_access_decision(current_trust)
+            if trust_decision is not None and not trust_decision.allowed:
+                return
+            if effective_trust is not None and current_trust != effective_trust:
+                audit_logger.warning(
+                    "MANAGED_INGRESS_STALE_TRUST_DENIED chat_hash=%s",
+                    self._access_identifier_hash(chat_id),
+                )
+                return
+
             # Parsing is allowed only after the current event facts pass their
             # independent worker check. No downstream fact is trusted from the
             # queued TaskSpec.
@@ -1872,7 +2148,7 @@ class FeishuWSClient:
             except Exception:
                 command_match = None
 
-            ingress_decision = self._decide_ingress_access(
+            ingress_decision = trust_decision or self._decide_ingress_access(
                 message_id=message_id,
                 sender_id=_sender_id,
                 chat_id=chat_id,
@@ -1880,6 +2156,12 @@ class FeishuWSClient:
                 command_match=command_match,
             )
             if not ingress_decision.allowed:
+                return
+            if not self._managed_ingress_action_allowed(
+                current_trust,
+                text=text,
+                command_match=command_match,
+            ):
                 return
 
             request_id = self._ensure_request_id(message_id, chat_id=chat_id)
@@ -1986,6 +2268,23 @@ class FeishuWSClient:
 
             # 3. Handle Images (if any)
             is_image_only = False
+            trusted_project = None
+            if (
+                current_trust is not None
+                and current_trust.managed_group is not None
+            ):
+                trusted_project = self._project_manager.get_project_for_chat(
+                    current_trust.managed_group.project_id,
+                    chat_id,
+                )
+                if (
+                    trusted_project is None
+                    or getattr(trusted_project, "project_id", None)
+                    != current_trust.managed_group.project_id
+                    or getattr(trusted_project, "root_path", None)
+                    != current_trust.managed_group.canonical_root_ref
+                ):
+                    return
             if parse_result.image_keys:
                 project, auto_enter_mode, text, is_image_only = self._handle_image_content(
                     message, parse_result.image_keys, text, request_id, task_ctx
@@ -1997,9 +2296,14 @@ class FeishuWSClient:
                     enriched_match = SlashCommandParser.parse(text)
                     if enriched_match is not None and enriched_match.command == command_match.command:
                         command_match = enriched_match
+                if trusted_project is not None:
+                    project = trusted_project
             else:
                 # 4. Resolve Context (if no images to drive it)
-                project, auto_enter_mode = self._resolve_message_context(message)
+                if trusted_project is not None:
+                    project, auto_enter_mode = trusted_project, None
+                else:
+                    project, auto_enter_mode = self._resolve_message_context(message)
 
             # 4b. Safety net: if auto_enter_mode is still None but we are in a
             # registered thread, force-set mode from thread context so that the
@@ -2029,6 +2333,8 @@ class FeishuWSClient:
                 self._update_task_project(task_ctx, project.project_id)
 
             # 6. Dispatch Logic
+            if not self._current_trust_can_dispatch(current_trust):
+                return
             if not text and not is_image_only:
                 # Special case: handle empty text (e.g. unsupported content that parsed to empty)
                 # But wait, if image_keys exist, text might be empty but valid (image only).
@@ -2048,6 +2354,7 @@ class FeishuWSClient:
                 is_image_only=is_image_only,
                 shell_fast_tracked=shell_fast_tracked,
                 chat_type=chat_type,
+                effective_trust=current_trust,
             )
 
         except asyncio.TimeoutError as e:
@@ -2285,6 +2592,7 @@ class FeishuWSClient:
         is_image_only=False,
         shell_fast_tracked=False,
         chat_type: str = "group",
+        effective_trust: EffectiveTrust | None = None,
     ):
         """根据 auto-enter 与当前模式，将消息路由到对应编程模式或 SMART 处理路径。"""
         # Compatibility: some unit tests call _dispatch_message_logic directly.
@@ -2294,6 +2602,22 @@ class FeishuWSClient:
                 command_match = SlashCommandParser.parse(text)
             except Exception:
                 command_match = None
+
+        def forward_to_intent(target_project=project) -> None:
+            kwargs = {
+                "command_match": command_match,
+                "shell_fast_tracked": shell_fast_tracked,
+                "chat_type": chat_type,
+            }
+            if effective_trust is not None:
+                kwargs["effective_trust"] = effective_trust
+            self._process_with_intent(
+                message_id,
+                chat_id,
+                text,
+                target_project,
+                **kwargs,
+            )
 
         missing_topic_project_safe_commands = {
             "/help",
@@ -2349,15 +2673,7 @@ class FeishuWSClient:
             # must be routed to the system handler even inside thread programming mode,
             # otherwise they can be hidden behind same-mode/topic-hint handling.
             if self._is_interceptable_command_match(command_match):
-                self._process_with_intent(
-                    message_id,
-                    chat_id,
-                    text,
-                    project,
-                    command_match=command_match,
-                    shell_fast_tracked=shell_fast_tracked,
-                    chat_type=chat_type,
-                )
+                forward_to_intent()
                 return
             from .product_catalog import is_same_programming_mode_entry
 
@@ -2378,27 +2694,11 @@ class FeishuWSClient:
                 or self._is_spec_command(text)
                 or self._is_workflow_command(text)
             ):
-                self._process_with_intent(
-                    message_id,
-                    chat_id,
-                    text,
-                    project,
-                    command_match=command_match,
-                    shell_fast_tracked=shell_fast_tracked,
-                    chat_type=chat_type,
-                )
+                forward_to_intent()
                 return
         if auto_enter_mode in {"worktree", "deep", "spec", "workflow"}:
             if command_match is not None:
-                self._process_with_intent(
-                    message_id,
-                    chat_id,
-                    text,
-                    project,
-                    command_match=command_match,
-                    shell_fast_tracked=shell_fast_tracked,
-                    chat_type=chat_type,
-                )
+                forward_to_intent()
                 return
             self._add_reaction(message_id, EmojiReaction.on_processing())
             if auto_enter_mode == "worktree":
@@ -2419,15 +2719,7 @@ class FeishuWSClient:
                 self._add_reaction(message_id, EmojiReaction.on_processing())
                 handler.handle_message(message_id, chat_id, text, project)
             else:
-                self._process_with_intent(
-                    message_id,
-                    chat_id,
-                    text,
-                    project,
-                    command_match=command_match,
-                    shell_fast_tracked=shell_fast_tracked,
-                    chat_type=chat_type,
-                )
+                forward_to_intent()
         else:
             # Project-chat default: when the chat is bound to a project via
             # /new-chat and the message is neither a slash command, a shell-like
@@ -2449,15 +2741,7 @@ class FeishuWSClient:
                         chat_id, project_id=bound_project_id
                     )
                     if is_programming:
-                        self._process_with_intent(
-                            message_id,
-                            chat_id,
-                            text,
-                            bound_project,
-                            command_match=command_match,
-                            shell_fast_tracked=shell_fast_tracked,
-                            chat_type=chat_type,
-                        )
+                        forward_to_intent(bound_project)
                         return
 
                     default_tool = str(
@@ -2489,15 +2773,7 @@ class FeishuWSClient:
                             message_id, chat_id, bound_project, pending_prompt=text,
                         )
                     return
-            self._process_with_intent(
-                message_id,
-                chat_id,
-                text,
-                project,
-                command_match=command_match,
-                shell_fast_tracked=shell_fast_tracked,
-                chat_type=chat_type,
-            )
+            forward_to_intent()
 
     @staticmethod
     def _requested_topic_engine(command_match) -> Optional[str]:
@@ -2559,6 +2835,83 @@ class FeishuWSClient:
     def _handle_card_action(self, data: P2CardActionTrigger) -> Optional[P2CardActionTriggerResponse]:
         """飞书卡片回调入口：做去重 + 任务入队（system action 走快通道）。"""
         try:
+            open_message_id = data.event.context.open_message_id
+            open_chat_id = data.event.context.open_chat_id
+            operator = data.event.operator
+            operator_id = (
+                getattr(operator, "open_id", None)
+                or getattr(operator, "user_id", None)
+                or getattr(operator, "union_id", None)
+                or ""
+            )
+        except (AttributeError, TypeError):
+            return None
+
+        effective_trust = self._resolve_effective_trust(
+            sender_id=operator_id,
+            chat_id=open_chat_id,
+            chat_type="group",
+        )
+        trust_decision = self._managed_trust_access_decision(effective_trust)
+        card_is_p2p = False
+        if trust_decision is not None and not trust_decision.allowed:
+            registry = getattr(self, "_managed_group_registry", None)
+            active_group = (
+                registry.active_record(open_chat_id)
+                if type(registry) is ManagedGroupRegistry
+                else None
+            )
+            # A current managed group with an unknown actor is never a DM.
+            # Only the configured Owner may use durable origin provenance to
+            # distinguish an actual P2P callback from an external group.
+            if (
+                active_group is None
+                and operator_id == getattr(self, "_managed_group_owner_id", "")
+            ):
+                try:
+                    origin = self._message_linker.resolve_origin(
+                        reply_message_id=open_message_id
+                    ) or open_message_id
+                    card_is_p2p = self._resolve_card_is_p2p(
+                        origin_message_id=origin,
+                        open_chat_id=open_chat_id,
+                        operator_id=operator_id,
+                    )
+                except (RuntimeError, OSError, TypeError, ValueError):
+                    card_is_p2p = False
+                if card_is_p2p:
+                    effective_trust = self._resolve_effective_trust(
+                        sender_id=operator_id,
+                        chat_id=open_chat_id,
+                        chat_type="p2p",
+                    )
+                    trust_decision = self._managed_trust_access_decision(
+                        effective_trust
+                    )
+            if not card_is_p2p:
+                return None
+
+        if (
+            effective_trust is not None
+            and effective_trust.zone is TrustZone.MANAGED_AGENT_GROUP
+        ):
+            submitted_group_revision, submitted_grant_revision = (
+                CardActionInspector.trust_revisions(data.event.action)
+            )
+            if (
+                submitted_group_revision is None
+                or submitted_grant_revision is None
+                or submitted_group_revision != effective_trust.group_revision
+            ) or (
+                submitted_grant_revision != effective_trust.grant_revision
+            ):
+                audit_logger.warning(
+                    "MANAGED_CARD_STALE_REVISION_DENIED chat_hash=%s",
+                    self._access_identifier_hash(open_chat_id),
+                )
+                return None
+
+        try:
             header = data.header
             event_id = header.event_id
             if self._card_event_cache.is_duplicate(event_id):
@@ -2590,13 +2943,6 @@ class FeishuWSClient:
             )
         except (AttributeError, TypeError, KeyError) as e:
             logger.warning("卡片回调基础信息解析失败: %s", get_error_detail(e))
-        try:
-            open_message_id = data.event.context.open_message_id
-            open_chat_id = data.event.context.open_chat_id
-        except (AttributeError, TypeError):
-            open_message_id = None
-            open_chat_id = "unknown"
-
         _raw_tenant_key = getattr(getattr(data, "header", None), "tenant_key", None)
         tenant_key = _raw_tenant_key if isinstance(_raw_tenant_key, str) else ""
 
@@ -2618,16 +2964,9 @@ class FeishuWSClient:
             classify_card_action_error(RuntimeError("system command gate failed"), phase="dispatch")
             logger.debug("failed to check system command gate", exc_info=True)
 
-        operator_id = ""
         operator_union_id = ""
         try:
             operator = data.event.operator
-            operator_id = (
-                getattr(operator, "open_id", None)
-                or getattr(operator, "user_id", None)
-                or getattr(operator, "union_id", None)
-                or ""
-            )
             raw_operator_union_id = getattr(operator, "union_id", None)
             operator_union_id = (
                 raw_operator_union_id
@@ -2665,12 +3004,18 @@ class FeishuWSClient:
         except (json.JSONDecodeError, TypeError, ValueError):
             classify_card_action_error(RuntimeError("undo payload parse failed"), phase="payload_parse")
 
-        project_id = None
-        try:
-            project_id = CardActionInspector.project_id(data.event.action)
-        except (AttributeError, TypeError, ValueError):
-            classify_card_action_error(RuntimeError("project id parse failed"), phase="payload_parse")
-            project_id = None
+        project_id = (
+            effective_trust.managed_group.project_id
+            if effective_trust is not None
+            and effective_trust.managed_group is not None
+            else None
+        )
+        if project_id is None:
+            try:
+                project_id = CardActionInspector.project_id(data.event.action)
+            except (AttributeError, TypeError, ValueError):
+                classify_card_action_error(RuntimeError("project id parse failed"), phase="payload_parse")
+                project_id = None
 
         if not project_id:
             try:
@@ -2686,8 +3031,7 @@ class FeishuWSClient:
         except (RuntimeError, OSError, TypeError, ValueError):
             origin_lookup_failed = True
         origin_message_id = origin_message_id or open_message_id
-        card_is_p2p = False
-        if not origin_lookup_failed:
+        if not card_is_p2p and not origin_lookup_failed:
             card_is_p2p = self._resolve_card_is_p2p(
                 origin_message_id=origin_message_id,
                 open_chat_id=open_chat_id,
@@ -2715,7 +3059,14 @@ class FeishuWSClient:
                 sender_union_id=operator_union_id,
                 tenant_key=tenant_key,
             )
-            handle = self._scheduler.submit(spec, lambda ctx: self._process_card_action_async(data, task_ctx=ctx))
+            handle = self._scheduler.submit(
+                spec,
+                lambda ctx, _trust=effective_trust: self._process_card_action_async(
+                    data,
+                    task_ctx=ctx,
+                    effective_trust=_trust,
+                ),
+            )
             try:
                 self._message_linker.link_task(origin_message_id, handle.run_id)
             except (KeyError, AttributeError, RuntimeError) as e:
@@ -2981,7 +3332,12 @@ class FeishuWSClient:
         except (json.JSONDecodeError, AttributeError, KeyError, TypeError):
             return False
 
-    def _process_card_action_async(self, data: Any, task_ctx=None):
+    def _process_card_action_async(
+        self,
+        data: Any,
+        task_ctx=None,
+        effective_trust: EffectiveTrust | None = None,
+    ):
         """卡片动作处理逻辑（第二阶段实现）。
 
         该方法会把 `action.value` normalize 为 dict，提取 `action/project_id`，并通过
@@ -3028,6 +3384,20 @@ class FeishuWSClient:
                 if task_ctx and hasattr(task_ctx, "spec")
                 else getattr(getattr(data.event, "context", None), "chat_type", None) == "p2p"
             )
+            current_trust = self._resolve_effective_trust(
+                sender_id=_operator_id,
+                chat_id=open_chat_id,
+                chat_type=("p2p" if _card_is_p2p else "group"),
+            )
+            current_decision = self._managed_trust_access_decision(current_trust)
+            if current_decision is not None and not current_decision.allowed:
+                return
+            if effective_trust is not None and current_trust != effective_trust:
+                audit_logger.warning(
+                    "MANAGED_CARD_CURRENT_REVISION_DENIED chat_hash=%s",
+                    self._access_identifier_hash(open_chat_id),
+                )
+                return
             set_current_sender_id(_operator_id)
             _operator_union_id = (
                 task_ctx.spec.sender_union_id
@@ -3080,7 +3450,14 @@ class FeishuWSClient:
                 logger.debug("failed to extract action input_value", exc_info=True)
 
             action_type = value.get("action", "")
-            project_id = value.get("project_id", "")
+            project_id = (
+                current_trust.managed_group.project_id
+                if current_trust is not None
+                and current_trust.managed_group is not None
+                else value.get("project_id", "")
+            )
+            if project_id:
+                value["project_id"] = project_id
 
             card_thread_id = value.get("thread_root_id")
             if card_thread_id and self.settings.thread_programming_enabled:
@@ -3109,6 +3486,8 @@ class FeishuWSClient:
                 return
 
             # --- Dispatch via ActionDispatcher ---
+            if not self._current_trust_can_dispatch(current_trust):
+                return
             matched = self._action_dispatcher.dispatch(action_type, open_message_id, open_chat_id, project_id, value)
 
             if not matched:
@@ -3194,6 +3573,7 @@ class FeishuWSClient:
         command_match=_COMMAND_MATCH_MISSING,
         shell_fast_tracked: bool = False,
         chat_type: str = "group",
+        effective_trust: EffectiveTrust | None = None,
     ):
         """SMART 模式下的主路由：控制命令优先，其次进入意图识别/多任务执行。"""
         # Compatibility: allow callers outside ws message ingress to omit command_match.
@@ -3213,6 +3593,7 @@ class FeishuWSClient:
                 command_match=command_match,
                 shell_fast_tracked=shell_fast_tracked,
                 chat_type=chat_type,
+                effective_trust=effective_trust,
             )
         )
 
@@ -3279,21 +3660,26 @@ class FeishuWSClient:
             return
         manager = self._slock_engine_manager
         try:
-            record = self._managed_group_registry.record(chat_id)
+            registry = getattr(self, "_managed_group_registry", None)
+            if type(registry) is not ManagedGroupRegistry:
+                manager.retire_deleted_chat(chat_id)
+                return
+            record = registry.record(chat_id)
             revoke_required = (
                 record is not None
                 and getattr(record.status, "value", "") == "active"
             )
             if revoke_required:
-                self._managed_group_registry.begin_revoke(
+                registry.begin_revoke(
                     chat_id,
                     requested_at=datetime.now(UTC),
                 )
             manager.retire_deleted_chat(chat_id)
-            if not self._project_manager.revoke_managed_chat(chat_id):
+            project_manager = getattr(self, "_project_manager", None)
+            if project_manager is None or not project_manager.revoke_managed_chat(chat_id):
                 raise OSError("project managed-chat revocation was not persisted")
             if revoke_required:
-                self._managed_group_registry.complete_revoke(chat_id)
+                registry.complete_revoke(chat_id)
         except Exception:
             logger.exception(
                 "failed to retire deleted Slock chat=%s",
@@ -3623,40 +4009,30 @@ class FeishuWSClient:
             )
         return event_builder.build()
 
-    def start(self):
-        """启动 WS 长连接并进入重连循环。
+    def _restore_trusted_ingress_dependencies(self, root: str) -> None:
+        """Restore authority dependencies before any WS admission opens."""
 
-        注意：该方法是阻塞的；通常在主线程调用。
-        """
-        self._publish_restart_participation()
-        event_handler = self._build_event_handler()
-
-        self._message_cache.start_cleanup_thread()
-        self._card_event_cache.start_cleanup_thread()
-        self._ws_health_monitor.start_watchdog()
-        self._start_main_slash_command_sync()
-
-        # Registry reconciliation must precede marker-based Slock restore.
-        import os
-        _root = os.getcwd()
         try:
             self._reconcile_managed_groups_before_slock_restore()
         except Exception:
             logger.exception("Managed-group startup reconciliation failed")
             raise
 
-        # Restore slock engines from persisted marker files
+        registry = getattr(self, "_managed_group_registry", None)
         try:
             restored = self._slock_engine_manager.restore_from_disk(
-                _root,
+                root,
                 managed_group_active=lambda chat_id: (
-                    self._managed_group_registry.active_record(chat_id) is not None
+                    type(registry) is ManagedGroupRegistry
+                    and registry.active_record(chat_id) is not None
                 ),
             )
             if restored:
                 logger.info("Restored %d slock engine(s) from disk", restored)
         except (OSError, ValueError, KeyError):
             logger.warning("Failed to restore slock engines from disk", exc_info=True)
+
+        self._recover_employee_runtime_after_handler_binding()
 
         runtime = self._employee_department_runtime
         membership = (
@@ -3680,6 +4056,24 @@ class FeishuWSClient:
                     removed,
                     degraded,
                 )
+
+    def start(self):
+        """启动 WS 长连接并进入重连循环。
+
+        注意：该方法是阻塞的；通常在主线程调用。
+        """
+        self._publish_restart_participation()
+        event_handler = self._build_event_handler()
+
+        self._message_cache.start_cleanup_thread()
+        self._card_event_cache.start_cleanup_thread()
+        self._ws_health_monitor.start_watchdog()
+        self._start_main_slash_command_sync()
+
+        # Registry reconciliation must precede marker-based Slock restore.
+        import os
+        _root = os.getcwd()
+        self._restore_trusted_ingress_dependencies(_root)
 
         logger.info("正在建立飞书长连接...")
         logger.info("多项目管理已启用")

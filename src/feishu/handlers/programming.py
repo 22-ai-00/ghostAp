@@ -1126,7 +1126,15 @@ class ProgrammingModeHandler(BaseHandler):
             return
 
         # Create card delivery + session
-        delivery = create_card_delivery(api_client)
+        delivery = create_card_delivery(
+            api_client,
+            payload_transform=lambda target_chat_id, payload: (
+                self._bind_managed_card_revisions(
+                    payload,
+                    chat_id=target_chat_id,
+                )
+            ),
+        )
         from src.card.session.config import SessionConfig
         card_callbacks = build_programming_session_callbacks(
             reply_text_fn=self.reply_text,

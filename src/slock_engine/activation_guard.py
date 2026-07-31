@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from src.config.settings import Settings
+    from src.trust.models import EffectiveTrust
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,8 @@ ACTIVATION_DENIED_NOT_WHITELISTED = "not_whitelisted"
 
 ACTIVATION_ALLOWED = "allowed"
 """Reason string when activation is permitted."""
+
+ACTIVATION_DENIED_EXTERNAL = "external_or_unknown"
 
 
 def _normalize_user_ids(value: object) -> frozenset[str]:
@@ -75,6 +78,8 @@ class ActivationGuard:
         sender_id: str,
         chat_id: str,
         settings: "Settings",
+        *,
+        effective_trust: "EffectiveTrust | None" = None,
     ) -> tuple[bool, str]:
         """Check if the sender is allowed to trigger auto-activation.
 
@@ -92,6 +97,12 @@ class ActivationGuard:
                 - ACTIVATION_DENIED_ADMIN_REQUIRED: admin-only policy
                 - ACTIVATION_DENIED_NOT_WHITELISTED: not in whitelist
         """
+        if effective_trust is not None:
+            from src.trust.models import TrustZone
+
+            if effective_trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP:
+                return False, ACTIVATION_DENIED_EXTERNAL
+
         # Inline GC: every 50 calls trigger a full purge
         self._call_count += 1
         if self._call_count % 50 == 0:

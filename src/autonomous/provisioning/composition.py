@@ -25,6 +25,9 @@ from src.slock_engine.memory_manager import (
 from src.utils.async_helpers import safe_wait_for
 from src.utils.path import canonicalize_user_home_path
 
+from ...trust.models import ActorKind, EffectiveTrust, TrustZone
+from ...trust.registry import ManagedGroupRegistry
+from ...trust.resolver import TrustZoneResolver
 from ..acceptance.main_bot_audit import MainBotSendAuditLog
 from ..acceptance.release_trust import ReleaseTrustProvider
 from ..context.group_ledger import GroupContextLedger, GroupEventPayload
@@ -741,6 +744,8 @@ class EmployeeDepartmentRuntime:
         *,
         blockers: tuple[str, ...] = (),
         runtime_enabled: bool = False,
+        managed_group_registry: ManagedGroupRegistry | None = None,
+        managed_group_owner_id: str = "",
     ) -> None:
         self._blockers = blockers
         self._runtime_enabled = runtime_enabled is True
@@ -796,6 +801,8 @@ class EmployeeDepartmentRuntime:
         self._automatic_activation = False
         self._core_recovered = False
         self._recovery_trace: list[str] = []
+        self._managed_group_registry = managed_group_registry
+        self._managed_group_owner_id = managed_group_owner_id
 
     @classmethod
     def from_settings(
@@ -817,23 +824,37 @@ class EmployeeDepartmentRuntime:
         membership_health: Any = None,
         manager_client_factory: Callable[[], Any] | None = None,
         recover_immediately: bool = True,
+        managed_group_registry: ManagedGroupRegistry | None = None,
+        managed_group_owner_id: str = "",
     ) -> EmployeeDepartmentRuntime:
         limit = getattr(settings, "autonomous_visible_employee_limit", 0)
         if limit == 0:
             if release_trust_provider is not None:
                 release_trust_provider.close()
-            return cls(blockers=("visible_employee_limit",))
+            return cls(
+                blockers=("visible_employee_limit",),
+                managed_group_registry=managed_group_registry,
+                managed_group_owner_id=managed_group_owner_id,
+            )
         if notification_link is None:
             if release_trust_provider is not None:
                 release_trust_provider.close()
-            return cls(blockers=("registration_notifier",))
+            return cls(
+                blockers=("registration_notifier",),
+                managed_group_registry=managed_group_registry,
+                managed_group_owner_id=managed_group_owner_id,
+            )
         if release_trust_provider is not None:
             try:
                 release_trust_provider.close()
             except Exception:
                 logger.warning("unused employee release provider close failed")
 
-        runtime = cls(runtime_enabled=True)
+        runtime = cls(
+            runtime_enabled=True,
+            managed_group_registry=managed_group_registry,
+            managed_group_owner_id=managed_group_owner_id,
+        )
         try:
             material = resolve_employee_runtime_material(settings)
             credential_root = canonicalize_user_home_path(
@@ -2188,6 +2209,13 @@ class EmployeeDepartmentRuntime:
                     settings,
                     "autonomous_context_retry_max_seconds",
                 ),
+                managed_group_registry_provider=(
+                    (lambda: self._managed_group_registry)
+                    if type(self._managed_group_registry) is ManagedGroupRegistry
+                    else None
+                ),
+                managed_group_owner_id=self._managed_group_owner_id,
+                employee_bot_ids_provider=self.trusted_employee_bot_open_ids,
                 requester_principal_resolver=(
                     self._resolve_employee_requester_principal
                 ),
@@ -2407,6 +2435,51 @@ class EmployeeDepartmentRuntime:
         worked = False
         for acceptance_id, record in tuple(ingress.state.by_acceptance_id.items()):
             if record.disposition is None:
+                try:
+                    payload = ingress.get_payload(acceptance_id)
+                    first = (
+                        payload.normalized_parts[0]
+                        if len(payload.normalized_parts) == 1
+                        else None
+                    )
+                    if (
+                        isinstance(first, Mapping)
+                        and first.get("type") == "membership_event"
+                        and self._handle_control_ingress(acceptance_id)
+                    ):
+                        worked = True
+                        continue
+                    trust = self._managed_employee_ingress_trust(
+                        record,
+                        payload,
+                    )
+                except Exception:
+                    trust = self._unknown_employee_ingress_trust()
+                if trust is not None and trust.zone is not TrustZone.MANAGED_AGENT_GROUP:
+                    try:
+                        ingress.record_disposition(
+                            acceptance_id,
+                            state="ignored",
+                            reason_code="authority_denied",
+                        )
+                    except IngressConflictError:
+                        pass
+                    worked = True
+                    continue
+                if trust is not None and trust.actor is ActorKind.EMPLOYEE:
+                    # Employee Channel SDK ingress has no authenticated causal
+                    # envelope.  Only the main Bot reply path can correlate a
+                    # server parent/root message to an anchored Outbox record.
+                    try:
+                        ingress.record_disposition(
+                            acceptance_id,
+                            state="ignored",
+                            reason_code="authority_denied",
+                        )
+                    except IngressConflictError:
+                        pass
+                    worked = True
+                    continue
                 if self._handle_control_ingress(acceptance_id):
                     worked = True
                     continue
@@ -2435,6 +2508,260 @@ class EmployeeDepartmentRuntime:
         if self._outbox is not None:
             worked = self._outbox.gc_superseded_snapshots() > 0 or worked
         return ingress.gc_terminal_payloads() > 0 or worked
+
+    @staticmethod
+    def _unknown_employee_ingress_trust() -> EffectiveTrust:
+        return EffectiveTrust(
+            zone=TrustZone.EXTERNAL_OR_UNKNOWN_GROUP,
+            actor=ActorKind.UNKNOWN,
+            managed_group=None,
+            group_revision=None,
+            grant_revision=None,
+        )
+
+    def trusted_employee_bot_open_ids(self) -> frozenset[str]:
+        """Return only current READY employee Bot Open IDs.
+
+        Workforce ``bot_principal_id`` values are internal identifiers and are
+        deliberately never compared with Feishu ``open_id`` values.
+        """
+
+        service = self._service
+        channels = self._channels
+        if service is None or channels is None:
+            return frozenset()
+        projection = service.synchronize_projection()
+        result: set[str] = set()
+        for employee in projection.employees.values():
+            if (
+                employee.state is not EmployeeState.ACTIVE
+                or employee.worker_type is not WorkerType.VISIBLE
+                or not employee.bot_principal_id
+            ):
+                continue
+            principal = projection.bot_principals.get(employee.bot_principal_id)
+            status = channels.status(employee.agent_id)
+            identity = getattr(status, "identity", None)
+            open_id = identity.get("open_id") if isinstance(identity, Mapping) else None
+            if (
+                principal is not None
+                and getattr(status, "state", None) is ChannelProcessState.READY
+                and getattr(status, "agent_id", None) == employee.agent_id
+                and getattr(status, "tenant_key", None) == employee.tenant_key
+                and getattr(status, "bot_principal_id", None)
+                == employee.bot_principal_id
+                and getattr(status, "app_id", None) == principal.app_id
+                and isinstance(open_id, str)
+                and open_id.startswith("ou_")
+            ):
+                result.add(open_id)
+        return frozenset(result)
+
+    def is_valid_employee_continuation(
+        self,
+        *,
+        sender_open_id: str,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """Validate one Employee reply against durable outbound causality.
+
+        ``message_id`` is the server-reported parent/root message, never an
+        Employee-supplied payload field.  A READY identity alone is
+        insufficient: its exact Channel generation and connection must match
+        a delivered terminal Outbox record with an anchored collaboration
+        publication.
+        """
+
+        service = self._service
+        channels = self._channels
+        outbox = self._outbox
+        if (
+            service is None
+            or channels is None
+            or outbox is None
+            or not isinstance(sender_open_id, str)
+            or not sender_open_id.startswith("ou_")
+            or not isinstance(chat_id, str)
+            or not chat_id.startswith("oc_")
+            or not isinstance(message_id, str)
+            or not message_id.startswith("om_")
+        ):
+            return False
+        try:
+            projection = service.synchronize_projection()
+            outbox.rebuild_projection()
+            candidates: list[tuple[Any, Any, Any]] = []
+            for employee in projection.employees.values():
+                if (
+                    employee.state is not EmployeeState.ACTIVE
+                    or employee.worker_type is not WorkerType.VISIBLE
+                    or not employee.bot_principal_id
+                ):
+                    continue
+                principal = projection.bot_principals.get(
+                    employee.bot_principal_id
+                )
+                status = channels.status(employee.agent_id)
+                identity = getattr(status, "identity", None)
+                ready_metadata = getattr(status, "ready_metadata", None)
+                if (
+                    principal is None
+                    or not isinstance(identity, Mapping)
+                    or not isinstance(ready_metadata, Mapping)
+                    or identity.get("open_id") != sender_open_id
+                    or identity.get("app_id") != principal.app_id
+                    or getattr(status, "state", None)
+                    is not ChannelProcessState.READY
+                    or getattr(status, "agent_id", None) != employee.agent_id
+                    or getattr(status, "tenant_key", None)
+                    != employee.tenant_key
+                    or getattr(status, "bot_principal_id", None)
+                    != employee.bot_principal_id
+                    or getattr(status, "app_id", None) != principal.app_id
+                    or type(getattr(status, "generation", None)) is not int
+                    or not ready_metadata.get("connection_id")
+                ):
+                    continue
+                candidates.append((employee, principal, status))
+            if len(candidates) != 1:
+                return False
+            employee, principal, status = candidates[0]
+            connection_id = status.ready_metadata["connection_id"]
+            records = tuple(
+                record
+                for record in outbox.state.by_outbox_id.values()
+                if record.tenant_key == employee.tenant_key
+                and record.agent_id == employee.agent_id
+                and record.chat_id == chat_id
+                and record.binding is not None
+                and record.binding.message_id == message_id
+                and record.binding.app_id == principal.app_id
+                and record.binding.generation == status.generation
+                and record.binding.connection_id == connection_id
+                and record.latest.state.terminal
+            )
+            if len(records) != 1:
+                return False
+            record = records[0]
+            publications = tuple(
+                event
+                for frame in outbox._writer.replay()
+                for event in frame.events
+                if event.event_type
+                == "employee.outbox.collaboration_published"
+                and event.aggregate_id == record.outbox_id
+                and event.payload.get("tenant_key") == employee.tenant_key
+                and event.payload.get("chat_id") == chat_id
+                and event.payload.get("agent_id") == employee.agent_id
+                and event.payload.get("app_id") == principal.app_id
+                and event.payload.get("generation") == status.generation
+                and all(
+                    isinstance(event.payload.get(field), str)
+                    and bool(event.payload[field])
+                    for field in (
+                        "team_run_id",
+                        "assignment_id",
+                        "causal_event_id",
+                    )
+                )
+            )
+            return len(publications) == 1
+        except Exception:
+            logger.warning(
+                "employee continuation validation failed closed",
+                exc_info=True,
+            )
+            return False
+
+    def _membership_event_transport_is_current(
+        self,
+        metadata: EmployeeIngressMetadata,
+        remote_chat_id: str,
+    ) -> bool:
+        """Gate membership events without inferring identity rotation."""
+
+        registry = self._managed_group_registry
+        service = self._service
+        channels = self._channels
+        if (
+            type(registry) is not ManagedGroupRegistry
+            or service is None
+            or channels is None
+            or not isinstance(remote_chat_id, str)
+        ):
+            return False
+        try:
+            group, grant = registry.trust_snapshot(remote_chat_id)
+            if group is None or grant is None:
+                return False
+            projection = service.synchronize_projection()
+            employee = projection.employees.get(metadata.agent_id)
+            if employee is None:
+                return False
+            principal = projection.bot_principals.get(employee.bot_principal_id)
+            status = channels.status(metadata.agent_id)
+            identity = getattr(status, "identity", None)
+            ready_metadata = getattr(status, "ready_metadata", None)
+            return (
+                employee.state is EmployeeState.ACTIVE
+                and employee.worker_type is WorkerType.VISIBLE
+                and employee.tenant_key == metadata.tenant_key
+                and employee.agent_id == metadata.agent_id
+                and employee.bot_principal_id == metadata.bot_principal_id
+                and principal is not None
+                and principal.tenant_key == metadata.tenant_key
+                and principal.agent_id == metadata.agent_id
+                and principal.app_id == metadata.app_id
+                and isinstance(identity, Mapping)
+                and isinstance(ready_metadata, Mapping)
+                and getattr(status, "state", None)
+                is ChannelProcessState.READY
+                and getattr(status, "tenant_key", None) == metadata.tenant_key
+                and getattr(status, "agent_id", None) == metadata.agent_id
+                and getattr(status, "bot_principal_id", None)
+                == metadata.bot_principal_id
+                and getattr(status, "app_id", None) == metadata.app_id
+                and getattr(status, "generation", None)
+                == metadata.channel_generation
+                and identity.get("app_id") == metadata.app_id
+                and ready_metadata.get("connection_id")
+                == metadata.connection_id
+            )
+        except Exception:
+            return False
+
+    def _managed_employee_ingress_trust(
+        self,
+        record: Any,
+        payload: EmployeeIngressPayload,
+    ) -> EffectiveTrust | None:
+        registry = self._managed_group_registry
+        if type(registry) is not ManagedGroupRegistry:
+            return None
+        if len(payload.normalized_parts) != 1:
+            return self._unknown_employee_ingress_trust()
+        part = payload.normalized_parts[0]
+        if not isinstance(part, Mapping):
+            return self._unknown_employee_ingress_trust()
+        coordinates = _bound_remote_coordinates(record.metadata, part)
+        if coordinates is None:
+            return self._unknown_employee_ingress_trust()
+        chat_id, _message_id, _root_id = coordinates
+        sender_id = part.get("sender_id")
+        if not isinstance(sender_id, str) or not sender_id:
+            return self._unknown_employee_ingress_trust()
+        group, grant = registry.trust_snapshot(chat_id)
+        return TrustZoneResolver(
+            owner_id=self._managed_group_owner_id,
+            managed_groups=(() if group is None else (group,)),
+            project_grants=(() if grant is None else (grant,)),
+            employee_bot_ids=self.trusted_employee_bot_open_ids(),
+        ).resolve(
+            sender_id=sender_id,
+            chat_id=chat_id,
+            chat_type=str(part.get("chat_type") or "group"),
+        )
 
     def _reconcile_recovered_activation_required_ingress(self) -> int:
         """Terminalize old Inbox records whose reply is unknown or rejected."""
@@ -2648,8 +2975,48 @@ class EmployeeDepartmentRuntime:
             payload = ingress.get_payload(acceptance_id)
         except Exception:
             return False
-        first = payload.normalized_parts[0] if len(payload.normalized_parts) == 1 else None
-        if isinstance(first, Mapping) and first.get("type") == "membership_event":
+        first = (
+            payload.normalized_parts[0]
+            if len(payload.normalized_parts) == 1
+            else None
+        )
+        is_membership_event = (
+            isinstance(first, Mapping)
+            and first.get("type") == "membership_event"
+        )
+        if is_membership_event:
+            remote_chat_id = first.get("remote_chat_id")
+            if not isinstance(remote_chat_id, str) or not self._membership_event_transport_is_current(
+                record.metadata,
+                remote_chat_id,
+            ):
+                try:
+                    ingress.record_disposition(
+                        acceptance_id,
+                        state="ignored",
+                        reason_code="membership_unmanaged",
+                    )
+                except IngressConflictError:
+                    pass
+                return True
+        if not is_membership_event:
+            try:
+                trust = self._managed_employee_ingress_trust(record, payload)
+            except Exception:
+                trust = self._unknown_employee_ingress_trust()
+            if trust is not None and trust.zone is not TrustZone.MANAGED_AGENT_GROUP:
+                try:
+                    ingress.record_disposition(
+                        acceptance_id,
+                        state="ignored",
+                        reason_code="authority_denied",
+                    )
+                except IngressConflictError:
+                    pass
+                return True
+            if trust is not None and trust.actor is ActorKind.EMPLOYEE:
+                return False
+        if is_membership_event:
             if self._membership is None:
                 try:
                     ingress.record_disposition(

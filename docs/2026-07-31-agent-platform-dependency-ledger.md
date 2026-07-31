@@ -147,7 +147,7 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 | 0.7 辅助 Agent 权限 | complete (`f69acc90`) | evidence-only | coordinator/classifier deny-all；不产生用户交互 |
 | 0.8 TrustZone/Actor/ActionMatrix | complete (`77a70c17`, fix `124749de`) | evidence-only | `ALLOW/DENY` only；Owner/Employee/unknown + stale revision |
 | 0.9 ManagedGroup Registry/lifecycle | partial | blocked: Employee rotation source | ACTIVE 早于 welcome；Project/Team 共用；tombstone/replay；principal CAS primitive complete，生产 rebind saga 缺事件源 |
-| 0.10 ingress/callback cutover | missing | active | trust 早于业务副作用；managed group 零 enrollment；external 零副作用 |
+| 0.10 ingress/callback cutover | complete | local acceptance | Registry trust 早于业务副作用；managed group 零 enrollment；external/unknown 零下游副作用；card revision fence |
 
 CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
 
@@ -470,6 +470,30 @@ CP-C-Managed 的关键证据：
 | E2 workload baseline | missing | deferred | 只保留 1 Direct + 1 Team + 1 Trigger restart/cancel smoke |
 | E3 backup/restore | missing | active | point-in-time restore；trust registry + grants；unknown 不重放 |
 | E4 direct enable/fallback | partial | folded → 0.10/C8 | 完成即启用；每子系统一个 emergency switch |
+
+### Task 0.10 evidence
+
+- Main-Bot message/card ingress now consumes Registry-backed `EffectiveTrust`
+  before content parsing, Ledger/image/project/classifier/scheduler/Slock/Shell,
+  and rechecks current revisions immediately before handler/ActionDispatcher.
+- Managed Owner and server-correlated Employee continuations reuse existing
+  routes without `/access`; unknown/external actors and stale callbacks are
+  silent and produce no downstream business effect. Host Shell/admin actions
+  are denied in managed groups through the production ActionMatrix.
+- Employee causality requires a server parent/root message bound to a terminal
+  Outbox delivery, exact READY employee/app/generation/connection, and anchored
+  collaboration publication. Membership events have an independent exact
+  transport/Registry gate and never infer principal rotation.
+- Static and session Card delivery stamps both group and grant revision. Startup
+  order is Registry reconcile → Registry-filtered Slock restore → Employee
+  recovery → membership audit → main WS.
+- Local evidence: focused + Resolver `35 passed`; brief contracts `33 passed`;
+  expanded Direct/ingress `163 passed`; protected
+  and card `94 passed`; autonomous adjacent `94 passed`; WS adjacent
+  `208 passed, 17 subtests passed`; Ruff and diff check pass.
+- Real tenant/mobile evidence remains `not_tested`. The deployment assumption is
+  still personal/single-primary-process. Task 0.9 Employee principal rotation
+  remains blocked and CP-T must not be read as multi-tenant production proof.
 | E5 Owner E2E checklist | missing | active | managed group 零提示、external 零执行、explicit action 不二次确认 |
 
 ## Completion record requirements

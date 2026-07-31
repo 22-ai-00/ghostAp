@@ -21,6 +21,7 @@ from ...card.ui_text import UI_TEXT
 from ...utils.engine_identity import resolve_engine_identity
 from ...utils.errors import get_error_detail
 from ..im_client import FeishuIMClient
+from ..ws_card_action_handler import bind_managed_trust_revisions
 
 
 @_dataclass
@@ -222,7 +223,15 @@ class BaseHandler:
                     self._resolve_origin(target)
                 ),
             )
-            self._card_delivery = create_card_delivery(api_client)
+            self._card_delivery = create_card_delivery(
+                api_client,
+                payload_transform=lambda chat_id, payload: (
+                    self._bind_managed_card_revisions(
+                        payload,
+                        chat_id=chat_id,
+                    )
+                ),
+            )
         return self._card_delivery
 
     def _resolve_origin(self, message_id: str) -> str:
@@ -263,6 +272,47 @@ class BaseHandler:
         ):
             aliases.append(sender_id)
         return tuple(aliases)
+
+    def _bind_managed_card_revisions(
+        self,
+        card_content: Any,
+        *,
+        chat_id: str = "",
+        origin_message_id: str = "",
+    ) -> Any:
+        registry = getattr(self.ctx, "managed_group_registry", None)
+        if registry is None:
+            return card_content
+        if not chat_id and origin_message_id:
+            try:
+                provenance = self.ctx.message_linker.query(origin_message_id)
+            except Exception:
+                provenance = None
+            if isinstance(provenance, Mapping):
+                candidate = provenance.get("chat_id")
+                chat_id = candidate if isinstance(candidate, str) else ""
+        if not chat_id:
+            return card_content
+        try:
+            group, grant = registry.trust_snapshot(chat_id)
+        except Exception:
+            logger.warning("managed card trust snapshot unavailable", exc_info=True)
+            return card_content
+        if group is None or grant is None:
+            return card_content
+        raw = card_content
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                return card_content
+        if not isinstance(raw, dict):
+            return card_content
+        return bind_managed_trust_revisions(
+            raw,
+            group_revision=group.revision,
+            grant_revision=grant.revision,
+        )
 
     # ------------------------------------------------------------------
     # Messaging API
@@ -348,6 +398,10 @@ class BaseHandler:
         audit_aliases = self._reply_audit_aliases(origin)
         request_id = self.ensure_request_id(origin)
         ref_note = self.format_ref_note(origin, request_id, None)
+        card_content = self._bind_managed_card_revisions(
+            card_content,
+            origin_message_id=origin,
+        )
         content_str = self._inject_ref_note(card_content, "interactive", ref_note)
 
         if reply_in_thread is None:
@@ -382,8 +436,12 @@ class BaseHandler:
             No exceptions raised; errors are logged and False is returned.
         """
         try:
-            content_str = self._normalize_interactive_card_content(card_content)
             origin = self._resolve_origin(message_id)
+            card_content = self._bind_managed_card_revisions(
+                card_content,
+                origin_message_id=origin,
+            )
+            content_str = self._normalize_interactive_card_content(card_content)
             response = self.im_client.patch_message(
                 message_id,
                 content_str,
@@ -418,6 +476,11 @@ class BaseHandler:
             No exceptions raised; errors are logged and None is returned.
         """
         try:
+            card_content = self._bind_managed_card_revisions(
+                card_content,
+                chat_id=chat_id,
+                origin_message_id=origin_message_id or "",
+            )
             ref_note = self.format_ref_note(origin_message_id, request_id, None)
             content_str = self._inject_ref_note(card_content, "interactive", ref_note)
             response = self.im_client.send_message(

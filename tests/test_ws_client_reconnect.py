@@ -222,7 +222,7 @@ def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
     monkeypatch.setattr(
         ws.SlockEngineManager,
         "restore_from_disk",
-        lambda self, root: 0,
+        lambda self, root, **_kwargs: 0,
     )
     slash_sync_starts = []
     monkeypatch.setattr(
@@ -238,6 +238,7 @@ def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
         membership_service=SimpleNamespace(
             reconcile_projected_memberships=lambda: membership_audits.append(True)
         ),
+        recover=lambda: None,
         close=lambda: None,
     )
 

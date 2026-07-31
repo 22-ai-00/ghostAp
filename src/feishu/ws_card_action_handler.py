@@ -5,9 +5,43 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
+
+
+def bind_managed_trust_revisions(
+    card: dict[str, Any],
+    *,
+    group_revision: int,
+    grant_revision: int,
+) -> dict[str, Any]:
+    """Copy a card and stamp every callback value with issued revisions."""
+
+    if type(group_revision) is not int or group_revision < 1:
+        raise ValueError("group_revision must be positive")
+    if type(grant_revision) is not int or grant_revision < 1:
+        raise ValueError("grant_revision must be positive")
+    bound = deepcopy(card)
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in tuple(value.items()):
+                if (
+                    key == "value"
+                    and isinstance(child, dict)
+                    and ("action" in child or "action_id" in child)
+                ):
+                    child["group_revision"] = group_revision
+                    child["grant_revision"] = grant_revision
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(bound)
+    return bound
 
 
 def _extract_behavior_value(behavior: Any) -> Any:
@@ -174,6 +208,18 @@ class CardActionInspector:
     def project_id(cls, action: Any) -> Optional[str]:
         project_id = cls.value_dict(action).get("project_id")
         return project_id if isinstance(project_id, str) and project_id else None
+
+    @classmethod
+    def trust_revisions(cls, action: Any) -> tuple[int | None, int | None]:
+        """Extract an optional immutable managed-group revision snapshot."""
+
+        value = cls.value_dict(action)
+
+        def revision(name: str) -> int | None:
+            item = value.get(name)
+            return item if type(item) is int and item > 0 else None
+
+        return revision("group_revision"), revision("grant_revision")
 
     @classmethod
     def is_system_action(cls, action: Any) -> bool:

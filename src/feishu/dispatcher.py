@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:
     from ..agent.intent_recognizer import IntentResult, TaskStep
     from ..project import ProjectContext
+    from ..trust.models import EffectiveTrust
 
 
 from ..agent.intent_recognizer import IntentRecognizer, IntentType
@@ -61,6 +62,7 @@ class FeishuRequestContext:
     command_match: CommandMatch | None = None
     shell_fast_tracked: bool = False
     chat_type: str = "group"
+    effective_trust: Optional['EffectiveTrust'] = None
 
 
 class MessageDispatcher:
@@ -135,6 +137,7 @@ class MessageDispatcher:
             command_match=request.command_match,
             shell_fast_tracked=request.shell_fast_tracked,
             chat_type=request.chat_type,
+            effective_trust=request.effective_trust,
         )
 
     def process_with_intent(
@@ -147,9 +150,27 @@ class MessageDispatcher:
         command_match: CommandMatch | None = None,
         shell_fast_tracked: bool = False,
         chat_type: str = "group",
+        effective_trust: Optional['EffectiveTrust'] = None,
     ):
         """SMART mode routing logic."""
+        if effective_trust is not None:
+            from ..trust.models import TrustZone
+
+            if effective_trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP:
+                return
         from .slash_command_parser import SlashCommandParser
+
+        if command_match is None and (text or "").strip().startswith("/"):
+            command_match = SlashCommandParser.parse(text)
+        if (
+            command_match is not None
+            and command_match.command in {"/access", "/setadmin", "/hire", "/fire"}
+            and not self._action_matrix_allows(
+                effective_trust,
+                action_name="grant_admin",
+            )
+        ):
+            return
 
         _pid = project.project_id if project else None
         current_mode, is_in_programming = self.client._get_effective_mode(chat_id, project_id=_pid)
@@ -158,8 +179,6 @@ class MessageDispatcher:
         )
         slock_context_allowed = not is_in_programming and not is_topic_engine_context
         slock_auto_activate_allowed = slock_context_allowed and project is None
-        if command_match is None and (text or "").strip().startswith("/"):
-            command_match = SlashCommandParser.parse(text)
 
         # Control-plane commands: handle consistently in all modes
         if self.client._is_deep_command(text):
@@ -423,6 +442,11 @@ class MessageDispatcher:
         except (RuntimeError, TimeoutError, ValueError, TypeError) as e:
             classification = classify_dispatch_error(e, phase="intent_recognition")
             if classification.action == DispatchErrorAction.FALLBACK_TO_SHELL:
+                if not self._action_matrix_allows(
+                    effective_trust,
+                    action_name="host_shell",
+                ):
+                    return
                 logger.warning("意图识别异常，回退到 shell: %s", get_error_detail(e))
                 working_dir = self.client._get_working_dir(chat_id)
                 self.client._submit_shell_command(message_id, chat_id, text, working_dir, project)
@@ -447,16 +471,62 @@ class MessageDispatcher:
         )
 
         if intent_result.is_multi_task:
+            if any(
+                task.intent is IntentType.SHELL_COMMAND
+                for task in intent_result.tasks
+            ) and not self._action_matrix_allows(
+                effective_trust,
+                action_name="host_shell",
+            ):
+                return
             self.execute_multi_tasks(message_id, chat_id, intent_result, project)
         else:
+            task = intent_result.tasks[0] if intent_result.tasks else None
+            if (
+                task is not None
+                and task.intent is IntentType.SHELL_COMMAND
+                and not self._action_matrix_allows(
+                    effective_trust,
+                    action_name="host_shell",
+                )
+            ):
+                return
             self.execute_single_task(
                 message_id,
                 chat_id,
-                intent_result.tasks[0] if intent_result.tasks else None,
+                task,
                 text,
                 project,
                 shell_fast_tracked=shell_fast_tracked,
             )
+
+    @staticmethod
+    def _action_matrix_allows(
+        effective_trust: Optional['EffectiveTrust'],
+        *,
+        action_name: str,
+    ) -> bool:
+        if effective_trust is None:
+            return True
+        from ..trust.action_matrix import ActionMatrix
+        from ..trust.models import (
+            ActionDecision,
+            ActionKind,
+            ActionRequest,
+            ActionTargetKind,
+        )
+
+        action = {
+            "grant_admin": ActionKind.GRANT_ADMIN,
+            "host_shell": ActionKind.HOST_SHELL,
+        }[action_name]
+        return ActionMatrix().decide(
+            ActionRequest(
+                trust=effective_trust,
+                action=action,
+                target=ActionTargetKind.HOST_GLOBAL,
+            )
+        ) is ActionDecision.ALLOW
 
     def execute_multi_tasks(
         self, message_id: str, chat_id: str, intent_result: 'IntentResult', project: Optional['ProjectContext'] = None
