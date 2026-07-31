@@ -6,6 +6,14 @@ statements continue to work without modification.
 
 from .card import CardSessionConfig
 from .errors import ConfigurationError
+from .security_posture import (
+    IngressAccessMode,
+    SecurityFinding,
+    SecurityPosture,
+    SecuritySeverity,
+    ShellAccessMode,
+    evaluate_security_posture,
+)
 from .settings import Settings
 from .singleton import (
     _post_validate_warnings,
@@ -18,8 +26,14 @@ from .spec import SpecReviewConfig
 __all__ = [
     "CardSessionConfig",
     "ConfigurationError",
+    "IngressAccessMode",
+    "SecurityFinding",
+    "SecurityPosture",
+    "SecuritySeverity",
     "Settings",
+    "ShellAccessMode",
     "SpecReviewConfig",
+    "evaluate_security_posture",
     "get_settings",
     "set_settings",
     "_post_validate_warnings",

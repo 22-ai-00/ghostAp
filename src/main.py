@@ -7,10 +7,20 @@ import threading
 from typing import Optional
 
 try:
-    from config import ConfigurationError, get_settings
+    from config import (
+        ConfigurationError,
+        SecuritySeverity,
+        evaluate_security_posture,
+        get_settings,
+    )
     from utils.errors import get_error_detail
 except ImportError:
-    from .config import ConfigurationError, get_settings
+    from .config import (
+        ConfigurationError,
+        SecuritySeverity,
+        evaluate_security_posture,
+        get_settings,
+    )
     from .utils.errors import get_error_detail
 
 logger = logging.getLogger(__name__)
@@ -73,13 +83,13 @@ def _get_version() -> str:
     return ""
 
 
-def _print_validate_summary(settings) -> None:
+def _print_validate_summary(settings):
     """Print structured --validate summary with version, groups, and units."""
     version = _get_version()
     if version:
-        print(f"GhostAP v{version} 配置校验通过")
+        print(f"GhostAP v{version} 配置校验")
     else:
-        print("GhostAP 配置校验通过")
+        print("GhostAP 配置校验")
     print()
 
     # Group 1: 会话超时
@@ -112,6 +122,25 @@ def _print_validate_summary(settings) -> None:
     print(f"  CARD_MAX_CHARS                 = {settings.card.max_chars} chars")
     print(f"  CARD_SESSION_LOCK_TTL          = {_format_duration(int(settings.card.session_lock_ttl))}")
     print(f"  CARD_SESSION_LOCK_MAX          = {settings.card.session_lock_max}")
+    print()
+
+    posture = evaluate_security_posture(settings)
+    print("[安全姿态]")
+    print(f"  INGRESS_ACCESS_MODE = {posture.ingress_mode.value}")
+    print(f"  SHELL_ACCESS_MODE   = {posture.shell_mode.value}")
+    print(
+        "  EMPLOYEE_DEPARTMENT = "
+        f"{'enabled' if posture.employee_department_enabled else 'disabled'}"
+    )
+    if posture.findings:
+        for finding in posture.findings:
+            print(
+                f"  [{finding.severity.value}] {finding.code}: "
+                f"{finding.message}"
+            )
+    else:
+        print("  [info] no_security_findings")
+    return posture
 
 
 class Application:
@@ -294,7 +323,21 @@ def main(argv: Optional[list[str]] = None) -> None:
                     f"{'=' * 40}\n"
                 )
                 sys.exit(1)
-            _print_validate_summary(settings)
+            posture = _print_validate_summary(settings)
+            if not posture.is_valid:
+                blocking_codes = ", ".join(
+                    finding.code
+                    for finding in posture.findings
+                    if finding.severity is SecuritySeverity.BLOCKING
+                )
+                sys.stderr.write(
+                    f"{'=' * 40}\n[配置校验失败]\n"
+                    "安全姿态存在阻断项: "
+                    f"{blocking_codes}\n{'=' * 40}\n"
+                )
+                sys.exit(1)
+            print()
+            print("配置校验通过")
             sys.exit(0)
         except ConfigurationError as e:
             sys.stderr.write(f"{'=' * 40}\n[配置校验失败]\n{e}\n{'=' * 40}\n")

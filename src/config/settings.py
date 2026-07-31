@@ -91,6 +91,20 @@ class Settings(BaseSettings):
     sandbox_command_blacklist: str = ""
     sandbox_use_whitelist: bool = False
     sandbox_command_whitelist: str = ""
+    ingress_access_mode: Literal[
+        "enforced", "shadow", "legacy_allow_all"
+    ] = "enforced"
+    admin_bootstrap_scope: Literal["any_chat", "p2p_only"] = "p2p_only"
+    shell_access_mode: Literal[
+        "disabled", "admin_dm", "allowlisted", "isolated", "trusted_local"
+    ] = "disabled"
+    shell_trusted_local_ack: bool = False
+    employee_department_enabled: bool = False
+    employee_group_context_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=3650,
+    )
 
     # 允许 set_working_dir 切换到的根目录列表
     # 校验时会通过 realpath 解析 symlink，所以 ~/work 能匹配 /data00/home/x/work

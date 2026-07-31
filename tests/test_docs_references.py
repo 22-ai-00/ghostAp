@@ -92,3 +92,43 @@ def test_readme_card_tree_documents_current_pipeline_directories() -> None:
 
     old_card_summary = "CardBuilder（schema 2.0）" + "+ 流式更新 + 统一布局"
     assert old_card_summary not in text
+
+
+def test_public_positioning_matches_agent_department_contract() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    contract = (ROOT / "docs" / "product-contract.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Agent Department" in readme
+    assert "主 Bot 是控制面" in readme
+    assert "provider/transport" in readme
+    assert (
+        'description = "飞书原生 Agent Department 控制面与研发执行网关"'
+        in pyproject
+    )
+    for boundary in (
+        "Main Bot: control plane",
+        "Employee Bot: execution identity",
+        "Host Shell: privileged host execution",
+        "single-host and file-backed",
+        "Direct programming keeps the selected Agent",
+    ):
+        assert boundary in contract
+
+
+def test_public_docs_do_not_promise_rejected_hire_prompt() -> None:
+    public = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "README.md", ROOT / "docs" / "product-contract.md")
+    )
+    fenced_blocks = "\n".join(
+        match.group(1)
+        for match in re.finditer(r"```[^\n]*\n(.*?)```", public, re.DOTALL)
+    )
+    assert re.search(
+        r"(?im)^\s*/hire\b[^\n]*\s--prompt(?:\s|=|$)",
+        fenced_blocks,
+    ) is None
+    assert "Arbitrary `/hire --prompt` input is rejected." in public

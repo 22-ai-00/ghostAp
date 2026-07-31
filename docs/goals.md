@@ -1,4 +1,14 @@
-你需要继续完成 GhostAP 的长期开发目标。不要从头重做，也不要把局部模块、自动化测试或安全脚手架误认为整个目标已经完成。
+# GhostAP 长期目标与历史执行上下文
+
+> 当前公开产品定位以
+> [`docs/product-contract.md`](./product-contract.md) 为唯一权威：GhostAP 是面向
+> 受信工程环境的飞书/Lark 原生 Agent Department Gateway。主 Bot 是控制面，
+> Employee Bot 是独立执行身份；provider/transport 可替换；Host Shell 是必须关闭
+> 或显式授权的特权宿主执行能力，不是操作系统沙箱。内置员工档案仅承诺单机、
+> 文件持久化，不承诺多副本线性一致性或对特权宿主机的回滚抵抗。
+
+以下内容保留长期目标和历史执行证据。继续开发时不要从头重做，也不要把局部模块、
+自动化测试或安全脚手架误认为整个目标已经完成。
 
   工作目录：
   /data00/home/jiataorui/work/github/ghostAp
@@ -60,8 +70,8 @@
   - `/hire` 不再降级写入 `AgentRegistry.legacy()`；`/new-role` 继续只负责 Slock 虚拟角色。没有 production service 或 readiness 时必须 fail-close。
   - 旧的独立 Autonomous Manager 命令面（`/goal`、`/goals`、`/run`、`/runs`、
     `/approve`、`/approvals`、`/decisions`）不再作为生产入口，已明确退役并 fail-close；
-    自主目标从 Journal-backed Employee/Slock 团队入口 `/goal <描述>` 创建。兼容模块可导入不代表
-    它已接入消息调度器。
+    当前工作从 Employee Bot 的 `/task` 或 Slock 团队入口进入。兼容模块可导入不代表
+    旧目标命令已接入消息调度器。
   - `/hire` 管理员 DM 卡片权限 Bug 已修复：消息事件入口保存官方 `event.message.chat_type` 与 origin/chat/operator；卡片回调不再读取不存在的 `context.chat_type`。只有服务端明确无 provenance 记录时才查询 Chat API，并且只读结构字段 `chat_mode`；API 结果必须原子写回完整可信绑定。来源查询/写入失败、残缺、过期、跨 chat、跨 operator 或并发冲突均 fail-close。
   - readiness 反馈已接入处理器：只有 provider 明确返回 `ready=True` 且无 blockers 才派发真实 Hire；否则向管理员显示具体安全门禁，不再误报“不是管理员”，也不降级创建本地虚拟角色。
   - Visible Employee 已改为内置启动能力：默认 `autonomous_visible_employee_limit=8`，不再需要 root-owned release broker、evidence/attestation、release binding 或人工 sandbox 标记。首次启动在 `AUTONOMOUS_STATE_DIR` 下创建 mode `0600` 的本地密钥；显式设为 `0` 仍可完全关闭员工 runtime。

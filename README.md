@@ -1,25 +1,35 @@
 # GhostAP
 
-GhostAP 是一个飞书/Lark 机器人服务，用聊天界面驱动本地项目中的 Shell、AI 编程工具和多 Agent 编排。它通过飞书长连接接收消息，不要求本机暴露公网地址，适合把日常研发命令、代码修改和长任务执行接入到团队聊天里。
+GhostAP 是一个面向受信工程环境的飞书/Lark 原生 Agent Department
+Gateway。主 Bot 是控制面，负责项目、员工、团队、任务、审批和审计；员工 Bot
+是拥有独立 Channel、历史、记忆和停止语义的执行身份。底层
+provider/transport、模型和执行引擎均可替换，普通编程仍可直接连接用户选定的
+Agent。
+
+完整边界以 [产品合同](docs/product-contract.md) 为准。
 
 ## 核心能力
 
-- **远程 Shell**：在当前项目目录执行命令，带超时、输出截断、黑名单和可选白名单。
-- **多工具编程会话**：支持 Coco、Claude、Aiden、Codex、Gemini、Traex、TTADK 和 TUI2ACP 等后端，普通会话可持续多轮对话。
-- **长任务引擎**：Deep、Spec、Worktree、Workflow 和 Slock 覆盖从单次自主执行到结构化闭环、并行 worktree 和群内多 Agent 协作。
-- **自主工作内核（v5，生产接线中）**：基于持久化 Journal 实现目标、计划、效果追踪和安全门禁；当前飞书控制入口尚未接入执行运行时。
-- **飞书卡片进度**：任务状态、计划、工具调用、模型选择和错误诊断通过卡片持续更新。
-- **多项目隔离**：每个聊天可绑定不同项目目录；会话、线程上下文、锁和持久化状态按项目隔离。
-- **并发保护**：包含 chat 锁、repo 锁、任务调度队列和锁顺序检查，避免多个聊天同时改同一个仓库。
+| 能力 | 产品边界 |
+| --- | --- |
+| 主 Bot 控制面 | 管理项目、员工、团队、任务、审批和审计，不冒充员工输出 |
+| 直接编程 | Coco、Claude、Aiden、Codex、Gemini、Traex、TTADK、TUI2ACP 等后端保持多轮直连 |
+| Agent Department | 持久员工拥有独立飞书 Bot、Channel、历史、记忆和停止语义 |
+| 专项与编排策略 | Deep、Spec、Worktree、Workflow、Team/Slock 分别承接成熟专项执行与开发中的多 Agent 协作 |
+| 飞书交互 | 卡片持续展示任务状态、工具调用、模型选择和错误诊断 |
+| Host Shell | 特权宿主机执行，只能关闭或显式授权；超时、截断和命令过滤不构成操作系统沙箱 |
+| 本地持久化 | Journal、Vault、Blob 和项目状态面向单机文件存储，不承诺多副本线性一致性或对特权宿主机的回滚抵抗 |
 
 ## 运行模型
 
-GhostAP 把“执行策略”和“工具传输”拆开：
+GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 
 | 维度 | 说明 |
 | --- | --- |
-| 执行策略 | Smart、Shell、普通编程、Deep、Spec、Worktree、Workflow、Slock；Autonomous 内核尚未接入生产消息控制面 |
-| 工具传输 | ACP 直接模式、Shell CLI 桥接、TTADK CLI 桥接 |
+| 产品身份 | 主 Bot 是控制面；Employee Bot 是独立执行身份 |
+| 执行策略 | Smart、普通编程、Deep、Spec、Worktree、Workflow、Team/Slock |
+| provider/transport | ACP 直接模式、Shell CLI 桥接、TTADK CLI 桥接 |
+| Host Shell | 独立的特权宿主执行能力，不是 Agent provider，也不是操作系统沙箱 |
 
 普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec、Worktree 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
 
@@ -82,6 +92,11 @@ APP_ID=your_app_id
 APP_SECRET=your_app_secret
 DEFAULT_ACP_TOOL=coco
 ADMIN_USER_IDS=
+INGRESS_ACCESS_MODE=enforced
+ADMIN_BOOTSTRAP_SCOPE=p2p_only
+SHELL_ACCESS_MODE=disabled
+EMPLOYEE_DEPARTMENT_ENABLED=false
+EMPLOYEE_GROUP_CONTEXT_RETENTION_DAYS=30
 ```
 
 常用配置：
@@ -104,6 +119,11 @@ TTADK_DEFAULT_MODEL=
 SLOCK_DEFAULT_ROLES=planner:claude,coder:codex,reviewer:claude,tester:codex
 ```
 
+这些字段构成显式安全姿态：空授权列表不代表公开访问；Host Shell 默认关闭；
+Employee Department 必须单独启用，并为群上下文设置有界保留期。`shadow`、
+`legacy_allow_all` 和 `trusted_local` 只用于显式诊断或紧急回退，校验输出会用稳定
+finding code 标出未强制执行或未确认的风险。
+
 更多参数见 `.env.example` 和 `src/config/settings.py`。各 AI 后端所需的密钥、登录态或 CLI 配置应按对应工具自己的方式准备，GhostAP 只读取必要的环境变量和本地命令。
 
 ### 校验并启动
@@ -112,6 +132,9 @@ SLOCK_DEFAULT_ROLES=planner:claude,coder:codex,reviewer:claude,tester:codex
 uv run python -m src.main --validate
 uv run python -m src.main
 ```
+
+`--validate` 会输出 `[安全姿态]`；存在 blocking finding 时返回非零，必须先修正
+配置或准备隔离后端。
 
 首次启动后，可在飞书私聊机器人发送 `/setadmin` 设置管理员。`ADMIN_USER_IDS` 为空时允许首次设置；设置后只有管理员可以替换管理员配置。
 
@@ -155,7 +178,9 @@ PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就�
 | `/acp` | 查看 ACP 工具选择入口 |
 | `/exit` | 退出当前模式，回到 Smart |
 
-Shell 不需要单独入口；在 Smart 模式中直接发送 `ls`、`git status`、`uv run ...` 等命令即可执行。`DEFAULT_ACP_TOOL` 留空时，未匹配文本也会回退到 Shell。
+Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文本会进入宿主机
+执行路径。它是特权能力而非操作系统沙箱，按产品合同必须关闭或由授权用户显式
+启用；黑白名单、超时和输出截断只是附加防护。
 
 ### 项目
 
@@ -181,36 +206,39 @@ Shell 不需要单独入口；在 Smart 模式中直接发送 `ls`、`git status
 | `/slock`、`/new-team <名称>` | 启用或创建 Slock 多 Agent 团队 |
 | `/slock status`、`/task status`、`/new-role <名称>`、`/team dissolve <名称>` | 管理 Slock 团队 |
 
-### 自主工作系统（Autonomous）
+### Agent Department（持久数字员工）
 
 | 命令 | 作用 |
 | --- | --- |
-| `/hire <名字>` | 雇佣新数字员工（全局，不需要先建群） |
-| `/hire <名字> --tool codex --model o3-pro --prompt <约束>` | 带参数雇佣 |
-| `/goal <描述>` | 创建新的自主目标并启动执行 |
-| `/goals` | 列出当前租户的所有目标 |
-| `/runs` | 列出所有运行中的 Run |
-| `/approve <id>` | 批准待审批操作 |
+| `/hire <名字>` | 由配置管理员在主 Bot 私聊中雇佣持久数字员工 |
+| `/hire <名字> --tool codex --model <模型> --role coder` | 使用受控参数发起雇佣 |
+| `/employees` | 查看在职数字员工 |
+| `/fire <名字>` | 退役持久数字员工 |
+| `/history <名字>`、`/employee-memory <名字>` | 由主 Bot 管理员读取授权范围内的员工历史或记忆 |
 
 **雇佣数字员工流程（/hire）：**
 
-1. 发送 `/hire 小明` — 弹出工具选择卡片（复用 ACP 工具发现，与 Deep/Spec/Workflow 一致）
-2. 选择工具（traex/coco/claude/codex/gemini）— 弹出模型选择卡片（复用 ACP 模型发现）
-3. 选择模型 — 员工创建完成，作为飞书 bot 智能体注册到本地
+1. 配置管理员在主 Bot 私聊发送 `/hire 小明`，打开工具和模型选择卡片。
+2. 选择后启动 Journal-backed 雇佣流程，并按返回的飞书注册链接完成应用创建。
+3. 凭据写入加密 Vault，独立 Channel、Slash Commands 和身份校验全部就绪后，
+   员工才进入可用状态；等待或失败不会被报告成创建成功。
 
 可选参数直接写在命令行跳过卡片交互：
+
 ```
-/hire 小明 --tool codex --model o3-pro --role coder --prompt “专注后端开发，注重代码质量”
+/hire 小明 --tool codex --model <模型名> --role coder --profile standard --effort default
 ```
 
 员工创建后：
-- 本地持久化为 `identity.json`（名字、工具、模型、约束、记忆路径）
-- 可被邀请加入 slock 群组参与协作
-- 群内可通过 @员工名 分配任务
-- 如不设 `--prompt` 约束，后续通过交互慢慢养成记忆
 
-**注：** `/goal`、`/runs`、`/approve` 等自主内核命令已接入路由但尚未连接生产运行时，
-会明确回复”未接入”状态，不会伪造成功。`/status` 保留为 Deep/Spec 诊断命令。
+- Journal、加密 Blob/Vault 是事实源，`identity.json` 仅是可安全重建的投影，不含密钥。
+- 员工使用自己的 Bot 接收任务、更新卡片和返回结果，不回退到主 Bot 代发。
+- 员工可加入 Slock 团队；在员工 Bot 中使用 `/task`、`/status`、`/history`、
+  `/memory` 和 `/stop` 管理其工作。
+- `/hire` 拒绝任意提示词注入；工作风格由受控 role/profile 与持久上下文形成。
+
+旧的独立 Autonomous Manager 命令面已经退役并默认拒绝，不是 Agent Department
+的生产入口。
 
 Workflow 使用三步流程：选择主编排 Agent、选择评审 Agent 或 Auto、确认后自动生成并执行脚本。内置原语包括 `agent()`、`sequence()`、`fanout()`、`verify()`、`generate()`、`tournament()`、`loop()` 和 `race()`，并由运行时限制总 agent 数、嵌套深度和危险脚本能力。
 
@@ -245,9 +273,11 @@ handler -> session -> render
 
 渲染层保持纯函数；投递层不反向依赖会话层。跨层共享类型放在 `src/card/protocols.py` 或 `src/card/events/`。
 
-## 自主工作系统架构（src/autonomous/）
+## Agent Department 耐久架构（src/autonomous/）
 
-v5 自主工作系统使用 Journal-backed 持久化架构，所有状态变更通过事务帧记录，支持崩溃恢复和重放。
+生产 Employee Department 使用 Journal-backed 持久化架构，所有状态变更通过
+事务帧记录，并通过 Vault、Blob、独立员工 Channel 和 Durable Outbox 完成恢复。
+旧 Autonomous Manager 的目标/Run 命令模块仅保留兼容导入，不构成生产产品入口。
 
 ```text
 src/autonomous/
@@ -272,19 +302,20 @@ src/autonomous/
 ```
 
 **关键依赖：**
-- `lark-oapi==1.6.5`：REST API 消息发送、卡片更新、机器人管理
+- `lark-oapi==1.7.1`：REST API 消息发送、卡片更新、机器人管理
 - `lark-channel-sdk==1.1.0`：WebSocket 事件订阅（持久收件箱）
 
 **测试：**
 
 ```bash
-uv run pytest tests/autonomous/ -q        # 577+ 测试
+uv run python -m pytest tests/autonomous/ -q
 uv run ruff check src/autonomous/         # 0 错误
 ```
 
 ## 安全与运维
 
-- Shell 执行经过沙箱检查，支持黑名单、白名单、超时和输出截断。
+- Host Shell 是特权宿主机执行，不是操作系统沙箱；仅限受信工程主机，并且必须
+  保持关闭或由授权用户显式开启。命令过滤、超时和输出截断不提升隔离等级。
 - 飞书消息有过期检查和去重缓存，避免重复执行。
 - ACP 工具调用通过权限钩子处理，可配置自动批准或默认拒绝。
 - 仓库操作受 repo 锁保护，群聊访问可由管理员锁定。
