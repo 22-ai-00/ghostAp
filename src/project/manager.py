@@ -49,6 +49,7 @@ class ManagedChatBindingSaga:
     expected_receiving_bot_ref: str = ""
     expected_root_ref: str = ""
     remove_project_on_restore: bool = False
+    displaced_legacy_operation_id: str = ""
 
 
 class ProjectManager:
@@ -707,7 +708,6 @@ class ProjectManager:
                 return False, None
             existing_saga = self._managed_chat_binding_sagas.get(operation_id)
             replaced_legacy_saga = None
-            replaced_legacy_residual = None
             if existing_saga is not None:
                 if (
                     existing_saga.project_id != project_id
@@ -734,6 +734,11 @@ class ProjectManager:
                         and project_sagas[0].expected is None
                         and project_sagas[0].chat_id == chat_id
                         and project_sagas[0].expected_root_ref == project.root_path
+                        and self._managed_group_residuals.get(
+                            project_sagas[0].operation_id
+                        )
+                        == (chat_id, "legacy_saga_resolution_required")
+                        and chat_id in self._quarantined_bound_chat_ids
                     ):
                         replaced_legacy_saga = project_sagas[0]
                     else:
@@ -750,15 +755,6 @@ class ProjectManager:
                 project.add_chat_id(additional_chat_id)
             expected = self._binding_snapshot(project)
             if operation_id:
-                if replaced_legacy_saga is not None:
-                    self._managed_chat_binding_sagas.pop(
-                        replaced_legacy_saga.operation_id,
-                        None,
-                    )
-                    replaced_legacy_residual = self._managed_group_residuals.pop(
-                        replaced_legacy_saga.operation_id,
-                        None,
-                    )
                 self._managed_chat_binding_sagas[operation_id] = (
                     ManagedChatBindingSaga(
                         operation_id=operation_id,
@@ -771,10 +767,16 @@ class ProjectManager:
                         expected_receiving_bot_ref=expected_receiving_bot_ref,
                         expected_root_ref=project.root_path,
                         remove_project_on_restore=remove_project_on_restore,
+                        displaced_legacy_operation_id=(
+                            replaced_legacy_saga.operation_id
+                            if replaced_legacy_saga is not None
+                            else ""
+                        ),
                     )
                 )
             was_quarantined = chat_id in self._quarantined_bound_chat_ids
-            self._quarantined_bound_chat_ids.discard(chat_id)
+            if replaced_legacy_saga is None:
+                self._quarantined_bound_chat_ids.discard(chat_id)
             try:
                 if self._save_projects():
                     return True, snapshot
@@ -791,14 +793,6 @@ class ProjectManager:
                 self._quarantined_bound_chat_ids.add(chat_id)
             if operation_id and existing_saga is None:
                 self._managed_chat_binding_sagas.pop(operation_id, None)
-            if replaced_legacy_saga is not None:
-                self._managed_chat_binding_sagas[
-                    replaced_legacy_saga.operation_id
-                ] = replaced_legacy_saga
-                if replaced_legacy_residual is not None:
-                    self._managed_group_residuals[
-                        replaced_legacy_saga.operation_id
-                    ] = replaced_legacy_residual
             self._rebuild_bound_chat_index()
             return False, None
 
@@ -899,10 +893,46 @@ class ProjectManager:
             project = self._projects.get(saga.project_id)
             if project is None or not self._saga_matches_project(saga, project):
                 return self._quarantine_saga_locked(saga, project)
+            displaced = None
+            displaced_residual = None
+            displaced_was_quarantined = False
+            if saga.displaced_legacy_operation_id:
+                displaced = self._managed_chat_binding_sagas.get(
+                    saga.displaced_legacy_operation_id
+                )
+                displaced_residual = self._managed_group_residuals.get(
+                    saga.displaced_legacy_operation_id
+                )
+                if (
+                    displaced is None
+                    or displaced.expected is not None
+                    or displaced.project_id != saga.project_id
+                    or displaced.chat_id != saga.chat_id
+                    or displaced.expected_root_ref != saga.expected_root_ref
+                    or displaced_residual
+                    != (saga.chat_id, "legacy_saga_resolution_required")
+                    or saga.chat_id not in self._quarantined_bound_chat_ids
+                ):
+                    return self._quarantine_saga_locked(saga, project)
             previous = self._managed_chat_binding_sagas.pop(operation_id)
+            if displaced is not None:
+                self._managed_chat_binding_sagas.pop(displaced.operation_id)
+                self._managed_group_residuals.pop(displaced.operation_id)
+                displaced_was_quarantined = (
+                    displaced.chat_id in self._quarantined_bound_chat_ids
+                )
+                self._quarantined_bound_chat_ids.discard(displaced.chat_id)
             if self._save_projects():
                 return True
             self._managed_chat_binding_sagas[operation_id] = previous
+            if displaced is not None:
+                self._managed_chat_binding_sagas[displaced.operation_id] = displaced
+                if displaced_residual is not None:
+                    self._managed_group_residuals[
+                        displaced.operation_id
+                    ] = displaced_residual
+                if displaced_was_quarantined:
+                    self._quarantined_bound_chat_ids.add(displaced.chat_id)
             return False
 
     def managed_chat_binding_saga(self, operation_id: str) -> ManagedChatBindingSaga | None:
@@ -1174,6 +1204,9 @@ class ProjectManager:
                         "expected_owner_id": saga.expected_owner_id,
                         "expected_receiving_bot_ref": saga.expected_receiving_bot_ref,
                         "expected_root_ref": saga.expected_root_ref,
+                        "displaced_legacy_operation_id": (
+                            saga.displaced_legacy_operation_id
+                        ),
                     }
                     for operation_id, saga in sorted(
                         self._managed_chat_binding_sagas.items()
@@ -1320,6 +1353,20 @@ class ProjectManager:
                             "expected_root_ref",
                         }
                     ),
+                    frozenset(
+                        {
+                            "chat_id",
+                            "project_id",
+                            "remove_project_on_restore",
+                            "snapshot",
+                            "expected",
+                            "expected_origin",
+                            "expected_owner_id",
+                            "expected_receiving_bot_ref",
+                            "expected_root_ref",
+                            "displaced_legacy_operation_id",
+                        }
+                    ),
                 }:
                     raise ValueError("invalid managed chat binding saga")
                 snapshot = value["snapshot"]
@@ -1368,6 +1415,9 @@ class ProjectManager:
                     or not isinstance(chat_id, str)
                     or not chat_id
                     or type(value.get("remove_project_on_restore", False)) is not bool
+                    or not isinstance(
+                        value.get("displaced_legacy_operation_id", ""), str
+                    )
                 ):
                     raise ValueError("invalid managed chat binding saga identity")
                 parsed_snapshot = ManagedChatBindingSnapshot(
@@ -1440,7 +1490,26 @@ class ProjectManager:
                     remove_project_on_restore=value.get(
                         "remove_project_on_restore", False
                     ),
+                    displaced_legacy_operation_id=str(
+                        value.get("displaced_legacy_operation_id") or ""
+                    ),
                 )
+            for saga in parsed_sagas.values():
+                displaced_operation_id = saga.displaced_legacy_operation_id
+                if not displaced_operation_id:
+                    continue
+                displaced = parsed_sagas.get(displaced_operation_id)
+                if (
+                    displaced is None
+                    or displaced.expected is not None
+                    or displaced.project_id != saga.project_id
+                    or displaced.chat_id != saga.chat_id
+                    or displaced.expected_root_ref != saga.expected_root_ref
+                    or parsed_residuals.get(displaced_operation_id)
+                    != (saga.chat_id, "legacy_saga_resolution_required")
+                    or saga.chat_id not in self._quarantined_bound_chat_ids
+                ):
+                    raise ValueError("invalid displaced legacy binding saga")
             self._managed_chat_binding_sagas = parsed_sagas
             self._rebuild_bound_chat_index()
         except Exception as e:

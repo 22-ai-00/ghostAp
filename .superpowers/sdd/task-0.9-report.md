@@ -6,8 +6,8 @@
 - Branch: `dev`
 - Baseline: `7c34a2d9c4ec2a2d4051b9f69ea3340d3cbcbd5c`
 - Initial commit: `073e9c32` (`feat(trust): persist managed group lifecycle`)
-- Review fixes: `4970193c`, `71d7d3cc`, `b8e39873`, `5ba6a7ce`, `8c22339a`
-- Sixth review fix: this commit (`fix(trust): recover retained managed groups`)
+- Review fixes: `4970193c`, `71d7d3cc`, `b8e39873`, `5ba6a7ce`, `8c22339a`, `b508b9e8`
+- Seventh review fix: this commit (`fix(trust): preserve managed recovery exits`)
 - Push: not performed
 
 Task 0.9's Registry and Project/Team lifecycle are implemented and hardened.
@@ -365,3 +365,29 @@ than being guessed from membership events.
 - Scope remains one GhostAP primary process/single writer. Employee principal
   rotation is still blocked on a trustworthy production event/rebind saga;
   Task 0.9 remains partial, Task 0.10 was not started, and CP-T is not complete.
+
+## Seventh review correction
+
+- Owner adoption no longer destroys incompatible legacy evidence before
+  Registry ACTIVE. The new adoption saga durably references the displaced
+  legacy operation while the old saga, `legacy_saga_resolution_required`, and
+  quarantine remain anchored. Ordinary activation failure removes only the new
+  saga, leaving the chat unroutable and immediately re-adoptable; successful
+  completion consumes both sagas, the residual, and quarantine atomically.
+- Team retry now checks an exact retained cleanup record against complete
+  ACTIVE record and grant facts before ordinary name reservation. When ACTIVE
+  already committed but cleanup previously failed, retry only consumes the
+  cleanup record and releases the reservation. It never creates a second chat
+  or calls Registry activation again; another cleanup failure remains blocked.
+
+### Seventh-correction verification
+
+- The two focused regressions initially failed: legacy adoption failure left no
+  pending saga, and Team retry invoked cleanup only once before the ordinary
+  reservation rejected it. Focused GREEN: `2 passed, 2 warnings`.
+- Registry/ProjectGrant core: `99 passed, 2 warnings`.
+- Project/ProjectChat/Lark adjacency: `71 passed, 2 warnings`.
+- WS routing/handler/Slock adjacency: `292 passed, 2 warnings`.
+- Touched-file Ruff and `git diff --check`: passed. No brief-wide or external
+  slow suite was used because unrelated test files remain modified in the
+  shared worktree. Real Feishu tenant/mobile execution remains `not_tested`.

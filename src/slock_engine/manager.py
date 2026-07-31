@@ -106,11 +106,8 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
     def reserve_retained_team_name(self, team_name: str) -> Optional[str]:
         """Claim an exact durable retained-group retry despite its name block."""
 
-        record = self._pending_cleanup_record(team_name)
-        if record is None or record.get("delete_state") != "untrusted_retained":
-            return None
-        chat_id = record.get("chat_id")
-        if not isinstance(chat_id, str) or not chat_id:
+        chat_id = self.retained_team_chat_id(team_name)
+        if chat_id is None:
             return None
         normalized = (team_name or "").strip().casefold()
         with self._lock:
@@ -126,6 +123,15 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
                     return None
             self._reserved_team_names.add(normalized)
             return chat_id
+
+    def retained_team_chat_id(self, team_name: str) -> Optional[str]:
+        """Return the exact durable retained chat without changing reservation."""
+
+        record = self._pending_cleanup_record(team_name)
+        if record is None or record.get("delete_state") != "untrusted_retained":
+            return None
+        chat_id = record.get("chat_id")
+        return chat_id if isinstance(chat_id, str) and chat_id else None
 
     def release_team_name(self, team_name: str) -> None:
         normalized = (team_name or "").strip().casefold()

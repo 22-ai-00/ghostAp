@@ -2387,3 +2387,139 @@ def test_owner_adopt_replaces_resolution_required_legacy_saga_after_validation(
     assert restarted.pending_managed_chat_binding_sagas() == ()
     assert restarted.managed_group_residual(legacy_operation) is None
     assert handler.reply_error.call_count == 0
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_owner_adopt_failure_restores_legacy_resolution_for_retry(
+    client_cls, tmp_path, project_manager, registry
+):
+    from src.project_chat.lark_chat_client import ManagedChatValidation
+    from src.slock_engine.manager import SlockEngineManager
+
+    root = str(tmp_path / "legacy-adopt-retry")
+    legacy_operation = "new-chat:ou_owner:legacy-adopt-retry"
+    success, _, project = project_manager.create_project_with_managed_chat_saga(
+        project_id="legacy-adopt-retry",
+        project_name="legacy-adopt-retry",
+        root_path=root,
+        owner_chat_id="oc_legacy_adopt_retry",
+        managed_chat_id="oc_legacy_adopt_retry",
+        managed_chat_name="legacy-adopt-retry-dev",
+        created_at=123.0,
+        operation_id=legacy_operation,
+        expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        expected_owner_id="ou_owner",
+        expected_receiving_bot_ref="cli_main_bot",
+    )
+    assert success and project is not None
+    storage = tmp_path / "projects.json"
+    _rewrite_binding_saga_as_legacy(storage, legacy_operation)
+    restarted = ProjectManager(storage_path=str(storage))
+    client = _startup_reconciler(
+        tmp_path,
+        registry,
+        SlockEngineManager(storage_base_path=str(tmp_path / "slock")),
+        client_cls.return_value,
+        restarted,
+    )
+    client._reconcile_managed_groups_before_slock_restore()
+    client_cls.return_value.validate_managed_chat.return_value = (
+        ManagedChatValidation.VALID
+    )
+    handler = _adoption_handler(restarted, registry)
+    original_activate = registry.activate
+    attempts = 0
+
+    def fail_once(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            durable = ProjectManager(storage_path=str(storage))
+            durable_pending = durable.pending_managed_chat_binding_sagas()
+            assert len(durable_pending) == 2
+            adoption = next(
+                saga for saga in durable_pending if saga.expected is not None
+            )
+            assert adoption.displaced_legacy_operation_id == legacy_operation
+            assert durable.find_by_bound_chat_id("oc_legacy_adopt_retry") is None
+            raise OSError("registry unavailable")
+        return original_activate(**kwargs)
+
+    registry.activate = MagicMock(side_effect=fail_once)
+
+    handler.adopt_managed_chat(
+        "om_failed", "oc_legacy_adopt_retry", "legacy-adopt-retry"
+    )
+
+    pending = restarted.pending_managed_chat_binding_sagas()
+    assert [saga.operation_id for saga in pending] == [legacy_operation]
+    assert pending[0].expected is None
+    assert restarted.managed_group_residual(legacy_operation) == (
+        "oc_legacy_adopt_retry",
+        "legacy_saga_resolution_required",
+    )
+    assert restarted.find_by_bound_chat_id("oc_legacy_adopt_retry") is None
+
+    handler.adopt_managed_chat(
+        "om_retry", "oc_legacy_adopt_retry", "legacy-adopt-retry"
+    )
+
+    assert registry.active_record("oc_legacy_adopt_retry") is not None
+    assert restarted.pending_managed_chat_binding_sagas() == ()
+    assert restarted.managed_group_residual(legacy_operation) is None
+    assert restarted.find_by_bound_chat_id("oc_legacy_adopt_retry") is not None
+
+
+@patch("src.slock_engine.engine.create_engine_session")
+@patch("src.thread.manager.get_current_sender_id", return_value="ou_owner")
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_team_active_cleanup_retry_only_finalizes_existing_group(
+    client_cls, _sender, _session, tmp_path, registry
+):
+    from src.project_chat.lark_chat_client import ManagedChatValidation
+
+    handler = _make_slock_handler(tmp_path, registry)
+    remote = client_cls.return_value
+    remote.create_chat.return_value = _FakeCreateChatResult(
+        chat_id="oc_team_cleanup_retry",
+        name="Cleanup Retry [Slock]",
+    )
+    original_bind = registry.bind_provision_chat
+    bind_attempts = 0
+
+    def fail_bind_once(operation_id, chat_id):
+        nonlocal bind_attempts
+        bind_attempts += 1
+        if bind_attempts == 1:
+            raise OSError("registry unavailable")
+        return original_bind(operation_id, chat_id)
+
+    registry.bind_provision_chat = MagicMock(side_effect=fail_bind_once)
+    handler.create_team("om_first", "oc_owner_p2p", "Cleanup Retry")
+    remote.validate_managed_chat.return_value = ManagedChatValidation.VALID
+    manager = handler.ctx.slock_engine_manager
+    original_consume = manager.consume_retained_team_name
+    consume_attempts = 0
+
+    def fail_consume_once(team_name, chat_id):
+        nonlocal consume_attempts
+        consume_attempts += 1
+        if consume_attempts == 1:
+            return False
+        return original_consume(team_name, chat_id)
+
+    manager.consume_retained_team_name = MagicMock(
+        side_effect=fail_consume_once
+    )
+    registry.activate = MagicMock(wraps=registry.activate)
+
+    handler.create_team("om_activate", "oc_owner_p2p", "Cleanup Retry")
+    handler.create_team("om_finalize", "oc_owner_p2p", "Cleanup Retry")
+
+    assert remote.create_chat.call_count == 1
+    assert registry.activate.call_count == 1
+    assert manager.consume_retained_team_name.call_count == 2
+    assert not list((tmp_path / "slock" / "pending_cleanup").glob("*.json"))
+    assert manager.retained_team_chat_id("Cleanup Retry") is None
+    assert "cleanup retry" not in manager._blocked_team_names
+    assert "已存在" in handler.reply_text.call_args.args[1]

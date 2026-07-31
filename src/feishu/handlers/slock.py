@@ -1911,11 +1911,6 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         settings = self.ctx.settings
         group_name = self._format_slock_group_name(name, getattr(settings, "slock_team_name_suffix", "[Slock]"))
         manager = self._get_engine_manager()
-        retained_chat_id = manager.reserve_retained_team_name(name)
-        if retained_chat_id is None and not manager.reserve_team_name(name):
-            self.reply_text(message_id, f"❌ 团队名称 **{name}** 已存在或正在创建，请换一个名称。")
-            return
-
         root_path = project.root_path if project else self.get_working_dir(chat_id)
         project_id = project.project_id if project else f"team:{name}"
         managed_groups = self._managed_group_registry()
@@ -1923,6 +1918,52 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             f"new-team:{self._managed_group_owner_id()}:"
             f"{name.casefold()}:{root_path}"
         )
+        pending_cleanup_chat_id = manager.retained_team_chat_id(name)
+        if pending_cleanup_chat_id is not None and managed_groups is not None:
+            from ...trust.models import ManagedGroupOrigin, ManagedGroupStatus
+
+            active = managed_groups.active_record(pending_cleanup_chat_id)
+            grant = managed_groups.grant_for_chat(pending_cleanup_chat_id)
+            if (
+                active is not None
+                and active.status is ManagedGroupStatus.ACTIVE
+                and active.chat_id == pending_cleanup_chat_id
+                and active.project_id == project_id
+                and active.canonical_root_ref == root_path
+                and active.origin is ManagedGroupOrigin.GHOSTAP_CREATED
+                and active.owner_id == self._managed_group_owner_id()
+                and active.receiving_bot_ref
+                == self._managed_group_receiving_bot_ref()
+                and grant is not None
+                and grant.managed_group_id == pending_cleanup_chat_id
+                and grant.project_id == project_id
+                and grant.canonical_root_ref == root_path
+                and grant.owner_id == self._managed_group_owner_id()
+                and not grant.backend_binding_ids
+                and not grant.connected_target_refs
+            ):
+                if manager.consume_retained_team_name(
+                    name,
+                    pending_cleanup_chat_id,
+                ):
+                    manager.release_team_name(name)
+                    self.reply_text(
+                        message_id,
+                        f"✅ 团队 **{name}** 已存在（群 ID: "
+                        f"`{pending_cleanup_chat_id}`），恢复记录已清理。",
+                    )
+                else:
+                    self.reply_text(
+                        message_id,
+                        f"⚠️ 团队 **{name}** 已获得信任，但恢复记录仍未能持久清理；"
+                        "请重试原命令完成核对。",
+                    )
+                return
+        retained_chat_id = manager.reserve_retained_team_name(name)
+        if retained_chat_id is None and not manager.reserve_team_name(name):
+            self.reply_text(message_id, f"❌ 团队名称 **{name}** 已存在或正在创建，请换一个名称。")
+            return
+
         persisted = True
         if managed_groups is not None:
             from ...trust.models import ManagedGroupOrigin
