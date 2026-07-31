@@ -17,6 +17,7 @@ from .models import (
     AgentProgress,
     AgentStatus,
     PhaseProgress,
+    ReviewerEvidence,
     WorkflowMetrics,
     WorkflowProject,
     WorkflowStatus,
@@ -59,7 +60,15 @@ class WorkflowStateManager:
             self._project.phases.append(phase)
             self._project.status = WorkflowStatus.RUNNING
 
-    def on_agent_started(self, label: str, tool: str, phase: str, task_summary: str = "") -> str:
+    def on_agent_started(
+        self,
+        label: str,
+        tool: str,
+        phase: str,
+        task_summary: str = "",
+        model: str | None = None,
+        role: str | None = None,
+    ) -> str:
         """Add an agent entry to the current (or matching) phase.
 
         Returns the effective, UI-visible label. User-generated workflow
@@ -76,6 +85,8 @@ class WorkflowStateManager:
             agent = AgentProgress(
                 label=effective_label,
                 tool=tool,
+                model=model,
+                role=role,
                 task_summary=task_summary,
                 status=AgentStatus.RUNNING,
                 started_at=now,
@@ -255,6 +266,11 @@ class WorkflowStateManager:
         with self._write_locked():
             self._delta_context_tokens += max(0, int(tokens))
 
+    def record_reviewer_evidence(self, evidence: ReviewerEvidence) -> None:
+        """Persist one immutable snapshot of an independent review call."""
+        with self._write_locked():
+            self._project.reviewer_evidence.append(evidence.model_copy(deep=True))
+
     @property
     def delta_context_tokens(self) -> int:
         """Observed main-context token delta for the current workflow run."""
@@ -292,6 +308,8 @@ class WorkflowStateManager:
                         AgentProgress.model_construct(
                             label=agent.label,
                             tool=agent.tool,
+                            model=agent.model,
+                            role=agent.role,
                             task_summary=agent.task_summary,
                             status=agent.status,
                             token_usage=agent.token_usage,
@@ -299,6 +317,7 @@ class WorkflowStateManager:
                             error=agent.error,
                             started_at=agent.started_at,
                             finished_at=agent.finished_at,
+                            current_activity=agent.current_activity,
                         )
                         for agent in phase.agents
                     ],
@@ -327,6 +346,11 @@ class WorkflowStateManager:
                     list(self._project.selected_tools) if self._project.selected_tools is not None else None
                 ),
                 tool_model_map=dict(self._project.tool_model_map),
+                run_spec=copy.deepcopy(self._project.run_spec),
+                reviewer_evidence=[
+                    evidence.model_copy(deep=True)
+                    for evidence in self._project.reviewer_evidence
+                ],
                 orchestrator_selection_state=copy.deepcopy(self._project.orchestrator_selection_state),
                 review_selection_state=copy.deepcopy(self._project.review_selection_state),
             )

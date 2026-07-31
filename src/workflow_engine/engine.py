@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from ..engine_base import BaseEngine, EngineRunState
+from ..spec_engine.review_agents import ReviewAgentBinding
 from .bridge import RuntimeBridge
 from .constants import (
     DEFAULT_MAX_CONCURRENT,
@@ -29,12 +30,14 @@ from .models import (
     AgentCallParams,
     AgentCallResult,
     AgentStatus,
+    ReviewerEvidence,
     WorkflowMetrics,
     WorkflowProject,
     WorkflowStatus,
 )
 from .progress_coalescer import ProgressCoalescer
 from .renderer import WorkflowProgressRenderer
+from .run_spec import WorkflowRunSpec
 from .state_manager import WorkflowStateManager
 
 logger = logging.getLogger(__name__)
@@ -221,6 +224,7 @@ class WorkflowEngine(BaseEngine):
         self._progress_coalescer: Optional[ProgressCoalescer] = None
         self._cancel_event = threading.Event()
         self._callbacks: Optional[WorkflowEngineCallbacks] = None
+        self._run_spec: Optional[WorkflowRunSpec] = None
 
         # Heartbeat: periodically re-renders the progress card while a run is
         # active so the live elapsed counters keep advancing even when no
@@ -478,12 +482,68 @@ class WorkflowEngine(BaseEngine):
     # Main execution entry point
     # ------------------------------------------------------------------
 
+    def _build_legacy_run_spec(
+        self,
+        *,
+        requirement: str | None,
+        selected_tools: list[str] | None,
+        initiator_user_id: str | None,
+    ) -> WorkflowRunSpec:
+        """Adapt direct/legacy callers to a complete explicit contract.
+
+        Production confirmation never takes this path. Keeping the adapter at
+        the boundary lets existing template and engine tests use the older
+        signature without allowing a partially-bound mutable project inside
+        the engine.
+        """
+        tools = tuple(
+            dict.fromkeys(
+                str(tool or "").strip()
+                for tool in (selected_tools or [self._agent_type or "coco"])
+                if str(tool or "").strip()
+            )
+        ) or ("coco",)
+        primary_tool = tools[0]
+        configured_model = (
+            str(self._model_name).strip()
+            if primary_tool == self._agent_type and self._model_name
+            else None
+        )
+        orchestrator = ReviewAgentBinding(
+            provider="legacy",
+            tool_name=primary_tool,
+            display_name=primary_tool,
+            agent_type=primary_tool,
+            model_name=configured_model,
+            model_display_name=configured_model,
+            selection_key=f"legacy:{primary_tool}:{configured_model or 'default'}",
+            use_default_model=configured_model is None,
+        )
+        return WorkflowRunSpec(
+            orchestrator=orchestrator,
+            reviewers=(),
+            tool_model_map={
+                tool: configured_model if tool == primary_tool else None
+                for tool in tools
+            },
+            task=str(requirement or "Workflow execution").strip() or "Workflow execution",
+            chat_id=str(self.chat_id or "workflow"),
+            topic_id=None,
+            budget=MAX_TOTAL_AGENTS,
+            deadline=None,
+            auto_reviewer=True,
+            initiator_user_id=initiator_user_id,
+            allowed_tools=tools,
+            enforce_tool_allowlist=selected_tools is not None,
+        )
+
     def execute_workflow(
         self,
-        requirement: str,
-        script_path: str,
+        requirement: Optional[str] = None,
+        script_path: str = "",
         callbacks: Optional[WorkflowEngineCallbacks] = None,
         *,
+        run_spec: Optional[WorkflowRunSpec] = None,
         selected_tools: Optional[list[str]] = None,
         initiator_user_id: Optional[str] = None,
         start_owner: Any = None,
@@ -492,9 +552,11 @@ class WorkflowEngine(BaseEngine):
         """Execute a workflow script end-to-end.
 
         Args:
-            requirement: The user's original requirement text.
+            requirement: Legacy form of the user's requirement. New handler
+                paths pass it inside ``run_spec``.
             script_path: Absolute path to the .js workflow script.
             callbacks: Optional event callbacks for progress/completion.
+            run_spec: Frozen confirmation-time execution contract.
             selected_tools: Optional tool whitelist; agents may only use these tools.
             start_owner: Optional handler lifecycle token for a queued start.
             source_script_path: Stable generated source retained for save/reuse.
@@ -506,6 +568,27 @@ class WorkflowEngine(BaseEngine):
             RuntimeError: If Node.js is unavailable or the bridge fails fatally.
         """
         run_callbacks = callbacks or WorkflowEngineCallbacks()
+        if run_spec is None:
+            run_spec = self._build_legacy_run_spec(
+                requirement=requirement,
+                selected_tools=selected_tools,
+                initiator_user_id=initiator_user_id,
+            )
+        else:
+            if requirement is not None and requirement.strip() != run_spec.task:
+                raise ValueError("Workflow requirement conflicts with frozen run spec")
+            if selected_tools is not None and tuple(selected_tools) != run_spec.allowed_tools:
+                raise ValueError("Workflow selected tools conflict with frozen run spec")
+            if initiator_user_id is not None and initiator_user_id != run_spec.initiator_user_id:
+                raise ValueError("Workflow initiator conflicts with frozen run spec")
+
+        requirement = run_spec.task
+        selected_tools = (
+            list(run_spec.allowed_tools)
+            if run_spec.enforce_tool_allowlist
+            else None
+        )
+        initiator_user_id = run_spec.initiator_user_id
 
         # Parse meta from the generated script so we can honor meta.maxConcurrent
         # before the bridge / executor thread pools are created.
@@ -542,6 +625,8 @@ class WorkflowEngine(BaseEngine):
             started_at=time.time(),
             selected_tools=selected_tools,
             initiator_user_id=initiator_user_id,
+            tool_model_map=dict(run_spec.tool_model_map),
+            run_spec=run_spec.to_dict(),
         )
 
         # Claim a queued start and publish runtime state in one critical
@@ -626,6 +711,7 @@ class WorkflowEngine(BaseEngine):
                 self._state_manager = None
                 self._progress_coalescer = None
                 self._callbacks = run_callbacks
+                self._run_spec = run_spec
                 self._project = project
                 self._run_state = EngineRunState.RUNNING
                 self._run_thread_id = threading.get_ident()
@@ -691,6 +777,7 @@ class WorkflowEngine(BaseEngine):
                     cancel_event=self._cancel_event,
                     allowed_tools=selected_tools,
                     initiator_user_id=project.initiator_user_id,
+                    workflow_deadline_monotonic=run_spec.deadline,
                 )
                 bridge = self._bridge
 
@@ -717,6 +804,8 @@ class WorkflowEngine(BaseEngine):
             terminal_failure = _terminal_failure_from_result(result_text)
             if terminal_failure is None and self._state_manager is not None:
                 terminal_failure = _terminal_failure_from_project(self._state_manager.snapshot())
+            if terminal_failure is None:
+                terminal_failure = self._run_committed_reviewers(result_text)
 
             # The terminal state commit shares the same engine lock as
             # stop(). Exactly one side wins: a stopped owner cannot publish a
@@ -979,6 +1068,69 @@ class WorkflowEngine(BaseEngine):
     # Bridge callbacks
     # ------------------------------------------------------------------
 
+    def _run_committed_reviewers(self, result_text: str) -> str | None:
+        """Invoke every explicitly confirmed reviewer and persist evidence.
+
+        Reviewer calls intentionally bypass the workflow journal cache. A
+        selected reviewer is a promise of an independent backend invocation
+        for this run; cached text is not proof that the promise was kept.
+        """
+        run_spec = getattr(self, "_run_spec", None)
+        if run_spec is None or run_spec.auto_reviewer:
+            return None
+
+        failures: list[str] = []
+        for index, reviewer in enumerate(run_spec.reviewers, start=1):
+            started_at = time.time()
+            params = AgentCallParams(
+                prompt=(
+                    "Independently review the completed Workflow deliverable below. "
+                    "Identify correctness gaps, unmet requirements, security or reliability "
+                    "risks, and give a clear verdict supported by evidence.\n\n"
+                    f"Original task:\n{run_spec.task}\n\n"
+                    f"Deliverable:\n{result_text}"
+                ),
+                tool=reviewer.tool_name,
+                model=None if reviewer.use_default_model else reviewer.model_name,
+                role="workflow_reviewer",
+                label=f"reviewer-{index}-{reviewer.tool_name}",
+                phase="Independent Review",
+            )
+            result = self._handle_agent_call(
+                params,
+                deadline_monotonic=run_spec.deadline,
+                forced_binding=reviewer,
+                allow_cache=False,
+            )
+            evidence = ReviewerEvidence(
+                reviewer_index=index,
+                selection_key=reviewer.selection_key,
+                display_name=reviewer.display_name,
+                tool=reviewer.tool_name,
+                model=None if reviewer.use_default_model else reviewer.model_name,
+                status="failed" if result.error else "completed",
+                output=result.output,
+                stop_reason=result.stop_reason,
+                error=result.error,
+                cached=bool(result.cached),
+                token_usage=result.token_usage,
+                duration_s=result.duration_s,
+                started_at=started_at,
+                finished_at=time.time(),
+            )
+            if self._state_manager is not None:
+                self._state_manager.record_reviewer_evidence(evidence)
+            elif self._project is not None:
+                self._project.reviewer_evidence.append(evidence)
+            if result.error:
+                failures.append(
+                    f"{reviewer.tool_name}/{reviewer.model_name or 'default'}: {result.error}"
+                )
+
+        if failures:
+            return "Independent review failed: " + "; ".join(failures)
+        return None
+
     def _handle_agent_call(
         self,
         params: AgentCallParams,
@@ -986,6 +1138,8 @@ class WorkflowEngine(BaseEngine):
         cancel_event=None,
         request_id=None,
         deadline_monotonic: float | None = None,
+        forced_binding: ReviewAgentBinding | None = None,
+        allow_cache: bool = True,
     ) -> AgentCallResult:
         """Handle an agent() call from the JS runtime.
 
@@ -997,18 +1151,46 @@ class WorkflowEngine(BaseEngine):
             5. Store result in journal
             6. Fire progress callbacks
         """
+        # Work on a private copy: the bridge/test caller may retain its params,
+        # but the confirmed run binding is authoritative for execution.
+        params = params.model_copy(deep=True)
+        run_spec = getattr(self, "_run_spec", None)
+        if forced_binding is not None:
+            params.tool = forced_binding.tool_name
+            params.model = None if forced_binding.use_default_model else forced_binding.model_name
+        elif run_spec is not None:
+            params.tool = params.tool or run_spec.orchestrator.tool_name
+            if params.tool in run_spec.tool_model_map:
+                # Assign even when the confirmed value is None. None means the
+                # user explicitly chose that tool's default model and an
+                # invented model in generated JS must not override it.
+                params.model = run_spec.tool_model_map[params.tool]
+
+        effective_deadline = deadline_monotonic
+        if run_spec is not None and run_spec.deadline is not None:
+            effective_deadline = (
+                min(effective_deadline, run_spec.deadline)
+                if effective_deadline is not None
+                else run_spec.deadline
+            )
+
         with self._lock:
             self._agent_call_count += 1
             count = self._agent_call_count
         label = params.label or f"agent-{count}"
 
-        # Resolve missing model from user's orchestrator/review bindings
-        if not params.model and params.tool and self._project:
+        # Legacy direct callers still resolve from the complete adapted project.
+        if run_spec is None and not params.model and params.tool and self._project:
             params.model = self._resolve_model_for_tool(params.tool)
 
         # Safety fuse
-        if count > MAX_TOTAL_AGENTS:
-            error_msg = f"Agent call limit exceeded ({MAX_TOTAL_AGENTS})"
+        call_budget = run_spec.budget if run_spec is not None else MAX_TOTAL_AGENTS
+        if count > call_budget:
+            error_msg = f"Agent call limit exceeded ({call_budget})"
+            logger.warning("[WorkflowEngine] %s", error_msg)
+            return AgentCallResult(error=error_msg, tool=params.tool, model=params.model)
+        if effective_deadline is not None and time.monotonic() >= effective_deadline:
+            error_msg = "Workflow deadline exhausted before agent execution"
             logger.warning("[WorkflowEngine] %s", error_msg)
             return AgentCallResult(error=error_msg, tool=params.tool, model=params.model)
 
@@ -1030,6 +1212,8 @@ class WorkflowEngine(BaseEngine):
                 tool=params.tool,
                 phase=params.phase or "default",
                 task_summary=task_summary,
+                model=params.model,
+                role=params.role,
             )
 
         # Track request_id → effective label for abort-by-request-id lookup
@@ -1061,13 +1245,14 @@ class WorkflowEngine(BaseEngine):
         self._fire_progress()
 
         # Journal cache lookup
-        if self._journal:
+        if allow_cache and self._journal:
             cached = self._journal.get_cached(cache_key)
             if cached is not None:
                 logger.debug("[WorkflowEngine] Cache hit for %s", label)
                 cached_result = AgentCallResult(
                     output=cached.output,
                     parsed=cached.parsed,
+                    stop_reason=cached.stop_reason,
                     token_usage=0,  # No tokens consumed on cache hit
                     duration_s=0.0,
                     cached=True,
@@ -1090,11 +1275,30 @@ class WorkflowEngine(BaseEngine):
         result = self._executor.execute(
             params,
             cancel_event=cancel_event,
-            deadline_monotonic=deadline_monotonic,
+            deadline_monotonic=effective_deadline,
         )
 
+        # A selected Reviewer is a completion promise, not merely a backend
+        # round-trip. Only an explicit end_turn with non-empty output proves
+        # that the independent review finished. Unknown/new stop reasons fail
+        # closed and are retained in durable Reviewer evidence.
+        if forced_binding is not None and result.error is None:
+            stop_reason = (result.stop_reason or "").strip().casefold()
+            if stop_reason != "end_turn":
+                reason = stop_reason or "missing_stop_reason"
+                result = result.model_copy(
+                    update={
+                        "error": (
+                            "Reviewer did not complete normally "
+                            f"(stop_reason={reason})"
+                        )
+                    }
+                )
+            elif not str(result.output or "").strip():
+                result = result.model_copy(update={"error": "Reviewer returned empty output"})
+
         # Store in journal (only on success)
-        if result.error is None and self._journal:
+        if allow_cache and result.error is None and self._journal:
             self._journal.store(cache_key, result)
 
         # Update state

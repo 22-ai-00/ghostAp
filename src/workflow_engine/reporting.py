@@ -156,6 +156,22 @@ def _workflow_summary(project: WorkflowProject) -> str:
         f"- 代理: {completed_agents}/{total_agents} 完成，{failed_agents} 失败，{cached_agents} 缓存",
         f"- Token: {total_tokens}",
     ]
+    run_spec = project.run_spec or {}
+    orchestrator = run_spec.get("orchestrator") or {}
+    if orchestrator:
+        orchestrator_model = (
+            "default"
+            if orchestrator.get("use_default_model", True)
+            else orchestrator.get("model_name") or "default"
+        )
+        lines.append(
+            f"- 主编排绑定: {orchestrator.get('tool_name') or '(none)'}/{orchestrator_model}"
+        )
+    if run_spec:
+        lines.append(
+            "- 评审模式: "
+            + ("Auto（无独立 Reviewer）" if run_spec.get("auto_reviewer") else "显式独立 Reviewer")
+        )
     return "\n".join(lines)
 
 
@@ -180,6 +196,10 @@ def _phase_process(project: WorkflowProject) -> str:
                 f"- [{_status_text(agent.status)}] {agent.label or 'agent'}"
                 f" tool={agent.tool or '(none)'}"
             )
+            if agent.model:
+                agent_line += f" model={agent.model}"
+            if agent.role:
+                agent_line += f" role={agent.role}"
             if agent.duration_s:
                 agent_line += f" duration={_format_duration(agent.duration_s)}"
             if agent.token_usage:
@@ -189,6 +209,34 @@ def _phase_process(project: WorkflowProject) -> str:
             if agent.error:
                 agent_line += f"\n  - error: {agent.error}"
             lines.append(agent_line)
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _reviewer_evidence(project: WorkflowProject) -> str:
+    """Render only committed evidence; never infer a review from selection."""
+    run_spec = project.run_spec or {}
+    if run_spec.get("auto_reviewer"):
+        return "Auto 模式：未承诺、也未执行独立 Reviewer 调用。"
+    if not project.reviewer_evidence:
+        return "未记录独立 Reviewer 调用证据；本次运行不得视为已完成评审。"
+
+    lines: list[str] = []
+    for evidence in project.reviewer_evidence:
+        binding = f"{evidence.tool}/{evidence.model or 'default'}"
+        lines.append(
+            f"### Reviewer {evidence.reviewer_index}: {binding}\n"
+            f"- 状态: {evidence.status}\n"
+            f"- Selection key: {evidence.selection_key or '(none)'}\n"
+            f"- Fresh call: {'否' if evidence.cached else '是'}\n"
+            f"- Stop reason: {evidence.stop_reason or '(missing)'}\n"
+            f"- Token: {evidence.token_usage}\n"
+            f"- 耗时: {_format_duration(evidence.duration_s)}"
+        )
+        if evidence.error:
+            lines.append(f"- 错误: {evidence.error}")
+        if evidence.output:
+            lines.append(f"- 输出:\n{evidence.output}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -244,6 +292,7 @@ def _result_sections(project: WorkflowProject) -> list[_ReportSection]:
 def _report_sections(project: WorkflowProject) -> list[_ReportSection]:
     sections = [
         _ReportSection("运行摘要", _workflow_summary(project), expanded=True),
+        _ReportSection("独立评审证据", _reviewer_evidence(project), expanded=True),
         *_result_sections(project),
         _ReportSection("执行过程", _phase_process(project), expanded=False),
         _ReportSection("原始结果 JSON", project.result or "", expanded=False),
@@ -353,13 +402,15 @@ def _render_phases_html(project: WorkflowProject) -> str:
             a_dur = f' <span class="agent-meta">{_format_duration(agent.duration_s)}</span>' if agent.duration_s else ""
             a_tok = f' <span class="agent-meta">{agent.token_usage} tok</span>' if agent.token_usage else ""
             a_tool = f' <span class="agent-tool">{html.escape(agent.tool or "")}</span>' if agent.tool else ""
+            a_model = f' <span class="agent-tool">{html.escape(agent.model or "")}</span>' if agent.model else ""
+            a_role = f' <span class="agent-meta">{html.escape(agent.role or "")}</span>' if agent.role else ""
             a_task = f'<div class="agent-task">{html.escape(agent.task_summary or "")}</div>' if agent.task_summary else ""
             a_err = f'<div class="agent-error">{html.escape(agent.error or "")}</div>' if agent.error else ""
             agent_rows.append(
                 f'<div class="agent-row {a_cls}">'
                 f'<span class="agent-status">{html.escape(a_status)}</span>'
                 f'<span class="agent-label">{html.escape(agent.label or "agent")}</span>'
-                f'{a_tool}{a_dur}{a_tok}'
+                f'{a_tool}{a_model}{a_role}{a_dur}{a_tok}'
                 f'{a_task}{a_err}'
                 f'</div>'
             )

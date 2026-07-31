@@ -257,6 +257,7 @@ class AgentExecutor:
                 if _is_cancelled():
                     return AgentCallResult(
                         error="Cancelled before execution",
+                        stop_reason="cancelled",
                         tool=params.tool,
                         model=params.model,
                         duration_s=time.monotonic() - start,
@@ -313,6 +314,7 @@ class AgentExecutor:
                         self._close_late_session(future, params.tool)
                         return AgentCallResult(
                             error="Cancelled during session creation",
+                            stop_reason="cancelled",
                             tool=params.tool,
                             model=params.model,
                             duration_s=time.monotonic() - start,
@@ -420,6 +422,12 @@ class AgentExecutor:
                 # Extract text output and token usage from PromptResult
                 output_text = result.text if result else ""
                 token_usage = result.output_tokens or 0 if result else 0
+                raw_stop_reason = getattr(result, "stop_reason", None) if result else None
+                stop_reason = (
+                    raw_stop_reason.strip()
+                    if isinstance(raw_stop_reason, str) and raw_stop_reason.strip()
+                    else None
+                )
 
                 # Report token usage via callback
                 if token_usage > 0 and self.on_token_usage:
@@ -430,6 +438,7 @@ class AgentExecutor:
                 if call_cancel_event.is_set():
                     return AgentCallResult(
                         output=output_text,
+                        stop_reason=stop_reason,
                         token_usage=total_token_usage,
                         duration_s=time.monotonic() - start,
                         error="Cancelled during execution",
@@ -482,6 +491,15 @@ class AgentExecutor:
 
                         retry_text = retry_result.text if retry_result else ""
                         retry_tokens = retry_result.output_tokens or 0 if retry_result else 0
+                        raw_retry_stop_reason = (
+                            getattr(retry_result, "stop_reason", None) if retry_result else None
+                        )
+                        stop_reason = (
+                            raw_retry_stop_reason.strip()
+                            if isinstance(raw_retry_stop_reason, str)
+                            and raw_retry_stop_reason.strip()
+                            else None
+                        )
 
                         # Accumulate token usage from retries
                         total_token_usage += retry_tokens
@@ -507,6 +525,7 @@ class AgentExecutor:
                 return AgentCallResult(
                     output=output_text,
                     parsed=parsed,
+                    stop_reason=stop_reason,
                     token_usage=total_token_usage,
                     duration_s=duration_s,
                     error=schema_error,
@@ -575,6 +594,7 @@ class AgentExecutor:
         duration_s = time.monotonic() - start
         return AgentCallResult(
             error="Cancelled during retry",
+            stop_reason="cancelled",
             tool=params.tool,
             model=params.model,
             duration_s=duration_s,

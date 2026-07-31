@@ -89,6 +89,7 @@ class RuntimeBridge:
         nesting_depth: int = 0,
         args: Optional[dict[str, Any]] = None,
         initiator_user_id: Optional[str] = None,
+        workflow_deadline_monotonic: float | None = None,
     ) -> None:
         self._script_path = script_path
         self._cwd = cwd
@@ -106,6 +107,10 @@ class RuntimeBridge:
         # templates remain consistent across the tree.  May be None when the
         # bridge is constructed without a known initiator.
         self._initiator_user_id: Optional[str] = initiator_user_id
+        # Confirmation-time deadline from WorkflowRunSpec. It is converted to
+        # the JS wall-clock representation exactly once in
+        # _ensure_workflow_deadline().
+        self._confirmed_deadline_monotonic = workflow_deadline_monotonic
 
         # Subprocess handle
         self._process: Optional[subprocess.Popen] = None
@@ -281,6 +286,17 @@ class RuntimeBridge:
         started_unix_ms = int(time.time() * 1000)
         self._workflow_started_monotonic = started_monotonic
         self._workflow_started_unix_ms = started_unix_ms
+
+        confirmed_deadline = vars(self).get("_confirmed_deadline_monotonic")
+        if confirmed_deadline is not None:
+            remaining_s = max(
+                0.0,
+                confirmed_deadline - started_monotonic,
+            )
+            self._workflow_deadline_monotonic = confirmed_deadline
+            self._workflow_deadline_unix_ms = started_unix_ms + int(remaining_s * 1000)
+            self._workflow_total_timeout_s = max(0, int(remaining_s))
+            return
 
         if total_timeout_s <= 0:
             # Unlimited: no total deadline. Leave *_deadline_* fields cleared;

@@ -1482,7 +1482,12 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 ),
                 "review_agents": (
                     existing_pending.review_agents
-                    if existing_pending and getattr(existing_pending, "review_agents", None)
+                    if existing_pending is not None
+                    else None
+                ),
+                "auto_reviewer": (
+                    existing_pending.auto_reviewer
+                    if existing_pending is not None
                     else None
                 ),
             }
@@ -1707,6 +1712,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 is_template_hint=generation_context["is_template_hint"],
                 orchestrator_binding=generation_context["orchestrator_binding"],
                 review_agents=generation_context["review_agents"],
+                auto_reviewer=generation_context["auto_reviewer"],
                 script_hash=script_hash,
             )
             if not self._commit_generation_result_if_current(
@@ -3723,6 +3729,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 current_pending = current_project.pending
 
                 current_pending.review_agents = review_agents
+                current_pending.auto_reviewer = bool(ctrl.review_auto_mode)
                 orchestrator_tool = current_pending.orchestrator_agent or ""
                 for tool_name in [
                     orchestrator_tool,
@@ -3744,7 +3751,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     ]
                     selections_summary.append("**评审 Agent**:\n" + "\n".join(review_lines))
                 elif ctrl.review_auto_mode:
-                    selections_summary.append("**评审 Agent**: Auto（沿用主 Agent）")
+                    selections_summary.append(
+                        "**评审 Agent**: Auto（无独立 Reviewer；编排器负责最终检查）"
+                    )
                 locked_card = CardBuilder._wrap_card(
                     header_title="✅ Workflow — 工具选择完成",
                     header_template="green",
@@ -4432,6 +4441,10 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 execution_script_path=immutable_script_path,
             )
 
+        origin_message_id = self._resolve_origin(message_id)
+        run_spec = None
+        binding_error: TypeError | ValueError | None = None
+
         def _abandon_start(*, remove_source: bool = True) -> None:
             start_owner.stop_event.set()
             _discard_immutable_script()
@@ -4473,25 +4486,49 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     _discard_immutable_script()
                     return
 
-                current_project.start_execution()
-                current_project.status = WorkflowStatus.RUNNING
-                current_project.requirement = requirement
-                current_project.script_path = script_path
-                current_project.started_at = time.time()
-                current_project.selected_tools = selected_tools or None
-                engine._workflow_start_owner = start_owner
-                if _generation_owner is not None:
-                    self._retire_workflow_owner(
-                        engine,
-                        _generation_owner,
+                try:
+                    run_spec = self._build_confirmed_run_spec(
+                        pending=current_pending,
+                        engine=engine,
+                        task=current_pending.requirement or requirement,
+                        chat_id=chat_id,
+                        topic_id=origin_message_id,
                     )
-                    engine._script_generation_owner = None
+                except (TypeError, ValueError) as exc:
+                    binding_error = exc
+                else:
+                    requirement = run_spec.task
+                    current_project.start_execution()
+                    current_project.status = WorkflowStatus.RUNNING
+                    current_project.requirement = requirement
+                    current_project.script_path = script_path
+                    current_project.started_at = time.time()
+                    current_project.selected_tools = list(run_spec.allowed_tools)
+                    current_project.tool_model_map = dict(run_spec.tool_model_map)
+                    current_project.run_spec = run_spec.to_dict()
+                    engine._workflow_start_owner = start_owner
+                    if _generation_owner is not None:
+                        self._retire_workflow_owner(
+                            engine,
+                            _generation_owner,
+                        )
+                        engine._script_generation_owner = None
+
+            if binding_error is not None:
+                _discard_immutable_script()
+                _reply_start_error(
+                    "invalid_state",
+                    detail=f"Workflow 执行绑定无效: {binding_error}",
+                )
+                return
+            if run_spec is None:
+                _discard_immutable_script()
+                return
 
             if start_owner.stop_event.is_set():
                 _abandon_start()
                 return
 
-            origin_message_id = self._resolve_origin(message_id)
             progress_card_message_id = self._show_initial_workflow_progress_card(
                 card_message_id=message_id,
                 chat_id=chat_id,
@@ -4556,11 +4593,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                         lifecycle_owner=start_owner,
                     )
                     engine.execute_workflow(
-                        requirement=requirement,
                         script_path=immutable_script_path,
                         callbacks=callbacks,
-                        selected_tools=selected_tools or None,
-                        initiator_user_id=stored_initiator or None,
+                        run_spec=run_spec,
                         start_owner=start_owner,
                         source_script_path=script_path,
                     )
@@ -4966,6 +5001,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     script_content=_script_content,
                     orchestrator_binding=pending.orchestrator_binding,
                     review_agents=pending.review_agents,
+                    auto_reviewer=pending.auto_reviewer,
                 )
                 self.update_card(message_id, confirm_card)
 
@@ -5078,6 +5114,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 script_content=_script_content,
                 orchestrator_binding=pending.orchestrator_binding,
                 review_agents=pending.review_agents,
+                auto_reviewer=pending.auto_reviewer,
             )
             self.update_card(message_id, confirm_card)
 
@@ -5829,6 +5866,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             script_content=_script_content,
             orchestrator_binding=pending.orchestrator_binding,
             review_agents=pending.review_agents,
+            auto_reviewer=pending.auto_reviewer,
         )
         self.update_card(message_id, confirm_card)
 
@@ -6521,10 +6559,12 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Get orchestrator binding and review agents from pending state
         orchestrator_binding = None
         review_agents = None
+        auto_reviewer = None
         selected_model_name = None
         if engine and engine.project and engine.project.pending:
             orchestrator_binding = engine.project.pending.orchestrator_binding
             review_agents = engine.project.pending.review_agents
+            auto_reviewer = engine.project.pending.auto_reviewer
             # Extract model_name from orchestrator_binding if not using default
             if orchestrator_binding and not orchestrator_binding.use_default_model:
                 selected_model_name = orchestrator_binding.model_name
@@ -6535,6 +6575,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             orchestrator_agent=agent_type,
             orchestrator_binding=orchestrator_binding,
             review_agents=review_agents,
+            auto_reviewer=auto_reviewer,
         )
 
         # Attempt AI generation via one-shot ACP session
@@ -7000,6 +7041,104 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             f.write(script_content)
         return script_path
 
+    @staticmethod
+    def _build_confirmed_run_spec(
+        *,
+        pending: Any,
+        engine: Any,
+        task: str,
+        chat_id: str,
+        topic_id: str | None,
+    ):
+        """Freeze the confirmation-time selection into one execution contract."""
+        from src.spec_engine.review_agents import ReviewAgentBinding
+
+        from ...workflow_engine.constants import (
+            MAX_TOTAL_AGENTS,
+            WORKFLOW_TOTAL_TIMEOUT_S,
+        )
+        from ...workflow_engine.run_spec import WorkflowRunSpec
+
+        selected_tools = list(dict.fromkeys(pending.selected_tools or []))
+        orchestrator = pending.orchestrator_binding
+        if orchestrator is None:
+            primary_tool = (
+                str(pending.orchestrator_agent or "").strip()
+                or (selected_tools[0] if selected_tools else "coco")
+            )
+            engine_agent_type = getattr(engine, "_agent_type", None)
+            if not isinstance(engine_agent_type, str) or not engine_agent_type.strip():
+                engine_agent_type = primary_tool
+            engine_model = getattr(engine, "_model_name", None)
+            if not isinstance(engine_model, str) or not engine_model.strip():
+                engine_model = None
+            orchestrator = ReviewAgentBinding(
+                provider="legacy",
+                tool_name=primary_tool,
+                display_name=primary_tool,
+                agent_type=engine_agent_type,
+                model_name=engine_model,
+                model_display_name=engine_model,
+                selection_key=f"legacy:{primary_tool}:{engine_model or 'default'}",
+                use_default_model=engine_model is None,
+            )
+
+        reviewers = tuple(pending.review_agents or ())
+        auto_reviewer = pending.auto_reviewer
+        if auto_reviewer is None:
+            # Explicit compatibility for restored pre-RunSpec confirmations;
+            # all newly selected flows persist the boolean before generation.
+            auto_reviewer = not reviewers
+
+        allowed_tools = list(selected_tools)
+        for tool in [orchestrator.tool_name, *(reviewer.tool_name for reviewer in reviewers)]:
+            if tool and tool not in allowed_tools:
+                allowed_tools.append(tool)
+
+        tool_model_map: dict[str, str | None] = {
+            tool: None for tool in allowed_tools
+        }
+        tool_model_map[orchestrator.tool_name] = (
+            None if orchestrator.use_default_model else orchestrator.model_name
+        )
+        for reviewer in reviewers:
+            tool_model_map.setdefault(
+                reviewer.tool_name,
+                None if reviewer.use_default_model else reviewer.model_name,
+            )
+            # When a tool is not shared with the orchestrator, the explicit
+            # reviewer selection is also its ordinary runtime binding.
+            if reviewer.tool_name != orchestrator.tool_name:
+                tool_model_map[reviewer.tool_name] = (
+                    None if reviewer.use_default_model else reviewer.model_name
+                )
+
+        settings = getattr(engine, "settings", None)
+        raw_timeout = getattr(
+            settings,
+            "workflow_total_timeout_s",
+            WORKFLOW_TOTAL_TIMEOUT_S,
+        )
+        try:
+            timeout_s = int(raw_timeout)
+        except (TypeError, ValueError):
+            timeout_s = WORKFLOW_TOTAL_TIMEOUT_S
+        deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
+
+        return WorkflowRunSpec(
+            orchestrator=orchestrator,
+            reviewers=reviewers,
+            tool_model_map=tool_model_map,
+            task=task,
+            chat_id=chat_id,
+            topic_id=topic_id,
+            budget=MAX_TOTAL_AGENTS,
+            deadline=deadline,
+            auto_reviewer=bool(auto_reviewer),
+            initiator_user_id=pending.initiator_user_id or None,
+            allowed_tools=tuple(allowed_tools),
+        )
+
     def _build_confirm_card(
         self,
         meta: dict[str, Any] | None,
@@ -7012,6 +7151,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         script_content: str = "",
         orchestrator_binding: dict | None = None,
         review_agents: list[dict] | None = None,
+        auto_reviewer: bool | None = None,
     ) -> dict:
         """Build a Feishu card showing the workflow script preview for confirmation.
 
@@ -7049,7 +7189,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         # Format review agents display
         review_display = ""
-        if review_agents and len(review_agents) > 0:
+        if auto_reviewer is True:
+            review_display = (
+                "**评审 Agent**: Auto（无独立 Reviewer；编排器负责最终检查）"
+            )
+        elif review_agents and len(review_agents) > 0:
             review_lines = ["**评审 Agent**:"]
             for i, agent in enumerate(review_agents):
                 tool_name = agent.tool_name
@@ -7062,8 +7206,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     line += f" · {agent.model_display_name or model_name}"
                 review_lines.append(line)
             review_display = "\n".join(review_lines)
-        elif review_agents is not None:
-            review_display = "**评审 Agent**: Auto（跳过独立评审，使用主 Agent 自评审）"
+        elif auto_reviewer is None and review_agents is not None:
+            # Restored legacy cards did not persist the explicit Auto flag.
+            review_display = (
+                "**评审 Agent**: Auto（无独立 Reviewer；编排器负责最终检查）"
+            )
 
         # Pre-compute has_mismatch for action button state (used in both modes)
         allowed_tools = set(selected_tools) if selected_tools else set(tools)

@@ -590,6 +590,7 @@ def build_script_gen_prompt(
     orchestrator_agent: str = "coco",
     orchestrator_binding: Optional[dict] = None,
     review_agents: Optional[list[dict]] = None,
+    auto_reviewer: bool | None = None,
 ) -> str:
     """Build the prompt that instructs an AI to generate a workflow script.
 
@@ -601,6 +602,9 @@ def build_script_gen_prompt(
             to the agent's capabilities. Defaults to "coco".
         orchestrator_binding: Selected orchestrator agent binding with tool and model info.
         review_agents: List of selected review agent bindings with tool and model info.
+        auto_reviewer: Explicit confirmation-time review mode. True means no
+            independent Reviewer call is promised; False pairs with explicit
+            reviewers that the Engine invokes after the script completes.
 
     Returns:
         A complete prompt string ready to send to a code-generation agent.
@@ -650,6 +654,17 @@ def build_script_gen_prompt(
             if not _ra_use_default and _ra_model:
                 agent_bindings_section += f"  **模型**: {_ra_model}"
             agent_bindings_section += "\n"
+        agent_bindings_section += """
+这些是运行时承诺的独立 Reviewer。Engine 会在脚本完成后逐个发起独立真实调用并持久化证据；
+脚本无需伪造 Reviewer 已执行，也不得在最终结果中把仅有选择记录描述为“已评审”。
+"""
+    elif auto_reviewer is True:
+        agent_bindings_section += """
+
+## Reviewer 模式
+
+- **Auto**：无独立 Reviewer；编排器负责最终检查。本运行不承诺独立 Reviewer 调用，也不得声称存在独立 Reviewer 证据。
+"""
 
     if agent_bindings_section:
         agent_capability_section += agent_bindings_section
@@ -797,7 +812,8 @@ def validate_generated_script(
       (pure orchestration / workflow-only scripts are accepted)
     - Presence of `export default` entry function
     - Dangerous patterns are reported as BLOCKING errors (fail-closed — not warnings)
-    - Review agent constraints: if review_agents are specified, verify they are used in the script
+    - Reviewer selections are not inferred from script text; committed
+      independent calls are enforced by WorkflowEngine after script completion
 
     The runtime sandbox provides defense-in-depth, but script-level rejection
     is the primary security boundary for user-generated workflows. Templates
@@ -807,7 +823,8 @@ def validate_generated_script(
     Args:
         script_content: The raw JavaScript source code of the workflow script.
         review_agents: List of selected review agent bindings with tool and model info.
-                       If provided, validates that all review tools are used in the script.
+                       Retained for API compatibility; runtime Reviewer
+                       commitments are enforced outside generated JavaScript.
 
     Returns:
         A tuple of (is_valid, list_of_messages). Dangerous patterns are treated

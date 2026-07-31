@@ -403,7 +403,10 @@ class WorkflowProgressRenderer:
             agent_status_icon = STATUS_ICONS.get(active_agent.status, "⏳")
             lines.append(f"🤖 **{agent_label_key}:** {agent_status_icon} {agent_label}")
             if active_agent.tool:
-                lines.append(f"🛠 **{tool_label_key}:** `{active_agent.tool}`")
+                binding = f"`{active_agent.tool}`"
+                if active_agent.model:
+                    binding += f" / `{active_agent.model}`"
+                lines.append(f"🛠 **{tool_label_key}:** {binding}")
             else:
                 lines.append(f"🛠 **{tool_label_key}:** (未指定工具)")
             if active_agent.task_summary:
@@ -592,6 +595,8 @@ class WorkflowProgressRenderer:
             lines: list[str] = []
             for agent in group:
                 tool_badge = f"`{agent.tool}`" if agent.tool else ""
+                if agent.model:
+                    tool_badge += f"/`{agent.model}`"
                 display_label = _middle_ellipsis(agent.label or "agent")
                 if agent.status == AgentStatus.RUNNING:
                     summary_text = ""

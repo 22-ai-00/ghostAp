@@ -10,8 +10,8 @@ The flow is intentionally simple:
 1. Orchestrator step: the user picks one tool + model combination that will
    drive the top-level script generation.
 2. Review step: the user picks additional tool + model combinations that act
-   as independent reviewers *or* clicks the "Auto" shortcut to skip review
-   entirely (meaning the orchestrator also self-reviews).
+   as independent reviewers *or* clicks the "Auto" shortcut, which commits no
+   independent Reviewer and leaves the final check with the orchestrator.
 
 Selections are stored as dicts keyed by ``selection_key`` so the handler can
 add / remove items without having to parse card state.
@@ -333,7 +333,7 @@ class SelectionFlowController:
         store = self._selection_store(is_review=is_review)
         if not store:
             if is_review:
-                return False, "请至少选择一个评审 Agent，或启用 Auto 跳过独立评审。"
+                return False, "请至少选择一个评审 Agent，或选择 Auto（无独立 Reviewer）。"
             return False, "请至少选择一个主编排 Agent（工具 + 模型）。"
         return True, ""
 
@@ -498,9 +498,9 @@ class SelectionFlowController:
         # Auto shortcut for review step
         if has_auto_shortcut:
             auto_btn_text = (
-                "✅ Auto 模式已启用（跳过独立评审）"
+                "✅ Auto：无独立 Reviewer；编排器负责最终检查"
                 if self.review_auto_mode
-                else "Auto — 跳过独立评审 / 沿用主 Agent 能力"
+                else "Auto — 无独立 Reviewer / 编排器负责最终检查"
             )
             auto_value = self._make_button_value(
                 action="workflow_review_toggle_auto",

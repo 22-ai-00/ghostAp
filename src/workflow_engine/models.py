@@ -14,6 +14,7 @@ from .constants import (
     AGENT_CALL_TIMEOUT_S,
     DEFAULT_MAX_CONCURRENT,
 )
+from .run_spec import WorkflowRunSpec as WorkflowRunSpec
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -92,6 +93,9 @@ class AgentCallResult(BaseModel):
 
     output: Optional[str] = None
     parsed: Optional[dict[str, Any]] = None
+    # Preserve the backend's actual PromptResult terminal reason. A transport
+    # returning without raising is not proof that user work completed.
+    stop_reason: Optional[str] = None
     token_usage: int = 0
     duration_s: float = 0.0
     error: Optional[str] = None
@@ -132,6 +136,8 @@ class AgentProgress(BaseModel):
 
     label: str = ""
     tool: str = ""
+    model: Optional[str] = None
+    role: Optional[str] = None
     task_summary: str = ""
     status: AgentStatus = AgentStatus.PENDING
     token_usage: int = 0
@@ -140,6 +146,25 @@ class AgentProgress(BaseModel):
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     current_activity: str = ""  # Live activity hint (e.g. "read_file src/...", "writing code...")
+
+
+class ReviewerEvidence(BaseModel):
+    """Durable proof of one committed, independent reviewer invocation."""
+
+    reviewer_index: int
+    selection_key: str = ""
+    display_name: str = ""
+    tool: str
+    model: Optional[str] = None
+    status: str
+    output: Optional[str] = None
+    stop_reason: Optional[str] = None
+    error: Optional[str] = None
+    cached: bool = False
+    token_usage: int = 0
+    duration_s: float = 0.0
+    started_at: float = Field(default_factory=time.time)
+    finished_at: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +207,9 @@ class PendingConfirmation(BaseModel):
     # --- New selection flow fields ---
     orchestrator_binding: Optional[ReviewAgentBinding] = None  # ReviewAgentBinding for the main agent
     review_agents: Optional[list[ReviewAgentBinding]] = None  # ReviewAgentBinding list for review pool
+    # None is reserved for restored legacy selections. New UI flows always
+    # persist True (Auto) or False (explicit reviewers).
+    auto_reviewer: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +238,11 @@ class WorkflowProject(BaseModel):
     # Runtime state — set when execution begins
     initiator_user_id: Optional[str] = None  # Who started this workflow (for stop auth)
     selected_tools: Optional[list[str]] = None  # Active tool whitelist during execution
-    tool_model_map: dict[str, str] = Field(default_factory=dict)  # tool_name -> model_name from user selection
+    tool_model_map: dict[str, Optional[str]] = Field(default_factory=dict)  # tool_name -> confirmed model (None means the tool default)
+    # Immutable WorkflowRunSpec is serialized here for state/history audit;
+    # the live engine keeps the frozen object itself.
+    run_spec: Optional[dict[str, Any]] = None
+    reviewer_evidence: list[ReviewerEvidence] = Field(default_factory=list)
     # Selection state storage for WorktreeSelectionController
     orchestrator_selection_state: Optional[dict] = None
     review_selection_state: Optional[dict] = None
@@ -227,15 +259,15 @@ class WorkflowProject(BaseModel):
             if self.pending.selected_tools is not None:
                 self.selected_tools = self.pending.selected_tools
             # Build tool→model mapping from user selections
-            mapping: dict[str, str] = {}
+            mapping: dict[str, Optional[str]] = {}
             if self.pending.orchestrator_binding:
                 b = self.pending.orchestrator_binding
-                if b.tool_name and b.model_name and not b.use_default_model:
-                    mapping[b.tool_name] = b.model_name
+                if b.tool_name:
+                    mapping[b.tool_name] = None if b.use_default_model else b.model_name
             for agent in (self.pending.review_agents or []):
-                if agent.tool_name and agent.model_name and not agent.use_default_model:
+                if agent.tool_name:
                     if agent.tool_name not in mapping:
-                        mapping[agent.tool_name] = agent.model_name
+                        mapping[agent.tool_name] = None if agent.use_default_model else agent.model_name
             self.tool_model_map = mapping
             self.pending = None
 
