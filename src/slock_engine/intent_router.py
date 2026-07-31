@@ -500,7 +500,7 @@ Output:"""
     ) -> str:
         """Own one NLI session from creation through close in one worker."""
 
-        from ..agent_session import close_session_safely, create_engine_session
+        from ..agent_session import close_session_safely, create_auxiliary_session
 
         unknown = '{"action": "unknown", "confidence": 0.0, "params": {}}'
         session = None
@@ -508,11 +508,10 @@ Output:"""
             remaining = deadline - time.monotonic()
             if cancel_requested.is_set() or remaining <= 0:
                 return unknown
-            session = create_engine_session(
+            session = create_auxiliary_session(
                 agent_type="coco",
                 cwd=".",
                 thread_id="slock_nli_classify",
-                auto_approve=True,
                 cancel_event=cancel_requested,
                 startup_timeout=remaining,
                 startup_retries=1,

@@ -14,6 +14,10 @@ from ..config import get_settings
 from ..utils.errors import get_error_detail
 from .claude_cli import SyncClaudeCLISession
 from .protocol import SyncSession
+from .tool_permissions import (
+    AuxiliarySessionPermissionError,
+    apply_auxiliary_tool_profile,
+)
 from .ttadk_cli import SyncTTADKCLISession
 from .wrappers import ModelFailureAwareSession, RateLimitAwareSession
 
@@ -348,6 +352,96 @@ def create_engine_session(
         # best-effort: wrapper 失败不应影响正常会话创建
         logger.debug("create_engine_session: ModelFailureAwareSession wrapper failed", exc_info=True)
 
+    return session
+
+
+def create_auxiliary_session(
+    agent_type: str,
+    cwd: str,
+    model_name: Optional[str] = None,
+    *,
+    thread_id: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
+    startup_timeout: Optional[float] = None,
+    startup_retries: Optional[int] = None,
+    startup_log_failures: Optional[bool] = None,
+) -> SyncSession:
+    """Create a text-only coordination/classification session with no tools.
+
+    Auxiliary sessions deliberately skip ``ModelFailureAwareSession`` because
+    that wrapper may replace its inner session during repair. A replacement
+    would otherwise lose the deny-all filter. Rate-limit retry remains safe
+    because it never replaces the filtered inner session.
+    """
+
+    from ..acp.sync_adapter import start_session_with_retry
+    from ..coco_model import get_coco_model_manager
+    from ..utils.path import normalize_ttadk_cwd
+
+    settings = get_settings()
+    normalized_agent = (agent_type or "coco").strip().lower()
+    if normalized_agent.startswith("ttadk_"):
+        raise AuxiliarySessionPermissionError(
+            "TTADK CLI cannot enforce the auxiliary deny-all tool profile"
+        )
+
+    normalized_cwd = normalize_ttadk_cwd(cwd) or cwd
+    effective_model = model_name
+    if not effective_model and normalized_agent == "coco":
+        effective_model = get_coco_model_manager().get_current_model()
+    elif not effective_model and normalized_agent == "traex":
+        try:
+            from ..acp.providers import get_providers, tool_registry
+
+            get_providers()
+            provider = tool_registry.get_provider("traex")
+            if provider and hasattr(provider, "get_default_model"):
+                effective_model = provider.get_default_model()
+        except Exception:
+            logger.debug(
+                "create_auxiliary_session: traex default model resolution failed",
+                exc_info=True,
+            )
+    effective_model = _normalize_acp_startup_model(
+        normalized_agent,
+        effective_model,
+    )
+
+    startup_kwargs: dict[str, object] = {}
+    if startup_retries is not None:
+        startup_kwargs["retries"] = startup_retries
+    if startup_log_failures is not None:
+        startup_kwargs["log_failures"] = startup_log_failures
+
+    logger.info(
+        "[SessionFactory] create_auxiliary_session: agent=%s cwd=%s "
+        "model=%s thread=%s profile=deny_all",
+        normalized_agent,
+        normalized_cwd,
+        effective_model,
+        thread_id or "",
+    )
+    session: SyncSession = start_session_with_retry(
+        agent_type=normalized_agent,
+        cwd=normalized_cwd,
+        startup_timeout=(
+            settings.acp_startup_timeout
+            if startup_timeout is None
+            else startup_timeout
+        ),
+        model_name=effective_model,
+        **startup_kwargs,
+    )
+    if settings.rate_limit_retry_enabled:
+        session = RateLimitAwareSession(
+            inner=session,
+            cancel_event=cancel_event,
+        )
+    try:
+        apply_auxiliary_tool_profile(session)
+    except Exception:
+        close_session_safely(session)
+        raise
     return session
 
 

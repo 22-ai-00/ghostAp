@@ -132,7 +132,7 @@ class SessionCoordinatorDecisionProvider:
         context: str,
         allowed_actions: frozenset[CoordinatorAction],
     ) -> CoordinatorDecision:
-        from src.agent_session import create_engine_session
+        from src.agent_session import create_auxiliary_session
 
         candidates = [
             {
@@ -162,12 +162,11 @@ class SessionCoordinatorDecisionProvider:
         with self._lock:
             session = self._sessions.get(run.coordinator_session_key)
             if session is None:
-                session = create_engine_session(
+                session = create_auxiliary_session(
                     agent_type=self._tool,
                     cwd=self._cwd(run),
                     model_name=self._model or None,
                     thread_id=f"team-coordinator:{run.coordinator_session_key[:24]}",
-                    auto_approve=True,
                 )
                 self._sessions[run.coordinator_session_key] = session
             result = session.send_prompt(prompt, timeout=self._timeout)

@@ -1258,7 +1258,7 @@ class TestCallLLMForSummaryIntegration:
         dm = DiscussionManager(engine=engine)
 
         with patch(
-            "src.agent_session.create_engine_session",
+            "src.agent_session.create_auxiliary_session",
             return_value=mock_session,
         ), patch(
             "src.agent_session.close_session_safely",
@@ -1285,7 +1285,7 @@ class TestCallLLMForSummaryIntegration:
         dm = DiscussionManager(engine=engine)
 
         with patch(
-            "src.agent_session.create_engine_session",
+            "src.agent_session.create_auxiliary_session",
             return_value=None,
         ):
             result = dm._call_llm_for_summary("Summarize this discussion")
@@ -1305,7 +1305,7 @@ class TestCallLLMForSummaryIntegration:
         dm = DiscussionManager(engine=engine)
 
         with patch(
-            "src.agent_session.create_engine_session",
+            "src.agent_session.create_auxiliary_session",
             return_value=mock_session,
         ), patch(
             "src.agent_session.close_session_safely",

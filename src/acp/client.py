@@ -74,6 +74,17 @@ _MAX_FILE_CHARS = 200_000
 _ACP_PERMISSION_DANGEROUS_CHECK = DangerousPatternCheckStrategy()
 _ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SHELL_CONTROL_TOKENS = frozenset({";", "&", "&&", "|", "||", "<", ">", "(", ")", "`"})
+_PERMISSION_KIND_TOOL_NAMES = {
+    "read": "file_read",
+    "edit": "file_write",
+    "delete": "file_write",
+    "move": "file_write",
+    "search": "search",
+    "fetch": "fetch",
+    "think": "think",
+    "switch_mode": "switch_mode",
+    "other": "other",
+}
 MAX_ACP_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_BASE64_IMAGE_CHARS = ((MAX_ACP_IMAGE_BYTES + 2) // 3) * 4
 SUPPORTED_ACP_IMAGE_MIME_TYPES = frozenset({
@@ -162,6 +173,46 @@ def _permission_execute_tool_name(command: str) -> str:
     if any(token in _SHELL_CONTROL_TOKENS for token in tokens[1:]):
         return "shell"
     return "git"
+
+
+def _permission_tool_request(
+    tool_call: Any,
+    *,
+    root_dir: str,
+) -> tuple[str, dict, Optional[str]]:
+    """Map every ACP permission kind to a stable tool-filter request."""
+
+    raw_input = getattr(tool_call, "raw_input", None)
+    if isinstance(raw_input, Mapping):
+        tool_args = dict(raw_input)
+    elif raw_input is None:
+        tool_args = {}
+    else:
+        tool_args = {"raw_input": raw_input}
+
+    raw_kind = getattr(tool_call, "kind", None)
+    kind = raw_kind.strip().casefold() if isinstance(raw_kind, str) else ""
+    if kind != "execute":
+        return _PERMISSION_KIND_TOOL_NAMES.get(kind, "other"), tool_args, None
+
+    command_value: Any = None
+    if isinstance(raw_input, Mapping):
+        command_value = (
+            raw_input.get("command")
+            or raw_input.get("cmd")
+            or raw_input.get("shell_command")
+        )
+    elif isinstance(raw_input, str):
+        command_value = raw_input
+    if command_value and not isinstance(command_value, str):
+        raise ValueError("execute command must be a string")
+    command = command_value if isinstance(command_value, str) and command_value else None
+    if command is None:
+        return "execute", tool_args, None
+
+    tool_args["command"] = command
+    tool_args.setdefault("cwd", root_dir)
+    return _permission_execute_tool_name(command), tool_args, command
 
 
 def _get_max_file_chars() -> int:
@@ -1263,57 +1314,55 @@ class GhostAPClient(Client):
             self._record(session_id, "permission", {"outcome": "cancelled", "reason": "empty_options"})
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
-        # Best-effort safety gate for execute operations.
+        # Permission filters apply to every ACP kind before auto-approval.
         try:
-            kind = getattr(tool_call, "kind", None)
-            if kind == "execute":
-                raw_input = getattr(tool_call, "raw_input", None)
-                command: Optional[str] = None
-                if isinstance(raw_input, dict):
-                    command = raw_input.get("command") or raw_input.get("cmd") or raw_input.get("shell_command")
-                elif isinstance(raw_input, str):
-                    command = raw_input
-                if command:
-                    tool_args = {"command": command}
-                    if isinstance(raw_input, dict):
-                        tool_args.update(raw_input)
-                    tool_args.setdefault("cwd", self._root_dir)
-                    permission_tool = _permission_execute_tool_name(command)
-                    if not self._is_tool_allowed(permission_tool, tool_args):
-                        self._record(
-                            session_id,
-                            "permission",
-                            {"outcome": "cancelled", "reason": "tool_filter_denied", "command": command},
-                        )
-                        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
-                    hard_ok, hard_reason = _ACP_PERMISSION_DANGEROUS_CHECK.check(command, None)
-                    if not hard_ok:
-                        logger.info("[ACP] Reject dangerous auto-approved command: %s (%s)", command, hard_reason)
-                        self._record(
-                            session_id,
-                            "permission",
-                            {
-                                "outcome": "cancelled",
-                                "reason": "dangerous_execute",
-                                "command": command,
-                                "detail": hard_reason,
-                            },
-                        )
-                        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
-                    ok, reason = self._sandbox.is_command_safe(command)
-                    if not ok:
-                        logger.info("[ACP] Reject unsafe command: %s (%s)", command, reason)
-                        self._record(
-                            session_id,
-                            "permission",
-                            {
-                                "outcome": "cancelled",
-                                "reason": "unsafe_execute",
-                                "command": command,
-                                "detail": reason,
-                            },
-                        )
-                        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+            permission_tool, tool_args, command = _permission_tool_request(
+                tool_call,
+                root_dir=self._root_dir,
+            )
+            if not self._is_tool_allowed(permission_tool, tool_args):
+                denied_data = {
+                    "outcome": "cancelled",
+                    "reason": "tool_filter_denied",
+                    "tool": permission_tool,
+                }
+                if command is not None:
+                    denied_data["command"] = command
+                self._record(session_id, "permission", denied_data)
+                return RequestPermissionResponse(
+                    outcome=DeniedOutcome(outcome="cancelled")
+                )
+
+            # Keep the existing hard and sandbox checks for executable commands.
+            if command is not None:
+                hard_ok, hard_reason = _ACP_PERMISSION_DANGEROUS_CHECK.check(command, None)
+                if not hard_ok:
+                    logger.info("[ACP] Reject dangerous auto-approved command: %s (%s)", command, hard_reason)
+                    self._record(
+                        session_id,
+                        "permission",
+                        {
+                            "outcome": "cancelled",
+                            "reason": "dangerous_execute",
+                            "command": command,
+                            "detail": hard_reason,
+                        },
+                    )
+                    return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+                ok, reason = self._sandbox.is_command_safe(command)
+                if not ok:
+                    logger.info("[ACP] Reject unsafe command: %s (%s)", command, reason)
+                    self._record(
+                        session_id,
+                        "permission",
+                        {
+                            "outcome": "cancelled",
+                            "reason": "unsafe_execute",
+                            "command": command,
+                            "detail": reason,
+                        },
+                    )
+                    return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         except Exception as e:
             logger.warning("[ACP] Permission safety check failed closed: %s", type(e).__name__)
             self._record(

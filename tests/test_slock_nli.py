@@ -1007,7 +1007,7 @@ class TestNLITimeoutProtection:
             captured.update(kwargs)
             return None
 
-        with patch("src.agent_session.create_engine_session", side_effect=create_session):
+        with patch("src.agent_session.create_auxiliary_session", side_effect=create_session):
             result = router._run_llm_session(
                 "classify",
                 time.monotonic() + 1.0,
@@ -1034,7 +1034,7 @@ class TestNLITimeoutProtection:
             events.append("heartbeat")
 
         with (
-            patch("src.agent_session.create_engine_session", side_effect=create_session),
+            patch("src.agent_session.create_auxiliary_session", side_effect=create_session),
             patch("src.agent_session.close_session_safely") as close_session,
         ):
             heartbeat_task = asyncio.create_task(heartbeat())
@@ -1064,7 +1064,7 @@ class TestNLITimeoutProtection:
             close_done.set()
 
         with (
-            patch("src.agent_session.create_engine_session", side_effect=create_session),
+            patch("src.agent_session.create_auxiliary_session", side_effect=create_session),
             patch("src.agent_session.close_session_safely", side_effect=close_session),
         ):
             task = asyncio.create_task(router._call_llm("classify"))
@@ -1097,7 +1097,7 @@ class TestNLITimeoutProtection:
             events.append(("close", threading.get_ident()))
 
         with (
-            patch("src.agent_session.create_engine_session", side_effect=create_session),
+            patch("src.agent_session.create_auxiliary_session", side_effect=create_session),
             patch("src.agent_session.close_session_safely", side_effect=close_session),
         ):
             result = await router._call_llm("classify")
@@ -1139,7 +1139,7 @@ class TestNLITimeoutProtection:
             close_done.set()
 
         with (
-            patch("src.agent_session.create_engine_session", side_effect=create_session),
+            patch("src.agent_session.create_auxiliary_session", side_effect=create_session),
             patch("src.agent_session.close_session_safely", side_effect=close_session),
         ):
             with pytest.raises(TimeoutError):

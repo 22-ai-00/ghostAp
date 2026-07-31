@@ -195,6 +195,9 @@ def test_configured_coordinator_session_is_reused_and_strictly_parsed(
     calls = []
 
     class _Session:
+        def set_tool_filter(self, _tool_filter):
+            return None
+
         def send_prompt(self, prompt, timeout):
             calls.append((prompt, timeout))
             return SimpleNamespace(
@@ -207,7 +210,7 @@ def test_configured_coordinator_session_is_reused_and_strictly_parsed(
 
     created = []
     monkeypatch.setattr(
-        "src.agent_session.create_engine_session",
+        "src.agent_session.create_auxiliary_session",
         lambda **kwargs: created.append(kwargs) or _Session(),
     )
     monkeypatch.setattr("src.agent_session.close_session_safely", lambda session: None)

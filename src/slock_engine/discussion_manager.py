@@ -2333,16 +2333,15 @@ class DiscussionManager:
             return fallback
 
         try:
-            from ..agent_session import close_session_safely, create_engine_session
+            from ..agent_session import close_session_safely, create_auxiliary_session
 
             agent_type = getattr(self._engine, "agent_type", "coco") or "coco"
             cwd = getattr(self._engine, "root_path", ".") or "."
 
-            session = create_engine_session(
+            session = create_auxiliary_session(
                 agent_type=agent_type,
                 cwd=cwd,
                 thread_id=f"slock_summary_{id(prompt) & 0xFFFF:04x}",
-                auto_approve=True,
             )
             if session is None:
                 logger.warning("Failed to create summary ACP session; using fallback.")

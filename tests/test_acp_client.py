@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +15,7 @@ from acp.schema import (
     ContentToolCallContent,
     EnvVariable,
     ImageContentBlock,
+    PermissionOption,
     ResourceContentBlock,
     TextContentBlock,
     ToolCallLocation,
@@ -1219,6 +1221,107 @@ def test_tool_filter_blocks_auto_approved_permission_request():
         assert resp.outcome.outcome == "cancelled"
     finally:
         loop.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "raw_input", "expected_tool", "expected_args"),
+    [
+        ("read", {"path": "/project/secret.txt"}, "file_read", {"path": "/project/secret.txt"}),
+        ("edit", {"path": "/project/app.py"}, "file_write", {"path": "/project/app.py"}),
+        ("delete", {"path": "/project/app.py"}, "file_write", {"path": "/project/app.py"}),
+        (
+            "move",
+            {"source": "/project/a.py", "destination": "/project/b.py"},
+            "file_write",
+            {"source": "/project/a.py", "destination": "/project/b.py"},
+        ),
+        ("search", {"query": "password"}, "search", {"query": "password"}),
+        ("fetch", {"url": "https://example.invalid"}, "fetch", {"url": "https://example.invalid"}),
+        ("other", {"operation": "custom"}, "other", {"operation": "custom"}),
+        ("think", {"topic": "plan"}, "think", {"topic": "plan"}),
+        ("switch_mode", {"mode": "code"}, "switch_mode", {"mode": "code"}),
+        ("execute", {"opaque": "missing command"}, "execute", {"opaque": "missing command"}),
+        ("future_kind", {"operation": "future"}, "other", {"operation": "future"}),
+        (None, {"operation": "unspecified"}, "other", {"operation": "unspecified"}),
+    ],
+)
+def test_permission_bridge_checks_every_kind_before_auto_approve(
+    kind,
+    raw_input,
+    expected_tool,
+    expected_args,
+):
+    seen: list[tuple[str, dict]] = []
+    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
+    client.set_tool_filter(
+        lambda tool, args: seen.append((tool, args or {})) or False
+    )
+    option = PermissionOption(
+        optionId="allow-once",
+        name="Allow once",
+        kind="allow_once",
+    )
+    tool_call = SimpleNamespace(kind=kind, raw_input=raw_input)
+
+    response = asyncio.run(
+        client.request_permission(
+            options=[option],
+            session_id="s1",
+            tool_call=tool_call,
+        )
+    )
+
+    assert response.outcome.outcome == "cancelled"
+    assert seen == [(expected_tool, expected_args)]
+
+
+def test_permission_bridge_filter_exception_fails_closed_before_auto_approve():
+    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
+
+    def broken_filter(_tool, _args):
+        raise RuntimeError("filter unavailable")
+
+    client.set_tool_filter(broken_filter)
+    option = PermissionOption(
+        optionId="allow-once",
+        name="Allow once",
+        kind="allow_once",
+    )
+
+    response = asyncio.run(
+        client.request_permission(
+            options=[option],
+            session_id="s1",
+            tool_call=SimpleNamespace(
+                kind="read",
+                raw_input={"path": "/project/secret.txt"},
+            ),
+        )
+    )
+
+    assert response.outcome.outcome == "cancelled"
+
+
+def test_permission_bridge_malformed_execute_command_remains_fail_closed():
+    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
+    option = PermissionOption(
+        optionId="allow-once",
+        name="Allow once",
+        kind="allow_once",
+    )
+
+    response = asyncio.run(
+        client.request_permission(
+            options=[option],
+            session_id="s1",
+            tool_call=SimpleNamespace(
+                kind="execute",
+                raw_input={"command": ["rm", "-rf", "/"]},
+            ),
+        )
+    )
+
+    assert response.outcome.outcome == "cancelled"
 
 
 def test_permission_bridge_classifies_canonical_git_execute_as_git():
