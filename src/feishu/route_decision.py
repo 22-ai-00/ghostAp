@@ -10,9 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .product_catalog import is_programming_entry_command
+
+if TYPE_CHECKING:
+    from ..trust.models import EffectiveTrust
 
 
 class RouteTarget(str, Enum):
@@ -48,6 +51,7 @@ class RouteDecision:
     payload: dict = field(default_factory=dict)
     reactions: tuple[str, ...] = ()
     reply_text: Optional[str] = None
+    effective_trust: EffectiveTrust | None = None
 
 
 class CommandRouter:

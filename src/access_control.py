@@ -16,6 +16,7 @@ from .config import (
 
 if TYPE_CHECKING:
     from .feishu.slash_command_parser import CommandMatch
+    from .trust.models import EffectiveTrust
 
 AdminBootstrapScope = Literal["any_chat", "p2p_only"]
 
@@ -52,6 +53,7 @@ class AccessDecision:
     operation: AccessOperation
     reason_code: str
     prospective_allowed: bool
+    effective_trust: EffectiveTrust | None = None
 
 
 @dataclass(frozen=True, slots=True)
