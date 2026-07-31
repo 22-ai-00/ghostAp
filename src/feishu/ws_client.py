@@ -3313,6 +3313,76 @@ class FeishuWSClient:
         # or running any compensation against remote chats.
         self._managed_group_registry.reconcile_uncertain_commit()
         remote = LarkChatClient(api_client_factory=self._get_api_client)
+
+        # Project binding sagas are authoritative lifecycle work, not legacy
+        # migration candidates. Consume them before scanning bound projects so
+        # OWNER_ADOPTED provenance cannot be rewritten as GHOSTAP_CREATED.
+        from ..trust.registry import RegistryCommitUncertainError
+
+        for saga in self._project_manager.pending_managed_chat_binding_sagas():
+            project = self._project_manager.get_project_for_diagnostics(
+                saga.project_id
+            )
+            active = self._managed_group_registry.active_record(saga.chat_id)
+            if (
+                project is not None
+                and active is not None
+                and active.project_id == saga.project_id
+                and active.canonical_root_ref == project.root_path
+            ):
+                self._project_manager.complete_managed_chat_binding_saga(
+                    saga.operation_id
+                )
+                continue
+
+            binding = self._managed_group_registry.provision_binding(
+                saga.operation_id
+            )
+            if (
+                project is not None
+                and binding is not None
+                and binding.chat_id == saga.chat_id
+                and binding.project_id == saga.project_id
+                and binding.canonical_root_ref == project.root_path
+            ):
+                try:
+                    self._managed_group_registry.activate(
+                        provision_id=saga.operation_id,
+                        chat_id=saga.chat_id,
+                        project_id=saga.project_id,
+                        canonical_root_ref=project.root_path,
+                    )
+                except RegistryCommitUncertainError as exc:
+                    if exc.committed:
+                        continue
+                    raise
+                except Exception:
+                    logger.exception(
+                        "managed group binding saga activation failed operation=%s",
+                        saga.operation_id,
+                    )
+                else:
+                    self._project_manager.complete_managed_chat_binding_saga(
+                        saga.operation_id
+                    )
+                    continue
+
+            restored = self._project_manager.restore_managed_chat_binding_saga(
+                saga.operation_id
+            )
+            if restored:
+                try:
+                    self._managed_group_registry.abandon_provision(
+                        saga.operation_id
+                    )
+                except RegistryCommitUncertainError:
+                    logger.exception(
+                        "managed group binding saga cleanup uncertain operation=%s",
+                        saga.operation_id,
+                    )
+            else:
+                self._project_manager.quarantine_bound_chat(saga.chat_id)
+
         for chat_id in self._managed_group_registry.pending_revokes():
             marker_disposition = (
                 self._slock_engine_manager.prepare_revoke_marker(chat_id)

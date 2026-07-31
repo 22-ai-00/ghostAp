@@ -114,7 +114,10 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
         normalized = (team_name or "").strip().casefold()
         if not normalized:
             return False
-        if delete_state != "create_outcome_unknown":
+        if delete_state not in {
+            "create_outcome_unknown",
+            "registry_bind_uncertain",
+        }:
             with self._lock:
                 self._blocked_team_names.add(normalized)
 
@@ -136,6 +139,14 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, record_path)
+            directory_fd = os.open(
+                records_dir,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
             return True
         except OSError:
             logger.exception(
@@ -180,6 +191,8 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
                     and time.time_ns() - created_at_ns < 10 * 60 * 60 * 1_000_000_000
                 ):
                     continue
+            if record.get("delete_state") == "registry_bind_uncertain":
+                continue
             if normalized and entry == f"{expected}.json":
                 blocked.add(normalized)
         return blocked

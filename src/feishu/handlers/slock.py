@@ -1991,6 +1991,25 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     CreateChatFailureDisposition,
                 )
                 logger.error("create_team: 建群/绑定失败 name=%s err=%s", name, redact_sensitive(str(e)))
+                from ...trust.registry import RegistryCommitUncertainError
+
+                if (
+                    isinstance(e, RegistryCommitUncertainError)
+                    and e.committed
+                    and "new_chat_id" in locals()
+                ):
+                    manager.block_team_name_for_cleanup(
+                        name,
+                        new_chat_id,
+                        "registry_bind_uncertain",
+                    )
+                    self.reply_text(
+                        message_id,
+                        "⚠️ 受管团队远端绑定结果不确定，已保留飞书群且不会执行删除；"
+                        "服务恢复核对后可安全重试。",
+                    )
+                    manager.release_team_name(name)
+                    return
                 self.reply_text(message_id, f"❌ 创建团队群失败: {safe_error_message(e)}")
                 if "new_chat_id" in locals():
                     delete_result = lark_client.delete_chat(new_chat_id)
@@ -2337,15 +2356,17 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 )
                 return
 
-        def _cancel_revoke() -> None:
-            if revoke_started:
-                try:
-                    registry.cancel_revoke(target_chat_id)
-                except Exception:
-                    logger.exception(
-                        "dissolve_team: failed to cancel revoke chat=%s",
-                        target_chat_id,
-                    )
+        def _cancel_revoke() -> bool:
+            if not revoke_started:
+                return True
+            try:
+                return bool(registry.cancel_revoke(target_chat_id))
+            except Exception:
+                logger.exception(
+                    "dissolve_team: failed to cancel revoke chat=%s",
+                    target_chat_id,
+                )
+                return False
 
         try:
             archived_marker = manager.archive_managed_chat_marker(target_chat_id)
@@ -2355,15 +2376,25 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 target_chat_id,
                 redact_sensitive(str(e)),
             )
+            cancelled = _cancel_revoke()
             self.reply_text(
                 message_id,
-                f"❌ 团队 **{team_name}** 未解散：本地状态归档失败，请重试。",
+                (
+                    f"❌ 团队 **{team_name}** 未解散：本地状态归档失败，撤销意图已取消，请重试。"
+                    if cancelled
+                    else f"⚠️ 团队 **{team_name}** 未解散，但撤销取消无法持久化；该群保持失败关闭，请人工检查。"
+                ),
             )
             return
         if archived_marker is None:
+            cancelled = _cancel_revoke()
             self.reply_text(
                 message_id,
-                f"❌ 团队 **{team_name}** 缺少活动 marker，未执行删群以避免重复操作。",
+                (
+                    f"❌ 团队 **{team_name}** 缺少活动 marker，撤销意图已取消，未执行删群。"
+                    if cancelled
+                    else f"⚠️ 团队 **{team_name}** 缺少活动 marker，且撤销取消无法持久化；该群保持失败关闭。"
+                ),
             )
             return
 

@@ -184,10 +184,12 @@ ambiguous external outcomes fail-closed:
   inside Feishu's 10-hour window, and block blind creation after it expires.
 - Migration first aggregates every legacy candidate by chat. Conflicting
   project/root bindings persist `ambiguous`; only unique consistent candidates
-  are validated/imported. INVALID/UNKNOWN/AMBIGUOUS notifications go to the
-  configured Owner `open_id`, are marked reported only after successful SDK
-  delivery, and remain retryable after failure. Membership pagination rejects
-  repeated tokens and stops at 100 pages.
+  are validated/imported. Only AMBIGUOUS items notify the configured Owner
+  `open_id`. Delivery is at-least-once: the durable `reported` flag is written
+  only after SDK success, so a crash between send and flag persistence may
+  duplicate one notification. INVALID/UNKNOWN remain visible through Owner
+  status inspection without proactive notification. Membership pagination
+  rejects repeated tokens and stops at 100 pages.
 
 ### Remaining model blocker
 
@@ -209,4 +211,39 @@ than being guessed from membership events.
 - WS/handler/Lark/Slock compatibility command: `299 passed, 2 warnings`.
 - Touched-file Ruff: `All checks passed!`; `git diff --check`: no output.
 - The two warnings are the existing pinned Lark SDK Python 3.13 deprecations.
+- Real Feishu tenant/mobile execution remains `not_tested`.
+
+## Third review correction
+
+- Project binding is now one durable saga shared by `/new-chat` and Owner
+  adoption. Startup consumes every pending saga before legacy migration:
+  matching provision intents activate with their original provenance,
+  completed ACTIVE records finish idempotently, and failed/orphaned work
+  restores the exact pre-bind snapshot. Newly-created projects are removed on
+  compensation rather than left as half-bound migration candidates.
+- Dissolve keeps a pending revoke only after the local marker was durably
+  archived. Archive errors and missing markers durably cancel the revoke and
+  keep the runtime usable; cancellation persistence failure remains explicitly
+  fail-closed and never dispatches remote deletion in that request.
+- A committed-but-uncertain `bind_provision_chat` result is handled like an
+  uncertain activation in Project and Team creation: the remote group is not
+  deleted, a durable retry residual is retained, and startup Registry
+  reconciliation resolves the commit before a same-operation retry.
+- Project snapshot writes no longer treat parent-directory open/fsync failure
+  as success. Slock residual writes now fsync their parent directory after
+  replace and return failure when that durability boundary is unconfirmed.
+- Employee principal rotation remains the same documented model blocker;
+  Task 0.10 was not started.
+
+### Third-correction verification
+
+- Registry/ProjectGrant focused set: `67 passed, 2 warnings`.
+- Expanded Registry/ProjectChat/Project/Slock set: `164 passed, 2 warnings`.
+- WS routing/handler/Lark/Slock compatibility set: `266 passed, 2 warnings`.
+- Touched-file Ruff and `git diff --check`: passed.
+- The brief-wide suite was not rerun for this correction because unrelated
+  tests were being edited concurrently in the shared worktree. The prior
+  `71d7d3cc` correction established `2407 passed, 2 warnings`; that historical
+  result is not represented as verification of this new diff.
+- The warnings remain the existing pinned Lark SDK Python 3.13 deprecations.
 - Real Feishu tenant/mobile execution remains `not_tested`.

@@ -365,6 +365,12 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   Registry/Project/Slock target, `130 passed` for expanded Project/Chat/Manager,
   and `351 passed, 17 subtests passed` for WS/handler compatibility. Touched
   Ruff and `git diff --check` pass. Real tenant execution remains `not_tested`.
+- Third review: Project and adoption now share one restart-consumed binding
+  saga before legacy migration; marker preparation failures cancel pending
+  revokes; uncertain provision binding never deletes the remote group; Project
+  and Slock supporting stores expose parent-directory durability failures.
+  AMBIGUOUS Owner notification is at-least-once, not exactly-once. Employee
+  principal rotation remains the same production model blocker.
 - Managed permission prompts remain a Task 0.8 matrix property with
   `permission_prompt_count(managed project task) = 0`; Task 0.9 adds no
   approval/tenant ACL. Real Feishu membership/receiving-bot validation,

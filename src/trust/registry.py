@@ -17,7 +17,7 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -113,6 +113,15 @@ class ManagedGroupConflictError(ManagedGroupRegistryError):
 
 class ManagedGroupValidationError(ManagedGroupRegistryError):
     """External migration/adoption validation did not establish provenance."""
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedGroupProvisionBinding:
+    provision_id: str
+    chat_id: str
+    project_id: str
+    canonical_root_ref: str
+    origin: ManagedGroupOrigin
 
 
 def single_owner_id(value: object) -> str:
@@ -416,6 +425,26 @@ class ManagedGroupRegistry:
                 return None
             remote_chat_id = intent.get("remote_chat_id")
             return remote_chat_id if isinstance(remote_chat_id, str) else None
+
+    def provision_binding(
+        self,
+        provision_id: str,
+    ) -> ManagedGroupProvisionBinding | None:
+        key = self._runtime_string(provision_id, "provision_id")
+        with self._disk_transaction():
+            intent = self._intents.get(key)
+            if intent is None:
+                return None
+            chat_id = intent.get("remote_chat_id")
+            if not isinstance(chat_id, str):
+                return None
+            return ManagedGroupProvisionBinding(
+                provision_id=key,
+                chat_id=chat_id,
+                project_id=intent["project_id"],
+                canonical_root_ref=intent["canonical_root_ref"],
+                origin=ManagedGroupOrigin(intent["origin"]),
+            )
 
     def provision_create_state(self, provision_id: str) -> str | None:
         key = self._runtime_string(provision_id, "provision_id")

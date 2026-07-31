@@ -182,7 +182,10 @@ class ProjectChatService:
                 return
 
         residual = self._pm.managed_group_residual(provision_id)
-        if residual is not None and residual[1] != "create_outcome_unknown":
+        if residual is not None and residual[1] not in {
+            "create_outcome_unknown",
+            "registry_bind_uncertain",
+        }:
             self._reply(
                 message_id,
                 "⚠️ 上次建群留下未确认的飞书群，已阻止重复建群；请先人工处理残留群。",
@@ -247,10 +250,28 @@ class ProjectChatService:
                     self._managed_groups.bind_provision_chat(
                         provision_id, new_chat_id
                     )
-                except Exception:
+                except Exception as exc:
+                    from ..trust.registry import RegistryCommitUncertainError
+
                     logger.exception(
                         "failed to bind remote chat to provision %s", provision_id
                     )
+                    if (
+                        isinstance(exc, RegistryCommitUncertainError)
+                        and exc.committed
+                    ):
+                        self._pm.record_managed_group_residual(
+                            provision_id,
+                            new_chat_id,
+                            "registry_bind_uncertain",
+                        )
+                        self._reply(
+                            message_id,
+                            "⚠️ 受管群远端绑定结果不确定，已保留飞书群且不会执行删除；"
+                            "服务恢复核对后可安全重试。",
+                            None,
+                        )
+                        return
                     delete_result = self._lark.delete_chat(new_chat_id)
                     if delete_result is True:
                         self._abandon_provision(provision_id)
@@ -276,21 +297,9 @@ class ProjectChatService:
 
         # 5. Bind, then atomically activate Registry before any success delivery.
         created_project = False
-        existing_snapshot = self._binding_snapshot(ctx) if ctx else None
+        binding_saga_prepared = False
         try:
-            if ctx:
-                # Branch B: legacy project without bound chat
-                ctx.project_name = name  # respect user-specified name
-                ctx.bound_chat_id = new_chat_id
-                ctx.bound_chat_name = new_chat_name
-                ctx.bound_chat_created_at = time.time()
-                ctx.add_chat_id(new_chat_id)
-                # Ensure the originating chat can still see this project
-                if chat_id != new_chat_id:
-                    ctx.add_chat_id(chat_id)
-                if self._pm._save_projects() is False:
-                    raise OSError("project binding persistence failed")
-            else:
+            if ctx is None:
                 # Branch C: new project
                 success, msg, ctx_new = self._pm.create_project(
                     project_id=None,
@@ -306,15 +315,21 @@ class ProjectChatService:
                         self._abandon_provision(provision_id)
                     return
                 created_project = True
-                ctx_new.bound_chat_id = new_chat_id
-                ctx_new.bound_chat_name = new_chat_name
-                ctx_new.bound_chat_created_at = time.time()
-                # Ensure the originating chat can also see this project
-                if chat_id != new_chat_id:
-                    ctx_new.add_chat_id(chat_id)
-                if self._pm._save_projects() is False:
-                    raise OSError("project binding persistence failed")
                 ctx = ctx_new
+
+            bound, _binding_snapshot = self._pm.bind_managed_chat_for_saga(
+                ctx.project_id,
+                new_chat_id,
+                chat_name=new_chat_name,
+                created_at=time.time(),
+                operation_id=provision_id,
+                additional_chat_id=chat_id,
+                project_name=name,
+                remove_project_on_restore=created_project,
+            )
+            if not bound:
+                raise OSError("project binding persistence failed")
+            binding_saga_prepared = True
 
             if self._managed_groups is not None:
                 self._managed_groups.activate(
@@ -323,6 +338,13 @@ class ProjectChatService:
                     project_id=ctx.project_id,
                     canonical_root_ref=ctx.root_path,
                 )
+            if not self._pm.complete_managed_chat_binding_saga(provision_id):
+                self._reply(
+                    message_id,
+                    "⚠️ 项目群已登记，但本地绑定事务收尾失败；请重试以完成恢复核对。",
+                    None,
+                )
+                return
         except Exception as e:
             from ..trust.registry import RegistryCommitUncertainError
 
@@ -344,11 +366,15 @@ class ProjectChatService:
                 new_chat_id[:12],
                 str(e),
             )
-            rollback_ok = self._rollback_binding(
-                ctx=ctx,
-                created_project=created_project,
-                existing_snapshot=existing_snapshot,
-                remote_chat_id=new_chat_id,
+            rollback_ok = (
+                self._pm.restore_managed_chat_binding_saga(provision_id)
+                if binding_saga_prepared
+                else self._rollback_binding(
+                    ctx=ctx,
+                    created_project=created_project,
+                    existing_snapshot=None,
+                    remote_chat_id=new_chat_id,
+                )
             )
             delete_result = self._lark.delete_chat(new_chat_id)
             if delete_result is True:
