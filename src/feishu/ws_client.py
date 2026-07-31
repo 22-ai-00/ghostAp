@@ -3309,15 +3309,26 @@ class FeishuWSClient:
             ManagedChatValidation,
         )
 
+        # Resolve an anchored pre/post-replace state before interpreting grants
+        # or running any compensation against remote chats.
+        self._managed_group_registry.reconcile_uncertain_commit()
         remote = LarkChatClient(api_client_factory=self._get_api_client)
         for chat_id in self._managed_group_registry.pending_revokes():
+            marker_disposition = (
+                self._slock_engine_manager.prepare_revoke_marker(chat_id)
+            )
             result = remote.delete_chat(chat_id)
             if result is False:
-                self._managed_group_registry.cancel_revoke(chat_id)
+                if self._slock_engine_manager.restore_revoke_marker(
+                    marker_disposition
+                ):
+                    self._managed_group_registry.cancel_revoke(chat_id)
                 continue
-            self._project_manager.revoke_managed_chat(chat_id)
+            if not self._project_manager.revoke_managed_chat(chat_id):
+                continue
             self._managed_group_registry.complete_revoke(chat_id)
 
+        candidates_by_chat: dict[str, list[dict]] = {}
         for project in self._project_manager.get_all_projects(
             sort_by_recent=False,
             chat_id=None,
@@ -3329,8 +3340,31 @@ class FeishuWSClient:
             if candidate is None:
                 continue
             chat_id = candidate["chat_id"]
+            candidates_by_chat.setdefault(chat_id, []).append(candidate)
+
+        for chat_id, candidates in sorted(candidates_by_chat.items()):
             if self._managed_group_registry.record(chat_id) is not None:
                 continue
+            distinct_bindings = {
+                (candidate["project_id"], candidate["canonical_root_ref"])
+                for candidate in candidates
+            }
+            if len(distinct_bindings) != 1:
+                project_ids = ",".join(
+                    sorted({candidate["project_id"] for candidate in candidates})
+                )
+                self._managed_group_registry.record_migration_disposition(
+                    chat_id,
+                    project_id=project_ids,
+                    status="ambiguous",
+                )
+                logger.warning(
+                    "managed group migration is ambiguous chat=%s projects=%s",
+                    chat_id[:12],
+                    project_ids,
+                )
+                continue
+            candidate = candidates[0]
             validation = remote.validate_managed_chat(
                 chat_id,
                 self._managed_group_owner_id,
@@ -3345,10 +3379,10 @@ class FeishuWSClient:
                     item[0]: (item[1], item[2])
                     for item in self._managed_group_registry.migration_dispositions()
                 }
-                disposition = (project.project_id, validation.value)
+                disposition = (candidate["project_id"], validation.value)
                 self._managed_group_registry.record_migration_disposition(
                     chat_id,
-                    project_id=project.project_id,
+                    project_id=candidate["project_id"],
                     status=validation.value,
                 )
                 if existing.get(chat_id) != disposition:
@@ -3357,6 +3391,20 @@ class FeishuWSClient:
                         chat_id[:12],
                         validation.value,
                     )
+
+        for chat_id, project_id, status in (
+            self._managed_group_registry.unreported_migration_dispositions()
+        ):
+            if status != "ambiguous":
+                continue
+            sent = remote.send_text_to_open_id(
+                self._managed_group_owner_id,
+                "受管群迁移需要人工处理："
+                f"群 {chat_id}，项目 {project_id}，状态 {status}。"
+                "请在 Owner 私聊中使用 /access migration-status 查看。",
+            )
+            if sent:
+                self._managed_group_registry.mark_migration_reported(chat_id)
 
     def rotate_main_managed_group_bot(
         self,
@@ -3476,7 +3524,12 @@ class FeishuWSClient:
 
         # Restore slock engines from persisted marker files
         try:
-            restored = self._slock_engine_manager.restore_from_disk(_root)
+            restored = self._slock_engine_manager.restore_from_disk(
+                _root,
+                managed_group_active=lambda chat_id: (
+                    self._managed_group_registry.active_record(chat_id) is not None
+                ),
+            )
             if restored:
                 logger.info("Restored %d slock engine(s) from disk", restored)
         except (OSError, ValueError, KeyError):

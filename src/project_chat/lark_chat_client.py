@@ -1,12 +1,14 @@
 """Feishu Chat API wrapper for project-chat binding."""
 
+import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from .errors import CreateChatError
+from .errors import CreateChatError, CreateChatFailureDisposition
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ class LarkChatClient:
         name: str,
         description: str,
         user_id_list: list[str],
+        operation_id: str = "",
     ) -> CreateChatResult:
         """Create a Feishu group chat. Bot is auto-added as creator.
 
@@ -57,12 +60,19 @@ class LarkChatClient:
             .chat_mode("group") \
             .chat_type("private") \
             .build()
-        request = CreateChatRequest.builder() \
-            .user_id_type("open_id") \
-            .request_body(body) \
-            .build()
+        request_builder = (
+            CreateChatRequest.builder()
+            .user_id_type("open_id")
+            .request_body(body)
+        )
+        if operation_id:
+            request_builder = request_builder.uuid(
+                str(uuid.uuid5(uuid.NAMESPACE_URL, operation_id))
+            )
+        request = request_builder.build()
 
         last_error = None
+        last_code: int | None = None
         for attempt in range(self._max_retries):
             try:
                 response = client.im.v1.chat.create(request)
@@ -72,14 +82,25 @@ class LarkChatClient:
                         name=name,
                     )
                 last_error = f"[{response.code}] {response.msg}"
+                last_code = response.code
                 if response.code in (230001, 230020, 99991672):
                     break
             except Exception as e:
                 last_error = str(e)
+                last_code = None
             if attempt < self._max_retries - 1:
                 time.sleep(0.3 * (2 ** attempt))
 
-        raise CreateChatError(f"建群失败: {last_error}")
+        definitive = last_code in (230001, 230020, 99991672)
+        raise CreateChatError(
+            f"建群失败: {last_error}",
+            disposition=(
+                CreateChatFailureDisposition.DEFINITIVE_REJECTED
+                if definitive
+                else CreateChatFailureDisposition.OUTCOME_UNKNOWN
+            ),
+            api_code=last_code,
+        )
 
     def add_managers(self, chat_id: str, manager_ids: list[str]) -> None:
         """Add managers to a group chat (best-effort).
@@ -135,7 +156,9 @@ class LarkChatClient:
                 return ManagedChatValidation.INVALID
 
             page_token = ""
-            while True:
+            seen_page_tokens: set[str] = set()
+            max_pages = 100
+            for _page_number in range(max_pages):
                 builder = (
                     GetChatMembersRequest.builder()
                     .chat_id(chat_id)
@@ -160,6 +183,10 @@ class LarkChatClient:
                 page_token = getattr(data, "page_token", "") or ""
                 if not page_token:
                     return ManagedChatValidation.UNKNOWN
+                if page_token in seen_page_tokens:
+                    return ManagedChatValidation.UNKNOWN
+                seen_page_tokens.add(page_token)
+            return ManagedChatValidation.UNKNOWN
         except Exception:
             logger.exception("validate_managed_chat(%s) failed", chat_id[:12])
             return ManagedChatValidation.UNKNOWN
@@ -197,6 +224,34 @@ class LarkChatClient:
         except Exception as e:
             logger.warning("delete_chat(%s) exception: %s", chat_id[:12], e)
             return None
+
+    def send_text_to_open_id(self, open_id: str, text: str) -> bool:
+        """Send an Owner-control notification through the official SDK."""
+
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
+
+        try:
+            client = self._api_client_factory()
+            body = (
+                CreateMessageRequestBody.builder()
+                .receive_id(open_id)
+                .msg_type("text")
+                .content(json.dumps({"text": text}, ensure_ascii=False))
+                .build()
+            )
+            request = (
+                CreateMessageRequest.builder()
+                .receive_id_type("open_id")
+                .request_body(body)
+                .build()
+            )
+            return bool(client.im.v1.message.create(request).success())
+        except Exception:
+            logger.exception("Owner migration notification failed")
+            return False
 
     def patch_description(self, chat_id: str, description: str) -> None:
         """Update group chat description (best-effort)."""

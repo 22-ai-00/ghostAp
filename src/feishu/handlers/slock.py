@@ -1958,17 +1958,38 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         if recovered_chat_id is not None:
             new_chat_id = recovered_chat_id
         else:
+            if managed_groups is not None and not managed_groups.prepare_create_dispatch(
+                provision_id,
+                dispatched_at=datetime.now(UTC),
+            ):
+                manager.block_team_name_for_cleanup(
+                    name,
+                    "outcome_unknown",
+                    "create_window_expired",
+                )
+                self.reply_text(
+                    message_id,
+                    "⚠️ 上次建群结果仍不确定且去重窗口已过，已阻止重复建群；请人工核对飞书群。",
+                )
+                manager.release_team_name(name)
+                return
             try:
                 result = lark_client.create_chat(
                     name=group_name,
                     description=f"Slock 协作团队: {name}",
                     user_id_list=[sender_open_id],
+                    operation_id=provision_id,
                 )
                 new_chat_id = result.chat_id
                 if managed_groups is not None:
                     managed_groups.bind_provision_chat(provision_id, new_chat_id)
             except Exception as e:
                 from src.utils.errors import redact_sensitive
+
+                from ...project_chat.errors import (
+                    CreateChatError,
+                    CreateChatFailureDisposition,
+                )
                 logger.error("create_team: 建群/绑定失败 name=%s err=%s", name, redact_sensitive(str(e)))
                 self.reply_text(message_id, f"❌ 创建团队群失败: {safe_error_message(e)}")
                 if "new_chat_id" in locals():
@@ -1977,6 +1998,28 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                         self._abandon_managed_group_provision(
                             managed_groups, provision_id
                         )
+                    else:
+                        manager.block_team_name_for_cleanup(
+                            name,
+                            new_chat_id,
+                            (
+                                "delete_rejected"
+                                if delete_result is False
+                                else "delete_unknown"
+                            ),
+                        )
+                elif (
+                    managed_groups is not None
+                    and isinstance(e, CreateChatError)
+                    and e.disposition
+                    is CreateChatFailureDisposition.OUTCOME_UNKNOWN
+                ):
+                    managed_groups.mark_create_outcome_unknown(provision_id)
+                    manager.block_team_name_for_cleanup(
+                        name,
+                        "outcome_unknown",
+                        "create_outcome_unknown",
+                    )
                 else:
                     self._abandon_managed_group_provision(
                         managed_groups, provision_id
@@ -2070,6 +2113,9 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
 
         except Exception as e:
             from src.utils.errors import redact_sensitive
+
+            from ...trust.registry import RegistryCommitUncertainError
+
             if registry_committed:
                 logger.exception(
                     "create_team: post-ACTIVE bootstrap/delivery degraded chat=%s",
@@ -2078,6 +2124,30 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 self.reply_text(
                     message_id,
                     f"⚠️ 团队 **{name}** 已创建并获得信任，但初始化未完整完成；请在团队群内重试 `/slock`。",
+                )
+                return
+            if isinstance(e, RegistryCommitUncertainError) and e.committed:
+                logger.error(
+                    "create_team: registry commit uncertain chat=%s; "
+                    "preserving remote group and stopping local runtime",
+                    new_chat_id,
+                )
+                if engine is not None:
+                    try:
+                        manager.archive_managed_chat_marker(new_chat_id)
+                        engine.deactivate()
+                        manager.unregister_managed_chat(new_chat_id)
+                        manager.remove(new_chat_id, root_path)
+                    except Exception:
+                        logger.exception(
+                            "create_team: uncertain-commit local stop failed chat=%s",
+                            new_chat_id,
+                        )
+                release_reservation = False
+                self.reply_text(
+                    message_id,
+                    f"⚠️ 团队 **{name}** 登记结果不确定，已停止继续操作且不会删除飞书群；"
+                    "服务恢复核对前该群不获得信任。",
                 )
                 return
             logger.error("create_team: 激活失败, 回滚建群 chat=%s err=%s", new_chat_id, redact_sensitive(str(e)))
@@ -2280,7 +2350,6 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         try:
             archived_marker = manager.archive_managed_chat_marker(target_chat_id)
         except (OSError, ValueError) as e:
-            _cancel_revoke()
             logger.error(
                 "dissolve_team: 归档本地 marker 失败 chat=%s err=%s",
                 target_chat_id,
@@ -2292,7 +2361,6 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             )
             return
         if archived_marker is None:
-            _cancel_revoke()
             self.reply_text(
                 message_id,
                 f"❌ 团队 **{team_name}** 缺少活动 marker，未执行删群以避免重复操作。",
@@ -2320,8 +2388,9 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             manager.unregister_managed_chat(target_chat_id)
             manager.remove(target_chat_id, root_path)
         except Exception as e:
-            _restore_local_team()
-            _cancel_revoke()
+            restored = _restore_local_team()
+            if restored:
+                _cancel_revoke()
             logger.error(
                 "dissolve_team: 本地运行时拆除失败 chat=%s err=%s",
                 target_chat_id,
@@ -2335,7 +2404,8 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         delete_result = lark_client.delete_chat(target_chat_id)
         if delete_result is False:
             restored = _restore_local_team()
-            _cancel_revoke()
+            if restored:
+                _cancel_revoke()
             self.reply_text(
                 message_id,
                 (

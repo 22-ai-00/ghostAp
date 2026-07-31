@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,7 +14,7 @@ from src.project.manager import ProjectManager
 from src.project_chat.lark_chat_client import CreateChatResult
 from src.project_chat.service import ProjectChatService
 from src.trust.models import ManagedGroupOrigin, ManagedGroupStatus
-from src.trust.registry import ManagedGroupRegistry
+from src.trust.registry import ManagedGroupRegistry, RegistryCommitUncertainError
 
 
 @pytest.fixture
@@ -81,6 +82,9 @@ def test_new_project_chat_is_active_before_welcome_without_allow_chat(
     assert record.canonical_root_ref == root
     assert events[-1][0] == "welcome"
     assert not any("allow-chat" in str(item) for item in events)
+    assert lark_client.create_chat.call_args.kwargs["operation_id"].startswith(
+        "new-chat:ou_owner:"
+    )
 
 
 @dataclass
@@ -149,6 +153,91 @@ def test_new_team_uses_same_managed_group_registry(
     assert handler.ctx.managed_group_registry is registry
 
 
+@patch("src.slock_engine.engine.create_engine_session")
+@patch("src.thread.manager.get_current_sender_id", return_value="ou_owner")
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_team_registry_commit_uncertain_never_deletes_remote_chat(
+    MockLarkChatClient, _sender, _session, tmp_path, registry
+):
+    handler = _make_slock_handler(tmp_path, registry)
+    lark = MockLarkChatClient.return_value
+    lark.create_chat.return_value = _FakeCreateChatResult(
+        chat_id="oc_team_uncertain",
+        name="Uncertain [Slock]",
+    )
+    registry.activate = MagicMock(
+        side_effect=RegistryCommitUncertainError(
+            "parent fsync failed",
+            committed=True,
+        )
+    )
+
+    handler.create_team("om_new_team", "oc_owner_p2p", "Uncertain")
+
+    lark.delete_chat.assert_not_called()
+    handler.send_card_to_chat.assert_not_called()
+    assert any(
+        "结果不确定" in str(call)
+        for call in handler.reply_text.call_args_list
+    )
+
+
+@pytest.mark.parametrize("delete_result", [False, None])
+@patch("src.slock_engine.engine.create_engine_session")
+@patch("src.thread.manager.get_current_sender_id", return_value="ou_owner")
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_team_bind_failure_persists_residual_name_block(
+    MockLarkChatClient,
+    _sender,
+    _session,
+    delete_result,
+    tmp_path,
+    registry,
+):
+    from src.slock_engine.manager import SlockEngineManager
+
+    handler = _make_slock_handler(tmp_path, registry)
+    lark = MockLarkChatClient.return_value
+    lark.create_chat.return_value = _FakeCreateChatResult(
+        chat_id="oc_team_residual",
+        name="Residual [Slock]",
+    )
+    lark.delete_chat.return_value = delete_result
+    registry.bind_provision_chat = MagicMock(side_effect=OSError("disk full"))
+
+    handler.create_team("om_new_team", "oc_owner_p2p", "Residual")
+
+    restarted = SlockEngineManager(
+        storage_base_path=handler.ctx.settings.slock_memory_base_path
+    )
+    assert restarted.reserve_team_name("Residual") is False
+
+
+@patch("src.slock_engine.engine.create_engine_session")
+@patch("src.thread.manager.get_current_sender_id", return_value="ou_owner")
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_team_create_outcome_unknown_retries_same_intent_inside_window(
+    MockLarkChatClient, _sender, _session, tmp_path, registry
+):
+    from src.project_chat.errors import CreateChatError
+
+    handler = _make_slock_handler(tmp_path, registry)
+    lark = MockLarkChatClient.return_value
+    lark.create_chat.side_effect = [
+        CreateChatError("timeout"),
+        _FakeCreateChatResult(
+            chat_id="oc_team_retry",
+            name="Retry [Slock]",
+        ),
+    ]
+
+    handler.create_team("om_first", "oc_owner_p2p", "Retry")
+    handler.create_team("om_retry", "oc_owner_p2p", "Retry")
+
+    assert lark.create_chat.call_count == 2
+    assert registry.active_record("oc_team_retry") is not None
+
+
 @pytest.mark.parametrize("delete_result", [True, False, None])
 def test_create_bind_registry_failure_never_reports_false_success(
     delete_result, tmp_path, project_manager, lark_client, registry
@@ -173,6 +262,68 @@ def test_create_bind_registry_failure_never_reports_false_success(
     assert registry.active_record("oc_project_group") is None
     project = project_manager.find_project_by_path(root, chat_id=None)
     assert project is None or not project.bound_chat_id
+
+
+def test_project_registry_commit_uncertain_never_deletes_remote_chat(
+    tmp_path, project_manager, lark_client, registry
+):
+    root = str(tmp_path / "uncertain")
+    os.makedirs(root)
+    events = []
+    service = _project_service(project_manager, lark_client, registry, events)
+    registry.activate = MagicMock(
+        side_effect=RegistryCommitUncertainError(
+            "parent fsync failed",
+            committed=True,
+        )
+    )
+
+    service.handle(
+        message_id="om_uncertain",
+        chat_id="oc_owner_p2p",
+        sender_open_id="ou_owner",
+        data={"name": "uncertain", "path": root},
+    )
+
+    lark_client.delete_chat.assert_not_called()
+    project = project_manager.find_project_by_path(root, chat_id=None)
+    assert project is not None
+    assert project.bound_chat_id == "oc_project_group"
+    assert not any(event[0] == "welcome" for event in events)
+
+
+def test_project_create_outcome_unknown_is_durable_and_not_abandoned(
+    tmp_path, project_manager, lark_client, registry
+):
+    from src.project_chat.errors import (
+        CreateChatError,
+        CreateChatFailureDisposition,
+    )
+
+    root = str(tmp_path / "create-unknown")
+    os.makedirs(root)
+    service = _project_service(project_manager, lark_client, registry, [])
+    lark_client.create_chat.side_effect = CreateChatError(
+        "timeout",
+        disposition=CreateChatFailureDisposition.OUTCOME_UNKNOWN,
+    )
+
+    service.handle(
+        message_id="om_unknown",
+        chat_id="oc_owner_p2p",
+        sender_open_id="ou_owner",
+        data={"name": "create-unknown", "path": root},
+    )
+
+    provision_id = (
+        f"new-chat:ou_owner:{ProjectManager.generate_id('create-unknown')}:"
+        f"{os.path.normpath(root)}"
+    )
+    assert registry.provision_create_state(provision_id) == "outcome_unknown"
+    assert project_manager.managed_group_residual(provision_id) == (
+        "outcome_unknown",
+        "create_outcome_unknown",
+    )
 
 
 def test_project_migration_requires_membership_and_receiving_bot_validation(
@@ -418,6 +569,32 @@ def test_dissolve_tombstone_failure_leaves_durable_fail_closed_revoke(
     assert registry.active_record("oc_uncertain") is None
 
 
+@patch("src.slock_engine.engine.create_engine_session")
+@patch("src.thread.manager.get_current_sender_id", return_value="ou_owner")
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_dissolve_restore_failure_keeps_pending_revoke_fail_closed(
+    MockLarkChatClient, _sender, _session, tmp_path, registry
+):
+    handler = _make_slock_handler(tmp_path, registry)
+    lark = MockLarkChatClient.return_value
+    lark.create_chat.return_value = _FakeCreateChatResult(
+        chat_id="oc_restore_failed", name="Restore Failed [Slock]"
+    )
+    handler.create_team("om_create", "oc_owner_p2p", "Restore Failed")
+    lark.delete_chat.return_value = False
+    handler._check_slock_permission = MagicMock(return_value=True)
+    handler.ctx.slock_engine_manager.restore_archived_chat_marker = MagicMock(
+        side_effect=OSError("disk unavailable")
+    )
+
+    handler.dissolve_team(
+        "om_dissolve", "oc_owner_p2p", "Restore Failed"
+    )
+
+    assert registry.pending_revokes() == ("oc_restore_failed",)
+    assert registry.active_record("oc_restore_failed") is None
+
+
 def test_lark_managed_chat_validation_requires_bot_and_owner_membership():
     from src.project_chat.lark_chat_client import (
         LarkChatClient,
@@ -453,6 +630,33 @@ def test_lark_managed_chat_validation_requires_bot_and_owner_membership():
     )
 
 
+def test_lark_managed_chat_validation_stops_repeated_page_token():
+    from src.project_chat.lark_chat_client import (
+        LarkChatClient,
+        ManagedChatValidation,
+    )
+
+    api = MagicMock()
+    bot_response = MagicMock()
+    bot_response.success.return_value = True
+    bot_response.data.is_in_chat = True
+    members_response = MagicMock()
+    members_response.success.return_value = True
+    members_response.data.items = []
+    members_response.data.has_more = True
+    members_response.data.page_token = "same-token"
+    members_response.data.trigger_security_conf_limit = False
+    api.im.v1.chat_members.is_in_chat.return_value = bot_response
+    api.im.v1.chat_members.get.return_value = members_response
+    client = LarkChatClient(api_client_factory=lambda: api)
+
+    assert (
+        client.validate_managed_chat("oc_loop", "ou_owner")
+        is ManagedChatValidation.UNKNOWN
+    )
+    assert api.im.v1.chat_members.get.call_count == 2
+
+
 def test_owner_p2p_access_adoption_delegates_without_allow_chat(monkeypatch):
     from src.feishu.handlers.system import SystemHandler
 
@@ -477,3 +681,421 @@ def test_owner_p2p_access_adoption_delegates_without_allow_chat(monkeypatch):
         "om_adopt", "oc_target", "project-1"
     )
     handler._admin_bootstrap_service.assert_not_called()
+
+
+def _write_slock_marker(base_path, chat_id: str) -> str:
+    marker_dir = base_path / "groups" / chat_id
+    marker_dir.mkdir(parents=True)
+    marker = marker_dir / ".slock_channel.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "channel_id": chat_id,
+                "name": "Crash Team",
+                "team_name": "Crash Team",
+                "owner_id": "ou_owner",
+                "root_path": str(base_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return str(marker)
+
+
+def _activate_managed_chat(registry, chat_id: str) -> None:
+    registry.register(
+        chat_id=chat_id,
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        receiving_bot_ref="cli_main_bot",
+        project_id=f"project:{chat_id}",
+        canonical_root_ref="/srv/project",
+        created_at=datetime.now(UTC),
+    )
+
+
+def _startup_reconciler(tmp_path, registry, manager, remote, project_manager):
+    from src.feishu.ws_client import FeishuWSClient
+
+    client = object.__new__(FeishuWSClient)
+    client._managed_group_registry = registry
+    client._slock_engine_manager = manager
+    client._project_manager = project_manager
+    client._managed_group_owner_id = "ou_owner"
+    client._managed_group_receiving_bot_ref = "cli_main_bot"
+    client._get_api_client = MagicMock()
+    return client
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_startup_reconciles_uncertain_registry_commit_before_other_recovery(
+    client_cls, tmp_path, registry, project_manager
+):
+    from src.slock_engine.manager import SlockEngineManager
+
+    manager = SlockEngineManager(storage_base_path=str(tmp_path / "slock"))
+    registry.reconcile_uncertain_commit = MagicMock(return_value=True)
+    client = _startup_reconciler(
+        tmp_path, registry, manager, client_cls.return_value, project_manager
+    )
+    client._reconcile_managed_groups_before_slock_restore()
+
+    registry.reconcile_uncertain_commit.assert_called_once_with()
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_startup_migration_aggregates_conflicting_chat_candidates_as_ambiguous(
+    client_cls, tmp_path, registry, project_manager
+):
+    from src.slock_engine.manager import SlockEngineManager
+
+    roots = (tmp_path / "a", tmp_path / "b")
+    for root_path in roots:
+        root_path.mkdir()
+    for project_id, root in (
+        ("legacy-a", str(roots[0])),
+        ("legacy-b", str(roots[1])),
+    ):
+        success, _, project = project_manager.create_project(
+            project_id, project_id, root
+        )
+        assert success and project is not None
+        project.bound_chat_id = "oc_shared_legacy"
+        project.bound_chat_created_at = 123.0
+    assert project_manager._save_projects()
+    manager = SlockEngineManager(storage_base_path=str(tmp_path / "slock"))
+    client = _startup_reconciler(
+        tmp_path, registry, manager, client_cls.return_value, project_manager
+    )
+    client_cls.return_value.send_text_to_open_id.return_value = True
+
+    client._reconcile_managed_groups_before_slock_restore()
+
+    client_cls.return_value.validate_managed_chat.assert_not_called()
+    assert registry.active_record("oc_shared_legacy") is None
+    assert registry.migration_dispositions() == (
+        ("oc_shared_legacy", "legacy-a,legacy-b", "ambiguous"),
+    )
+    client_cls.return_value.send_text_to_open_id.assert_called_once()
+    assert registry.unreported_migration_dispositions() == ()
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_migration_owner_notification_failure_remains_retryable(
+    client_cls, tmp_path, registry, project_manager
+):
+    from src.slock_engine.manager import SlockEngineManager
+
+    registry.record_migration_disposition(
+        "oc_review",
+        project_id="legacy-a,legacy-b",
+        status="ambiguous",
+    )
+    manager = SlockEngineManager(storage_base_path=str(tmp_path / "slock"))
+    client = _startup_reconciler(
+        tmp_path, registry, manager, client_cls.return_value, project_manager
+    )
+    client_cls.return_value.send_text_to_open_id.return_value = False
+
+    client._reconcile_managed_groups_before_slock_restore()
+
+    assert registry.unreported_migration_dispositions() == (
+        ("oc_review", "legacy-a,legacy-b", "ambiguous"),
+    )
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_startup_pending_revoke_archives_marker_before_confirmed_delete(
+    client_cls, tmp_path, registry, project_manager
+):
+    from src.slock_engine.manager import SlockEngineManager
+
+    manager = SlockEngineManager(storage_base_path=str(tmp_path / "slock"))
+    marker = _write_slock_marker(tmp_path / "slock", "oc_crash_before_archive")
+    _activate_managed_chat(registry, "oc_crash_before_archive")
+    registry.begin_revoke("oc_crash_before_archive", requested_at=datetime.now(UTC))
+    client_cls.return_value.delete_chat.return_value = True
+    client = _startup_reconciler(
+        tmp_path, registry, manager, client_cls.return_value, project_manager
+    )
+
+    client._reconcile_managed_groups_before_slock_restore()
+
+    assert not os.path.exists(marker)
+    assert registry.record("oc_crash_before_archive").status is ManagedGroupStatus.TOMBSTONED
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_startup_rejected_delete_cancels_only_after_durable_marker_restore(
+    client_cls, tmp_path, registry, project_manager
+):
+    from src.slock_engine.manager import SlockEngineManager
+
+    manager = SlockEngineManager(storage_base_path=str(tmp_path / "slock"))
+    marker = _write_slock_marker(tmp_path / "slock", "oc_crash_after_archive")
+    _activate_managed_chat(registry, "oc_crash_after_archive")
+    registry.begin_revoke("oc_crash_after_archive", requested_at=datetime.now(UTC))
+    archived = manager.archive_managed_chat_marker("oc_crash_after_archive")
+    assert archived and not os.path.exists(marker)
+    client_cls.return_value.delete_chat.return_value = False
+    client = _startup_reconciler(
+        tmp_path, registry, manager, client_cls.return_value, project_manager
+    )
+
+    client._reconcile_managed_groups_before_slock_restore()
+
+    assert os.path.isfile(marker)
+    assert registry.pending_revokes() == ()
+    assert registry.active_record("oc_crash_after_archive") is not None
+
+
+def test_restore_from_disk_skips_and_archives_untrusted_markers(tmp_path):
+    from src.slock_engine.manager import SlockEngineManager
+
+    manager = SlockEngineManager(storage_base_path=str(tmp_path / "slock"))
+    marker = _write_slock_marker(tmp_path / "slock", "oc_tombstoned")
+
+    restored = manager.restore_from_disk(
+        str(tmp_path),
+        managed_group_active=lambda _chat_id: False,
+    )
+
+    assert restored == 0
+    assert not os.path.exists(marker)
+
+
+def _adoption_handler(project_manager, registry):
+    from src.feishu.handlers.project import ProjectHandler
+
+    handler = object.__new__(ProjectHandler)
+    handler.ctx = MagicMock()
+    handler.ctx.project_manager = project_manager
+    handler.ctx.managed_group_registry = registry
+    handler.ctx.managed_group_owner_id = "ou_owner"
+    handler.ctx.managed_group_receiving_bot_ref = "cli_main_bot"
+    handler.ctx.api_client_factory = MagicMock()
+    handler.reply_error = MagicMock()
+    handler.reply_text = MagicMock()
+    return handler
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_adoption_durably_binds_project_before_registry_active(
+    client_cls, tmp_path, project_manager, registry
+):
+    from src.project_chat.lark_chat_client import ManagedChatValidation
+
+    root = str(tmp_path / "adopt-order")
+    success, _, project = project_manager.create_project(
+        "adopt-order", "adopt-order", root
+    )
+    assert success and project is not None
+    client_cls.return_value.validate_managed_chat.return_value = (
+        ManagedChatValidation.VALID
+    )
+    handler = _adoption_handler(project_manager, registry)
+    calls = []
+    original_bind = project_manager.bind_managed_chat_for_saga
+    original_activate = registry.activate
+
+    def observe_bind(*args, **kwargs):
+        calls.append("bind")
+        assert registry.active_record("oc_adopt_order") is None
+        return original_bind(*args, **kwargs)
+
+    def observe_activate(*args, **kwargs):
+        calls.append("activate")
+        assert project_manager.find_by_bound_chat_id("oc_adopt_order") is project
+        return original_activate(*args, **kwargs)
+
+    project_manager.bind_managed_chat_for_saga = MagicMock(side_effect=observe_bind)
+    registry.activate = MagicMock(side_effect=observe_activate)
+
+    handler.adopt_managed_chat("om_adopt", "oc_adopt_order", "adopt-order")
+
+    assert calls == ["bind", "activate"]
+    assert registry.active_record("oc_adopt_order") is not None
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_adoption_activation_failure_durably_restores_project_binding(
+    client_cls, tmp_path, project_manager, registry
+):
+    from src.project_chat.lark_chat_client import ManagedChatValidation
+
+    root = str(tmp_path / "adopt-rollback")
+    success, _, project = project_manager.create_project(
+        "adopt-rollback", "adopt-rollback", root
+    )
+    assert success and project is not None
+    client_cls.return_value.validate_managed_chat.return_value = (
+        ManagedChatValidation.VALID
+    )
+    handler = _adoption_handler(project_manager, registry)
+    original_bind = project_manager.bind_managed_chat_for_saga
+    project_manager.bind_managed_chat_for_saga = MagicMock(wraps=original_bind)
+    registry.activate = MagicMock(side_effect=OSError("registry unavailable"))
+
+    handler.adopt_managed_chat(
+        "om_adopt", "oc_adopt_rollback", "adopt-rollback"
+    )
+
+    project_manager.bind_managed_chat_for_saga.assert_called_once()
+    replayed = ProjectManager(storage_path=str(tmp_path / "projects.json"))
+    restored = replayed.get_project_for_diagnostics("adopt-rollback")
+    assert restored is not None and restored.bound_chat_id == ""
+    assert registry.active_record("oc_adopt_rollback") is None
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_adoption_retry_after_crash_uses_durable_original_binding_snapshot(
+    client_cls, tmp_path, project_manager, registry
+):
+    from src.project_chat.lark_chat_client import ManagedChatValidation
+
+    root = str(tmp_path / "adopt-crash")
+    success, _, project = project_manager.create_project(
+        "adopt-crash", "adopt-crash", root
+    )
+    assert success and project is not None
+    operation_id = "adopt:ou_owner:oc_adopt_crash:adopt-crash"
+    bound, _ = project_manager.bind_managed_chat_for_saga(
+        "adopt-crash",
+        "oc_adopt_crash",
+        created_at=123.0,
+        operation_id=operation_id,
+    )
+    assert bound
+    restarted = ProjectManager(storage_path=str(tmp_path / "projects.json"))
+    client_cls.return_value.validate_managed_chat.return_value = (
+        ManagedChatValidation.VALID
+    )
+    handler = _adoption_handler(restarted, registry)
+    registry.activate = MagicMock(side_effect=OSError("registry unavailable"))
+
+    handler.adopt_managed_chat("om_adopt", "oc_adopt_crash", "adopt-crash")
+
+    replayed = ProjectManager(storage_path=str(tmp_path / "projects.json"))
+    restored = replayed.get_project_for_diagnostics("adopt-crash")
+    assert restored is not None and restored.bound_chat_id == ""
+
+
+@patch("src.project_chat.lark_chat_client.LarkChatClient")
+def test_adoption_registry_commit_uncertain_preserves_durable_project_binding(
+    client_cls, tmp_path, project_manager, registry
+):
+    from src.project_chat.lark_chat_client import ManagedChatValidation
+
+    root = str(tmp_path / "adopt-uncertain")
+    success, _, project = project_manager.create_project(
+        "adopt-uncertain", "adopt-uncertain", root
+    )
+    assert success and project is not None
+    client_cls.return_value.validate_managed_chat.return_value = (
+        ManagedChatValidation.VALID
+    )
+    handler = _adoption_handler(project_manager, registry)
+    registry.activate = MagicMock(
+        side_effect=RegistryCommitUncertainError(
+            "parent fsync failed",
+            committed=True,
+        )
+    )
+
+    handler.adopt_managed_chat(
+        "om_adopt", "oc_adopt_uncertain", "adopt-uncertain"
+    )
+
+    replayed = ProjectManager(storage_path=str(tmp_path / "projects.json"))
+    rebound = replayed.get_project_for_diagnostics("adopt-uncertain")
+    assert rebound is not None
+    assert rebound.bound_chat_id == "oc_adopt_uncertain"
+    assert handler.reply_text.call_count == 0
+
+
+def test_project_quarantine_survives_restart_and_blocks_bound_index(
+    tmp_path, project_manager
+):
+    root = str(tmp_path / "quarantine")
+    success, _, project = project_manager.create_project(
+        "quarantine", "quarantine", root
+    )
+    assert success and project is not None
+    assert project_manager.bind_managed_chat(
+        "quarantine",
+        "oc_quarantined",
+        created_at=datetime.now(UTC).timestamp(),
+    )
+
+    assert project_manager.quarantine_bound_chat("oc_quarantined") is True
+    restarted = ProjectManager(storage_path=str(tmp_path / "projects.json"))
+    assert restarted.find_by_bound_chat_id("oc_quarantined") is None
+
+
+def test_lark_create_chat_uses_deterministic_operation_uuid():
+    from src.project_chat.lark_chat_client import LarkChatClient
+
+    api = MagicMock()
+    response = MagicMock()
+    response.success.return_value = True
+    response.data.chat_id = "oc_uuid"
+    api.im.v1.chat.create.return_value = response
+    client = LarkChatClient(api_client_factory=lambda: api)
+
+    client.create_chat(
+        name="UUID Team",
+        description="test",
+        user_id_list=["ou_owner"],
+        operation_id="new-chat:ou_owner:project:/srv/project",
+    )
+    first_uuid = api.im.v1.chat.create.call_args.args[0].uuid
+    client.create_chat(
+        name="UUID Team",
+        description="test",
+        user_id_list=["ou_owner"],
+        operation_id="new-chat:ou_owner:project:/srv/project",
+    )
+    second_uuid = api.im.v1.chat.create.call_args.args[0].uuid
+
+    assert first_uuid == second_uuid
+    assert len(first_uuid) == 36
+
+
+@pytest.mark.parametrize("delete_result", [False, None])
+def test_project_bind_failure_persists_residual_and_blocks_blind_retry(
+    delete_result, tmp_path, project_manager, lark_client, registry
+):
+    root = str(tmp_path / "residual-project")
+    os.makedirs(root)
+    events = []
+    service = _project_service(project_manager, lark_client, registry, events)
+    lark_client.delete_chat.return_value = delete_result
+    registry.bind_provision_chat = MagicMock(
+        side_effect=OSError("registry unavailable")
+    )
+
+    service.handle(
+        "om_first",
+        "oc_owner_p2p",
+        "ou_owner",
+        {"name": "residual-project", "path": root},
+    )
+
+    restarted = ProjectManager(storage_path=str(tmp_path / "projects.json"))
+    provision_id = (
+        f"new-chat:ou_owner:residual_project:{os.path.normpath(root)}"
+    )
+    assert restarted.managed_group_residual(provision_id) == (
+        "oc_project_group",
+        "delete_rejected" if delete_result is False else "delete_unknown",
+    )
+
+    lark_client.create_chat.reset_mock()
+    retry = _project_service(restarted, lark_client, registry, events)
+    retry.handle(
+        "om_retry",
+        "oc_owner_p2p",
+        "ou_owner",
+        {"name": "residual-project", "path": root},
+    )
+    lark_client.create_chat.assert_not_called()

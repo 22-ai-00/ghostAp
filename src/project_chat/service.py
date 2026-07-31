@@ -181,22 +181,64 @@ class ProjectChatService:
                 self._reply(message_id, "❌ 受管群登记准备失败，请重试", None)
                 return
 
+        residual = self._pm.managed_group_residual(provision_id)
+        if residual is not None and residual[1] != "create_outcome_unknown":
+            self._reply(
+                message_id,
+                "⚠️ 上次建群留下未确认的飞书群，已阻止重复建群；请先人工处理残留群。",
+                None,
+            )
+            return
+
         # 4. Create the remote chat once, then durably bind its ID before any
         # local project mutation.  A retry after restart reuses that binding.
         if recovered_chat_id is not None:
             new_chat_id = recovered_chat_id
             new_chat_name = group_name
         else:
+            if self._managed_groups is not None and not (
+                self._managed_groups.prepare_create_dispatch(
+                    provision_id,
+                    dispatched_at=datetime.now(UTC),
+                )
+            ):
+                self._pm.record_managed_group_residual(
+                    provision_id,
+                    "outcome_unknown",
+                    "create_outcome_unknown",
+                )
+                self._reply(
+                    message_id,
+                    "⚠️ 上次建群结果仍不确定且去重窗口已过，已阻止重复建群；"
+                    "请人工核对飞书群。",
+                    None,
+                )
+                return
             try:
                 result = self._lark.create_chat(
                     name=group_name,
                     description=description,
                     user_id_list=[sender_open_id],
+                    operation_id=provision_id,
                 )
             except CreateChatError as e:
+                from .errors import CreateChatFailureDisposition
+
                 logger.warning("create_chat failed for path=%s: %s", path, str(e))
                 self._reply(message_id, f"❌ 建群失败: {e}", None)
-                self._abandon_provision(provision_id)
+                if (
+                    self._managed_groups is not None
+                    and e.disposition
+                    is CreateChatFailureDisposition.OUTCOME_UNKNOWN
+                ):
+                    self._managed_groups.mark_create_outcome_unknown(provision_id)
+                    self._pm.record_managed_group_residual(
+                        provision_id,
+                        "outcome_unknown",
+                        "create_outcome_unknown",
+                    )
+                else:
+                    self._abandon_provision(provision_id)
                 return
             new_chat_id = result.chat_id
             new_chat_name = result.name
@@ -212,6 +254,16 @@ class ProjectChatService:
                     delete_result = self._lark.delete_chat(new_chat_id)
                     if delete_result is True:
                         self._abandon_provision(provision_id)
+                    else:
+                        self._pm.record_managed_group_residual(
+                            provision_id,
+                            new_chat_id,
+                            (
+                                "delete_rejected"
+                                if delete_result is False
+                                else "delete_unknown"
+                            ),
+                        )
                     self._reply(
                         message_id,
                         "❌ 受管群远端绑定持久化失败，请重试或人工确认残留群。",
@@ -272,6 +324,21 @@ class ProjectChatService:
                     canonical_root_ref=ctx.root_path,
                 )
         except Exception as e:
+            from ..trust.registry import RegistryCommitUncertainError
+
+            if isinstance(e, RegistryCommitUncertainError) and e.committed:
+                logger.error(
+                    "registry activation durability is uncertain; preserving "
+                    "remote chat and durable project binding chat=%s",
+                    new_chat_id[:12],
+                )
+                self._reply(
+                    message_id,
+                    "⚠️ 项目群登记结果不确定，已停止继续操作且不会删除飞书群；"
+                    "服务恢复核对前该群不获得信任。",
+                    None,
+                )
+                return
             logger.error(
                 "bind/registry activation failed, rolling back chat %s: %s",
                 new_chat_id[:12],

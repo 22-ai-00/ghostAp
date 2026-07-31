@@ -146,7 +146,7 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 | 0.6 Spec completion fail-closed | complete (`93a52598`) | evidence-only | 明确失败不能被空建议转成通过 |
 | 0.7 辅助 Agent 权限 | complete (`f69acc90`) | evidence-only | coordinator/classifier deny-all；不产生用户交互 |
 | 0.8 TrustZone/Actor/ActionMatrix | complete (`77a70c17`, fix `124749de`) | evidence-only | `ALLOW/DENY` only；Owner/Employee/unknown + stale revision |
-| 0.9 ManagedGroup Registry/lifecycle | complete | evidence-only | ACTIVE 早于 welcome；Project/Team 共用；tombstone/replay |
+| 0.9 ManagedGroup Registry/lifecycle | partial | blocked: Employee rotation source | ACTIVE 早于 welcome；Project/Team 共用；tombstone/replay；principal CAS primitive complete，生产 rebind saga 缺事件源 |
 | 0.10 ingress/callback cutover | missing | active | trust 早于业务副作用；managed group 零 enrollment；external 零副作用 |
 
 CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
@@ -293,9 +293,11 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   managed project Owner/valid Employee actions resolve directly. Therefore
   `permission_prompt_count(managed project task) = 0` is proven at the pure
   matrix boundary only; no tenant/UI prompt count is claimed.
-- Real Feishu managed-group/manual/mobile evidence: `not_tested`. ManagedGroup
-  Registry/lifecycle (0.9) is complete, but ingress/callback production cutover
-  (0.10) is still missing, so this evidence does not pass CP-T.
+- Real Feishu managed-group/manual/mobile evidence: `not_tested`. Registry and
+  Project/Team lifecycle (0.9) are implemented, but Employee principal rotation
+  remains blocked on a trustworthy production event/rebind saga;
+  ingress/callback production cutover (0.10) is still missing, so this evidence
+  does not pass CP-T.
 
 ### Task 0.9 evidence
 
@@ -354,7 +356,8 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   `is_in_chat` plus paged Owner membership; UNKNOWN/INVALID legacy candidates
   are persisted for Owner P2P inspection/adoption. Main-Bot rotation is an
   explicit Owner P2P, remote-validated CAS; Employee principal rotation remains
-  a documented future limitation rather than inferred identity.
+  a model blocker rather than inferred identity. Registry CAS primitive tests
+  are not production workforce/Journal/remote-validation evidence.
 - Review TDD: Registry concurrency/uncertain-commit/strict-input batch began at
   `6 failed`; provision binding/Project compensation at `4 failed`; Slock
   commit/revoke/marker at `3 failed` plus ordering regression; production

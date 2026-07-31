@@ -8,15 +8,17 @@ registry's leaf lock while validating and replacing its JSON snapshot.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
 import secrets
 import threading
+import uuid
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -40,14 +42,27 @@ _TOP_LEVEL_KEYS = {
 }
 _INTENT_KEYS = {
     "canonical_root_ref",
+    "create_dispatched_at",
+    "create_state",
     "created_at",
+    "operation_uuid",
     "origin",
     "owner_id",
     "project_id",
     "receiving_bot_ref",
     "remote_chat_id",
 }
-_LEGACY_INTENT_KEYS = _INTENT_KEYS - {"remote_chat_id"}
+_LEGACY_INTENT_KEYS = _INTENT_KEYS - {
+    "create_dispatched_at",
+    "create_state",
+    "operation_uuid",
+    "remote_chat_id",
+}
+_V1_INTENT_KEYS = _INTENT_KEYS - {
+    "create_dispatched_at",
+    "create_state",
+    "operation_uuid",
+}
 _ENTRY_KEYS = {"grant", "record"}
 _RECORD_KEYS = {
     "canonical_root_ref",
@@ -72,7 +87,8 @@ _GRANT_KEYS = {
     "revision",
 }
 _REVOKE_KEYS = {"requested_at"}
-_MIGRATION_KEYS = {"project_id", "status"}
+_MIGRATION_KEYS = {"project_id", "reported", "status"}
+_LEGACY_MIGRATION_KEYS = _MIGRATION_KEYS - {"reported"}
 
 
 class ManagedGroupRegistryError(RuntimeError):
@@ -81,6 +97,14 @@ class ManagedGroupRegistryError(RuntimeError):
 
 class RegistryCorruptionError(ManagedGroupRegistryError):
     """The on-disk registry is malformed or uses an unsupported schema."""
+
+
+class RegistryCommitUncertainError(ManagedGroupRegistryError):
+    """A target replace may have committed but durability is not confirmed."""
+
+    def __init__(self, message: str, *, committed: bool) -> None:
+        super().__init__(message)
+        self.committed = committed
 
 
 class ManagedGroupConflictError(ManagedGroupRegistryError):
@@ -251,13 +275,17 @@ class ManagedGroupRegistry:
             raise TypeError("storage_path must be path-like")
         self._path = Path(storage_path)
         self._lock_path = self._path.with_name(f".{self._path.name}.lock")
+        self._uncertain_path = self._path.with_name(
+            f".{self._path.name}.commit-uncertain"
+        )
         self._lock = threading.RLock()  # leaf lock: no external calls while held
         self._revision = 0
         self._intents: dict[str, dict[str, Any]] = {}
         self._records: dict[str, ManagedGroupRecord] = {}
         self._grants: dict[str, ProjectGrant] = {}
         self._revokes: dict[str, dict[str, str]] = {}
-        self._migration_dispositions: dict[str, dict[str, str]] = {}
+        self._migration_dispositions: dict[str, dict[str, Any]] = {}
+        self._commit_uncertain = False
         self._validate_storage_path()
         with self._disk_transaction():
             pass
@@ -277,6 +305,8 @@ class ManagedGroupRegistry:
 
     def project_grants(self) -> tuple[ProjectGrant, ...]:
         with self._disk_transaction():
+            if self._commit_uncertain:
+                return ()
             active_ids = {
                 record.project_grant_id
                 for record in self._records.values()
@@ -295,7 +325,7 @@ class ManagedGroupRegistry:
 
     def active_record(self, chat_id: str) -> ManagedGroupRecord | None:
         with self._disk_transaction():
-            if chat_id in self._revokes:
+            if self._commit_uncertain or chat_id in self._revokes:
                 return None
             record = self._records.get(chat_id)
             if record is None or record.status is not ManagedGroupStatus.ACTIVE:
@@ -309,6 +339,7 @@ class ManagedGroupRegistry:
                 record is None
                 or record.status is not ManagedGroupStatus.ACTIVE
                 or chat_id in self._revokes
+                or self._commit_uncertain
             ):
                 return None
             return self._grants.get(record.project_grant_id)
@@ -326,32 +357,45 @@ class ManagedGroupRegistry:
     ) -> str:
         if not isinstance(origin, ManagedGroupOrigin):
             raise TypeError("origin must be ManagedGroupOrigin")
+        key = self._runtime_string(provision_id, "provision_id")
         facts = {
             "canonical_root_ref": self._runtime_string(
                 canonical_root_ref, "canonical_root_ref"
             ),
+            "create_dispatched_at": None,
+            "create_state": "prepared",
             "created_at": self._runtime_datetime(created_at).isoformat(),
             "origin": origin.value,
             "owner_id": self._runtime_string(owner_id, "owner_id"),
+            "operation_uuid": str(uuid.uuid5(uuid.NAMESPACE_URL, key)),
             "project_id": self._runtime_string(project_id, "project_id"),
             "receiving_bot_ref": self._runtime_string(
                 receiving_bot_ref, "receiving_bot_ref"
             ),
             "remote_chat_id": None,
         }
-        key = self._runtime_string(provision_id, "provision_id")
         with self._disk_transaction():
             existing = self._intents.get(key)
             if existing is not None:
                 stable_existing = {
                     name: value
                     for name, value in existing.items()
-                    if name not in {"created_at", "remote_chat_id"}
+                    if name not in {
+                        "create_dispatched_at",
+                        "create_state",
+                        "created_at",
+                        "remote_chat_id",
+                    }
                 }
                 stable_retry = {
                     name: value
                     for name, value in facts.items()
-                    if name not in {"created_at", "remote_chat_id"}
+                    if name not in {
+                        "create_dispatched_at",
+                        "create_state",
+                        "created_at",
+                        "remote_chat_id",
+                    }
                 }
                 if stable_existing != stable_retry:
                     raise ManagedGroupConflictError("provision retry changed facts")
@@ -373,6 +417,44 @@ class ManagedGroupRegistry:
             remote_chat_id = intent.get("remote_chat_id")
             return remote_chat_id if isinstance(remote_chat_id, str) else None
 
+    def provision_create_state(self, provision_id: str) -> str | None:
+        key = self._runtime_string(provision_id, "provision_id")
+        with self._disk_transaction():
+            intent = self._intents.get(key)
+            return None if intent is None else intent["create_state"]
+
+    def prepare_create_dispatch(
+        self,
+        provision_id: str,
+        *,
+        dispatched_at: datetime,
+    ) -> bool:
+        key = self._runtime_string(provision_id, "provision_id")
+        now = self._runtime_datetime(dispatched_at)
+        with self._disk_transaction():
+            intent = self._intents.get(key)
+            if intent is None or intent.get("remote_chat_id") is not None:
+                return False
+            first_raw = intent.get("create_dispatched_at")
+            if isinstance(first_raw, str):
+                first = datetime.fromisoformat(first_raw)
+                if now - first >= timedelta(hours=10):
+                    return False
+            else:
+                intent["create_dispatched_at"] = now.isoformat()
+            intent["create_state"] = "dispatched"
+            self._persist_locked()
+            return True
+
+    def mark_create_outcome_unknown(self, provision_id: str) -> None:
+        key = self._runtime_string(provision_id, "provision_id")
+        with self._disk_transaction():
+            intent = self._intents.get(key)
+            if intent is None or intent.get("remote_chat_id") is not None:
+                raise ManagedGroupConflictError("unknown or bound provision intent")
+            intent["create_state"] = "outcome_unknown"
+            self._persist_locked()
+
     def bind_provision_chat(self, provision_id: str, chat_id: str) -> str:
         key = self._runtime_string(provision_id, "provision_id")
         chat = self._runtime_string(chat_id, "chat_id")
@@ -388,6 +470,7 @@ class ManagedGroupRegistry:
                     "provision intent is bound to a different chat"
                 )
             intent["remote_chat_id"] = chat
+            intent["create_state"] = "bound"
             self._persist_locked()
             return chat
 
@@ -740,11 +823,14 @@ class ManagedGroupRegistry:
     ) -> None:
         chat = self._runtime_string(chat_id, "chat_id")
         project = self._runtime_string(project_id, "project_id")
-        if status not in {"invalid", "unknown"}:
+        if status not in {"ambiguous", "invalid", "unknown"}:
             raise ValueError("unsupported migration disposition")
         with self._disk_transaction():
-            value = {"project_id": project, "status": status}
-            if self._migration_dispositions.get(chat) == value:
+            value = {"project_id": project, "reported": False, "status": status}
+            existing = self._migration_dispositions.get(chat)
+            if existing is not None and (
+                existing["project_id"], existing["status"]
+            ) == (project, status):
                 return
             self._migration_dispositions[chat] = value
             self._persist_locked()
@@ -759,6 +845,28 @@ class ManagedGroupRegistry:
                 )
                 for chat_id, value in sorted(self._migration_dispositions.items())
             )
+
+    def unreported_migration_dispositions(self) -> tuple[tuple[str, str, str], ...]:
+        with self._disk_transaction():
+            return tuple(
+                (chat_id, value["project_id"], value["status"])
+                for chat_id, value in sorted(self._migration_dispositions.items())
+                if value["reported"] is False
+            )
+
+    def mark_migration_reported(self, chat_id: str) -> bool:
+        chat = self._runtime_string(chat_id, "chat_id")
+        with self._disk_transaction():
+            value = self._migration_dispositions.get(chat)
+            if value is None or value["reported"] is True:
+                return False
+            value["reported"] = True
+            try:
+                self._persist_locked()
+            except BaseException:
+                value["reported"] = False
+                raise
+            return True
 
     def complete_revoke(self, chat_id: str) -> ManagedGroupRecord:
         chat = self._runtime_string(chat_id, "chat_id")
@@ -832,6 +940,7 @@ class ManagedGroupRegistry:
             self._grants = {}
             self._revokes = {}
             self._migration_dispositions = {}
+            self._commit_uncertain = self._uncertain_path.exists()
             return
         try:
             with self._path.open("r", encoding="utf-8") as handle:
@@ -872,15 +981,25 @@ class ManagedGroupRegistry:
             records: dict[str, ManagedGroupRecord] = {}
             grants: dict[str, ProjectGrant] = {}
             revokes: dict[str, dict[str, str]] = {}
-            migrations: dict[str, dict[str, str]] = {}
+            migrations: dict[str, dict[str, Any]] = {}
             for provision_id, raw_intent in intents_raw.items():
                 _require_string(provision_id, "provision id")
                 if not isinstance(raw_intent, dict) or frozenset(raw_intent) not in {
                     frozenset(_INTENT_KEYS),
                     frozenset(_LEGACY_INTENT_KEYS),
+                    frozenset(_V1_INTENT_KEYS),
                 }:
                     raise RegistryCorruptionError("invalid provision intent schema")
                 intent = dict(raw_intent)
+                intent.setdefault("create_dispatched_at", None)
+                intent.setdefault(
+                    "create_state",
+                    "bound" if intent.get("remote_chat_id") else "prepared",
+                )
+                intent.setdefault(
+                    "operation_uuid",
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, provision_id)),
+                )
                 intent.setdefault("remote_chat_id", None)
                 _parse_datetime(intent["created_at"], "intent created_at")
                 try:
@@ -888,11 +1007,24 @@ class ManagedGroupRegistry:
                 except (TypeError, ValueError) as exc:
                     raise RegistryCorruptionError("invalid intent origin") from exc
                 for key in _INTENT_KEYS - {
+                    "create_dispatched_at",
                     "created_at",
                     "origin",
                     "remote_chat_id",
                 }:
                     _require_string(intent[key], f"intent {key}")
+                if intent["create_state"] not in {
+                    "bound",
+                    "dispatched",
+                    "outcome_unknown",
+                    "prepared",
+                }:
+                    raise RegistryCorruptionError("invalid intent create_state")
+                if intent["create_dispatched_at"] is not None:
+                    _parse_datetime(
+                        intent["create_dispatched_at"],
+                        "intent create_dispatched_at",
+                    )
                 if intent["remote_chat_id"] is not None:
                     _require_string(
                         intent["remote_chat_id"], "intent remote_chat_id"
@@ -931,13 +1063,19 @@ class ManagedGroupRegistry:
                 revokes[chat_id] = dict(revoke)
             for chat_id, raw_disposition in migrations_raw.items():
                 _require_string(chat_id, "migration chat_id")
-                disposition = _require_dict(
-                    raw_disposition,
-                    _MIGRATION_KEYS,
-                    "migration disposition",
-                )
+                if not isinstance(raw_disposition, dict) or frozenset(
+                    raw_disposition
+                ) not in {
+                    frozenset(_MIGRATION_KEYS),
+                    frozenset(_LEGACY_MIGRATION_KEYS),
+                }:
+                    raise RegistryCorruptionError("invalid migration disposition schema")
+                disposition = dict(raw_disposition)
+                disposition.setdefault("reported", False)
                 _require_string(disposition["project_id"], "migration project_id")
-                if disposition["status"] not in {"invalid", "unknown"}:
+                if type(disposition["reported"]) is not bool:
+                    raise RegistryCorruptionError("invalid migration reported flag")
+                if disposition["status"] not in {"ambiguous", "invalid", "unknown"}:
                     raise RegistryCorruptionError("invalid migration status")
                 migrations[chat_id] = dict(disposition)
             if revision < max_revision:
@@ -953,6 +1091,7 @@ class ManagedGroupRegistry:
         self._grants = grants
         self._revokes = revokes
         self._migration_dispositions = migrations
+        self._commit_uncertain = self._uncertain_path.exists()
 
     @staticmethod
     def _grant_matches_record(
@@ -968,6 +1107,11 @@ class ManagedGroupRegistry:
         )
 
     def _persist_locked(self) -> None:
+        if self._commit_uncertain:
+            raise RegistryCommitUncertainError(
+                "registry has an unresolved commit",
+                committed=True,
+            )
         payload = {
             "groups": {
                 chat_id: {
@@ -1004,6 +1148,8 @@ class ManagedGroupRegistry:
         self._validate_storage_path()
         parent = self._path.parent
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        previous_raw = self._path.read_bytes() if self._path.exists() else None
+        self._anchor_uncertain_locked(raw, previous_raw)
         temp_path = parent / f".{self._path.name}.{secrets.token_hex(12)}.tmp"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
@@ -1024,17 +1170,15 @@ class ManagedGroupRegistry:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
-        except OSError:
-            # Once replace succeeded the target is authoritative for this
-            # process, even if the directory fsync reported an uncertain
-            # durability result.  Re-read and compare before deciding whether
-            # the mutation failed so callers never roll memory behind disk.
+            self._clear_uncertain_locked()
+        except OSError as exc:
             if replaced:
-                try:
-                    if self._path.read_bytes() == raw:
-                        return
-                except OSError:
-                    pass
+                self._commit_uncertain = True
+                raise RegistryCommitUncertainError(
+                    "registry replace committed but durability is uncertain",
+                    committed=True,
+                ) from exc
+            self._clear_uncertain_best_effort_locked()
             raise
         finally:
             if fd >= 0:
@@ -1044,8 +1188,128 @@ class ManagedGroupRegistry:
             except FileNotFoundError:
                 pass
 
+    def _anchor_uncertain_locked(
+        self,
+        desired_raw: bytes,
+        previous_raw: bytes | None,
+    ) -> None:
+        payload = {
+            "desired_sha256": hashlib.sha256(desired_raw).hexdigest(),
+            "previous_sha256": (
+                hashlib.sha256(previous_raw).hexdigest()
+                if previous_raw is not None
+                else None
+            ),
+            "schema": "ghostap.managed_groups.commit_uncertain",
+            "version": 1,
+        }
+        raw = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        temp_path = self._path.parent / (
+            f".{self._uncertain_path.name}.{secrets.token_hex(12)}.tmp"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(temp_path, flags, 0o600)
+        try:
+            with os.fdopen(fd, "wb", closefd=True) as handle:
+                fd = -1
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self._uncertain_path)
+            self._fsync_parent_locked()
+        except OSError:
+            self._clear_uncertain_best_effort_locked()
+            raise
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _clear_uncertain_locked(self) -> None:
+        self._uncertain_path.unlink()
+        self._fsync_parent_locked()
+        self._commit_uncertain = False
+
+    def _clear_uncertain_best_effort_locked(self) -> None:
+        try:
+            self._uncertain_path.unlink()
+            self._fsync_parent_locked()
+        except OSError:
+            pass
+        self._commit_uncertain = self._uncertain_path.exists()
+
+    def _fsync_parent_locked(self) -> None:
+        directory_fd = os.open(
+            self._path.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def reconcile_uncertain_commit(self) -> bool:
+        """Resolve an anchored pre/post-replace crash state before reuse."""
+
+        with self._disk_transaction():
+            if not self._uncertain_path.exists():
+                self._commit_uncertain = False
+                return False
+            if self._uncertain_path.is_symlink():
+                raise RegistryCorruptionError("unsafe uncertain commit marker")
+            try:
+                marker = json.loads(self._uncertain_path.read_text("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise RegistryCorruptionError(
+                    "cannot read uncertain commit marker"
+                ) from exc
+            if (
+                not isinstance(marker, dict)
+                or set(marker)
+                != {
+                    "desired_sha256",
+                    "previous_sha256",
+                    "schema",
+                    "version",
+                }
+                or marker["schema"]
+                != "ghostap.managed_groups.commit_uncertain"
+                or marker["version"] != 1
+            ):
+                raise RegistryCorruptionError("invalid uncertain commit marker")
+            current_raw = self._path.read_bytes() if self._path.exists() else None
+            current_hash = (
+                hashlib.sha256(current_raw).hexdigest()
+                if current_raw is not None
+                else None
+            )
+            if current_hash not in {
+                marker["desired_sha256"],
+                marker["previous_sha256"],
+            }:
+                raise RegistryCorruptionError(
+                    "uncertain commit target does not match either state"
+                )
+            self._fsync_parent_locked()
+            self._clear_uncertain_locked()
+            self._load()
+            return current_hash == marker["desired_sha256"]
+
     def _validate_storage_path(self) -> None:
-        if self._path.is_symlink() or self._path.parent.is_symlink():
+        if (
+            self._path.is_symlink()
+            or self._uncertain_path.is_symlink()
+            or self._path.parent.is_symlink()
+        ):
             raise RegistryCorruptionError("registry path must not use symlinks")
 
     @contextmanager
@@ -1072,3 +1336,4 @@ class ManagedGroupRegistry:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
                 finally:
                     os.close(lock_fd)
+    "operation_uuid",

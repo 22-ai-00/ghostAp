@@ -315,25 +315,79 @@ class ProjectHandler(BaseHandler):
             )
             return
         now = datetime.now(UTC)
+        provision_id = (
+            f"adopt:{owner_id}:{target_chat_id}:{project.project_id}"
+        )
+        binding_snapshot = None
         try:
-            registry.adopt_existing(
-                chat_id=target_chat_id,
+            from ...trust.models import ManagedGroupOrigin
+
+            registry.begin_provision(
+                provision_id=provision_id,
                 owner_id=owner_id,
+                origin=ManagedGroupOrigin.OWNER_ADOPTED,
                 receiving_bot_ref=receiving_bot_ref,
                 project_id=project.project_id,
                 canonical_root_ref=project.root_path,
                 created_at=now,
-                validator=lambda _facts: True,
             )
-            if not self.project_manager.bind_managed_chat(
-                project.project_id,
-                target_chat_id,
-                created_at=now.timestamp(),
-            ):
-                registry.tombstone(target_chat_id)
+            registry.bind_provision_chat(provision_id, target_chat_id)
+            bound, binding_snapshot = (
+                self.project_manager.bind_managed_chat_for_saga(
+                    project.project_id,
+                    target_chat_id,
+                    created_at=now.timestamp(),
+                    operation_id=provision_id,
+                )
+            )
+            if not bound or binding_snapshot is None:
                 raise OSError("project binding persistence failed")
-        except Exception:
+            registry.activate(
+                provision_id=provision_id,
+                chat_id=target_chat_id,
+                project_id=project.project_id,
+                canonical_root_ref=project.root_path,
+            )
+            if not self.project_manager.complete_managed_chat_binding_saga(
+                provision_id
+            ):
+                self.reply_error(
+                    message_id,
+                    "受管群已登记，但本地收养事务收尾失败；请重试以完成核对。",
+                )
+                return
+        except Exception as exc:
+            from ...trust.registry import RegistryCommitUncertainError
+
+            if isinstance(exc, RegistryCommitUncertainError) and exc.committed:
+                logger.error(
+                    "managed group adoption commit uncertain chat=%s; "
+                    "preserving durable project binding",
+                    target_chat_id,
+                )
+                self.reply_error(
+                    message_id,
+                    "受管群登记结果不确定；已停止继续操作，恢复核对前不授予信任。",
+                )
+                return
             logger.exception("managed group adoption failed chat=%s", target_chat_id)
+            restored = True
+            if binding_snapshot is not None:
+                restored = self.project_manager.restore_managed_chat_binding(
+                    project.project_id,
+                    binding_snapshot,
+                    operation_id=provision_id,
+                )
+            if restored:
+                try:
+                    registry.abandon_provision(provision_id)
+                except Exception:
+                    logger.exception(
+                        "managed group adoption intent cleanup failed chat=%s",
+                        target_chat_id,
+                    )
+            else:
+                self.project_manager.quarantine_bound_chat(target_chat_id)
             self.reply_error(message_id, "受管群收养持久化失败，未保留活动授权。")
             return
         self.reply_text(

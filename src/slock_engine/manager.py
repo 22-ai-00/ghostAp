@@ -10,7 +10,7 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from ..engine_base import BaseEngineManager
 from .activation import slock_activation_guard
@@ -33,6 +33,13 @@ class ActivatedSlockBinding:
     canonical_root: str
     channel_id: str
     engine: SlockEngine = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class RevokeMarkerDisposition:
+    chat_id: str
+    state: str
+    archived_path: str = ""
 
 
 class SlockEngineManager(BaseEngineManager["SlockEngine"]):
@@ -107,8 +114,9 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
         normalized = (team_name or "").strip().casefold()
         if not normalized:
             return False
-        with self._lock:
-            self._blocked_team_names.add(normalized)
+        if delete_state != "create_outcome_unknown":
+            with self._lock:
+                self._blocked_team_names.add(normalized)
 
         records_dir = os.path.join(self._storage_base_path, "pending_cleanup")
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -165,6 +173,13 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
                 continue
             normalized = str(record.get("team_name") or "").strip().casefold()
             expected = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            if record.get("delete_state") == "create_outcome_unknown":
+                created_at_ns = record.get("created_at_ns")
+                if (
+                    isinstance(created_at_ns, int)
+                    and time.time_ns() - created_at_ns < 10 * 60 * 60 * 1_000_000_000
+                ):
+                    continue
             if normalized and entry == f"{expected}.json":
                 blocked.add(normalized)
         return blocked
@@ -185,7 +200,31 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
             f".slock_channel.dissolved.{time.time_ns()}.json",
         )
         os.replace(marker_path, archived_path)
+        self._fsync_directory(group_dir)
         return archived_path
+
+    def prepare_revoke_marker(self, chat_id: str) -> RevokeMarkerDisposition:
+        """Idempotently ensure an active marker cannot be restored."""
+
+        archived = self.archive_managed_chat_marker(chat_id)
+        if archived is not None:
+            return RevokeMarkerDisposition(chat_id, "archived", archived)
+        group_dir = os.path.realpath(
+            os.path.join(self._storage_base_path, "groups", chat_id)
+        )
+        try:
+            candidates = sorted(
+                os.path.join(group_dir, entry)
+                for entry in os.listdir(group_dir)
+                if re.fullmatch(r"\.slock_channel\.dissolved\.\d+\.json", entry)
+                and os.path.isfile(os.path.join(group_dir, entry))
+                and not os.path.islink(os.path.join(group_dir, entry))
+            )
+        except FileNotFoundError:
+            candidates = []
+        if candidates:
+            return RevokeMarkerDisposition(chat_id, "archived", candidates[-1])
+        return RevokeMarkerDisposition(chat_id, "absent")
 
     def restore_archived_chat_marker(self, chat_id: str, archived_path: str) -> None:
         """Restore a retired marker as compensation for a failed teardown."""
@@ -197,6 +236,34 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
         if not os.path.isfile(archived_path) or os.path.islink(archived_path):
             raise FileNotFoundError(archived_path)
         os.replace(archived_path, os.path.join(group_dir, ".slock_channel.json"))
+        self._fsync_directory(group_dir)
+
+    def restore_revoke_marker(
+        self,
+        disposition: RevokeMarkerDisposition,
+    ) -> bool:
+        if disposition.state == "absent":
+            return True
+        try:
+            self.restore_archived_chat_marker(
+                disposition.chat_id,
+                disposition.archived_path,
+            )
+            return True
+        except (OSError, ValueError):
+            logger.exception(
+                "failed to durably restore revoke marker chat=%s",
+                disposition.chat_id,
+            )
+            return False
+
+    @staticmethod
+    def _fsync_directory(path: str) -> None:
+        directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def retire_deleted_chat(self, chat_id: str) -> Optional[str]:
         """Durably retire a remotely deleted chat and all indexed runtimes.
@@ -448,7 +515,12 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
                 return engine
         return None
 
-    def restore_from_disk(self, root_path: str) -> int:
+    def restore_from_disk(
+        self,
+        root_path: str,
+        *,
+        managed_group_active: Callable[[str], bool] | None = None,
+    ) -> int:
         """Scan app-level Slock group markers and restore engines.
 
         For each valid marker file, rebuilds a SlockEngine, activates the
@@ -509,6 +581,19 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
                         "restore_from_disk: skipping non-Lark chat marker: %s",
                         marker_path,
                     )
+                    continue
+
+                if (
+                    managed_group_active is not None
+                    and not managed_group_active(channel_id)
+                ):
+                    try:
+                        self.prepare_revoke_marker(channel_id)
+                    except (OSError, ValueError):
+                        logger.exception(
+                            "restore_from_disk: cannot retire untrusted marker %s",
+                            marker_path,
+                        )
                     continue
 
                 # Skip if already managed (idempotent)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
@@ -12,6 +13,7 @@ from src.trust.models import ManagedGroupOrigin, ManagedGroupStatus
 from src.trust.registry import (
     ManagedGroupConflictError,
     ManagedGroupRegistry,
+    RegistryCommitUncertainError,
     RegistryCorruptionError,
 )
 
@@ -241,7 +243,7 @@ def test_stale_registry_instance_cannot_overwrite_a_durable_tombstone(tmp_path):
     assert replayed.active_record("oc_new") is not None
 
 
-def test_post_replace_fsync_failure_recovers_authoritative_commit(
+def test_post_replace_fsync_failure_stays_fail_closed_until_reconciled(
     tmp_path,
     monkeypatch,
 ):
@@ -261,6 +263,8 @@ def test_post_replace_fsync_failure_recovers_authoritative_commit(
 
     def fail_parent_fsync(fd: int) -> None:
         nonlocal calls
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            return original_fsync(fd)
         calls += 1
         if calls == 2:
             raise OSError("injected parent fsync failure")
@@ -268,17 +272,21 @@ def test_post_replace_fsync_failure_recovers_authoritative_commit(
 
     monkeypatch.setattr("src.trust.registry.os.fsync", fail_parent_fsync)
 
-    record, grant = registry.activate(
-        provision_id="provision:oc_managed",
-        chat_id="oc_managed",
-        project_id="project-1",
-        canonical_root_ref="/srv/project-1",
-        backend_binding_ids=("codex",),
-    )
+    with pytest.raises(RegistryCommitUncertainError) as caught:
+        registry.activate(
+            provision_id="provision:oc_managed",
+            chat_id="oc_managed",
+            project_id="project-1",
+            canonical_root_ref="/srv/project-1",
+            backend_binding_ids=("codex",),
+        )
 
-    assert registry.active_record("oc_managed") == record
-    assert registry.grant_for_chat("oc_managed") == grant
-    assert ManagedGroupRegistry(path).active_record("oc_managed") == record
+    assert caught.value.committed is True
+    assert registry.active_record("oc_managed") is None
+    replayed = ManagedGroupRegistry(path)
+    assert replayed.active_record("oc_managed") is None
+    replayed.reconcile_uncertain_commit()
+    assert replayed.active_record("oc_managed") is not None
 
 
 def test_registry_rejects_boolean_version(tmp_path):
@@ -298,6 +306,51 @@ def test_registry_rejects_boolean_version(tmp_path):
 
     with pytest.raises(RegistryCorruptionError):
         ManagedGroupRegistry(path)
+
+
+def test_migration_owner_notification_is_marked_only_after_durable_success(tmp_path):
+    path = tmp_path / "managed-groups.json"
+    registry = ManagedGroupRegistry(path)
+    registry.record_migration_disposition(
+        "oc_ambiguous",
+        project_id="project-a,project-b",
+        status="ambiguous",
+    )
+
+    assert registry.unreported_migration_dispositions() == (
+        ("oc_ambiguous", "project-a,project-b", "ambiguous"),
+    )
+    assert registry.mark_migration_reported("oc_ambiguous") is True
+    replayed = ManagedGroupRegistry(path)
+    assert replayed.unreported_migration_dispositions() == ()
+    assert replayed.migration_dispositions() == (
+        ("oc_ambiguous", "project-a,project-b", "ambiguous"),
+    )
+
+
+def test_create_dispatch_outcome_unknown_is_durable_and_age_bounded(tmp_path):
+    path = tmp_path / "managed-groups.json"
+    registry = ManagedGroupRegistry(path)
+    registry.begin_provision(
+        provision_id="create:unknown",
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        receiving_bot_ref="cli_bot",
+        project_id="project",
+        canonical_root_ref="/srv/project",
+        created_at=NOW,
+    )
+
+    assert registry.prepare_create_dispatch("create:unknown", dispatched_at=NOW)
+    registry.mark_create_outcome_unknown("create:unknown")
+    replayed = ManagedGroupRegistry(path)
+    assert replayed.provision_create_state("create:unknown") == "outcome_unknown"
+    assert replayed.prepare_create_dispatch(
+        "create:unknown", dispatched_at=NOW + timedelta(hours=9)
+    )
+    assert not replayed.prepare_create_dispatch(
+        "create:unknown", dispatched_at=NOW + timedelta(hours=11)
+    )
 
 
 def test_registry_rejects_symlink_target_or_parent(tmp_path):
