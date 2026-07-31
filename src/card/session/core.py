@@ -141,6 +141,9 @@ class CardSession:
         self._chat_id = chat_id
         self._metadata = config.metadata
         self._delivery = delivery
+        open_delivery_session = getattr(self._delivery, "open_session", None)
+        if callable(open_delivery_session):
+            open_delivery_session(self._session_id, chat_id)
         self._budget = config.budget
         self._reply_to = config.reply_to
         self._closed = threading.Event()

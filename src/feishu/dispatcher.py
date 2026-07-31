@@ -158,6 +158,15 @@ class MessageDispatcher:
 
             if effective_trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP:
                 return
+
+        def current_dispatch_allowed() -> bool:
+            if effective_trust is None:
+                return True
+            gate = getattr(self.client, "_current_trust_can_dispatch", None)
+            return bool(
+                callable(gate)
+                and gate(effective_trust, project=project) is True
+            )
         from .slash_command_parser import SlashCommandParser
 
         if command_match is None and (text or "").strip().startswith("/"):
@@ -182,18 +191,24 @@ class MessageDispatcher:
 
         # Control-plane commands: handle consistently in all modes
         if self.client._is_deep_command(text):
+            if not current_dispatch_allowed():
+                return
             self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
             self.client._add_reaction(message_id, EmojiReaction.on_processing())
             self.client._handle_deep_command(message_id, chat_id, text, project)
             return
 
         if self.client._is_spec_command(text):
+            if not current_dispatch_allowed():
+                return
             self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
             self.client._add_reaction(message_id, EmojiReaction.on_processing())
             self.client._handle_spec_command(message_id, chat_id, text, project)
             return
 
         if self.client._is_workflow_command(text):
+            if not current_dispatch_allowed():
+                return
             # Workflow mode entry: /wf is the top-level orchestrator agent entry point
             # (agent → tools → roles → script confirm → execute), no prior /coco needed
             self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
@@ -211,6 +226,8 @@ class MessageDispatcher:
                     # Free-text messages in workflow topic context go to WorkflowHandler
                     # Consistent with ws_client.py:1558-1590 routing logic
                     if command_match is None and project is not None:
+                        if not current_dispatch_allowed():
+                            return
                         self.client._add_reaction(message_id, EmojiReaction.on_processing())
                         self.client._workflow_handler.handle_message(message_id, chat_id, text, project)
                         return
@@ -383,6 +400,8 @@ class MessageDispatcher:
                 return
 
         if is_in_programming and self.client._is_exit_command(text):
+            if not current_dispatch_allowed():
+                return
             self.client._add_reaction(message_id, EmojiReaction.on_coco_mode())
             if self.client._control_plane.should_defer_exit(chat_id=chat_id, project_id=_pid):
                 self.client._control_plane.request_deferred_exit(message_id=message_id, chat_id=chat_id, project_id=_pid)
@@ -394,10 +413,14 @@ class MessageDispatcher:
         # Request-scoped slash parsing: direct system commands must not fall
         # through to intent recognition, which can be slow or ambiguous.
         if self.client._is_interceptable_command_match(command_match):
+            if not current_dispatch_allowed():
+                return
             self.client._handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
             return
 
         if command_match is not None:
+            if not current_dispatch_allowed():
+                return
             self.client._handle_intercepted_command(
                 message_id,
                 chat_id,
@@ -409,12 +432,16 @@ class MessageDispatcher:
 
         # Worktree mode
         if project and self.client._is_worktree_awaiting_goal(project):
+            if not current_dispatch_allowed():
+                return
             self.client._add_reaction(message_id, EmojiReaction.on_processing())
             self.client._handle_worktree_execute(message_id, chat_id, text, project)
             return
 
         # Programming mode (Coco / Claude / TTADK): exit or forward to active session
         if is_in_programming:
+            if not current_dispatch_allowed():
+                return
             self.client._add_reaction(message_id, EmojiReaction.on_coco_mode())
             self.client._add_reaction(message_id, EmojiReaction.on_processing())
             handler = self.client._get_mode_handler(current_mode)
@@ -428,6 +455,8 @@ class MessageDispatcher:
         with self.client._pending_image_lock:
             is_image_only = message_id in self.client._pending_image_only
         if is_image_only:
+            if not current_dispatch_allowed():
+                return
             self.client._add_reaction(message_id, EmojiReaction.on_coco_mode())
             self.client._add_reaction(message_id, EmojiReaction.on_processing())
             self.client._handle_coco_message(message_id, chat_id, text, project)
@@ -447,6 +476,8 @@ class MessageDispatcher:
                     action_name="host_shell",
                 ):
                     return
+                if not current_dispatch_allowed():
+                    return
                 logger.warning("意图识别异常，回退到 shell: %s", get_error_detail(e))
                 working_dir = self.client._get_working_dir(chat_id)
                 self.client._submit_shell_command(message_id, chat_id, text, working_dir, project)
@@ -459,7 +490,14 @@ class MessageDispatcher:
                 raise
             # Default: log and fallback to shell
             logger.error("意图识别异常: %s", get_error_detail(e))
+            if not self._action_matrix_allows(
+                effective_trust,
+                action_name="host_shell",
+            ):
+                return
             working_dir = self.client._get_working_dir(chat_id)
+            if not current_dispatch_allowed():
+                return
             self.client._submit_shell_command(message_id, chat_id, text, working_dir, project)
             return
 
@@ -471,6 +509,8 @@ class MessageDispatcher:
         )
 
         if intent_result.is_multi_task:
+            if not current_dispatch_allowed():
+                return
             if any(
                 task.intent is IntentType.SHELL_COMMAND
                 for task in intent_result.tasks
@@ -479,7 +519,16 @@ class MessageDispatcher:
                 action_name="host_shell",
             ):
                 return
-            self.execute_multi_tasks(message_id, chat_id, intent_result, project)
+            multi_kwargs = {}
+            if effective_trust is not None:
+                multi_kwargs["effective_trust"] = effective_trust
+            self.execute_multi_tasks(
+                message_id,
+                chat_id,
+                intent_result,
+                project,
+                **multi_kwargs,
+            )
         else:
             task = intent_result.tasks[0] if intent_result.tasks else None
             if (
@@ -490,6 +539,8 @@ class MessageDispatcher:
                     action_name="host_shell",
                 )
             ):
+                return
+            if not current_dispatch_allowed():
                 return
             self.execute_single_task(
                 message_id,
@@ -529,7 +580,13 @@ class MessageDispatcher:
         ) is ActionDecision.ALLOW
 
     def execute_multi_tasks(
-        self, message_id: str, chat_id: str, intent_result: 'IntentResult', project: Optional['ProjectContext'] = None
+        self,
+        message_id: str,
+        chat_id: str,
+        intent_result: 'IntentResult',
+        project: Optional['ProjectContext'] = None,
+        *,
+        effective_trust: Optional['EffectiveTrust'] = None,
     ):
         """执行多任务计划（逐步执行；遇到失败停止后续步骤）。"""
         tasks = intent_result.tasks
@@ -542,6 +599,14 @@ class MessageDispatcher:
 
         all_success = True
         for i, task in enumerate(tasks, 1):
+            if effective_trust is not None:
+                gate = getattr(self.client, "_current_trust_can_dispatch", None)
+                if not callable(gate) or gate(
+                    effective_trust,
+                    project=project,
+                ) is not True:
+                    all_success = False
+                    break
             success = self.execute_task_step(
                 message_id, chat_id, task, step_num=i, total_steps=len(tasks), project=project
             )

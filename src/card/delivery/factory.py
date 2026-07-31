@@ -15,6 +15,7 @@ def create_card_delivery(
     client: "CardAPIClient",
     *,
     payload_transform: Callable[[str, dict], dict] | None = None,
+    trust_revision_provider: Callable[[str], tuple[int, int] | None] | None = None,
 ) -> "CardDelivery":
     """Create a CardDelivery with max_session_locks/session_lock_ttl from Settings.
 
@@ -31,4 +32,5 @@ def create_card_delivery(
         max_session_locks=settings.card.session_lock_max,
         session_lock_ttl=settings.card.session_lock_ttl,
         payload_transform=payload_transform,
+        trust_revision_provider=trust_revision_provider,
     )

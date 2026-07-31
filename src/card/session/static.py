@@ -52,6 +52,9 @@ class StaticCardSession:
         self._delivery = delivery
         self._chat_id = chat_id
         self._session_id = session_id or str(uuid.uuid4())
+        open_delivery_session = getattr(self._delivery, "open_session", None)
+        if callable(open_delivery_session):
+            open_delivery_session(self._session_id, chat_id)
         self._reply_to = reply_to
         self._reply_in_thread = reply_in_thread
         self._closed = threading.Event()

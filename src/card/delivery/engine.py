@@ -60,6 +60,7 @@ class CardDelivery:
         eviction_interval: float = 30.0,
         registry: "DeliveryRegistry | None" = None,
         payload_transform: Callable[[str, dict], dict] | None = None,
+        trust_revision_provider: Callable[[str], tuple[int, int] | None] | None = None,
     ) -> None:
         self._client = client
         self._bindings = BindingStore()
@@ -67,6 +68,10 @@ class CardDelivery:
         self._closed_sessions = TTLSet(ttl=3600.0, max_size=50_000)
         self._mutator = PageMutator(client, self._bindings, self._sequences)
         self._payload_transform = payload_transform
+        self._trust_revision_provider = trust_revision_provider
+        self._trust_lock = threading.Lock()
+        self._expected_trust_revisions: dict[str, tuple[int, int] | None] = {}
+        self._trust_snapshot_failed: set[str] = set()
 
         # Delegate lock pool management
         self._lock_pool = SessionLockPool(
@@ -164,6 +169,7 @@ class CardDelivery:
         with self._closed_lock:
             if session_id in self._closed_sessions:
                 return []
+        self.open_session(session_id, chat_id)
         # Acquire per-session lock (creates if needed, may evict LRU)
         try:
             session_lock = self._lock_pool.acquire(session_id)
@@ -196,14 +202,20 @@ class CardDelivery:
         # the fast-path _closed_lock check and per-session lock acquisition.
         if session_id in self._closed_sessions:
             return []
+        if not self._current_trust_matches(session_id, chat_id):
+            return [MutationOutcome(kind="rejected", message="managed trust revision changed")]
         binding = self._bindings.get(session_id)
         outcomes: list[MutationOutcome] = []
         ordered = sorted(rendered, key=lambda card: card.page_index)
         if self._payload_transform is not None:
-            ordered = [
-                self._transform_rendered_payload(chat_id, card)
-                for card in ordered
-            ]
+            try:
+                ordered = [
+                    self._transform_rendered_payload(session_id, chat_id, card)
+                    for card in ordered
+                ]
+            except (RuntimeError, TypeError, ValueError):
+                logger.warning("managed card payload transform rejected", exc_info=True)
+                return [MutationOutcome(kind="rejected", message="managed trust payload rejected")]
         if not ordered:
             return outcomes
         latest_rendered_idx = ordered[-1].page_index
@@ -400,6 +412,7 @@ class CardDelivery:
 
     def _transform_rendered_payload(
         self,
+        session_id: str,
         chat_id: str,
         card: RenderedCard,
     ) -> RenderedCard:
@@ -421,6 +434,13 @@ class CardDelivery:
                     collect(value)
 
         collect(payload)
+        with self._trust_lock:
+            expected = self._expected_trust_revisions.get(session_id)
+        if self._trust_revision_provider is not None:
+            if expected is None and revisions:
+                raise ValueError("unmanaged card payload contains managed trust revisions")
+            if expected is not None and revisions != {expected}:
+                raise ValueError("managed card payload trust revision mismatch")
         revision_suffix = ""
         if revisions:
             revision_suffix = ":trust:" + ",".join(
@@ -433,6 +453,47 @@ class CardDelivery:
             structure_signature=card.structure_signature + revision_suffix,
             content_hash=card.content_hash + revision_suffix,
         )
+
+    def open_session(self, session_id: str, chat_id: str) -> None:
+        """Capture the immutable managed trust snapshot for one card run."""
+
+        if self._trust_revision_provider is None:
+            return
+        with self._trust_lock:
+            if (
+                session_id in self._expected_trust_revisions
+                or session_id in self._trust_snapshot_failed
+            ):
+                return
+        try:
+            revisions = self._trust_revision_provider(chat_id)
+            if revisions is not None and (
+                type(revisions) is not tuple
+                or len(revisions) != 2
+                or any(type(value) is not int or value < 1 for value in revisions)
+            ):
+                raise ValueError("invalid managed trust revision snapshot")
+        except Exception:
+            with self._trust_lock:
+                self._trust_snapshot_failed.add(session_id)
+            logger.warning("managed card trust snapshot failed closed", exc_info=True)
+            return
+        with self._trust_lock:
+            if session_id not in self._trust_snapshot_failed:
+                self._expected_trust_revisions.setdefault(session_id, revisions)
+
+    def _current_trust_matches(self, session_id: str, chat_id: str) -> bool:
+        if self._trust_revision_provider is None:
+            return True
+        with self._trust_lock:
+            if session_id in self._trust_snapshot_failed:
+                return False
+            expected = self._expected_trust_revisions.get(session_id)
+        try:
+            return self._trust_revision_provider(chat_id) == expected
+        except Exception:
+            logger.warning("managed card current trust unavailable", exc_info=True)
+            return False
 
     @staticmethod
     def _latest_page_for_source(binding, source_page_index: int) -> PageBinding | None:
@@ -608,6 +669,9 @@ class CardDelivery:
             if session_id in self._closed_sessions:
                 return
             self._closed_sessions.add(session_id)
+        with self._trust_lock:
+            self._expected_trust_revisions.pop(session_id, None)
+            self._trust_snapshot_failed.discard(session_id)
 
         # Acquire existing session lock (or create temporary) for cleanup serialization
         session_lock = self._lock_pool.get_existing(session_id)

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.card.delivery.engine import CardDelivery
+from src.card.session.static import StaticCardSession
 from src.card.types import RenderedCard
 from src.feishu.ws_card_action_handler import bind_managed_trust_revisions
 from src.feishu.ws_client import FeishuWSClient
@@ -165,6 +166,7 @@ def test_stale_card_revision_cannot_dispatch_effect(tmp_path) -> None:
     current_grant = registry.grant_for_chat(GROUP_ID)
     assert current_group is not None and current_grant is not None
     client = _card_client(registry)
+    client._refresh_managed_card_revisions = MagicMock(return_value=True)
     data = _card(
         chat_id=GROUP_ID,
         operator_id=OWNER_ID,
@@ -178,12 +180,14 @@ def test_stale_card_revision_cannot_dispatch_effect(tmp_path) -> None:
     client._project_manager.get_active_project.assert_not_called()
     client._message_linker.resolve_origin.assert_not_called()
     client._scheduler.submit.assert_not_called()
+    client._refresh_managed_card_revisions.assert_called_once()
 
 
 def test_card_rotation_after_enqueue_is_fenced_before_action_dispatch(tmp_path) -> None:
     registry = _registry(tmp_path)
     client = _card_client(registry)
     client._action_dispatcher = MagicMock()
+    client._refresh_managed_card_revisions = MagicMock(return_value=True)
     intake_trust = client._resolve_effective_trust(
         sender_id=OWNER_ID,
         chat_id=GROUP_ID,
@@ -208,6 +212,45 @@ def test_card_rotation_after_enqueue_is_fenced_before_action_dispatch(tmp_path) 
 
     client._action_dispatcher.dispatch.assert_not_called()
     client._chat_lock_gate.check_card_action.assert_not_called()
+    client._refresh_managed_card_revisions.assert_called_once()
+
+
+def test_stale_card_refresh_reads_existing_card_and_only_updates_revisions(tmp_path) -> None:
+    registry = _registry(tmp_path)
+    client = _card_client(registry)
+    trust = client._resolve_effective_trust(
+        sender_id=OWNER_ID,
+        chat_id=GROUP_ID,
+        chat_type="group",
+    )
+    card = {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {"tag": "button", "value": {"action": "workflow_confirm_start"}}
+            ]
+        },
+    }
+    item = SimpleNamespace(
+        message_id="om_card",
+        chat_id=GROUP_ID,
+        body=SimpleNamespace(content=__import__("json").dumps(card)),
+    )
+    response = MagicMock()
+    response.success.return_value = True
+    response.data = SimpleNamespace(items=[item])
+    client._get_api_client.return_value.im.v1.message.get.return_value = response
+    client._system_handler = MagicMock()
+    client._system_handler.update_card.return_value = True
+
+    assert client._refresh_managed_card_revisions("om_card", GROUP_ID, trust) is True
+
+    refreshed = client._system_handler.update_card.call_args.args[1]
+    value = refreshed["body"]["elements"][0]["value"]
+    assert value["action"] == "workflow_confirm_start"
+    assert value["group_revision"] == trust.group_revision
+    assert value["grant_revision"] == trust.grant_revision
+    client._scheduler.submit.assert_not_called()
 
 
 def test_external_card_callback_is_silent_before_mutation(tmp_path) -> None:
@@ -314,6 +357,66 @@ def test_card_delivery_stamps_rendered_payload_before_transport() -> None:
         "group_revision": 7,
         "grant_revision": 11,
     }
+
+
+def test_long_card_run_cannot_be_reblessed_after_rotation() -> None:
+    client = MagicMock()
+    client.create_card.return_value = ("om_card", "om_card")
+    revision = [7, 11]
+    delivery = CardDelivery(
+        client,
+        registry=MagicMock(),
+        payload_transform=lambda _chat_id, card: bind_managed_trust_revisions(
+            card,
+            group_revision=revision[0],
+            grant_revision=revision[1],
+        ),
+        trust_revision_provider=lambda _chat_id: tuple(revision),
+    )
+    rendered = RenderedCard(
+        _card_json={
+            "schema": "2.0",
+            "body": {"elements": [{"tag": "button", "value": {"action": "run"}}]},
+        },
+        structure_signature="stable",
+    )
+
+    delivery.deliver("session-rotation", GROUP_ID, [rendered])
+    revision[0] += 1
+    outcomes = delivery.deliver("session-rotation", GROUP_ID, [rendered])
+
+    assert client.create_card.call_count == 1
+    client.update_card.assert_not_called()
+    assert outcomes and outcomes[0].kind == "rejected"
+
+
+@pytest.mark.parametrize("next_snapshot", [None, RuntimeError("registry unavailable")])
+def test_card_session_start_snapshot_fails_closed_before_first_send(next_snapshot) -> None:
+    client = MagicMock()
+    client.create_card.return_value = ("om_card", "om_card")
+    current = [(7, 11)]
+
+    def snapshot(_chat_id):
+        value = current[0]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    delivery = CardDelivery(
+        client,
+        registry=MagicMock(),
+        payload_transform=lambda _chat_id, card: bind_managed_trust_revisions(
+            card,
+            group_revision=7,
+            grant_revision=11,
+        ),
+        trust_revision_provider=snapshot,
+    )
+    session = StaticCardSession(delivery, GROUP_ID, session_id="session-start")
+    current[0] = next_snapshot
+
+    assert session.send({"schema": "2.0", "body": {"elements": []}}) is None
+    client.create_card.assert_not_called()
 
 
 def test_activation_guard_denies_external_trust_before_rate_limit() -> None:

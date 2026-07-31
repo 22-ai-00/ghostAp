@@ -231,6 +231,7 @@ class BaseHandler:
                         chat_id=chat_id,
                     )
                 ),
+                trust_revision_provider=self._managed_card_trust_revisions,
             )
         return self._card_delivery
 
@@ -313,6 +314,20 @@ class BaseHandler:
             group_revision=group.revision,
             grant_revision=grant.revision,
         )
+
+    def _managed_card_trust_revisions(
+        self,
+        chat_id: str,
+    ) -> tuple[int, int] | None:
+        registry = getattr(self.ctx, "managed_group_registry", None)
+        if registry is None:
+            return None
+        group, grant = registry.trust_snapshot(chat_id)
+        if group is None and grant is None:
+            return None
+        if group is None or grant is None:
+            raise RuntimeError("incomplete managed card trust snapshot")
+        return group.revision, grant.revision
 
     # ------------------------------------------------------------------
     # Messaging API

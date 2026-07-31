@@ -3004,7 +3004,20 @@ class EmployeeDepartmentRuntime:
                 trust = self._managed_employee_ingress_trust(record, payload)
             except Exception:
                 trust = self._unknown_employee_ingress_trust()
-            if trust is not None and trust.zone is not TrustZone.MANAGED_AGENT_GROUP:
+            content = first.get("content") if isinstance(first, Mapping) else None
+            exact_owner_status = (
+                trust is not None
+                and trust.zone is TrustZone.OWNER_P2P
+                and trust.actor is ActorKind.OWNER
+                and isinstance(content, Mapping)
+                and isinstance(content.get("text"), str)
+                and content["text"].strip() == "/status"
+            )
+            if (
+                trust is not None
+                and trust.zone is not TrustZone.MANAGED_AGENT_GROUP
+                and not exact_owner_status
+            ):
                 try:
                     ingress.record_disposition(
                         acceptance_id,

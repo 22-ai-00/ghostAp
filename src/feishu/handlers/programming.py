@@ -1134,6 +1134,7 @@ class ProgrammingModeHandler(BaseHandler):
                     chat_id=target_chat_id,
                 )
             ),
+            trust_revision_provider=self._managed_card_trust_revisions,
         )
         from src.card.session.config import SessionConfig
         card_callbacks = build_programming_session_callbacks(

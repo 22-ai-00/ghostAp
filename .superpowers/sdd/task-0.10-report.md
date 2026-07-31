@@ -7,6 +7,9 @@
 - Push: not performed
 - Real Feishu tenant/mobile execution: `not_tested`
 
+Nested review follow-up is complete. Two Critical and three Important findings
+were reproduced with RED tests and fixed before handoff.
+
 Ingress and card callbacks now resolve durable Registry trust before business
 side effects. Managed Owner requests and server-correlated Employee
 continuations use the existing Direct/Deep/Spec/Worktree/Workflow/Team/Slock
@@ -24,6 +27,14 @@ The failures proved that the old path parsed content and scheduled work before
 durable trust, accepted missing card revisions, lacked EffectiveTrust in the
 Dispatcher/ActivationGuard, trusted Employee identity without causal Outbox
 evidence, and restored runtime dependencies in the wrong order.
+
+The review-fix batch initially produced 8 focused failures (with 32 existing
+passes); the production-composed Owner P2P control regression independently
+failed once. The completed review-focused suite is 45 passes. Fixes cover
+Registry-only topic/bound-chat/image project resolution, current-trust checks
+after recognition and before every multi-task step, stale-card refresh without
+action dispatch, immutable CardSession revisions, and Owner P2P `/status` with
+a production Registry.
 
 ## Production behavior
 
@@ -65,6 +76,17 @@ Protected lanes + focused + Card delivery: 94 passed
 CardSession/CardDelivery adjacent: 64 passed
 Autonomous runtime/Outbox/direct-mention/ingress: 94 passed
 WS routing/reconnect/context/base-handler adjacent: 208 passed, 17 subtests passed
+Touched-file Ruff: All checks passed
+git diff --check: passed
+```
+
+Review-fix verification adds:
+
+```text
+Focused five-finding regressions: 45 passed
+Core ingress/card/dispatcher cross-suite: 450 passed
+CardSession full file: 125 passed
+Employee status adjacent: 10 passed, 97 deselected
 Touched-file Ruff: All checks passed
 git diff --check: passed
 ```

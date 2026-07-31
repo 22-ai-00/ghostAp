@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -7,11 +8,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.agent.intent_recognizer import IntentType
 from src.autonomous.domain import EmployeeState, WorkerType
 from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 from src.autonomous.supervisor.employee_channels import ChannelProcessState
 from src.feishu.dispatcher import MessageDispatcher
 from src.feishu.ws_client import FeishuWSClient
+from src.mode import InteractionMode
 from src.trust.models import ActorKind, EffectiveTrust, ManagedGroupOrigin, TrustZone
 from src.trust.registry import ManagedGroupRegistry
 
@@ -152,6 +155,287 @@ def test_owner_p2p_bypasses_legacy_chat_enrollment(tmp_path) -> None:
     client._handle_message(data)
 
     client._scheduler.submit.assert_called_once()
+
+
+def test_employee_owner_p2p_status_survives_production_registry_gate(tmp_path) -> None:
+    raw_chat_id = "chat-owner-employee-dm"
+    raw_message_id = "om-owner-status"
+    metadata = SimpleNamespace(
+        chat_id="oc_" + hashlib.sha256(raw_chat_id.encode()).hexdigest(),
+        message_id="om_" + hashlib.sha256(raw_message_id.encode()).hexdigest(),
+        thread_root_message_id="",
+    )
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "p2p",
+                "content": {"text": "/status"},
+                "sender_id": OWNER_ID,
+                "remote_chat_id": raw_chat_id,
+                "remote_message_id": raw_message_id,
+                "remote_root_id": "",
+            },
+        )
+    )
+    record = SimpleNamespace(metadata=metadata, disposition=None)
+    ingress = MagicMock()
+    ingress.state.by_acceptance_id = {"acceptance-1": record}
+    ingress.get_payload.return_value = payload
+    runtime = EmployeeDepartmentRuntime(
+        managed_group_registry=_registry(tmp_path),
+        managed_group_owner_id=OWNER_ID,
+    )
+    runtime._ingress = ingress
+    runtime._router = MagicMock()
+    runtime._router.claim_control.return_value = True
+    runtime._handle_durable_activation_status = MagicMock(return_value=True)
+
+    assert runtime._handle_control_ingress("acceptance-1") is True
+
+    runtime._router.claim_control.assert_called_once_with(
+        "acceptance-1",
+        command="/status",
+    )
+    runtime._handle_durable_activation_status.assert_called_once_with("acceptance-1")
+    ingress.record_disposition.assert_not_called()
+
+
+def test_managed_topic_cannot_replace_registry_project(tmp_path) -> None:
+    client = _client(_registry(tmp_path), enforced=True)
+    client.settings.thread_programming_enabled = True
+    data = _message()
+    data.event.message.root_id = "om_legacy_topic"
+    client._thread_manager.get.return_value = SimpleNamespace(
+        project_id="attacker-project",
+        mode="deep",
+        thread_root_id="om_legacy_topic",
+    )
+    client._current_worker_text = "implement the task"
+
+    client._process_message_async(data)
+
+    client._thread_manager.get.assert_not_called()
+    project = client._dispatch_message_logic.call_args.args[3]
+    assert project.project_id == "project-1"
+    assert project.root_path == "/srv/project-1"
+
+
+def test_managed_bound_chat_cannot_replace_registry_project(tmp_path) -> None:
+    client = _client(_registry(tmp_path), enforced=True)
+    trusted_project = client._project_manager.get_project_for_chat.return_value
+    client._project_manager.find_by_bound_chat_id.return_value = SimpleNamespace(
+        project_id="attacker-project",
+        root_path="/srv/attacker",
+    )
+    client._intent_recognizer = MagicMock()
+    client._intent_recognizer.looks_like_shell.return_value = False
+    client._process_with_intent = MagicMock()
+    trust = client._resolve_effective_trust(
+        sender_id=OWNER_ID,
+        chat_id=GROUP_ID,
+        chat_type="group",
+    )
+
+    FeishuWSClient._dispatch_message_logic(
+        client,
+        "om_managed",
+        GROUP_ID,
+        "implement the task",
+        trusted_project,
+        None,
+        command_match=None,
+        effective_trust=trust,
+    )
+
+    client._project_manager.find_by_bound_chat_id.assert_not_called()
+    assert client._process_with_intent.call_args.args[3] is trusted_project
+
+
+def test_managed_image_download_uses_registry_root_only(tmp_path) -> None:
+    client = _client(_registry(tmp_path), enforced=True)
+    message = _message().event.message
+    trusted_project = client._project_manager.get_project_for_chat.return_value
+    client._resolve_message_context.return_value = (
+        SimpleNamespace(project_id="attacker-project", root_path="/srv/attacker"),
+        "deep",
+    )
+    client._get_image_handler.return_value.download_images.return_value = SimpleNamespace(
+        saved_paths=[],
+        failed_keys=[],
+    )
+    client._get_working_dir = MagicMock(return_value="/srv/default")
+
+    with patch("src.feishu.ws_client.FeishuImageHandler.get_image_save_dir") as save_dir:
+        client._handle_image_content(
+            message,
+            ["img-1"],
+            "implement the task",
+            "req-managed",
+            None,
+            trusted_project=trusted_project,
+        )
+
+    client._resolve_message_context.assert_not_called()
+    save_dir.assert_called_once_with("/srv/project-1", client._get_working_dir(GROUP_ID))
+
+
+def test_current_trust_rejects_project_mismatch(tmp_path) -> None:
+    client = _client(_registry(tmp_path), enforced=True)
+    trust = client._resolve_effective_trust(
+        sender_id=OWNER_ID,
+        chat_id=GROUP_ID,
+        chat_type="group",
+    )
+
+    assert client._current_trust_can_dispatch(
+        trust,
+        project=SimpleNamespace(
+            project_id="attacker-project",
+            root_path="/srv/attacker",
+        ),
+    ) is False
+
+
+def test_recognizer_rotation_fences_single_executor(tmp_path) -> None:
+    registry = _registry(tmp_path)
+    client = _client(registry, enforced=True)
+    project = client._project_manager.get_project_for_chat.return_value
+    trust = client._resolve_effective_trust(
+        sender_id=OWNER_ID,
+        chat_id=GROUP_ID,
+        chat_type="group",
+    )
+    task = SimpleNamespace(intent=IntentType.COCO_MESSAGE, data={}, description="work")
+    result = SimpleNamespace(
+        primary_intent=IntentType.COCO_MESSAGE,
+        confidence=1.0,
+        tasks=[task],
+        is_multi_task=False,
+    )
+
+    def recognize(*_args):
+        registry.rotate_receiving_bot(
+            chat_id=GROUP_ID,
+            expected_bot_ref="cli_main_bot",
+            new_bot_ref="cli_rotated_bot",
+        )
+        return result
+
+    client._get_effective_mode = MagicMock(return_value=(InteractionMode.SMART, False))
+    client._is_deep_command = MagicMock(return_value=False)
+    client._is_spec_command = MagicMock(return_value=False)
+    client._is_workflow_command = MagicMock(return_value=False)
+    client._is_topic_engine_context = MagicMock(return_value=False)
+    client._is_slock_command = MagicMock(return_value=False)
+    client._is_slock_managed_chat = MagicMock(return_value=False)
+    client._is_slock_active = MagicMock(return_value=False)
+    client._is_interceptable_command_match = MagicMock(return_value=False)
+    client._is_worktree_awaiting_goal = MagicMock(return_value=False)
+    client._intent_recognizer = MagicMock()
+    client._intent_recognizer.recognize.side_effect = recognize
+    client._handle_coco_message = MagicMock()
+    client._add_reaction = MagicMock()
+    client.settings.slock_passive_mode = False
+
+    MessageDispatcher(client).process_with_intent(
+        "om_managed",
+        GROUP_ID,
+        "implement the task",
+        project,
+        command_match=None,
+        effective_trust=trust,
+    )
+
+    client._handle_coco_message.assert_not_called()
+
+
+def test_multi_task_rechecks_trust_before_every_step(tmp_path) -> None:
+    registry = _registry(tmp_path)
+    client = _client(registry, enforced=True)
+    project = client._project_manager.get_project_for_chat.return_value
+    trust = client._resolve_effective_trust(
+        sender_id=OWNER_ID,
+        chat_id=GROUP_ID,
+        chat_type="group",
+    )
+    dispatcher = MessageDispatcher(client)
+    dispatcher.execute_task_step = MagicMock()
+
+    def first_step(*_args, **_kwargs):
+        registry.rotate_receiving_bot(
+            chat_id=GROUP_ID,
+            expected_bot_ref="cli_main_bot",
+            new_bot_ref="cli_rotated_bot",
+        )
+        return True
+
+    dispatcher.execute_task_step.side_effect = first_step
+    tasks = [
+        SimpleNamespace(intent=IntentType.SHOW_HELP, data={}, description="one"),
+        SimpleNamespace(intent=IntentType.SHOW_HELP, data={}, description="two"),
+    ]
+    client._reply_text = MagicMock()
+    client._add_reaction = MagicMock()
+
+    dispatcher.execute_multi_tasks(
+        "om_managed",
+        GROUP_ID,
+        SimpleNamespace(tasks=tasks),
+        project,
+        effective_trust=trust,
+    )
+
+    dispatcher.execute_task_step.assert_called_once()
+
+
+@pytest.mark.parametrize("mode", ["worktree", "deep", "spec", "workflow", "coco"])
+def test_stale_trust_fences_direct_engine_and_programming_dispatch(
+    tmp_path,
+    mode: str,
+) -> None:
+    registry = _registry(tmp_path)
+    client = _client(registry, enforced=True)
+    project = client._project_manager.get_project_for_chat.return_value
+    trust = client._resolve_effective_trust(
+        sender_id=OWNER_ID,
+        chat_id=GROUP_ID,
+        chat_type="group",
+    )
+    registry.rotate_receiving_bot(
+        chat_id=GROUP_ID,
+        expected_bot_ref="cli_main_bot",
+        new_bot_ref="cli_rotated_bot",
+    )
+    client._reply_if_topic_engine_switch_blocked = MagicMock(return_value=False)
+    client._is_interceptable_command_match = MagicMock(return_value=False)
+    client._is_programming_entry_command = MagicMock(return_value=False)
+    client._is_deep_command = MagicMock(return_value=False)
+    client._is_spec_command = MagicMock(return_value=False)
+    client._is_workflow_command = MagicMock(return_value=False)
+    client._add_reaction = MagicMock()
+    client._handle_worktree_execute = MagicMock()
+    client._start_deep_engine = MagicMock()
+    client._start_spec_engine = MagicMock()
+    client._workflow_handler = MagicMock()
+    handler = MagicMock()
+    client._get_mode_handler = MagicMock(return_value=handler)
+
+    client._dispatch_message_logic(
+        "om_managed",
+        GROUP_ID,
+        "implement the task",
+        project,
+        mode,
+        command_match=None,
+        effective_trust=trust,
+    )
+
+    client._handle_worktree_execute.assert_not_called()
+    client._start_deep_engine.assert_not_called()
+    client._start_spec_engine.assert_not_called()
+    client._workflow_handler.handle_message.assert_not_called()
+    handler.handle_message.assert_not_called()
 
 
 def test_managed_group_scheduler_uses_registry_project_not_legacy_lookup(tmp_path) -> None:

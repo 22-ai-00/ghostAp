@@ -127,6 +127,7 @@ from .slash_command_parser import CommandMatch, SlashCommandParser
 from .ws_card_action_handler import (
     CardActionInspector,
     _extract_behavior_value,
+    bind_managed_trust_revisions,
     classify_card_action_error,
 )
 from .ws_event_router import MessageIngressGuard, WSErrorAction, classify_ws_error
@@ -1769,7 +1770,12 @@ class FeishuWSClient:
             or IntentRecognizer._looks_like_local_executable_path(first_word)
         )
 
-    def _current_trust_can_dispatch(self, trust: EffectiveTrust | None) -> bool:
+    def _current_trust_can_dispatch(
+        self,
+        trust: EffectiveTrust | None,
+        *,
+        project=None,
+    ) -> bool:
         if trust is None:
             return True
         current_group_revision = None
@@ -1787,6 +1793,16 @@ class FeishuWSClient:
             current_grant_revision = (
                 current_grant.revision if current_grant is not None else None
             )
+            if (
+                project is not None
+                and (
+                    current_group is None
+                    or getattr(project, "project_id", None) != current_group.project_id
+                    or getattr(project, "root_path", None)
+                    != current_group.canonical_root_ref
+                )
+            ):
+                return False
         return can_dispatch(
             trust,
             current_group_revision=current_group_revision,
@@ -2229,7 +2245,14 @@ class FeishuWSClient:
             set_current_mentioned_names(structured_mentions)
 
             root_id = getattr(message, "root_id", None)
-            if root_id and self.settings.thread_programming_enabled:
+            if (
+                root_id
+                and self.settings.thread_programming_enabled
+                and not (
+                    current_trust is not None
+                    and current_trust.zone is TrustZone.MANAGED_AGENT_GROUP
+                )
+            ):
                 thread_ctx = self._thread_manager.get(root_id)
                 if thread_ctx:
                     set_current_thread_id(thread_ctx.thread_root_id)
@@ -2286,8 +2309,16 @@ class FeishuWSClient:
                 ):
                     return
             if parse_result.image_keys:
+                image_kwargs = {}
+                if trusted_project is not None:
+                    image_kwargs["trusted_project"] = trusted_project
                 project, auto_enter_mode, text, is_image_only = self._handle_image_content(
-                    message, parse_result.image_keys, text, request_id, task_ctx
+                    message,
+                    parse_result.image_keys,
+                    text,
+                    request_id,
+                    task_ctx,
+                    **image_kwargs,
                 )
                 # Downloaded image references are part of the effective prompt.
                 # Refresh slash args so consumers such as Worktree receive the
@@ -2308,7 +2339,7 @@ class FeishuWSClient:
             # 4b. Safety net: if auto_enter_mode is still None but we are in a
             # registered thread, force-set mode from thread context so that the
             # message never accidentally falls through to SMART / intent recognition.
-            if not auto_enter_mode:
+            if not auto_enter_mode and trusted_project is None:
                 _root = getattr(message, "root_id", None)
                 if _root and self.settings.thread_programming_enabled:
                     _tctx = self._thread_manager.get(_root)
@@ -2333,7 +2364,7 @@ class FeishuWSClient:
                 self._update_task_project(task_ctx, project.project_id)
 
             # 6. Dispatch Logic
-            if not self._current_trust_can_dispatch(current_trust):
+            if not self._current_trust_can_dispatch(current_trust, project=project):
                 return
             if not text and not is_image_only:
                 # Special case: handle empty text (e.g. unsupported content that parsed to empty)
@@ -2416,7 +2447,16 @@ class FeishuWSClient:
             return ""
         return text
 
-    def _handle_image_content(self, message, image_keys, text, request_id, task_ctx):
+    def _handle_image_content(
+        self,
+        message,
+        image_keys,
+        text,
+        request_id,
+        task_ctx,
+        *,
+        trusted_project=None,
+    ):
         """处理图片消息：下载并把图片引用文本拼接回 prompt。
 
         返回 `(project, auto_enter_mode, text, is_image_only)`。
@@ -2429,7 +2469,10 @@ class FeishuWSClient:
         with self._pending_image_lock:
             self._pending_image_keys[message_id] = image_keys
 
-        project, auto_enter_mode = self._resolve_message_context(message)
+        if trusted_project is not None:
+            project, auto_enter_mode = trusted_project, None
+        else:
+            project, auto_enter_mode = self._resolve_message_context(message)
 
         try:
             if project:
@@ -2604,6 +2647,11 @@ class FeishuWSClient:
                 command_match = None
 
         def forward_to_intent(target_project=project) -> None:
+            if not self._current_trust_can_dispatch(
+                effective_trust,
+                project=target_project,
+            ):
+                return
             kwargs = {
                 "command_match": command_match,
                 "shell_fast_tracked": shell_fast_tracked,
@@ -2650,6 +2698,8 @@ class FeishuWSClient:
             and project is None
             and is_missing_topic_exit
         ):
+            if not self._current_trust_can_dispatch(effective_trust):
+                return
             self._exit_current_mode(message_id, chat_id, project=None)
             return
 
@@ -2661,6 +2711,11 @@ class FeishuWSClient:
             ):
                 return
             if self._is_exit_command(text):
+                if not self._current_trust_can_dispatch(
+                    effective_trust,
+                    project=project,
+                ):
+                    return
                 self._add_reaction(message_id, EmojiReaction.on_coco_mode())
                 _pid = project.project_id if project else None
                 if self._control_plane.should_defer_exit(chat_id=chat_id, project_id=_pid):
@@ -2701,6 +2756,11 @@ class FeishuWSClient:
                 forward_to_intent()
                 return
             self._add_reaction(message_id, EmojiReaction.on_processing())
+            if not self._current_trust_can_dispatch(
+                effective_trust,
+                project=project,
+            ):
+                return
             if auto_enter_mode == "worktree":
                 self._handle_worktree_execute(message_id, chat_id, text, project)
             elif auto_enter_mode == "deep":
@@ -2715,6 +2775,11 @@ class FeishuWSClient:
             from ..mode import InteractionMode
             handler = self._get_mode_handler(InteractionMode(auto_enter_mode))
             if handler:
+                if not self._current_trust_can_dispatch(
+                    effective_trust,
+                    project=project,
+                ):
+                    return
                 self._add_reaction(message_id, EmojiReaction.on_coco_mode())
                 self._add_reaction(message_id, EmojiReaction.on_processing())
                 handler.handle_message(message_id, chat_id, text, project)
@@ -2728,8 +2793,13 @@ class FeishuWSClient:
             # Slash commands (command_match is not None) always fall through to
             # _process_with_intent so that /coco, /help, /deep, /wt, /exit, ...
             # keep their highest priority.
+            has_registry_project_authority = (
+                effective_trust is not None
+                and effective_trust.zone is TrustZone.MANAGED_AGENT_GROUP
+            )
             if (
-                command_match is None
+                not has_registry_project_authority
+                and command_match is None
                 and not is_image_only
                 and text
                 and not self._intent_recognizer.looks_like_shell(text)
@@ -2773,6 +2843,9 @@ class FeishuWSClient:
                             message_id, chat_id, bound_project, pending_prompt=text,
                         )
                     return
+            if has_registry_project_authority:
+                forward_to_intent()
+                return
             forward_to_intent()
 
     @staticmethod
@@ -2831,6 +2904,59 @@ class FeishuWSClient:
             ),
         )
         return True
+
+    def _refresh_managed_card_revisions(
+        self,
+        message_id: str,
+        chat_id: str,
+        trust: EffectiveTrust,
+    ) -> bool:
+        """Refresh a stale managed card without dispatching its submitted action."""
+
+        if (
+            not message_id
+            or trust.zone is not TrustZone.MANAGED_AGENT_GROUP
+            or trust.managed_group is None
+            or trust.managed_group.chat_id != chat_id
+            or not self._current_trust_can_dispatch(trust)
+        ):
+            return False
+        try:
+            from lark_oapi.api.im.v1 import GetMessageRequest
+
+            request = (
+                GetMessageRequest.builder()
+                .message_id(message_id)
+                .user_id_type("open_id")
+                .card_msg_content_type("user_card_content")
+                .build()
+            )
+            response = self._get_api_client().im.v1.message.get(request)
+            if not response or not response.success() or response.data is None:
+                return False
+            items = getattr(response.data, "items", None)
+            if not isinstance(items, (list, tuple)) or len(items) != 1:
+                return False
+            item = items[0]
+            if (
+                getattr(item, "message_id", None) != message_id
+                or getattr(item, "chat_id", None) != chat_id
+            ):
+                return False
+            content = getattr(getattr(item, "body", None), "content", None)
+            if isinstance(content, str):
+                content = json.loads(content)
+            if not isinstance(content, dict):
+                return False
+            refreshed = bind_managed_trust_revisions(
+                content,
+                group_revision=trust.group_revision,
+                grant_revision=trust.grant_revision,
+            )
+            return self._system_handler.update_card(message_id, refreshed) is True
+        except (AttributeError, RuntimeError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("managed stale card refresh failed closed", exc_info=True)
+            return False
 
     def _handle_card_action(self, data: P2CardActionTrigger) -> Optional[P2CardActionTriggerResponse]:
         """飞书卡片回调入口：做去重 + 任务入队（system action 走快通道）。"""
@@ -2908,6 +3034,11 @@ class FeishuWSClient:
                 audit_logger.warning(
                     "MANAGED_CARD_STALE_REVISION_DENIED chat_hash=%s",
                     self._access_identifier_hash(open_chat_id),
+                )
+                self._refresh_managed_card_revisions(
+                    open_message_id,
+                    open_chat_id,
+                    effective_trust,
                 )
                 return None
 
@@ -3397,6 +3528,15 @@ class FeishuWSClient:
                     "MANAGED_CARD_CURRENT_REVISION_DENIED chat_hash=%s",
                     self._access_identifier_hash(open_chat_id),
                 )
+                if (
+                    current_trust is not None
+                    and current_trust.zone is TrustZone.MANAGED_AGENT_GROUP
+                ):
+                    self._refresh_managed_card_revisions(
+                        open_message_id,
+                        open_chat_id,
+                        current_trust,
+                    )
                 return
             set_current_sender_id(_operator_id)
             _operator_union_id = (
