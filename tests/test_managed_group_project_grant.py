@@ -7,6 +7,7 @@ import os
 import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2498,28 +2499,42 @@ def test_team_active_cleanup_retry_only_finalizes_existing_group(
     handler.create_team("om_first", "oc_owner_p2p", "Cleanup Retry")
     remote.validate_managed_chat.return_value = ManagedChatValidation.VALID
     manager = handler.ctx.slock_engine_manager
-    original_consume = manager.consume_retained_team_name
-    consume_attempts = 0
+    cleanup_dir = tmp_path / "slock" / "pending_cleanup"
+    original_fsync = manager._fsync_directory
+    cleanup_fsync_failures = 0
 
-    def fail_consume_once(team_name, chat_id):
-        nonlocal consume_attempts
-        consume_attempts += 1
-        if consume_attempts == 1:
-            return False
-        return original_consume(team_name, chat_id)
+    def fail_first_post_unlink_fsync(path):
+        nonlocal cleanup_fsync_failures
+        if Path(path) == cleanup_dir and cleanup_fsync_failures == 0:
+            cleanup_fsync_failures += 1
+            raise OSError("pending cleanup parent fsync failed")
+        return original_fsync(path)
 
-    manager.consume_retained_team_name = MagicMock(
-        side_effect=fail_consume_once
+    manager._fsync_directory = MagicMock(
+        side_effect=fail_first_post_unlink_fsync
     )
+    manager.block_team_name_for_cleanup = MagicMock(return_value=False)
     registry.activate = MagicMock(wraps=registry.activate)
 
     handler.create_team("om_activate", "oc_owner_p2p", "Cleanup Retry")
+
+    assert manager.retained_team_chat_id("Cleanup Retry") == (
+        "oc_team_cleanup_retry"
+    )
+    assert not list(cleanup_dir.glob("*.json"))
+    manager.block_team_name_for_cleanup.assert_called_once_with(
+        "Cleanup Retry",
+        "oc_team_cleanup_retry",
+        "untrusted_retained",
+    )
+    assert "未能持久清理" in handler.reply_text.call_args.args[1]
+
     handler.create_team("om_finalize", "oc_owner_p2p", "Cleanup Retry")
 
     assert remote.create_chat.call_count == 1
     assert registry.activate.call_count == 1
-    assert manager.consume_retained_team_name.call_count == 2
-    assert not list((tmp_path / "slock" / "pending_cleanup").glob("*.json"))
+    assert cleanup_fsync_failures == 1
+    assert not list(cleanup_dir.glob("*.json"))
     assert manager.retained_team_chat_id("Cleanup Retry") is None
     assert "cleanup retry" not in manager._blocked_team_names
     assert "已存在" in handler.reply_text.call_args.args[1]

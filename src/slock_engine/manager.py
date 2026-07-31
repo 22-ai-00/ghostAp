@@ -63,6 +63,7 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
         self._retired_chats: set[str] = set()
         self._dissolving_chats: set[str] = set()
         self._reserved_team_names: set[str] = set()
+        self._retained_team_evidence: dict[str, str] = {}
         self._storage_base_path = storage_base_path or default_slock_storage_base()
         self._blocked_team_names = self._load_pending_cleanup_names()
 
@@ -125,13 +126,16 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
             return chat_id
 
     def retained_team_chat_id(self, team_name: str) -> Optional[str]:
-        """Return the exact durable retained chat without changing reservation."""
+        """Return exact durable or fail-closed in-process retained evidence."""
 
         record = self._pending_cleanup_record(team_name)
-        if record is None or record.get("delete_state") != "untrusted_retained":
-            return None
-        chat_id = record.get("chat_id")
-        return chat_id if isinstance(chat_id, str) and chat_id else None
+        if record is not None and record.get("delete_state") == "untrusted_retained":
+            chat_id = record.get("chat_id")
+            if isinstance(chat_id, str) and chat_id:
+                return chat_id
+        normalized = (team_name or "").strip().casefold()
+        with self._lock:
+            return self._retained_team_evidence.get(normalized)
 
     def release_team_name(self, team_name: str) -> None:
         normalized = (team_name or "").strip().casefold()
@@ -152,11 +156,15 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
         normalized = (team_name or "").strip().casefold()
         if not normalized:
             return False
-        if delete_state not in {
-            "create_outcome_unknown",
-            "registry_bind_uncertain",
-        }:
-            with self._lock:
+        with self._lock:
+            if delete_state == "untrusted_retained":
+                self._retained_team_evidence[normalized] = chat_id
+            else:
+                self._retained_team_evidence.pop(normalized, None)
+            if delete_state not in {
+                "create_outcome_unknown",
+                "registry_bind_uncertain",
+            }:
                 self._blocked_team_names.add(normalized)
 
         records_dir = os.path.join(self._storage_base_path, "pending_cleanup")
@@ -196,28 +204,43 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
     def consume_retained_team_name(self, team_name: str, chat_id: str) -> bool:
         """Durably consume one exact retained-group block after activation."""
 
-        record = self._pending_cleanup_record(team_name)
-        if (
-            record is None
-            or record.get("delete_state") != "untrusted_retained"
-            or record.get("chat_id") != chat_id
-        ):
-            return False
         normalized = (team_name or "").strip().casefold()
+        record = self._pending_cleanup_record(team_name)
+        with self._lock:
+            in_process_chat_id = self._retained_team_evidence.get(normalized)
+        durable_record = (
+            record is not None
+            and record.get("delete_state") == "untrusted_retained"
+            and record.get("chat_id") == chat_id
+        )
+        if not durable_record and in_process_chat_id != chat_id:
+            return False
         digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
         records_dir = os.path.join(self._storage_base_path, "pending_cleanup")
         record_path = os.path.join(records_dir, f"{digest}.json")
         try:
-            os.unlink(record_path)
+            if durable_record:
+                os.unlink(record_path)
             self._fsync_directory(records_dir)
         except OSError:
             logger.exception(
                 "consume_retained_team_name: cannot persist cleanup chat=%s",
                 chat_id,
             )
+            if not self.block_team_name_for_cleanup(
+                team_name,
+                chat_id,
+                "untrusted_retained",
+            ):
+                logger.error(
+                    "consume_retained_team_name: retained evidence is only "
+                    "available in process chat=%s",
+                    chat_id,
+                )
             return False
         with self._lock:
             self._blocked_team_names.discard(normalized)
+            self._retained_team_evidence.pop(normalized, None)
         return True
 
     def _pending_cleanup_record(self, team_name: str) -> Optional[dict]:

@@ -6,8 +6,8 @@
 - Branch: `dev`
 - Baseline: `7c34a2d9c4ec2a2d4051b9f69ea3340d3cbcbd5c`
 - Initial commit: `073e9c32` (`feat(trust): persist managed group lifecycle`)
-- Review fixes: `4970193c`, `71d7d3cc`, `b8e39873`, `5ba6a7ce`, `8c22339a`, `b508b9e8`
-- Seventh review fix: this commit (`fix(trust): preserve managed recovery exits`)
+- Review fixes: `4970193c`, `71d7d3cc`, `b8e39873`, `5ba6a7ce`, `8c22339a`, `b508b9e8`, `606f69f6`
+- Eighth review fix: this commit (`fix(trust): retain cleanup evidence`)
 - Push: not performed
 
 Task 0.9's Registry and Project/Team lifecycle are implemented and hardened.
@@ -391,3 +391,23 @@ than being guessed from membership events.
 - Touched-file Ruff and `git diff --check`: passed. No brief-wide or external
   slow suite was used because unrelated test files remain modified in the
   shared worktree. Real Feishu tenant/mobile execution remains `not_tested`.
+
+## Eighth review correction
+
+- Team cleanup no longer loses its exact retained-chat evidence when unlink
+  succeeds but parent-directory fsync fails. The manager first attempts to
+  recreate the same durable `untrusted_retained` record. If recreation also
+  fails, an exact in-process name-to-chat mapping keeps the ACTIVE cleanup fast
+  path reachable and the existing reservation blocked.
+- A subsequent retry with only in-process evidence fsyncs the cleanup directory
+  to confirm deletion durability, then clears the evidence, block, and
+  reservation. It does not create a chat or invoke Registry activation again.
+
+### Eighth-correction verification
+
+- Real post-unlink parent-fsync fault injection initially failed because
+  `retained_team_chat_id()` returned `None`. GREEN, including forced durable
+  record recreation failure and the in-process retry: `1 passed, 2 warnings`.
+- Registry/ProjectGrant focused set: `99 passed, 2 warnings`.
+- Touched-file Ruff and `git diff --check`: passed. Unrelated shared-worktree
+  test edits were not run, staged, or used as evidence.
