@@ -10,6 +10,7 @@ from src.card.state.models import ContentBlock
 from src.card.themes import PANEL_STYLES
 from src.card.tool_display import (
     is_unhelpful_display_label,
+    sanitize_subagent_display_text,
     sanitize_tool_failure_detail,
 )
 from src.card.ui_text import UI_TEXT
@@ -71,7 +72,7 @@ def _safe_subagent_metadata(
         or is_unhelpful_display_label(raw)
     ):
         return fallback
-    return sanitize_tool_failure_detail(
+    return sanitize_subagent_display_text(
         raw,
         fallback=fallback,
         max_chars=max_chars,
@@ -185,6 +186,14 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
         seq_part = f" · #{seq}" if seq else ""
         model_part = f" · {model}" if model else ""
         lines.append(f"- {icon} {label}{seq_part} · {tool}{model_part}")
+        if item.get("progress"):
+            progress = _safe_subagent_metadata(
+                item["progress"],
+                fallback="",
+                max_chars=180,
+            )
+            if progress:
+                lines.append(f"  - 进展：{progress}")
         if status == "failed" and item.get("error"):
             error_detail = sanitize_tool_failure_detail(
                 item["error"],
@@ -219,7 +228,11 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
     header_icon = (
         "❌"
         if failed_count
-        else ("🟠" if running_count or unknown_count else "✅")
+        else (
+            "🟠"
+            if running_count or unknown_count
+            else ("⚪" if cancelled_count else "✅")
+        )
     )
 
     return {

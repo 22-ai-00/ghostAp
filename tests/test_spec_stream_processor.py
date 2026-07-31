@@ -10,7 +10,7 @@ Covers:
 
 from unittest.mock import MagicMock, patch
 
-from src.acp import ACPEventType
+from src.acp import ACPEvent, ACPEventType, ToolCallInfo
 from src.card.events import CardEventType
 from src.card.render.budget import RenderBudget
 from src.card.render.throttle import StreamThrottle
@@ -254,6 +254,75 @@ class TestOnPhaseEventThrottle:
         proc.on_phase_event(1, SpecPhase.BUILD, ev_text)
         assert proc._footer_status is None
 
+    def test_no_plan_codex_activity_and_collaboration_route_to_orchestrator(self):
+        """Dynamic child events must not depend on Spec receiving a plan first."""
+        proc, _ = _make_processor()
+        proc._orchestrator.route_acp_event = MagicMock()
+        source_id = "thread-stable-spec-audit"
+        events = (
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id="activity-call-started",
+                    title="Subagent started",
+                    kind="other",
+                    status="completed",
+                    subagent_source_id=source_id,
+                    subagent_path="/root/spec-audit",
+                    subagent_activity="started",
+                ),
+            ),
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="collaboration-call-wait",
+                    title="wait",
+                    kind="agent",
+                    status="completed",
+                    collaboration_tool="wait",
+                    collaboration_receivers=(source_id,),
+                    subagent_states=({
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": "spec audit complete",
+                    },),
+                ),
+            ),
+        )
+
+        assert proc._orchestrator.has_plan is False
+        for event in events:
+            proc.on_phase_event(1, SpecPhase.BUILD, event)
+
+        assert [
+            call.args[0]
+            for call in proc._orchestrator.route_acp_event.call_args_list
+        ] == list(events)
+
+    def test_bound_child_text_routes_to_orchestrator_outside_build_phase(self):
+        """Structured parent phases must not swallow source-tagged child output."""
+        proc, _ = _make_processor()
+        proc._orchestrator.route_acp_event = MagicMock()
+        source_id = "thread-stable-spec-audit"
+        proc._orchestrator.registry.register(
+            task_id=source_id,
+            name="spec-audit",
+            status="in_progress",
+        )
+        event = ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="child progress",
+            source_id=source_id,
+        )
+
+        proc.on_phase_event(1, SpecPhase.SPEC, event)
+
+        proc._orchestrator.route_acp_event.assert_called_once_with(
+            event,
+            proc._stream_bridge,
+        )
+
 
 class TestOnReviewRetryBranches:
     """Verify on_review_retry handles all RetryStatus branches."""
@@ -408,3 +477,57 @@ class TestOnError:
         deps["rotator"].dispatch.assert_called_once()
         ev = deps["rotator"].dispatch.call_args[0][0]
         assert ev.type == CardEventType.FAILED
+
+    def test_closes_no_plan_dynamic_children_as_failed(self):
+        proc, _ = _make_processor()
+        proc._orchestrator.close = MagicMock()
+
+        proc.on_error("something broke")
+
+        proc._orchestrator.close.assert_called_once_with(
+            terminal_status="failed",
+            summary="something broke",
+        )
+
+
+class TestOnProjectDone:
+    """Spec project terminal state also owns no-plan dynamic child cards."""
+
+    def test_completed_project_closes_no_plan_dynamic_children_as_completed(self):
+        proc, _ = _make_processor()
+        proc._orchestrator.close = MagicMock()
+        proc._orchestrator.finalize_unfinished_subagents = MagicMock()
+        project = MagicMock()
+        project.status.value = "completed"
+        project.satisfied_count = 2
+        project.total_criteria = 2
+
+        proc.on_project_done(project)
+
+        proc._orchestrator.finalize_unfinished_subagents.assert_called_once_with(
+            status="cancelled",
+            summary="父任务已结束，子任务终态未确认",
+        )
+        proc._orchestrator.close.assert_called_once_with(
+            terminal_status="completed",
+        )
+
+    def test_failed_project_closes_no_plan_dynamic_children_as_failed(self):
+        proc, _ = _make_processor()
+        proc._orchestrator.close = MagicMock()
+        proc._orchestrator.finalize_unfinished_subagents = MagicMock()
+        project = MagicMock()
+        project.status.value = "failed"
+        project.satisfied_count = 1
+        project.total_criteria = 2
+
+        proc.on_project_done(project)
+
+        proc._orchestrator.finalize_unfinished_subagents.assert_called_once_with(
+            status="cancelled",
+            summary="父任务已结束，子任务终态未确认",
+        )
+        proc._orchestrator.close.assert_called_once_with(
+            terminal_status="failed",
+            summary=UI_TEXT["card_project_failed"],
+        )

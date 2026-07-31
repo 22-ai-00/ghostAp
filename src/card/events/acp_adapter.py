@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.card.tool_display import sanitize_tool_event_content
+from src.card.tool_display import (
+    sanitize_tool_event_content,
+    sanitize_tool_failure_detail,
+)
 
 from .factories import CardEvent
 from .types import CardEventType
@@ -71,6 +74,11 @@ def card_event_from_acp(acp_event: "ACPEvent") -> CardEvent:
             output = sanitize_tool_event_content(tc.content if tc else "", fallback=summary)
             status = tc.status if tc else "completed"
             if status == "failed":
+                output = sanitize_tool_failure_detail(
+                    tc.content if tc else "",
+                    fallback=summary or "工具执行失败",
+                    opaque_ids=(tc.id,) if tc else (),
+                )
                 return CardEvent(type=CardEventType.TOOL_FAILED, payload={
                     "block_id": tc.id if tc else "",
                     "error": output,

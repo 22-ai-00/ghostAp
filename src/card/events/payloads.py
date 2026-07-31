@@ -308,7 +308,7 @@ class TaskSnapshotPayload(TypedDict):
     """Single task item in task list payload."""
     task_id: str
     name: str
-    status: Literal["pending", "in_progress", "completed", "failed"]
+    status: Literal["pending", "in_progress", "completed", "failed", "cancelled"]
 
 
 class TaskListUpdatedPayload(TypedDict):

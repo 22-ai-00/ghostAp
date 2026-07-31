@@ -7,7 +7,10 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any, Callable, Optional
+
+from src.card.tool_display import sanitize_tool_failure_detail
 
 from .constants import (
     AGENT_CALL_TIMEOUT_S,
@@ -21,11 +24,137 @@ from .constants import (
     SESSION_CREATE_TIMEOUT_S,
     WORKFLOW_TIMEOUT_HEADROOM_S,
 )
-from .errors import is_transient_error
+from .errors import _strip_internal_details, is_transient_error
 from .models import AgentCallParams, AgentCallResult
 from .roles import get_subagent_encouragement_prompt
 
 logger = logging.getLogger(__name__)
+
+
+_SUBAGENT_STATUS_MAP = {
+    "pendinginit": "running",
+    "pending": "running",
+    "running": "running",
+    "completed": "completed",
+    "shutdown": "completed",
+    "errored": "failed",
+    "failed": "failed",
+    "notfound": "failed",
+    "interrupted": "cancelled",
+}
+_SUBAGENT_STATUS_PROGRESS = {
+    "running": "已启动",
+    "completed": "已完成",
+    "failed": "执行失败",
+    "cancelled": "已中断",
+}
+_SUBAGENT_ACTIVITY = {
+    "started": ("running", "已启动"),
+    "interacted": ("running", "已与主 Agent 交互"),
+}
+
+
+def _is_subagent_tool_call(tool_call: Any) -> bool:
+    if tool_call is None:
+        return False
+    return bool(
+        getattr(tool_call, "subagent_source_id", None)
+        or getattr(tool_call, "subagent_activity", None)
+        or getattr(tool_call, "collaboration_tool", None)
+        or getattr(tool_call, "collaboration_receivers", ())
+        or getattr(tool_call, "subagent_states", ())
+    )
+
+
+def _safe_subagent_progress(value: object, *, opaque_ids: tuple[str, ...]) -> str:
+    text = _strip_internal_details(str(value or "").strip())
+    if not text:
+        return ""
+    return sanitize_tool_failure_detail(
+        text,
+        fallback="",
+        max_chars=180,
+        opaque_ids=opaque_ids,
+    )
+
+
+def _subagent_updates_from_tool_call(
+    tool_call: Any,
+) -> tuple[dict[str, object], ...]:
+    """Normalize one ACP child-agent frame for Workflow state consumption."""
+    if tool_call is None:
+        return ()
+
+    receivers = tuple(
+        source_id
+        for item in (getattr(tool_call, "collaboration_receivers", ()) or ())
+        if (source_id := str(item or "").strip())
+    )
+    raw_states = getattr(tool_call, "subagent_states", ()) or ()
+    states: dict[str, Mapping[str, object]] = {}
+    for item in raw_states:
+        if not isinstance(item, Mapping):
+            continue
+        source_id = str(item.get("source_id") or "").strip()
+        if source_id:
+            states[source_id] = item
+
+    all_source_ids = tuple(dict.fromkeys((*receivers, *states.keys())))
+    updates: dict[str, dict[str, object]] = {}
+
+    source_id = str(getattr(tool_call, "subagent_source_id", None) or "").strip()
+    activity = str(getattr(tool_call, "subagent_activity", None) or "").strip().lower()
+    tool_status = str(getattr(tool_call, "status", None) or "").strip().lower()
+    activity_status = (
+        (
+            ("cancelled", "已中断")
+            if tool_status == "completed"
+            else (
+                ("running", "中断未完成")
+                if tool_status == "failed"
+                else ("running", "正在中断")
+            )
+        )
+        if activity == "interrupted"
+        else _SUBAGENT_ACTIVITY.get(activity)
+    )
+    if source_id and activity_status:
+        status, progress = activity_status
+        updates[source_id] = {
+            "source_id": source_id,
+            "status": status,
+            "progress": progress,
+            "model": None,
+        }
+
+    model_value = getattr(tool_call, "collaboration_model", None)
+    model = str(model_value).strip() if model_value else None
+    for child_source_id in all_source_ids:
+        state = states.get(child_source_id)
+        if state is None:
+            if child_source_id not in updates:
+                updates[child_source_id] = {
+                    "source_id": child_source_id,
+                    "status": "running",
+                    "progress": "已启动",
+                    "model": model,
+                }
+            continue
+
+        raw_status = str(state.get("status") or "running").strip().lower()
+        status = _SUBAGENT_STATUS_MAP.get(raw_status, "running")
+        progress = _safe_subagent_progress(
+            state.get("message"),
+            opaque_ids=all_source_ids,
+        ) or _SUBAGENT_STATUS_PROGRESS[status]
+        updates[child_source_id] = {
+            "source_id": child_source_id,
+            "status": status,
+            "progress": progress,
+            "model": model,
+        }
+
+    return tuple(updates.values())
 
 
 def _settings_int(field: str, fallback: int) -> int:
@@ -88,11 +217,15 @@ class AgentExecutor:
         # Deprecated: kept for backwards compatibility
         budget_total: Optional[int] = None,
         on_budget_exceeded: Optional[Callable[[], None]] = None,
+        on_subagent_update: Optional[
+            Callable[[str, tuple[dict[str, object], ...]], None]
+        ] = None,
     ) -> None:
         self.cwd = cwd
         self.cancel_event = cancel_event
         self.on_token_usage = on_token_usage
         self.on_activity = on_activity  # (label, activity_text) -> None
+        self.on_subagent_update = on_subagent_update
         # Deprecated parameters - kept for backwards compatibility but ignored
         del budget_total, on_budget_exceeded
         # Shared thread pool for session creation — avoids per-call pool overhead.
@@ -376,23 +509,30 @@ class AgentExecutor:
 
                 # Build on_event callback for activity tracking
                 _on_activity = self.on_activity
+                _on_subagent_update = self.on_subagent_update
                 _agent_label = params.label or ""
 
                 def _event_cb(ev: Any) -> None:
-                    if not _on_activity or not _agent_label:
+                    if (not _on_activity and not _on_subagent_update) or not _agent_label:
                         return
                     try:
                         ev_type = getattr(ev, "event_type", None)
                         if ev_type is None:
                             return
                         type_val = ev_type.value if hasattr(ev_type, "value") else str(ev_type)
+                        tc = getattr(ev, "tool_call", None)
+                        subagent_updates = _subagent_updates_from_tool_call(tc)
+                        if subagent_updates and _on_subagent_update:
+                            _on_subagent_update(_agent_label, subagent_updates)
+                        if _is_subagent_tool_call(tc):
+                            return
+                        if not _on_activity:
+                            return
                         if type_val == "tool_call_start":
-                            tc = getattr(ev, "tool_call", None)
                             if tc:
                                 title = getattr(tc, "title", "") or getattr(tc, "kind", "")
                                 _on_activity(_agent_label, title[:60])
                         elif type_val == "tool_call_done":
-                            tc = getattr(ev, "tool_call", None)
                             if tc:
                                 title = getattr(tc, "title", "") or getattr(tc, "kind", "")
                                 status = getattr(tc, "status", "")
@@ -403,7 +543,11 @@ class AgentExecutor:
                 # Pass idle_timeout for adaptive timeout; gracefully degrade
                 # for session implementations that don't support it (e.g. test mocks).
                 send_kwargs: dict[str, Any] = {
-                    "on_event": _event_cb if _on_activity else None,
+                    "on_event": (
+                        _event_cb
+                        if _on_activity or _on_subagent_update
+                        else None
+                    ),
                     "timeout": prompt_timeout_s,
                 }
                 if idle_timeout_s > 0:
@@ -415,7 +559,7 @@ class AgentExecutor:
                     # Fallback: session doesn't accept idle_timeout
                     result = session.send_prompt(
                         full_prompt,
-                        on_event=None,
+                        on_event=send_kwargs["on_event"],
                         timeout=prompt_timeout_s,
                     )
 
@@ -474,7 +618,7 @@ class AgentExecutor:
                             break
 
                         retry_kwargs: dict[str, Any] = {
-                            "on_event": None,
+                            "on_event": send_kwargs["on_event"],
                             "timeout": retry_timeout_s,
                         }
                         if idle_timeout_s > 0:
@@ -485,7 +629,7 @@ class AgentExecutor:
                         except TypeError:
                             retry_result = session.send_prompt(
                                 fix_prompt,
-                                on_event=None,
+                                on_event=retry_kwargs["on_event"],
                                 timeout=retry_timeout_s,
                             )
 

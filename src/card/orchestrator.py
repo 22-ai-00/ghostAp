@@ -16,7 +16,7 @@ import logging
 import threading
 import time
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -25,9 +25,11 @@ from src.card.hooks import BackfillHook
 from src.card.nav_link import format_task_continuation_link
 from src.card.task_registry import TaskRegistry, TaskStatus
 from src.card.tool_display import (
+    collect_subagent_opaque_ids,
     extract_agent_tool_name,
     extract_tool_call_label,
     is_unhelpful_display_label,
+    sanitize_subagent_display_text,
     summarize_tool_call_content,
 )
 from src.card.ui_text import UI_TEXT
@@ -51,6 +53,34 @@ _MIN_TASKS_FOR_MULTI_CARD = 2
 _AGENT_TOOL_TITLES = {"agent", "subagent", "task"}
 _GENERIC_TASK_LABELS = {"", "agent", "subagent", "task", "子任务"}
 _FINAL_SUMMARY_TASK_ID = "__final_summary__"
+UNCONFIRMED_SUBAGENT_SUMMARY = "父任务已结束，子任务终态未确认"
+_SUBAGENT_PROVIDER_STATUS: dict[str, TaskStatus] = {
+    "pendinginit": "in_progress",
+    "pending_init": "in_progress",
+    "pending": "in_progress",
+    "running": "in_progress",
+    "completed": "completed",
+    "shutdown": "completed",
+    "errored": "failed",
+    "failed": "failed",
+    "notfound": "failed",
+    "not_found": "failed",
+    "interrupted": "cancelled",
+}
+_SUBAGENT_PROVIDER_PROGRESS = {
+    "pendinginit": "准备中",
+    "pending_init": "准备中",
+    "pending": "准备中",
+    "running": "执行中",
+    "completed": "已完成",
+    "shutdown": "已完成并停止",
+    "errored": "执行失败",
+    "failed": "执行失败",
+    "notfound": "状态不可用",
+    "not_found": "状态不可用",
+    "interrupted": "已中断",
+}
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 class TaskIdResolver:
@@ -185,6 +215,12 @@ class TaskOrchestrator:
         self._resolver: TaskIdResolver | None = None
         self._subagent_task_ids: set[str] = set()
         self._subagent_summaries: dict[str, dict] = {}
+        self._subagent_progress: dict[str, str] = {}
+        self._terminal_task_ids: set[str] = set()
+        self._terminal_task_summaries: dict[str, str] = {}
+        # Physical card sessions that have received a lifecycle terminal event.
+        # Logical overflow children are tracked separately so they cannot revive
+        # or prematurely close a card shared with an active sibling.
         self._finalized_task_ids: set[str] = set()
         self._tool_task_bindings: dict[str, str] = {}
 
@@ -288,6 +324,9 @@ class TaskOrchestrator:
             self._resolver = None
             self._subagent_task_ids.clear()
             self._subagent_summaries.clear()
+            self._subagent_progress.clear()
+            self._terminal_task_ids.clear()
+            self._terminal_task_summaries.clear()
             self._finalized_task_ids.clear()
             self._tool_task_bindings.clear()
             self._pending_broadcast_task_ids.clear()
@@ -498,6 +537,9 @@ class TaskOrchestrator:
         # Resolve overflow mapping (flood-prevention)
         resolved_id = self._overflow_target.get(task_id, task_id)
         is_overflow = task_id in self._overflow_target
+        with self._lock:
+            if task_id in self._terminal_task_ids:
+                return
 
         # Idempotent safety net: visible plan tasks are normally created when
         # the plan arrives; late dynamic tasks may still need materialization.
@@ -668,7 +710,9 @@ class TaskOrchestrator:
         if self._closed_event.is_set():
             return
 
-        if self._route_bound_media_event(acp_event, fallback_bridge):
+        if self._route_bound_source_event(acp_event, fallback_bridge):
+            return
+        if self._route_collaboration_event(acp_event, fallback_bridge):
             return
         if self._route_bound_tool_task_event(acp_event):
             return
@@ -712,15 +756,19 @@ class TaskOrchestrator:
             card_evt = card_event_from_acp(acp_event)
             self.dispatch_to_task(task_id, card_evt)
 
-    def _route_bound_media_event(
+    def _route_bound_source_event(
         self,
         acp_event: ACPEvent,
         fallback_bridge: StreamBridge,
     ) -> bool:
-        """Route source-tagged media to its stable tool/task owner."""
+        """Route source-tagged child text, thought, and media to its owner."""
         from src.acp.models import ACPEventType
 
-        if acp_event.event_type is not ACPEventType.IMAGE_CHUNK:
+        if acp_event.event_type not in {
+            ACPEventType.TEXT_CHUNK,
+            ACPEventType.THOUGHT_CHUNK,
+            ACPEventType.IMAGE_CHUNK,
+        }:
             return False
         source_id = str(getattr(acp_event, "source_id", "") or "").strip()
         if not source_id:
@@ -732,19 +780,32 @@ class TaskOrchestrator:
             else:
                 task_id = self._tool_task_bindings.get(source_id, "")
             resolved_id = self._overflow_target.get(task_id, task_id)
-            finalized = resolved_id in self._finalized_task_ids
+            finalized = (
+                task_id in self._terminal_task_ids
+                or resolved_id in self._finalized_task_ids
+            )
             bridge = self._bridges.get(resolved_id)
 
         if not task_id:
             return False
-        if not finalized and bridge is not None:
-            bridge.on_event(acp_event)
-            return True
+        if not finalized:
+            if bridge is not None:
+                bridge.on_event(acp_event)
+                return True
+            if acp_event.event_type is not ACPEventType.IMAGE_CHUNK:
+                from src.card.events import card_event_from_acp
+
+                self.dispatch_to_task(task_id, card_event_from_acp(acp_event))
+                return True
 
         # A closed task card rejects later mutations, and a task without its
         # own media bridge cannot upload the payload. Preserve the artifact on
         # the fallback card with an explicit owner instead of silently losing
         # it or attributing it to whichever task happens to be active.
+        if acp_event.event_type is not ACPEventType.IMAGE_CHUNK:
+            fallback_bridge.on_event(acp_event)
+            return True
+
         task = self._registry.get(task_id)
         label = str(getattr(task, "name", "") or task_id).strip()
         image = getattr(acp_event, "image", None)
@@ -757,6 +818,127 @@ class TaskOrchestrator:
                 image=replace(image, name=name[:120]),
             )
         fallback_bridge.on_event(acp_event)
+        return True
+
+    def _route_collaboration_event(
+        self,
+        acp_event: ACPEvent,
+        fallback_bridge: StreamBridge,
+    ) -> bool:
+        """Project Codex collaboration snapshots onto stable child cards."""
+        tool_call = getattr(acp_event, "tool_call", None)
+        collaboration_tool = getattr(tool_call, "collaboration_tool", "")
+        if (
+            tool_call is None
+            or not isinstance(collaboration_tool, str)
+            or not collaboration_tool.strip()
+        ):
+            return False
+
+        states_by_source = {
+            str(item.get("source_id") or "").strip(): item
+            for item in getattr(tool_call, "subagent_states", ())
+            if isinstance(item, Mapping)
+            and str(item.get("source_id") or "").strip()
+        }
+        source_ids = [
+            str(source_id or "").strip()
+            for source_id in getattr(tool_call, "collaboration_receivers", ())
+            if str(source_id or "").strip()
+        ]
+        source_ids.extend(
+            source_id
+            for source_id in states_by_source
+            if source_id not in source_ids
+        )
+
+        if not source_ids:
+            if str(getattr(tool_call, "status", "") or "").lower() == "failed":
+                fallback_bridge.on_event(acp_event)
+            return True
+
+        label = self._extract_agent_task_label(tool_call)
+        opaque_ids = collect_subagent_opaque_ids(tool_call)
+        # Materialize every receiver before applying terminal snapshots. This
+        # is required when the card cap folds later receivers into the first
+        # physical child card: an early completed receiver must not close that
+        # shared card before its running sibling is registered.
+        running_status_changed = False
+        for source_id in source_ids:
+            with self._lock:
+                if source_id in self._terminal_task_ids:
+                    continue
+                known_subagent = source_id in self._subagent_task_ids
+            if not known_subagent:
+                self.create_subagent_session(source_id, label)
+            with self._lock:
+                known_subagent = source_id in self._subagent_task_ids
+            if not known_subagent:
+                fallback_bridge.on_event(acp_event)
+                return True
+
+        for source_id in source_ids:
+            with self._lock:
+                if source_id in self._terminal_task_ids:
+                    continue
+            self._rename_task_from_tool_label(source_id, tool_call)
+            state = states_by_source.get(source_id, {})
+            raw_status = str(state.get("status") or "running").strip().lower()
+            status = _SUBAGENT_PROVIDER_STATUS.get(raw_status, "in_progress")
+            message = sanitize_subagent_display_text(
+                state.get("message"),
+                fallback="",
+                max_chars=180,
+                opaque_ids=opaque_ids,
+            )
+            progress = message or _SUBAGENT_PROVIDER_PROGRESS.get(
+                raw_status,
+                "执行中",
+            )
+            self._publish_subagent_progress(source_id, progress)
+            if status in _TERMINAL_TASK_STATUSES:
+                self._finalize_task_session(
+                    source_id,
+                    status,
+                    summary=progress,
+                )
+            else:
+                item = self._registry.get(source_id)
+                if item is not None and item.status != "in_progress":
+                    self._registry.update_status(
+                        source_id,
+                        "in_progress",
+                        notify=False,
+                    )
+                    running_status_changed = True
+        if running_status_changed:
+            self._broadcast_subagent_task_list()
+        return True
+
+    def _publish_subagent_progress(self, task_id: str, progress: str) -> bool:
+        """Show one safe, de-duplicated collaboration status on its child card."""
+        progress = str(progress or "").strip()
+        if not progress:
+            return False
+        with self._lock:
+            if task_id in self._terminal_task_ids:
+                return False
+            if self._subagent_progress.get(task_id) == progress:
+                return False
+            resolved_id = self._overflow_target.get(task_id, task_id)
+            if resolved_id in self._finalized_task_ids:
+                return False
+            self._subagent_progress[task_id] = progress
+            session = self._sessions.get(resolved_id)
+        if session is not None:
+            try:
+                session.dispatch(CardEvent.progress_updated(0, 0, progress))
+            except Exception:
+                logger.debug(
+                    "TaskOrchestrator: failed to publish child progress task_id=%s",
+                    task_id,
+                    exc_info=True,
+                )
         return True
 
     def route_or_fallback(self, acp_event: ACPEvent, fallback_bridge: StreamBridge) -> bool:
@@ -1127,13 +1309,21 @@ class TaskOrchestrator:
         if tool_call is None:
             return False
 
-        tool_id = str(getattr(tool_call, "id", "") or "").strip()
+        activity_source_id = str(
+            getattr(tool_call, "subagent_source_id", "") or ""
+        ).strip()
+        activity = str(
+            getattr(tool_call, "subagent_activity", "") or ""
+        ).strip().lower()
+        tool_id = activity_source_id or str(
+            getattr(tool_call, "id", "") or ""
+        ).strip()
         if not tool_id:
             return False
 
         with self._lock:
             known_subagent = tool_id in self._subagent_task_ids
-            finalized = tool_id in self._finalized_task_ids
+            finalized = tool_id in self._terminal_task_ids
         if not known_subagent and not self._is_agent_task(tool_call):
             return False
         if finalized:
@@ -1153,6 +1343,14 @@ class TaskOrchestrator:
                 known_subagent = tool_id in self._subagent_task_ids
             if not known_subagent:
                 return False
+
+        if activity_source_id:
+            self._route_subagent_activity(
+                task_id=tool_id,
+                activity=activity,
+                acp_event=acp_event,
+            )
+            return True
 
         if acp_event.event_type != ACPEventType.TOOL_CALL_DONE:
             self._rename_task_from_tool_label(tool_id, tool_call)
@@ -1179,6 +1377,64 @@ class TaskOrchestrator:
         else:
             self._publish_subagent_summary(tool_call, status="running")
         return True
+
+    def _route_subagent_activity(
+        self,
+        *,
+        task_id: str,
+        activity: str,
+        acp_event: ACPEvent,
+    ) -> None:
+        """Render a child lifecycle operation without closing the child task."""
+        tool_call = acp_event.tool_call
+        if tool_call is None:
+            return
+        self._rename_task_from_tool_label(task_id, tool_call)
+
+        provider_status = str(getattr(tool_call, "status", "") or "").lower()
+
+        if activity == "started":
+            progress = (
+                "已启动"
+                if provider_status == "completed"
+                else ("启动未完成" if provider_status == "failed" else "正在启动")
+            )
+        elif activity == "interacted":
+            progress = (
+                "已与主 Agent 交互"
+                if provider_status == "completed"
+                else (
+                    "交互未完成"
+                    if provider_status == "failed"
+                    else "正在与主 Agent 交互"
+                )
+            )
+        elif activity == "interrupted":
+            progress = (
+                "已中断"
+                if provider_status == "completed"
+                else (
+                    "中断未完成"
+                    if provider_status == "failed"
+                    else "正在中断"
+                )
+            )
+        else:
+            progress = "动态已更新"
+        self._publish_subagent_progress(task_id, progress)
+
+        if activity == "interrupted" and provider_status == "completed":
+            self._finalize_task_session(
+                task_id,
+                "cancelled",
+                summary="子代理已中断",
+            )
+            return
+
+        item = self._registry.get(task_id)
+        if item is not None and item.status != "in_progress":
+            self._registry.update_status(task_id, "in_progress", notify=False)
+            self._broadcast_subagent_task_list()
 
     def create_subagent_session(self, task_id: str, name: str) -> None:
         """Create a new session for a detected subagent task.
@@ -1411,6 +1667,12 @@ class TaskOrchestrator:
         title = str(getattr(tool_call, "title", "") or "").strip().lower()
         kind = str(getattr(tool_call, "kind", "") or "").strip().lower()
         content = str(getattr(tool_call, "content", "") or "").strip()
+        source_id = getattr(tool_call, "subagent_source_id", "")
+        if isinstance(source_id, str) and source_id.strip():
+            return True
+        collaboration_tool = getattr(tool_call, "collaboration_tool", "")
+        if isinstance(collaboration_tool, str) and collaboration_tool.strip():
+            return True
         if kind == "agent" or title in _AGENT_TOOL_TITLES:
             return True
         return kind == "other" and "子代理：" in content
@@ -1421,11 +1683,27 @@ class TaskOrchestrator:
 
     @staticmethod
     def _extract_agent_task_label(tool_call) -> str:
-        return extract_tool_call_label(
-            tool_call,
-            generic_labels=_GENERIC_TASK_LABELS,
+        opaque_ids = collect_subagent_opaque_ids(tool_call)
+        path = str(getattr(tool_call, "subagent_path", "") or "").strip()
+        if path:
+            label = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+            if label:
+                return sanitize_subagent_display_text(
+                    label,
+                    opaque_ids=opaque_ids,
+                    max_chars=60,
+                    fallback="子任务",
+                )
+        return sanitize_subagent_display_text(
+            extract_tool_call_label(
+                tool_call,
+                generic_labels=_GENERIC_TASK_LABELS,
+                fallback="子任务",
+                max_chars=240,
+            ),
             fallback="子任务",
             max_chars=60,
+            opaque_ids=opaque_ids,
         )
 
     @staticmethod
@@ -1449,15 +1727,18 @@ class TaskOrchestrator:
         summary: str = "",
     ) -> None:
         """Mark one task card terminal so later task updates no longer patch it."""
-        if status not in ("completed", "failed"):
+        if status not in _TERMINAL_TASK_STATUSES:
             return
 
-        resolved_id = self._overflow_target.get(task_id, task_id)
         with self._lock:
-            if resolved_id in self._finalized_task_ids:
+            resolved_id = self._overflow_target.get(task_id, task_id)
+            if (
+                task_id in self._terminal_task_ids
+                or resolved_id in self._finalized_task_ids
+            ):
                 return
-
-        with self._lock:
+            self._terminal_task_ids.add(task_id)
+            self._terminal_task_summaries[task_id] = summary
             is_subagent = task_id in self._subagent_task_ids
         if is_subagent:
             self._registry.update_status(task_id, status, notify=False)
@@ -1467,38 +1748,92 @@ class TaskOrchestrator:
         if self._resolver is not None:
             self._resolver.mark_inactive(task_id)
 
-        if is_subagent:
-            with self._lock:
-                grouped_task_ids = {
-                    resolved_id,
-                    *(
-                        overflow_id
-                        for overflow_id, target_id in self._overflow_target.items()
-                        if target_id == resolved_id
-                    ),
-                }
-            if any(
-                (item := self._registry.get(grouped_id)) is not None
-                and item.status not in {"completed", "failed"}
-                for grouped_id in grouped_task_ids
-            ):
-                return
+        with self._lock:
+            grouped_task_ids = {
+                resolved_id,
+                *(
+                    overflow_id
+                    for overflow_id, target_id in self._overflow_target.items()
+                    if target_id == resolved_id
+                ),
+            }
+        grouped_items = [
+            self._registry.get(grouped_id)
+            for grouped_id in grouped_task_ids
+        ]
+        if any(
+            item is not None and item.status not in _TERMINAL_TASK_STATUSES
+            for item in grouped_items
+        ):
+            return
+
+        statuses = {
+            item.status
+            for item in grouped_items
+            if item is not None
+        }
+        if "failed" in statuses:
+            terminal_status: TaskStatus = "failed"
+        elif "cancelled" in statuses:
+            terminal_status = "cancelled"
         else:
-            grouped_task_ids = {task_id}
+            terminal_status = "completed"
+        terminal_summary = next(
+            (
+                self._terminal_task_summaries.get(grouped_id, "")
+                for grouped_id in grouped_task_ids
+                if (item := self._registry.get(grouped_id)) is not None
+                and item.status == terminal_status
+                and self._terminal_task_summaries.get(grouped_id, "")
+            ),
+            summary,
+        )
 
         with self._lock:
+            if resolved_id in self._finalized_task_ids:
+                return
+            self._finalized_task_ids.add(resolved_id)
             session = self._sessions.get(resolved_id)
 
         if session is not None:
-            event = CardEvent.failed(summary) if status == "failed" else CardEvent.completed(summary=summary)
+            if terminal_status == "failed":
+                event = CardEvent.failed(terminal_summary)
+            elif terminal_status == "cancelled":
+                event = CardEvent.cancelled(
+                    reason=terminal_summary or "subagent_interrupted"
+                )
+            else:
+                event = CardEvent.completed(summary=terminal_summary)
             try:
                 session.dispatch(event)
             except Exception:
                 logger.debug("TaskOrchestrator: failed to finalize task_id=%s", task_id, exc_info=True)
 
+    def finalize_unfinished_subagents(
+        self,
+        *,
+        status: TaskStatus = "cancelled",
+        summary: str = UNCONFIRMED_SUBAGENT_SUMMARY,
+    ) -> tuple[str, ...]:
+        """Settle live child tasks without inventing a successful terminal.
+
+        Parent completion proves only that the parent prompt ended. A child
+        that never supplied an authoritative terminal ``agentsStates`` frame
+        is therefore cancelled/unknown rather than presented as completed.
+        """
+        if status not in _TERMINAL_TASK_STATUSES:
+            return ()
         with self._lock:
-            self._finalized_task_ids.add(resolved_id)
-            self._finalized_task_ids.update(grouped_task_ids)
+            task_ids = tuple(self._subagent_task_ids)
+        unfinished = tuple(
+            task_id
+            for task_id in task_ids
+            if (item := self._registry.get(task_id)) is not None
+            and item.status not in _TERMINAL_TASK_STATUSES
+        )
+        for task_id in unfinished:
+            self._finalize_task_session(task_id, status, summary=summary)
+        return unfinished
 
     def finish_with_summary(self, summary: str, *, failed: bool = False) -> None:
         """Close task cards, then create one fresh final summary card."""
@@ -1610,11 +1945,12 @@ class TaskOrchestrator:
 
         self._close_bridges(bridges)
 
-        terminal_event = (
-            CardEvent.failed(summary)
-            if terminal_status == "failed"
-            else CardEvent.completed(summary=summary)
-        )
+        if terminal_status == "failed":
+            terminal_event = CardEvent.failed(summary)
+        elif terminal_status == "cancelled":
+            terminal_event = CardEvent.cancelled(reason=summary or None)
+        else:
+            terminal_event = CardEvent.completed(summary=summary)
         for task_id, session in sessions:
             if task_id in finalized:
                 continue

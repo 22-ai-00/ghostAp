@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from src.acp.models import PlanEntryInfo
     from src.spec_engine.models import SpecTask
 
-TaskStatus = Literal["pending", "in_progress", "completed", "failed"]
+TaskStatus = Literal["pending", "in_progress", "completed", "failed", "cancelled"]
 
 StatusCallback = Callable[["str", "TaskStatus"], None]
 

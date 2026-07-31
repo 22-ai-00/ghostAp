@@ -23,7 +23,9 @@ _STATUS_ICONS = {
 
 _ACTIVE_STATUSES = frozenset({"in_progress", "active", "running"})
 _COMPLETED_STATUSES = frozenset({"completed", "done"})
-_FAILED_STATUSES = frozenset({"failed", "cancelled"})
+_FAILED_STATUSES = frozenset({"failed"})
+_CANCELLED_STATUSES = frozenset({"cancelled"})
+_ENDED_STATUSES = _COMPLETED_STATUSES | _FAILED_STATUSES | _CANCELLED_STATUSES
 
 _TASK_BUCKET_VISIBLE_LIMIT = 50
 _COMPACT_BUCKET_VISIBLE_LIMIT = 2
@@ -41,7 +43,7 @@ def group_tasks(plan_or_tasks) -> tuple[list, list, list]:
         status = _task_status(task)
         if status in _ACTIVE_STATUSES:
             in_progress.append(task)
-        elif status in _COMPLETED_STATUSES or status in _FAILED_STATUSES:
+        elif status in _ENDED_STATUSES:
             completed.append(task)
         else:
             pending.append(task)
@@ -197,13 +199,17 @@ def _build_compact_task_lines(
 
     if ended:
         ended_visible = ended[-_COMPACT_BUCKET_VISIBLE_LIMIT:]
-        failed_count = sum(
-            1 for task in ended if _task_status(task) in _FAILED_STATUSES
-        )
-        ended_label = "已结束" if failed_count else "已完成"
-        lines.append(
-            f"**{ended_label} ({len(ended)}) · 最近 {len(ended_visible)} 项**"
-        )
+        completed_count, failed_count, cancelled_count = _count_ended_statuses(ended)
+        if failed_count or cancelled_count:
+            status_summary = _format_ended_status_summary(
+                completed_count=completed_count,
+                failed_count=failed_count,
+                cancelled_count=cancelled_count,
+            )
+            ended_label = f"已结束 ({len(ended)}) · {status_summary}"
+        else:
+            ended_label = f"已完成 ({len(ended)})"
+        lines.append(f"**{ended_label} · 最近 {len(ended_visible)} 项**")
         lines.extend(
             _format_done_line(
                 task,
@@ -250,10 +256,17 @@ def _build_v2_task_lines(tasks: tuple[TaskSnapshotPayload, ...], current_id: str
     if len(active_visible) < len(in_progress):
         lines.append(f"　…还有 {len(in_progress) - len(active_visible)} 个进行中")
 
-    completed_only = sum(1 for task in completed if _task_status(task) in _COMPLETED_STATUSES)
-    failed_count = len(completed) - completed_only
-    if failed_count:
-        ended_label = f"✅ **已结束 ({len(completed)})** · 完成 {completed_only} / 失败 {failed_count}"
+    completed_only, failed_count, cancelled_count = _count_ended_statuses(completed)
+    if failed_count or cancelled_count:
+        ended_icon = "❌" if failed_count else "⊘"
+        status_summary = _format_ended_status_summary(
+            completed_count=completed_only,
+            failed_count=failed_count,
+            cancelled_count=cancelled_count,
+        )
+        ended_label = (
+            f"{ended_icon} **已结束 ({len(completed)})** · {status_summary}"
+        )
     else:
         ended_label = f"✅ **已完成 ({len(completed)})**"
     lines.append(ended_label)
@@ -261,7 +274,7 @@ def _build_v2_task_lines(tasks: tuple[TaskSnapshotPayload, ...], current_id: str
     for task in done_visible:
         lines.append(_format_done_line(task))
     if len(done_visible) < len(completed):
-        folded_label = "已结束" if failed_count else "已完成"
+        folded_label = "已结束" if failed_count or cancelled_count else "已完成"
         lines.append(f"　…还有 {len(completed) - len(done_visible)} 个{folded_label}")
 
     lines.append(f"⏳ **未处理 ({len(pending)})**")
@@ -271,6 +284,36 @@ def _build_v2_task_lines(tasks: tuple[TaskSnapshotPayload, ...], current_id: str
     if len(pending_visible) < len(pending):
         lines.append(f"　…还有 {len(pending) - len(pending_visible)} 个")
     return lines
+
+
+def _count_ended_statuses(tasks) -> tuple[int, int, int]:
+    """Return completed, failed, and cancelled counts without conflating them."""
+    completed_count = sum(
+        1 for task in tasks if _task_status(task) in _COMPLETED_STATUSES
+    )
+    failed_count = sum(
+        1 for task in tasks if _task_status(task) in _FAILED_STATUSES
+    )
+    cancelled_count = sum(
+        1 for task in tasks if _task_status(task) in _CANCELLED_STATUSES
+    )
+    return completed_count, failed_count, cancelled_count
+
+
+def _format_ended_status_summary(
+    *,
+    completed_count: int,
+    failed_count: int,
+    cancelled_count: int,
+) -> str:
+    parts: list[str] = []
+    if completed_count:
+        parts.append(f"完成 {completed_count}")
+    if failed_count:
+        parts.append(f"失败 {failed_count}")
+    if cancelled_count:
+        parts.append(f"取消 {cancelled_count}")
+    return " / ".join(parts)
 
 
 def _format_task_line(

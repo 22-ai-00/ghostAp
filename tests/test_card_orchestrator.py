@@ -368,6 +368,416 @@ class TestAgentTaskRouting:
 
         assert not sessions["t1"].events_of_type(CardEventType.TOOL_MODEL_CHANGED)
 
+    def test_source_tagged_subagent_text_routes_to_its_child_bridge(self):
+        from src.acp.models import ACPEvent, ACPEventType
+
+        sessions: dict[str, FakeSession] = {}
+        bridges: dict[str, FakeStreamBridge] = {}
+
+        def create_session(task_id: str):
+            session = FakeSession(session_id=f"session_{task_id}")
+            sessions[task_id] = session
+            return session
+
+        def create_bridge(dispatchable):
+            bridge = FakeStreamBridge()
+            bridges[dispatchable.session_id] = bridge
+            return bridge
+
+        orch = TaskOrchestrator(
+            chat_id="chat-source-text",
+            session_creator=create_session,
+            registry=TaskRegistry(),
+            bridge_factory=create_bridge,
+        )
+        fallback = FakeStreamBridge()
+        orch.route_acp_event(
+            self._tool_event(
+                ACPEventType.TOOL_CALL_START,
+                tool_id="agent-source",
+                content="核查卡片同步\n子代理：Explore",
+            ),
+            fallback,
+        )
+        text_event = ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="已定位 provider 事件缺口。",
+            source_id="agent-source",
+        )
+
+        orch.route_acp_event(text_event, fallback)
+
+        assert bridges["session_agent-source"].events[-1] == text_event
+        assert fallback.events == []
+
+    def test_codex_subagent_activity_reuses_child_session_without_false_completion(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, registry, sessions = _make_orchestrator()
+        fallback = FakeStreamBridge()
+        source_id = "thread-private-subagent"
+
+        for event_type, status in (
+            (ACPEventType.TOOL_CALL_START, "in_progress"),
+            (ACPEventType.TOOL_CALL_DONE, "completed"),
+        ):
+            orch.route_acp_event(
+                ACPEvent(
+                    event_type=event_type,
+                    source_id=source_id,
+                    tool_call=ToolCallInfo(
+                        id="activity-start-private",
+                        title="Start subagent card-audit",
+                        kind="other",
+                        status=status,
+                        subagent_source_id=source_id,
+                        subagent_path="/root/card-audit",
+                        subagent_activity="started",
+                    ),
+                ),
+                fallback,
+            )
+
+        assert source_id in sessions
+        assert registry.get(source_id).name == "card-audit"
+        assert registry.get(source_id).status == "in_progress"
+        progress = sessions[source_id].events_of_type(CardEventType.PROGRESS_UPDATED)
+        assert progress[-1].payload["label"] == "已启动"
+        assert not sessions[source_id].events_of_type(CardEventType.TOOL_STARTED)
+        assert not sessions[source_id].events_of_type(CardEventType.TOOL_DONE)
+        assert not sessions[source_id].events_of_type(CardEventType.COMPLETED)
+        assert fallback.events == []
+
+    def test_codex_interrupted_subagent_activity_cancels_child_session(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, registry, sessions = _make_orchestrator()
+        fallback = FakeStreamBridge()
+        source_id = "thread-private-subagent"
+
+        orch.route_acp_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id="activity-interrupt-private",
+                    title="Interrupt subagent card-audit",
+                    kind="other",
+                    status="completed",
+                    subagent_source_id=source_id,
+                    subagent_path="/root/card-audit",
+                    subagent_activity="interrupted",
+                ),
+            ),
+            fallback,
+        )
+
+        assert registry.get(source_id).status == "cancelled"
+        assert sessions[source_id].events_of_type(CardEventType.CANCELLED)
+        assert not sessions[source_id].events_of_type(CardEventType.FAILED)
+        assert fallback.events == []
+
+    def test_failed_codex_interrupt_activity_keeps_child_running(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, registry, sessions = _make_orchestrator()
+        fallback = FakeStreamBridge()
+        source_id = "thread-private-subagent"
+
+        orch.route_acp_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id="activity-interrupt-private",
+                    title="Interrupt subagent card-audit",
+                    kind="other",
+                    status="failed",
+                    subagent_source_id=source_id,
+                    subagent_path="/root/card-audit",
+                    subagent_activity="interrupted",
+                ),
+            ),
+            fallback,
+        )
+
+        assert registry.get(source_id).status == "in_progress"
+        assert not sessions[source_id].events_of_type(CardEventType.CANCELLED)
+        assert fallback.events == []
+
+    def test_codex_collaboration_snapshot_finishes_child_with_safe_progress(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, registry, sessions = _make_orchestrator()
+        fallback = FakeStreamBridge()
+        source_id = "thread-private-subagent"
+        event = ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="wait-private",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                content="等待卡片审计",
+                collaboration_tool="wait_agent",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": (
+                            "卡片审计已完成 thread-private-subagent wait-private"
+                        ),
+                    },
+                ),
+            ),
+        )
+
+        assert orch.route_or_fallback(event, fallback) is True
+
+        assert set(sessions) == {source_id}
+        assert registry.get(source_id).status == "completed"
+        progress = sessions[source_id].events_of_type(CardEventType.PROGRESS_UPDATED)
+        assert progress[-1].payload["label"] == "卡片审计已完成"
+        completed = sessions[source_id].events_of_type(CardEventType.COMPLETED)
+        assert completed[-1].payload["summary"] == "卡片审计已完成"
+        assert fallback.events == []
+
+    def test_identical_collaboration_snapshot_does_not_republish_child_cards(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, _registry, sessions = _make_orchestrator()
+        fallback = FakeStreamBridge()
+        event = ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="wait-private",
+                title="wait_agent",
+                kind="other",
+                status="in_progress",
+                content="等待并行审计",
+                collaboration_tool="wait_agent",
+                collaboration_receivers=("thread-a", "thread-b"),
+                subagent_states=(
+                    {
+                        "source_id": "thread-a",
+                        "status": "running",
+                        "message": "A 执行中",
+                    },
+                    {
+                        "source_id": "thread-b",
+                        "status": "running",
+                        "message": "B 执行中",
+                    },
+                ),
+            ),
+        )
+
+        orch.route_acp_event(event, fallback)
+        event_counts = {
+            task_id: session.event_count
+            for task_id, session in sessions.items()
+        }
+        orch.route_acp_event(event, fallback)
+
+        assert {
+            task_id: session.event_count
+            for task_id, session in sessions.items()
+        } == event_counts
+
+    def test_collaboration_label_and_progress_are_card_safe(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, registry, sessions = _make_orchestrator()
+        fallback = FakeStreamBridge()
+        source_a = "0192a4a7-aaaa-7bbb-8ccc-111111111111"
+        source_b = "0192a4a7-bbbb-7ccc-8ddd-222222222222"
+        orch.route_acp_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=ToolCallInfo(
+                    id="call_private_progress",
+                    title="spawn_agent",
+                    kind="other",
+                    status="in_progress",
+                    content=(
+                        "/data00/home/user/private.py:12 "
+                        "API_TOKEN=super-secret [审计](file:///tmp/private.md)"
+                    ),
+                    collaboration_tool="spawn_agent",
+                    collaboration_receivers=(source_a, source_b),
+                    subagent_states=(
+                        {
+                            "source_id": source_a,
+                            "status": "running",
+                            "message": (
+                                f"复核 {source_b} /data00/home/user/private.py:12 "
+                                "[详情](file:///tmp/private.md)"
+                            ),
+                        },
+                        {
+                            "source_id": source_b,
+                            "status": "running",
+                            "message": "等待执行",
+                        },
+                    ),
+                ),
+            ),
+            fallback,
+        )
+
+        visible = "\n".join(
+            [registry.get(source_a).name]
+            + [
+                event.payload.get("label", "")
+                for event in sessions[source_a].events_of_type(
+                    CardEventType.PROGRESS_UPDATED
+                )
+            ]
+        )
+        assert source_a not in visible
+        assert source_b not in visible
+        assert "/data00/home/user/private.py" not in visible
+        assert "super-secret" not in visible
+        assert "](file:" not in visible
+
+    def test_codex_collaboration_receivers_finish_independently(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, registry, sessions = _make_orchestrator()
+        fallback = FakeStreamBridge()
+
+        def snapshot(states):
+            return ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=ToolCallInfo(
+                    id="wait-private",
+                    title="wait_agent",
+                    kind="other",
+                    status="completed",
+                    content="等待并行审计",
+                    collaboration_tool="wait_agent",
+                    collaboration_receivers=("thread-a", "thread-b"),
+                    subagent_states=tuple(states),
+                ),
+            )
+
+        orch.route_acp_event(snapshot((
+            {"source_id": "thread-a", "status": "completed", "message": "A 完成"},
+            {"source_id": "thread-b", "status": "running", "message": "B 执行中"},
+        )), fallback)
+
+        assert registry.get("thread-a").status == "completed"
+        assert registry.get("thread-b").status == "in_progress"
+        assert sessions["thread-a"].events_of_type(CardEventType.COMPLETED)
+        assert not sessions["thread-b"].events_of_type(CardEventType.COMPLETED)
+
+        orch.route_acp_event(snapshot((
+            {"source_id": "thread-a", "status": "completed", "message": "A 完成"},
+            {"source_id": "thread-b", "status": "errored", "message": "B 校验失败"},
+        )), fallback)
+
+        assert registry.get("thread-b").status == "failed"
+        failed = sessions["thread-b"].events_of_type(CardEventType.FAILED)
+        assert failed[-1].payload["error"] == "B 校验失败"
+
+    def test_parent_completion_cancels_only_unfinished_subagents(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, registry, sessions = _make_orchestrator()
+        fallback = FakeStreamBridge()
+        orch.route_acp_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=ToolCallInfo(
+                    id="wait-private",
+                    title="wait_agent",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="wait_agent",
+                    collaboration_receivers=("thread-done", "thread-running"),
+                    subagent_states=(
+                        {
+                            "source_id": "thread-done",
+                            "status": "completed",
+                            "message": "已完成",
+                        },
+                        {
+                            "source_id": "thread-running",
+                            "status": "running",
+                            "message": "仍在执行",
+                        },
+                    ),
+                ),
+            ),
+            fallback,
+        )
+
+        orch.finalize_unfinished_subagents(
+            status="cancelled",
+            summary="父任务已结束，子任务终态未确认",
+        )
+
+        assert registry.get("thread-done").status == "completed"
+        assert registry.get("thread-running").status == "cancelled"
+        assert sessions["thread-done"].events_of_type(CardEventType.COMPLETED)
+        assert sessions["thread-running"].events_of_type(CardEventType.CANCELLED)
+        assert not sessions["thread-running"].events_of_type(CardEventType.COMPLETED)
+
+    def test_overflow_terminal_status_is_monotonic_and_failure_dominates(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        orch, registry, sessions = _make_orchestrator(max_task_cards=1)
+        fallback = FakeStreamBridge()
+
+        def snapshot(state_a, state_b):
+            return ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=ToolCallInfo(
+                    id="wait-private",
+                    title="wait_agent",
+                    kind="other",
+                    status="completed",
+                    content="等待并行审计",
+                    collaboration_tool="wait_agent",
+                    collaboration_receivers=("thread-a", "thread-b"),
+                    subagent_states=(state_a, state_b),
+                ),
+            )
+
+        orch.route_acp_event(snapshot(
+            {"source_id": "thread-a", "status": "errored", "message": "A 失败"},
+            {"source_id": "thread-b", "status": "running", "message": "B 执行中"},
+        ), fallback)
+
+        physical = sessions["thread-a"]
+        assert registry.get("thread-a").status == "failed"
+        assert not physical.events_of_type(CardEventType.FAILED)
+
+        before_late_activity = physical.event_count
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            source_id="thread-a",
+            tool_call=ToolCallInfo(
+                id="late-activity-private",
+                title="Start subagent",
+                kind="other",
+                status="completed",
+                subagent_source_id="thread-a",
+                subagent_activity="started",
+            ),
+        ), fallback)
+        assert registry.get("thread-a").status == "failed"
+        assert physical.event_count == before_late_activity
+
+        orch.route_acp_event(snapshot(
+            {"source_id": "thread-a", "status": "errored", "message": "A 失败"},
+            {"source_id": "thread-b", "status": "completed", "message": "B 完成"},
+        ), fallback)
+
+        assert physical.events_of_type(CardEventType.FAILED)
+        assert not physical.events_of_type(CardEventType.COMPLETED)
+
     def test_agent_image_routes_to_its_bound_child_bridge(self):
         from src.acp.models import (
             ACPEvent,

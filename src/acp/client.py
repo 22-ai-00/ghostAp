@@ -924,6 +924,83 @@ def _is_todo_tool(title: str, raw_input: Any) -> bool:
     return False
 
 
+def _codex_namespaced_metadata(update: Any) -> tuple[dict, dict]:
+    """Return normalized Codex subagent/collaboration metadata containers."""
+    meta = getattr(update, "field_meta", None) or getattr(update, "_meta", None)
+    if not isinstance(meta, Mapping):
+        return {}, {}
+    codex = meta.get("codex")
+    if not isinstance(codex, Mapping):
+        return {}, {}
+    subagent = codex.get("subagent")
+    collaboration = codex.get("collaboration")
+    return (
+        dict(subagent) if isinstance(subagent, Mapping) else {},
+        dict(collaboration) if isinstance(collaboration, Mapping) else {},
+    )
+
+
+def _parse_subagent_metadata(update: Any) -> tuple[str, str, str]:
+    """Extract the stable child thread, display path, and lifecycle activity."""
+    subagent, _ = _codex_namespaced_metadata(update)
+    if not subagent:
+        return "", "", ""
+    source_id = str(subagent.get("threadId") or "").strip()
+    path = str(subagent.get("path") or "").strip()
+    activity = str(subagent.get("activity") or "").strip().lower()
+    return source_id, path, activity
+
+
+def _parse_collaboration_metadata(
+    update: Any,
+    raw_input: Any,
+) -> tuple[str, tuple[str, ...], str, tuple[dict, ...]]:
+    """Normalize Codex collaboration state without exposing provider ids."""
+    _, collaboration = _codex_namespaced_metadata(update)
+    if not collaboration:
+        return "", (), "", ()
+
+    tool = str(collaboration.get("tool") or "").strip()
+    raw_receivers = collaboration.get("receiverThreadIds")
+    if not isinstance(raw_receivers, (list, tuple)) and isinstance(raw_input, Mapping):
+        raw_receivers = raw_input.get("receiverThreadIds")
+    if not isinstance(raw_receivers, (list, tuple)):
+        raw_receivers = ()
+    receivers = tuple(
+        value
+        for item in (raw_receivers or ())
+        if (value := str(item or "").strip())
+    )
+
+    model = ""
+    raw_states: Any = None
+    if isinstance(raw_input, Mapping):
+        model = str(raw_input.get("model") or "").strip()
+        raw_states = raw_input.get("agentsStates")
+
+    states: list[dict] = []
+    if isinstance(raw_states, Mapping):
+        normalized_states = {str(key): value for key, value in raw_states.items()}
+        ordered_ids = list(receivers)
+        ordered_ids.extend(
+            source_id
+            for source_id in normalized_states
+            if source_id not in ordered_ids
+        )
+        for source_id in ordered_ids:
+            raw_state = normalized_states.get(source_id)
+            if not isinstance(raw_state, Mapping):
+                continue
+            states.append(
+                {
+                    "source_id": source_id,
+                    "status": str(raw_state.get("status") or "").strip(),
+                    "message": str(raw_state.get("message") or "").strip(),
+                }
+            )
+    return tool, receivers, model, tuple(states)
+
+
 def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
     """Extract ToolCallInfo from a ToolCallStart or ToolCallProgress."""
     locations: list[str] = []
@@ -934,6 +1011,15 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
     raw_input = getattr(update, "raw_input", None)
     raw_output = getattr(update, "raw_output", None)
     status = (update.status or "in_progress").strip() or "in_progress"
+    subagent_source_id, subagent_path, subagent_activity = (
+        _parse_subagent_metadata(update)
+    )
+    (
+        collaboration_tool,
+        collaboration_receivers,
+        collaboration_model,
+        subagent_states,
+    ) = _parse_collaboration_metadata(update, raw_input)
 
     def _json_dump(obj: Any) -> str:
         try:
@@ -955,6 +1041,8 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
         kind == "agent"
         or title_lower == "agent"
         or title_lower == "task"
+        or bool(subagent_source_id)
+        or bool(collaboration_tool)
         or (isinstance(raw_input, dict) and any(k in raw_input for k in ("subagent_type", "description", "prompt")))
     )
 
@@ -1037,6 +1125,19 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
 
         content = _truncate((content or "").strip("\n"), 12000)
 
+    # Collaboration output is normalized separately into per-child states.
+    # Keep the input prompt as the stable user-facing child label instead of
+    # rendering provider result JSON. Failed calls retain raw output so the
+    # ordinary error path can expose a sanitized failure reason.
+    if (
+        collaboration_tool
+        and status != "failed"
+        and isinstance(raw_input, Mapping)
+    ):
+        prompt = str(raw_input.get("prompt") or "").strip()
+        if prompt:
+            content = _truncate(prompt.splitlines()[0].strip(), 4000)
+
     return ToolCallInfo(
         id=update.tool_call_id,
         title=title,
@@ -1044,6 +1145,13 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
         status=status,
         content=content,
         locations=locations,
+        subagent_source_id=subagent_source_id or None,
+        subagent_path=subagent_path or None,
+        subagent_activity=subagent_activity or None,
+        collaboration_tool=collaboration_tool or None,
+        collaboration_receivers=collaboration_receivers,
+        collaboration_model=collaboration_model or None,
+        subagent_states=subagent_states,
     )
 
 
@@ -1079,6 +1187,10 @@ def _extract_update_source_id(update: Any) -> str | None:
     ``_meta``. Keep that identity so concurrent streams do not share one card
     text block.
     """
+    subagent_source_id, _, _ = _parse_subagent_metadata(update)
+    if subagent_source_id:
+        return subagent_source_id
+
     # 注意：不要包含"id"，因为这通常是每个块的唯一标识符，而不是源标识符
     # 我们需要保留源标识符，以便将来自同一源的连续块合并到同一个文本块中
     candidates = ("source_id", "source", "agent_id", "task_id", "tool_call_id")
@@ -1254,6 +1366,7 @@ class GhostAPClient(Client):
             ACPEvent(
                 event_type=ACPEventType.TOOL_CALL_START,
                 tool_call=tool_info,
+                source_id=tool_info.subagent_source_id,
             )
         )
         self._emit_tool_images(update)
@@ -1272,10 +1385,12 @@ class GhostAPClient(Client):
             ACPEvent(
                 event_type=event_type,
                 tool_call=tool_info,
+                source_id=tool_info.subagent_source_id,
             )
         )
 
     def _emit_tool_images(self, update: ToolCallStart | ToolCallProgress) -> None:
+        source_id = _extract_update_source_id(update) or update.tool_call_id
         for image in _tool_call_images(
             update,
             root_dir=self._root_dir,
@@ -1285,7 +1400,7 @@ class GhostAPClient(Client):
                 ACPEvent(
                     event_type=ACPEventType.IMAGE_CHUNK,
                     image=image,
-                    source_id=update.tool_call_id,
+                    source_id=source_id,
                 )
             )
 

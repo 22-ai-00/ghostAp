@@ -46,6 +46,15 @@ class AgentStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class SubagentStatus(str, Enum):
+    """User-visible status of an ACP-internal child agent."""
+
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 # ---------------------------------------------------------------------------
 # Meta — describes the workflow script shape
 # ---------------------------------------------------------------------------
@@ -131,6 +140,19 @@ class PhaseProgress(BaseModel):
     finished_at: Optional[float] = None
 
 
+class SubagentProgress(BaseModel):
+    """Latest safe snapshot for one ACP-internal child thread.
+
+    ``source_id`` is an internal merge key only. Renderers must use list order
+    for display labels and must never expose this opaque provider identifier.
+    """
+
+    source_id: str
+    status: SubagentStatus = SubagentStatus.RUNNING
+    progress: str = ""
+    model: Optional[str] = None
+
+
 class AgentProgress(BaseModel):
     """Runtime state of a single agent() call."""
 
@@ -146,6 +168,7 @@ class AgentProgress(BaseModel):
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     current_activity: str = ""  # Live activity hint (e.g. "read_file src/...", "writing code...")
+    subagents: list[SubagentProgress] = Field(default_factory=list)
 
 
 class ReviewerEvidence(BaseModel):

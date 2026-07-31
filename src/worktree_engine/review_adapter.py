@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 from ..acp.outcome import PromptOutcome, classify_prompt_result
 from ..utils.errors import get_error_detail
 from .models import WorktreeUnit
+from .subagent_progress import WorktreeSubagentProgress
 
 if TYPE_CHECKING:
     from ..agent_session import SyncSession
@@ -592,6 +593,7 @@ class WorktreeReviewAdapter:
         unit: WorktreeUnit,
         timeout: float = 240.0,
         base_branch: str | None = None,
+        on_unit_update: Callable[[WorktreeUnit], None] | None = None,
     ) -> WorktreeReviewOutcome:
         diff, touched_files = _capture_git_evidence(
             unit.worktree_path,
@@ -635,13 +637,24 @@ class WorktreeReviewAdapter:
             input_findings=input_findings,
         )
         session = None
+        subagent_progress = None
         try:
             session = self._session_factory(
                 agent_type=self._agent_type(unit),
                 cwd=unit.worktree_path,
                 model_name=unit.model_name,
             )
-            result = session.send_prompt(prompt, timeout=timeout)
+            subagent_progress = WorktreeSubagentProgress(
+                unit,
+                on_unit_update=on_unit_update,
+                label="评审子Agent",
+                base_summary=unit.summary,
+            )
+            result = session.send_prompt(
+                prompt,
+                on_event=subagent_progress.on_event,
+                timeout=timeout,
+            )
             assessment = classify_prompt_result(result)
             if assessment.outcome is not PromptOutcome.COMPLETED:
                 return WorktreeReviewOutcome(
@@ -678,6 +691,8 @@ class WorktreeReviewAdapter:
                 error_code="review_error",
             )
         finally:
+            if subagent_progress is not None:
+                subagent_progress.restore_base_summary()
             if session is not None:
                 try:
                     session.close()
@@ -691,6 +706,7 @@ class WorktreeReviewAdapter:
         units: Iterable[WorktreeUnit],
         timeout: float = 240.0,
         base_branch: str | None = None,
+        on_unit_update: Callable[[WorktreeUnit], None] | None = None,
     ) -> WorktreeReviewOutcome:
         unit_list = list(units)
         if not unit_list:
@@ -701,6 +717,7 @@ class WorktreeReviewAdapter:
                 unit=unit,
                 timeout=timeout,
                 base_branch=base_branch,
+                on_unit_update=on_unit_update,
             )
             for unit in unit_list
         ]

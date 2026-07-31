@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from typing import Dict, Optional
 
@@ -18,6 +19,8 @@ from .models import (
     AgentStatus,
     PhaseProgress,
     ReviewerEvidence,
+    SubagentProgress,
+    SubagentStatus,
     WorkflowMetrics,
     WorkflowProject,
     WorkflowStatus,
@@ -177,6 +180,88 @@ class WorkflowStateManager:
                 return
             agent.current_activity = activity
 
+    def update_agent_subagents(
+        self,
+        label: str,
+        updates: Sequence[Mapping[str, object]],
+    ) -> bool:
+        """Merge child-agent snapshots by stable provider thread identity.
+
+        Returns ``True`` only when renderable state changed, allowing callers
+        to avoid redundant Feishu card refreshes for replayed ACP frames.
+        """
+        with self._write_locked():
+            agent = self._label_to_agent.get(label)
+            if agent is None or self._is_terminal_agent(agent):
+                return False
+
+            changed = False
+            by_source = {item.source_id: item for item in agent.subagents}
+            terminal = {
+                SubagentStatus.COMPLETED,
+                SubagentStatus.FAILED,
+                SubagentStatus.CANCELLED,
+            }
+            latest_index: int | None = None
+
+            for update in updates:
+                source_id = str(update.get("source_id") or "").strip()
+                if not source_id:
+                    continue
+                raw_status = str(update.get("status") or "running").strip().lower()
+                try:
+                    status = SubagentStatus(raw_status)
+                except ValueError:
+                    status = SubagentStatus.RUNNING
+                progress = str(update.get("progress") or "").strip()
+                raw_model = update.get("model")
+                model = str(raw_model).strip() if raw_model else None
+
+                child = by_source.get(source_id)
+                if child is None:
+                    child = SubagentProgress(
+                        source_id=source_id,
+                        status=status,
+                        progress=progress,
+                        model=model,
+                    )
+                    agent.subagents.append(child)
+                    by_source[source_id] = child
+                    latest_index = len(agent.subagents) - 1
+                    changed = True
+                    continue
+
+                # Terminal child state is sticky. A replayed/late "running"
+                # activity must not resurrect a child that already finished.
+                if child.status in terminal and status != child.status:
+                    continue
+                child_changed = False
+                if child.status != status:
+                    child.status = status
+                    child_changed = True
+                if progress and child.progress != progress:
+                    child.progress = progress
+                    child_changed = True
+                if model and child.model != model:
+                    child.model = model
+                    child_changed = True
+                if child_changed:
+                    latest_index = agent.subagents.index(child)
+                    changed = True
+
+            if changed and latest_index is not None:
+                latest = agent.subagents[latest_index]
+                status_text = {
+                    SubagentStatus.RUNNING: "执行中",
+                    SubagentStatus.COMPLETED: "已完成",
+                    SubagentStatus.FAILED: "失败",
+                    SubagentStatus.CANCELLED: "已取消",
+                }[latest.status]
+                agent.current_activity = (
+                    f"子 Agent {latest_index + 1} · {latest.progress or status_text}"
+                )
+            return changed
+
     def on_agent_aborted(self, label: str, reason: str = "Aborted by race loser") -> None:
         """Mark a running agent as CANCELLED (e.g. race() loser abort).
 
@@ -318,6 +403,10 @@ class WorkflowStateManager:
                             started_at=agent.started_at,
                             finished_at=agent.finished_at,
                             current_activity=agent.current_activity,
+                            subagents=[
+                                item.model_copy(deep=True)
+                                for item in agent.subagents
+                            ],
                         )
                         for agent in phase.agents
                     ],

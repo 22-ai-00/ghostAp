@@ -1296,9 +1296,7 @@ class ProgrammingModeHandler(BaseHandler):
             if assessment.outcome is PromptOutcome.COMPLETED:
                 prog_session.finish(
                     fallback_text=result_text,
-                    unfinished_subagent_status=(
-                        "cancelled" if entered_finalization[0] else "completed"
-                    ),
+                    unfinished_subagent_status="cancelled",
                 )
                 final_response = (
                     prog_session.get_final_text()

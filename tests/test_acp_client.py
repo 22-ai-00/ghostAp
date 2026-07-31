@@ -116,6 +116,50 @@ def test_tool_content_image_emits_before_tool_completion(tmp_path: Path):
     assert events[0].image.name == "generated.png"
 
 
+def test_subagent_tool_image_uses_stable_child_thread_source(tmp_path: Path):
+    events: list[ACPEvent] = []
+    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
+    update = ToolCallProgress.model_validate(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "activity-call-private",
+            "title": "Subagent image",
+            "kind": "other",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "content",
+                    "content": {
+                        "type": "image",
+                        "data": _ONE_PIXEL_PNG,
+                        "mimeType": "image/png",
+                    },
+                }
+            ],
+            "_meta": {
+                "codex": {
+                    "subagent": {
+                        "threadId": "thread-stable-private",
+                        "path": "/root/card-audit",
+                        "activity": "interacted",
+                    }
+                }
+            },
+        }
+    )
+
+    asyncio.run(client.session_update("session-image", update))
+
+    assert [event.source_id for event in events] == [
+        "thread-stable-private",
+        "thread-stable-private",
+    ]
+    assert [event.event_type.value for event in events] == [
+        "image_chunk",
+        "tool_call_done",
+    ]
+
+
 def test_completed_tool_image_location_emits_live_image_event(tmp_path: Path):
     events: list[ACPEvent] = []
     client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
@@ -981,6 +1025,7 @@ class MockToolCallStart:
         locations=None,
         raw_input=None,
         raw_output=None,
+        field_meta=None,
     ):
         self.tool_call_id = tool_call_id
         self.title = title
@@ -989,6 +1034,7 @@ class MockToolCallStart:
         self.locations = locations or []
         self.raw_input = raw_input
         self.raw_output = raw_output
+        self.field_meta = field_meta
 
 
 class MockToolCallProgress:
@@ -1003,6 +1049,7 @@ class MockToolCallProgress:
         locations=None,
         raw_input=None,
         raw_output=None,
+        field_meta=None,
     ):
         self.tool_call_id = tool_call_id
         self.title = title
@@ -1011,6 +1058,7 @@ class MockToolCallProgress:
         self.locations = locations or []
         self.raw_input = raw_input
         self.raw_output = raw_output
+        self.field_meta = field_meta
 
 
 class MockLocation:
@@ -1065,6 +1113,102 @@ class TestParseToolCall:
         )
         tc = _parse_tool_call(update)
         assert "实现后端接口" in tc.content
+
+    def test_codex_subagent_activity_metadata_is_normalized(self):
+        update = MockToolCallStart(
+            tool_call_id="activity-call-private",
+            title="Start subagent card-audit",
+            kind="other",
+            status="in_progress",
+            raw_input={
+                "agentThreadId": "thread-private",
+                "agentPath": "/root/card-audit",
+                "activityKind": "started",
+            },
+            field_meta={
+                "codex": {
+                    "subagent": {
+                        "threadId": "thread-private",
+                        "path": "/root/card-audit",
+                        "activity": "started",
+                    }
+                }
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.subagent_source_id == "thread-private"
+        assert tc.subagent_path == "/root/card-audit"
+        assert tc.subagent_activity == "started"
+
+    def test_codex_collaboration_states_are_normalized_by_thread(self):
+        update = MockToolCallStart(
+            tool_call_id="collaboration-call-private",
+            title="wait_agent",
+            kind="other",
+            status="completed",
+            raw_input={
+                "prompt": "等待卡片审计",
+                "receiverThreadIds": ["thread-a", "thread-b"],
+                "agentsStates": {
+                    "thread-a": {"status": "running", "message": "正在核查普通卡"},
+                    "thread-b": {"status": "completed", "message": "已核查 Deep 卡"},
+                },
+                "model": "gpt-test",
+                "reasoningEffort": "high",
+            },
+            raw_output={"result": "collaboration snapshot"},
+            field_meta={
+                "codex": {
+                    "collaboration": {
+                        "tool": "wait_agent",
+                        "senderThreadId": "thread-parent",
+                        "receiverThreadIds": ["thread-a", "thread-b"],
+                    }
+                }
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.collaboration_tool == "wait_agent"
+        assert tc.collaboration_receivers == ("thread-a", "thread-b")
+        assert tc.collaboration_model == "gpt-test"
+        assert tc.content == "等待卡片审计"
+        assert tc.subagent_states == (
+            {"source_id": "thread-a", "status": "running", "message": "正在核查普通卡"},
+            {"source_id": "thread-b", "status": "completed", "message": "已核查 Deep 卡"},
+        )
+
+    def test_codex_collaboration_rejects_scalar_receiver_ids(self):
+        update = MockToolCallStart(
+            tool_call_id="collaboration-call-private",
+            title="wait_agent",
+            kind="other",
+            status="in_progress",
+            raw_input={
+                "receiverThreadIds": "thread-a",
+                "agentsStates": {
+                    "thread-a": {"status": "running", "message": "正在核查"},
+                },
+            },
+            field_meta={
+                "codex": {
+                    "collaboration": {
+                        "tool": "wait_agent",
+                        "receiverThreadIds": "thread-a",
+                    }
+                }
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.collaboration_receivers == ()
+        assert tc.subagent_states == (
+            {"source_id": "thread-a", "status": "running", "message": "正在核查"},
+        )
 
 
 class TestParsePlan:
@@ -1162,6 +1306,40 @@ class TestGhostAPClient:
 
         assert len(self.events) == 1
         assert self.events[0].source_id is None
+
+    def test_tool_call_copies_codex_subagent_source_to_event(self):
+        from acp.schema import ToolCallStart
+
+        update = ToolCallStart.model_validate(
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "activity-call-private",
+                "title": "Start subagent card-audit",
+                "kind": "other",
+                "status": "in_progress",
+                "rawInput": {
+                    "agentThreadId": "thread-private",
+                    "agentPath": "/root/card-audit",
+                    "activityKind": "started",
+                },
+                "_meta": {
+                    "codex": {
+                        "subagent": {
+                            "threadId": "thread-private",
+                            "path": "/root/card-audit",
+                            "activity": "started",
+                        }
+                    }
+                },
+            }
+        )
+
+        self.client._handle_tool_call_start(update)
+
+        assert len(self.events) == 1
+        assert self.events[0].source_id == "thread-private"
+        assert self.events[0].tool_call is not None
+        assert self.events[0].tool_call.subagent_activity == "started"
 
 
 def test_read_write_text_file(tmp_path: Path):

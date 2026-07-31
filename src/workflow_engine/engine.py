@@ -741,6 +741,7 @@ class WorkflowEngine(BaseEngine):
                 cancel_event=self._cancel_event,
                 max_workers=max_concurrent,
                 on_activity=self._handle_agent_activity,
+                on_subagent_update=self._handle_agent_subagent_update,
             )
             self._state_manager = WorkflowStateManager(project)
             self._renderer_wf = WorkflowProgressRenderer(project)
@@ -1215,6 +1216,10 @@ class WorkflowEngine(BaseEngine):
                 model=params.model,
                 role=params.role,
             )
+            # Event callbacks originate inside AgentExecutor and only carry
+            # params.label. Use the disambiguated UI label so activity from a
+            # repeated generated label cannot update an earlier agent row.
+            params.label = label
 
         # Track request_id → effective label for abort-by-request-id lookup
         if request_id is not None:
@@ -1342,6 +1347,18 @@ class WorkflowEngine(BaseEngine):
         """
         if self._state_manager:
             self._state_manager.update_agent_activity(label, activity)
+            self._fire_progress()
+
+    def _handle_agent_subagent_update(
+        self,
+        label: str,
+        updates: tuple[dict[str, object], ...],
+    ) -> None:
+        """Fold ACP child activity into the existing Workflow progress card."""
+        if self._state_manager and self._state_manager.update_agent_subagents(
+            label,
+            updates,
+        ):
             self._fire_progress()
 
     def _handle_agent_aborted(self, label: str, reason: str, *, request_id=None) -> None:

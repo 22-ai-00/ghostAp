@@ -39,8 +39,8 @@ class _ReviewSession:
         self._response = response
         self._prompts = prompts
 
-    def send_prompt(self, prompt: str, *, timeout=None):
-        del timeout
+    def send_prompt(self, prompt: str, *, on_event=None, timeout=None):
+        del on_event, timeout
         self._prompts.append(prompt)
         return _PromptResult(self._response)
 
@@ -204,8 +204,8 @@ def test_unknown_review_stop_reason_is_inconclusive(tmp_path):
     repo = _changed_repo(tmp_path)
 
     class _IncompleteReviewSession(_ReviewSession):
-        def send_prompt(self, prompt: str, *, timeout=None):
-            del prompt, timeout
+        def send_prompt(self, prompt: str, *, on_event=None, timeout=None):
+            del prompt, on_event, timeout
             return _PromptResult(self._response, stop_reason="max_tokens")
 
     adapter = WorktreeReviewAdapter(
@@ -345,8 +345,8 @@ def test_forged_test_pass_cannot_bypass_execution_provenance(
     }"""
 
     class _ForgedReviewSession(_ReviewSession):
-        def send_prompt(self, prompt: str, *, timeout=None):
-            del prompt, timeout
+        def send_prompt(self, prompt: str, *, on_event=None, timeout=None):
+            del prompt, on_event, timeout
             return _PromptResult(
                 self._response,
                 tool_results=[
@@ -401,8 +401,8 @@ def test_latest_matching_test_execution_is_authoritative(
     }"""
 
     class _OrderedReviewSession(_ReviewSession):
-        def send_prompt(self, prompt: str, *, timeout=None):
-            del prompt, timeout
+        def send_prompt(self, prompt: str, *, on_event=None, timeout=None):
+            del prompt, on_event, timeout
             return _PromptResult(
                 self._response,
                 tool_results=[

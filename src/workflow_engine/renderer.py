@@ -6,6 +6,7 @@ import json
 import time
 from typing import Any
 
+from src.card.tool_display import sanitize_tool_failure_detail
 from src.utils.text import format_elapsed_clock
 
 from .errors import _strip_internal_details
@@ -13,6 +14,8 @@ from .models import (
     AgentProgress,
     AgentStatus,
     PhaseProgress,
+    SubagentProgress,
+    SubagentStatus,
     WorkflowProject,
     WorkflowStatus,
 )
@@ -99,6 +102,14 @@ WORKFLOW_STATUS_ICONS: dict[WorkflowStatus, str] = {
 _PHASE_AGENT_DISPLAY_LIMIT = 20
 _PHASE_COMPLETED_TAIL = 5
 _CARD_MAX_BYTES = 28_000  # Feishu card payload limit with safety margin
+_SUBAGENT_DISPLAY_LIMIT = 12
+
+_SUBAGENT_STATUS_META: dict[SubagentStatus, tuple[str, str]] = {
+    SubagentStatus.RUNNING: ("🟠", "执行中"),
+    SubagentStatus.COMPLETED: ("✅", "已完成"),
+    SubagentStatus.FAILED: ("❌", "失败"),
+    SubagentStatus.CANCELLED: ("⚪", "已取消"),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +258,66 @@ def _format_tokens(tokens: int) -> str:
     if tokens >= 1_000:
         return f"{tokens / 1_000:.0f}K"
     return str(tokens)
+
+
+def _render_subagent_lines(subagents: list[SubagentProgress]) -> str:
+    """Render bounded child status lines without provider thread identifiers."""
+    if not subagents:
+        return ""
+
+    source_ids = tuple(item.source_id for item in subagents if item.source_id)
+    indexed = list(enumerate(subagents, start=1))
+    if len(indexed) > _SUBAGENT_DISPLAY_LIMIT:
+        important = [
+            item
+            for item in indexed
+            if item[1].status
+            in {SubagentStatus.RUNNING, SubagentStatus.FAILED, SubagentStatus.CANCELLED}
+        ]
+        selected = important[:_SUBAGENT_DISPLAY_LIMIT]
+        selected_ids = {index for index, _ in selected}
+        if len(selected) < _SUBAGENT_DISPLAY_LIMIT:
+            remaining = [item for item in indexed if item[0] not in selected_ids]
+            selected.extend(remaining[-(_SUBAGENT_DISPLAY_LIMIT - len(selected)):])
+        indexed = sorted(selected, key=lambda item: item[0])
+
+    counts = {status: 0 for status in SubagentStatus}
+    for child in subagents:
+        counts[child.status] += 1
+    summary_parts = [
+        f"运行 {counts[SubagentStatus.RUNNING]}",
+        f"完成 {counts[SubagentStatus.COMPLETED]}",
+        f"失败 {counts[SubagentStatus.FAILED]}",
+        f"取消 {counts[SubagentStatus.CANCELLED]}",
+    ]
+    lines = [
+        f"    ↳ 子 Agent · {len(subagents)} 个 · "
+        + " / ".join(part for part in summary_parts if not part.endswith(" 0"))
+    ]
+    for index, child in indexed:
+        icon, status_text = _SUBAGENT_STATUS_META[child.status]
+        model = sanitize_tool_failure_detail(
+            child.model,
+            fallback="",
+            max_chars=60,
+            opaque_ids=source_ids,
+        )
+        model_text = f" · {model}" if model else ""
+        lines.append(
+            f"    - {icon} 子 Agent {index} · {status_text}{model_text}"
+        )
+        progress = sanitize_tool_failure_detail(
+            _strip_internal_details(child.progress),
+            fallback="",
+            max_chars=180,
+            opaque_ids=source_ids,
+        )
+        if progress:
+            lines.append(f"      - 进展：{progress}")
+    hidden = len(subagents) - len(indexed)
+    if hidden > 0:
+        lines.append(f"    - 另有 {hidden} 个子 Agent 已折叠")
+    return "\n" + "\n".join(lines)
 
 
 def _unicode_progress_bar(ratio: float, *, length: int = 20) -> str:
@@ -598,6 +669,7 @@ class WorkflowProgressRenderer:
                 if agent.model:
                     tool_badge += f"/`{agent.model}`"
                 display_label = _middle_ellipsis(agent.label or "agent")
+                subagent_text = _render_subagent_lines(agent.subagents)
                 if agent.status == AgentStatus.RUNNING:
                     summary_text = ""
                     activity_text = getattr(agent, "current_activity", "") or ""
@@ -613,13 +685,15 @@ class WorkflowProgressRenderer:
                         if elapsed > 0:
                             running_text = f"执行中 {_format_duration(elapsed)}…"
                     lines.append(
-                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} {running_text}{summary_text}"
+                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} "
+                        f"{running_text}{summary_text}{subagent_text}"
                     )
                 elif agent.error:
                     safe_err = _strip_internal_details(agent.error[:60])
                     dur = _format_duration(agent.duration_s) if agent.duration_s > 0 else ""
                     lines.append(
-                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} {dur} — {safe_err}"
+                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} "
+                        f"{dur} — {safe_err}{subagent_text}"
                     )
                 else:
                     dur = _format_duration(agent.duration_s) if agent.duration_s > 0 else ""
@@ -627,7 +701,8 @@ class WorkflowProgressRenderer:
                     if agent.task_summary:
                         summary_hint = f" — {_middle_ellipsis(agent.task_summary, 40)}"
                     lines.append(
-                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} {dur}{summary_hint}"
+                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} "
+                        f"{dur}{summary_hint}{subagent_text}"
                     )
             header_obj: dict[str, Any] = {
                 "title": {"tag": "plain_text", "content": f"{label} ({len(group)})"},

@@ -59,7 +59,7 @@ def test_codex_provider_name():
 
 
 def test_codex_fallback_package_is_official_agentclientprotocol_adapter():
-    assert CODEX_ACP_NPM_PACKAGE == "@agentclientprotocol/codex-acp@1.1.2"
+    assert CODEX_ACP_NPM_PACKAGE == "@agentclientprotocol/codex-acp@1.1.7"
 
 
 @patch("src.acp.providers.shutil.which")

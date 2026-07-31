@@ -12,7 +12,10 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from ...acp import ACPEventType
 from ...card.events import CardEvent, card_event_from_acp
-from ...card.orchestrator import TaskOrchestrator
+from ...card.orchestrator import (
+    UNCONFIRMED_SUBAGENT_SUMMARY,
+    TaskOrchestrator,
+)
 from ...card.render.budget import RenderBudget
 from ...card.render.build_heartbeat import BuildHeartbeat
 from ...card.render.throttle import StreamThrottle
@@ -334,14 +337,19 @@ class SpecStreamProcessor(BaseStreamProcessor):
             total_count=spec_project.total_criteria,
         ))
 
-        # Close orchestrator if in multi-card mode
-        if self._orchestrator.has_plan and not self._orchestrator.is_fallback_mode:
-            self._orchestrator.close()
-
         # Terminal event (hooks fire emoji automatically)
+        self._orchestrator.finalize_unfinished_subagents(
+            status="cancelled",
+            summary=UNCONFIRMED_SUBAGENT_SUMMARY,
+        )
         if spec_project.status.value == "completed":
+            self._orchestrator.close(terminal_status="completed")
             self._rotator.dispatch(CardEvent.completed())
         else:
+            self._orchestrator.close(
+                terminal_status="failed",
+                summary=UI_TEXT["card_project_failed"],
+            )
             self._rotator.dispatch(CardEvent.failed(UI_TEXT["card_project_failed"]))
         self._renderer._current_session = None
 
@@ -350,9 +358,14 @@ class SpecStreamProcessor(BaseStreamProcessor):
             self._spec_project_id, view_mode="error", view_context={"error": error}
         )
 
-        # Close orchestrator if in multi-card mode
-        if self._orchestrator.has_plan and not self._orchestrator.is_fallback_mode:
-            self._orchestrator.close()
+        self._orchestrator.finalize_unfinished_subagents(
+            status="cancelled",
+            summary=UNCONFIRMED_SUBAGENT_SUMMARY,
+        )
+        self._orchestrator.close(
+            terminal_status="failed",
+            summary=error,
+        )
 
         self._dispatch_failed(error)
 
@@ -395,6 +408,25 @@ class SpecStreamProcessor(BaseStreamProcessor):
         if phase == SpecPhase.BUILD and self._build_heartbeat is not None:
             activity = "tool_running" if self._footer_status == "tool_running" else "thinking"
             self._build_heartbeat.reset(activity)
+
+        # Codex child lifecycle is independent from whether the model emits a
+        # PLAN_UPDATE. Once a stable child source is registered, keep its text
+        # and thought stream on that child card in every Spec phase.
+        source_id = str(getattr(event, "source_id", "") or "").strip()
+        tool_call = getattr(event, "tool_call", None)
+        is_dynamic_agent_event = (
+            tool_call is not None
+            and TaskOrchestrator.is_agent_task_event(event)
+        )
+        is_bound_child_event = bool(
+            source_id and self._orchestrator.registry.get(source_id) is not None
+        )
+        if (
+            is_dynamic_agent_event
+            or is_bound_child_event
+        ):
+            self._orchestrator.route_acp_event(event, self._stream_bridge)
+            return
 
         # SPEC/PLAN/TASK are structured artifact phases whose model output is
         # intentionally JSON-like for parsing. Streaming those chunks verbatim

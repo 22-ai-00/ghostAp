@@ -47,6 +47,19 @@ class ToolCallInfo:
     locations: list[str] = field(default_factory=list)
     # Optional structured result (best-effort, may be populated from local history)
     result: Optional[dict] = None
+    # Stable child-agent identity normalized from provider namespaced metadata.
+    # ``tool_call.id`` identifies one activity invocation and may change on every
+    # interaction; this source id identifies the child thread across invocations.
+    subagent_source_id: Optional[str] = None
+    subagent_path: Optional[str] = None
+    subagent_activity: Optional[str] = None
+    # Parent collaboration snapshots. Entries are normalized to
+    # {source_id, status, message} and never rendered without card-layer
+    # sanitization.
+    collaboration_tool: Optional[str] = None
+    collaboration_receivers: tuple[str, ...] = ()
+    collaboration_model: Optional[str] = None
+    subagent_states: tuple[dict, ...] = ()
 
 
 @dataclass

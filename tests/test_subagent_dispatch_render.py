@@ -53,6 +53,24 @@ def test_render_subagent_dispatch_panel_does_not_present_unknown_status_as_succe
     assert "暂无状态" not in panel["header"]["title"]["content"]
 
 
+def test_render_subagent_dispatch_panel_does_not_present_cancel_only_as_success():
+    panel = render_subagent_dispatch_panel(
+        [
+            {
+                "label": "用户取消的子任务",
+                "tool": "Codex",
+                "status": "cancelled",
+            }
+        ]
+    )
+
+    assert panel is not None
+    title = panel["header"]["title"]["content"]
+    assert title.startswith("⚪")
+    assert "取消 1" in title
+    assert "✅" not in title
+
+
 def test_build_subagent_dispatch_atom_renders_through_registry():
     atom = build_subagent_dispatch_atom(_subagents())
 

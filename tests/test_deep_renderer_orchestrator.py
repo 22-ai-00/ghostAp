@@ -641,6 +641,24 @@ class TestDeepRendererSingleCard:
         assert _terminals(tracker.sessions_created[0]) == [CardEventType.CANCELLED]
         assert _terminals(tracker.sessions_created[1]) == [CardEventType.COMPLETED]
         assert _terminals(tracker.sessions_created[2]) == [CardEventType.CANCELLED]
+        main_task_updates = [
+            call.args[0]
+            for call in tracker.sessions_created[0].dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None) == CardEventType.TASK_LIST_UPDATED
+        ]
+        by_id = {
+            task["task_id"]: task["status"]
+            for task in main_task_updates[-1].payload["tasks"]
+        }
+        assert by_id["agent_done"] == "completed"
+        assert by_id["agent_active"] == "cancelled"
+        processor = callbacks.on_event.__self__
+        assert processor._task_registry.get("agent_active").status == "cancelled"
+        assert (
+            processor._subagent_orchestrator.registry.get("agent_active").status
+            == "cancelled"
+        )
 
     def test_agent_tool_call_uses_marked_child_card_and_main_task_summary(self):
         """Subagent details use a child card while main keeps only task progress."""
@@ -723,6 +741,198 @@ class TestDeepRendererSingleCard:
         assert CardEventType.TOOL_DELTA in child_event_types
         assert CardEventType.TOOL_DONE in child_event_types
         assert CardEventType.COMPLETED in child_event_types
+
+    def test_codex_activity_uses_stable_thread_id_without_false_completion(self):
+        """Activity calls are operations on one child, not child terminal frames."""
+        renderer, tracker = self._setup_renderer()
+        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks.on_analyzing_start("track Codex child activity")
+
+        source_id = "thread-stable-card-audit"
+        for call_id, activity in (
+            ("activity-call-started", "started"),
+            ("activity-call-interacted", "interacted"),
+        ):
+            for event_type, status in (
+                (ACPEventType.TOOL_CALL_START, "in_progress"),
+                (ACPEventType.TOOL_CALL_DONE, "completed"),
+            ):
+                callbacks.on_event(ACPEvent(
+                    event_type=event_type,
+                    source_id=source_id,
+                    tool_call=ToolCallInfo(
+                        id=call_id,
+                        title=f"Subagent {activity}",
+                        kind="other",
+                        status=status,
+                        subagent_source_id=source_id,
+                        subagent_path="/root/card-audit",
+                        subagent_activity=activity,
+                    ),
+                ))
+
+        main_session = tracker.sessions_created[0]
+        task_updates = [
+            call.args[0]
+            for call in main_session.dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None) == CardEventType.TASK_LIST_UPDATED
+        ]
+        latest_tasks = task_updates[-1].payload["tasks"]
+        child_tasks = [task for task in latest_tasks if task["task_id"] != "_deep_main"]
+
+        assert child_tasks == [{
+            "task_id": source_id,
+            "name": "🧬 card-audit",
+            "status": "in_progress",
+        }]
+        assert tracker.create_card_count == 2
+
+    def test_failed_codex_interrupt_activity_keeps_deep_child_running(self):
+        renderer, tracker = self._setup_renderer()
+        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks.on_analyzing_start("failed interrupt must not cancel child")
+
+        source_id = "thread-stable-card-audit"
+        callbacks.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            source_id=source_id,
+            tool_call=ToolCallInfo(
+                id="activity-call-interrupt",
+                title="Subagent interrupted",
+                kind="other",
+                status="failed",
+                subagent_source_id=source_id,
+                subagent_path="/root/card-audit",
+                subagent_activity="interrupted",
+            ),
+        ))
+
+        main_session = tracker.sessions_created[0]
+        task_updates = [
+            call.args[0]
+            for call in main_session.dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None) == CardEventType.TASK_LIST_UPDATED
+        ]
+        child_tasks = [
+            task
+            for task in task_updates[-1].payload["tasks"]
+            if task["task_id"] != "_deep_main"
+        ]
+        assert child_tasks == [{
+            "task_id": source_id,
+            "name": "🧬 card-audit",
+            "status": "in_progress",
+        }]
+
+    def test_codex_collaboration_state_finalizes_stable_deep_task(self):
+        """The collaboration snapshot, not activity DONE, owns child terminal state."""
+        renderer, tracker = self._setup_renderer()
+        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks.on_analyzing_start("finish Codex child from collaboration state")
+
+        source_id = "thread-stable-card-audit"
+        callbacks.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            source_id=source_id,
+            tool_call=ToolCallInfo(
+                id="activity-call-started",
+                title="Subagent started",
+                kind="other",
+                status="in_progress",
+                subagent_source_id=source_id,
+                subagent_path="/root/card-audit",
+                subagent_activity="started",
+            ),
+        ))
+        callbacks.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="collaboration-call-wait",
+                title="wait",
+                kind="agent",
+                status="completed",
+                collaboration_tool="wait",
+                collaboration_receivers=(source_id,),
+                subagent_states=({
+                    "source_id": source_id,
+                    "status": "completed",
+                    "message": "card audit complete",
+                },),
+            ),
+        ))
+
+        main_session = tracker.sessions_created[0]
+        task_updates = [
+            call.args[0]
+            for call in main_session.dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None) == CardEventType.TASK_LIST_UPDATED
+        ]
+        latest_tasks = task_updates[-1].payload["tasks"]
+        child_tasks = [task for task in latest_tasks if task["task_id"] != "_deep_main"]
+
+        assert child_tasks == [{
+            "task_id": source_id,
+            "name": "🧬 card-audit",
+            "status": "completed",
+        }]
+
+    def test_completed_parent_does_not_fabricate_running_child_completion(self):
+        from src.deep_engine.models import DeepProjectStatus
+
+        renderer, tracker = self._setup_renderer()
+        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks.on_analyzing_start("running child terminal truth")
+        source_id = "thread-still-running"
+        callbacks.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="collaboration-call-wait",
+                title="wait",
+                kind="agent",
+                status="completed",
+                collaboration_tool="wait",
+                collaboration_receivers=(source_id,),
+                subagent_states=({
+                    "source_id": source_id,
+                    "status": "running",
+                    "message": "still running",
+                },),
+            ),
+        ))
+
+        callbacks.on_project_done(
+            FakeDeepProject(status=DeepProjectStatus.COMPLETED)
+        )
+
+        main_session = tracker.sessions_created[0]
+        task_updates = [
+            call.args[0]
+            for call in main_session.dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None) == CardEventType.TASK_LIST_UPDATED
+        ]
+        child = next(
+            task
+            for task in task_updates[-1].payload["tasks"]
+            if task["task_id"] == source_id
+        )
+        assert child["status"] == "cancelled"
+        child_session = tracker.sessions_created[1]
+        child_terminals = [
+            call.args[0].type
+            for call in child_session.dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None)
+            in {
+                CardEventType.COMPLETED,
+                CardEventType.FAILED,
+                CardEventType.CANCELLED,
+            }
+        ]
+        assert child_terminals == [CardEventType.CANCELLED]
 
     def test_execute_failure_output_with_subagent_source_marker_does_not_create_child_card(self):
         renderer, tracker = self._setup_renderer()
@@ -998,7 +1208,7 @@ class TestDeepRendererSingleCard:
             "failed",
         ]
 
-    def test_error_fails_active_subagent_card(self):
+    def test_parent_error_cancels_unconfirmed_active_subagent_card(self):
         renderer, tracker = self._setup_renderer()
         callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
         callbacks.on_analyzing_start("fail active child")
@@ -1021,9 +1231,14 @@ class TestDeepRendererSingleCard:
             for call in child_session.dispatch.call_args_list
             if call.args
             and hasattr(call.args[0], "type")
-            and call.args[0].type in {CardEventType.COMPLETED, CardEventType.FAILED}
+            and call.args[0].type
+            in {
+                CardEventType.COMPLETED,
+                CardEventType.FAILED,
+                CardEventType.CANCELLED,
+            }
         ]
-        assert child_terminal_types == [CardEventType.FAILED]
+        assert child_terminal_types == [CardEventType.CANCELLED]
 
 
 # ---------------------------------------------------------------------------

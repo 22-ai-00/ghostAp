@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING
 
 from ...acp import ACPEvent, ACPEventType
 from ...card.events import CardEvent, CardEventType
-from ...card.orchestrator import TaskOrchestrator
+from ...card.orchestrator import (
+    UNCONFIRMED_SUBAGENT_SUMMARY,
+    TaskOrchestrator,
+)
 from ...card.render.build_heartbeat import BuildHeartbeat
 from ...card.stream_bridge import ACPStreamBridge
 from ...card.task_registry import TaskRegistry, tasks_from_plan_entries
@@ -201,13 +204,15 @@ class DeepStreamProcessor(BaseStreamProcessor):
         duration_seconds = self._project_duration(deep_project)
 
         if deep_project.status == DeepProjectStatus.COMPLETED:
+            self._cancel_unfinished_subagent_cards(
+                reason=UNCONFIRMED_SUBAGENT_SUMMARY,
+            )
             self._finalize_main_tasks(success=True)
             self._rotator.dispatch(CardEvent.completed(
                 summary=summary,
                 duration_seconds=duration_seconds,
             ))
             self._renderer.handler.add_reaction(self._message_id, EmojiReaction.on_multi_task_done())
-            self._subagent_orchestrator.close()
         else:
             tasks = self._task_payload()
             completed = sum(1 for task in tasks if task.get("status") == "completed")
@@ -216,54 +221,46 @@ class DeepStreamProcessor(BaseStreamProcessor):
                 total=len(tasks),
             )
             if deep_project.status == DeepProjectStatus.PAUSED:
-                self._rotator.dispatch(CardEvent.cancelled(reason=failure))
                 self._cancel_unfinished_subagent_cards(reason=failure)
+                self._rotator.dispatch(CardEvent.cancelled(reason=failure))
             else:
+                self._cancel_unfinished_subagent_cards(
+                    reason=UNCONFIRMED_SUBAGENT_SUMMARY,
+                )
                 self._finalize_main_tasks(success=False)
                 self._rotator.dispatch(CardEvent.failed(
                     failure,
                     duration_seconds=duration_seconds,
                 ))
-                self._subagent_orchestrator.close(
-                    terminal_status="failed",
-                    summary=failure,
-                )
         self._renderer._current_session = None
 
     def _cancel_unfinished_subagent_cards(self, *, reason: str) -> None:
         """Cancel open child cards while preserving their existing terminals."""
         orchestrator = self._subagent_orchestrator
-        with orchestrator._lock:
-            sessions = [
-                (task_id, session)
-                for task_id, session in orchestrator._sessions.items()
-                if task_id not in orchestrator._finalized_task_ids
-            ]
-            orchestrator._finalized_task_ids.update(
-                task_id for task_id, _session in sessions
-            )
-
-        for task_id, session in sessions:
-            try:
-                session.dispatch(CardEvent.cancelled(reason=reason))
-            except Exception:
-                logger.debug(
-                    "Deep failed to cancel subagent card task_id=%s",
-                    task_id,
-                    exc_info=True,
-                )
-        orchestrator.close()
+        cancelled_ids = orchestrator.finalize_unfinished_subagents(
+            status="cancelled",
+            summary=reason,
+        )
+        changed = False
+        for task_id in cancelled_ids:
+            item = self._task_registry.get(task_id)
+            if item is None or item.status in {"completed", "failed", "cancelled"}:
+                continue
+            self._task_registry.update_status(task_id, "cancelled", notify=False)
+            changed = True
+        if changed:
+            self._dispatch_task_list()
+        orchestrator.close(terminal_status="cancelled", summary=reason)
 
     def on_error(self, error: str) -> None:
         self._heartbeat.stop()
+        self._cancel_unfinished_subagent_cards(
+            reason=UNCONFIRMED_SUBAGENT_SUMMARY,
+        )
         self._finalize_main_tasks(success=False)
         self._dispatch_failed(
             error,
             duration_seconds=self._current_project_duration(),
-        )
-        self._subagent_orchestrator.close(
-            terminal_status="failed",
-            summary=error,
         )
 
     def _current_project_duration(self) -> float | None:
@@ -361,7 +358,7 @@ class DeepStreamProcessor(BaseStreamProcessor):
         name = str(name or "").strip()
         if not task_id:
             return
-        if status not in {"pending", "in_progress", "completed", "failed"}:
+        if status not in {"pending", "in_progress", "completed", "failed", "cancelled"}:
             status = "pending"
 
         existing = self._task_registry.get(task_id)
@@ -371,11 +368,20 @@ class DeepStreamProcessor(BaseStreamProcessor):
 
         if (
             name
-            and TaskOrchestrator._is_generic_task_label(existing.name)
-            and not TaskOrchestrator._is_generic_task_label(name)
+            and self._is_generic_agent_task_label(existing.name)
+            and not self._is_generic_agent_task_label(name)
         ):
             self._task_registry.update_name(task_id, name)
+        if existing.status in {"completed", "failed", "cancelled"}:
+            return
         self._task_registry.update_status(task_id, status)
+
+    @staticmethod
+    def _is_generic_agent_task_label(value: str) -> bool:
+        label = str(value or "").strip()
+        if label.startswith("🧬 "):
+            label = label[2:].strip()
+        return TaskOrchestrator._is_generic_task_label(label)
 
     def _handle_plan_task_list(self, event: ACPEvent) -> bool:
         if event.event_type != ACPEventType.PLAN_UPDATE or not event.plan:
@@ -403,14 +409,33 @@ class DeepStreamProcessor(BaseStreamProcessor):
             ACPEventType.TOOL_CALL_DONE,
         }:
             return False
-        is_agent_task_event = TaskOrchestrator.is_agent_task_event(event)
         tool_call = event.tool_call
-        task_id = str(getattr(tool_call, "id", "") or "").strip()
+        if tool_call is None:
+            return False
+        if self._handle_collaboration_task_states(tool_call):
+            return True
+
+        is_agent_task_event = TaskOrchestrator.is_agent_task_event(event)
+        task_id = str(
+            getattr(tool_call, "subagent_source_id", "")
+            or getattr(tool_call, "id", "")
+            or ""
+        ).strip()
         if not task_id:
             return False
         if not is_agent_task_event and self._task_registry.get(task_id) is None:
             return False
-        if event.event_type == ACPEventType.TOOL_CALL_DONE:
+        activity = str(getattr(tool_call, "subagent_activity", "") or "").strip().lower()
+        if activity in {"started", "interacted"}:
+            status = "in_progress"
+        elif activity == "interrupted":
+            provider_status = str(getattr(tool_call, "status", "") or "").lower()
+            status = (
+                "cancelled"
+                if provider_status == "completed"
+                else "in_progress"
+            )
+        elif event.event_type == ACPEventType.TOOL_CALL_DONE:
             raw_status = str(getattr(tool_call, "status", "") or "").strip().lower()
             status = "failed" if raw_status == "failed" else "completed"
         else:
@@ -420,6 +445,49 @@ class DeepStreamProcessor(BaseStreamProcessor):
             label = f"🧬 {label}"
         self._upsert_task(task_id, label, status)
         self._dispatch_task_list(task_id)
+        return True
+
+    def _handle_collaboration_task_states(self, tool_call) -> bool:
+        """Project stable child states from a parent collaboration snapshot."""
+        states = tuple(getattr(tool_call, "subagent_states", ()) or ())
+        is_collaboration = bool(
+            getattr(tool_call, "collaboration_tool", None)
+            or getattr(tool_call, "collaboration_receivers", ())
+            or states
+        )
+        if not is_collaboration:
+            return False
+
+        status_map = {
+            "pendinginit": "in_progress",
+            "pending_init": "in_progress",
+            "pending": "in_progress",
+            "running": "in_progress",
+            "completed": "completed",
+            "shutdown": "completed",
+            "errored": "failed",
+            "failed": "failed",
+            "notfound": "failed",
+            "not_found": "failed",
+            "interrupted": "cancelled",
+        }
+        current_task_id = ""
+        for state in states:
+            if not isinstance(state, dict):
+                continue
+            task_id = str(state.get("source_id") or "").strip()
+            if not task_id:
+                continue
+            raw_status = str(state.get("status") or "pending").strip().lower()
+            status = status_map.get(raw_status, "pending")
+            existing = self._task_registry.get(task_id)
+            name = existing.name if existing is not None else "🧬 子任务"
+            self._upsert_task(task_id, name, status)
+            if not current_task_id and status == "in_progress":
+                current_task_id = task_id
+
+        if states:
+            self._dispatch_task_list(current_task_id)
         return True
 
     def _ensure_build_phase(self) -> None:

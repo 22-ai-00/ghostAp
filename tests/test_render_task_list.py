@@ -1,6 +1,9 @@
 """Tests for src.card.render.task_list module."""
 from __future__ import annotations
 
+from typing import get_args, get_type_hints
+
+from src.card.events.payloads import TaskSnapshotPayload
 from src.card.render.task_list import render_task_list_panel
 from src.card.state.models import TaskListBlock
 
@@ -103,6 +106,34 @@ class TestRenderTaskListPanel:
         assert "完成 1 / 失败 1" in content
         assert "已完成 (2)" not in content
 
+    def test_cancelled_task_is_counted_separately_from_failed(self):
+        tasks = [
+            {"task_id": "t1", "name": "成功任务", "status": "completed"},
+            {"task_id": "t2", "name": "取消任务", "status": "cancelled"},
+        ]
+        block = _make_block(tasks, "t2")
+
+        result = render_task_list_panel(block)
+        content = result["elements"][0]["content"]
+
+        assert "已结束 (2)" in content
+        assert "完成 1 / 取消 1" in content
+        assert "失败" not in content
+        assert "⊘ ~~取消任务~~" in content
+
+    def test_failed_and_cancelled_task_counts_are_independent(self):
+        tasks = [
+            {"task_id": "t1", "name": "成功任务", "status": "completed"},
+            {"task_id": "t2", "name": "失败任务", "status": "failed"},
+            {"task_id": "t3", "name": "取消任务", "status": "cancelled"},
+        ]
+        block = _make_block(tasks, "t3")
+
+        result = render_task_list_panel(block)
+        content = result["elements"][0]["content"]
+
+        assert "完成 1 / 失败 1 / 取消 1" in content
+
     def test_empty_tasks(self):
         """Empty tasks list returns None (no panel rendered)."""
         block = _make_block([], "")
@@ -147,6 +178,19 @@ class TestRenderTaskListPanel:
         assert "**正在执行**" in content
         assert "后续任务" in content
         assert "未处理 (1)" in content
+
+    def test_compact_mode_keeps_cancelled_separate_from_failed(self):
+        tasks = [
+            {"task_id": "t1", "name": "成功任务", "status": "completed"},
+            {"task_id": "t2", "name": "取消任务", "status": "cancelled"},
+        ]
+        block = _make_block(tasks, "t2")
+
+        result = render_task_list_panel(block, compact=True)
+        content = result["elements"][0]["content"]
+
+        assert "已结束 (2) · 完成 1 / 取消 1 · 最近 2 项" in content
+        assert "失败" not in content
 
     def test_compact_empty_tasks(self):
         """Compact mode also returns None for empty task lists."""
@@ -216,3 +260,9 @@ class TestTaskListAtomOrdering:
         ordered = _order_atoms_by_section(atoms)
 
         assert ordered[0].kind == "task_list"
+
+
+def test_task_snapshot_payload_accepts_cancelled_status():
+    status_values = get_args(get_type_hints(TaskSnapshotPayload)["status"])
+
+    assert "cancelled" in status_values

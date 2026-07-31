@@ -110,7 +110,16 @@ class TestBuildProgrammingMetadata:
         assert meta.working_dir == "/repo"
 
     def test_all_modes_have_display(self):
-        modes = ["coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk"]
+        modes = [
+            "coco",
+            "claude",
+            "aiden",
+            "codex",
+            "gemini",
+            "traex",
+            "ttadk",
+            "tui2acp",
+        ]
         for mode in modes:
             meta = build_programming_metadata(mode)
             assert meta.mode_name != ""
@@ -675,6 +684,351 @@ class TestProgrammingCardSession:
         )
         assert "子代理 · 检查移动端分段布局" in rendered
         assert "子代理 · 子任务" not in rendered
+
+    def test_codex_subagent_activity_updates_one_safe_progress_summary(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.render.budget import RenderBudget
+        from src.card.render.renderer import render_card
+
+        source_id = "thread-private-subagent"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+
+        for event_type, status in (
+            (ACPEventType.TOOL_CALL_START, "in_progress"),
+            (ACPEventType.TOOL_CALL_DONE, "completed"),
+        ):
+            pcs.on_event(ACPEvent(
+                event_type=event_type,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id="activity-start-private",
+                    title="Start subagent card-audit",
+                    kind="other",
+                    status=status,
+                    subagent_source_id=source_id,
+                    subagent_path="/root/card-audit",
+                    subagent_activity="started",
+                ),
+            ))
+
+        summary = pcs.session.state.metadata.subagents
+        assert len(summary) == 1
+        assert summary[0]["label"] == "card-audit"
+        assert summary[0]["status"] == "running"
+        assert summary[0]["progress"] == "已启动"
+        assert not [block for block in pcs.session.state.blocks if block.kind == "tool_call"]
+
+        rendered = json.dumps(
+            render_card(pcs.session.state, RenderBudget())[0]._card_json,
+            ensure_ascii=False,
+        )
+        assert "进展：已启动" in rendered
+        assert source_id not in rendered
+        assert "activity-start-private" not in rendered
+
+    def test_codex_collaboration_and_multiple_activities_merge_by_thread(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        source_id = "thread-private-subagent"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="collaboration-private",
+                title="spawn_agent",
+                kind="other",
+                status="in_progress",
+                content="审计所有编程卡片",
+                collaboration_tool="spawn_agent",
+                collaboration_receivers=(source_id,),
+                collaboration_model="gpt-test",
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "running",
+                        "message": "正在核查普通编程卡",
+                    },
+                ),
+            ),
+        ))
+        for call_id, activity in (
+            ("activity-start-private", "started"),
+            ("activity-interact-private", "interacted"),
+        ):
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id=call_id,
+                    title="Subagent activity",
+                    kind="other",
+                    status="completed",
+                    subagent_source_id=source_id,
+                    subagent_path="/root/card-audit",
+                    subagent_activity=activity,
+                ),
+            ))
+
+        summaries = pcs.session.state.metadata.subagents
+        assert len(summaries) == 1
+        assert summaries[0]["label"] == "审计所有编程卡片"
+        assert summaries[0]["status"] == "running"
+        assert summaries[0]["progress"] == "已与主 Agent 交互"
+        assert summaries[0]["model"] == "gpt-test"
+        assert not [block for block in pcs.session.state.blocks if block.kind == "tool_call"]
+
+    def test_identical_codex_collaboration_snapshot_does_not_republish_card(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        source_id = "thread-private-subagent"
+        pcs, client = _make_programming_session(mode_name="codex")
+        pcs.start()
+        event = ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="collaboration-private",
+                title="wait_agent",
+                kind="other",
+                status="in_progress",
+                collaboration_tool="wait_agent",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "running",
+                        "message": "正在核查普通编程卡",
+                    },
+                ),
+            ),
+        )
+
+        pcs.on_event(event)
+        updates_after_first_snapshot = len([
+            operation
+            for operation in client.operations
+            if operation[0] == "update_card"
+        ])
+        pcs.on_event(event)
+
+        assert len([
+            operation
+            for operation in client.operations
+            if operation[0] == "update_card"
+        ]) == updates_after_first_snapshot
+
+    def test_identical_codex_activity_does_not_republish_summary(self):
+        from unittest.mock import patch
+
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        source_id = "thread-private-subagent"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+        event = ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            source_id=source_id,
+            tool_call=ToolCallInfo(
+                id="activity-start-private",
+                title="Subagent activity",
+                kind="other",
+                status="completed",
+                subagent_source_id=source_id,
+                subagent_path="/root/card-audit",
+                subagent_activity="started",
+            ),
+        )
+
+        with patch.object(
+            pcs,
+            "_dispatch_card_event",
+            wraps=pcs._dispatch_card_event,
+        ) as dispatch:
+            pcs.on_event(event)
+            calls_after_first = dispatch.call_count
+            pcs.on_event(event)
+
+        assert dispatch.call_count == calls_after_first
+
+    def test_collaboration_progress_hides_peer_ids_paths_secrets_and_markdown(self):
+        import json
+
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.render.budget import RenderBudget
+        from src.card.render.renderer import render_card
+
+        source_a = "0192a4a7-aaaa-7bbb-8ccc-111111111111"
+        source_b = "0192a4a7-bbbb-7ccc-8ddd-222222222222"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="call_private_progress",
+                title="spawn_agent",
+                kind="other",
+                status="in_progress",
+                content="审计卡片",
+                collaboration_tool="spawn_agent",
+                collaboration_receivers=(source_a, source_b),
+                subagent_states=(
+                    {
+                        "source_id": source_a,
+                        "status": "running",
+                        "message": (
+                            f"检查 {source_b} /data00/home/user/private.py:12 "
+                            "API_TOKEN=super-secret [详情](file:///tmp/private.md)"
+                        ),
+                    },
+                    {
+                        "source_id": source_b,
+                        "status": "running",
+                        "message": "等待执行",
+                    },
+                ),
+            ),
+        ))
+
+        rendered = json.dumps(
+            render_card(pcs.session.state, RenderBudget())[0]._card_json,
+            ensure_ascii=False,
+        )
+        assert source_a not in rendered
+        assert source_b not in rendered
+        assert "/data00/home/user/private.py" not in rendered
+        assert "super-secret" not in rendered
+        assert "](file:" not in rendered
+
+    def test_failed_codex_collaboration_without_child_is_not_swallowed(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="collaboration-private",
+                title="spawn_agent",
+                kind="other",
+                status="failed",
+                content='{"error":"子代理暂时不可用"}',
+                collaboration_tool="spawn_agent",
+            ),
+        ))
+
+        tool_blocks = [
+            block
+            for block in pcs.session.state.blocks
+            if block.kind == "tool_call"
+        ]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].status == "failed"
+        assert "子代理暂时不可用" in tool_blocks[0].tool_output
+
+    def test_codex_subagent_terminal_summary_ignores_late_activity(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        source_id = "thread-private-subagent"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="wait-private",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                collaboration_tool="wait_agent",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": "卡片链路核查完成",
+                    },
+                ),
+            ),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            source_id=source_id,
+            tool_call=ToolCallInfo(
+                id="late-activity-private",
+                title="Start subagent",
+                kind="other",
+                status="completed",
+                subagent_source_id=source_id,
+                subagent_path="/root/card-audit",
+                subagent_activity="started",
+            ),
+        ))
+
+        summary = pcs.session.state.metadata.subagents
+        assert len(summary) == 1
+        assert summary[0]["status"] == "completed"
+        assert summary[0]["progress"] == "卡片链路核查完成"
+
+    def test_codex_interrupted_activity_marks_only_its_thread_cancelled(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+        for source_id, activity in (
+            ("thread-a", "started"),
+            ("thread-b", "started"),
+            ("thread-a", "interrupted"),
+        ):
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id=f"activity-{source_id}-{activity}",
+                    title="Subagent activity",
+                    kind="other",
+                    status="completed",
+                    subagent_source_id=source_id,
+                    subagent_path=f"/root/{source_id}",
+                    subagent_activity=activity,
+                ),
+            ))
+
+        summaries = pcs.session.state.metadata.subagents
+        assert len(summaries) == 2
+        assert sorted(item["status"] for item in summaries) == [
+            "cancelled",
+            "running",
+        ]
+        assert any(
+            item["status"] == "cancelled" and item["progress"] == "已中断"
+            for item in summaries
+        )
+
+    def test_failed_codex_interrupt_activity_does_not_cancel_child(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        source_id = "thread-interrupt-failed"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+        for activity, status in (("started", "completed"), ("interrupted", "failed")):
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id=f"activity-{activity}",
+                    title="Subagent activity",
+                    kind="other",
+                    status=status,
+                    subagent_source_id=source_id,
+                    subagent_path="/root/card-audit",
+                    subagent_activity=activity,
+                ),
+            ))
+
+        summary = pcs.session.state.metadata.subagents
+        assert len(summary) == 1
+        assert summary[0]["status"] == "running"
+        assert summary[0]["progress"] == "中断未完成"
 
     def test_acp_turn_text_block_ids_are_monotonic_after_renderer_reset(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
@@ -2115,10 +2469,11 @@ class TestProgrammingCardSession:
 
         pcs.finish()
 
-        assert pcs.session.state.metadata.subagents[0]["status"] == "completed"
+        assert pcs.session.state.metadata.subagents[0]["status"] == "cancelled"
         body = str(render_card(pcs.session.state, RenderBudget())[0]._card_json["body"]["elements"])
-        assert "✅ 实现后端接口" in body
-        assert "完成 1" in body
+        assert "⚪ 实现后端接口" in body
+        assert "取消 1" in body
+        assert "完成 1" not in body
 
     def test_failed_subagent_panel_renders_safe_error_as_subordinate_line(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
@@ -2206,6 +2561,7 @@ class TestProgrammingCardSession:
                     ),
                     "model": f"API_TOKEN={secret} **private-model**",
                     "sequence": "1.a\n![private](/tmp/private-seq.png)",
+                    "progress": f"API_TOKEN={secret} ![](/tmp/private-progress.png)",
                     "error": "transport timeout",
                 }
             ]
@@ -2219,6 +2575,7 @@ class TestProgrammingCardSession:
         assert "![](" not in body
         assert "**private-model**" not in body
         assert "/tmp/private-seq.png" not in body
+        assert "/tmp/private-progress.png" not in body
         assert "#1.a" not in body
 
     def test_cancel_updates_parent_subagent_summary_before_terminal(self):

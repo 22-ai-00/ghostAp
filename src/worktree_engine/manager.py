@@ -387,7 +387,10 @@ class WorktreeManager(BaseEngineManager):
             state.units = self._dispatcher.execute_units(
                 state.units, timeout=timeout, on_unit_update=on_unit_update,
             )
-            self._finalize_execution_truth(state)
+            self._finalize_execution_truth(
+                state,
+                on_unit_update=on_unit_update,
+            )
         except Exception as exc:
             from ..utils.errors import get_error_detail
 
@@ -405,7 +408,12 @@ class WorktreeManager(BaseEngineManager):
             if unit.status != WorktreeUnitStatus.COMPLETED
         ]
 
-    def _finalize_execution_truth(self, state: WorktreeRuntimeState) -> None:
+    def _finalize_execution_truth(
+        self,
+        state: WorktreeRuntimeState,
+        *,
+        on_unit_update: Optional[Callable] = None,
+    ) -> None:
         incomplete = self._incomplete_required_units(state)
         if incomplete:
             detail = ", ".join(
@@ -441,6 +449,7 @@ class WorktreeManager(BaseEngineManager):
             goal=state.journey.goal,
             units=state.units,
             base_branch=state.base_branch or None,
+            on_unit_update=on_unit_update,
         )
         state.review_outcome = review_outcome.to_dict()
         if not review_outcome.passed:
@@ -519,7 +528,10 @@ class WorktreeManager(BaseEngineManager):
             self._dispatcher.execute_units(
                 failed_units, timeout=timeout, on_unit_update=on_unit_update,
             )
-            self._finalize_execution_truth(state)
+            self._finalize_execution_truth(
+                state,
+                on_unit_update=on_unit_update,
+            )
         except Exception as exc:
             from ..utils.errors import get_error_detail
             state.last_error = get_error_detail(exc)

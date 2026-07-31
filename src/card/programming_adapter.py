@@ -2,7 +2,7 @@
 
 Bridges streaming card pattern to CardSession for
 ProgrammingHandler.handle_response(). Supports all programming modes:
-Coco/Claude/Aiden/Codex/Gemini/Traex/TTADK.
+Coco/Claude/Aiden/Codex/Gemini/Traex/TTADK/Tui2ACP.
 """
 
 from __future__ import annotations
@@ -27,9 +27,11 @@ from src.card.state.reducer import (
 )
 from src.card.text_stream import append_stream_text
 from src.card.tool_display import (
+    collect_subagent_opaque_ids,
     extract_agent_tool_name,
     extract_tool_call_label,
     is_unhelpful_display_label,
+    sanitize_subagent_display_text,
     sanitize_tool_failure_detail,
 )
 
@@ -47,12 +49,39 @@ _MODE_DISPLAY: dict[str, tuple[str, str]] = {
     "gemini": ("💎", "Gemini"),
     "traex": ("🚀", "Traex"),
     "ttadk": ("🛠️", "TTADK"),
+    "tui2acp": ("🔌", "Tui2ACP"),
 }
 
 _AGENT_TOOL_TITLES = {"agent", "subagent", "task"}
 _GENERIC_TASK_LABELS = {"", "agent", "subagent", "task", "子任务"}
 _TERMINAL_AGENT_STATUSES = {"completed", "failed", "cancelled"}
 _GENERIC_AGENT_FAILURE_DETAIL = "子任务执行失败"
+_SUBAGENT_STATE_STATUS = {
+    "pendinginit": "running",
+    "pending_init": "running",
+    "pending": "running",
+    "running": "running",
+    "completed": "completed",
+    "errored": "failed",
+    "failed": "failed",
+    "interrupted": "cancelled",
+    "shutdown": "completed",
+    "notfound": "failed",
+    "not_found": "failed",
+}
+_SUBAGENT_STATE_PROGRESS = {
+    "pendinginit": "准备中",
+    "pending_init": "准备中",
+    "pending": "准备中",
+    "running": "执行中",
+    "completed": "已完成",
+    "errored": "执行失败",
+    "failed": "执行失败",
+    "interrupted": "已中断",
+    "shutdown": "已完成并停止",
+    "notfound": "状态不可用",
+    "not_found": "状态不可用",
+}
 _TOOL_CARD_EVENT_TYPES = frozenset({
     CardEventType.TOOL_STARTED,
     CardEventType.TOOL_DELTA,
@@ -209,6 +238,12 @@ class ProgrammingCardSession:
             self._handle_plan_update(acp_event)
             return
 
+        if self._handle_collaboration_event(acp_event):
+            return
+
+        if self._handle_subagent_activity_event(acp_event):
+            return
+
         if self._handle_agent_task_event(acp_event):
             return
 
@@ -311,7 +346,7 @@ class ProgrammingCardSession:
         self,
         *,
         fallback_text: str = "",
-        unfinished_subagent_status: str = "completed",
+        unfinished_subagent_status: str = "cancelled",
     ) -> None:
         """Complete the session normally.
 
@@ -319,6 +354,9 @@ class ProgrammingCardSession:
             fallback_text: If provided and the card contains no streamed text,
                 this text is injected as a completion summary so the user sees
                 the answer instead of a blank completed card.
+            unfinished_subagent_status: Truthful fallback for children that did
+                not emit an authoritative terminal snapshot. Defaults to
+                ``cancelled``; parent completion does not prove child success.
         """
         self._flush_now()
         if self._reasoning_active:
@@ -328,7 +366,7 @@ class ProgrammingCardSession:
         terminal_status = (
             unfinished_subagent_status
             if unfinished_subagent_status in {"completed", "failed", "cancelled"}
-            else "completed"
+            else "cancelled"
         )
         self._finish_agent_summaries(terminal_status=terminal_status)
         # If the main Agent did not stream an answer, use fallback_text as its
@@ -1069,6 +1107,179 @@ class ProgrammingCardSession:
             self._update_agent_summary(tool_call, status="running")
         return True
 
+    def _handle_collaboration_event(self, acp_event: "ACPEvent") -> bool:
+        """Fold provider collaboration snapshots into stable child summaries."""
+        tool_call = getattr(acp_event, "tool_call", None)
+        if tool_call is None or not getattr(tool_call, "collaboration_tool", None):
+            return False
+
+        states_by_source = {
+            str(item.get("source_id") or "").strip(): item
+            for item in getattr(tool_call, "subagent_states", ())
+            if isinstance(item, dict) and str(item.get("source_id") or "").strip()
+        }
+        source_ids = list(getattr(tool_call, "collaboration_receivers", ()))
+        source_ids.extend(
+            source_id
+            for source_id in states_by_source
+            if source_id not in source_ids
+        )
+        if not source_ids:
+            # A failed spawn can terminate before the provider allocates a
+            # child thread. Let the ordinary tool path render that failure;
+            # successful structural no-op frames remain intentionally hidden.
+            return str(getattr(tool_call, "status", "") or "").lower() != "failed"
+
+        label_candidate = self._extract_agent_task_label(tool_call)
+        opaque_ids = collect_subagent_opaque_ids(tool_call)
+        changed = False
+        for source_id in source_ids:
+            source_id = str(source_id or "").strip()
+            if not source_id:
+                continue
+            state = states_by_source.get(source_id, {})
+            raw_status = str(state.get("status") or "running").strip().lower()
+            incoming_status = _SUBAGENT_STATE_STATUS.get(raw_status, "running")
+            existing = self._agent_summaries.get(source_id, {})
+            existing_status = str(existing.get("status") or "").strip().lower()
+            message = sanitize_subagent_display_text(
+                state.get("message"),
+                fallback="",
+                max_chars=180,
+                opaque_ids=opaque_ids,
+            )
+            if existing_status in _TERMINAL_AGENT_STATUSES:
+                if incoming_status != existing_status:
+                    continue
+                if not message or message == str(existing.get("progress") or ""):
+                    continue
+
+            existing_label = str(existing.get("label") or "").strip()
+            label = existing_label or label_candidate
+            if self._is_generic_task_label(label):
+                label = "子任务"
+
+            progress = message or _SUBAGENT_STATE_PROGRESS.get(raw_status, "执行中")
+            summary = {
+                **existing,
+                "label": label,
+                "tool": str(existing.get("tool") or "子代理"),
+                "status": incoming_status,
+                "progress": progress,
+            }
+            summary.setdefault(
+                "sequence",
+                f"{self._rotator.current.sequence}.{chr(ord('a') + len(self._agent_summaries))}",
+            )
+            model = str(
+                getattr(tool_call, "collaboration_model", None)
+                or existing.get("model")
+                or self._base_metadata.model_name
+                or ""
+            ).strip()
+            if model:
+                summary["model"] = model
+            if summary != existing:
+                self._agent_summaries[source_id] = summary
+                changed = True
+
+        if changed:
+            self._publish_agent_summaries()
+        # Collaboration calls are structural transport events. The stable child
+        # summary is the user-facing representation; rendering every spawn/wait
+        # invocation as a normal tool block creates duplicate, noisy history.
+        return True
+
+    def _handle_subagent_activity_event(self, acp_event: "ACPEvent") -> bool:
+        """Update one child summary from a namespaced lifecycle activity."""
+        tool_call = getattr(acp_event, "tool_call", None)
+        source_id = str(
+            getattr(tool_call, "subagent_source_id", None)
+            or getattr(acp_event, "source_id", None)
+            or ""
+        ).strip()
+        activity = str(
+            getattr(tool_call, "subagent_activity", None) or ""
+        ).strip().lower()
+        if tool_call is None or not source_id or not activity:
+            return False
+
+        provider_status = str(getattr(tool_call, "status", "") or "").lower()
+        activity_complete = provider_status == "completed"
+        activity_failed = provider_status == "failed"
+        if activity == "started":
+            progress = (
+                "已启动"
+                if activity_complete
+                else ("启动未完成" if activity_failed else "正在启动")
+            )
+            incoming_status = "running"
+        elif activity == "interacted":
+            progress = (
+                "已与主 Agent 交互"
+                if activity_complete
+                else (
+                    "交互未完成"
+                    if activity_failed
+                    else "正在与主 Agent 交互"
+                )
+            )
+            incoming_status = "running"
+        elif activity == "interrupted":
+            progress = (
+                "已中断"
+                if activity_complete
+                else ("中断未完成" if activity_failed else "正在中断")
+            )
+            incoming_status = "cancelled" if activity_complete else "running"
+        else:
+            progress = "动态已更新"
+            incoming_status = "running"
+
+        existing = self._agent_summaries.get(source_id, {})
+        existing_status = str(existing.get("status") or "").strip().lower()
+        if existing_status in _TERMINAL_AGENT_STATUSES:
+            return True
+
+        raw_path = str(getattr(tool_call, "subagent_path", None) or "").strip()
+        path_label = raw_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        label = str(existing.get("label") or "").strip()
+        if not label or self._is_generic_task_label(label):
+            label = sanitize_subagent_display_text(
+                path_label,
+                fallback="子任务",
+                max_chars=60,
+                opaque_ids=collect_subagent_opaque_ids(tool_call),
+            )
+
+        summary = {
+            **existing,
+            "label": label,
+            "tool": str(existing.get("tool") or "子代理"),
+            "status": incoming_status,
+            "progress": progress,
+        }
+        summary.setdefault(
+            "sequence",
+            f"{self._rotator.current.sequence}.{chr(ord('a') + len(self._agent_summaries))}",
+        )
+        if self._base_metadata.model_name:
+            summary.setdefault("model", self._base_metadata.model_name)
+        if summary == existing:
+            return True
+        self._agent_summaries[source_id] = summary
+        self._publish_agent_summaries()
+        return True
+
+    def _publish_agent_summaries(self) -> None:
+        if self._rotator.current.closed:
+            return
+        self._dispatch_card_event(
+            CardEvent.tool_model_changed(
+                subagents=tuple(self._agent_summaries.values())
+            )
+        )
+
     def _handle_agent_image_event(self, acp_event: "ACPEvent") -> bool:
         """Route subtask media into the main card with task attribution."""
         source_id = str(getattr(acp_event, "source_id", "") or "").strip()
@@ -1244,7 +1455,7 @@ class ProgrammingCardSession:
             tool_call,
             minimum=60,
         )
-        return sanitize_tool_failure_detail(
+        return sanitize_subagent_display_text(
             extract_tool_call_label(
                 tool_call,
                 generic_labels=_GENERIC_TASK_LABELS,
@@ -1253,7 +1464,7 @@ class ProgrammingCardSession:
             ),
             fallback="子任务",
             max_chars=60,
-            opaque_ids=(tool_call.id,),
+            opaque_ids=collect_subagent_opaque_ids(tool_call),
         )
 
     @staticmethod
@@ -1266,14 +1477,14 @@ class ProgrammingCardSession:
             tool_call,
             minimum=24,
         )
-        return sanitize_tool_failure_detail(
+        return sanitize_subagent_display_text(
             extract_agent_tool_name(
                 tool_call,
                 max_chars=raw_limit,
             ),
             fallback="子代理",
             max_chars=24,
-            opaque_ids=(tool_call.id,),
+            opaque_ids=collect_subagent_opaque_ids(tool_call),
         )
 
     @staticmethod

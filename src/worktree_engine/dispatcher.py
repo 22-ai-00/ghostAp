@@ -15,6 +15,7 @@ from ..utils.callbacks import safe_invoke
 from ..utils.errors import classify_timeout, get_error_detail
 from .models import WorktreeSelectionItem, WorktreeUnit, WorktreeUnitStatus
 from .reporter import REASON_DISPLAY_MAP
+from .subagent_progress import WorktreeSubagentProgress
 
 logger = logging.getLogger(__name__)
 
@@ -439,10 +440,30 @@ class WorktreeDispatcher:
             safe_invoke(on_unit_update, unit, label="on_unit_update")
             return
 
+        subagent_progress = None
         try:
             if control.cancel_event.is_set() or unit.generation != control.generation:
                 return
-            result = session.send_prompt(unit.task_prompt or unit.task_title, timeout=timeout)
+            subagent_progress = WorktreeSubagentProgress(
+                unit,
+                on_unit_update=on_unit_update,
+            )
+
+            def _on_event(event) -> None:
+                if (
+                    control.cancel_event.is_set()
+                    or unit.generation != control.generation
+                    or unit.status != WorktreeUnitStatus.RUNNING
+                ):
+                    return
+                subagent_progress.on_event(event)
+
+            result = session.send_prompt(
+                unit.task_prompt or unit.task_title,
+                on_event=_on_event,
+                timeout=timeout,
+            )
+            subagent_progress.close()
             # Respect cancellation set by pool-timeout while this unit was running.
             # Uses _cancel_event (threading.Event) for memory-barrier guarantee instead
             # of bare status read which relies on GIL atomicity.
@@ -504,6 +525,8 @@ class WorktreeDispatcher:
                 )
             safe_invoke(on_unit_update, unit, label="on_unit_update")
         finally:
+            if subagent_progress is not None:
+                subagent_progress.close()
             try:
                 session.close()
             except Exception:

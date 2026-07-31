@@ -53,6 +53,12 @@ _ANSI_ESCAPE_RE = re.compile(
 _UNSAFE_FORMAT_CONTROL_RE = re.compile(
     r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]"
 )
+_SUBAGENT_INTERNAL_PATH_RE = re.compile(
+    r"(?<![\w])(?:"
+    r"[A-Za-z]:[\\/](?:[\w.@+~-]+[\\/])+[\w.@+~-]+(?::\d+)?"
+    r"|(?:/[\w.@+~-]+){2,}(?::\d+)?"
+    r")"
+)
 _FAILURE_KEYS = (
     "error",
     "error_message",
@@ -199,6 +205,55 @@ def sanitize_tool_failure_detail(
     )
     candidate = candidate.translate(_MARKDOWN_META_TRANSLATION)
     return _truncate(candidate, max_chars)
+
+
+def collect_subagent_opaque_ids(tool_call: Any) -> tuple[str, ...]:
+    """Collect provider-only child/call identifiers from one normalized frame."""
+    if tool_call is None:
+        return ()
+    values: list[object] = [
+        getattr(tool_call, "id", None),
+        getattr(tool_call, "subagent_source_id", None),
+    ]
+    receivers = getattr(tool_call, "collaboration_receivers", ())
+    if isinstance(receivers, Sequence) and not isinstance(
+        receivers,
+        (str, bytes, bytearray),
+    ):
+        values.extend(receivers)
+    states = getattr(tool_call, "subagent_states", ())
+    if isinstance(states, Sequence) and not isinstance(
+        states,
+        (str, bytes, bytearray),
+    ):
+        values.extend(
+            item.get("source_id")
+            for item in states
+            if isinstance(item, Mapping)
+        )
+    return tuple(dict.fromkeys(_normalize_opaque_values(values)))
+
+
+def sanitize_subagent_display_text(
+    content: object,
+    *,
+    fallback: str = "",
+    max_chars: int = 180,
+    opaque_ids: Iterable[object] = (),
+) -> str:
+    """Return bounded child progress safe for cards and shared summaries.
+
+    SubAgent messages are provider-controlled status hints, not trusted output.
+    Besides the general credential/control/Markdown neutralization, hide local
+    absolute paths and every known peer thread/call identifier in the frame.
+    """
+    text = _SUBAGENT_INTERNAL_PATH_RE.sub("<path>", str(content or ""))
+    return sanitize_tool_failure_detail(
+        text,
+        fallback=fallback,
+        max_chars=max_chars,
+        opaque_ids=opaque_ids,
+    )
 
 
 def extract_tool_call_label(
