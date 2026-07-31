@@ -105,7 +105,7 @@ def test_non_enforcing_ingress_modes_are_visibly_reported(
 
 
 def test_secure_defaults_are_enforced_and_shell_disabled() -> None:
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     assert settings.ingress_access_mode == "enforced"
     assert settings.admin_bootstrap_scope == "p2p_only"
@@ -193,6 +193,7 @@ def test_validate_secure_defaults_print_posture_and_exit_zero(
     from src.main import main
 
     settings = Settings(
+        _env_file=None,
         app_id="cli_test",
         app_secret="cli_test_secret",
     )

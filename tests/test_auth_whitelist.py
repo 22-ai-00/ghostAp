@@ -87,6 +87,7 @@ def _patch_settings():
 
     def _factory(allowed_chat_ids: str = "", allowed_user_ids: str = ""):
         s = Settings(
+            ingress_access_mode=IngressAccessMode.ENFORCED.value,
             allowed_chat_ids=allowed_chat_ids,
             allowed_user_ids=allowed_user_ids,
         )
