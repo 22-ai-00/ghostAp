@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional
 
 from ...card import CardBuilder
 from ...card.ui_text import UI_TEXT
+from ...config import SecurityFinding, evaluate_security_posture
 from ...project import context_helper
 from ...tasking import TaskPriority, TaskSpec
 from ...utils.errors import get_error_detail
@@ -27,6 +28,44 @@ class DiagnosticsHandler(BaseHandler):
     # ------------------------------------------------------------------
     # Task board
     # ------------------------------------------------------------------
+
+    def _build_security_posture_lines(self) -> str:
+        """Render current configured and runtime security findings."""
+
+        try:
+            findings: list[SecurityFinding] = list(
+                evaluate_security_posture(self.settings).findings
+            )
+            provider = getattr(
+                self.ctx,
+                "ingress_access_policy_provider",
+                None,
+            )
+            shared = getattr(provider, "blocking_findings", ())
+            if isinstance(shared, tuple):
+                findings.extend(
+                    finding
+                    for finding in shared
+                    if isinstance(finding, SecurityFinding)
+                )
+        except (AttributeError, TypeError, ValueError):
+            logger.warning(
+                "Failed to evaluate security posture for /status",
+                exc_info=True,
+            )
+            return ""
+
+        if not findings:
+            return ""
+        deduplicated = {finding.code: finding for finding in findings}
+        lines = ["### 🔐 安全姿态"]
+        lines.extend(
+            f"- **{finding.severity.value.upper()}** `{finding.code}`："
+            f"{finding.message}"
+            for finding in deduplicated.values()
+        )
+        return "\n".join(lines)
+
     def show_task_board(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
         arg = ""
         try:
@@ -247,6 +286,10 @@ class DiagnosticsHandler(BaseHandler):
         lock_lines = self._build_lock_status_lines(chat_id, project, is_admin=_is_admin)
         if lock_lines:
             content += "\n\n" + lock_lines
+
+        security_lines = self._build_security_posture_lines()
+        if security_lines:
+            content += "\n\n" + security_lines
 
         msg_type, card_content = CardBuilder.build_smart_response_card(
             project=project,

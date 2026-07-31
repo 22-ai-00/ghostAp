@@ -164,13 +164,15 @@ class TestLogNoise(unittest.TestCase):
 
         # Mock message data
         mock_data = MagicMock()
-        mock_data.event.message.message_id = "mid"
-        mock_data.event.message.chat_id = "cid"
+        mock_data.event.message.message_id = "om_timeout"
+        mock_data.event.message.chat_id = "oc_timeout"
+        mock_data.event.message.chat_type = "group"
         mock_data.event.message.create_time = None
         mock_data.event.message.parent_id = None
         mock_data.event.message.root_id = None
         mock_data.event.message.message_type = "text"
         mock_data.event.message.content = '{"text": "hello"}'
+        mock_data.event.sender.sender_id.open_id = "ou_timeout"
 
         with ExitStack() as stack:
             stack.enter_context(patch("src.feishu.ws_client.get_settings"))
@@ -196,6 +198,22 @@ class TestLogNoise(unittest.TestCase):
             stack.enter_context(patch("src.feishu.ws_client.DiagnosticsHandler"))
 
             client = FeishuWSClient(lambda *args: None)
+
+            from src.access_control import (
+                IngressAccessPolicy,
+                IngressAccessPolicyProvider,
+            )
+            from src.config import IngressAccessMode
+
+            client._ingress_access_policy_provider = IngressAccessPolicyProvider(
+                IngressAccessPolicy(
+                    admin_ids=frozenset(),
+                    allowed_user_ids=frozenset({"ou_timeout"}),
+                    allowed_chat_ids=frozenset({"oc_timeout"}),
+                    mode=IngressAccessMode.ENFORCED,
+                    admin_bootstrap_scope="p2p_only",
+                )
+            )
 
             # Mock _ensure_request_id
             client._ensure_request_id = MagicMock(return_value="req_id")

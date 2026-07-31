@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     import lark_oapi as lark
     from lark_channel import FeishuChannel
 
+    from ..access_control import IngressAccessPolicyProvider
     from ..acp.manager import ACPSessionManager
     from ..agent.intent_recognizer import IntentRecognizer
     from ..autonomous.data.composition import EmployeeDataComposition
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from ..autonomous.provisioning.hire_port import EmployeeHireService
     from ..autonomous.team import EmployeeTeamService
     from ..chat_lock import ChatLockManager
+    from ..config.env_file_store import AtomicEnvFileStore
     from ..deep_engine import DeepEngineManager, ProgressReporter
     from ..mode import ModeManager
     from ..project import MessageProjectMapper, ProjectContextManager, ProjectManager
@@ -110,6 +112,8 @@ class HandlerContext:
     main_bot_outbound_audit_failure: Optional[Callable[[Exception], None]] = None
     tenant_key_resolver: Optional[Callable[[], str]] = None
     channel_client_factory: Optional[Callable[[], "FeishuChannel"]] = None
+    ingress_access_policy_provider: Optional["IngressAccessPolicyProvider"] = None
+    ingress_env_store: Optional["AtomicEnvFileStore"] = None
 
     def dependency_view(self) -> HandlerDependencyView:
         """Return a minimal service view while keeping existing fields compatible."""

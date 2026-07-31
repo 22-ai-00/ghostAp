@@ -7,6 +7,9 @@ from src.utils.rate_limit import RateLimitExceededException
 
 @patch("src.feishu.ws_client.TaskScheduler")
 def test_spec_backpressure(mock_scheduler_cls):
+    from src.access_control import IngressAccessPolicy, IngressAccessPolicyProvider
+    from src.config import IngressAccessMode
+
     mock_scheduler = mock_scheduler_cls.return_value
 
     # Simulate backpressure by raising the exception on submit for spec tasks
@@ -19,12 +22,23 @@ def test_spec_backpressure(mock_scheduler_cls):
 
     client = FeishuWSClient(message_callback=lambda x: None)
     client._reply_text = MagicMock()
+    client._ingress_access_policy_provider = IngressAccessPolicyProvider(
+        IngressAccessPolicy(
+            admin_ids=frozenset(),
+            allowed_user_ids=frozenset({"ou_user"}),
+            allowed_chat_ids=frozenset({"oc_chat"}),
+            mode=IngressAccessMode.ENFORCED,
+            admin_bootstrap_scope="p2p_only",
+        )
+    )
 
     data = MagicMock()
-    data.event.message.message_id = "msg1"
-    data.event.message.chat_id = "chat1"
+    data.event.message.message_id = "om_1"
+    data.event.message.chat_id = "oc_chat"
+    data.event.message.chat_type = "group"
     data.event.message.message_type = "text"
     data.event.message.content = json.dumps({"text": "/spec do something"})
+    data.event.sender.sender_id.open_id = "ou_user"
 
     client._handle_message(data)
 

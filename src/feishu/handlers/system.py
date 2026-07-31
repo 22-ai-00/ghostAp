@@ -170,6 +170,7 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/lock": lambda m, c, t, p: self._handle_lock_command(m, c, "lock"),
             "/unlock": lambda m, c, t, p: self._handle_lock_command(m, c, "unlock"),
             "/setadmin": lambda m, c, t, p: self._handle_setadmin_command(m, c, ""),
+            "/access": lambda m, c, t, p: self._handle_access_command(m, c, ""),
         }
 
         # Prefix match handlers: prefix -> handler_func(message_id, chat_id, text, project)
@@ -406,6 +407,7 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/lock",
             "/unlock",
             "/setadmin",
+            "/access",
             "/btw",
             "/goals",
             "/runs",
@@ -426,6 +428,7 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/model",
             "/btw",
             "/setadmin",
+            "/access",
             "/goal",
             "/approve",
             "/runs",
@@ -477,6 +480,9 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             return
         if text_lower == "/setadmin":
             self._handle_setadmin_command(message_id, chat_id, m.args)
+            return
+        if text_lower == "/access":
+            self._handle_access_command(message_id, chat_id, m.args)
             return
 
         # 1. Try exact match
@@ -533,13 +539,17 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         self.reply_text(message_id, UI_TEXT["system_autonomous_manager_retired"])
 
     def _handle_setadmin_command(self, message_id: str, chat_id: str, args: str = "") -> None:
-        from ...admin_bootstrap import AdminBootstrapService
         from ...thread import get_current_is_p2p, get_current_sender_id
 
-        del chat_id
         sender_id = get_current_sender_id() or ""
         chat_type = "p2p" if get_current_is_p2p() else "group"
-        result = AdminBootstrapService().set_admin(sender_id, args, chat_type=chat_type)
+        result = self._admin_bootstrap_service().set_admin(
+            sender_id,
+            args,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
         if result.success:
             if result.code == "bootstrap":
                 self.reply_text(message_id, UI_TEXT["system_setadmin_bootstrap_success"])
@@ -558,8 +568,145 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             self.reply_error(message_id, UI_TEXT["system_setadmin_requires_p2p"])
         elif result.code == "rate_limited":
             self.reply_error(message_id, UI_TEXT["system_setadmin_rate_limited"])
+        elif result.code == "persistence_failed":
+            self.reply_error(
+                message_id,
+                "管理员配置持久化失败，在线访问策略未改变。",
+            )
+        elif result.code == "commit_uncertain":
+            self.reply_error(
+                message_id,
+                "管理员配置文件替换已发生，但目录耐久性确认失败；"
+                "在线策略已按磁盘现状重新对齐，并记录了安全阻断项。",
+            )
+        elif result.code == "commit_uncertain_unreconciled":
+            self.reply_error(
+                message_id,
+                "管理员配置替换状态不确定，且无法读取磁盘现状；"
+                "在线策略保持原快照，已记录安全阻断项。",
+            )
+        elif result.code == "commit_uncertain_refresh_failed":
+            self.reply_error(
+                message_id,
+                "管理员配置替换状态不确定；已读取磁盘现状，但运行时刷新失败，"
+                "并已记录安全阻断项。",
+            )
+        elif result.code == "commit_cleanup_failed":
+            self.reply_error(
+                message_id,
+                "管理员配置已持久化并在线生效，但事务资源清理失败；"
+                "已记录安全阻断项，请检查文件系统状态。",
+            )
+        elif result.code == "commit_cleanup_refresh_failed":
+            self.reply_error(
+                message_id,
+                "管理员配置已持久化，但事务资源清理和运行时刷新均失败；"
+                "已记录安全阻断项，请修复后重启。",
+            )
+        elif result.code == "policy_refresh_failed":
+            self.reply_error(
+                message_id,
+                "管理员配置已写入磁盘，但在线访问策略刷新失败；"
+                "当前进程仍使用旧策略，请修复配置后重启。",
+            )
+        elif result.code == "settings_mirror_failed":
+            self.reply_error(
+                message_id,
+                "管理员配置已写入磁盘，但运行时设置镜像失败；"
+                "在线策略保持旧快照并已记录安全阻断项。",
+            )
         else:
             self.reply_text(message_id, UI_TEXT["system_setadmin_denied"])
+
+    def _handle_access_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        args: str = "",
+    ) -> None:
+        from ...thread import get_current_is_p2p, get_current_sender_id
+
+        if (args or "").strip().casefold() != "allow-chat":
+            self.reply_text(
+                message_id,
+                "用法：请由管理员在目标群内发送 `/access allow-chat`。",
+            )
+            return
+
+        sender_id = get_current_sender_id() or ""
+        chat_type = "p2p" if get_current_is_p2p() else "group"
+        result = self._admin_bootstrap_service().allow_current_chat(
+            sender_id,
+            chat_id,
+            chat_type=chat_type,
+            message_id=message_id,
+        )
+        if result.success:
+            self.reply_text(message_id, "✅ 当前群已加入访问白名单，立即生效。")
+            return
+        if result.code == "access_requires_group":
+            self.reply_error(
+                message_id,
+                "请在需要授权的目标群内发送 `/access allow-chat`。",
+            )
+        elif result.code == "persistence_failed":
+            self.reply_error(
+                message_id,
+                "群授权持久化失败，在线访问策略未改变。",
+            )
+        elif result.code == "commit_uncertain":
+            self.reply_error(
+                message_id,
+                "群授权配置文件替换已发生，但目录耐久性确认失败；"
+                "在线策略已按磁盘现状重新对齐，并记录了安全阻断项。",
+            )
+        elif result.code == "commit_uncertain_unreconciled":
+            self.reply_error(
+                message_id,
+                "群授权配置替换状态不确定，且无法读取磁盘现状；"
+                "在线策略保持原快照，已记录安全阻断项。",
+            )
+        elif result.code == "commit_uncertain_refresh_failed":
+            self.reply_error(
+                message_id,
+                "群授权配置替换状态不确定；已读取磁盘现状，但运行时刷新失败，"
+                "并已记录安全阻断项。",
+            )
+        elif result.code == "commit_cleanup_failed":
+            self.reply_error(
+                message_id,
+                "群授权配置已持久化并在线生效，但事务资源清理失败；"
+                "已记录安全阻断项，请检查文件系统状态。",
+            )
+        elif result.code == "commit_cleanup_refresh_failed":
+            self.reply_error(
+                message_id,
+                "群授权配置已持久化，但事务资源清理和运行时刷新均失败；"
+                "已记录安全阻断项，请修复后重启。",
+            )
+        elif result.code == "policy_refresh_failed":
+            self.reply_error(
+                message_id,
+                "群授权已写入磁盘，但在线访问策略刷新失败；"
+                "当前进程仍拒绝该群，请修复配置后重启。",
+            )
+        elif result.code == "settings_mirror_failed":
+            self.reply_error(
+                message_id,
+                "群授权配置已写入磁盘，但运行时设置镜像失败；"
+                "在线策略保持旧快照并已记录安全阻断项。",
+            )
+        else:
+            self.reply_text(message_id, "当前账号无权授权此群。")
+
+    def _admin_bootstrap_service(self):
+        from ...admin_bootstrap import AdminBootstrapService
+
+        return AdminBootstrapService(
+            settings_getter=lambda: self.settings,
+            policy_provider=self.ctx.ingress_access_policy_provider,
+            env_store=self.ctx.ingress_env_store,
+        )
 
     def _handle_btw_command(
         self,

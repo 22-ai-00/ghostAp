@@ -43,6 +43,11 @@ def mock_ws_client(tmp_path: Path):
     settings.autonomous_credential_active_key_id = ""
     settings.autonomous_data_keys = SecretStr("")
     settings.autonomous_data_active_key_id = ""
+    # Routing tests exercise downstream behavior, so their synthetic events
+    # must cross the production deny-by-default ingress contract explicitly.
+    settings.admin_user_ids = frozenset({"ou_admin"})
+    settings.allowed_user_ids = frozenset({"ou_test", "ou_user"})
+    settings.allowed_chat_ids = frozenset({"oc_456", "oc_dm"})
 
     with patch("src.feishu.ws_client.ACPSessionManager"), \
          patch("src.feishu.ws_client.configure_logging_with_trace"), \
@@ -73,7 +78,7 @@ def mock_ws_client(tmp_path: Path):
         client.close()
 
 
-def create_mock_message(text: str, message_id="msg_123", chat_id="chat_456", message_type="text"):
+def create_mock_message(text: str, message_id="om_123", chat_id="oc_456", message_type="text"):
     data = MagicMock()
     data.header.tenant_key = "tenant_test"
     data.event.message.message_id = message_id
@@ -85,6 +90,9 @@ def create_mock_message(text: str, message_id="msg_123", chat_id="chat_456", mes
     data.event.message.parent_id = None
     data.event.message.root_id = None
     data.event.message.thread_id = None
+    data.event.message.chat_type = "group"
+    data.event.sender.sender_id.open_id = "ou_test"
+    data.event.sender.sender_id.union_id = "on_test"
     return data
 
 
@@ -107,16 +115,16 @@ def test_handle_message_system_command_routing(mock_ws_client: FeishuWSClient):
 
 def test_handle_message_records_trusted_chat_origin(mock_ws_client: FeishuWSClient):
     """Message events are the authoritative source for DM provenance."""
-    msg = create_mock_message("/hire 柳七月", message_id="msg_hire", chat_id="chat_dm")
+    msg = create_mock_message("/hire 柳七月", message_id="om_hire", chat_id="oc_dm")
     msg.event.message.chat_type = "p2p"
     msg.event.sender.sender_id.open_id = "ou_admin"
     msg.event.sender.sender_id.union_id = "on_admin"
 
     mock_ws_client._handle_message(msg)
 
-    origin = mock_ws_client._message_linker.query("msg_hire")
+    origin = mock_ws_client._message_linker.query("om_hire")
     assert origin is not None
-    assert origin["chat_id"] == "chat_dm"
+    assert origin["chat_id"] == "oc_dm"
     assert origin["chat_type"] == "p2p"
     assert origin["sender_id"] == "ou_admin"
     spec, _ = mock_ws_client._scheduler.submit.call_args.args
@@ -546,7 +554,7 @@ def test_process_message_async_auto_enter_mode(mock_ws_client: FeishuWSClient):
     # Since auto_enter_mode is 'coco', it should bypass intent recognition and call handle_message directly
     mock_ws_client._intent_recognizer.recognize.assert_not_called()
     mock_coco_handler.handle_message.assert_called_once_with(
-        "msg_123", "chat_456", "hello", project
+        "om_123", "oc_456", "hello", project
     )
 
 
@@ -579,11 +587,11 @@ def test_group_ledger_publication_precedes_programming_mode_dispatch(
     mock_ws_client._process_message_async(msg, task_ctx=task_ctx)
 
     runtime.record_group_event.assert_called_once_with(
-        tenant_key="tenant_1",
-        chat_id="chat_456",
+        tenant_key="tenant_test",
+        chat_id="oc_456",
         thread_id="omt_topic",
-        message_id="msg_123",
-        sender_id="ou_user",
+        message_id="om_123",
+        sender_id="ou_test",
         text="implement this",
     )
     mock_coco_handler.handle_message.assert_called_once()
@@ -618,8 +626,8 @@ def test_flat_post_engine_command_reaches_dispatch_with_command_and_image(
 
     args = mock_ws_client._dispatch_message_logic.call_args.args
     kwargs = mock_ws_client._dispatch_message_logic.call_args.kwargs
-    assert args[0] == "msg_123"
-    assert args[1] == "chat_456"
+    assert args[0] == "om_123"
+    assert args[1] == "oc_456"
     assert args[3] is project
     assert args[2].startswith("/deep 恢复自主执行逻辑")
     assert "/tmp/evidence.png" in args[2]

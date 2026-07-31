@@ -3,7 +3,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from src.access_control import (
+    IngressAccessPolicy,
+    IngressAccessPolicyProvider,
+)
 from src.agent.intent_recognizer import IntentType, TaskStep
+from src.config import IngressAccessMode
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.feishu.ws_client import FeishuWSClient
 from src.mode import InteractionMode
@@ -41,6 +46,23 @@ def _make_ws_client(**extra_settings):
             setattr(mock_settings, k, v)
         mock_get_settings.return_value = mock_settings
         return FeishuWSClient(MagicMock())
+
+
+def _enrol_test_ingress(
+    client: FeishuWSClient,
+    *,
+    sender_id: str = "ou_test",
+    chat_id: str = "oc_1",
+) -> None:
+    client._ingress_access_policy_provider = IngressAccessPolicyProvider(
+        IngressAccessPolicy(
+            admin_ids=frozenset(),
+            allowed_user_ids=frozenset({sender_id}),
+            allowed_chat_ids=frozenset({chat_id}),
+            mode=IngressAccessMode.ENFORCED,
+            admin_bootstrap_scope="p2p_only",
+        )
+    )
 
 
 class TestCardActionHandler(unittest.TestCase):
@@ -1440,6 +1462,7 @@ class TestThreadModeRetentionRobust(unittest.TestCase):
         client.settings.thread_programming_enabled = True
         client.settings.allowed_chat_ids = set()
         client.settings.allowed_user_ids = set()
+        _enrol_test_ingress(client)
 
         from src.thread.models import ThreadContext
         thread_ctx = ThreadContext(
@@ -1468,13 +1491,17 @@ class TestThreadModeRetentionRobust(unittest.TestCase):
         client._update_task_project = MagicMock()
 
         data = MagicMock()
-        data.event.message.message_id = "m2"
-        data.event.message.chat_id = "c1"
+        data.event.message.message_id = "om_2"
+        data.event.message.chat_id = "oc_1"
+        data.event.message.chat_type = "group"
         data.event.message.root_id = "root1"
         data.event.message.create_time = None
+        data.event.sender.sender_id.open_id = "ou_test"
 
         task_ctx = MagicMock()
         task_ctx.run_id = "run1"
+        task_ctx.spec.sender_id = "ou_test"
+        task_ctx.spec.is_p2p = False
 
         client._process_message_async(data, task_ctx=task_ctx)
 
@@ -1489,6 +1516,7 @@ class TestThreadModeRetentionRobust(unittest.TestCase):
             allowed_chat_ids=set(),
             allowed_user_ids=set(),
         )
+        _enrol_test_ingress(client)
         from src.thread.models import ThreadContext
         client._thread_manager = MagicMock()
         client._thread_manager.get.return_value = ThreadContext(
@@ -1510,10 +1538,12 @@ class TestThreadModeRetentionRobust(unittest.TestCase):
         client._dispatch_message_logic = MagicMock()
 
         data = MagicMock()
-        data.event.message.message_id = "m2"
-        data.event.message.chat_id = "c1"
+        data.event.message.message_id = "om_2"
+        data.event.message.chat_id = "oc_1"
+        data.event.message.chat_type = "group"
         data.event.message.root_id = "root1"
         data.event.message.create_time = None
+        data.event.sender.sender_id.open_id = "ou_test"
         client._process_message_async(data)
 
         args = client._dispatch_message_logic.call_args.args
@@ -1579,6 +1609,7 @@ class TestThreadModeRetentionRobust(unittest.TestCase):
         client.settings.thread_programming_enabled = True
         client.settings.allowed_chat_ids = set()
         client.settings.allowed_user_ids = set()
+        _enrol_test_ingress(client)
 
         from src.thread.models import ThreadContext
         thread_ctx = ThreadContext(
@@ -1607,13 +1638,17 @@ class TestThreadModeRetentionRobust(unittest.TestCase):
         client._update_task_project = MagicMock()
 
         data = MagicMock()
-        data.event.message.message_id = "m2"
-        data.event.message.chat_id = "c1"
+        data.event.message.message_id = "om_2"
+        data.event.message.chat_id = "oc_1"
+        data.event.message.chat_type = "group"
         data.event.message.root_id = "root1"
         data.event.message.create_time = None
+        data.event.sender.sender_id.open_id = "ou_test"
 
         task_ctx = MagicMock()
         task_ctx.run_id = "run1"
+        task_ctx.spec.sender_id = "ou_test"
+        task_ctx.spec.is_p2p = False
 
         client._process_message_async(data, task_ctx=task_ctx)
 
@@ -1796,6 +1831,7 @@ class TestDualKeyThreadContext(unittest.TestCase):
         client = self._make_client()
         client.settings = MagicMock()
         client.settings.thread_programming_enabled = True
+        _enrol_test_ingress(client)
 
         from src.thread.manager import ThreadContextManager
         real_mgr = ThreadContextManager(ttl=3600, cleanup_interval=99999)
@@ -1814,11 +1850,13 @@ class TestDualKeyThreadContext(unittest.TestCase):
         client._message_linker.link_task = MagicMock()
 
         event = MagicMock()
-        event.message.message_id = "m2"
-        event.message.chat_id = "c1"
+        event.message.message_id = "om_2"
+        event.message.chat_id = "oc_1"
+        event.message.chat_type = "group"
         event.message.content = '{"text":"hello"}'
         setattr(event.message, "root_id", "unknown_root")
         setattr(event.message, "parent_id", None)
+        event.sender.sender_id.open_id = "ou_test"
         data = MagicMock()
         data.event = event
         data.schema = "im.message.p2p_v1"

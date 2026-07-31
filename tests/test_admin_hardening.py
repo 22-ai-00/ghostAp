@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import time
@@ -11,6 +12,24 @@ from unittest.mock import patch
 import pytest
 
 from src.admin_bootstrap import AdminBootstrapService
+
+
+def _set_admin(
+    service: AdminBootstrapService,
+    sender_id: str,
+    target_id: str = "",
+    *,
+    chat_type: str = "p2p",
+    chat_id: str = "oc_dm",
+    message_id: str = "om_request",
+):
+    return service.set_admin(
+        sender_id,
+        target_id,
+        chat_type=chat_type,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -28,10 +47,11 @@ class TestBootstrapRequiresP2P:
         settings = SimpleNamespace(admin_user_ids=frozenset())
         env_path = tmp_path / ".env"
 
-        result = AdminBootstrapService(
+        service = AdminBootstrapService(
             env_path=env_path,
             settings_getter=lambda: settings,
-        ).set_admin("ou_sender", "", chat_type="group")
+        )
+        result = _set_admin(service, "ou_sender", chat_type="group")
 
         assert result.success is False
         assert result.code == "bootstrap_requires_p2p"
@@ -41,28 +61,30 @@ class TestBootstrapRequiresP2P:
         settings = SimpleNamespace(admin_user_ids=frozenset())
         env_path = tmp_path / ".env"
 
-        result = AdminBootstrapService(
+        service = AdminBootstrapService(
             env_path=env_path,
             settings_getter=lambda: settings,
-        ).set_admin("ou_sender", "", chat_type="p2p")
+        )
+        result = _set_admin(service, "ou_sender")
 
         assert result.success is True
         assert result.code == "bootstrap"
         assert result.target_id == "ou_sender"
         assert env_path.exists()
 
-    def test_empty_chat_type_allows_bootstrap_for_backward_compat(self, tmp_path):
-        """When chat_type is empty (legacy callers), bootstrap is allowed."""
+    def test_empty_chat_type_is_rejected_without_legacy_backdoor(self, tmp_path):
         settings = SimpleNamespace(admin_user_ids=frozenset())
         env_path = tmp_path / ".env"
 
-        result = AdminBootstrapService(
+        service = AdminBootstrapService(
             env_path=env_path,
             settings_getter=lambda: settings,
-        ).set_admin("ou_sender", "", chat_type="")
+        )
+        result = _set_admin(service, "ou_sender", chat_type="")
 
-        assert result.success is True
-        assert result.code == "bootstrap"
+        assert result.success is False
+        assert result.code == "invalid_request_context"
+        assert not env_path.exists()
 
     def test_existing_admin_update_from_group_allowed(self, tmp_path):
         """Once admin exists, chat_type restriction does not apply to updates."""
@@ -70,10 +92,17 @@ class TestBootstrapRequiresP2P:
         env_path = tmp_path / ".env"
         env_path.write_text("ADMIN_USER_IDS=ou_admin\n", encoding="utf-8")
 
-        result = AdminBootstrapService(
+        service = AdminBootstrapService(
             env_path=env_path,
             settings_getter=lambda: settings,
-        ).set_admin("ou_admin", "ou_new", chat_type="group")
+        )
+        result = _set_admin(
+            service,
+            "ou_admin",
+            "ou_new",
+            chat_type="group",
+            chat_id="oc_group",
+        )
 
         assert result.success is True
         assert result.code == "updated"
@@ -93,11 +122,11 @@ class TestRateLimiting:
         )
 
         # First call succeeds
-        result1 = svc.set_admin("ou_sender", "", chat_type="p2p")
+        result1 = _set_admin(svc, "ou_sender")
         assert result1.success is True
 
         # Second call within 60s is rate-limited
-        result2 = svc.set_admin("ou_sender", "", chat_type="p2p")
+        result2 = _set_admin(svc, "ou_sender", message_id="om_request_2")
         assert result2.success is False
         assert result2.code == "rate_limited"
 
@@ -110,11 +139,16 @@ class TestRateLimiting:
             settings_getter=lambda: settings,
         )
 
-        result1 = svc.set_admin("ou_sender_a", "", chat_type="p2p")
+        result1 = _set_admin(svc, "ou_sender_a")
         assert result1.success is True
 
         # Different sender is not rate-limited
-        result2 = svc.set_admin("ou_sender_b", "", chat_type="p2p")
+        result2 = _set_admin(
+            svc,
+            "ou_sender_b",
+            chat_id="oc_dm_b",
+            message_id="om_request_b",
+        )
         # Will be "not_admin" because sender_a already became admin, but NOT rate_limited
         assert result2.code != "rate_limited"
 
@@ -129,13 +163,13 @@ class TestRateLimiting:
         )
 
         # First call succeeds
-        result1 = svc.set_admin("ou_admin", "", chat_type="p2p")
+        result1 = _set_admin(svc, "ou_admin")
         assert result1.success is True
 
         # Simulate time passing beyond cooldown
         AdminBootstrapService._last_attempt["ou_admin"] = time.time() - 61
 
-        result2 = svc.set_admin("ou_admin", "", chat_type="p2p")
+        result2 = _set_admin(svc, "ou_admin", message_id="om_request_2")
         assert result2.success is True
         assert result2.code == "updated"
 
@@ -147,10 +181,11 @@ class TestEnvFilePermissions:
         settings = SimpleNamespace(admin_user_ids=frozenset())
         env_path = tmp_path / ".env"
 
-        AdminBootstrapService(
+        service = AdminBootstrapService(
             env_path=env_path,
             settings_getter=lambda: settings,
-        ).set_admin("ou_sender", "", chat_type="p2p")
+        )
+        _set_admin(service, "ou_sender")
 
         assert env_path.exists()
         mode = stat.S_IMODE(os.stat(env_path).st_mode)
@@ -167,7 +202,7 @@ class TestEnvFilePermissions:
             env_path=env_path,
             settings_getter=lambda: settings,
         )
-        svc.set_admin("ou_admin", "ou_new", chat_type="p2p")
+        _set_admin(svc, "ou_admin", "ou_new")
 
         mode = stat.S_IMODE(os.stat(env_path).st_mode)
         assert mode == 0o600
@@ -181,26 +216,29 @@ class TestAuditLogging:
         env_path = tmp_path / ".env"
 
         with patch("src.admin_bootstrap.audit_logger") as mock_audit:
-            AdminBootstrapService(
+            service = AdminBootstrapService(
                 env_path=env_path,
                 settings_getter=lambda: settings,
-            ).set_admin("ou_sender", "", chat_type="p2p")
+            )
+            _set_admin(service, "ou_sender")
 
             mock_audit.info.assert_called_once()
             call_args = mock_audit.info.call_args
             assert "ADMIN_CHANGE" in call_args[0][0]
-            # Verify the positional args contain sender and target
-            assert call_args[0][1] == "ou_sender"
-            assert call_args[0][2] == "ou_sender"
+            rendered = " ".join(str(item) for item in call_args.args)
+            assert "ou_sender" not in rendered
+            expected_hash = hashlib.sha256(b"ou_sender").hexdigest()[:16]
+            assert expected_hash in rendered
 
     def test_no_audit_log_on_failure(self, tmp_path):
         settings = SimpleNamespace(admin_user_ids=frozenset())
         env_path = tmp_path / ".env"
 
         with patch("src.admin_bootstrap.audit_logger") as mock_audit:
-            AdminBootstrapService(
+            service = AdminBootstrapService(
                 env_path=env_path,
                 settings_getter=lambda: settings,
-            ).set_admin("ou_sender", "", chat_type="group")
+            )
+            _set_admin(service, "ou_sender", chat_type="group")
 
             mock_audit.info.assert_not_called()

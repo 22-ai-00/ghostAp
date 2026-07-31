@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,15 @@ try:  # pragma: no cover
 except (ImportError, AttributeError):  # pragma: no cover
     P2ImMessageReceiveV1 = Any  # type: ignore
 
+from ..access_control import (
+    AccessDecision,
+    AccessOperation,
+    IngressAccessPolicy,
+    IngressAccessPolicyProvider,
+    IngressAccessRequest,
+    are_canonical_ingress_facts,
+    build_ingress_access_policy,
+)
 from ..acp.manager import ACPSessionManager
 from ..acp.telemetry import build_idle_health_config_for_manager
 from ..agent.intent_recognizer import IntentRecognizer, IntentResult, TaskStep
@@ -45,7 +55,8 @@ from ..autonomous.provisioning.notification_state import (
     hire_notification_message_uuid,
 )
 from ..card.ui_text import UI_TEXT
-from ..config import get_settings
+from ..config import IngressAccessMode, get_settings
+from ..config.env_file_store import AtomicEnvFileStore
 from ..deep_engine import DeepEngineManager, ProgressReporter
 from ..project import (
     ContextSourceMode,
@@ -109,6 +120,7 @@ from .ws_lifecycle import ObservedLarkWSClient
 from .ws_resource_manager import EngineResourceGroup
 
 logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("ghostap.audit")
 
 
 def _employee_hire_status_text(employee_name: str, status: str) -> str | None:
@@ -274,6 +286,10 @@ class FeishuWSClient:
         message_callback: Callable[[str, str, str, Optional[str]], None],
     ) -> None:
         self.settings = get_settings()
+        self._ingress_access_policy_provider = IngressAccessPolicyProvider(
+            build_ingress_access_policy(self.settings)
+        )
+        self._ingress_env_store = AtomicEnvFileStore(".env")
         self.message_callback = message_callback
         self._client: Optional[ObservedLarkWSClient] = None
         self._closed = False
@@ -546,6 +562,10 @@ class FeishuWSClient:
             main_bot_outbound_audit_failure=main_bot_outbound_audit_failure,
             tenant_key_resolver=get_current_tenant_key,
             channel_client_factory=self._get_channel_client,
+            ingress_access_policy_provider=(
+                self._ingress_access_policy_provider
+            ),
+            ingress_env_store=self._ingress_env_store,
         )
 
         # Instantiate handlers (temp locals for registry population)
@@ -1438,26 +1458,110 @@ class FeishuWSClient:
 
         return self._project_manager.get_active_project(chat_id), None
 
+    @staticmethod
+    def _access_identifier_hash(value: str) -> str:
+        return hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:16]
+
+    def _current_ingress_access_policy(self) -> IngressAccessPolicy:
+        provider = getattr(self, "_ingress_access_policy_provider", None)
+        if isinstance(provider, IngressAccessPolicyProvider):
+            return provider.current
+        # Direct unit construction historically bypasses _initialize. Keep that
+        # path secure by deriving a fresh immutable snapshot from its settings.
+        return build_ingress_access_policy(self.settings)
+
+    def _decide_ingress_access(
+        self,
+        *,
+        message_id: str,
+        sender_id: str,
+        chat_id: str,
+        chat_type: str,
+        command_match: CommandMatch | None,
+        policy_snapshot: IngressAccessPolicy | None = None,
+    ) -> AccessDecision:
+        try:
+            policy = (
+                policy_snapshot
+                if policy_snapshot is not None
+                else self._current_ingress_access_policy()
+            )
+            decision = policy.decide(
+                IngressAccessRequest(
+                    message_id=message_id,
+                    sender_id=sender_id,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    command_match=command_match,
+                )
+            )
+        except Exception:
+            logger.critical(
+                "INGRESS_ACCESS_POLICY_EVALUATION_FAILED",
+                exc_info=True,
+            )
+            policy = IngressAccessPolicy(
+                admin_ids=frozenset(),
+                allowed_user_ids=frozenset(),
+                allowed_chat_ids=frozenset(),
+                mode=IngressAccessMode.ENFORCED,
+                admin_bootstrap_scope="p2p_only",
+            )
+            decision = AccessDecision(
+                allowed=False,
+                operation=AccessOperation.NORMAL_MESSAGE,
+                reason_code="access_policy_error",
+                prospective_allowed=False,
+            )
+
+        if not decision.allowed or policy.mode.value in {
+            "shadow",
+            "legacy_allow_all",
+        }:
+            audit_logger.warning(
+                "INGRESS_ACCESS_DECISION mode=%s operation=%s reason=%s "
+                "sender_hash=%s chat_hash=%s prospective_allowed=%s",
+                policy.mode.value,
+                decision.operation.value,
+                decision.reason_code,
+                self._access_identifier_hash(sender_id),
+                self._access_identifier_hash(chat_id),
+                decision.prospective_allowed,
+            )
+        return decision
+
+    @staticmethod
+    def _extract_canonical_ingress_facts(
+        data: P2ImMessageReceiveV1,
+    ) -> tuple[str, str, str, str] | None:
+        """Read and validate the event trust root without parsing content."""
+
+        try:
+            message = data.event.message
+            message_id = message.message_id
+            chat_id = message.chat_id
+            chat_type = message.chat_type
+            sender_id = data.event.sender.sender_id.open_id
+        except (AttributeError, TypeError):
+            return None
+        if not are_canonical_ingress_facts(
+            message_id=message_id,
+            sender_id=sender_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+        ):
+            return None
+        return message_id, chat_id, chat_type, sender_id
+
     def _handle_message(self, data: P2ImMessageReceiveV1):
         """飞书消息事件入口：只做轻量前置判断，然后交给 scheduler 异步处理。"""
-        try:
-            msg = data.event.message
-            message_id = msg.message_id
-            chat_id = msg.chat_id
-        except (AttributeError, TypeError):
-            message_id = None
-            chat_id = "unknown"
-
-        # Extract chat_type for p2p privilege detection
-        chat_type = getattr(getattr(data.event, "message", None), "chat_type", None)
+        ingress_facts = self._extract_canonical_ingress_facts(data)
+        if ingress_facts is None:
+            audit_logger.warning("INGRESS_MALFORMED_EVENT_REJECTED phase=intake")
+            return
+        message_id, chat_id, chat_type, _sender_id = ingress_facts
         is_p2p = chat_type == "p2p"
 
-        # Extract sender_id for explicit passing via TaskSpec
-        _raw_sender = getattr(
-            getattr(getattr(data.event, "sender", None), "sender_id", None),
-            "open_id", None,
-        )
-        _sender_id = _raw_sender if isinstance(_raw_sender, str) else ""
         _raw_sender_union_id = getattr(
             getattr(getattr(data.event, "sender", None), "sender_id", None),
             "union_id", None,
@@ -1467,6 +1571,24 @@ class FeishuWSClient:
         )
         _raw_tenant_key = getattr(getattr(data, "header", None), "tenant_key", None)
         tenant_key = _raw_tenant_key if isinstance(_raw_tenant_key, str) else ""
+
+        # The event trust root was validated before this content/image parser.
+        # Authorization still precedes project/thread lookup, origin linking,
+        # scheduler submission, image download, Shell, and all handlers.
+        text = self._extract_text_from_message(data)
+        try:
+            command_match = SlashCommandParser.parse(text)
+        except Exception:
+            command_match = None
+        ingress_decision = self._decide_ingress_access(
+            message_id=message_id,
+            sender_id=_sender_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            command_match=command_match,
+        )
+        if not ingress_decision.allowed:
+            return
 
         project_id = None
         thread_root_id = None
@@ -1508,9 +1630,14 @@ class FeishuWSClient:
             except (AttributeError, KeyError):
                 project_id = None
 
-        text = self._extract_text_from_message(data)
-        is_system = self._is_system_command_message(data)
-        is_shell_fast = False if is_system else self._is_likely_shell_command_message(data)
+        is_system = bool(
+            text and (text.startswith("/") or self._is_exit_command(text))
+        )
+        is_shell_fast = (
+            False
+            if is_system
+            else SystemHandler.is_likely_shell_command(text)
+        )
         is_spec = self._is_spec_command(text) if text else False
 
         # For likely shell commands, route to a separate shell queue so they
@@ -1574,7 +1701,9 @@ class FeishuWSClient:
                 handle = self._scheduler.submit(
                     spec,
                     lambda ctx, _sf=is_shell_fast: self._process_message_async(
-                        data, task_ctx=ctx, shell_fast_tracked=_sf
+                        data,
+                        task_ctx=ctx,
+                        shell_fast_tracked=_sf,
                     ),
                 )
             except (RateLimitExceededException, CircuitBreakerOpenException) as e:
@@ -1653,7 +1782,12 @@ class FeishuWSClient:
         text = self._extract_text_from_message(data)
         return SystemHandler.is_likely_shell_command(text) if text else False
 
-    def _process_message_async(self, data: P2ImMessageReceiveV1, task_ctx=None, shell_fast_tracked: bool = False):
+    def _process_message_async(
+        self,
+        data: P2ImMessageReceiveV1,
+        task_ctx=None,
+        shell_fast_tracked: bool = False,
+    ):
         """消息处理主逻辑（运行在 scheduler 线程池中）。
 
         大致流程：校验 → 解析文本/图片 → 解析项目上下文 → 路由到对应模式/引擎。
@@ -1668,56 +1802,111 @@ class FeishuWSClient:
             set_current_thread_id,
         )
 
+        message_id = ""
         try:
+            ingress_facts = self._extract_canonical_ingress_facts(data)
+            if ingress_facts is None:
+                audit_logger.warning(
+                    "INGRESS_MALFORMED_EVENT_REJECTED phase=worker"
+                )
+                return
+            message_id, chat_id, chat_type, _sender_id = ingress_facts
             event = data.event
             message = event.message
-            message_id = message.message_id
-            chat_id = message.chat_id
+
+            event_sender_union_id = getattr(
+                getattr(getattr(event, "sender", None), "sender_id", None),
+                "union_id",
+                "",
+            )
+            _sender_union_id = (
+                event_sender_union_id
+                if isinstance(event_sender_union_id, str)
+                else ""
+            )
+            _is_p2p = chat_type == "p2p"
+            event_tenant_key = getattr(
+                getattr(data, "header", None),
+                "tenant_key",
+                "",
+            )
+            _tenant_key = (
+                event_tenant_key if isinstance(event_tenant_key, str) else ""
+            )
+
+            # Parsing is allowed only after the current event facts pass their
+            # independent worker check. No downstream fact is trusted from the
+            # queued TaskSpec.
+            image_handler = self._get_image_handler()
+            parse_result = image_handler.parse_message(message.message_type, message.content)
+            text = self._clean_at_text(parse_result.text)
+
+            # Slash parsing is request-scoped: parse once and reuse.
+            # This match becomes the single source of truth for downstream
+            # slash consumers (gate/system/worktree).
+            try:
+                command_match = SlashCommandParser.parse(text)
+            except Exception:
+                command_match = None
+
+            ingress_decision = self._decide_ingress_access(
+                message_id=message_id,
+                sender_id=_sender_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                command_match=command_match,
+            )
+            if not ingress_decision.allowed:
+                return
+
             request_id = self._ensure_request_id(message_id, chat_id=chat_id)
 
-            # sender_id is carried in task_ctx.spec (set at submit time);
-            # fall back to event extraction only when task_ctx is unavailable.
-            _sender_id = (
-                task_ctx.spec.sender_id
-                if task_ctx and hasattr(task_ctx, "spec") and task_ctx.spec.sender_id
-                else (
-                    getattr(
-                        getattr(getattr(event, "sender", None), "sender_id", None),
-                        "open_id", None,
-                    ) or ""
-                )
-            )
-            # Propagate to thread-local so downstream handlers (e.g. /lock) can access it.
-            set_current_sender_id(_sender_id)
-            _sender_union_id = (
-                task_ctx.spec.sender_union_id
-                if task_ctx and hasattr(task_ctx, "spec")
-                else (
-                    getattr(
-                        getattr(getattr(event, "sender", None), "sender_id", None),
-                        "union_id", None,
+            # Validation follows authorization so denied traffic cannot mutate
+            # duplicate/expiry state or trigger unsupported-content replies.
+            if not self._validate_message(message, request_id):
+                return
+
+            if ingress_decision.operation in {
+                AccessOperation.BOOTSTRAP_ADMIN,
+                AccessOperation.ENROL_CURRENT_CHAT,
+            }:
+                if command_match is None:
+                    logger.critical(
+                        "INGRESS_ENROLMENT_COMMAND_MATCH_MISSING operation=%s",
+                        ingress_decision.operation.value,
                     )
-                    or ""
+                    return
+                # Enrollment is its own narrow route. It must not touch chat
+                # locks, GroupLedger, image downloads, Shell, project lookup,
+                # or any non-system handler.
+                set_current_sender_id(_sender_id)
+                set_current_sender_union_id(_sender_union_id or None)
+                set_current_is_p2p(_is_p2p)
+                set_current_tenant_key(_tenant_key or None)
+                self._system_handler.handle_intercepted_command(
+                    message_id,
+                    chat_id,
+                    text,
+                    command_match=command_match,
                 )
-            )
+                return
+
+            # Propagate authorized identity to downstream request-local state.
+            set_current_sender_id(_sender_id)
             set_current_sender_union_id(_sender_union_id or None)
-            # Resolve display name via cached Feishu contact API lookup;
-            # falls back to truncated sender_id if unavailable.
+            set_current_is_p2p(_is_p2p)
+            set_current_tenant_key(_tenant_key or None)
+
             from .user_cache import resolve_display_name_nonblocking
+
             _display_name = (
                 resolve_display_name_nonblocking(_sender_id, self._get_api_client)
                 if _sender_id
                 else ""
             )
-            set_current_sender_name(_display_name or (_sender_id[:8] if _sender_id else ""))
-            _is_p2p = task_ctx.spec.is_p2p if task_ctx and hasattr(task_ctx, "spec") else False
-            set_current_is_p2p(_is_p2p)
-            _tenant_key = (
-                task_ctx.spec.tenant_key
-                if task_ctx and hasattr(task_ctx, "spec")
-                else ""
+            set_current_sender_name(
+                _display_name or (_sender_id[:8] if _sender_id else "")
             )
-            set_current_tenant_key(_tenant_key or None)
             structured_mentions = tuple(
                 dict.fromkeys(
                     name
@@ -1733,7 +1922,6 @@ class FeishuWSClient:
                 )
             )
             set_current_mentioned_names(structured_mentions)
-            chat_type = "p2p" if _is_p2p else "group"
 
             root_id = getattr(message, "root_id", None)
             if root_id and self.settings.thread_programming_enabled:
@@ -1742,27 +1930,11 @@ class FeishuWSClient:
                     set_current_thread_id(thread_ctx.thread_root_id)
                     logger.debug(
                         "[Thread] _process_async hit: msg_root=%s canonical=%s",
-                        root_id[:12], thread_ctx.thread_root_id[:12],
+                        root_id[:12],
+                        thread_ctx.thread_root_id[:12],
                     )
 
-            # 1. Validation
-            if not self._validate_message(message, request_id):
-                return
-
-            # 2. Parse Content
-            image_handler = self._get_image_handler()
-            parse_result = image_handler.parse_message(message.message_type, message.content)
-            text = self._clean_at_text(parse_result.text)
-
-            # 2b. Slash parsing is request-scoped: parse once and reuse.
-            # This match becomes the single source of truth for downstream
-            # slash consumers (gate/system/worktree).
-            try:
-                command_match = SlashCommandParser.parse(text)
-            except Exception:
-                command_match = None
-
-            # 2c. Chat lock interception (fail-close: non-admin blocked on exception).
+            # Chat lock interception (fail-close: non-admin blocked on exception).
             # Use the request-scoped CommandMatch instead of re-parsing raw text.
             if self._chat_lock_gate.check(
                 chat_id,
@@ -1770,15 +1942,6 @@ class FeishuWSClient:
                 message_id,
                 command_match=command_match,
             ):
-                return
-
-            # 2d. Authorization whitelist check (security hardening A2).
-            # Empty set means "allow all"; non-empty set restricts to members only.
-            if self.settings.allowed_chat_ids and chat_id not in self.settings.allowed_chat_ids:
-                logger.debug("Chat %s not in allowed_chat_ids, dropping message", chat_id)
-                return
-            if self.settings.allowed_user_ids and _sender_id not in self.settings.allowed_user_ids:
-                logger.debug("User %s not in allowed_user_ids, dropping message", _sender_id)
                 return
 
             # Publish every authorized main-Bot group message before any
@@ -1892,9 +2055,10 @@ class FeishuWSClient:
             set_current_sender_name("")
             set_current_is_p2p(False)
             set_current_tenant_key(None)
-            with self._pending_image_lock:
-                self._pending_image_keys.pop(message_id, None)
-                self._pending_image_only.discard(message_id)
+            if message_id:
+                with self._pending_image_lock:
+                    self._pending_image_keys.pop(message_id, None)
+                    self._pending_image_only.discard(message_id)
 
     def _validate_message(self, message, request_id: str) -> bool:
         """校验消息是否需要处理（过期/重复/类型不支持等）。"""
