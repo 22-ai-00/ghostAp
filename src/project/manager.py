@@ -25,6 +25,7 @@ class ProjectManager:
         # which is invoked from _save_projects and _load_projects. Any code path that mutates
         # ProjectContext.bound_chat_id MUST eventually call _save_projects to keep this in sync.
         self._bound_chat_index: dict[str, str] = {}
+        self._quarantined_bound_chat_ids: set[str] = set()
         self._lock = ordered_rlock(LockLevel.PROJECT_MANAGER, name="ProjectManager._lock")
         self._color_index = 0
 
@@ -110,6 +111,7 @@ class ProjectManager:
                 except Exception as e:
                     return False, f"无法创建目录 {expanded_path}: {get_error_detail(e)}", None
 
+            previous_color_index = self._color_index
             theme_color, emoji_prefix = self._get_next_theme()
             settings = get_settings()
             yolo_enabled = bool(getattr(settings, "ttadk_yolo_default_enabled", False))
@@ -132,7 +134,13 @@ class ProjectManager:
             if chat_id:
                 self._active_project[chat_id] = project_id
 
-            self._save_projects()
+            if not self._save_projects():
+                self._projects.pop(project_id, None)
+                if chat_id and self._active_project.get(chat_id) == project_id:
+                    self._active_project.pop(chat_id, None)
+                self._color_index = previous_color_index
+                self._rebuild_bound_chat_index()
+                return False, f"项目 {project_name} 持久化失败", None
             return True, f"项目 {project_name} 创建成功", ctx
 
     def get_project_for_diagnostics(self, project_id: str) -> Optional[ProjectContext]:
@@ -401,6 +409,12 @@ class ProjectManager:
                 return False, f"项目 {project_id} 不存在"
 
             ctx = self._projects[project_id]
+            previous_status = ctx.status
+            removed_active = {
+                chat_id: active_id
+                for chat_id, active_id in self._active_project.items()
+                if active_id == project_id
+            }
             ctx.status = ProjectStatus.CLOSED
 
             for chat_id, active_id in list(self._active_project.items()):
@@ -408,7 +422,12 @@ class ProjectManager:
                     del self._active_project[chat_id]
 
             del self._projects[project_id]
-            self._save_projects()
+            if not self._save_projects():
+                ctx.status = previous_status
+                self._projects[project_id] = ctx
+                self._active_project.update(removed_active)
+                self._rebuild_bound_chat_index()
+                return False, f"项目 {ctx.project_name} 关闭持久化失败"
             return True, f"项目 {ctx.project_name} 已关闭"
 
     def update_working_dir(self, project_id: str, new_dir: str) -> tuple[bool, str]:
@@ -444,6 +463,100 @@ class ProjectManager:
             if name_lower in ctx.project_name.lower() or name_lower in ctx.project_id.lower():
                 return ctx
         return None
+
+    def find_project_for_owner_control(
+        self,
+        reference: str,
+    ) -> Optional[ProjectContext]:
+        """Resolve only an exact project ID or one unambiguous exact name."""
+
+        if not isinstance(reference, str) or not reference:
+            return None
+        with self._lock:
+            by_id = self._projects.get(reference)
+            if by_id is not None:
+                return by_id
+            matches = [
+                project
+                for project in self._projects.values()
+                if project.project_name == reference
+            ]
+            return matches[0] if len(matches) == 1 else None
+
+    def bind_managed_chat(
+        self,
+        project_id: str,
+        chat_id: str,
+        *,
+        chat_name: str = "",
+        created_at: float,
+    ) -> bool:
+        """Persist a validated Owner-control group binding."""
+
+        with self._lock:
+            project = self._projects.get(project_id)
+            if project is None or not chat_id:
+                return False
+            indexed = self._bound_chat_index.get(chat_id)
+            if indexed not in (None, project_id):
+                return False
+            snapshot = (
+                project.bound_chat_id,
+                project.bound_chat_name,
+                project.bound_chat_created_at,
+                OrderedDict(project.allowed_chat_ids),
+            )
+            project.bound_chat_id = chat_id
+            project.bound_chat_name = chat_name
+            project.bound_chat_created_at = created_at
+            project.add_chat_id(chat_id)
+            self._quarantined_bound_chat_ids.discard(chat_id)
+            if self._save_projects():
+                return True
+            (
+                project.bound_chat_id,
+                project.bound_chat_name,
+                project.bound_chat_created_at,
+                project.allowed_chat_ids,
+            ) = snapshot
+            self._rebuild_bound_chat_index()
+            return False
+
+    def revoke_managed_chat(self, chat_id: str) -> bool:
+        """Clear a Project binding after durable Registry revocation."""
+
+        with self._lock:
+            project = next(
+                (
+                    item
+                    for item in self._projects.values()
+                    if item.bound_chat_id == chat_id
+                ),
+                None,
+            )
+            if project is None:
+                self._bound_chat_index.pop(chat_id, None)
+                return True
+            snapshot = (
+                project.bound_chat_id,
+                project.bound_chat_name,
+                project.bound_chat_created_at,
+                OrderedDict(project.allowed_chat_ids),
+            )
+            project.bound_chat_id = ""
+            project.bound_chat_name = ""
+            project.bound_chat_created_at = 0.0
+            project.allowed_chat_ids.pop(chat_id, None)
+            if self._save_projects():
+                return True
+            (
+                project.bound_chat_id,
+                project.bound_chat_name,
+                project.bound_chat_created_at,
+                project.allowed_chat_ids,
+            ) = snapshot
+            self._rebuild_bound_chat_index()
+            return False
 
     def find_project_by_name_with_hint(
         self, name: str, chat_id: Optional[str] = None
@@ -494,11 +607,23 @@ class ProjectManager:
         """
         index: dict[str, str] = {}
         for pid, ctx in self._projects.items():
-            if ctx.bound_chat_id:
+            if (
+                ctx.bound_chat_id
+                and ctx.bound_chat_id not in self._quarantined_bound_chat_ids
+            ):
                 # Last-write wins on duplicate bound_chat_id (should be unique by design,
                 # but defensive in case of inconsistent state)
                 index[ctx.bound_chat_id] = pid
         self._bound_chat_index = index
+
+    def quarantine_bound_chat(self, chat_id: str) -> None:
+        """Fail closed when compensating persistence cannot be confirmed."""
+
+        if not chat_id:
+            return
+        with self._lock:
+            self._quarantined_bound_chat_ids.add(chat_id)
+            self._bound_chat_index.pop(chat_id, None)
 
     def find_by_bound_chat_id(self, chat_id: str) -> Optional[ProjectContext]:
         """Return the project whose bound_chat_id equals *chat_id*, if any.

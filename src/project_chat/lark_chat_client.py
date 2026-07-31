@@ -3,6 +3,7 @@
 import logging
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable
 
 from .errors import CreateChatError
@@ -15,6 +16,14 @@ class CreateChatResult:
     """Result of creating a Feishu group chat."""
     chat_id: str
     name: str
+
+
+class ManagedChatValidation(str, Enum):
+    """Remote provenance result; UNKNOWN always fails closed."""
+
+    VALID = "valid"
+    INVALID = "invalid"
+    UNKNOWN = "unknown"
 
 
 class LarkChatClient:
@@ -101,6 +110,59 @@ class LarkChatClient:
                 )
         except Exception as e:
             logger.warning("add_managers(%s) exception: %s", chat_id[:12], e)
+
+    def validate_managed_chat(
+        self,
+        chat_id: str,
+        owner_open_id: str,
+    ) -> ManagedChatValidation:
+        """Verify the receiving bot and configured Owner are both members."""
+
+        from lark_oapi.api.im.v1 import (
+            GetChatMembersRequest,
+            IsInChatChatMembersRequest,
+        )
+
+        try:
+            client = self._api_client_factory()
+            bot_request = (
+                IsInChatChatMembersRequest.builder().chat_id(chat_id).build()
+            )
+            bot_response = client.im.v1.chat_members.is_in_chat(bot_request)
+            if not bot_response.success():
+                return ManagedChatValidation.UNKNOWN
+            if getattr(bot_response.data, "is_in_chat", None) is not True:
+                return ManagedChatValidation.INVALID
+
+            page_token = ""
+            while True:
+                builder = (
+                    GetChatMembersRequest.builder()
+                    .chat_id(chat_id)
+                    .member_id_type("open_id")
+                    .page_size(100)
+                )
+                if page_token:
+                    builder = builder.page_token(page_token)
+                response = client.im.v1.chat_members.get(builder.build())
+                if not response.success():
+                    return ManagedChatValidation.UNKNOWN
+                data = response.data
+                if getattr(data, "trigger_security_conf_limit", False):
+                    return ManagedChatValidation.UNKNOWN
+                if any(
+                    getattr(member, "member_id", None) == owner_open_id
+                    for member in (getattr(data, "items", None) or ())
+                ):
+                    return ManagedChatValidation.VALID
+                if not getattr(data, "has_more", False):
+                    return ManagedChatValidation.INVALID
+                page_token = getattr(data, "page_token", "") or ""
+                if not page_token:
+                    return ManagedChatValidation.UNKNOWN
+        except Exception:
+            logger.exception("validate_managed_chat(%s) failed", chat_id[:12])
+            return ManagedChatValidation.UNKNOWN
 
     def delete_chat(self, chat_id: str) -> bool | None:
         """Delete a Feishu group chat (best-effort, for rollback).

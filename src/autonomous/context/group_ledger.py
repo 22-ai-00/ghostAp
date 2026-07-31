@@ -10,7 +10,6 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ...trust.models import ManagedGroupRecord, ManagedGroupStatus
 from ..journal.blob_store import BlobRef, BlobStore
 from ..journal.frame import GENESIS_HASH, JournalEvent
 from ..journal.writer import CommitState, JournalWriter
@@ -31,22 +30,6 @@ from .models import (
 
 class GroupLedgerError(RuntimeError):
     pass
-
-
-def managed_group_context_allowed(
-    registry_record: ManagedGroupRecord | None,
-) -> bool:
-    """Return whether a registry fact may authorize group context creation.
-
-    Task 0.9 exposes this fail-closed adapter for the Task 0.10 ingress
-    cutover.  It does not change current WebSocket/callback routing.
-    """
-
-    return (
-        isinstance(registry_record, ManagedGroupRecord)
-        and registry_record.status is ManagedGroupStatus.ACTIVE
-        and registry_record.revision > 0
-    )
 
 
 _FEISHU_THREAD_ID_PATTERN = re.compile(r"omt_[A-Za-z0-9][A-Za-z0-9_-]*\Z")

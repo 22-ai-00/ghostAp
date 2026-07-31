@@ -338,6 +338,30 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   group name/description and Slock marker cannot register trust; legacy import
   requires complete bound-chat timestamp/root facts plus an injected
   membership/receiving-bot validator. Tombstones dominate stale candidates.
+- Review correction: Registry disk transactions now use a stable cross-process
+  lock file and reload-before-mutate, so concurrent instances preserve global
+  revision order and stale snapshots cannot overwrite tombstones. Post-replace
+  fsync uncertainty is reconciled by rereading and comparing the authoritative
+  target. Provision intents durably bind one remote chat ID before Project/Team
+  mutation; Project create/close failures restore memory and quarantine an
+  unconfirmed reverse index.
+- Revoke/production wiring: Team ACTIVE is the commit point; later bootstrap or
+  delivery failure is degraded success, never delete/rollback. Dissolve and
+  bot-deleted write pending revoke before external/local teardown; pending
+  records fail closed across restart, delete rejection cancels, and confirmed
+  or unknown deletion completes a tombstone. Startup reconciliation runs before
+  Slock restore. The production `lark-oapi` validator checks current-Bot
+  `is_in_chat` plus paged Owner membership; UNKNOWN/INVALID legacy candidates
+  are persisted for Owner P2P inspection/adoption. Main-Bot rotation is an
+  explicit Owner P2P, remote-validated CAS; Employee principal rotation remains
+  a documented future limitation rather than inferred identity.
+- Review TDD: Registry concurrency/uncertain-commit/strict-input batch began at
+  `6 failed`; provision binding/Project compensation at `4 failed`; Slock
+  commit/revoke/marker at `3 failed` plus ordering regression; production
+  validator/adoption at `2 failed`. GREEN evidence is `65 passed` for the
+  Registry/Project/Slock target, `130 passed` for expanded Project/Chat/Manager,
+  and `351 passed, 17 subtests passed` for WS/handler compatibility. Touched
+  Ruff and `git diff --check` pass. Real tenant execution remains `not_tested`.
 - Managed permission prompts remain a Task 0.8 matrix property with
   `permission_prompt_count(managed project task) = 0`; Task 0.9 adds no
   approval/tenant ACL. Real Feishu membership/receiving-bot validation,

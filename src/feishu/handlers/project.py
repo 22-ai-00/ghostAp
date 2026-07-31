@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
 from ...card import CardBuilder
@@ -278,3 +279,64 @@ class ProjectHandler(BaseHandler):
             data["path"] = self.get_working_dir(chat_id)
 
         self._project_chat_service.handle(message_id, chat_id, sender_open_id, data)
+
+    def adopt_managed_chat(
+        self,
+        message_id: str,
+        target_chat_id: str,
+        project_reference: str,
+    ) -> None:
+        """Owner-control entry for validated adoption of an existing group."""
+
+        from ...project_chat.lark_chat_client import (
+            LarkChatClient,
+            ManagedChatValidation,
+        )
+
+        registry = vars(self.ctx).get("managed_group_registry")
+        owner_id = vars(self.ctx).get("managed_group_owner_id", "")
+        receiving_bot_ref = vars(self.ctx).get(
+            "managed_group_receiving_bot_ref", ""
+        )
+        project = self.project_manager.find_project_for_owner_control(
+            project_reference
+        )
+        if registry is None or project is None:
+            self.reply_error(message_id, "未找到唯一的精确项目，或受管群服务未就绪。")
+            return
+        validator = LarkChatClient(
+            api_client_factory=self.ctx.api_client_factory
+        )
+        validation = validator.validate_managed_chat(target_chat_id, owner_id)
+        if validation is not ManagedChatValidation.VALID:
+            self.reply_error(
+                message_id,
+                "无法确认 Owner 与接收 Bot 同时在目标群中；未授予信任。",
+            )
+            return
+        now = datetime.now(UTC)
+        try:
+            registry.adopt_existing(
+                chat_id=target_chat_id,
+                owner_id=owner_id,
+                receiving_bot_ref=receiving_bot_ref,
+                project_id=project.project_id,
+                canonical_root_ref=project.root_path,
+                created_at=now,
+                validator=lambda _facts: True,
+            )
+            if not self.project_manager.bind_managed_chat(
+                project.project_id,
+                target_chat_id,
+                created_at=now.timestamp(),
+            ):
+                registry.tombstone(target_chat_id)
+                raise OSError("project binding persistence failed")
+        except Exception:
+            logger.exception("managed group adoption failed chat=%s", target_chat_id)
+            self.reply_error(message_id, "受管群收养持久化失败，未保留活动授权。")
+            return
+        self.reply_text(
+            message_id,
+            f"✅ 已将群 `{target_chat_id}` 收养为项目 **{project.project_name}** 的受管群。",
+        )

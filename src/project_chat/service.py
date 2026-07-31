@@ -155,6 +155,7 @@ class ProjectChatService:
             f"{os.path.normpath(path)}"
         )
         intended_project_id = ctx.project_id if ctx else ProjectManager.generate_id(name)
+        recovered_chat_id: str | None = None
 
         if self._managed_groups is not None:
             from ..trust.models import ManagedGroupOrigin
@@ -169,6 +170,9 @@ class ProjectChatService:
                     canonical_root_ref=path,
                     created_at=datetime.now(UTC),
                 )
+                recovered_chat_id = self._managed_groups.provision_chat_id(
+                    provision_id
+                )
             except Exception:
                 logger.exception(
                     "managed group provision intent failed for project=%s",
@@ -177,21 +181,43 @@ class ProjectChatService:
                 self._reply(message_id, "❌ 受管群登记准备失败，请重试", None)
                 return
 
-        # 4. Create chat
-        try:
-            result = self._lark.create_chat(
-                name=group_name,
-                description=description,
-                user_id_list=[sender_open_id],
-            )
-        except CreateChatError as e:
-            logger.warning("create_chat failed for path=%s: %s", path, str(e))
-            self._reply(message_id, f"❌ 建群失败: {e}", None)
-            self._abandon_provision(provision_id)
-            return
-
-        new_chat_id = result.chat_id
-        new_chat_name = result.name
+        # 4. Create the remote chat once, then durably bind its ID before any
+        # local project mutation.  A retry after restart reuses that binding.
+        if recovered_chat_id is not None:
+            new_chat_id = recovered_chat_id
+            new_chat_name = group_name
+        else:
+            try:
+                result = self._lark.create_chat(
+                    name=group_name,
+                    description=description,
+                    user_id_list=[sender_open_id],
+                )
+            except CreateChatError as e:
+                logger.warning("create_chat failed for path=%s: %s", path, str(e))
+                self._reply(message_id, f"❌ 建群失败: {e}", None)
+                self._abandon_provision(provision_id)
+                return
+            new_chat_id = result.chat_id
+            new_chat_name = result.name
+            if self._managed_groups is not None:
+                try:
+                    self._managed_groups.bind_provision_chat(
+                        provision_id, new_chat_id
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to bind remote chat to provision %s", provision_id
+                    )
+                    delete_result = self._lark.delete_chat(new_chat_id)
+                    if delete_result is True:
+                        self._abandon_provision(provision_id)
+                    self._reply(
+                        message_id,
+                        "❌ 受管群远端绑定持久化失败，请重试或人工确认残留群。",
+                        None,
+                    )
+                    return
 
         # 4.5 Promote sender to group manager (best-effort, enables dissolve permission)
         self._lark.add_managers(new_chat_id, [sender_open_id])
@@ -222,9 +248,10 @@ class ProjectChatService:
                 )
                 if not success or not ctx_new:
                     # Rollback: delete the created chat
-                    self._lark.delete_chat(new_chat_id)
+                    delete_result = self._lark.delete_chat(new_chat_id)
                     self._reply(message_id, f"❌ 创建项目失败: {msg}", None)
-                    self._abandon_provision(provision_id)
+                    if delete_result is True:
+                        self._abandon_provision(provision_id)
                     return
                 created_project = True
                 ctx_new.bound_chat_id = new_chat_id
@@ -250,19 +277,22 @@ class ProjectChatService:
                 new_chat_id[:12],
                 str(e),
             )
-            self._rollback_binding(
+            rollback_ok = self._rollback_binding(
                 ctx=ctx,
                 created_project=created_project,
                 existing_snapshot=existing_snapshot,
+                remote_chat_id=new_chat_id,
             )
-            self._abandon_provision(provision_id)
             delete_result = self._lark.delete_chat(new_chat_id)
             if delete_result is True:
+                self._abandon_provision(provision_id)
                 detail = "飞书群已删除"
             elif delete_result is False:
                 detail = "飞书群删除失败，请手动删除；该群未获得信任"
             else:
                 detail = "飞书删群结果未知，请人工确认；该群未获得信任"
+            if not rollback_ok:
+                detail += "；本地补偿持久化失败，绑定已隔离，请人工检查"
             self._reply(message_id, f"❌ 项目群绑定失败，{detail}", None)
             return
 
@@ -295,21 +325,27 @@ class ProjectChatService:
         ctx: ProjectContext | None,
         created_project: bool,
         existing_snapshot: dict[str, Any] | None,
-    ) -> None:
+        remote_chat_id: str,
+    ) -> bool:
         if ctx is None:
-            return
+            return True
         if created_project:
-            self._pm.close_project(ctx.project_id)
-            return
+            closed, _ = self._pm.close_project(ctx.project_id)
+            if not closed:
+                self._pm.quarantine_bound_chat(remote_chat_id)
+            return closed
         if existing_snapshot is None:
-            return
+            return True
         ctx.allowed_chat_ids = OrderedDict(existing_snapshot["allowed_chat_ids"])
         ctx.bound_chat_created_at = existing_snapshot["bound_chat_created_at"]
         ctx.bound_chat_id = existing_snapshot["bound_chat_id"]
         ctx.bound_chat_name = existing_snapshot["bound_chat_name"]
         ctx.owner_chat_id = existing_snapshot["owner_chat_id"]
         ctx.project_name = existing_snapshot["project_name"]
-        self._pm._save_projects()
+        saved = self._pm._save_projects()
+        if not saved:
+            self._pm.quarantine_bound_chat(remote_chat_id)
+        return saved
 
     def _build_description(self, name: str, path: str) -> str:
         git_remote = self._detect_git_remote(path)

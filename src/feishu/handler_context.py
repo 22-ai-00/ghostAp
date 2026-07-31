@@ -118,6 +118,7 @@ class HandlerContext:
     managed_group_registry: Optional["ManagedGroupRegistry"] = None
     managed_group_owner_id: str = ""
     managed_group_receiving_bot_ref: str = ""
+    managed_group_bot_rotation: Optional[Callable[[str], tuple[int, int]]] = None
 
     def dependency_view(self) -> HandlerDependencyView:
         """Return a minimal service view while keeping existing fields compatible."""

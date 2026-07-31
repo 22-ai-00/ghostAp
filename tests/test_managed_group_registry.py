@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+import os
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 
 from src.trust.models import ManagedGroupOrigin, ManagedGroupStatus
 from src.trust.registry import (
+    ManagedGroupConflictError,
     ManagedGroupRegistry,
     RegistryCorruptionError,
 )
@@ -180,7 +182,9 @@ def test_registry_snapshot_uses_exact_versioned_schema(tmp_path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert set(payload) == {
         "groups",
+        "migration_dispositions",
         "provision_intents",
+        "revoke_intents",
         "revision",
         "schema",
         "version",
@@ -205,3 +209,169 @@ def test_dangling_provision_retry_keeps_original_timestamp(tmp_path):
         **kwargs,
         created_at=NOW + timedelta(seconds=30),
     ) == "new-chat:project-1"
+
+
+def test_two_registry_instances_merge_mutations_without_lost_updates(tmp_path):
+    path = tmp_path / "managed-groups.json"
+    first = ManagedGroupRegistry(path)
+    stale = ManagedGroupRegistry(path)
+
+    _activate(first, chat_id="oc_first")
+    _activate(stale, chat_id="oc_second")
+
+    replayed = ManagedGroupRegistry(path)
+    assert {record.chat_id for record in replayed.managed_groups()} == {
+        "oc_first",
+        "oc_second",
+    }
+
+
+def test_stale_registry_instance_cannot_overwrite_a_durable_tombstone(tmp_path):
+    path = tmp_path / "managed-groups.json"
+    writer = ManagedGroupRegistry(path)
+    _activate(writer, chat_id="oc_retired")
+    stale = ManagedGroupRegistry(path)
+
+    writer.tombstone("oc_retired")
+    _activate(stale, chat_id="oc_new")
+
+    replayed = ManagedGroupRegistry(path)
+    assert replayed.active_record("oc_retired") is None
+    assert replayed.record("oc_retired").status is ManagedGroupStatus.TOMBSTONED
+    assert replayed.active_record("oc_new") is not None
+
+
+def test_post_replace_fsync_failure_recovers_authoritative_commit(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "managed-groups.json"
+    registry = ManagedGroupRegistry(path)
+    registry.begin_provision(
+        provision_id="provision:oc_managed",
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        receiving_bot_ref="cli_main_bot",
+        project_id="project-1",
+        canonical_root_ref="/srv/project-1",
+        created_at=NOW,
+    )
+    original_fsync = os.fsync
+    calls = 0
+
+    def fail_parent_fsync(fd: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected parent fsync failure")
+        original_fsync(fd)
+
+    monkeypatch.setattr("src.trust.registry.os.fsync", fail_parent_fsync)
+
+    record, grant = registry.activate(
+        provision_id="provision:oc_managed",
+        chat_id="oc_managed",
+        project_id="project-1",
+        canonical_root_ref="/srv/project-1",
+        backend_binding_ids=("codex",),
+    )
+
+    assert registry.active_record("oc_managed") == record
+    assert registry.grant_for_chat("oc_managed") == grant
+    assert ManagedGroupRegistry(path).active_record("oc_managed") == record
+
+
+def test_registry_rejects_boolean_version(tmp_path):
+    path = tmp_path / "managed-groups.json"
+    path.write_text(
+        json.dumps(
+            {
+                "groups": {},
+                "provision_intents": {},
+                "revision": 0,
+                "schema": "ghostap.managed_groups",
+                "version": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RegistryCorruptionError):
+        ManagedGroupRegistry(path)
+
+
+def test_registry_rejects_symlink_target_or_parent(tmp_path):
+    real_path = tmp_path / "real.json"
+    ManagedGroupRegistry(real_path)
+    target_link = tmp_path / "target-link.json"
+    target_link.symlink_to(real_path)
+    with pytest.raises(RegistryCorruptionError):
+        ManagedGroupRegistry(target_link)
+
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(RegistryCorruptionError):
+        ManagedGroupRegistry(parent_link / "registry.json")
+
+
+class _NaiveOffset(tzinfo):
+    def utcoffset(self, dt):
+        return None
+
+    def dst(self, dt):
+        return None
+
+
+def test_runtime_datetime_requires_concrete_utc_offset(tmp_path):
+    registry = ManagedGroupRegistry(tmp_path / "managed-groups.json")
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        registry.begin_provision(
+            provision_id="bad-time",
+            owner_id="ou_owner",
+            origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+            receiving_bot_ref="cli_main_bot",
+            project_id="project-1",
+            canonical_root_ref="/srv/project-1",
+            created_at=datetime(2026, 7, 31, tzinfo=_NaiveOffset()),
+        )
+
+
+def test_provision_intent_binds_one_remote_chat_across_restart(tmp_path):
+    path = tmp_path / "managed-groups.json"
+    registry = ManagedGroupRegistry(path)
+    registry.begin_provision(
+        provision_id="new-chat:project-1",
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        receiving_bot_ref="cli_main_bot",
+        project_id="project-1",
+        canonical_root_ref="/srv/project-1",
+        created_at=NOW,
+    )
+
+    assert registry.bind_provision_chat("new-chat:project-1", "oc_created") == "oc_created"
+    replayed = ManagedGroupRegistry(path)
+    assert replayed.provision_chat_id("new-chat:project-1") == "oc_created"
+    assert replayed.bind_provision_chat("new-chat:project-1", "oc_created") == "oc_created"
+    with pytest.raises(ManagedGroupConflictError, match="different chat"):
+        replayed.bind_provision_chat("new-chat:project-1", "oc_other")
+
+
+def test_pending_revoke_fails_closed_across_restart_until_resolved(tmp_path):
+    path = tmp_path / "managed-groups.json"
+    registry = ManagedGroupRegistry(path)
+    active, _ = _activate(registry)
+
+    registry.begin_revoke("oc_managed", requested_at=NOW)
+    assert registry.active_record("oc_managed") is None
+    assert ManagedGroupRegistry(path).pending_revokes() == ("oc_managed",)
+
+    registry.cancel_revoke("oc_managed")
+    assert registry.active_record("oc_managed") == active
+    registry.begin_revoke("oc_managed", requested_at=NOW)
+    tombstone = registry.complete_revoke("oc_managed")
+    assert tombstone.status is ManagedGroupStatus.TOMBSTONED
+    assert registry.pending_revokes() == ()

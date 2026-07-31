@@ -1944,30 +1944,48 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     canonical_root_ref=root_path,
                     created_at=datetime.now(UTC),
                 )
+                recovered_chat_id = managed_groups.provision_chat_id(provision_id)
             except Exception:
                 logger.exception("create_team: managed group provision intent failed")
                 self.reply_text(message_id, "❌ 受管团队登记准备失败，请重试")
                 manager.release_team_name(name)
                 return
+        else:
+            recovered_chat_id = None
 
         # Step 1: Create Feishu group
         lark_client = LarkChatClient(api_client_factory=self.ctx.api_client_factory)
-        try:
-            result = lark_client.create_chat(
-                name=group_name,
-                description=f"Slock 协作团队: {name}",
-                user_id_list=[sender_open_id],
-            )
-        except Exception as e:
-            from src.utils.errors import redact_sensitive
-            logger.error("create_team: 建群失败 name=%s err=%s", name, redact_sensitive(str(e)))
-            self.reply_text(message_id, f"❌ 创建团队群失败: {safe_error_message(e)}")
-            self._abandon_managed_group_provision(managed_groups, provision_id)
-            manager.release_team_name(name)
-            return
+        if recovered_chat_id is not None:
+            new_chat_id = recovered_chat_id
+        else:
+            try:
+                result = lark_client.create_chat(
+                    name=group_name,
+                    description=f"Slock 协作团队: {name}",
+                    user_id_list=[sender_open_id],
+                )
+                new_chat_id = result.chat_id
+                if managed_groups is not None:
+                    managed_groups.bind_provision_chat(provision_id, new_chat_id)
+            except Exception as e:
+                from src.utils.errors import redact_sensitive
+                logger.error("create_team: 建群/绑定失败 name=%s err=%s", name, redact_sensitive(str(e)))
+                self.reply_text(message_id, f"❌ 创建团队群失败: {safe_error_message(e)}")
+                if "new_chat_id" in locals():
+                    delete_result = lark_client.delete_chat(new_chat_id)
+                    if delete_result is True:
+                        self._abandon_managed_group_provision(
+                            managed_groups, provision_id
+                        )
+                else:
+                    self._abandon_managed_group_provision(
+                        managed_groups, provision_id
+                    )
+                manager.release_team_name(name)
+                return
 
-        new_chat_id = result.chat_id
         engine = None
+        registry_committed = False
         release_reservation = True
 
         try:
@@ -2005,6 +2023,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     project_id=project_id,
                     canonical_root_ref=root_path,
                 )
+                registry_committed = True
 
             # Runtime bootstrap follows durable Team bind + Registry ACTIVE.
             self._bootstrap_default_roles_if_configured(
@@ -2051,8 +2070,17 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
 
         except Exception as e:
             from src.utils.errors import redact_sensitive
+            if registry_committed:
+                logger.exception(
+                    "create_team: post-ACTIVE bootstrap/delivery degraded chat=%s",
+                    new_chat_id,
+                )
+                self.reply_text(
+                    message_id,
+                    f"⚠️ 团队 **{name}** 已创建并获得信任，但初始化未完整完成；请在团队群内重试 `/slock`。",
+                )
+                return
             logger.error("create_team: 激活失败, 回滚建群 chat=%s err=%s", new_chat_id, redact_sensitive(str(e)))
-            self._abandon_managed_group_provision(managed_groups, provision_id)
             local_rollback_ok = True
             if engine is not None:
                 try:
@@ -2067,6 +2095,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             detail = safe_error_message(e)
             local_state = "本地状态已回滚" if local_rollback_ok else "本地状态回滚失败"
             if delete_result is True:
+                self._abandon_managed_group_provision(managed_groups, provision_id)
                 self.reply_text(message_id, f"❌ 团队激活失败，飞书群已删除，{local_state}: {detail}")
             elif delete_result is False:
                 persisted = manager.block_team_name_for_cleanup(
@@ -2090,7 +2119,18 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         registry = vars(self.ctx).get("managed_group_registry")
         if registry is None:
             return None
-        required = ("begin_provision", "activate", "record", "tombstone")
+        required = (
+            "begin_provision",
+            "bind_provision_chat",
+            "provision_chat_id",
+            "activate",
+            "begin_revoke",
+            "cancel_revoke",
+            "complete_revoke",
+            "pending_revokes",
+            "record",
+            "tombstone",
+        )
         if all(callable(getattr(registry, name, None)) for name in required):
             return registry
         return None
@@ -2207,9 +2247,40 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         team_name = engine.channel.team_name or engine.channel.name or target_chat_id
         channel_snapshot = engine.channel
         root_path = engine.root_path
+        registry = self._managed_group_registry()
+        revoke_started = False
+        if registry is not None and registry.record(target_chat_id) is not None:
+            try:
+                registry.begin_revoke(
+                    target_chat_id,
+                    requested_at=datetime.now(UTC),
+                )
+                revoke_started = True
+            except Exception:
+                logger.exception(
+                    "dissolve_team: durable revoke intent failed chat=%s",
+                    target_chat_id,
+                )
+                self.reply_text(
+                    message_id,
+                    f"❌ 团队 **{team_name}** 未解散：受管群撤销意图无法持久化，请重试。",
+                )
+                return
+
+        def _cancel_revoke() -> None:
+            if revoke_started:
+                try:
+                    registry.cancel_revoke(target_chat_id)
+                except Exception:
+                    logger.exception(
+                        "dissolve_team: failed to cancel revoke chat=%s",
+                        target_chat_id,
+                    )
+
         try:
             archived_marker = manager.archive_managed_chat_marker(target_chat_id)
         except (OSError, ValueError) as e:
+            _cancel_revoke()
             logger.error(
                 "dissolve_team: 归档本地 marker 失败 chat=%s err=%s",
                 target_chat_id,
@@ -2221,6 +2292,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             )
             return
         if archived_marker is None:
+            _cancel_revoke()
             self.reply_text(
                 message_id,
                 f"❌ 团队 **{team_name}** 缺少活动 marker，未执行删群以避免重复操作。",
@@ -2249,6 +2321,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             manager.remove(target_chat_id, root_path)
         except Exception as e:
             _restore_local_team()
+            _cancel_revoke()
             logger.error(
                 "dissolve_team: 本地运行时拆除失败 chat=%s err=%s",
                 target_chat_id,
@@ -2262,6 +2335,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         delete_result = lark_client.delete_chat(target_chat_id)
         if delete_result is False:
             restored = _restore_local_team()
+            _cancel_revoke()
             self.reply_text(
                 message_id,
                 (
@@ -2302,7 +2376,10 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         if registry is None or registry.record(chat_id) is None:
             return True
         try:
-            registry.tombstone(chat_id)
+            if chat_id in registry.pending_revokes():
+                registry.complete_revoke(chat_id)
+            else:
+                registry.tombstone(chat_id)
             return True
         except Exception:
             logger.exception(

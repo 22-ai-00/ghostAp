@@ -680,10 +680,85 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
     ) -> None:
         from ...thread import get_current_is_p2p, get_current_sender_id
 
-        if (args or "").strip().casefold() != "allow-chat":
+        access_args = (args or "").strip()
+        if access_args.casefold().startswith("rotate-main-bot "):
+            sender_id = get_current_sender_id() or ""
+            owner_id = vars(self.ctx).get("managed_group_owner_id", "")
+            rotate = vars(self.ctx).get("managed_group_bot_rotation")
+            expected_bot_ref = access_args.split(maxsplit=1)[1].strip()
+            if (
+                not get_current_is_p2p()
+                or not owner_id
+                or sender_id != owner_id
+                or not callable(rotate)
+                or not expected_bot_ref
+            ):
+                self.reply_error(message_id, "仅配置的 Owner 可在私聊中执行主 Bot 轮换。")
+                return
+            rotated, rejected = rotate(expected_bot_ref)
             self.reply_text(
                 message_id,
-                "用法：请由管理员在目标群内发送 `/access allow-chat`。",
+                f"主 Bot 轮换完成：已更新 {rotated} 个群，远端校验未通过 {rejected} 个群。",
+            )
+            return
+
+        if access_args.casefold() == "migration-status":
+            sender_id = get_current_sender_id() or ""
+            owner_id = vars(self.ctx).get("managed_group_owner_id", "")
+            registry = vars(self.ctx).get("managed_group_registry")
+            if (
+                not get_current_is_p2p()
+                or not owner_id
+                or sender_id != owner_id
+                or registry is None
+            ):
+                self.reply_error(message_id, "仅配置的 Owner 可在私聊中查看迁移待办。")
+                return
+            dispositions = registry.migration_dispositions()
+            if not dispositions:
+                self.reply_text(message_id, "✅ 当前没有待人工处理的受管群迁移项。")
+                return
+            lines = ["受管群迁移待办："]
+            lines.extend(
+                f"- `{chat}` → `{project}`：{status}"
+                for chat, project, status in dispositions
+            )
+            self.reply_text(message_id, "\n".join(lines))
+            return
+
+        if access_args.casefold().startswith("adopt-chat "):
+            parts = access_args.split(maxsplit=2)
+            sender_id = get_current_sender_id() or ""
+            owner_id = vars(self.ctx).get("managed_group_owner_id", "")
+            if not get_current_is_p2p() or not owner_id or sender_id != owner_id:
+                self.reply_error(
+                    message_id,
+                    "仅配置的 Owner 可在与 Bot 的私聊中收养已有群。",
+                )
+                return
+            if (
+                len(parts) != 3
+                or not parts[1].startswith("oc_")
+                or not parts[2].strip()
+            ):
+                self.reply_error(
+                    message_id,
+                    "用法：`/access adopt-chat <oc_chat_id> <project-id-or-exact-name>`",
+                )
+                return
+            project_handler = self.ctx.handlers.get("project")
+            adopt = getattr(project_handler, "adopt_managed_chat", None)
+            if not callable(adopt):
+                self.reply_error(message_id, "受管群收养服务未就绪。")
+                return
+            adopt(message_id, parts[1], parts[2].strip())
+            return
+
+        if access_args.casefold() != "allow-chat":
+            self.reply_text(
+                message_id,
+                "用法：目标群内发送 `/access allow-chat`，或由 Owner 私聊发送 "
+                "`/access adopt-chat <oc_chat_id> <project-id-or-exact-name>`。",
             )
             return
 

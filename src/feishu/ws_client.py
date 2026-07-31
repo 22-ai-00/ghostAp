@@ -18,6 +18,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -604,6 +605,7 @@ class FeishuWSClient:
             managed_group_receiving_bot_ref=(
                 self._managed_group_receiving_bot_ref
             ),
+            managed_group_bot_rotation=self.rotate_main_managed_group_bot,
         )
 
         # Instantiate handlers (temp locals for registry population)
@@ -3269,7 +3271,7 @@ class FeishuWSClient:
         pass
 
     def _handle_bot_deleted(self, data):
-        """Retire local Slock state after the main Bot leaves a group."""
+        """Durably revoke trust before retiring a remotely deleted group."""
 
         event = getattr(data, "event", None)
         chat_id = getattr(event, "chat_id", "")
@@ -3277,13 +3279,121 @@ class FeishuWSClient:
             return
         manager = self._slock_engine_manager
         try:
+            record = self._managed_group_registry.record(chat_id)
+            revoke_required = (
+                record is not None
+                and getattr(record.status, "value", "") == "active"
+            )
+            if revoke_required:
+                self._managed_group_registry.begin_revoke(
+                    chat_id,
+                    requested_at=datetime.now(UTC),
+                )
             manager.retire_deleted_chat(chat_id)
+            if not self._project_manager.revoke_managed_chat(chat_id):
+                raise OSError("project managed-chat revocation was not persisted")
+            if revoke_required:
+                self._managed_group_registry.complete_revoke(chat_id)
         except Exception:
             logger.exception(
                 "failed to retire deleted Slock chat=%s",
                 chat_id[:12],
             )
             raise
+
+    def _reconcile_managed_groups_before_slock_restore(self) -> None:
+        """Reconcile pending revokes and validated legacy Project candidates."""
+
+        from ..project_chat.lark_chat_client import (
+            LarkChatClient,
+            ManagedChatValidation,
+        )
+
+        remote = LarkChatClient(api_client_factory=self._get_api_client)
+        for chat_id in self._managed_group_registry.pending_revokes():
+            result = remote.delete_chat(chat_id)
+            if result is False:
+                self._managed_group_registry.cancel_revoke(chat_id)
+                continue
+            self._project_manager.revoke_managed_chat(chat_id)
+            self._managed_group_registry.complete_revoke(chat_id)
+
+        for project in self._project_manager.get_all_projects(
+            sort_by_recent=False,
+            chat_id=None,
+        ):
+            candidate = project.managed_group_migration_candidate(
+                owner_id=self._managed_group_owner_id,
+                receiving_bot_ref=self._managed_group_receiving_bot_ref,
+            )
+            if candidate is None:
+                continue
+            chat_id = candidate["chat_id"]
+            if self._managed_group_registry.record(chat_id) is not None:
+                continue
+            validation = remote.validate_managed_chat(
+                chat_id,
+                self._managed_group_owner_id,
+            )
+            if validation is ManagedChatValidation.VALID:
+                self._managed_group_registry.import_candidate(
+                    candidate,
+                    validator=lambda _facts: True,
+                )
+            else:
+                existing = {
+                    item[0]: (item[1], item[2])
+                    for item in self._managed_group_registry.migration_dispositions()
+                }
+                disposition = (project.project_id, validation.value)
+                self._managed_group_registry.record_migration_disposition(
+                    chat_id,
+                    project_id=project.project_id,
+                    status=validation.value,
+                )
+                if existing.get(chat_id) != disposition:
+                    logger.warning(
+                        "managed group migration requires Owner review chat=%s disposition=%s",
+                        chat_id[:12],
+                        validation.value,
+                    )
+
+    def rotate_main_managed_group_bot(
+        self,
+        expected_bot_ref: str,
+    ) -> tuple[int, int]:
+        """CAS-rotate records for the explicitly identified former main Bot."""
+
+        from ..project_chat.lark_chat_client import (
+            LarkChatClient,
+            ManagedChatValidation,
+        )
+
+        if not expected_bot_ref or expected_bot_ref == self._managed_group_receiving_bot_ref:
+            return 0, 0
+        remote = LarkChatClient(api_client_factory=self._get_api_client)
+        rotated = 0
+        rejected = 0
+        for record in self._managed_group_registry.managed_groups():
+            if (
+                getattr(record.status, "value", "") != "active"
+                or record.receiving_bot_ref != expected_bot_ref
+            ):
+                continue
+            validation = remote.validate_managed_chat(
+                record.chat_id,
+                self._managed_group_owner_id,
+            )
+            if validation is not ManagedChatValidation.VALID:
+                rejected += 1
+                continue
+            self._managed_group_registry.rotate_receiving_bot(
+                chat_id=record.chat_id,
+                expected_bot_ref=expected_bot_ref,
+                new_bot_ref=self._managed_group_receiving_bot_ref,
+            )
+            rotated += 1
+        return rotated, rejected
 
     # ==================================================================
     # WebSocket lifecycle
@@ -3355,9 +3465,16 @@ class FeishuWSClient:
         self._ws_health_monitor.start_watchdog()
         self._start_main_slash_command_sync()
 
-        # Restore slock engines from persisted marker files
+        # Registry reconciliation must precede marker-based Slock restore.
         import os
         _root = os.getcwd()
+        try:
+            self._reconcile_managed_groups_before_slock_restore()
+        except Exception:
+            logger.exception("Managed-group startup reconciliation failed")
+            raise
+
+        # Restore slock engines from persisted marker files
         try:
             restored = self._slock_engine_manager.restore_from_disk(_root)
             if restored:

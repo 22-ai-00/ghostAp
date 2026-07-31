@@ -11,6 +11,7 @@ import contextlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import threading
 import time
@@ -2104,10 +2105,30 @@ class SlockEngine(BaseEngine):
             if not old_val and new_val:
                 merged[key] = new_val
 
-        tmp_path = marker_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            _json.dump(merged, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, marker_path)
+        marker_parent = os.path.dirname(marker_path) or "."
+        tmp_path = os.path.join(
+            marker_parent,
+            f".{os.path.basename(marker_path)}.{secrets.token_hex(12)}.tmp",
+        )
+        try:
+            with open(tmp_path, "x", encoding="utf-8") as f:
+                _json.dump(merged, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, marker_path)
+            directory_fd = os.open(
+                marker_parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
     def execute(
         self,
