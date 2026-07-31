@@ -64,9 +64,10 @@ Canonical trust model：
 - Phase B 原相邻回归：`202 passed`。
 - Foundation 原相邻回归：`24 passed`。
 - 已完成且保留证据的任务：Foundation F1–F3（其中 F3 为旧合同）和
-  Phase 0 的 0.4–0.7。
-- 新三信任域、ManagedGroup Registry、ingress cutover、ProjectGrant/ActionMatrix
-  尚无实现证据；因此 CP-T 未通过。
+  Phase 0 的 0.4–0.8。
+- 新三信任域与 `ProjectGrant/ActionMatrix` 纯类型/决策层已有实现证据；
+  ManagedGroup Registry 与 ingress/callback production cutover 尚未实现，因此
+  CP-T 未通过。
 
 ## Canonical ownership and overlap decisions
 
@@ -144,7 +145,7 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 | 0.5 Worktree 终态/超时/评审 | complete (`9054d221`) | evidence-only | hard timeout、cancel ack、证据 review、无部分自动 merge |
 | 0.6 Spec completion fail-closed | complete (`93a52598`) | evidence-only | 明确失败不能被空建议转成通过 |
 | 0.7 辅助 Agent 权限 | complete (`f69acc90`) | evidence-only | coordinator/classifier deny-all；不产生用户交互 |
-| 0.8 TrustZone/Actor/ActionMatrix | missing | active | `ALLOW/DENY` only；Owner/Employee/unknown + stale revision |
+| 0.8 TrustZone/Actor/ActionMatrix | complete (`77a70c17`, fix `124749de`) | evidence-only | `ALLOW/DENY` only；Owner/Employee/unknown + stale revision |
 | 0.9 ManagedGroup Registry/lifecycle | missing | active | ACTIVE 早于 welcome；Project/Team 共用；tombstone/replay |
 | 0.10 ingress/callback cutover | missing | active | trust 早于业务副作用；managed group 零 enrollment；external 零副作用 |
 
@@ -198,6 +199,46 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
 - Real Feishu/mobile and managed-project permission-prompt evidence:
   `not_tested`; the recorder is a local transport boundary and this task does
   not make a tenant or mobile-delivery claim.
+
+### Task 0.8 evidence
+
+- Production wiring: `src/trust/models.py` defines frozen trust, grant,
+  Employee causal-assignment, action, target and Trigger scope facts;
+  `src/trust/resolver.py` deterministically resolves Owner P2P, managed-group
+  Owner/Employee and unknown trust from immutable snapshots;
+  `src/trust/action_matrix.py` owns the pure `ALLOW/DENY` matrix and
+  stale-dispatch fence. `AccessDecision` and `RouteDecision` can carry the
+  frozen `EffectiveTrust`, but `ws_client` ingress/callback wiring is
+  intentionally not part of 0.8 and remains Task 0.10.
+- Initial TDD RED: the two required test modules failed collection with two
+  `ModuleNotFoundError: No module named 'src.trust'` errors before production
+  code existed. A self-review RED then proved empty `run_id/assignment_id`
+  values incorrectly matched (`1 failed`, expected DENY but received ALLOW).
+  Review remediation added assertion REDs for Owner P2P project actions and
+  typed Trigger scope (`5 failed`), followed by request-boundary REDs for the
+  absent Trigger scope field (`8 failed`).
+- GREEN: `tests/test_trust_zone_resolver.py` plus
+  `tests/test_trust_action_matrix.py` are `43 passed`. Direct adjacent
+  `tests/test_access_control.py` plus `tests/test_route_decision.py` are
+  `32 passed`; the expanded legacy access/route consumer set was
+  `269 passed, 17 subtests passed`. Touched-file Ruff and
+  `git diff --check` passed; only the two pre-existing Lark SDK Python 3.13
+  deprecation warnings remain.
+- Failure-path evidence: inactive, duplicate, missing or mismatched managed
+  group/grant provenance resolves to unknown and DENY. `can_dispatch()`
+  returns DENY for stale group revision, stale grant revision, kill, pause or
+  unknown trust without asking a user. Employee project/Trigger actions require
+  non-empty matching `run_id + assignment_id + causal_event_id`; Employee
+  permanent or unscoped Trigger control and all grant/system escalation return
+  DENY. This is pure decision evidence, not a recovery or transport claim.
+- Managed permission-prompt evidence: the exhaustive enum cross-product test
+  proves `ActionDecision` contains only `ALLOW` and `DENY`, with no `ASK`, and
+  managed project Owner/valid Employee actions resolve directly. Therefore
+  `permission_prompt_count(managed project task) = 0` is proven at the pure
+  matrix boundary only; no tenant/UI prompt count is claimed.
+- Real Feishu managed-group/manual/mobile evidence: `not_tested`. ManagedGroup
+  Registry/lifecycle (0.9) and ingress/callback production cutover (0.10) are
+  still missing, so this evidence does not pass CP-T.
 
 ## Phase A disposition
 
