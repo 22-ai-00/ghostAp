@@ -13,6 +13,7 @@ from src.card.state.models import (
     EngineExtState,
     FooterState,
 )
+from src.utils.text import format_elapsed_clock
 
 
 def _tool(name, status="active", tool_input=None):
@@ -24,6 +25,92 @@ def _tool(name, status="active", tool_input=None):
         tool_input=tool_input or "{}",
         tool_output="",
     )
+
+
+@pytest.mark.parametrize(
+    ("seconds", "expected"),
+    [
+        (0, "00:00:00"),
+        (59, "00:00:59"),
+        (3661, "01:01:01"),
+        (90061, "1天 01:01:01"),
+    ],
+)
+def test_elapsed_clock_uses_zero_padded_hms_and_days(seconds, expected):
+    assert format_elapsed_clock(seconds) == expected
+
+
+def test_running_main_footer_is_always_visible_and_advances_on_each_render(
+    monkeypatch,
+):
+    now = [220.0]
+    monkeypatch.setattr(
+        "src.card.render.footer.time.monotonic",
+        lambda: now[0],
+    )
+    state = CardState(
+        metadata=CardMetadata(session_started_at=100.0),
+        footer=FooterState(),
+    )
+
+    first_content = "\n".join(
+        element.get("content", "")
+        for element in render_footer(state)
+    )
+    now[0] = 225.0
+    second_content = "\n".join(
+        element.get("content", "")
+        for element in render_footer(state)
+    )
+
+    assert "⏱ 用时 00:02:00" in first_content
+    assert "⏱ 用时 00:02:05" in second_content
+
+
+def test_terminal_footer_freezes_authoritative_duration_in_clock_format(
+    monkeypatch,
+):
+    now = [10_000.0]
+    monkeypatch.setattr(
+        "src.card.render.footer.time.monotonic",
+        lambda: now[0],
+    )
+    state = CardState(
+        terminal="completed",
+        metadata=CardMetadata(session_started_at=100.0),
+        footer=FooterState(duration_seconds=58),
+    )
+
+    first_content = "\n".join(
+        element.get("content", "")
+        for element in render_footer(state)
+    )
+    now[0] = 20_000.0
+    second_content = "\n".join(
+        element.get("content", "")
+        for element in render_footer(state)
+    )
+
+    assert "⏱ 用时 00:00:58" in first_content
+    assert second_content == first_content
+
+
+def test_running_footer_uses_days_as_largest_unit(monkeypatch):
+    monkeypatch.setattr(
+        "src.card.render.footer.time.monotonic",
+        lambda: 90_161.0,
+    )
+    state = CardState(
+        metadata=CardMetadata(session_started_at=100.0),
+        footer=FooterState(status="thinking", status_text="执行中"),
+    )
+
+    content = "\n".join(
+        element.get("content", "")
+        for element in render_footer(state)
+    )
+
+    assert "⏱ 用时 1天 01:01:01" in content
 
 
 # --- render_now_tool_hint unit tests ---
@@ -143,7 +230,7 @@ def test_child_footer_keeps_one_status_and_metadata_line_without_duplicates(monk
     assert "🔄 执行中" in content_lines
     assert [
         line for line in content_lines if "codex" in line or "gpt-5" in line
-    ] == ["🔧 codex · 🧩 gpt-5 · ⏱ 46 秒"]
+    ] == ["🔧 codex · 🧩 gpt-5 · ⏱ 用时 00:00:46"]
     assert not any("📂" in line for line in content_lines)
     assert not any("⚙" in line for line in content_lines)
     assert not any("🧬" in line for line in content_lines)
@@ -173,7 +260,7 @@ def test_running_child_footer_uses_session_start_when_progress_never_started(
         for element in render_footer(state)
     )
 
-    assert "🔧 codex · 🧩 gpt-5 · ⏱ 46 秒" in content
+    assert "🔧 codex · 🧩 gpt-5 · ⏱ 用时 00:00:46" in content
 
 
 @pytest.mark.parametrize(
@@ -439,8 +526,8 @@ def test_spec_footer_uses_session_start_for_total_elapsed(monkeypatch):
     elements = render_footer(state)
     content = "\n".join(e.get("content", "") for e in elements)
 
-    assert "已执行 2 分钟 0 秒" in content
-    assert "30 秒" not in content
+    assert "⏱ 用时 00:02:00" in content
+    assert "00:00:30" not in content
 
 
 def test_spec_footer_renders_elapsed_even_without_status(monkeypatch):
@@ -455,7 +542,7 @@ def test_spec_footer_renders_elapsed_even_without_status(monkeypatch):
     content = "\n".join(e.get("content", "") for e in elements)
 
     assert elements[0] == {"tag": "hr"}
-    assert "已执行 30 秒" in content
+    assert "⏱ 用时 00:00:30" in content
 
 
 def test_terminal_footer_places_duration_after_tool_model():
@@ -468,5 +555,4 @@ def test_terminal_footer_places_duration_after_tool_model():
     elements = render_footer(state)
     content_lines = [e.get("content", "") for e in elements if e.get("tag") == "markdown"]
 
-    assert "🔧 coco · 🧩 Test-O-New-Thinking · ✅ 0m58s" in content_lines
-    assert not any("耗时" in line for line in content_lines)
+    assert "🔧 coco · 🧩 Test-O-New-Thinking · ⏱ 用时 00:00:58" in content_lines

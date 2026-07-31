@@ -10,13 +10,22 @@ from src.card.render.atoms import RenderAtom, estimate_atom_size
 from src.card.state.models import CardMetadata, CardState, ContentBlock
 from src.card.tool_display import is_unhelpful_display_label
 from src.card.ui_text import UI_TEXT
+from src.utils.text import format_elapsed_clock
 
 from .budget import RenderBudget
 from .progress import MOBILE_SEGMENTS, render_progress_bar
 
 _ACTIVE_TOOL_STATUSES = frozenset({"active"})
 _FINAL_TERMINAL_STATUSES = frozenset(
-    {"completed", "failed", "cancelled", "blocked", "archived", "ttl_expired"}
+    {
+        "completed",
+        "completed_empty",
+        "failed",
+        "cancelled",
+        "blocked",
+        "archived",
+        "ttl_expired",
+    }
 )
 
 
@@ -131,14 +140,6 @@ _TOOL_BRIEF = {
     "Bash": lambda p: f"执行 {_short_cmd(p.get('command') or p.get('cmd') or '')}",
 }
 
-_TERMINAL_DURATION_MARKERS = {
-    "completed": "✅",
-    "failed": "❌",
-    "cancelled": "⚪",
-    "blocked": "⛔",
-    "archived": "⏸",
-    "ttl_expired": "⏱",
-}
 _SUBTASK_TERMINAL_STATUS = {
     "completed": "✅ 已完成",
     "failed": "❌ 执行失败",
@@ -164,15 +165,6 @@ def _format_duration(seconds: float) -> str:
     return UI_TEXT["duration_hours_mins_secs"].format(hours=hours, minutes=mins, seconds=secs)
 
 
-def _format_compact_duration(seconds: float) -> str:
-    total = max(0, int(seconds))
-    minutes, secs = divmod(total, 60)
-    if minutes < 60:
-        return f"{minutes}m{secs:02d}s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h{minutes:02d}m{secs:02d}s"
-
-
 def _total_elapsed_from_session(state: CardState) -> float | None:
     """Return CardSession total elapsed seconds when a monotonic start exists."""
     metadata = state.metadata
@@ -181,6 +173,27 @@ def _total_elapsed_from_session(state: CardState) -> float | None:
     if metadata.session_started_at is None:
         return None
     return max(0.0, time.monotonic() - float(metadata.session_started_at))
+
+
+def _footer_elapsed_seconds(
+    state: CardState,
+    *,
+    is_final_terminal: bool,
+) -> float | None:
+    """Select the live or frozen total elapsed value for the footer."""
+    if is_final_terminal:
+        if state.footer.duration_seconds is not None:
+            return max(0.0, float(state.footer.duration_seconds))
+        if state.metadata.frozen_total_elapsed is not None:
+            return max(0.0, float(state.metadata.frozen_total_elapsed))
+        return None
+
+    total_elapsed = _total_elapsed_from_session(state)
+    if total_elapsed is not None:
+        return total_elapsed
+    if state.footer.progress_started_at is None:
+        return None
+    return max(0.0, time.monotonic() - state.footer.progress_started_at)
 
 
 def render_now_tool_hint(tool) -> str:
@@ -252,16 +265,10 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
     """
     elements: list[dict] = []
     is_final_terminal = state.terminal in _FINAL_TERMINAL_STATUSES
-    running_spec_elapsed: float | None = None
-    running_subtask_elapsed: float | None = None
-    if state.metadata.engine_type == "spec" and not is_final_terminal:
-        total_elapsed = _total_elapsed_from_session(state)
-        if total_elapsed is not None and total_elapsed >= 1:
-            running_spec_elapsed = total_elapsed
-    elif state.metadata.is_subagent and not is_final_terminal:
-        total_elapsed = _total_elapsed_from_session(state)
-        if total_elapsed is not None and total_elapsed >= 1:
-            running_subtask_elapsed = total_elapsed
+    elapsed_seconds = _footer_elapsed_seconds(
+        state,
+        is_final_terminal=is_final_terminal,
+    )
 
     # Determine if we have any status/progress content to show
     has_status_content = state.footer.status is not None
@@ -270,8 +277,7 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
         state.metadata.tool_name
         or state.metadata.model_name
         or state.footer.duration_seconds is not None
-        or running_spec_elapsed is not None
-        or running_subtask_elapsed is not None
+        or elapsed_seconds is not None
     )
     # Check for active tool hint
     running_tool = _find_running_tool(state)
@@ -384,27 +390,8 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
     ):
         meta_parts.append(f"🧩 {model_name}")
 
-    # Duration: terminal states use final duration_seconds; running states compute elapsed.
-    # Spec progress can start well after the engine starts, so its footer uses
-    # CardSession's monotonic start instant to show total wall time.
-    duration_str = None
-    duration_label = ""
-    if state.footer.duration_seconds is not None and is_final_terminal:
-        duration_str = _format_compact_duration(state.footer.duration_seconds)
-        marker = _TERMINAL_DURATION_MARKERS.get(state.terminal, "✅")
-        duration_label = f"{marker} {duration_str}"
-    elif running_spec_elapsed is not None:
-        duration_str = _format_duration(running_spec_elapsed)
-        duration_label = UI_TEXT.get("card_footer_elapsed_total_fmt", "已执行 {duration}").format(duration=duration_str)
-    elif running_subtask_elapsed is not None:
-        duration_str = _format_duration(running_subtask_elapsed)
-    elif state.footer.progress_started_at is not None and not is_final_terminal:
-        elapsed = time.monotonic() - state.footer.progress_started_at
-        if elapsed >= 1:
-            duration_str = _format_duration(elapsed)
-
-    if duration_str:
-        meta_parts.append(duration_label or f"⏱ {duration_str}")
+    if elapsed_seconds is not None:
+        meta_parts.append(f"⏱ 用时 {format_elapsed_clock(elapsed_seconds)}")
 
     if meta_parts:
         elements.append(

@@ -1,4 +1,6 @@
 """Tests for main reducer orchestration."""
+from dataclasses import replace
+
 import pytest
 
 from src.card.events import CardEvent, CardEventType
@@ -137,16 +139,18 @@ class TestMainReducer:
         assert s.buttons == ()
 
     def test_approval_resolved_rejected(self):
-        s = reduce_card_state(None, CardEvent.started(), metadata=_meta())
+        metadata = replace(_meta(), session_started_at=100.0)
+        s = reduce_card_state(None, CardEvent.started(), metadata=metadata)
         s = reduce_card_state(s, CardEvent(
             type=CardEventType.APPROVAL_REQUESTED,
             payload={"tool_name": "bash"},
         ))
         s = reduce_card_state(s, CardEvent(
             type=CardEventType.APPROVAL_RESOLVED,
-            payload={"approved": False},
+            payload={"approved": False, "_now": 158.0},
         ))
         assert s.terminal == "cancelled"
+        assert s.footer.duration_seconds == 58.0
         assert len(s.buttons) == 1
         assert s.buttons[0].action_id == "intent.deep.resume"
 

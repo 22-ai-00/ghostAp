@@ -1265,6 +1265,17 @@ class TestProactiveTTLTimer:
         # Should contain TTL expired text in warning banner
         assert session.state.footer.warning_banner is not None
 
+    def test_timer_callback_freezes_duration_from_session_clock(self):
+        now = [100.0]
+        session = self._make_session(now)
+        session.dispatch(CardEvent.started())
+
+        now[0] = 111.0
+        session._ttl_handler.on_ttl_expired()
+
+        assert session.state.terminal == "cancelled"
+        assert session.state.footer.duration_seconds == 11.0
+
     def test_timer_callback_noop_if_already_closed(self):
         """Proactive timer ignores if session already closed."""
         now = [0.0]

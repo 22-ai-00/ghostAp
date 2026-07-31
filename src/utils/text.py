@@ -105,6 +105,16 @@ def format_duration(seconds: float) -> str:
     return f"{secs} 秒"
 
 
+def format_elapsed_clock(seconds: float) -> str:
+    """Format elapsed seconds as HH:MM:SS, with days as the largest unit."""
+    total = max(0, int(seconds))
+    days, remainder = divmod(total, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, secs = divmod(remainder, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{days}天 {clock}" if days else clock
+
+
 def format_friendly_duration(seconds: float) -> str:
     """Format a duration into a friendly Chinese string without '前' suffix.
 

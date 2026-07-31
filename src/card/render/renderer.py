@@ -186,8 +186,18 @@ def render_card(
             body_elements.insert(0, warning_note)
 
         # Append footer and buttons only on the last page
+        live_elapsed_footer_element_ids: set[int] = set()
         if page_idx == total_pages - 1:
-            body_elements.extend(render_footer(state, budget=budget))
+            footer_elements = render_footer(state, budget=budget)
+            live_elapsed_footer_element_ids = {
+                id(element)
+                for element in footer_elements
+                if (
+                    element.get("tag") == "markdown"
+                    and "⏱ 用时 " in str(element.get("content") or "")
+                )
+            }
+            body_elements.extend(footer_elements)
             body_elements.extend(render_buttons(state, budget=budget))
 
         # Detect active element for streaming
@@ -235,6 +245,10 @@ def render_card(
                 page_sig_parts,
                 elem,
                 streaming_element_id=streaming_element_id,
+                ignore_root_content=(
+                    active_element is not None
+                    and id(elem) in live_elapsed_footer_element_ids
+                ),
             )
         page_signature = hashlib.md5(
             utf8_replace_bytes("|".join(page_sig_parts))
@@ -978,6 +992,7 @@ def _append_element_structure_signature(
     node: object,
     *,
     streaming_element_id: str | None,
+    ignore_root_content: bool = False,
 ) -> None:
     """Recursively fingerprint Card 2.0 structure and static text.
 
@@ -985,6 +1000,11 @@ def _append_element_structure_signature(
     deliver that element through the element-content API. Other active text
     elements must retain a content fingerprint so concurrent source updates
     trigger a full card patch instead of being silently skipped.
+
+    While an element is streaming, the live elapsed footer is also excluded
+    from the signature. An element-content call cannot update that separate
+    footer node without a second API call, so the next existing full-card
+    update refreshes the clock instead of degrading every text chunk to PATCH.
     """
     if isinstance(node, list):
         for item in node:
@@ -1004,11 +1024,14 @@ def _append_element_structure_signature(
         element_id = str(node.get("element_id") or "")
         if element_id:
             parts.append(f"element_id:{element_id}")
-            if element_id != streaming_element_id:
+            if (
+                not ignore_root_content
+                and element_id != streaming_element_id
+            ):
                 parts.append(
                     _content_signature(node.get("content", ""))
                 )
-        else:
+        elif not ignore_root_content:
             parts.append(_content_signature(node.get("content", "")))
 
     for key, value in node.items():

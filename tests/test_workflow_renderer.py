@@ -126,6 +126,19 @@ class TestWorkflowProgressRenderer(unittest.TestCase):
         md_elements = [e for e in card["elements"] if e.get("tag") == "markdown"]
         self.assertGreater(len(md_elements), 0, "Expected at least one markdown in card")
 
+    def test_metrics_footer_uses_clock_format_with_days_as_largest_unit(self):
+        project = WorkflowProject(
+            name="long-workflow",
+            status=WorkflowStatus.COMPLETED,
+            started_at=100.0,
+            finished_at=90_161.0,
+        )
+
+        footer = WorkflowProgressRenderer(project)._render_metrics_footer()
+        rendered = json.dumps(footer, ensure_ascii=False)
+
+        self.assertIn("**耗时:** 1天 01:01:01", rendered)
+
     def test_render_compact_status_format(self):
         project = self._make_project()
         renderer = WorkflowProgressRenderer(project)
@@ -680,6 +693,17 @@ class TestRenderCompletionCard(unittest.TestCase):
         self.assertIn("耗时", all_content)
         self.assertIn("阶段", all_content)
         self.assertIn("验证", all_content)
+
+    def test_completion_card_keeps_clock_format_for_final_elapsed(self):
+        project = self._make_project(
+            started_at=100.0,
+            finished_at=90_161.0,
+        )
+
+        card = render_completion_card(project)
+        all_content = self._extract_all_text(card["elements"])
+
+        self.assertIn("1天 01:01:01", all_content)
 
     def test_elements_contain_phase_summary(self):
         project = self._make_project()

@@ -42,6 +42,51 @@ class _MockClient:
 class TestForceClosePath:
     """TTL force-close when lock cannot be acquired."""
 
+    def test_force_close_renders_and_reports_frozen_session_duration(self):
+        clock = [100.0]
+        terminal_states = []
+
+        class TrackingHook:
+            def on_dispatched(self, event, state):
+                pass
+
+            def on_terminal(self, state, reason):
+                terminal_states.append((state, reason))
+
+        client = _MockClient()
+        delivery = CardDelivery(client)
+        config = SessionConfig(
+            metadata=CardMetadata(
+                engine_type="deep",
+                mode_name="Deep",
+                mode_emoji="🔍",
+            ),
+            clock=lambda: clock[0],
+            sync_delivery=True,
+        )
+        session = CardSession(
+            chat_id="chat_elapsed",
+            config=config,
+            delivery=delivery,
+            session_id="force_close_elapsed",
+            hooks=(TrackingHook(),),
+        )
+        session.dispatch(CardEvent.started())
+        clock[0] = 158.0
+
+        session._lock.acquire()
+        try:
+            session._ttl_actuator.force_terminate("ttl_expired")
+        finally:
+            session._lock.release()
+
+        assert client.updated
+        assert "⏱ 用时 00:00:58" in str(client.updated[-1][1])
+        terminal_state, terminal_reason = terminal_states[-1]
+        assert terminal_reason == "ttl_expired"
+        assert terminal_state.terminal == "cancelled"
+        assert terminal_state.footer.duration_seconds == 58.0
+
     def test_force_close_sets_closed_flag(self):
         """When TTL retries are exhausted, session is marked closed."""
         client = _MockClient()

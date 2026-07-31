@@ -6,6 +6,8 @@ import json
 import time
 from typing import Any
 
+from src.utils.text import format_elapsed_clock
+
 from .errors import _strip_internal_details
 from .models import (
     AgentProgress,
@@ -657,7 +659,7 @@ class WorkflowProgressRenderer:
         start = self._project.started_at or self._start_time
         end = self._project.finished_at or time.time()
         elapsed = end - start if end >= start else time.time() - self._start_time
-        elapsed_str = _format_duration(elapsed)
+        elapsed_str = format_elapsed_clock(elapsed)
 
         # Left column: Agents + 耗时
         left_content = [
@@ -870,7 +872,7 @@ def _completion_process_markdown(
     if cached_agents:
         agent_desc += f"，{cached_agents} 缓存"
     stats_parts.append(f"**代理** {agent_desc}")
-    stats_parts.append(f"**耗时** {_format_duration(elapsed)}")
+    stats_parts.append(f"**耗时** {format_elapsed_clock(elapsed)}")
 
     lines = [" · ".join(stats_parts)]
 
@@ -1023,7 +1025,12 @@ def render_completion_card(
         _column_set(
             [
                 _column(
-                    [_md_element(f"**{_format_duration(elapsed)}**\n<font color='grey'>耗时</font>", text_align="center")],
+                    [
+                        _md_element(
+                            f"**{format_elapsed_clock(elapsed)}**\n<font color='grey'>耗时</font>",
+                            text_align="center",
+                        )
+                    ],
                     weight=1,
                     vertical_align="center",
                 ),

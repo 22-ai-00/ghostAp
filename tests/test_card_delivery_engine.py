@@ -3,7 +3,7 @@
 import dataclasses
 import threading
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -229,6 +229,98 @@ class TestCardDeliveryUpdate:
                 "sequence": 1,
             },
         ]
+
+    def test_live_elapsed_does_not_disable_programming_element_streaming(self):
+        client = MockCardClient()
+        delivery = CardDelivery(client)
+        metadata = dataclasses.replace(
+            build_programming_metadata("codex"),
+            session_started_at=100.0,
+        )
+        initial_state = CardState(
+            blocks=(
+                ContentBlock(
+                    kind="text",
+                    block_id="stream",
+                    content="正在检查",
+                    element_id="el_stream",
+                    status="active",
+                ),
+            ),
+            metadata=metadata,
+        )
+        updated_state = dataclasses.replace(
+            initial_state,
+            blocks=(
+                dataclasses.replace(
+                    initial_state.blocks[0],
+                    content="正在检查流式投递",
+                ),
+            ),
+        )
+
+        with patch("src.card.render.footer.time.monotonic", return_value=220.0):
+            initial = render_card(initial_state, RenderBudget())
+        with patch("src.card.render.footer.time.monotonic", return_value=221.0):
+            updated = render_card(updated_state, RenderBudget())
+
+        delivery.deliver("elapsed-programming-section", "chat_abc", initial)
+        outcomes = delivery.deliver(
+            "elapsed-programming-section",
+            "chat_abc",
+            updated,
+        )
+
+        assert initial[0].structure_signature == updated[0].structure_signature
+        assert outcomes[0].kind == "applied"
+        assert client.updates == []
+        assert client.elements == [
+            {
+                "card_id": "stream_card_1",
+                "element_id": "el_stream",
+                "content": "正在检查流式投递",
+                "sequence": 1,
+            },
+        ]
+
+    def test_live_elapsed_mask_keeps_other_footer_metadata_in_signature(self):
+        metadata = dataclasses.replace(
+            build_programming_metadata("codex"),
+            is_subagent=True,
+            model_name="model-a",
+            unit_id="task-1",
+            unit_label="核对投递",
+            session_started_at=100.0,
+        )
+        initial_state = CardState(
+            blocks=(
+                ContentBlock(
+                    kind="text",
+                    block_id="stream",
+                    content="正在检查",
+                    element_id="el_stream",
+                    status="active",
+                ),
+            ),
+            metadata=metadata,
+        )
+        updated_state = dataclasses.replace(
+            initial_state,
+            blocks=(
+                dataclasses.replace(
+                    initial_state.blocks[0],
+                    content="正在检查流式投递",
+                ),
+            ),
+            metadata=dataclasses.replace(metadata, model_name="model-b"),
+        )
+
+        with patch("src.card.render.footer.time.monotonic", return_value=220.0):
+            initial = render_card(initial_state, RenderBudget())
+        with patch("src.card.render.footer.time.monotonic", return_value=221.0):
+            updated = render_card(updated_state, RenderBudget())
+
+        assert initial[0].structure_signature != updated[0].structure_signature
 
     def test_no_change_skips(self):
         client = MockCardClient()

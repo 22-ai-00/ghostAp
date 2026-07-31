@@ -33,6 +33,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _with_monotonic_now(event: CardEvent, now: float) -> CardEvent:
+    """Return an event carrying the session clock used by normal dispatch."""
+    if "_now" in event.payload:
+        return event
+    return CardEvent(
+        type=event.type,
+        payload={**event.payload, "_now": now},
+    )
+
+
 @dataclass(frozen=False)
 class TTLContext:
     """Shared mutable state container injected into TTLActuator.
@@ -136,9 +146,14 @@ class TTLActuator:
         ctx = self._ctx
         with ctx.lock:
             snapshot = ctx.mutable.state
+            now = ctx.clock()
             try:
                 for ev in events:
-                    ctx.mutable.state = _core.reduce_card_state(ctx.mutable.state, ev, ctx.metadata)
+                    ctx.mutable.state = _core.reduce_card_state(
+                        ctx.mutable.state,
+                        _with_monotonic_now(ev, now),
+                        ctx.metadata,
+                    )
                 assert ctx.mutable.state is not None
                 rendered = _core.render_card(ctx.mutable.state, ctx.budget)
             except Exception:
@@ -194,6 +209,7 @@ class TTLActuator:
         lightweight_delivered = False
         engine_cmd_str = ctx.engine_cmd_fn()
         engine_name_str = ctx.engine_name_fn()
+        terminal_state = ctx.mutable.state
 
         # Attempt lock for state access — non-blocking to avoid deadlock
         state_lock_acquired = ctx.lock.acquire(timeout=0)
@@ -211,8 +227,21 @@ class TTLActuator:
                     "CardSession %s: force-close proceeding without lock — state snapshot may be stale",
                     ctx.session_id,
                 )
-            snap = _core.reduce_card_state(snap, CardEvent.warning_updated(ttl_text), ctx.metadata)
-            snap = _core.reduce_card_state(snap, CardEvent.cancelled(reason=reason), ctx.metadata)
+            now = ctx.clock()
+            snap = _core.reduce_card_state(
+                snap,
+                _with_monotonic_now(CardEvent.warning_updated(ttl_text), now),
+                ctx.metadata,
+            )
+            snap = _core.reduce_card_state(
+                snap,
+                _with_monotonic_now(CardEvent.cancelled(reason=reason), now),
+                ctx.metadata,
+            )
+            terminal_state = snap
+            if state_lock_acquired:
+                ctx.mutable.state = snap
+                ctx.mutable.terminal_reason = reason
             rendered = _core.render_card(snap, ctx.budget)
             ctx.delivery.deliver(
                 session_id=ctx.session_id, chat_id=ctx.chat_id,
@@ -236,7 +265,7 @@ class TTLActuator:
             )
             self.notify_user(notice_text)
 
-        ctx.hook_firer.fire_terminal(ctx.mutable.state, reason)
+        ctx.hook_firer.fire_terminal(terminal_state, reason)
 
     def deliver_terminal(self, rendered: list) -> None:
         """Deliver rendered payload as a terminal event (with tracking)."""

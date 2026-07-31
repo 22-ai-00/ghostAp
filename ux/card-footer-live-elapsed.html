@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GhostAP · 实时任务耗时页脚</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f4f6f8;
+      --card: #ffffff;
+      --text: #1f2329;
+      --muted: #646a73;
+      --line: #dee0e3;
+      --blue: #3370ff;
+      --green: #34a853;
+      font-family: Inter, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--canvas);
+      color: var(--text);
+      padding: 40px 20px;
+    }
+    main { width: min(920px, 100%); margin: 0 auto; }
+    h1 { margin: 0 0 8px; font-size: 26px; letter-spacing: -0.02em; }
+    .intro { margin: 0 0 28px; color: var(--muted); line-height: 1.6; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(270px, 1fr));
+      gap: 18px;
+    }
+    .case-label {
+      margin: 0 0 8px 4px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .card {
+      overflow: hidden;
+      background: var(--card);
+      border: 1px solid rgba(31, 35, 41, 0.08);
+      border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(31, 35, 41, 0.06);
+    }
+    .header {
+      padding: 14px 16px;
+      background: linear-gradient(135deg, #eaf1ff, #f5f8ff);
+      border-left: 4px solid var(--blue);
+      font-weight: 650;
+    }
+    .header.done {
+      background: linear-gradient(135deg, #eaf8ef, #f4fbf6);
+      border-left-color: var(--green);
+    }
+    .body { min-height: 118px; padding: 18px 16px; line-height: 1.55; }
+    .status { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    .footer {
+      margin: 0 16px;
+      padding: 11px 0 13px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .elapsed {
+      color: #4e5969;
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum";
+      white-space: nowrap;
+    }
+    .note {
+      margin-top: 22px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: #fff;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+    code {
+      padding: 2px 5px;
+      border-radius: 4px;
+      background: #f2f3f5;
+      color: #2b2f36;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>实时任务耗时页脚</h1>
+    <p class="intro">耗时始终固定在卡片页脚；内容更新时同步刷新，终态后冻结。固定宽度数字避免秒数变化引起视觉跳动。</p>
+
+    <section class="grid">
+      <div>
+        <p class="case-label">运行中 · 随卡片更新</p>
+        <article class="card">
+          <div class="header">正在实现实时耗时</div>
+          <div class="body">
+            正在运行相关测试并更新卡片内容。
+            <div class="status">🔄 执行中 · 工具调用 4/7</div>
+          </div>
+          <footer class="footer">🔧 Codex · 🧩 gpt-5.6 · <span class="elapsed">⏱ 用时 00:07:42</span></footer>
+        </article>
+      </div>
+
+      <div>
+        <p class="case-label">已完成 · 最终值冻结</p>
+        <article class="card">
+          <div class="header done">任务执行完成</div>
+          <div class="body">
+            所有回归测试已经通过。
+            <div class="status">✅ 已完成</div>
+          </div>
+          <footer class="footer">🔧 Codex · 🧩 gpt-5.6 · <span class="elapsed">⏱ 用时 00:12:08</span></footer>
+        </article>
+      </div>
+
+      <div>
+        <p class="case-label">跨天任务 · 天为最大单位</p>
+        <article class="card">
+          <div class="header">长时间任务仍在运行</div>
+          <div class="body">
+            正在等待外部验收结果。
+            <div class="status">⏳ 等待确认</div>
+          </div>
+          <footer class="footer"><span class="elapsed">⏱ 用时 2天 03:04:05</span></footer>
+        </article>
+      </div>
+    </section>
+
+    <div class="note">
+      格式契约：不足一天使用 <code>HH:MM:SS</code>；达到一天使用 <code>N天 HH:MM:SS</code>。
+      不创建独立秒级心跳，只在卡片原本发生更新时重算，从而保持实时感并避免额外飞书 API 压力。
+    </div>
+  </main>
+</body>
+</html>

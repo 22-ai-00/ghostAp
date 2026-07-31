@@ -8,6 +8,7 @@ from ...ui_text import UI_TEXT
 from ..button_intent import ButtonIntent
 from ..models import ButtonSpec, CardState, FooterState
 from ._shared import build_header
+from .lifecycle import _compute_duration
 
 # Reuse retry actions for restart button on rejection
 _RETRY_ACTIONS: dict[str, str] = {
@@ -66,7 +67,13 @@ def reduce_approval(state: CardState, event: CardEvent) -> CardState:
                 terminal="cancelled",
                 terminal_reason="rejected",
                 header=header,
-                footer=FooterState(status_text=UI_TEXT["card_lifecycle_cancelled_status"]),
+                footer=FooterState(
+                    status_text=UI_TEXT["card_lifecycle_cancelled_status"],
+                    duration_seconds=_compute_duration(
+                        state,
+                        event.payload.get("_now"),
+                    ),
+                ),
                 buttons=reject_buttons,
             )
 

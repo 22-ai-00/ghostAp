@@ -435,7 +435,7 @@ def test_programming_pipeline_preserves_rich_state_and_finishes_channel_stream()
         assert "Read" in rendered_history
         assert "正在分析普通编程模式。" in rendered_history
         assert "流式更新已完成。" in rendered_history
-        assert "✅ 0m00s" in rendered_history
+        assert "⏱ 用时 00:00:00" in rendered_history
         assert channel.element_updates
         assert channel.finishes
 

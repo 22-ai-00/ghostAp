@@ -23,6 +23,7 @@ from ..models import (
     WorktreeUnitsBlock,
 )
 from ._shared import build_header
+from .lifecycle import _compute_duration
 
 
 def _is_model_select_action(action: str) -> bool:
@@ -201,7 +202,20 @@ def reduce_worktree(state: CardState, event: CardEvent) -> CardState:
                                      status_text=UI_TEXT["worktree_footer_silent"])
             else:
                 footer = FooterState(status="tool_running", progress=progress_text, progress_pct=pct)
-            return replace(state, blocks=(block,), buttons=buttons, footer=footer, header=header, metadata=metadata)
+            terminal = (
+                "running"
+                if state.terminal == "completed_empty"
+                else state.terminal
+            )
+            return replace(
+                state,
+                blocks=(block,),
+                buttons=buttons,
+                footer=footer,
+                header=header,
+                metadata=metadata,
+                terminal=terminal,
+            )
 
         case CardEventType.WORKTREE_MERGE:
             merge_notes = event.payload.get("merge_notes", [])
@@ -316,7 +330,14 @@ def reduce_worktree(state: CardState, event: CardEvent) -> CardState:
                 ButtonSpec(text=UI_TEXT["wt_btn_cancel"], action_id=ButtonIntent.WORKTREE_CANCEL, type="danger"),
             )
             header = _build_worktree_header(state, UI_TEXT["worktree_no_change_subtitle"])
-            footer = FooterState(status="idle", status_text=message)
+            footer = FooterState(
+                status="idle",
+                status_text=message,
+                duration_seconds=_compute_duration(
+                    state,
+                    event.payload.get("_now"),
+                ),
+            )
             return replace(state, blocks=(block,), buttons=buttons, footer=footer, header=header, terminal="completed_empty", metadata=metadata)
 
     return state

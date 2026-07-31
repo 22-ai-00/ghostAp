@@ -10,6 +10,7 @@ from src.card.events.worktree import (
     worktree_progress,
     worktree_tool_select,
 )
+from src.card.render.footer import render_footer
 from src.card.state.button_intent import ButtonIntent
 from src.card.state.models import CardMetadata, CardState
 from src.card.state.reducer import reduce_card_state
@@ -415,6 +416,54 @@ class TestReporterSummaryEndToEnd:
 
 class TestReduceWorktreeCompletedNoChange:
     """Test the WORKTREE_COMPLETED_NO_CHANGE event and its reducer handler."""
+
+    def test_completed_no_change_freezes_total_elapsed(self, monkeypatch):
+        metadata = CardMetadata(
+            engine_type="worktree",
+            session_started_at=100.0,
+        )
+        state = reduce_card_state(None, CardEvent.started(), metadata)
+        event = worktree_completed_no_change([], message="无变更")
+        event = CardEvent(
+            type=event.type,
+            payload={**event.payload, "_now": 158.0},
+        )
+
+        state = reduce_card_state(state, event)
+        monkeypatch.setattr(
+            "src.card.render.footer.time.monotonic",
+            lambda: 999.0,
+        )
+        content = "\n".join(
+            element.get("content", "")
+            for element in render_footer(state)
+        )
+
+        assert state.footer.duration_seconds == 58.0
+        assert "⏱ 用时 00:00:58" in content
+
+    def test_progress_resumes_completed_no_change_state(self):
+        metadata = CardMetadata(
+            engine_type="worktree",
+            session_started_at=100.0,
+        )
+        state = reduce_card_state(None, CardEvent.started(), metadata)
+        completed = worktree_completed_no_change([], message="无变更")
+        state = reduce_card_state(
+            state,
+            CardEvent(
+                type=completed.type,
+                payload={**completed.payload, "_now": 158.0},
+            ),
+        )
+
+        state = reduce_card_state(
+            state,
+            worktree_progress([{"name": "U1", "status": "running"}]),
+        )
+
+        assert state.terminal == "running"
+        assert state.footer.duration_seconds is None
 
     def test_event_factory_creates_correct_type(self):
         event = worktree_completed_no_change(
