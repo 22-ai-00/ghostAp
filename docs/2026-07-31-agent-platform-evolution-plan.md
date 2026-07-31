@@ -2,31 +2,61 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development`（推荐，同一会话并行）或 `executing-plans`（独立会话）逐任务实施；每个行为变更使用 `test-driven-development`。执行时把任务内的编号步骤复制为可勾选工作清单。
 
-**Goal:** 在不牺牲普通 Agent 直连编程、Deep 与 Spec 成熟路径的前提下，把 GhostAP 演进为一个飞书原生的 Agent Department 平台：既能稳定连接多种 Agent，也能以可恢复、可审计、可授权的方式编排 Agent，并允许 Agent 在明确边界内主动工作。
+**Goal:** 在不牺牲普通 Agent 直连编程、Deep 与 Spec 成熟路径的前提下，把 GhostAP 演进为一个飞书原生的 Agent Department 平台：既能稳定连接多种 Agent，也能以可恢复、可审计且默认低打扰的方式编排 Agent，并允许 Agent 在绑定项目内主动工作。
 
-**Architecture:** 采用“一个控制面、三条执行通道、一个耐久安全内核”。普通编程保持零额外 LLM 跳数的 Direct Lane；Deep/Spec 作为 Protected Strategy Lane 保持现有实现和交互；Worktree/Workflow/Team/Slock 作为 Development Lane，优先承接统一 Agent 能力目录、类型化编排 IR、耐久调度和主动触发的演进。三条通道共享只读任务视图、控制协议、策略门、审计事件和 Agent 后端能力目录，但不强制共享内部执行算法。
+**Architecture:** 采用“一个控制面、三条执行通道、一个耐久正确性内核、三个信任域”。普通编程保持零额外 LLM 跳数的 Direct Lane；Deep/Spec 作为 Protected Strategy Lane 保持现有实现和交互；Worktree/Workflow/Team/Slock 作为 Development Lane，优先承接统一 Agent 能力目录、类型化编排 IR、耐久调度和主动触发的演进。三条通道共享只读任务视图、控制协议、Journal/Effect、预算、停止、恢复和 Agent 后端能力目录，但不强制共享内部执行算法，也不在 GhostAP 自建 Agent 群内重复做逐消息授权。
 
 **Tech Stack:** Python 3.11+、`uv`、Pydantic、frozen dataclass、现有 ACP/CLI 传输、Node.js Workflow DSL、Feishu `lark-oapi` / `lark-channel-sdk`、现役 Journal/Blob/Vault 与待收敛的 production Policy/Dispatch ports、pytest、ruff。
 
 **Status:** 仅为实施计划；本轮未授权生产代码、配置、运行时或卡片行为变更。
 
-**Deployment assumption:** 当前只有 Owner 自己在一台受信主机上使用 GhostAP。功能通过对应的自动化合同、安全和恢复测试后，立即在 Owner 的正常菜单或命令中可见、可体验；本计划不建设按租户灰度、Beta/RC/production 晋级、长观察窗口、发布 allowlist 或签名发布证据包。
+**Deployment assumption:** 当前只有 Owner 自己在一台受信主机上使用 GhostAP，易用性高于面向未知租户的防御深度。功能通过对应的自动化合同、正确性和恢复测试后，立即在 Owner 的正常菜单或命令中可见、可体验；本计划不建设多租户 ACL、按租户灰度、Beta/RC/production 晋级、长观察窗口、发布 allowlist 或签名发布证据包。
 
 ---
 
 ## 中文执行摘要
 
-### 单用户直接体验约束
+### 单用户、易用性优先约束
 
-这条约束覆盖既有计划中的发布节奏设计，但不降低工程正确性和安全边界：
+这条约束覆盖既有计划中的发布节奏和重型安全设计。首要产品指标是：**Owner 在正常编程路径和 GhostAP 自建 Agent 群中不被权限提示打断。**
 
 - **完成即开放：** 一个功能完成相关自动化合同/故障测试和最小 Owner smoke 后，直接对当前 Owner 开放，不再等待灰度、放量、版本晋级或人工设备验收。
 - **标签只表达完成度：** `mature`、`developing`、`not_implemented` 只帮助 Owner 理解能力成熟度，不控制菜单曝光，也不形成发布状态机。
 - **开关只用于止损：** 每个新子系统最多保留一个紧急关闭/回退开关；开关不能演化成租户分组、百分比放量或多级发布配置。
 - **开放后继续验真：** 桌面/移动端卡片、长时间运行和更高容量属于开放后的体验/诊断清单；发现问题直接修复或紧急回退，不反向建设发布流程。
 - **短时 dry-run 仍保留：** IR compiler、迁移 comparator、恢复演练和离线 replay 是工程验证步骤，不是线上观察期；一旦对应检查通过，不再人为延迟 Owner 使用。
-- **单用户不等于无权限：** 主 Bot 可能收到群成员、外部事件和 Agent 生成内容。Owner 身份、项目/聊天范围、数据外发、预算、审批、Effect 锚定、kill、备份和恢复仍是硬边界。
-- **内部命名空间可以保留：** `tenant_key` 可作为当前部署的固定安全/恢复命名空间，防止事件、Artifact 和授权串线；它不再是发布或功能开放维度。
+- **权限只在边界处判断一次：** Owner 私聊在入站时确认 Owner 身份；GhostAP 自建群在建群/绑定项目时取得持久 `ProjectGrant`；后续消息和每个 Run 不再重复审批。
+- **正确性保护不等于权限摩擦：** Journal、Effect 锚定、幂等、预算、deadline、真实取消、kill、备份和恢复继续是硬合同，因为它们防止重复执行、失控和数据损坏，而不是为了多租户合规。
+- **固定命名空间不是授权系统：** `tenant_key` 如为兼容旧 Journal/Blob 路径所需可以暂留为常量，但不参与用户授权、Artifact ACL、路由或功能开放。
+
+### 三个信任域
+
+`TrustZoneResolver` 在每个消息或卡片 callback 进入控制面时解析一次信任域；下游 Run、Artifact 和 Agent 调用携带不可变结果，不再层层重新做 Principal/ACL 校验。真正派发 Effect 前只静默比较当前 group/grant revision、pause 和 kill，防止 stale callback；这不会产生用户确认。
+
+| 信任域 | 判定方式 | 默认体验 | 能力边界 |
+| --- | --- | --- | --- |
+| `OWNER_P2P` | 私聊且发送者是配置的唯一 Owner | Direct/Deep/Spec/管理命令均直接执行，不做逐动作审批 | 可创建/修改群项目授权、配置凭据与 Backend、执行宿主级动作和关闭/恢复系统 |
+| `MANAGED_AGENT_GROUP` | GhostAP/Employee 创建并持久登记 `chat_id + owner_id + project_id + canonical_root` | Owner 可直接发起项目读写、Backend 工具/Shell/测试、Worktree/Workflow/Team/Slock、本地 Git 和项目 Trigger；已注册 Employee 零提示继续既有 assignment；不做逐 Run 审批 | Agent 不能自行扩大项目根、limits、Backend/远端目标或系统权限；超出授权时一次性引导 Owner 到私聊调整 |
+| `EXTERNAL_OR_UNKNOWN_GROUP` | 不在受管群登记中 | 不执行命令；只给简短说明 | Owner 可在私聊中一次性导入并绑定项目，之后转为受管群 |
+
+受管群的信任来自 GhostAP 的建群记录和项目绑定，而不是可编辑的用户/群 allowlist。可发起执行的 actor 只有固定 Owner 和 Employee registry 中的 Bot；意外加入的其他成员消息不创建 Run，也不进入 Agent 上下文，但不会冻结整群或打断 Owner，成员变化只记一次审计事件。若未来出现真实多人协作需求，再单独增加成员角色，不把未发生的多租户场景预埋进首版。
+
+### 零打扰动作矩阵
+
+| 动作 | Owner 私聊 | Owner 在受管群明确要求 | Employee/Trigger 在受管群派生 | 外部群/未知成员 |
+| --- | --- | --- | --- | --- |
+| Direct/Deep/Spec、读项目、生成方案 | 直接执行 | 直接执行 | 只继续既有 assignment；不进入 Owner 的 Direct session | 不执行 |
+| 项目文件读写/删除、测试/构建、Backend 项目工具 | 直接执行 | 直接执行 | 直接执行 | 不执行 |
+| Workflow/Team/Slock/Worktree、Agent handoff | 直接执行 | 直接执行 | 直接执行 | 不执行 |
+| 本地 branch/commit/merge | 直接执行 | 直接执行 | 直接执行；受 limits、done criteria 和 kill 约束 | 不执行 |
+| 项目 Trigger 的创建/修改/暂停/run-now | 直接执行 | 直接执行 | 只可提交草案或操作当前已分配 Run，不能自行创建永久 Trigger | 不执行 |
+| push/PR/外部 API/deploy | 明确要求即执行，不二次确认 | 明确要求即执行，不二次确认 | 仅对 `connected_target_refs` 自动执行；否则 `DENY + 摘要` | 不执行 |
+| `/hire`、`/fire`、群成员或 Employee 全局配置 | 直接执行并审计 | 引导到 Owner 私聊 | 不执行 | 不执行 |
+| 改项目根、增加 connected target、配置凭据/Backend、群权限、原始 Host Shell、系统设置 | 直接执行并审计 | 引导到 Owner 私聊，不生成 approval | 不执行 | 不执行 |
+
+这不是“默认拒绝后不断申请”的模型，而是“一次建群/绑定，后续项目内自治”的模型。卡片默认展示当前项目和预算，不展示冗余权限状态；只有越界、预算耗尽、unknown Effect 或失败才打断 Owner。
+
+`ProjectGrant.canonical_root` 是路由、cwd、上下文选择和意图边界，不伪称 OS filesystem sandbox。已配置 Backend 在受信工程主机上运行项目工具时可能具有更广的宿主能力；当前单 Owner profile 接受这项信任。原始管理员 Host Shell 仍只在 Owner 私聊开放，未来可选 `bwrap`/容器仅作 hardening，不作为群内 Agent 可用性的前置。
 
 ### 核心判断
 
@@ -44,7 +74,7 @@ GhostAP 当前不是“缺少 Agent 能力”，而是已经拥有多套较强�
 1. **Agent 接入闭环**：增加一个 Agent 后端时，只需要声明能力、实现一个驱动并通过一致性测试，不再修改多个引擎中的 `if agent_type == ...`。
 2. **编排闭环**：把开发中的 Workflow、Team、Slock 和 Worktree 接到同一个可恢复任务/产物/Effect 模型上，同时保留它们各自的产品职责。
 3. **主动工作闭环**：由耐久 Trigger 产生有权限边界、有预算、有截止时间、有去重键的 Goal/Run，而不是让 Agent 无限制轮询或“自己决定一直干活”。
-4. **产品闭环**：用户看到的是项目、员工、团队、任务、审批和审计；Agent 后端、模型和执行策略仍然可直接选择，但不再成为彼此冲突的顶层产品分类。
+4. **产品闭环**：用户看到的是项目、员工、团队、任务、自动化和审计；Agent 后端、模型和执行策略仍然可直接选择，但不再成为彼此冲突的顶层产品分类，也不把“审批中心”当作个人工具的默认心智。
 
 ### 必须保护的成熟路径
 
@@ -64,17 +94,17 @@ GhostAP 当前不是“缺少 Agent 能力”，而是已经拥有多套较强�
 
 ### 推荐的产品北极星
 
-> GhostAP 是一个飞书/Lark 原生的 Agent Department Gateway。人可以直接与一个 Agent 编程，也可以雇佣有独立身份和长期上下文的员工，把复杂目标交给团队或工作流，并在审批、预算、审计和恢复边界内让这些 Agent 主动工作。
+> GhostAP 是一个飞书/Lark 原生的 Agent Department Gateway。Owner 可以直接与一个 Agent 编程，也可以雇佣有独立身份和长期上下文的员工，把复杂目标交给团队或工作流；GhostAP 自建群默认拥有绑定项目内的工作能力，Agent 在预算、停止、审计和恢复边界内主动推进，只在真正越界或失败时打断 Owner。
 
 这一定义同时容纳三种用户心智：
 
 - “我现在就要和 Codex 直接写代码。”
 - “这个复杂问题交给 Deep/Spec，或者让一组 Agent 编排完成。”
-- “持续关注这个目标，条件满足后主动处理，只在例外或高风险动作时找我。”
+- “持续关注这个目标，条件满足后主动处理；项目内直接做，越出项目或要扩大权限时再找我。”
 
 ### 与既有计划的关系
 
-本计划不是对 [`docs/2026-07-30-ghostap-product-convergence-plan.md`](./2026-07-30-ghostap-product-convergence-plan.md) 的重复。该计划解决的是产品合同、访问控制、统一上下文/路由/任务控制、运行生命周期和恢复等基础收敛问题；其中 Task 1–24 仍应被视为本计划的 **Foundation Track**。原 Task 25 的签名租户 Beta Gate 不再是前置，Task 26 只保留本机切换、回退和验证，不做分批发布。
+本计划不是对 [`docs/2026-07-30-ghostap-product-convergence-plan.md`](./2026-07-30-ghostap-product-convergence-plan.md) 的重复。该计划仍是产品合同、上下文/路由/任务控制、运行生命周期和恢复的 **Foundation 参考来源**，但不能整包照搬。只有依赖账本标为 `active` 或 `folded` 的 Task 1–24 步骤继续进入当前路线；`superseded`/`deferred` 的 flat allowlist、重型 ACL、sandbox 首发门槛和相关测试禁止重新引入。原 Task 25 的签名租户 Beta Gate 不再是前置，Task 26 只保留本机切换、回退和验证，不做分批发布。
 
 本计划在其上新增三类内容：
 
@@ -144,9 +174,9 @@ GhostAP 当前不是“缺少 Agent 能力”，而是已经拥有多套较强�
 | Employee Runtime | Hire、独立 Bot、Vault、Channel 子进程、Actor、上下文、恢复 | **单机运行架构已成形** | 当前 Owner 环境的端到端验证、运维可见性和故障恢复体验 |
 | Team v2 | `TeamCoordinatorActor`、冻结模型、投影、加密 Blob、边界限制 | **开发中/试运行** | 有限阶段机，不是通用 DAG；与 Slock/Workflow 职责重叠 |
 | Slock | 分类、自动解析、activation guard、任务队列、群协作上下文 | **开发中/兼容层** | 与 Employee Team 的事实源、调度和任务模型重复 |
-| Autonomous 安全内核 | 现役 Journal/Vault/frozen domain，加上 Effect/Policy/Dispatch 原型 | **架构强项但尚未全线接通** | 生产 Employee 使用独立 dispatch coordinator；旧 Gate/Policy/Manager/Scheduler 不可直接当作生产事实 |
-| 主动 Trigger | Trigger/Subscription/Scheduler 类型和局部实现 | **未形成生产闭环** | cron 求值、投影恢复、去重、misfire、生产 composition、权限包络 |
-| 产品控制面 | 飞书命令、卡片、主 Bot、员工 Bot | **功能多但表面分散** | 项目/员工/团队/任务/审批视图未完全成为统一产品入口 |
+| Autonomous 耐久内核 | 现役 Journal/Vault/frozen domain，加上 Effect/Policy/Dispatch 原型 | **架构强项但尚未全线接通** | 生产 Employee 使用独立 dispatch coordinator；旧 Gate/Policy/Manager/Scheduler 不可直接当作生产事实，旧 approval Policy 不进入新路线 |
+| 主动 Trigger | Trigger/Subscription/Scheduler 类型和局部实现 | **未形成生产闭环** | cron 求值、投影恢复、去重、misfire、生产 composition、受管群项目授权 |
+| 产品控制面 | 飞书命令、卡片、主 Bot、员工 Bot | **功能多但表面分散** | 项目/员工/团队/任务/自动化/审计视图未完全成为统一产品入口 |
 | 本机体验验证 | 大量单元/集成/chaos/acceptance 测试 | **自动化证据强** | 需补 Owner 飞书端到端、桌面/移动端、重启与备份恢复清单 |
 
 ### 2.2 Agent 接入层的真实状态
@@ -186,7 +216,7 @@ Team v2 已有更强的耐久 Actor 与投影，但它采用有界的 planning �
 - `src/autonomous/scheduler/triggers.py` 仍以进程内可变映射为主，`schedule_cron` 与 `next_fire_at` 尚未构成完整的耐久 cron 语义。
 - `src/autonomous/domain/goals.py` 已有 `TriggerSubscription`，但“订阅 → occurrence → admission → plan → run → notification”的生产组合路径仍不完整。
 - 较早的 `src/autonomous/coordinator.py`、`bootstrap.py`、manager-only 配置与新的 Employee production composition 并存。
-- Policy/standing order 的概念已有实现，但尚未成为所有主动 Effect 的统一生产门。
+- 旧 Policy/standing-order 原型仍在仓库中，但不适合当前单 Owner 产品；新路线只复用 Journal/Effect/Vault，授权改为受管群 ProjectGrant + 无交互动作矩阵。
 
 所以当前可以说“有自主系统的内核和大量零件”，不能说“Agent 已经可以在生产中按计划或事件长期主动完成目标”。
 
@@ -206,13 +236,13 @@ Team v2 已有更强的耐久 Actor 与投影，但它采用有界的 planning �
 
 一个擅长“怎么组织 Agent”，另一个擅长“如何保证状态、Effect 和恢复可信”。二者尚未通过稳定的端口连接，导致编排丰富性和生产可靠性无法同时成立。
 
-### 根因 D：主动触发尚未走完同一条准入和权限路径
+### 根因 D：主动触发尚未走完同一条耐久准入路径
 
-如果定时器、事件监听器或 Agent 自己能绕过人工入口直接创建工作，就会形成第二套安全模型。主动工作必须与人工任务共享 admission、policy、budget、approval、journal 和 kill switch。
+如果定时器、事件监听器或 Agent 自己能绕过现役 Run/Journal 直接创建工作，就会形成第二套易丢失、易重复的执行模型。主动工作必须与人工任务共享 admission、ProjectGrant、budget、journal、Effect 和 kill switch；`MANAGED_AGENT_GROUP` 的项目授权在入口解析一次，不能在每次触发、节点或 Effect 上重新弹出审批。
 
 ### 根因 E：产品能力和内部技术分类仍然靠命令堆叠暴露
 
-用户真正关心的是“找谁做、做什么、做到哪、能否停、为何需要我批准”，而不是内部使用了 ACP、CLI、Workflow 还是 Team Coordinator。技术入口可以保留给高级用户，但默认产品表面需要围绕项目、员工、团队、任务、审批和审计收敛。
+用户真正关心的是“找谁做、做什么、做到哪、能否停、是否越界”，而不是内部使用了 ACP、CLI、Workflow 还是 Team Coordinator。技术入口可以保留给高级用户，但默认产品表面需要围绕项目、员工、团队、任务、自动化和审计收敛；正常项目工作不应以“待审批”作为主要状态。
 
 ### 根因 F：自动化正确性证据很强，Owner 真实体验证据仍不足
 
@@ -223,9 +253,9 @@ Team v2 已有更强的耐久 Actor 与投影，但它采用有界的 planning �
 ## 4. 目标架构：一个控制面，三条执行通道
 
 ```text
-Feishu/Lark Events + Human Commands + Approved Triggers
+Feishu/Lark Events + Human Commands + Durable Triggers
                          |
-                  Effective Context
+          TrustZoneResolver + Effective Context
                          |
                  Immutable RouteDecision
                          |
@@ -242,9 +272,9 @@ Feishu/Lark Events + Human Commands + Approved Triggers
           Agent Backend Capability Catalog
                          |
        Session Factory / Backend Drivers
-          ACP | CLI | approved remote
+          ACP | CLI | configured remote
                          |
-      Policy + Budget + Effect Dispatch Gate
+     ProjectGrant + Budget + Effect Dispatch Gate
                          |
        Journal + Blob + Vault + Projections
                          |
@@ -284,19 +314,19 @@ Slock 不再发展第二个调度内核；Workflow 不再自有另一套真相 J
 
 ### 4.4 主动工作不是第四个 Engine
 
-主动工作是任务的**来源和授权方式**，不是另一套执行算法：
+主动工作是任务的**来源**，不是另一套执行算法，也不是每次执行都重新申请权限的理由：
 
 ```text
 TriggerDefinition
     -> TriggerOccurrence (dedupe_key, observed_at)
     -> AdmissionDecision
-    -> GoalTemplate + AuthorityEnvelope
+    -> GoalTemplate + ProjectGrant reference
     -> Direct single-node / Workflow plan / Team run
-    -> Policy check for every external Effect
-    -> Result / Exception / Approval / Digest
+    -> scope/budget check + anchored Effect dispatch
+    -> Result / Exception / Digest
 ```
 
-这样同一个目标既可由人立即触发，也可由 cron、飞书事件、代码仓库事件或人工批准后的 standing order 触发；后续执行、停止、审计和恢复完全一致。
+这样同一个目标既可由人立即触发，也可由 cron、飞书事件或代码仓库事件触发；在受管群绑定项目内，人工和主动任务使用同一个持久 `ProjectGrant`，后续执行、停止、审计和恢复完全一致。只有扩大项目根、增加 Backend/远端目标或修改系统权限时，才回到 Owner 私聊修改授权。
 
 ---
 
@@ -363,6 +393,21 @@ Team Coordinator 负责计划 patch、资源和收敛；Employee 之间允许有
 
 当前明确采用单 Owner、单主机部署，不应为多副本提前重写。若未来真实容量或可用性需求超过单机边界，多副本应另立计划，要求外部协调、共享耐久存储、KMS/workload identity 和故障注入；不能通过在共享目录上启动两个进程来声称实现。
 
+### 5.7 权限模型：逐动作审批、群级信任还是全局放开
+
+| 方案 | 易用性 | 主要问题 | 结论 |
+| --- | --- | --- | --- |
+| 多租户 ACL + 每 Run/Effect 审批 | 最差 | 在个人工具中制造大量无价值提示，阻碍 Agent 主动工作 | 删除 |
+| 全部聊天和群全局放开 | 最好 | 外部群或误加 Bot 时可越出预期项目 | 不采用 |
+| Owner 私聊 + 受管群一次性项目授权 + 外部群不执行 | 高 | 需要可靠记录建群来源和 canonical project root | **推荐** |
+
+推荐模型只保留两个执行能力级别：
+
+- `PROJECT_WORKSPACE`：受管群内自动允许项目读写、测试、构建、受限于 canonical root 的 Shell、编排、本地 Git，以及 `ProjectGrant` 已登记的远端目标。
+- `OWNER_UNRESTRICTED`：仅 Owner 私聊可用，用于改授权、凭据、Backend、系统设置和项目外宿主动作。
+
+协调器、分类器和摘要器使用 `AUXILIARY_DENY_ALL`，因为它们只需要返回结构化判断；这是一项非交互式实现约束，不会给 Owner 增加确认步骤。OS sandbox、网络 egress allowlist、签名插件和对象级 ACL 只属于未来多人/Hardened Profile，不是当前主动 Agent 的启用前置。
+
 ---
 
 ## 6. 能力边界与天花板
@@ -372,6 +417,7 @@ Team Coordinator 负责计划 patch、资源和收敛；Employee 之间允许有
 | 维度 | 当前边界 | 含义 |
 | --- | --- | --- |
 | 部署 | 内置单主机 profile | 不能声称跨机房或多副本线性一致 |
+| 信任 | 单 Owner + 受管群项目授权 | 不提供多人角色 ACL；外部群必须先由 Owner 私聊导入 |
 | Employee 可见规模 | 默认配置为 8 | 是安全默认值，不是压测得出的容量上限 |
 | Team run | turn 12、assignment 32、fanout 4、handoff 8 | 是防失控硬边界，不代表质量最优点 |
 | Workflow | host 侧总 Agent 调用上限 200；loop/generate 上限 50 | 是单 run 防爆炸上限，不是推荐规模 |
@@ -387,8 +433,8 @@ Team Coordinator 负责计划 patch、资源和收敛；Employee 之间允许有
 - 一个用户仍可直接选择任意已注册 Agent 进行低摩擦编程。
 - 新 Backend 可以通过一个 family/binding 声明、driver 和 conformance suite 接入。
 - Workflow/Team/Slock/Worktree 的任务在重启后有可信状态，并能从统一入口查看、停止和恢复。
-- cron、飞书事件和批准的外部事件可以创建去重的主动任务。
-- 每个主动任务都有 owner、authority、预算、截止时间、通知策略和 kill switch。
+- cron、飞书事件和已登记来源可以创建去重的主动任务。
+- 每个主动任务继承受管群的 project grant，并有预算、截止时间、通知策略和 kill switch；项目内不再逐 Run 确认。
 - 本机端到端清单能诚实区分“通过、失败、未测试”，并可一键关闭新子系统而不影响 Direct/Deep/Spec。
 
 ### 6.3 单机架构的实际天花板
@@ -413,7 +459,7 @@ min(
 - 远端 Agent 或 Shell 已执行的副作用通常不能自动回滚。
 - 不同 provider 不保证相同工具、上下文、模型名称或可续接语义。
 - Agent 之间自然语言交接会丢失信息；必须使用 Artifact schema 和验收标准降低风险。
-- LLM 协调器不能替代权限系统；“它认为安全”不是授权。
+- LLM 协调器不能扩大 `ProjectGrant`；“它认为应该访问另一个目录/远端”不构成扩权。
 - 无限循环、无限 fanout 和无预算主动任务不能成为生产能力。
 - 在 file-only 单机 profile 下，无法诚实承诺跨副本共识、区域容灾或外部防回滚。
 
@@ -465,7 +511,7 @@ Phase A：Agent Connectivity   Phase B1：统一 Run/IR 编译合同
                 Phase E：本机体验、恢复与运维
 ```
 
-Phase A 的静态 catalog 和 Phase B 的只读 RunView 可以并行；任何主动触发都必须等待耐久 Run、Policy、Effect 和 kill switch 可用。
+Phase A 的静态 catalog 和 Phase B 的只读 RunView 可以并行；任何主动触发都必须等待耐久 Run、ProjectGrant、Effect、预算和 kill switch 可用。
 
 ### 7.2 工程检查点
 
@@ -473,12 +519,12 @@ Phase A 的静态 catalog 和 Phase B 的只读 RunView 可以并行；任何主
 
 | Checkpoint | 必须回答的问题 | 完成条件 | 未完成时 |
 | --- | --- | --- | --- |
+| CP-T：信任域 | 系统能否一次判断 Owner 私聊、受管群和外部群 | 受管群 provenance/project root 持久化；项目内零权限提示；外部群零执行；越界只引导私聊 | 不启用群内自动执行 |
 | CP-P0：保护基线 | Direct/Deep/Spec 的真实合同是什么 | 字符化测试通过；无额外 LLM hop；已知“显示成功但实际未执行”问题被修复或禁用 | 不迁移成熟路径 |
 | CP-A：Backend Catalog | catalog 是否比散落分支更真实 | 所有内建 Backend 通过 conformance；显式选择不会静默 fallback | 保留兼容工厂为 SSOT |
 | CP-B-Compile：IR 编译 | IR v2 能否在零 dispatch 下被确定性验证 | schema、compiler、预算、单一生成源、unsupported fallback 和零外部调用测试通过 | v1 继续可用，v2 不执行 |
 | CP-B-Execute：耐久执行 | 恢复后是否会重复或遗漏 Effect | kill/restart/unknown Effect/cancel acknowledgment 和 schema migration 测试通过 | IR 不驱动外部写操作 |
-| CP-C-Assist：主动只读 | Trigger 是否能安全地产生只读任务 | occurrence 去重、TTL、预算、owner、data egress、pause/kill、quiet hours 全部通过 | 仅允许手工触发 |
-| CP-C-Write：Owner 确认写入 | 是否可以执行 Owner 明确批准的可逆写操作 | 每 Run 确认、risk gate、nonce、审计、Effect 锚定和例外通知通过 | 保持 assist/read-only |
+| CP-C-Managed：受管群主动执行 | Trigger 是否能在已绑定项目内无人值守推进 | occurrence 去重、ProjectGrant、limits、deadline、pause/kill、Effect 锚定、通知合并和 restart 全部通过 | 仅允许群内手工任务，不增加逐 Run approval |
 | CP-E：Owner 运维闭环 | 已开放能力是否能持续使用和恢复 | 每项开放前最小 smoke 通过；开放后清单持续记录桌面/移动端、重启/备份恢复和紧急回退 | 记录为需修复缺陷或回退对应子系统，不伪报完成 |
 
 CP-E 是跨功能的持续运维清单，不是第二道总发布门；它不能延迟已经通过自身检查点和最小 smoke 的能力。
@@ -489,18 +535,19 @@ CP-E 是跨功能的持续运维清单，不是第二道总发布门；它不能
 
 | 本计划依赖 | 对应既有任务 | 最低要求 |
 | --- | --- | --- |
-| 产品与信任边界 | Task 1–8 | 明确 trusted engineering host、入口权限、Employee enablement 和 topic routing |
+| 产品与信任边界 | Task 1–8 | 明确 Owner 私聊、受管群、外部群、Employee enablement 和 topic routing |
 | 统一产品控制面 | Task 9–13 | action catalog、effective context、RouteDecision、task read/control |
 | 共享运行合同 | Task 14–20 | backend catalog/session request、run lifecycle、WT/WF 恢复正确性 |
-| 运维与本机体验 | Task 21–24、Task 26 的本机部分 | legacy quarantine、doctor、backup、可选 sandbox、本机切换与回退 |
+| 运维与本机体验 | Task 21–24、Task 26 的本机部分 | legacy isolation、doctor、backup、本机切换与回退；sandbox 仅为可选 hardened 能力 |
 
 原 Task 25 的签名 Beta Gate 不实施；Task 26 中按租户或阶段切流的内容删除，只保留当前部署的一次启用、兼容回退和验证。
 
-若既有任务尚未实施，执行者应直接使用既有计划中的测试和文件步骤。本计划只在以下地方覆盖它：
+若既有任务尚未实施，执行者先查依赖账本：只有标为 `active`/`folded` 的部分可以复用既有计划中的文件和测试步骤，并且必须按本计划的三信任域/零提示合同改写；`superseded`/`deferred` 步骤不得照搬。本计划特别覆盖：
 
 - Direct/Deep/Spec 为保护路径；不能为了“统一”修改内部算法。
 - Workflow/Worktree/Team/Slock 是新合同首批试点。
 - 任何发现的新高正确性或安全问题必须在扩展能力前修复。
+- Foundation 中与多租户 ACL、逐消息授权、逐 Run approval、网络沙箱首发门槛相关的要求由本计划替换为三信任域合同；不要把旧重型门禁继续作为实施前置。
 
 ---
 
@@ -508,7 +555,7 @@ CP-E 是跨功能的持续运维清单，不是第二道总发布门；它不能
 
 **目标：** 先消除“UI/文案承诺与实际执行不一致”，建立后续重构不可突破的基线。
 
-**预计投入：** 15–25 engineer-days。这里的工作是后续平台化的准入门，不是可选 polish。
+**剩余投入：** 7–11 engineer-days。0.4–0.7 已有完成证据；重点是 0.1–0.3 的未闭环项与新增 0.8–0.10/CP-T。
 
 ### Task 0.1：建立执行通道完成度与产品合同
 
@@ -781,7 +828,7 @@ uv run pytest tests/test_adaptive_review_pipeline.py tests/test_adaptive_review_
 
 1. Team Coordinator 的 JSON decision session 使用 deny-all tool filter；只允许文本/结构化返回。
 2. Slock intent classifier、NLI 和讨论摘要同样禁止项目工具和 Shell。
-3. `auto_approve=True` 不能单独作为安全策略；session purpose 必须决定权限 profile。
+3. `auto_approve=True` 不能单独描述工具能力；session purpose 必须决定 `AUXILIARY_DENY_ALL` 或项目执行 profile。这个约束在后端自动应用，不产生用户确认。
 4. 如果某个协调任务确需读仓库，使用单独的 read-only context collector，结果作为 Artifact 注入，不能给 coordinator 任意工具。
 
 **Tests first:**
@@ -795,7 +842,7 @@ def test_read_only_context_is_passed_as_data_not_tool_authority(): ...
 **Acceptance:**
 
 - prompt injection 无法让协调/分类 Agent 获得项目写权限。
-- Employee 实际执行权限仍由原有 capability + ACL 组合决定。
+- 本任务只验收 auxiliary deny-all，保持现有完成证据；Employee 的 `ProjectGrant + PROJECT_WORKSPACE` 集成归 0.8/A1/A5/0.10，不能用 0.7 冒充已完成。
 
 **Verify:**
 
@@ -804,6 +851,241 @@ uv run pytest tests/autonomous/security/test_coordinator_tool_filter.py tests/te
 ```
 
 **Commit:** `fix(security): deny tools to coordination-only sessions`
+
+### Task 0.8：定义 TrustZoneResolver、Actor 和无交互 ActionMatrix
+
+**Why now:** 先把“谁从哪里发起什么动作”变成一个确定性结果，替换现有平面 user/chat allowlist。矩阵只有 `ALLOW/DENY`，不产生用户审批。
+
+**Files:**
+
+- Create: `src/trust/models.py`
+- Create: `src/trust/resolver.py`
+- Create: `src/trust/action_matrix.py`
+- Modify: `src/access_control.py`
+- Modify: `src/feishu/route_decision.py`
+- Test: `tests/test_trust_zone_resolver.py`
+- Test: `tests/test_trust_action_matrix.py`
+
+**Required types:**
+
+```python
+class TrustZone(StrEnum):
+    OWNER_P2P = "owner_p2p"
+    MANAGED_AGENT_GROUP = "managed_agent_group"
+    EXTERNAL_OR_UNKNOWN_GROUP = "external_or_unknown_group"
+
+class ActorKind(StrEnum):
+    OWNER = "owner"
+    EMPLOYEE = "employee"
+    UNKNOWN = "unknown"
+
+class ActionKind(StrEnum):
+    PROJECT_READ = "project_read"
+    PROJECT_WRITE = "project_write"
+    PROJECT_TOOL = "project_tool"
+    LOCAL_GIT = "local_git"
+    TRIGGER_CONTROL = "trigger_control"
+    EXTERNAL_MUTATION = "external_mutation"
+    GRANT_ADMIN = "grant_admin"
+    BACKEND_ADMIN = "backend_admin"
+    CREDENTIAL_ADMIN = "credential_admin"
+    HOST_SHELL = "host_shell"
+    SYSTEM_ADMIN = "system_admin"
+
+class ActionTargetKind(StrEnum):
+    CURRENT_PROJECT = "current_project"
+    CONNECTED_TARGET = "connected_target"
+    EXTERNAL = "external"
+    HOST_GLOBAL = "host_global"
+
+class ActionDecision(StrEnum):
+    ALLOW = "allow"
+    DENY = "deny"
+
+class ManagedGroupStatus(StrEnum):
+    ACTIVE = "active"
+    TOMBSTONED = "tombstoned"
+
+class ManagedGroupOrigin(StrEnum):
+    GHOSTAP_CREATED = "ghostap_created"
+    EMPLOYEE_CREATED = "employee_created"
+    OWNER_ADOPTED = "owner_adopted"
+
+@dataclass(frozen=True)
+class ProjectGrant:
+    grant_id: str
+    revision: int
+    owner_id: str
+    managed_group_id: str
+    project_id: str
+    canonical_root_ref: str
+    backend_binding_ids: tuple[str, ...]
+    connected_target_refs: tuple[str, ...]
+
+@dataclass(frozen=True)
+class ManagedGroupRecord:
+    chat_id: str
+    revision: int
+    status: ManagedGroupStatus
+    owner_id: str
+    project_id: str
+    canonical_root_ref: str
+    origin: ManagedGroupOrigin
+    receiving_bot_ref: str
+    project_grant_id: str
+    created_at: datetime
+
+@dataclass(frozen=True)
+class EffectiveTrust:
+    zone: TrustZone
+    actor: ActorKind
+    managed_group: ManagedGroupRecord | None
+    group_revision: int | None
+    grant_revision: int | None
+```
+
+**Implementation:**
+
+1. Resolver 在每个 ingress/action callback 边界解析一次：
+   - Owner 私聊 → `OWNER_P2P/OWNER`；
+   - 受管群中的固定 Owner → `MANAGED_AGENT_GROUP/OWNER`；
+   - 受管群中 Employee registry 的 Bot → `MANAGED_AGENT_GROUP/EMPLOYEE`；
+   - 其他来源/成员 → `EXTERNAL_OR_UNKNOWN_GROUP/UNKNOWN`。
+2. ActionMatrix 按 `zone + actor + ActionKind + ActionTargetKind` 返回 `ActionDecision.ALLOW/DENY`。Owner/Employee 的项目内动作允许；grant/system 管理只允许 Owner 私聊；Owner 在受管群明确请求外部动作时直接允许，不再二次确认；自动外部动作只允许已登记 connected target。Runtime adapter 必须确认真实 ActionKind/target，不能信任 LLM 自报。
+3. Employee Bot 发起协作事件必须携带既有 `run_id + assignment_id + causal_event_id`，只能继续已分配工作，不能继承 Owner 的 grant 管理能力。
+4. `EffectiveTrust` 固化在 immutable context 中；worker/Effect dispatch 只静默比较当前 group/grant revision、kill 和 pause 状态，防止 stale callback，不重新询问用户。
+5. `canonical_root_ref` 是产品范围/cwd，不声称 OS sandbox。当前 trusted-host profile 允许已配置 Backend 的项目工具；原始 Host Shell 仍只在 Owner 私聊。
+
+**Tests first:**
+
+```python
+def test_owner_p2p_and_managed_group_owner_resolve_to_distinct_zones(): ...
+def test_action_matrix_has_only_allow_or_deny_never_ask(): ...
+def test_managed_project_actions_need_no_approval(): ...
+def test_owner_explicit_external_action_in_managed_group_is_not_reconfirmed(): ...
+def test_managed_group_cannot_expand_root_backend_or_connected_targets(): ...
+def test_original_host_shell_and_grant_admin_are_owner_p2p_only(): ...
+def test_employee_bot_requires_existing_causal_assignment(): ...
+def test_stale_group_or_grant_revision_cannot_dispatch(): ...
+```
+
+**Acceptance:**
+
+- 相同输入总是得到相同 trust/action 决策，且永远没有 `ASK`。
+- 当前 Owner 明确请求的动作不出现二次确认。
+- 受管群 Agent 不能修改 grant/system，也不能脱离已有 Run 自行冒充 Owner。
+
+**Verify:**
+
+```bash
+uv run pytest tests/test_trust_zone_resolver.py tests/test_trust_action_matrix.py -q
+```
+
+**Commit:** `feat(trust): define zero-prompt trust and action matrix`
+
+### Task 0.9：建立受管群 Registry 与原子建群/绑定生命周期
+
+**Files:**
+
+- Create: `src/trust/registry.py`
+- Modify: `src/project_chat/service.py`
+- Modify: `src/project/context.py`
+- Modify: `src/feishu/handlers/slock.py`
+- Modify: `src/autonomous/context/group_ledger.py`
+- Test: `tests/test_managed_group_registry.py`
+- Test: `tests/test_managed_group_project_grant.py`
+
+**Implementation:**
+
+1. `/new-chat` 和 `/new-team` 使用同一生命周期：写 provision intent → 飞书建群 → 绑定 project/team → 写 `ManagedGroupRecord + ProjectGrant` ACTIVE revision → 最后发送 welcome/成功卡。
+2. Registry 持久化 `chat_id`、owner、创建来源、receiving bot、project/team binding、root、grant、revision、created_at 和 tombstone；不依赖 Employee runtime enablement，必须能在主 ingress 启动前恢复。
+3. 任一步失败都不得先报成功。飞书群可回滚时删除；不可回滚时保持 untrusted 并给 Owner 一次清晰错误，不加入 legacy allowlist。
+4. 一个群只有一个 ACTIVE record 和一个 grant；重复 callback/建群重试幂等，dissolve/revoke 写 tombstone，旧 Project/Slock marker 不能复活。
+5. 首次迁移对 `bound_chat_id + bound_chat_created_at + root_path` 记录做一次飞书 membership/receiving-bot 校验，通过者自动批量导入；只有歧义项才在 Owner 私聊列一次确认。普通 `allowed_chat_ids`、群名、描述或 `.slock_channel.json` 不能独自证明 trust。
+6. 预期 Employee Bot rotation 静默更新 revision。未知成员消息不创建 Run/上下文；当前个人 profile 不冻结整群，只记录一次低噪声 drift。若未来需要保密多人群，再增加 optional quarantine profile。
+7. Owner 可在私聊中一次性把既有群绑定到一个项目，写 `OWNER_ADOPTED` record；完成后该群走与自建群相同的零提示路径，不使用 `/access allow-chat` 作为长期机制。
+
+**Tests first:**
+
+```python
+def test_new_project_chat_is_active_before_welcome_without_allow_chat(): ...
+def test_new_team_uses_same_managed_group_registry(): ...
+def test_create_bind_registry_failure_never_reports_false_success(): ...
+def test_registry_replays_before_ingress_and_preserves_one_grant(): ...
+def test_marker_name_or_allowed_chat_cannot_forge_managed_group(): ...
+def test_tombstoned_group_cannot_resurrect_from_stale_project_or_slock_marker(): ...
+def test_expected_employee_rotation_updates_revision_without_prompt(): ...
+def test_owner_p2p_can_adopt_existing_group_once_without_per_message_enrollment(): ...
+```
+
+**Acceptance:**
+
+- GhostAP 自建项目群/Team 群无需 `/access allow-chat` 即可使用。
+- ACTIVE 必须早于 welcome；失败和重启不产生半绑定信任。
+- Registry 是受管群 provenance 的唯一事实源。
+
+**Verify:**
+
+```bash
+uv run pytest tests/test_managed_group_registry.py tests/test_managed_group_project_grant.py tests/test_project_chat/test_service.py -q
+uv run pytest tests/test_slock_*.py tests/autonomous/unit/test_group_* -q
+```
+
+**Commit:** `feat(trust): persist managed group lifecycle`
+
+### Task 0.10：切换 ingress/callback 到三信任域
+
+**Files:**
+
+- Modify: `src/feishu/ws_client.py`
+- Modify: `src/feishu/dispatcher.py`
+- Modify: `src/feishu/ws_card_action_handler.py`
+- Modify: `src/autonomous/ingress/router.py`
+- Modify: `src/autonomous/provisioning/composition.py`
+- Modify: `src/slock_engine/activation_guard.py`
+- Test: `tests/test_managed_group_ingress.py`
+- Test: `tests/test_external_group_ingress.py`
+
+**Implementation:**
+
+1. Registry/Resolver 在接收新 event 前完成恢复；trust 判定早于 GroupLedger、图片下载、项目 lookup、Slock passive activation、scheduler、LLM、Shell 和卡片 mutation。
+2. `MANAGED_AGENT_GROUP` 的 Owner/有效 Employee continuation 直接进入既有 route；跳过 legacy user/chat enrollment，权限提示计数为 0。
+3. `EXTERNAL_OR_UNKNOWN_GROUP/UNKNOWN` 在业务副作用前退出：不写 GroupLedger、不下载内容、不查项目、不启动 classifier/session/run。Owner 可收到一次限流导入指引，其他人静默。
+4. card callback 重新解析当前 revision；stale callback/grant revision 自动拒绝并刷新状态，不弹审批。
+5. legacy `/access allow-chat` 仅用于迁移诊断，不再是 ProjectChat/Team 的正常启用路径。
+
+**Tests first:**
+
+```python
+def test_registry_is_ready_before_first_ingress_event(): ...
+def test_managed_group_repeated_tasks_emit_zero_permission_prompts(): ...
+def test_direct_deep_spec_worktree_workflow_team_slock_all_bypass_legacy_enrollment(): ...
+def test_unknown_member_or_external_group_has_zero_business_side_effects(): ...
+def test_slock_external_group_does_not_passively_activate_or_classify(): ...
+def test_stale_card_revision_cannot_dispatch_effect(): ...
+```
+
+**Acceptance:**
+
+- Owner 在受管群重复执行项目任务时权限提示数恒为 0。
+- 外部群/未知成员在 route 前终止，session/run/ledger/image/context 副作用均为 0。
+- Direct/Deep/Spec 单 prompt、会话键、取消和卡片合同不变。
+
+**Verify:**
+
+```bash
+uv run pytest tests/test_managed_group_ingress.py tests/test_external_group_ingress.py tests/test_trust_zone_resolver.py -q
+uv run pytest tests/contracts/test_direct_programming_lane.py tests/contracts/test_protected_execution_lanes.py -q
+```
+
+**Commit:** `feat(feishu): cut ingress over to managed trust zones`
+
+### Checkpoint CP-T 验证
+
+- Owner 私聊、受管群 Owner、受管群 Employee、未知成员和外部群五条路径均有纵向测试。
+- 受管群项目内行为没有 enrollment、approval 或 sandbox 提示。
+- 权限扩大只能来自 Owner 私聊；群内拒绝只给一次摘要。
+- Direct/Deep/Spec 的单 prompt、会话键和取消合同不变。
 
 ### Checkpoint CP-P0 验证
 
@@ -830,7 +1112,7 @@ uv run python scripts/test_inventory.py tests/
 
 **目标：** 把“多处硬编码支持多个工具”收敛为“一个可验证的后端能力目录 + 一个兼容会话工厂”，同时保持 Direct Lane 最短路径。
 
-**预计投入：** 25–40 engineer-days。
+**核心投入：** 8–13 engineer-days，优先 A1–A6 内建 Backend；A7 仅在 Owner 真正需要 custom binding 时实施。
 
 ### Task A1：定义 Backend 能力和会话请求的中立类型
 
@@ -864,7 +1146,6 @@ class Capability(StrEnum):
     IMAGE_OUTPUT = "image_output"
     TOOL_PERMISSION_CALLBACK = "tool_permission_callback"
     TOOL_FILTER_ENFORCED = "tool_filter_enforced"
-    NETWORK_EGRESS_ENFORCED = "network_egress_enforced"
     CANCEL_REQUEST = "cancel_request"
     CANCEL_ACK = "cancel_ack"
     HEALTH_PROBE = "health_probe"
@@ -877,10 +1158,9 @@ class ToolMediation(StrEnum):
     OS_SANDBOX = "os_sandbox"
 
 class PermissionProfile(StrEnum):
-    DENY_ALL = "deny_all"
-    READ_ONLY = "read_only"
-    PROJECT_SCOPED_WRITE = "project_scoped_write"
-    EMPLOYEE_POLICY = "employee_policy"
+    AUXILIARY_DENY_ALL = "auxiliary_deny_all"
+    PROJECT_WORKSPACE = "project_workspace"
+    OWNER_UNRESTRICTED = "owner_unrestricted"
 
 class SessionPurpose(StrEnum):
     DIRECT = "direct"
@@ -912,15 +1192,18 @@ class SessionRequest:
     cwd: Path
     session_key: str
     permission_profile: PermissionProfile
+    trust_zone: "TrustZone"
+    project_root_ref: str | None
     environment_ref: "EnvironmentRef | None"
 ```
 
-`identity.py` 定义 Backend family/binding ids 和上述 `BackendBinding`；`options.py` 定义中立 `ToolDescriptor/ModelDescriptor`；`environment.py` 定义不可序列化、`repr=False` 的 `EnvironmentRef`。真正环境由 production composition/Vault 注入的 provider 在 driver 边界解析。`SessionRequest` 不能携带明文员工凭据、任意 env mapping 或可以被日志序列化的 secret。`PermissionProfile` 替代含义模糊的 `auto_approve: bool`；driver 必须证明它能强制执行所选 profile。
+`identity.py` 定义 Backend family/binding ids 和上述 `BackendBinding`；`options.py` 定义中立 `ToolDescriptor/ModelDescriptor`；`environment.py` 定义不可序列化、`repr=False` 的 `EnvironmentRef`。真正环境由 production composition/Vault 注入的 provider 在 driver 边界解析。`SessionRequest` 不能携带明文员工凭据、任意 env mapping 或可以被日志序列化的 secret。`PermissionProfile` 替代含义模糊的 `auto_approve: bool`：辅助 Agent 永远无工具，受管群 Employee 默认获得项目工作区能力，Owner 私聊可以显式执行宿主级动作。首版不要求 Backend 证明 OS/network sandbox。
 
 **Tests first:**
 
 ```python
 def test_coordinator_request_requires_deny_all_tool_filter(): ...
+def test_managed_group_employee_gets_project_workspace_without_prompt(): ...
 def test_capabilities_are_serializable_for_cards_and_diagnostics(): ...
 def test_declared_only_tool_filter_is_not_exposed_as_enforced(): ...
 def test_environment_ref_never_serializes_or_reprs_secret_material(): ...
@@ -1150,7 +1433,7 @@ uv run pytest tests/test_backend_discovery.py tests/test_backend_admin_update.py
 
 **Implementation:**
 
-每个 Backend 必须根据自己声明的 capability 通过条件测试：
+每个 Backend 必须根据自己声明的 capability 通过条件测试。目标是保证“宣称能做的真的能做”，不是为个人工具构建沙箱认证体系：
 
 - start/send/close 基础合同。
 - persistent context 与 session-id load 分开验证；只保存一个 id 不能宣称恢复上下文。
@@ -1159,8 +1442,9 @@ uv run pytest tests/test_backend_discovery.py tests/test_backend_admin_update.py
 - structured events：文本、思考、工具、图片、计划顺序。
 - image input 与 image output 分开验证。
 - tool permission callback、保存 filter 字段和真正强制拒绝分开验证；CLI 的 no-op setter 不能宣称 enforced。
-- 对每个声明支持的 `DENY_ALL`、`READ_ONLY`、`PROJECT_SCOPED_WRITE` profile 做真实拒绝测试；只保存 profile/filter 字段不能通过。
-- `NETWORK_EGRESS_ENFORCED` 必须通过目标域安全 allowlist/deny 和旁路测试；opaque CLI 未运行在可证明网络隔离中时不得声明。这里的 allowlist 是数据外发安全边界，不是功能灰度。
+- `AUXILIARY_DENY_ALL` 必须真实拒绝工具；这是分类器/协调器的内部正确性合同。
+- `PROJECT_WORKSPACE` 验证 cwd/canonical root、项目工具和取消合同；它允许所选 Backend 正常访问模型服务和在项目内工作，不要求 OS/network sandbox。
+- `OWNER_UNRESTRICTED` 只可由 `OWNER_P2P` 构造；受管群不能通过 prompt 或 Agent handoff 将 profile 升级。
 - usage：若支持，输入/输出 token 不得丢失。
 - health：不得用恒真冒充真实健康。
 - stateless CLI：明确降级，不伪装成 ACP 等价能力。
@@ -1172,8 +1456,9 @@ uv run pytest tests/test_backend_discovery.py tests/test_backend_admin_update.py
 def test_claimed_capabilities_have_executable_evidence(binding): ...
 
 def test_unclaimed_capability_is_never_exposed_to_ui_or_router(): ...
-def test_claimed_permission_profiles_are_actually_enforced(): ...
-def test_claimed_network_egress_control_blocks_non_allowlisted_domain(): ...
+def test_auxiliary_deny_all_is_actually_enforced(): ...
+def test_managed_group_uses_project_workspace_without_sandbox_gate(): ...
+def test_managed_group_cannot_upgrade_to_owner_unrestricted(): ...
 ```
 
 **Acceptance:**
@@ -1205,7 +1490,7 @@ uv run python scripts/test_inventory.py tests/
 1. 用户显式 backend/model。
 2. Employee 持久配置。
 3. Workflow/Team RunSpec 的显式绑定。
-4. role 所需 capability + Owner 配置/所需权限 profile。
+4. role 所需 capability + Owner 默认 Backend 配置。
 5. 当前部署配置默认。
 
 只有用户选择 “Auto” 时才允许基于健康、质量、成本或延迟推荐；推荐首阶段仍是确定性本地规则，不调用路由 LLM。Direct Lane 与 Auto router 只能消费冻结的 catalog/discovery snapshot；不得在请求热路径同步 probe、update 或创建 capability session。缓存缺失时，显式 Backend 直接尝试目标 driver 并返回真实启动错误；Auto 则 fail clearly 或使用带 freshness 的最后快照。
@@ -1244,46 +1529,42 @@ uv run pytest tests/test_backend_routing_policy.py tests/contracts/test_direct_p
 
 **Commit:** `feat(agent-session): add deterministic capability routing`
 
-### Task A7：在静态 Catalog 稳定后增加受信扩展边界
+### Task A7（按需）：提供 Owner 私聊的轻量自定义 Backend 注册
 
 **Files:**
 
-- Create: `src/agent_session/manifest.py`
-- Create: `src/agent_session/external_driver.py`
-- Create: `schemas/backend-manifest-v1.json`
-- Create: `tests/security/test_backend_manifest.py`
-- Create: `docs/backend-extension-security.md`
+- Create: `src/agent_session/custom_binding.py`
+- Test: `tests/test_custom_backend_binding.py`
+- Modify: `docs/backend-driver-contract.md`
 
 **Implementation:**
 
-1. manifest 只允许声明 descriptor、命令模板参数、capability 和隔离要求。
-2. driver 必须在受信 driver registry 中；未知 Python entry point 默认拒绝。
-3. 外部命令使用 argv 数组，不接受 shell string。
-4. 安装权限与运行权限分离；聊天用户不能安装新 driver。
-5. TUI2ACP 的 custom command 必须完整、安全解析 argv；默认 `--unsafe` 行为必须被显式 trust profile 控制。
-6. 远程 Agent 适配器只有在本地 conformance kit 通过后再支持，协议特定逻辑封装在 driver 内。
+1. 只有 `OWNER_P2P` 可以新增、修改或删除 custom binding；受管群里的 Agent 不能安装 Backend 或改启动命令。
+2. 复用仓库内已有 driver 类型，Owner 只配置显示名、argv 数组、cwd 规则和模型选项；不加载任意 Python entry point。
+3. 外部命令使用 argv 数组，不接受 shell string，并对 TUI2ACP custom command 做确定性解析。
+4. custom binding 通过同一基础 conformance 后立即出现在 Owner 菜单；不建设签名 manifest、市场、发布晋级或 driver allowlist 服务。
+5. 未来若真实需要第三方 driver 生态，再单独设计进程隔离；不进入当前个人工具路线。
 
 **Tests first:**
 
 ```python
-def test_unknown_driver_or_manifest_version_fails_closed(): ...
-def test_manifest_command_cannot_inject_shell_metacharacters(): ...
-def test_chat_user_cannot_install_backend_extension(): ...
-def test_external_driver_capability_claims_use_same_conformance_suite(): ...
+def test_custom_command_is_parsed_as_argv_without_shell_injection(): ...
+def test_managed_group_cannot_register_or_change_custom_binding(): ...
+def test_owner_p2p_custom_binding_uses_existing_driver_contract(): ...
 ```
 
 **Acceptance:**
 
-- 插件化不扩大主 Bot 凭据和宿主 Shell 的隐式信任边界。
-- manifest 解析失败、未知 capability 或未满足隔离要求均 fail closed。
+- Owner 可以低成本接入自定义命令，不需要维护签名插件系统。
+- 群内 Agent 不能借 custom binding 扩大项目授权。
 
 **Verify:**
 
 ```bash
-uv run pytest tests/security/test_backend_manifest.py tests/contracts/test_builtin_backend_conformance.py -q
+uv run pytest tests/test_custom_backend_binding.py tests/contracts/test_builtin_backend_conformance.py -q
 ```
 
-**Commit:** `feat(agent-session): add trusted backend manifests`
+**Commit:** `feat(agent-session): add owner-managed custom bindings`
 
 ### Checkpoint CP-A 验证
 
@@ -1316,7 +1597,7 @@ rg -n 'startswith\\(\"ttadk_\"|agent_type\\s*==|_KNOWN_TOOLS|DEFAULT_TOOLS' \
 
 **目标：** 让 Workflow、Team、Slock 和 Worktree 共享可恢复、可验证、可停止的编排事实，同时只通过 adapter 观察 Direct/Deep/Spec。
 
-**预计投入：** 45–70 engineer-days。Phase B 先过“零派发编译检查”，再接入耐久真实执行；这是工程依赖，不是线上灰度周期。
+**核心投入：** 19–30 engineer-days。直接复用现役 Autonomous Journal/domain/scheduler，避免另造并行内核；Phase B 先过“零派发编译检查”，再接入耐久真实执行。
 
 **最短可体验路径：** B1–B6 + B10 + B9 的真实 synthesis 完成后即可让当前 Owner 使用 Workflow IR v2。B7（Team/Slock 收敛）、B8（Worktree 节点）和 B9 的动态 `PlanPatch` 是可独立完成并立即开放的扩展，不阻塞静态有界 DAG 的首版体验。
 
@@ -1362,13 +1643,13 @@ class CancellationState(StrEnum):
 @dataclass(frozen=True)
 class RunView:
     run_id: str
-    tenant_key: str
     source: str
     strategy: str
-    owner_id: str
+    initiator_ref: str
+    trust_zone: "TrustZone"
+    managed_group_id: str | None
     project_id: str | None
     thread_id: str | None
-    authority_ref: str
     state: RunState
     cancellation: CancellationState
     created_at: datetime
@@ -1379,14 +1660,13 @@ class RunView:
 @dataclass(frozen=True)
 class ControlResult:
     run_id: str
-    tenant_key: str
     cancellation: CancellationState
     reason_code: str
 
 class RunController(Protocol):
-    def get(self, run_id: str, actor: Principal) -> RunView | None: ...
-    def list(self, query: RunQuery, actor: Principal) -> tuple[RunView, ...]: ...
-    async def cancel(self, run_id: str, actor: Principal) -> ControlResult: ...
+    def get(self, run_id: str) -> RunView | None: ...
+    def list(self, query: RunQuery) -> tuple[RunView, ...]: ...
+    async def cancel(self, run_id: str) -> ControlResult: ...
 ```
 
 **Implementation:**
@@ -1396,7 +1676,7 @@ class RunController(Protocol):
 3. 适配器不得把内部状态推测成更强承诺；Deep 若不能 crash-safe recovery，就返回 `recoverable=False`。
 4. 一个 run 只有一个 owner adapter，避免 cancel 双发。
 5. 用稳定 namespace 生成 run id；重启后同一耐久 run 不改变 id。
-6. 所有 get/list/cancel 先按 tenant、owner/project scope 和 authority 检查；仅凭全局 run id 不可读取或控制。
+6. `TrustZoneResolver` 在飞书 ingress/control action 入口完成一次身份与群来源判断；进入 `RunController` 后不再按对象重复 Principal/ACL 校验。`RunView` 的 project/group 字段用于归属、筛选和解释，不是多租户授权表。
 7. B1 只统一“请求取消”和取消状态。只有实际资源 owner 返回 acknowledgment 才显示已停止；cooperative/未知结果不得包装成成功。
 
 **Tests first:**
@@ -1406,13 +1686,15 @@ def test_run_view_never_claims_recovery_the_engine_does_not_support(): ...
 def test_cancel_is_sent_to_exactly_one_owner_adapter(): ...
 def test_deep_and_spec_adapters_do_not_change_engine_state_machine(): ...
 def test_direct_adapter_adds_no_prompt_or_planner_call(): ...
-def test_cross_tenant_run_lookup_and_cancel_are_denied(): ...
+def test_managed_group_can_view_and_cancel_its_project_run_without_prompt(): ...
+def test_unknown_group_is_rejected_before_run_control(): ...
 def test_cancel_request_is_not_rendered_as_acknowledged_stop(): ...
 ```
 
 **Acceptance:**
 
-- `/status`、`/stop` 类产品能力可以从一个 tenant-scoped 接口读取或请求控制所有通道，并诚实显示 requested/acknowledged/unknown/unsupported。
+- `/status`、`/stop` 类产品能力可以从一个本机控制面读取或请求控制所有通道，并诚实显示 requested/acknowledged/unknown/unsupported。
+- Owner 私聊和受管群控制任务都不出现逐 Run 权限提示；外部群在到达控制面前被拒绝。
 - 关闭 Task Control Plane 不影响原 direct/deep/spec 入口。
 
 **Verify:**
@@ -1448,7 +1730,7 @@ class NodeKind(StrEnum):
     MAP = "map"
     LOOP = "loop"
     SYNTHESIS = "synthesis"
-    HUMAN_APPROVAL = "human_approval"
+    HUMAN_INPUT = "human_input"
     WORKTREE = "worktree"
     SUBRUN = "subrun"
 
@@ -1481,7 +1763,7 @@ class NodeSpec:
     retry: RetryPolicy
     budget: NodeBudget
     done_criteria: tuple[str, ...]
-    risk_class: "RiskClass"
+    effect_kind: "ActionKind | None"
     effect_visibility: EffectVisibility
 
 @dataclass(frozen=True)
@@ -1508,12 +1790,12 @@ class OrchestrationPlan:
 - `loop` 是显式节点，必须有最大轮数、预算和结构化停止条件。
 - `map` 必须有 fanout 上限。
 - 所有输入引用必须由先行节点或 plan input 提供。
-- 每个外部写节点必须有 risk class 和 policy hook。
+- 每个外部动作必须由 runtime adapter 产生真实 `ActionKind`，不能信任 LLM 自报；固定动作矩阵只有 `ALLOW/DENY`，没有 `ASK`。
 - backend requirement 只声明能力，不硬编码员工身份；显式 Run binding 可覆盖。
 - agent-call/token 上限按所有可达节点、retry、map、loop 的**最坏有界展开**累计；wall time 按并行 DAG critical path、retry deadline 和总 deadline 校验，不能用“最短路径预算”代替。
 - `max_total_nodes`、`max_plan_revisions`、map fanout 和 loop iterations 均不可缺省。
-- `MEDIATED` 只用于 driver 能逐工具上报并门控 Effect 的路径。ACP/CLI 内部副作用不可见时，整个 Agent session 标为 `OPAQUE_SESSION` 高风险 Effect；只有在可证明的 OS/filesystem/network sandbox 或明确人工批准下运行。普通 Git worktree 只隔离代码分支，不隔离宿主文件系统、进程或网络，不能满足安全 isolation gate。
-- 可能产生副作用的 `OPAQUE_SESSION` 强制 `max_attempts=1`；dispatch 后的 timeout、cancel、断连或崩溃一律进入 `effect.unknown` 并禁止自动 retry，等待 reconcile/人工处置。只有已证明 side-effect-free 的 opaque 分析 session 才能按普通 retry policy 重试。
+- `MEDIATED` 只用于 driver 能逐工具上报并门控 Effect 的路径。ACP/CLI 内部副作用不可见时，整个 Agent session 标为 `OPAQUE_SESSION`；它可以在受管项目中直接运行，不以 OS/filesystem/network sandbox 或人工批准作为前置。
+- 可能产生副作用的 `OPAQUE_SESSION` 强制 `max_attempts=1`；dispatch 后的 timeout、cancel、断连或崩溃一律进入 `effect.unknown` 并禁止自动 retry，随后自动 reconcile 或发送一次异常摘要。可用 sandbox 时可作为额外加固启用，但缺失时不弹审批，也不让已配置 Backend 失去项目内可用性。
 
 **Tests first:**
 
@@ -1521,15 +1803,14 @@ class OrchestrationPlan:
 def test_cycle_is_rejected_outside_bounded_loop_node(): ...
 def test_unbounded_map_or_loop_is_rejected(): ...
 def test_missing_artifact_producer_is_rejected(): ...
-def test_external_write_without_risk_class_is_rejected(): ...
+def test_effect_action_kind_is_confirmed_by_runtime_adapter(): ...
 def test_round_trip_preserves_frozen_plan_hash(): ...
 def test_ir_compiles_atomically_to_one_canonical_durable_plan(): ...
 def test_ir_and_durable_plan_step_ids_and_revisions_remain_stable(): ...
 def test_attempt_and_effect_ids_are_created_only_at_runtime_boundaries(): ...
 def test_worst_case_retry_map_loop_budget_is_enforced(): ...
-def test_opaque_side_effectful_session_requires_isolation_or_approval(): ...
+def test_opaque_project_session_does_not_require_sandbox_or_approval(): ...
 def test_opaque_side_effectful_session_never_auto_retries_after_dispatch_unknown(): ...
-def test_plain_git_worktree_does_not_satisfy_os_sandbox_capability(): ...
 ```
 
 **Acceptance:**
@@ -1562,9 +1843,7 @@ uv run pytest tests/orchestration/test_domain.py tests/orchestration/test_valida
 @dataclass(frozen=True)
 class ArtifactRef:
     artifact_id: str
-    tenant_key: str
-    project_id: str | None
-    authority_ref: str
+    scope_ref: str
     media_type: str
     schema_id: str | None
     content_hash: str
@@ -1573,19 +1852,16 @@ class ArtifactRef:
     producer_node_id: str
     producer_attempt_id: str
     source_artifacts: tuple[str, ...]
-    sensitivity: "SensitivityClass"
-    acl_ref: str
     created_at: datetime
 ```
 
 **Implementation:**
 
-1. 大内容进入现有加密 Blob/DataService；Journal 只保存引用和 hash。
+1. 大内容进入现有 Blob/DataService；Journal 只保存引用和 hash。凭据继续只进 Vault；普通代码/测试 Artifact 不强制增加一层对象 ACL 或敏感度分类。
 2. 文本结果也必须具有 provenance，禁止把缓存输出当作无来源的新结果。
-3. code patch、test report、review verdict、decision、user approval 定义首批 schema。
-4. done criteria 分为 deterministic、reviewer、human approval；不得仅凭“有文本输出”完成。
-5. Artifact 删除/保留遵循项目、员工、群上下文的 TTL 和数据删除合同。
-6. 所有 read/list/resolve 都接收 Principal 并验证 tenant/project/ACL/sensitivity；不可通过猜测 artifact id 跨租户读取。
+3. code patch、test report、review verdict、decision、explicit human decision 定义首批 schema。
+4. done criteria 分为 deterministic、reviewer、任务本身明确要求的 human decision；后者用于产品/内容判断，不承担权限审批。不得仅凭“有文本输出”完成。
+5. `scope_ref` 用于项目/群/线程归属、上下文选择和清理；当前单 Owner 部署不为每个 Artifact 构建 Principal ACL。
 
 **Tests first:**
 
@@ -1593,8 +1869,8 @@ class ArtifactRef:
 def test_artifact_hash_and_lineage_survive_replay(): ...
 def test_cached_artifact_cannot_hide_changed_input_provenance(): ...
 def test_missing_required_test_report_blocks_done_criteria(): ...
-def test_sensitive_artifact_uses_encrypted_blob_store(): ...
-def test_cross_tenant_artifact_read_is_denied(): ...
+def test_artifact_scope_prevents_accidental_cross_project_selection(): ...
+def test_secret_material_is_never_written_as_artifact(): ...
 ```
 
 **Acceptance:**
@@ -1674,7 +1950,7 @@ node --test src/workflow_engine/runtime/*.test.js
 - Modify: `src/autonomous/provisioning/composition.py`
 - Modify: `src/autonomous/gateway/coordinator.py`
 - Modify: `src/autonomous/broker/dispatch_gate.py`
-- Modify: `src/autonomous/policy/policy_engine.py`
+- Modify: `src/autonomous/policy/policy_engine.py`（仅保留委托 `src/trust/action_matrix.py` 的兼容 adapter）
 - Modify: `src/workflow_engine/journal.py`
 - Test: `tests/orchestration/test_projection_replay.py`
 - Test: `tests/orchestration/test_effect_dispatch.py`
@@ -1697,9 +1973,9 @@ run.succeeded | run.failed | run.cancelled
 
 **Implementation:**
 
-1. `src/orchestration` 只依赖新的 `JournalPort`、`PolicyPort`、`EffectDispatchPort`，不得直接绑定 legacy concrete class。
-2. 先用 conformance test 审计三条现实：production `EmployeeDepartmentRuntime` 当前使用 `EmployeeDispatchCoordinator`；旧 `DispatchGate` 在 `effect.executing` 后未再次 anchor；旧 `PolicyEngine` 的 approval/standing order 仍以内存为主。它们在修复并接入现役 composition 前都不能被宣称为生产安全内核。
-3. 以现役 `JournalWriter` 为唯一写入核心，实现/适配生产 ports；严格顺序为 policy decision → `effect.prepared` fsync+anchor → `effect.executing` fsync+anchor → adapter invocation。缺少 EXECUTING 时不得调用外部 adapter。
+1. `src/orchestration` 只依赖新的 `JournalPort`、无交互 `ActionMatrixPort`、`EffectDispatchPort`，不得直接绑定 legacy concrete class。Action 判定的唯一实现是 `src/trust/action_matrix.py`；`ActionMatrixPort` 只返回 `ALLOW/DENY`，绝不返回 `ASK`。
+2. 先用 conformance test 审计三条现实：production `EmployeeDepartmentRuntime` 当前使用 `EmployeeDispatchCoordinator`；旧 `DispatchGate` 在 `effect.executing` 后未再次 anchor；旧 `PolicyEngine` 的 approval/standing order 以内存为主且不符合当前易用性模型。旧 `policy_engine.py` 若仍被调用，只能做参数转换并委托 canonical ActionMatrix；删除/隔离旧 approval、standing-order 和第二份规则表。
+3. 以现役 `JournalWriter` 为唯一写入核心，实现/适配 production ports；严格顺序为 `TrustZone + ProjectGrant + ActionKind` 固定矩阵判定 → `effect.prepared` fsync+anchor → `effect.executing` fsync+anchor → adapter invocation。缺少 EXECUTING 时不得调用外部 adapter。
 4. 逐类迁移 live Employee/Team/Workflow Effect；迁移期间一个 Effect kind 只有一个 dispatch owner，禁止 legacy gate 与新 port 双派发。
 5. run 不能在 unresolved Effect 存在时进入终态。
 6. 对 `OPAQUE_SESSION` 只锚定整个 session dispatch/结果，不能声称观察到内部工具 Effect；MEDIATED driver 才能产生逐工具 Effect。
@@ -1712,6 +1988,9 @@ run.succeeded | run.failed | run.cancelled
 def test_replay_rebuilds_identical_run_projection(): ...
 def test_external_call_never_starts_before_prepared_frame_is_anchored(): ...
 def test_executing_frame_is_anchored_before_adapter_invocation(): ...
+def test_action_matrix_has_no_ask_or_approval_result(): ...
+def test_managed_project_effect_runs_without_approval_node(): ...
+def test_legacy_policy_adapter_delegates_without_second_rule_table(): ...
 def test_crash_after_prepared_before_executing_is_not_treated_as_dispatched(): ...
 def test_terminal_run_rejects_unresolved_effect(): ...
 def test_side_effectful_node_is_never_reused_from_invocation_cache(): ...
@@ -1761,13 +2040,13 @@ uv run pytest tests/autonomous/unit/test_journal* tests/autonomous/chaos/ -q
    - `src/orchestration/scheduler.py` 只定义 port、budget/cancel 协议，不持有第二个队列。
    - 版本化迁移 `src/autonomous/scheduler/scheduler.py` 为新 IR/Team/Proactive 的唯一耐久 run scheduler。
    - Engine worker pool 只拥有已分配 attempt 的本地资源，不重新 admission。
-2. 当前 Autonomous scheduler 的 queue、lease、fencing counter 以内存为主；先迁移为 Journal event + replay projection，持久保存 scheduler owner epoch/lease/fencing。旧进程与新进程重叠时，较旧 epoch 的 admission/dispatch/commit 全部拒绝。
+2. 当前 Autonomous scheduler 的 queue、lease、fencing counter 以内存为主；迁移为 Journal event + replay projection，并保留单机进程锁、scheduler generation 和 attempt generation token。当前不建设多副本 lease 协议，但旧进程与新进程重叠时，较旧 generation 的 admission/dispatch/commit 必须拒绝。
 3. 在 `EmployeeDepartmentRuntime` production composition 中实际组装、恢复和关闭唯一 Durable scheduler；没有 wiring test 不能宣称上线。
 4. Durable scheduler 管理当前 Owner 的全局/project/backend 并发与简单有界队列；首版不建设多租户公平调度、复杂权重或防饥饿策略。
-5. 每个 run/node/attempt 有绝对 deadline；in-flight 调用不能无限延长总 deadline。
+5. 每个 run 有一个绝对 deadline，每个 adapter 调用有 timeout；节点只有需要更短限制时才覆盖，不要求三层重复配置。
 6. `CancellationScope` 持有实际 session/process handle，执行 cancel → bounded join → acknowledged/unknown。
-7. budget 至少覆盖 agent calls、wall time、output tokens；若 provider 提供 usage，再覆盖 token/cost。
-8. budget exhausted 进入明确终态或等待人工扩容，不得自动提高。
+7. 默认 limits 至少覆盖 agent calls、wall time 和 nodes；output token/cost 只有 provider 数据可靠且 Owner 需要时再启用，不作为首版硬门。
+8. limits exhausted 进入 `LIMIT_REACHED` 并生成一次摘要，不等待人工扩容，也不弹权限卡。
 9. race loser、timeout、用户 stop 和全局 kill 走同一取消协议。
 
 **Tests first:**
@@ -1780,8 +2059,8 @@ def test_budget_exhaustion_blocks_new_attempt_without_losing_checkpoint(): ...
 def test_scheduler_enforces_owner_project_and_backend_concurrency_limits(): ...
 def test_old_and_durable_scheduler_never_both_dispatch_same_run(): ...
 def test_feishu_control_plane_never_becomes_run_dispatch_owner(): ...
-def test_scheduler_replays_queue_lease_and_fencing_epoch_after_restart(): ...
-def test_old_scheduler_process_cannot_dispatch_or_commit_after_new_owner_epoch(): ...
+def test_scheduler_replays_queue_and_generation_after_restart(): ...
+def test_old_scheduler_process_cannot_dispatch_or_commit_after_new_generation(): ...
 def test_employee_department_runtime_composes_recovers_and_stops_durable_scheduler(): ...
 ```
 
@@ -1851,7 +2130,7 @@ uv run pytest tests/test_slock_*.py tests/autonomous/unit/test_team* -q
 
 **Commit:** `refactor(collaboration): unify slock and team run ownership`
 
-### Task B8：将 Worktree 作为受控黑盒节点接入
+### Task B8（按需）：将 Worktree 作为受控黑盒节点接入
 
 **Files:**
 
@@ -1866,7 +2145,7 @@ uv run pytest tests/test_slock_*.py tests/autonomous/unit/test_team* -q
 2. 输出是 branch refs、patch Artifact、test Artifact、review verdict 和 conflict disclosure。
 3. Orchestration Runtime 只调用 Worktree manager 的公开 run/cancel/status 接口，不操作内部 future。
 4. Worktree node 只有在 Task 0.5 的 terminal truth gate 通过后才能用于真实执行。
-5. merge/push 等外部 Effect 单独锚定并走 policy，不因为 node succeeded 自动执行。
+5. 本地 merge 在测试、done criteria 和真实 review 通过后可在受管项目中自动执行；push/deploy 等外部 Effect 单独锚定，并仅在 `ProjectGrant` 已一次性登记目标时自动执行。未登记时终止该 Effect 并给一次摘要，不创建逐 Run approval。
 
 **Tests first:**
 
@@ -1874,6 +2153,8 @@ uv run pytest tests/test_slock_*.py tests/autonomous/unit/test_team* -q
 def test_worktree_node_exposes_patch_test_review_artifacts(): ...
 def test_failed_worktree_unit_fails_node_and_blocks_merge_effect(): ...
 def test_orchestration_cancel_delegates_to_worktree_and_waits_for_ack(): ...
+def test_local_merge_does_not_create_approval_in_managed_project(): ...
+def test_unregistered_remote_push_is_denied_without_approval_prompt(): ...
 ```
 
 **Acceptance:**
@@ -1925,7 +2206,7 @@ uv run pytest tests/orchestration/test_synthesis.py -q
 
 **Commit:** `feat(orchestration): require real review and synthesis`
 
-#### B9b：有界 PlanPatch 与动态协调（独立扩展）
+#### B9b：有界 PlanPatch 与动态协调（后置扩展）
 
 **Files:**
 
@@ -1939,15 +2220,15 @@ uv run pytest tests/orchestration/test_synthesis.py -q
 
 1. Coordinator 不能直接修改 plan；只能提议 `PlanPatch`。
 2. patch 包含稳定 patch id、base revision、add/replace/cancel node、理由、预算变化和 done criteria 变化。
-3. validator 重新检查 DAG、预算、权限和 fanout；通过后写 `plan.revised`。
-4. 默认不得降低原 done criteria 或风险等级；降低必须人工批准。
+3. validator 重新检查 DAG、limits、ProjectGrant 和 fanout；通过后写 `plan.revised`。
+4. Coordinator 永远不得扩大外部 `ActionKind`、提高 Run limits、扩大项目根或降低 done criteria。需要这些变化时终止当前 Run，由 Owner 修改任务或群项目授权后重新启动；不生成 approval node。
 5. 每个 plan 强制 `max_plan_revisions`、`max_total_nodes`、`max_patch_rate` 和 coordinator wall/token budget；重复 patch id 幂等，patch storm 直接暂停并升级。
 
 **Tests first:**
 
 ```python
 def test_stale_plan_patch_is_rejected_by_revision(): ...
-def test_coordinator_cannot_raise_budget_or_lower_criteria_without_approval(): ...
+def test_coordinator_cannot_raise_limits_expand_scope_or_lower_criteria(): ...
 def test_duplicate_patch_is_idempotent_and_revision_ceiling_stops_patch_storm(): ...
 ```
 
@@ -1984,8 +2265,8 @@ uv run pytest tests/orchestration/test_plan_patch.py tests/orchestration/test_dy
 **Implementation:**
 
 1. startup replay 后逐个处理 queued、executing、unknown effect 和 cancellation-pending。
-2. 不自动重跑 unknown 外部 Effect；先 reconcile 或人工处置。
-3. 进度卡展示 goal、active nodes、blocked reason、backend/model、budget、latest artifact、cancel acknowledgment 和 recovery state。
+2. 对可查询或有幂等键的 Effect 自动 reconcile；无法确认的 opaque 外部 Effect 标记 `UNKNOWN`、禁止自动重放并发送一次异常摘要。它只阻塞所属 Run，不阻塞其他任务。
+3. 进度卡展示 goal、trust zone/project、active nodes、blocked reason、backend/model、limits、latest artifact、cancel acknowledgment 和 recovery state；正常执行不展示审批字段。
 4. 修复 Workflow snapshot 丢失 `current_activity` 一类“内部更新但卡片不可见”的投影断裂。
 5. 保留普通编程主卡和现有折叠执行记录，不将 Orchestration UI 强加给 Direct Lane。
 6. UI 实施前先更新 `ux/` 预览并经审查。
@@ -2070,23 +2351,27 @@ uv run python scripts/run_orchestration_chaos.py --manifest tests/orchestration/
 
 ## 11. Phase C — Proactive Work Loop
 
-**目标：** 让 Agent 能在明确的 Goal、Trigger、Authority、Budget 和通知边界内主动工作；不允许 Agent 自设无限目标或绕过人工入口。
+**目标：** 让 Agent 在 GhostAP 自建群的绑定项目内，按 Goal、Trigger、limits 和通知规则主动工作；允许的项目动作默认直接执行，只在越界、失败或 limits 耗尽时通知 Owner。
 
-**预计投入：** 30–45 engineer-days。首版只接 one-shot/interval/cron 与既有飞书事件，不建设多租户管理、Webhook 服务或多级开放状态。
+**预计投入：** 10–16 engineer-days。首版只接 one-shot/interval 与既有飞书事件；cron/DST、高级 digest、Webhook 和多来源连接在出现真实需求后追加，不建设多租户管理或审批系统。
 
-### Task C1：建立耐久 GoalTemplate、TriggerDefinition 和 AuthorityEnvelope
+**Context dependency:** CP-C-Managed 不依赖完整 D4。C1/C5 内置最小合同：只选当前 managed group/project/run 的输入、自动剔除 Vault/env secret、保留 source refs；D4 以后只优化相关性、摘要和 token 使用。
+
+### Task C1：建立耐久 GoalTemplate、TriggerDefinition 和 ProjectGrant
 
 **Files:**
 
 - Modify: `src/autonomous/domain/goals.py`
 - Create: `src/autonomous/domain/triggers.py`
-- Create: `src/autonomous/domain/authority.py`
+- Modify: `src/trust/models.py`
+- Modify: `src/trust/registry.py`
 - Create: `src/autonomous/proactive/projection.py`
 - Create: `src/autonomous/proactive/events.py`
 - Test: `tests/autonomous/unit/test_proactive_domain.py`
 - Test: `tests/autonomous/unit/test_proactive_projection.py`
 
 不要与现有 `TriggerSubscription` 并列创建第二套同义类型；先编写 migration/compat parser，再收敛到一个 schema。
+Task 0.8 已在 `src/trust/models.py` 建立 canonical `ProjectGrant`；本任务只以版本化迁移增加 `default_limits` 并让 Trigger 引用它，禁止在 Autonomous 下复制第二个 grant 类型。
 
 **Required types:**
 
@@ -2096,54 +2381,42 @@ class MisfirePolicy(StrEnum):
     FIRE_ONCE = "fire_once"
     CATCH_UP_BOUNDED = "catch_up_bounded"
 
+class TriggerMode(StrEnum):
+    DISABLED = "disabled"
+    MANAGED_PROJECT = "managed_project"
+    CONNECTED = "connected"
+
 @dataclass(frozen=True)
-class BudgetLimit:
+class RunLimits:
     wall_seconds: int
     max_agent_calls: int
-    max_output_tokens: int | None
-    max_cost_minor_units: int | None
+    max_total_nodes: int
+    max_output_tokens: int | None = None
 
 @dataclass(frozen=True)
-class DataEgressPolicy:
-    allowed_backend_families: tuple[str, ...]
-    allowed_model_ids: tuple[str, ...]
-    allowed_egress_domains: tuple[str, ...]
-    allowed_context_scopes: tuple[str, ...]
-    max_sensitivity: "SensitivityClass"
-
-@dataclass(frozen=True)
-class AuthorityEnvelope:
+class ProjectGrant:
     grant_id: str
-    issued_by: "PrincipalRef"
-    issued_at: datetime
-    issuer_acl_revision: int
+    revision: int
     owner_id: str
-    tenant_key: str
-    allowed_project_ids: tuple[str, ...]
-    allowed_chat_ids: tuple[str, ...]
-    allowed_action_kinds: frozenset["ActionKind"]
-    max_risk: "RiskClass"
-    max_occurrences: int
-    budget: BudgetLimit
-    run_deadline_seconds: int
-    data_egress: DataEgressPolicy
-    policy_version: str
-    policy_digest: str
-    approval_digest: str
-    resource_parameters_digest: str
-    expires_at: datetime
-    approval_ref: str | None
+    managed_group_id: str
+    project_id: str
+    canonical_root_ref: str
+    backend_binding_ids: tuple[str, ...]
+    connected_target_refs: tuple[str, ...]
+    default_limits: RunLimits
 
 @dataclass(frozen=True)
 class TriggerDefinition:
     trigger_id: str
     revision: int
     goal_template_id: str
+    project_grant_id: str
     kind: str
     schedule_or_filter: Mapping[str, object]
-    authority: AuthorityEnvelope
+    limits_override: RunLimits | None
+    expires_at: datetime | None
     misfire_policy: MisfirePolicy
-    enabled: bool
+    mode: TriggerMode
 
 @dataclass(frozen=True)
 class TriggerOccurrence:
@@ -2158,30 +2431,28 @@ class TriggerOccurrence:
 
 **Implementation:**
 
-1. create/pause/resume/expire/revoke 全部写 Journal。
-2. authority 不可由 Agent 扩大；PlanPatch 只能缩小。
-3. issuer/owner、tenant、project/chat scope、typed action/risk、次数、wall/agent/token/cost budget、run deadline、TTL、policy/resource digest 和 data-egress policy 缺一则 trigger 无法启用。
-4. GoalTemplate 引用版本化 IR template 或单 Employee 任务模板，不保存未经清理的完整聊天历史。
-5. replay 可重建 enabled trigger 和已消费 occurrence。
-6. “只读”仍可能把代码、群消息或员工记忆发送给外部 provider，属于不可逆数据披露；每次 Backend binding/context selection 都必须满足 `DataEgressPolicy`，不能只检查 filesystem write。
-7. grant 的签发、启用、撤销都验证 tenant-bound Principal、当时 ACL revision 与 approval digest；自由字符串身份不能授权。
-8. 当前部署的 `tenant_key` 从本机配置固定派生，只作事件、授权、Artifact 和恢复命名空间；不建设 tenant 管理、发布 allowlist 或跨租户配置面。只有配置的 Owner principal 能创建、修改、启用、撤销 Trigger。
+1. 受管群创建/项目绑定、Trigger create/pause/resume/expire/revoke 全部写 Journal；replay 可重建 grant、active Trigger mode 和已消费 occurrence。
+2. `ProjectGrant` 是一次性群项目能力包，不是逐 Run approval。其默认允许绑定项目内读写、Shell/test/build、编排、本地 Git、已配置 Backend 调用和同群输出。
+3. `connected_target_refs` 只记录 Owner 已在私聊中一次性登记的 repo remote、外部 API 或部署目标；群内 Agent、PlanPatch 和 Trigger 不能扩大它。
+4. Trigger 的 limits 可以小于或等于 grant 默认值，不能提高；`expires_at` 可选，长期自动化不需要反复续期。
+5. Owner 在私聊或受管群中明确创建 Trigger 时默认写 `MANAGED_PROJECT`；需要草稿时显式选择 `DISABLED`，登记了 connected targets 时可明确选 `CONNECTED`，不再强制“创建后再确认一次”。
+6. GoalTemplate 引用版本化 IR template 或单 Employee 任务模板。选择一个已配置 Backend 表示 Owner 同意发送完成任务所需的项目上下文；不再构建逐 Trigger `DataEgressPolicy`，但 Vault/环境 secret 永远自动剔除。
+7. `tenant_key`、ACL revision、policy/approval digest、RiskClass 和每对象 authority ref 不进入这些业务类型。
 
 **Tests first:**
 
 ```python
-def test_trigger_without_owner_expiry_or_budget_is_rejected(): ...
-def test_agent_plan_patch_cannot_expand_authority(): ...
+def test_managed_group_creation_persists_project_grant_once(): ...
+def test_project_trigger_runs_without_approval_node(): ...
+def test_agent_plan_patch_cannot_expand_project_root_targets_or_limits(): ...
 def test_replay_rebuilds_enabled_and_consumed_occurrences(): ...
-def test_revoked_authority_blocks_future_occurrences_immediately(): ...
-def test_read_only_external_prompt_still_requires_data_egress_authority(): ...
-def test_authority_is_bound_to_policy_and_resource_parameter_digests(): ...
-def test_unauthorized_or_cross_tenant_principal_cannot_issue_enable_or_revoke_grant(): ...
+def test_secret_material_is_removed_before_backend_context(): ...
+def test_external_group_cannot_create_or_run_project_trigger(): ...
 ```
 
 **Acceptance:**
 
-- “主动”是用户授予的有限能力，不是 Agent 的隐式属性。
+- “主动”是受管群项目能力的自然延伸，不产生新的审批层。
 - trigger 定义和每次发生均可审计。
 
 **Verify:**
@@ -2192,7 +2463,7 @@ uv run pytest tests/autonomous/unit/test_proactive_domain.py tests/autonomous/un
 
 **Commit:** `feat(autonomous): add durable proactive domain`
 
-### Task C2：实现可测试的时间、cron 与 misfire 语义
+### Task C2：实现首版 one-shot/interval 与有界 misfire 语义
 
 **Files:**
 
@@ -2201,17 +2472,14 @@ uv run pytest tests/autonomous/unit/test_proactive_domain.py tests/autonomous/un
 - Modify: `src/autonomous/scheduler/triggers.py`
 - Test: `tests/autonomous/unit/test_proactive_schedule.py`
 - Test: `tests/autonomous/chaos/test_trigger_clock_anomalies.py`
-- Modify: `pyproject.toml`
-- Modify: `uv.lock`
 
 **Implementation:**
 
-1. 第一小步支持 one-shot UTC 时间和固定 interval。
-2. 第二小步通过 `uv add croniter` 增加 cron 解析，并把解析后的版本锁进 `uv.lock`；不自行实现不完整 cron parser。
-3. schedule calculation 接收注入的 Clock，不直接散用 `time.time()`。
-4. 明确定义 timezone、DST、时钟回拨、长时间停机和 catch-up 上限。
-5. occurrence id 基于 `trigger_id + revision + scheduled_for/source_event_id` 稳定生成。
-6. 重启扫描只生成策略允许的 misfire，不形成触发风暴。
+1. 首版只支持 one-shot UTC 时间和固定 interval，优先让 Owner 尽快使用可靠主动任务。
+2. schedule calculation 接收注入的 Clock，不直接散用 `time.time()`。
+3. occurrence id 基于 `trigger_id + revision + scheduled_for/source_event_id` 稳定生成。
+4. 明确定义时钟回拨、长时间停机和 catch-up 上限；重启扫描不形成触发风暴。
+5. cron、timezone/DST fold/gap 在 Owner 出现真实日历表达需求后增加；届时使用 `uv add croniter`，不自行实现 parser，也不阻塞首版。
 
 **Tests first:**
 
@@ -2219,12 +2487,11 @@ uv run pytest tests/autonomous/unit/test_proactive_domain.py tests/autonomous/un
 def test_same_schedule_slot_has_same_occurrence_id_after_restart(): ...
 def test_clock_rollback_does_not_refire_consumed_slot(): ...
 def test_catch_up_is_bounded_after_long_downtime(): ...
-def test_dst_gap_and_fold_follow_documented_timezone_policy(): ...
 ```
 
 **Acceptance:**
 
-- 对相同定义和时钟输入，计算结果确定。
+- 对首版 one-shot/interval 的相同定义和时钟输入，计算结果确定。
 - 任意停机时长不会产生无界补跑。
 
 **Verify:**
@@ -2253,15 +2520,15 @@ uv run pytest tests/autonomous/unit/test_proactive_schedule.py tests/autonomous/
 ```python
 class TriggerAdapter(Protocol):
     async def observe(self) -> AsyncIterator[RawTriggerEvent]: ...
-    def authenticate(self, event: RawTriggerEvent) -> SourcePrincipal: ...
+    def verify_transport(self, event: RawTriggerEvent) -> VerifiedSourceEvent: ...
     def normalize(self, event: RawTriggerEvent) -> TriggerOccurrence: ...
 ```
 
 **Implementation:**
 
 1. 首批只实现 schedule 与已有 Feishu event；Webhook、repo 和 CI adapter 等 Owner 出现真实需求后另立任务，不进入首版依赖。
-2. Feishu adapter 不建立第二个 WebSocket observer，也不重新私自认证原始消息；它只消费现有主 Bot/Employee canonical ingress 已认证、已绑定 receiving bot principal、tenant、message/event revision、source cursor 且已写 GroupLedger/Journal 的事件。
-3. 事件必须有 source id、已认证身份、固定部署 scope 和 freshness。
+2. Feishu adapter 不建立第二个 WebSocket observer，也不重新私自认证原始消息；它只消费现有主 Bot/Employee canonical ingress 已完成平台签名验证、带 receiving bot、chat/message revision、source cursor 且已写 GroupLedger/Journal 的事件。
+3. 事件必须有 source id、传输验证结果、`TrustZone`、project grant ref 和 freshness；业务对象不携带 tenant-bound Principal。
 4. 所有 adapter 只产生 occurrence，不直接创建 session 或调用 Agent。
 5. 去重在统一 ingress/projection 完成，不在每个 adapter 私有 map 中完成。
 6. canonical event 必须有“聊天正常路由”与“Trigger 订阅”的互斥/并行规则，防止同一消息被普通 Slock 和 Trigger 双 admission。
@@ -2275,7 +2542,7 @@ def test_adapter_never_dispatches_agent_directly(): ...
 def test_stale_event_follows_definition_freshness_policy(): ...
 def test_feishu_trigger_consumes_canonical_event_without_second_subscription(): ...
 def test_same_message_cannot_double_admit_chat_and_trigger_runs(): ...
-def test_non_owner_cannot_create_or_enable_trigger(): ...
+def test_external_group_event_cannot_bind_to_managed_project_trigger(): ...
 ```
 
 **Acceptance:**
@@ -2306,7 +2573,7 @@ uv run pytest tests/autonomous/integration/test_trigger_adapters.py tests/autono
 
 ```text
 occurrence.observed
-  -> authority.checked
+  -> trigger.active_and_project_grant.checked
   -> atomic Journal transaction frame:
        occurrence.bound(run_id)          [occurrence aggregate]
        run.created(canonical_plan_id)    [run aggregate]
@@ -2316,18 +2583,18 @@ occurrence.observed
 **Implementation:**
 
 1. 使用 `JournalWriter.commit()` 的同一 transaction frame 原子提交 `occurrence.bound` 与 `run.created/plan.compiled`，两条 event 分别携带自己的 aggregate id、expected version/CAS；不能用一个 event 假装维护两个 aggregate，也不能用多个独立 frame 拼成“事务”。
-2. lease 有单调 fencing epoch；epoch 必须进入 attempt/effect PREPARED、EXECUTING、adapter invocation、terminal commit 和 outbox frame，每一步都与最新 projection 比较。过期 worker 不但不能提交 Effect，也不能提交迟到结果或消息。
+2. 单机 scheduler generation/attempt token 必须进入 attempt/effect PREPARED、EXECUTING、adapter invocation、terminal commit 和 outbox frame；旧 worker 不但不能提交 Effect，也不能提交迟到结果或消息。这里不建设多副本租约系统。
 3. duplicate 返回原 run id，不创建第二次执行。
-4. 预算不足、owner 撤权、过期、policy 拒绝和暂时故障使用不同状态。
+4. limits 不足、Trigger 暂停/过期、ProjectGrant 缺失、动作矩阵拒绝和暂时故障使用不同状态；动作被拒绝时给一次摘要，不进入 approval queue。
 5. 可重试基础设施错误进入有界 retry；不可恢复项进入 dead letter 并通知 owner。
 
 **Tests first:**
 
 ```python
 def test_duplicate_occurrence_binds_to_one_run_under_concurrency(): ...
-def test_stale_lease_holder_cannot_dispatch_effect(): ...
-def test_stale_lease_holder_cannot_commit_late_result_or_outbox(): ...
-def test_expired_or_revoked_trigger_consumes_no_agent_call(): ...
+def test_stale_generation_cannot_dispatch_effect(): ...
+def test_stale_generation_cannot_commit_late_result_or_outbox(): ...
+def test_expired_paused_or_unbound_trigger_consumes_no_agent_call(): ...
 def test_dead_letter_preserves_reason_and_original_occurrence(): ...
 def test_kill_between_each_admission_boundary_never_leaves_consumed_without_run(): ...
 def test_atomic_frame_advances_occurrence_and_run_aggregate_versions_together(): ...
@@ -2346,7 +2613,7 @@ uv run pytest tests/autonomous/integration/test_proactive_admission.py tests/aut
 
 **Commit:** `feat(autonomous): make trigger admission idempotent`
 
-### Task C5：将主动任务接入同一编排与策略门
+### Task C5：将主动任务接入同一编排与无交互动作门
 
 **Files:**
 
@@ -2357,91 +2624,86 @@ uv run pytest tests/autonomous/integration/test_proactive_admission.py tests/aut
 - Modify: `src/orchestration/dispatch.py`
 - Modify: `src/autonomous/provisioning/composition.py`
 - Test: `tests/autonomous/integration/test_proactive_run.py`
-- Test: `tests/autonomous/security/test_proactive_authority.py`
+- Test: `tests/autonomous/security/test_proactive_project_grant.py`
 
 **Initial allowed targets:**
 
 - 单 Employee 的单节点 IR。
 - Team v2 / Orchestration IR 中已通过 CP-B-Execute 的节点。
-- 明确标为 read-only 的分析/汇总任务。
+- 受管项目内的 read/write、Shell/test/build、本地 Git、Worktree/Workflow/Team/Slock 和同群输出。
 
-**首版不提供；未来必须有显式 adapter 合同、测试和 Owner 选择：**
+**首版外部动作规则：**
 
-- 自动进入用户的 Direct programming session。
-- 自动启动 Deep/Spec。
-- push、merge、deploy、删除、权限修改等高风险写操作。
-- Agent 自己创建新的永久 Trigger。
+- 自动任务不进入用户已有 Direct programming session；使用自己的 Employee/IR session。
+- Deep/Spec 仍由 Owner 显式启动；主动系统首版不偷用成熟策略入口。
+- 绑定项目内的普通动作直接执行，不创建 approval node。
+- `connected_target_refs` 已登记的 push、PR/issue、外部 API 或部署目标可以直接执行。
+- 未登记 remote、项目根外路径、凭据/Backend/权限/全局配置修改直接 `DENY + 一次摘要`；不弹 approval。
+- Agent 可以提交 Trigger 或 grant 变更草案，但不能自行扩大能力包。
 
 **Implementation:**
 
 1. GoalTemplate 只填充受控参数，得到完整 Plan。
-2. Plan validation 同时验证 authority、backend capability、budget、data egress 和 `PolicyPort`。
-3. 每个外部 Effect 在 dispatch 时再次检查最新 authority，防止执行中撤权失效。
-4. 首阶段默认 `assist/read-only`；需要写操作时创建 approval node。
-5. Agent 可以建议新 Trigger，但只能生成 draft，必须由 owner 明确确认。
-6. 复用 Task B5 已通过 production conformance 的 `PolicyPort/EffectDispatchPort`；不得直接重新启用旧内存 `PolicyEngine` 或未二次 anchor 的 legacy `DispatchGate`。
-7. Proactive Assist 只允许通过所需 `PermissionProfile` 和 data-egress conformance 的 binding。无法强制 DENY_ALL/READ_ONLY、无法限制额外网络出口的 opaque CLI/ACP 必须运行在可证明的 OS+network sandbox 中，否则不具备 proactive eligibility，即使它可用于人工 Direct Lane。
+2. Plan validation 同时验证 ProjectGrant、backend capability、limits 和固定 `ActionMatrixPort`；矩阵由 runtime adapter 的真实 `ActionKind + origin + destination` 决定，LLM 不能自报。
+3. 每个外部 Effect 在 dispatch 时重新读取最新 ProjectGrant，防止群内 Agent 用旧计划扩大 project root、Backend 或 connected target。
+4. 复用 Task B5 已通过 production conformance 的 `ActionMatrixPort/EffectDispatchPort`；不得重新启用旧 approval/standing-order `PolicyEngine` 或未二次 anchor 的 legacy `DispatchGate`。
+5. opaque CLI/ACP 在受管项目中可以主动执行；有副作用的 attempt 使用一次派发、unknown 不自动重试。可用 sandbox 时启用为额外 hardening，缺失时不产生权限提示。
+6. ProjectGrant 内允许的动作一路自动执行；矩阵拒绝的动作终止并汇总，不创建 `HUMAN_APPROVAL` 节点。
 
 **Tests first:**
 
 ```python
 def test_proactive_task_uses_same_plan_and_effect_gate_as_manual_run(): ...
-def test_revocation_between_plan_and_dispatch_blocks_effect(): ...
-def test_agent_can_only_draft_not_enable_new_trigger(): ...
-def test_proactive_trigger_cannot_enter_direct_deep_or_spec_lane(): ...
-def test_external_provider_prompt_is_denied_outside_data_egress_scope(): ...
-def test_backend_without_permission_and_egress_enforcement_is_ineligible_for_proactive(): ...
+def test_project_grant_change_between_plan_and_dispatch_is_observed(): ...
+def test_managed_group_local_effect_never_creates_approval_node(): ...
+def test_disallowed_automation_is_blocked_without_approval_prompt(): ...
+def test_opaque_backend_remains_eligible_without_os_network_sandbox(): ...
+def test_agent_cannot_expand_project_root_backend_or_connected_target(): ...
 ```
 
 **Acceptance:**
 
-- 主动入口没有单独的“自动批准”捷径。
+- 主动入口与群内手工任务使用同一个项目能力包；允许即直接做、拒绝即摘要，没有 `ASK` 分支。
 - 关闭 proactive runner 后，人工任务和成熟路径正常工作。
 
 **Verify:**
 
 ```bash
-uv run pytest tests/autonomous/integration/test_proactive_run.py tests/autonomous/security/test_proactive_authority.py -q
+uv run pytest tests/autonomous/integration/test_proactive_run.py tests/autonomous/security/test_proactive_project_grant.py -q
 ```
 
 **Commit:** `feat(autonomous): execute proactive goals through shared gates`
 
-### Task C6：增加 Owner 确认、Budget 和 Kill Switch
+### Task C6：统一 Run Limits、Stop 和 Automation Kill
 
 **Files:**
 
-- Create: `src/autonomous/proactive/standing_order.py`
 - Modify: `src/autonomous/policy/kill_switch.py`
 - Create: `src/autonomous/policy/kill_migration.py`
-- Modify: `src/autonomous/policy/policy_engine.py`
 - Modify: `src/autonomous/gateway/coordinator.py`
 - Modify: `src/autonomous/team/coordinator.py`
 - Modify: `src/autonomous/provisioning/composition.py`
-- Test: `tests/autonomous/security/test_standing_order.py`
 - Test: `tests/autonomous/chaos/test_proactive_kill_switch.py`
 - Test: `tests/autonomous/unit/test_kill_switch_migration.py`
 
 **Implementation:**
 
-1. 首版写操作使用逐 Run 的 Owner 确认，绑定 action kind、resource scope、risk、次数、预算、有效期和一次性 nonce；approval 不可被另一个 project/trigger/run 重放。
-2. `standing_order.py` 是后续扩展：只有 Owner 反复执行同一种低风险动作并明确需要时才启用；其权限不得超过逐 Run 确认，且必须有更短 TTL、次数和预算。首版验收不依赖 standing approval。
-3. 不创建 proactive 专属 kill switch。将现有 `src/autonomous/policy/kill_switch.py` 迁移为唯一 Journal-backed `KillPort/KillProjection`，并让 manual orchestration、Employee gateway、Team 和 proactive 共用。
-4. scope 分为 system、project、chat、employee、trigger、run；固定 `tenant_key` 只留在内部事件命名空间，不形成单独的发布/运营层级。每次 kill 有单调 epoch，任何较旧 epoch 不能解除或派发。
+1. 删除逐 Run approval、standing order、nonce、RiskClass 和双确认。它们在单 Owner 受管群模型中只增加摩擦。
+2. 每个 Run 使用 grant 默认 limits，可向下覆盖；limits 耗尽时停止并发送一次摘要，不等待人工扩容。
+3. 不创建 proactive 专属 kill switch。将现有 `kill_switch.py` 迁移为唯一 Journal-backed automation `KillPort/KillProjection`，manual orchestration、Employee gateway、Team 和 proactive 共用。
+4. 首版只需要全局 automation kill 与 per-run stop；project/trigger 使用普通 pause/resume。内部保留单调 epoch，旧 generation 不能派发。
 5. kill 后先阻止新 admission/dispatch，再取消 in-flight；无法确认取消的 Effect 标记 unknown。
-6. unkill 需要有权 principal、一次性 nonce 和高风险 scope 的双重确认；restart 时 kill state 在任何 admission 恢复前先 replay。
-7. R4 永久拒绝；删除、部署、权限修改等高风险动作首版拒绝，不能用 standing approval 绕过。
-8. compat parser 把现有 `kill.switch` JSON 的所有 active scope/epoch 原子迁入 Journal；先验证投影等价，再永久禁用旧 writer。迁移期只有 Journal owner 可写，旧文件只读；代码回滚若看不到新 Journal kill schema 必须 fail closed，不能把系统当作 un-killed。
+6. Owner 私聊一次点击/命令即可 resume，不使用 nonce 或双重确认；restart 时 kill state 在任何 admission 恢复前先 replay。
+7. compat parser 把现有 `kill.switch` JSON 原子迁入 Journal；验证投影等价后永久禁用旧 writer。代码回滚若不认识新 schema，必须 fail closed。
 
 **Tests first:**
 
 ```python
-def test_run_approval_cannot_cross_scope_or_replay_nonce(): ...
-def test_optional_standing_approval_is_never_broader_than_run_approval(): ...
 def test_kill_switch_causes_zero_new_external_calls_after_anchor(): ...
 def test_restart_replays_kill_before_trigger_recovery(): ...
-def test_r4_action_is_denied_even_with_standing_order(): ...
 def test_manual_team_and_proactive_share_one_kill_epoch(): ...
-def test_stale_or_replayed_unkill_nonce_cannot_clear_newer_kill(): ...
+def test_owner_resume_requires_one_p2p_action_not_double_confirmation(): ...
+def test_limit_exhaustion_stops_and_summarizes_without_approval(): ...
 def test_legacy_active_kill_and_epoch_migrate_without_dual_writer(): ...
 def test_rollback_cannot_ignore_newer_journal_kill_state(): ...
 ```
@@ -2454,10 +2716,10 @@ def test_rollback_cannot_ignore_newer_journal_kill_state(): ...
 **Verify:**
 
 ```bash
-uv run pytest tests/autonomous/security/test_standing_order.py tests/autonomous/chaos/test_proactive_kill_switch.py tests/autonomous/unit/test_kill_switch_migration.py -q
+uv run pytest tests/autonomous/chaos/test_proactive_kill_switch.py tests/autonomous/unit/test_kill_switch_migration.py -q
 ```
 
-**Commit:** `feat(autonomous): enforce owner approvals and kill switches`
+**Commit:** `feat(autonomous): unify proactive limits and kill`
 
 ### Task C7：设计主动任务卡片、通知节流和例外升级
 
@@ -2472,10 +2734,10 @@ uv run pytest tests/autonomous/security/test_standing_order.py tests/autonomous/
 
 **UI requirements:**
 
-- Goal/Trigger：owner、范围、下次触发、有效期、预算、模式。
-- Run：为何被触发、当前步骤、已用预算、最新产物、风险/审批。
-- Controls：pause、resume、run now、edit、revoke、stop。
-- Notification policy：立即异常、完成摘要、每日 digest、quiet hours。
+- Goal/Trigger：受管群、绑定项目、下次触发、limits、connected targets。
+- Run：为何被触发、当前步骤、已用 limits、最新产物、被动作矩阵阻止的项目。
+- Controls：pause、resume、run now、edit、stop。
+- Notification policy：首版只做异常立即通知、终态摘要和进度合并；daily digest/quiet hours 后置。
 - 所有主动消息必须明确标注来源；不能伪装成人工即时请求。
 
 **Implementation:**
@@ -2483,15 +2745,14 @@ uv run pytest tests/autonomous/security/test_standing_order.py tests/autonomous/
 1. 先在 `ux/` 产出 Interactive Card 2.0 预览。
 2. 卡片分段呈现推理进展摘要，不展示隐藏 chain-of-thought。
 3. 合并高频进度，避免卡片洪泛；保留现有执行记录/子任务折叠框合同。
-4. 正常运行使用 digest；权限、预算、重复失败和 unknown Effect 立即升级。
-5. 移动端和桌面端都验证按钮、折叠和长文本。
+4. 正常进度合并更新；limits、重复失败、拒绝动作和 unknown Effect 只发一次异常摘要。
+5. 保留现有执行记录/子任务折叠框结构；首版验证关键桌面/移动布局，不建设完整 UI 矩阵。
 
 **Tests first:**
 
 ```python
-def test_trigger_card_discloses_scope_expiry_and_budget(): ...
-def test_quiet_hours_suppress_progress_but_not_security_exception(): ...
-def test_notification_coalescing_preserves_terminal_and_approval_events(): ...
+def test_trigger_card_discloses_project_limits_and_connected_targets(): ...
+def test_notification_coalescing_preserves_terminal_and_blocked_action_events(): ...
 def test_existing_execution_record_fold_is_unchanged(): ...
 ```
 
@@ -2524,28 +2785,27 @@ uv run pytest tests/autonomous/unit/test_proactive_renderer.py tests/autonomous/
 
 ```text
 PROACTIVE_ENABLED=true|false
-each Trigger: disabled | assist_read_only | supervised_write
+each Trigger: disabled | managed_project | connected
 ```
 
 **Implementation:**
 
 1. 实现和依赖检查完成后，当前 Owner profile 默认 `PROACTIVE_ENABLED=true`；服务无 Trigger 时保持空闲。该开关只用于紧急关闭整个主动子系统，不承载发布阶段。
-2. 每个 Trigger 创建时默认 `disabled`，只有 Owner 明确启用后才 admission；不存在 `shadow_observe` 或 tenant allowlist。
-3. `assist_read_only` 允许满足权限和 data-egress 合同的只读模板。
-4. `supervised_write` 仅允许 CP-C-Write 已覆盖的动作，并逐 Run 使用 Owner 确认；模式是授权强度，不是灰度状态。
-5. startup 先恢复 Journal/Vault 与 policy/kill/trigger projection，但 trigger 始终保持 fenced；随后严格完成现役 Employee Runtime 的 membership、data/workspace、GroupLedger、Actor mailbox、ingress/router/outbox、unfinished attempts、Team、fire、context、Employee Channel 恢复。只有整体 readiness 与 admission gate 开放后，才启动 adapter due-scan 和 durable scheduler。
-6. shutdown 先 fence 新 occurrence/admission，再停止 adapter/scheduler、取消或处置 in-flight，最后按现役 Employee Runtime 反向关闭。
-7. B6 已迁移的 `src/autonomous/scheduler/scheduler.py` 是唯一 durable scheduler；仅 manager-only legacy consumer 被隔离，不能另起 proactive scheduler。
-8. 故障隔离按层处理：schedule parser、单 adapter 或 proactive worker 故障可降级关闭 proactive；共享 Journal、anchor、Vault、policy projection 或 schema integrity 故障必须让依赖它们的 Employee Runtime 一并 fail closed，不能宣称局部忽略。
+2. Owner 明确创建 Trigger 时默认 `MANAGED_PROJECT`；只有选择“保存草稿”才 `DISABLED`。不存在 shadow、tenant allowlist 或二次确认。
+3. Trigger 使用 `managed_project` 或 `connected`：前者允许项目内写；后者额外允许 ProjectGrant 已登记的 connected targets。二者都没有逐 Run approval。
+4. startup 先恢复 Journal/Vault 与 grant/kill/trigger projection，但 trigger 始终保持 fenced；随后严格完成现役 Employee Runtime 的 workspace、GroupLedger、Actor mailbox、ingress/router/outbox、unfinished attempts、Team、context、Employee Channel 恢复。只有整体 readiness 与 admission gate 开放后，才启动 adapter due-scan 和 durable scheduler。
+5. shutdown 先 fence 新 occurrence/admission，再停止 adapter/scheduler、取消或处置 in-flight，最后按现役 Employee Runtime 反向关闭。
+6. B6 已迁移的 `src/autonomous/scheduler/scheduler.py` 是唯一 durable scheduler；仅 manager-only legacy consumer 被隔离，不能另起 proactive scheduler。
+7. 故障隔离按层处理：schedule parser、单 adapter 或 proactive worker 故障可关闭 proactive；共享 Journal、anchor、Vault、grant projection 或 schema integrity 故障必须让依赖它们的 Employee Runtime 一并 fail closed。
 
 **Tests first:**
 
 ```python
 def test_completed_owner_profile_defaults_service_on(): ...
 def test_enabled_service_without_trigger_dispatches_nothing(): ...
-def test_new_trigger_is_disabled_until_owner_enables_it(): ...
+def test_owner_created_trigger_defaults_managed_project_unless_saved_as_draft(): ...
 def test_emergency_disable_starts_no_trigger_worker(): ...
-def test_recovery_loads_kill_and_authority_before_due_trigger(): ...
+def test_recovery_loads_kill_and_project_grant_before_due_trigger(): ...
 def test_legacy_and_production_scheduler_cannot_both_start(): ...
 def test_due_scan_stays_fenced_until_employee_runtime_is_fully_ready(): ...
 def test_shared_journal_or_anchor_failure_fails_employee_and_proactive_closed(): ...
@@ -2553,7 +2813,7 @@ def test_shared_journal_or_anchor_failure_fails_employee_and_proactive_closed():
 
 **Acceptance:**
 
-- 独立 adapter/worker 故障不影响主 Bot、员工 Bot、Direct/Deep/Spec；共享 Journal/anchor/Vault/policy 故障按现役 Employee 安全合同 fail closed，不作过强隔离承诺。
+- 独立 adapter/worker 故障不影响主 Bot、员工 Bot、Direct/Deep/Spec；共享 Journal/anchor/Vault/grant 故障按现役 Employee 正确性合同 fail closed。
 - readiness 明确显示 proactive mode、lag、dead letters 和 disabled reason。
 
 **Verify:**
@@ -2565,27 +2825,23 @@ uv run python -m src.main --validate
 
 **Commit:** `feat(autonomous): compose owner-enabled proactive runtime`
 
-### Checkpoint CP-C-Assist：Assist/Read-only
+### Checkpoint CP-C-Managed：受管项目主动执行
 
-- 仅配置的 Owner 可创建/启用 Trigger，且 project/chat scope 显式。
-- occurrence 去重、TTL、budget、quiet hours、kill/restart 全通过。
-- 除 AuthorityEnvelope 明确允许的 provider 数据外发外，不产生外部可变副作用；只写 GhostAP 自身 Journal/卡片。
-- 任何 direct/deep/spec 路由变化都必须先修复；通过后 Automation 入口立即对 Owner 可见。
-
-### Checkpoint CP-C-Write：Owner 确认写入
-
-- 逐 Run Owner approval 的 scope/nonce/expiry 全通过；可选 standing approval 单独验证。
-- 写 Effect 都经过 PREPARED/anchor/policy/dispatch/COMMITTED。
-- unknown Effect 有人工 reconcile UI。
-- 当前 Owner 环境完成撤权、重放攻击、断网和 cancel 演练后，对应可逆写动作直接可用。
+- 受管群拥有持久 project grant；项目内 read/write/Shell/test/build/local Git/编排无 approval node、无权限提示。
+- occurrence 去重、limits、pause/kill、Effect PREPARED/EXECUTING 锚定、restart 和进度合并通过。
+- `connected` 只使用一次性登记目标；矩阵拒绝的动作自动阻止并摘要，不出现 approval prompt。
+- opaque unknown 不自动重试且只阻塞所属 Run；kill anchor 后零新 dispatch。
+- Direct/Deep/Spec 路由无变化；通过后 Automation 入口立即对 Owner 可见。
 
 ---
 
 ## 12. Phase D — Evaluation, Skill Evidence and Adaptive Routing
 
-**目标：** 让平台基于证据逐步选对 Agent、组织更好的团队和优化上下文，同时不让统计学习绕过显式选择或安全策略。
+**目标：** 让平台基于证据逐步选对 Agent、组织更好的团队和优化上下文，同时不让统计学习覆盖显式选择或扩大 ProjectGrant。
 
-**预计投入：** 20–35 engineer-days。
+**投入：** D4 的 Context-lite 计入核心 7–12 engineer-days 运维包；D1–D3/D5 为按需质量优化，不阻塞受管项目自治。
+
+**处置：** 当前核心路线只实施 D4。D1 的最小 trace 字段可随 B 事件顺手落地；D1–D3/D5 的独立子系统在有真实路由优化数据后再启动。
 
 ### Task D1：定义不包含隐藏思维链的 Execution Trace
 
@@ -2594,7 +2850,6 @@ uv run python -m src.main --validate
 - Create: `src/evaluation/trace.py`
 - Create: `src/evaluation/projection.py`
 - Create: `src/evaluation/privacy.py`
-- Create: `src/evaluation/revocation.py`
 - Modify: `src/acp/client.py`
 - Modify: `src/orchestration/events.py`
 - Test: `tests/evaluation/test_trace.py`
@@ -2609,7 +2864,7 @@ uv run python -m src.main --validate
 - deterministic verifier、review verdict、human correction。
 - error code、retry reason、cache provenance。
 
-不保存或展示 provider 隐藏 chain-of-thought；只保存用户可见的进展摘要、结构化 decision 和工具/产物事实。Trace 元数据进入当前部署固定命名空间的 projection；可能含代码、工具参数、纠错文本或用户内容的 payload 只以加密 Blob/Artifact 引用保存，并继承 project/chat ACL、sensitivity、retention 和删除 lineage。当前计划不提供 eval 数据对外导出入口；未来若真实需要导出，再单独设计 Owner 显式动作、secret/source-code scan 和目标约束。
+不保存或展示 provider 隐藏 chain-of-thought；只保存用户可见的进展摘要、结构化 decision 和工具/产物事实。Trace 使用 `scope_ref + source_artifacts` 归属到项目/群/线程；Vault/env secret 在写日志、卡片、Blob 或发送给 provider 前自动过滤。当前单 Owner 部署不建设 project/chat ACL、SensitivityClass 或派生数据撤权图；源 Artifact 删除后让相关缓存/推荐失效即可。
 
 **Tests first:**
 
@@ -2617,8 +2872,7 @@ uv run python -m src.main --validate
 def test_trace_contains_binding_timing_and_artifact_provenance(): ...
 def test_hidden_reasoning_content_is_not_persisted(): ...
 def test_missing_usage_is_unknown_not_zero(): ...
-def test_trace_payload_is_encrypted_scoped_and_retention_bound(): ...
-def test_trace_has_no_implicit_or_agent_callable_export_path(): ...
+def test_trace_uses_scope_and_never_persists_known_secret_material(): ...
 ```
 
 **Acceptance:**
@@ -2652,7 +2906,7 @@ uv run pytest tests/evaluation/test_trace.py tests/evaluation/test_trace_privacy
 3. 分数分开记录：任务正确性、合同遵守、参数正确、完成率、人工介入、延迟、成本。
 4. Agent 友好性与 Backend 能力覆盖使用同一套 capability/conformance 数据，不靠手工表格。
 5. 版本化 dataset、prompt、template、backend descriptor 和 scorer。
-6. 录制数据只保存在当前 project 的加密本地存储；首版不建设 dataset export，删除/撤销源后本地派生集按 lineage 失效。
+6. 录制数据只保存在当前项目的本地 Artifact store；源 Artifact 删除后对应 replay cache 失效。首版不建设 export/ACL/撤权子系统。
 
 **Tests first:**
 
@@ -2660,7 +2914,7 @@ uv run pytest tests/evaluation/test_trace.py tests/evaluation/test_trace_privacy
 def test_replay_never_dispatches_recorded_external_effect(): ...
 def test_score_distinguishes_contract_failure_from_answer_quality(): ...
 def test_dataset_version_and_backend_version_are_part_of_result_key(): ...
-def test_revoked_or_tainted_source_is_removed_from_local_eval_dataset(): ...
+def test_deleted_source_invalidates_local_eval_cache(): ...
 ```
 
 **Acceptance:**
@@ -2696,7 +2950,6 @@ uv run python scripts/run_agent_eval.py --dataset smoke --offline
 @dataclass(frozen=True)
 class CapabilityEvidence:
     employee_id: str
-    tenant_key: str
     project_id: str | None
     task_domain: str
     skill_tag: str
@@ -2716,9 +2969,9 @@ class CapabilityEvidence:
 1. canonical owner 是由 Journal-backed Run/Attempt/Artifact/verifier 事件可重建的 `CapabilityProjection`；Slock memory/router 和 Team 只能消费这一只读 projection，不能继续写第二份 skill truth。
 2. 只有 deterministic verifier、独立 reviewer 或 human outcome 可以提高 verified success；每个聚合值必须列出 evidence ids。
 3. Agent 自评和“有输出”只能作为弱信号。
-4. project/task-domain、freshness、样本量、backend/model/tool 版本变化必须参与分组或降低可比性；固定 `tenant_key` 只作内部隔离键，禁止跨项目泄漏。
+4. project/task-domain、freshness、样本量、backend/model/tool 版本变化必须参与分组或降低可比性；project_id 用于防止错误跨项目比较，不构建 tenant ACL。
 5. profile 是 routing 输入之一，不覆盖显式员工/Backend 选择。
-6. 删除/撤销 evidence 后 projection 可重建并移除其贡献；连续失败可以建议降级或人工介入，但不能自动修改 Employee 身份和长期角色文案。
+6. 删除 evidence 后 projection 可重建并移除其贡献；连续失败可以建议降级或人工介入，但不能自动修改 Employee 身份和长期角色文案。
 
 **Tests first:**
 
@@ -2727,7 +2980,7 @@ def test_self_report_does_not_count_as_verified_success(): ...
 def test_stale_or_low_sample_profile_has_low_confidence(): ...
 def test_explicit_employee_choice_overrides_profile_ranking(): ...
 def test_profile_rebuilds_from_canonical_evidence_and_slock_cannot_write_it(): ...
-def test_cross_project_or_revoked_evidence_never_contributes(): ...
+def test_cross_project_or_deleted_evidence_never_contributes(): ...
 ```
 
 **Acceptance:**
@@ -2768,21 +3021,21 @@ current thread explicit input
 
 **Implementation:**
 
-1. 每个 context item 带 source、scope、freshness、sensitivity、token estimate 和 provenance。
-2. selector 按 node role/capability 选择上下文，不能默认注入全群历史。
+1. 每个 context item 带 source、scope、freshness、token estimate 和 provenance。
+2. 受管群默认可使用当前群、当前项目、当前 Run 和相关 Employee memory；selector 按任务相关性与 token budget 选择，不做逐 item ACL。
 3. context budget exhaustion 产生摘要 Artifact，不悄悄截断关键验收标准。
-4. 用户删除、TTL 和 membership 变化立即影响后续选择。
-5. coordinator 只接收必要 Artifact 和摘要，不获得所有员工私有记忆。
-6. 摘要、Trace、CapabilityEvidence 等派生数据继承 source lineage taint；源被删除/撤权后写 Journal tombstone、删除可删除的加密 Blob，并使派生项不可再选择。Journal 保留最小审计 tombstone，不保留被删除明文。
+4. 项目/群/thread scope 防止意外跨项目选择；Owner 明确附加的跨项目资料可直接使用，不弹授权。
+5. coordinator 只接收必要 Artifact 和摘要，不注入 Vault/环境凭据或所有员工私有记忆。
+6. 源删除后对应摘要/cache/profile 失效；不建设逐派生对象的 sensitivity、membership revocation 和 taint 状态机。
 
 **Tests first:**
 
 ```python
 def test_thread_input_outranks_stale_employee_memory(): ...
-def test_cross_project_or_expired_context_is_rejected(): ...
+def test_cross_project_context_is_not_selected_unless_owner_attaches_it(): ...
 def test_context_budget_preserves_goal_and_done_criteria(): ...
 def test_coordinator_cannot_read_unselected_private_memory(): ...
-def test_source_deletion_taints_and_revokes_derived_summary_trace_and_profile(): ...
+def test_source_deletion_invalidates_derived_summary_trace_and_profile_cache(): ...
 ```
 
 **Acceptance:**
@@ -2813,8 +3066,8 @@ uv run pytest tests/autonomous/unit/test_context_envelope.py tests/autonomous/se
 2. 离线 eval 和诊断模式记录推荐与实际选择的差异，不影响执行；它不形成线上观察期。
 3. 相关测试通过后，Auto 直接成为当前 Owner 可选项，仅在用户/Workflow 明确选择 Auto 时使用。
 4. 显式 Agent/Employee/model 永远优先。
-5. policy、Owner 配置和 capability hard requirements 在 recommendation 之后再次校验。
-6. exploration 有比例上限，禁止在高风险任务上随机探索。
+5. ProjectGrant、Owner 配置和 capability hard requirements 在 recommendation 之后再次校验。
+6. exploration 有比例上限；包含 external mutable Effect 的任务不探索，项目内普通任务不引入 RiskClass。
 
 **Tests first:**
 
@@ -2822,7 +3075,7 @@ uv run pytest tests/autonomous/unit/test_context_envelope.py tests/autonomous/se
 def test_recommendation_diagnostic_never_changes_actual_backend(): ...
 def test_auto_mode_never_selects_backend_missing_hard_capability(): ...
 def test_explicit_selection_cannot_be_overridden_by_quality_score(): ...
-def test_high_risk_task_has_zero_exploration(): ...
+def test_external_mutable_effect_task_has_zero_exploration(): ...
 ```
 
 **Acceptance:**
@@ -2844,7 +3097,7 @@ uv run pytest tests/evaluation/test_router_recommendation.py -q
 
 **目标：** 让通过工程检查的功能在当前账号直接可用，同时具备可重复的本机体验检查、故障诊断、备份恢复和紧急回退。这里没有灰度、签名发布包或观察窗口。
 
-**预计投入：** 8–15 engineer-days。复用既有收敛计划 Task 22–24 与 Task 26 的本机验证部分；不实施原 Task 25 的租户发布 Gate。
+**核心投入：** 与 D4 合计 7–12 engineer-days。复用既有收敛计划 Task 22–23 与 Task 26 的本机验证部分；sandbox 只做信息/可选 hardening，不实施租户发布 Gate。
 
 Task E4 是对各功能“检查通过即启用”规则的配置收敛与遗留清理，不允许把启用动作拖到 Phase E；B4、C8 及其他功能任务必须在自己的检查点内完成 Owner 默认可见性。Task E5 只汇总开放后的体验与运维状态。
 
@@ -2865,15 +3118,15 @@ Task E4 是对各功能“检查通过即启用”规则的配置收敛与遗留
 - Journal/anchor/Blob/Vault 健康和 replay lag。
 - active/queued/unknown/cancel-pending run 数。
 - trigger mode、next due、lag、dead letter 和 kill state。
-- Employee Channel isolation mode，明确 `bwrap` 与 `process-fallback`。
+- Employee Channel execution mode，明确 `bwrap` 与 `process-fallback`，但后者在当前 trusted-host profile 只是信息，不使整个系统 degraded。
 - queue wait、fsync latency、card update coalescing、provider 429。
 
 **Tests first:**
 
 ```python
 def test_readiness_never_calls_install_update_or_paid_model(): ...
-def test_process_fallback_is_reported_as_no_filesystem_isolation(): ...
-def test_unknown_effect_or_dead_letter_degrades_readiness(): ...
+def test_process_fallback_is_reported_as_trusted_host_not_global_degraded(): ...
+def test_unknown_effect_or_dead_letter_only_degrades_affected_run_or_proactive_service(): ...
 def test_enabled_proactive_service_without_triggers_is_healthy_and_idle(): ...
 def test_emergency_disabled_subsystem_is_healthy_and_explicit(): ...
 ```
@@ -2892,7 +3145,7 @@ uv run python -m src.main --validate
 
 **Commit:** `feat(diagnostics): expose agent platform readiness`
 
-### Task E2：建立单用户工作负载基线
+### Task E2（按需诊断）：建立单用户工作负载基线
 
 **Files:**
 
@@ -2953,7 +3206,6 @@ uv run python scripts/run_agent_platform_soak.py --duration-hours 48 --output-di
 - Create/complete: `scripts/restore_state.py`（复用 convergence Task 23）
 - Create: `scripts/verify_agent_platform_backup.py`
 - Modify: `src/autonomous/data/projection.py`
-- Modify: `src/evaluation/revocation.py`
 - Create: `tests/autonomous/acceptance/test_agent_platform_restore.py`
 - Create: `docs/operations/agent-platform-recovery.md`
 
@@ -2962,9 +3214,8 @@ uv run python scripts/run_agent_platform_soak.py --duration-hours 48 --output-di
 - Journal、anchor、Blob/Data、Vault ciphertext。
 - Employee registry/channel binding。
 - Orchestration plans/projections。
-- Trigger/authority/kill state。
+- ManagedGroup/ProjectGrant/Trigger/kill state。
 - Artifact schema/catalog version。
-- deletion/tombstone high-water mark。
 
 **Implementation:**
 
@@ -2973,8 +3224,8 @@ uv run python scripts/run_agent_platform_soak.py --duration-hours 48 --output-di
 3. 恢复后不自动执行 unknown Effect。
 4. catalog/IR/schema migration 必须可重放、版本化和幂等。
 5. 回滚代码版本时若不认识新 schema，fail closed，不丢弃事件继续启动。
-6. restore 旧备份时，在开放 query/context/eval 前先应用当前 deletion high-water 与 revocation manifest；已删除/tainted Blob 不得从旧备份复活。
-7. 明确定义备份保留/到期销毁策略；当前计划没有 eval 数据对外导出路径。
+6. restore 是 point-in-time restore：会恢复该备份时存在的数据。若 Owner 要永久擦除历史数据，应删除对应旧备份；不建设跨所有备份的 revocation manifest/taint 图。
+7. 明确定义备份保留和 Owner 手工销毁策略。
 
 **Tests first:**
 
@@ -2982,8 +3233,7 @@ uv run python scripts/run_agent_platform_soak.py --duration-hours 48 --output-di
 def test_restore_rebuilds_same_runs_triggers_and_artifacts(): ...
 def test_restore_never_refires_consumed_occurrence(): ...
 def test_unknown_schema_blocks_startup_without_mutating_backup(): ...
-def test_restore_never_resurrects_deleted_or_tainted_blob(): ...
-def test_restore_preserves_deletion_high_water_mark(): ...
+def test_restore_documents_point_in_time_data_semantics(): ...
 ```
 
 **Verify:**
@@ -2995,7 +3245,7 @@ uv run python scripts/verify_agent_platform_backup.py --source /tmp/ghostap-back
 
 **Commit:** `test(operations): verify agent platform backup recovery`
 
-### Task E4：直接启用与紧急回退收敛
+### Task E4（折入 0.10/C8）：直接启用与紧急回退收敛
 
 **Files:**
 
@@ -3053,8 +3303,8 @@ uv run python -m src.main --validate
 1. **成熟路径：** 分别从飞书真实入口启动 Direct Agent、Deep 和 Spec，确认无额外 planner hop、会话续接/取消和原卡片合同不变。
 2. **开发路径：** 已完成的 Worktree、Workflow、Team、Slock 在正常菜单中可见；逐项运行最小真实任务并核对 terminal truth、Artifact、Reviewer、取消与恢复。
 3. **Employee：** `/hire`、Bot 身份、会话复用、重启恢复和角色为空时的信息提示正常。
-4. **Automation：** Owner 创建、启用、暂停、run now、撤销一个只读 Trigger；写动作必须展示逐 Run 确认，kill 后零新 dispatch。
-5. **故障与恢复：** 重启、断网、unknown Effect、备份恢复和紧急回退不复活已删除数据、不重复 Effect。
+4. **Automation：** Owner 创建 Trigger 后即可运行；受管项目动作无审批执行，超出 profile 的动作被确定性阻止并汇总；Owner 明确要求的外部动作不再二次确认；kill 后零新 dispatch。
+5. **故障与恢复：** 重启、断网、unknown Effect、备份恢复和紧急回退不重复 Effect；point-in-time restore 的数据语义如实显示。
 6. **开放后 UI：** 桌面端和移动端人工查看长文本、按钮和分段进展；现有“并行子任务/执行记录”折叠框不得改变。
 7. **诚实记录：** 脚本输出普通 JSON/Markdown 报告，明确 `passed/failed/not_tested`；不签名、不生成 release label，也不把手工未测伪装成失败或通过。
 
@@ -3068,6 +3318,9 @@ def test_direct_deep_spec_checks_are_independent_from_new_subsystems(): ...
 def test_completed_capability_is_present_in_owner_menu(): ...
 def test_execution_record_and_subtask_folds_are_unchanged(): ...
 def test_unknown_effect_or_unacknowledged_cancel_cannot_be_reported_passed(): ...
+def test_managed_group_local_effect_never_creates_approval_node(): ...
+def test_owner_explicit_external_action_is_not_reconfirmed(): ...
+def test_disallowed_automation_is_blocked_without_approval_prompt(): ...
 ```
 
 **Acceptance:**
@@ -3094,9 +3347,9 @@ uv run pytest tests/test_docs_references.py -q
 
 ### 14.1 项目
 
-- 当前目录、代码库、授权、默认 Agent、活动任务。
+- 当前目录、代码库、受管群/connected targets、默认 Agent、活动任务。
 - 普通编程/Deep/Spec 快捷入口继续存在。
-- 项目级任务、预算、Trigger、最近产物和风险事件。
+- 项目级任务、limits、Trigger、最近产物和 blocked/unknown 事件。
 
 ### 14.2 Agent 与 Employee
 
@@ -3112,20 +3365,21 @@ uv run pytest tests/test_docs_references.py -q
 ### 14.4 Task Center
 
 - Direct/Deep/Spec/WT/WF/Team 的统一只读状态和停止入口。
-- active/blocked/waiting approval/unknown/terminal 分组。
+- active/blocked/limit-reached/unknown/terminal 分组。
 - 每项显示实际 owner、backend/model、预算和可恢复性。
 
 ### 14.5 Automation
 
-- Trigger/Goal template、下次运行、owner、scope、TTL、budget、mode。
-- pause/run now/edit/revoke/kill。
-- 主动子系统完成 CP-C-Assist 后立即在 Owner 菜单出现；没有 Trigger 时显示空状态和创建入口，不靠隐藏菜单控制开放。
+- Trigger/Goal template、下次运行、managed project、limits、mode、connected targets。
+- pause/run now/edit/stop/automation kill。
+- 主动子系统完成 CP-C-Managed 后立即在 Owner 菜单出现；没有 Trigger 时显示空状态和创建入口，不靠隐藏菜单控制开放。
 
-### 14.6 Approval 与 Audit
+### 14.6 Control 与 Audit
 
-- 待批准 Effect、standing authority、unknown Effect。
+- blocked action、unknown Effect、limit reached、stop/kill。
 - route、plan revision、Artifact lineage、成本和最终证据。
 - 用户看到的是进展摘要和事实，不展示隐藏思维链。
+- 正常项目工作没有 approval inbox；权限扩大直接引导 Owner 私聊配置一次。
 
 ---
 
@@ -3135,12 +3389,12 @@ uv run pytest tests/test_docs_references.py -q
 
 | 优先级 | 范围 | 为什么 |
 | --- | --- | --- |
-| P0 必须立即做 | Foundation 依赖账本、Task 0.1–0.7 | 先保护成熟路径并修正事实/安全缺口 |
+| P0 必须立即做 | Foundation 依赖账本、Task 0.1–0.10、CP-T/CP-P0 | 先保护成熟路径，并让自建项目群真正零打扰 |
 | P1 平台底座 | A1–A6、B1–B3 | 新 Agent 接入、统一可见性和类型化合同，收益高且不要求接管执行 |
 | P2 编排可用 | B4–B6、B9a、B10；再并行 B7/B8/B9b | 先直接交付静态耐久 Workflow，再扩展 WT/Team/Slock 和动态协调 |
-| P3 主动 Assist | C1–C8 到 CP-C-Assist | 先只读、可停、可审计地主动工作 |
-| P4 质量优化 | D1–D5 | 有数据后再做自适应，避免凭感觉路由 |
-| P5 本机体验与恢复 | E1–E5 | 完成即开放，同时保证诊断、备份和一键回退 |
+| P3 受管项目自治 | C1–C8 到 CP-C-Managed | 项目内读写/测试/编排直接做，越界自动阻止并摘要 |
+| P4 本机体验与恢复 | D4、E1、E3、E5 | 上下文、诊断、备份和一键回退服务真实日常使用 |
+| P5 按需质量优化 | D1–D3、D5、A7、B9b | 有真实数据或扩展需求后再做，不阻塞核心体验 |
 
 ### 15.2 可交付版本
 
@@ -3157,29 +3411,29 @@ uv run pytest tests/test_docs_references.py -q
 - CP-B-Execute 通过后 Workflow IR v2 直接出现在当前 Owner 入口，v1 保持紧急回退。
 - 用户收益：复杂任务有真实依赖、Reviewer、产物、预算、取消和重启恢复。
 
-**V3 — Proactive Assist**
+**V3 — Managed Project Autonomy**
 
-- C1–C8 至 CP-C-Assist。
-- 用户收益：定时/事件驱动的只读巡检、汇总和建议，异常时找人。
+- C1–C8 至 CP-C-Managed。
+- 用户收益：定时/事件驱动的项目内读写、测试、修复和团队编排默认直接推进；limits、stop、kill、unknown 与 blocked-action 摘要可见。
 
-**V4 — Owner-supervised Agent Department**
+**V4 — Evidence-informed Agent Department**
 
-- CP-C-Write、D、E。
-- 用户收益：经逐 Run Owner 确认执行有限可逆动作，并能基于证据选择合适 Agent/Employee；每项完成后直接可用。
+- D/E 的按需能力。
+- 用户收益：在不改变显式选择优先级的前提下，基于证据改进 Agent/Employee 推荐、上下文和本机运维；没有逐 Run Owner 确认层。
 
 ### 15.3 投入估算
 
-| 阶段 | 增量 engineer-days | 与既有计划重叠 |
+| Canonical work package | 剩余 engineer-days | 包含/折叠 |
 | --- | ---: | --- |
-| Phase 0 | 15–25 | 与现有正确性/收敛任务部分重叠 |
-| Phase A | 25–40 | 与既有 Task 14–16 高度重叠 |
-| Phase B | 45–70 | 与既有 Task 13、17–20 部分重叠 |
-| Phase C | 30–45 | 主要为新增；不含首版 Webhook/多租户开放状态 |
-| Phase D | 20–35 | 主要为新增 |
-| Phase E | 8–15 | 与既有 Task 22–24、26 的本机部分重叠 |
-| **总增量（未去重）** | **143–230** | 实施前必须用依赖账本去重 |
+| Trusted Project + Protected Lanes | 7–11 | 0.1–0.3、0.8–0.10；0.4–0.7 只保留完成证据 |
+| Built-in Backend Contract | 8–13 | A1–A6；A7 按需 |
+| Compile Domain + Durable Execute | 16–25 | B1–B6、B9a、B10；B4 属于 compile；直接复用 Autonomous Journal/domain |
+| Workflow/Team/Worktree adapters | 3–5 | B7；B8 按真实需求，B9b 后置 |
+| Useful Proactive Runtime | 10–16 | C1–C8 首版 one-shot/interval + CP-C-Managed |
+| Context + Operations | 7–12 | D4、E1、E3、E5 |
+| **核心剩余** | **51–82** | 不含 A7、B9b、cron/DST、D1–D3/D5、高容量压测等按需项 |
 
-既有收敛计划估算为 76–123 engineer-days；两份计划不能直接相加，因为 Backend、Task Control、Workflow recovery、doctor 和 backup 有明显重叠，且原租户发布任务已删除。建议先执行 3–5 天的任务去重和基线确认，再给出实际排期。
+原 143–230 engineer-days 估算建立在 tenant/对象 ACL、DataEgressPolicy、逐 Run approval、standing order、签名插件、sandbox eligibility 和完整 Eval 治理之上，已被本次单 Owner 易用性方案替换，不再作为排期依据。
 
 若由 3–4 个 Agent/工程师并行，按工程依赖串行通过检查点、按独立模块并行实现；每个已完成切片立即交给 Owner 体验。provider 兼容、Journal/Effect 正确性和故障演练是关键路径，增加并行度不能绕过它们。
 
@@ -3213,10 +3467,12 @@ uv run pytest tests/test_docs_references.py -q
 ### 16.4 主动工作
 
 - duplicate occurrence 创建多个 logical run 数 = 0。
-- 过期/撤权后新外部调用数 = 0。
+- pause/过期/解除项目绑定后新外部调用数 = 0。
 - kill anchor 后新 dispatch 数 = 0。
-- 无 owner/TTL/budget/authority 的 enabled trigger 数 = 0。
-- quiet hours 内非紧急通知泄漏数 = 0。
+- 无 ProjectGrant/limits 的 enabled trigger 数 = 0。
+- 受管群项目内动作产生 approval/enrollment prompt 数 = 0。
+- 动作矩阵 `ASK` 结果数 = 0。
+- 未登记 connected target 的自动外部写数 = 0。
 
 ### 16.5 质量与产品
 
@@ -3225,6 +3481,7 @@ uv run pytest tests/test_docs_references.py -q
 - 用户显式选择覆盖推荐的成功率 = 100%。
 - 已完成能力出现在 Owner 正常菜单的比例 = 100%。
 - rollout-only 租户 allowlist、百分比和发布状态控制项 = 0。
+- 业务对象 `tenant_key`、对象级 ACL、standing approval 数 = 0。
 - “未测试”不计入“通过”。
 
 ### 16.6 运维
@@ -3246,14 +3503,17 @@ uv run pytest tests/test_docs_references.py -q
 | ACP/CLI 被假装等价 | capability 过于粗糙 | UI 承诺失真、取消/恢复失败 | capability conformance；CLI 明确 stateless/text-only 降级 |
 | IR 限制 Workflow 表达力 | 类型化节点无法覆盖任意 JS | 用户已有 workflow 失效 | v1 兼容、离线 comparator、unsupported 明示、逐模板迁移 |
 | 双 Journal/双队列 | 新旧 runtime 并行期过长 | 重复派发、终态冲突 | Journal 单写、owner adapter、迁移后关闭旧消费者 |
-| Trigger 风暴 | 重启补跑、重复 event、时钟异常 | 成本和消息洪泛 | deterministic dedupe、bounded misfire、quota、dead letter、quiet hours |
-| Coordinator 越权 | JSON prompt 被当成安全边界 | 项目/Shell 被隐式操作 | deny-all tool filter；Artifact 注入；Effect policy |
+| Trigger 风暴 | 重启补跑、重复 event、时钟异常 | 成本和消息洪泛 | deterministic dedupe、bounded misfire、limits、dead letter、通知合并 |
+| Coordinator 越权 | JSON prompt 被当成能力边界 | Coordinator 自己操作项目 | deny-all tool filter；Artifact 注入；真实 Employee 执行 |
 | 指标驱动错误路由 | 小样本/自评/过期数据 | Agent 被错误分配 | evidence confidence、freshness、离线诊断、显式选择优先 |
-| 上下文泄漏 | 为提高质量注入全群/全记忆 | 跨项目或个人数据暴露 | Context Envelope、scope/TTL/provenance、最小选择 |
-| 外部副作用无法回滚 | provider/Shell/Feishu 已执行 | restart 后重复或未知 | prepared/committed/unknown、idempotency、人工 reconcile |
+| 上下文串项目 | 为提高质量注入无关群/记忆 | Agent 得到错误上下文 | scope/provenance、相关性选择、secret 自动过滤 |
+| 外部副作用无法回滚 | provider/Shell/Feishu 已执行 | restart 后重复或未知 | prepared/committed/unknown、idempotency、自动 reconcile 或一次摘要 |
+| 受管群记录缺失/伪造 | 建群与项目绑定非原子 | 自建群被拒绝或外部群误信 | durable provenance、原子 bind、重启 replay、CP-T 纵向测试 |
+| ProjectGrant 过宽 | connected target 或 root 配错 | Agent 影响非预期目标 | 只有 Owner 私聊可改；自动任务不能扩权；变更清晰展示 |
+| 意外成员加入受管群 | 飞书群成员被手工改变 | 其可见既有群消息 | 未知成员输入不进 Run/context、一次低噪声告警；真实多人保密需求出现后再启用 optional quarantine |
 | 多副本过早建设 | 对未来规模过度设计 | 复杂度与运维成本激增 | 先用容量证据触发 Hardened ADR |
-| 产品入口继续膨胀 | 每个内核增加新命令 | 用户无法形成心智模型 | 围绕项目/员工/团队/任务/自动化/审批组织 |
-| 把单用户假设写死进数据模型 | 为省发布逻辑而删除所有 scope | 群消息或未来迁移串线 | 保留固定内部 namespace、Owner/项目/聊天 ACL；只删除发布维度 |
+| 产品入口继续膨胀 | 每个内核增加新命令 | 用户无法形成心智模型 | 围绕项目/员工/团队/任务/自动化/控制与审计组织 |
+| 未来出现真实多人场景 | 当前没有成员 ACL | 新用户可能获得错误能力 | 届时单独增加角色模型；当前未知成员消息不创建 Run |
 
 ---
 
@@ -3264,13 +3524,13 @@ uv run pytest tests/test_docs_references.py -q
 1. 一个新 Backend 尚未通过 conformance 时，不新增第二个同类 Backend。
 2. Workflow/Team 尚不能真实取消和恢复时，不新增更多动态原语。
 3. Slock/Team 仍有双事实源时，不新增自动分配策略。
-4. Trigger 尚无 dedupe/TTL/budget/kill 时，不新增新的事件来源。
-5. Assist/read-only 的权限、data-egress、Effect、kill 和恢复测试未通过时，不开放 Owner 确认写入。
+4. Trigger 尚无 dedupe/limits/kill/restart 时，不新增新的事件来源。
+5. 受管群 project grant、ActionMatrix、Effect、kill 和恢复测试未通过时，不开放自动项目写；通过后直接开放，不增加 approval 阶段。
 6. 单机容量尚未测量时，不开始多副本实现。
 7. Direct/Deep/Spec 保护合同出现回归时，立即停止平台迁移并回滚。
 8. 任何 UI 声称“已评审、已停止、已恢复、已隔离、已完成”，必须有相应运行时证据。
 9. 不新增展示隐藏 chain-of-thought 的功能；只展示结构化计划、进展摘要、工具和证据。
-10. 不允许聊天用户安装任意 in-process 插件或不在受信 command registry 中的可执行命令；这是安全边界，不是功能开放名单。
+10. 受管群 Agent 不可安装 Backend、修改 raw argv 或扩大 ProjectGrant；Owner 私聊可配置 custom binding，使用 argv 数组和现有 driver contract。
 
 ---
 
@@ -3296,17 +3556,17 @@ uv run pytest tests/test_docs_references.py -q
 | O-14 | Team/Slock 辅助 Agent 工具权限未收口 | Team coordinator、Slock NLI/summary | 0.7 |
 | O-15 | Slock 内存 queue 与 Employee Team 并存 | `slock_engine/task_queue.py`、Team projection | B7 |
 | O-16 | Trigger/Scheduler 原型未接 production composition | `autonomous/scheduler/`、`domain/goals.py` | C1–C8 |
-| O-17 | Channel process fallback 不等于 filesystem isolation | employee channel supervisor | E1、既有 sandbox 安全任务 |
+| O-17 | Channel process fallback 不等于 filesystem isolation | employee channel supervisor | E1 如实显示；sandbox 移入 optional hardening |
 | O-18 | SkillProfile 主要由任务结果和自反馈更新 | Slock memory/router | D3 |
 | O-19 | README/欢迎文案与真实生产入口存在漂移 | README、welcome card、SystemHandler | Foundation Task 8、0.1、E4 |
 | O-20 | `ws_client`/programming/system/mode/config 仍有生产 Backend 硬编码，闲置 hub 不是 SSOT | Feishu production composition 与 Handler | A2、A3 |
 | O-21 | capability 粒度混淆选模/恢复/过滤/取消的请求与真实强制能力 | Session/ACP/CLI adapters | A1、A5 |
-| O-22 | 旧 DispatchGate/Policy 未接 Employee production，且执行帧锚定/standing state 不足 | broker gate、policy engine、gateway coordinator | B5、C5 |
-| O-23 | 新 Run/Artifact 控制面若无 tenant/ACL 会扩大跨租户读写面 | Tasking 与 Artifact proposal | B1、B3 |
+| O-22 | 旧 DispatchGate 未接 Employee production 且执行帧锚定不足；旧 approval/standing Policy 不符合个人工具 | broker gate、policy engine、gateway coordinator | B5 保留锚定；C5 改无交互 ActionMatrix |
+| O-23 | 现有平面 user/chat allowlist 无法表达 Owner 私聊、受管群和外部群，且会阻断自建群 | ingress、ProjectChatService、ProjectManager | 0.8–0.10、CP-T |
 | O-24 | 现有 task/autonomous/Feishu scheduler/control owner 重叠 | `tasking/scheduler.py`、Autonomous scheduler、Feishu control plane | B6、B7 |
 | O-25 | opaque ACP/CLI session 内部工具副作用无法由外层 Effect gate 逐项锚定 | Backend session 与 tool callback | A1、B2、B5 |
-| O-26 | 主动“只读”仍可能向外部 provider 披露代码/群上下文 | Authority 与 Context/Egress boundary | C1、C5、D4 |
-| O-27 | Trace/Eval/摘要派生数据需要 ACL、retention、删除 lineage 和导出许可 | Evaluation/Context proposal | D1–D4 |
+| O-26 | 配置 Backend 即会发送任务上下文，需避免凭据混入 | Backend context/Vault boundary | C1、D4：全局选择 + 自动 secret 过滤，不建逐 Trigger egress policy |
+| O-27 | Trace/Eval/摘要需要项目归属并避免 secret | Evaluation/Context proposal | D1–D4：scope/provenance/cache invalidation，不建对象 ACL/taint 图 |
 | O-28 | 复杂发布矩阵不符合当前单用户场景 | 原 Release/evidence model | E4、E5：Owner 清单与直接启用 |
 
 ---
@@ -3343,28 +3603,29 @@ uv run python -m src.main --validate
 
 ### 现在应该做
 
-1. 先完成 Foundation 依赖去重与 Phase 0，保护普通编程/Deep/Spec 并修正当前事实。
+1. 先完成 Task 0.8–0.10/CP-T：让 GhostAP 自建项目群一次绑定后默认直执；同时保护普通编程/Deep/Spec。
 2. 优先完成 Agent Catalog + Conformance，而不是继续增加 Agent 名称。
-3. 用 Workflow/Team/Slock/Worktree 作为 IR、Journal、Budget、Cancellation 的开发路径；每个闭环完成后立即开放。
+3. 用 Workflow/Team/Slock/Worktree 作为 IR、Journal、limits、Cancellation 的开发路径；每个闭环完成后立即开放。
 4. 在 Task/Effect 事实可靠之前，不上线持续 Trigger。
 
 ### 接下来最值得投入
 
 1. Durable Orchestration：这是把“多个 Agent 能并行调用”升级为“可交付复杂任务”的关键。
 2. Artifact/Done Criteria：这是减少 Agent 间信息丢失和虚假完成的关键。
-3. Proactive Assist：从只读巡检、总结、提醒开始，建立用户信任和本机运维证据。
+3. Managed Project Autonomy：项目内读写、测试、修复和编排默认推进，用 limits/kill/recovery 代替审批。
 4. Evidence-based Capability：数据足够后再做 Auto route 和团队自动组建。
 
 ### 暂时不要做
 
 1. 不把 Direct/Deep/Spec 重写到统一 IR。
 2. 不同时保留 Workflow Journal、Team projection、Slock queue 三套执行事实源。
-3. 不让 Agent 在没有 owner、TTL、预算和 authority 时创建永久目标。
-4. 不开放任意第三方插件在主进程执行。
-5. 不在单机证据不足时投入多副本。
+3. 不建设 tenant ACL、逐对象权限、RiskClass、逐 Run approval、standing order 或 DataEgressPolicy。
+4. 不把 sandbox、签名插件、cron/DST、完整 Eval 治理或高容量 soak 设为首版门槛。
+5. 不开放任意第三方 Python 插件在主进程执行；Owner custom command 复用现有 driver + argv 合同。
+6. 不在单机证据不足时投入多副本。
 
 ### 产品上限判断
 
-在当前单机、文件 Journal、受信工程主机边界内，GhostAP 有机会成为一个非常强的“可恢复多员工软件交付部门”：既保留与 Codex 等 Agent 直接编程的高效体验，也能将复杂工作交给有身份、有上下文、有审计的 Agent 团队，并让这些团队在有限授权下主动巡检和推进。
+在当前单机、文件 Journal、受信工程主机边界内，GhostAP 有机会成为一个非常强的“可恢复多员工软件交付部门”：既保留与 Codex 等 Agent 直接编程的高效体验，也能将复杂工作交给有身份、有上下文、有审计的 Agent 团队，并让这些团队在 GhostAP 自建群的绑定项目内默认主动推进。
 
 它在这一 profile 下不能诚实成为“无人监管、跨系统任意行动、跨区域高可用的自主组织”。达到那一层需要外部一致性、强隔离、KMS/身份、分布式租约、成本治理和相应故障证据。把这条边界说清楚，反而能让 GhostAP 在最有价值、最可控的范围内更快形成可靠产品。
