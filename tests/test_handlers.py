@@ -2804,21 +2804,6 @@ class TestForceReleaseRepoLockHandler:
 class TestRetryCommandHandler:
     """Tests for the retry_command card action handler in action_registry."""
 
-    def test_retry_command_dispatches_to_process_with_intent(self):
-        """retry_command should call _process_with_intent with command_text."""
-        client = MagicMock()
-        mock_project = MagicMock()
-        client._project_manager.get_project_for_chat.return_value = mock_project
-
-        # Simulate the handler logic directly (same as action_registry)
-        val = {"command_text": "/status"}
-        cmd = val.get("command_text", "").strip()
-        assert cmd == "/status"
-        project = client._project_manager.get_project_for_chat("proj-1", "chat-1")
-        client._process_with_intent("msg-1", "chat-1", cmd, project)
-
-        client._process_with_intent.assert_called_once_with("msg-1", "chat-1", "/status", mock_project)
-
     def test_retry_command_empty_command_replies(self):
         """retry_command with empty command_text should reply with retry_empty_command."""
         from src.feishu.retry_handler import RetryCommandHandler
@@ -2829,24 +2814,6 @@ class TestRetryCommandHandler:
         msg = dispatch.reply_text.call_args[0][1]
         assert "无法获取重试命令" in msg
         dispatch.process_with_intent.assert_not_called()
-
-    def test_retry_command_falls_back_to_active_project(self):
-        """When project_id is None, retry_command falls back to get_active_project."""
-        client = MagicMock()
-        mock_project = MagicMock()
-        client._project_manager.get_project_for_chat.return_value = None
-        client._project_manager.get_active_project.return_value = mock_project
-
-        val = {"command_text": "/help"}
-        cmd = val.get("command_text", "").strip()
-        pid = None
-        project = client._project_manager.get_project_for_chat(pid, "chat-1") if pid else None
-        if not project:
-            project = client._project_manager.get_active_project("chat-1")
-        client._process_with_intent("msg-1", "chat-1", cmd, project)
-
-        client._process_with_intent.assert_called_once_with("msg-1", "chat-1", "/help", mock_project)
-
 
 # ======================================================================
 # Engine base LockConflictError tests

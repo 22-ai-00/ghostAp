@@ -309,6 +309,7 @@ def test_control_fd_ownership_can_only_be_taken_once(tmp_path: Path) -> None:
         supervisor.close()
 
 
+@pytest.mark.slow
 def test_bootstrap_write_failure_closes_bootstrap_fd_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -365,6 +366,7 @@ def test_two_employees_get_distinct_fresh_processes_and_one_shot_credentials(tmp
         supervisor.close()
 
 
+@pytest.mark.slow
 def test_ready_timeout_fails_closed_and_reaps_child(tmp_path: Path) -> None:
     supervisor, _secret, _calls = _supervisor(tmp_path, behavior="timeout", timeout=0.1)
 
@@ -573,6 +575,7 @@ def test_concurrent_close_callers_wait_for_shared_teardown(
         supervisor.stop("agt_concurrent_close")
 
 
+@pytest.mark.slow
 def test_ready_event_pipe_eof_revokes_readiness_and_reaps_live_worker(
     tmp_path: Path,
 ) -> None:

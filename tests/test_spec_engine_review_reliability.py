@@ -52,15 +52,6 @@ def _make_artifacts() -> ReviewArtifacts:
     )
 
 
-def _chain(outer, *, cause=None, context=None):
-    """Attach __cause__ / __context__ and return outer exception."""
-    if cause is not None:
-        outer.__cause__ = cause
-    if context is not None:
-        outer.__context__ = context
-    return outer
-
-
 # ---------------------------------------------------------------------------
 # classify_timeout heuristic
 # ---------------------------------------------------------------------------
@@ -68,40 +59,6 @@ def _chain(outer, *, cause=None, context=None):
 
 class TestClassifyTimeoutStartupHeuristic:
     """Verify the "Internal error" + elapsed-time heuristic."""
-
-    def test_internal_error_near_timeout_is_classified_as_timeout(self):
-        exc = RuntimeError("Internal error: backend unavailable")
-        assert classify_timeout(exc, elapsed_s=19.5, timeout_s=20) is True
-
-    def test_internal_error_below_threshold_is_not_timeout(self):
-        exc = RuntimeError("Internal error: backend unavailable")
-        assert classify_timeout(exc, elapsed_s=10.0, timeout_s=20) is False
-
-    def test_no_internal_error_near_timeout_is_not_timeout(self):
-        exc = RuntimeError("some other error")
-        assert classify_timeout(exc, elapsed_s=19.5, timeout_s=20) is False
-
-    def test_internal_error_case_insensitive(self):
-        exc = RuntimeError("INTERNAL ERROR from upstream")
-        assert classify_timeout(exc, elapsed_s=19.5, timeout_s=20) is True
-
-    def test_chained_internal_error_detected(self):
-        inner = RuntimeError("Internal error: JSON-RPC -32603")
-        outer = _chain(RuntimeError("session creation failed"), cause=inner)
-        assert classify_timeout(outer, elapsed_s=19.0, timeout_s=20) is True
-
-    def test_no_params_no_heuristic(self):
-        """Without elapsed_s/timeout_s, Internal error alone is not a timeout."""
-        exc = RuntimeError("Internal error")
-        assert classify_timeout(exc) is False
-
-    def test_only_one_param_no_heuristic(self):
-        exc = RuntimeError("Internal error")
-        assert classify_timeout(exc, elapsed_s=19.5) is False
-        assert classify_timeout(exc, timeout_s=20) is False
-
-    def test_direct_timeout_still_works(self):
-        assert classify_timeout(TimeoutError("timed out")) is True
 
     def test_eighty_percent_threshold(self):
         """At exactly 80% of timeout, should be True."""

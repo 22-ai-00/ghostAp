@@ -1123,33 +1123,6 @@ class TestStopButtonConfirmDialogs:
 
 
 # ---------------------------------------------------------------------------
-# timeout_display formatting (system help card)
-# ---------------------------------------------------------------------------
-
-
-class TestTimeoutDisplayFormatting:
-    """Test timeout_display formatting logic in system help card."""
-
-    @pytest.mark.parametrize("timeout_seconds,expected_substring", [
-        (300, "5 分钟"),
-        (3600, "60 分钟"),
-        (7200, "2 小时"),
-    ])
-    def test_timeout_display_format(self, timeout_seconds, expected_substring):
-        """Verify timeout display formatting for various second values."""
-        import math
-
-        timeout_minutes = max(1, math.ceil(timeout_seconds / 60))
-        if timeout_minutes >= 120:
-            hours = timeout_minutes // 60
-            timeout_display = f"{hours} 小时" if timeout_seconds % 3600 == 0 else f"约 {hours} 小时"
-        else:
-            timeout_display = f"{timeout_minutes} 分钟" if timeout_seconds % 60 == 0 else f"约 {timeout_minutes} 分钟"
-
-        assert timeout_display == expected_substring
-
-
-# ---------------------------------------------------------------------------
 # button_size parameter pass-through tests
 # ---------------------------------------------------------------------------
 

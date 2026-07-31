@@ -21,6 +21,74 @@ def scheduler():
 class TestTimerSchedulerBasic:
     """Basic schedule/cancel/shutdown functionality."""
 
+    def test_shutdown_cancels_distant_timer_and_exits_worker_promptly(self):
+        sleep_entered = threading.Event()
+        fired = threading.Event()
+
+        class ObservedTimerScheduler(TimerScheduler):
+            def _interruptible_sleep(self, duration: float) -> None:
+                sleep_entered.set()
+                super()._interruptible_sleep(duration)
+
+        scheduler = ObservedTimerScheduler()
+        try:
+            scheduler.schedule(60.0, fired.set, session_id="distant")
+            assert sleep_entered.wait(timeout=1.0)
+
+            started_at = time.monotonic()
+            scheduler.shutdown()
+            elapsed = time.monotonic() - started_at
+
+            assert elapsed < 0.5
+            assert scheduler.is_alive is False
+            assert scheduler.pending_count == 0
+            assert fired.is_set() is False
+        finally:
+            # Wake the pre-fix implementation after the assertion so a red
+            # test does not leave its daemon worker asleep for 60 seconds.
+            scheduler._wake_event.set()
+            scheduler._thread.join(timeout=1.0)
+
+    def test_schedule_waiting_on_lock_is_rejected_after_shutdown_starts(self):
+        scheduler = TimerScheduler()
+        original_lock = scheduler._lock
+        schedule_waiting = threading.Event()
+        handles = []
+
+        class SignalingLock:
+            def __enter__(self):
+                if threading.current_thread().name == "late-schedule":
+                    schedule_waiting.set()
+                original_lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                original_lock.release()
+
+        scheduler._lock = SignalingLock()
+        original_lock.acquire()
+        worker = threading.Thread(
+            target=lambda: handles.append(
+                scheduler.schedule(60.0, lambda: None, session_id="late")
+            ),
+            name="late-schedule",
+        )
+        try:
+            worker.start()
+            assert schedule_waiting.wait(timeout=1.0)
+            scheduler._shutdown_event.set()
+        finally:
+            original_lock.release()
+
+        worker.join(timeout=1.0)
+        try:
+            assert worker.is_alive() is False
+            assert len(handles) == 1
+            assert handles[0].cancelled is True
+            assert scheduler.pending_count == 0
+        finally:
+            scheduler.shutdown()
+
     def test_schedule_fires_callback(self, scheduler):
         fired = threading.Event()
         scheduler.schedule(0.05, fired.set, session_id="test")

@@ -150,31 +150,24 @@ def test_main_agent_catalog_is_unique_and_within_feishu_limit() -> None:
     assert all(item.description for item in canonical)
 
 
-@pytest.mark.parametrize("command", sorted(SYSTEM_COMMANDS))
-def test_cataloged_system_commands_are_routable(command: str) -> None:
-    match = SlashCommandParser.parse(command)
-
-    assert SystemHandler.is_interceptable_command_match(match)
-
-
-@pytest.mark.parametrize("command", sorted(DEEP_COMMANDS))
-def test_cataloged_deep_commands_are_routable(command: str) -> None:
-    assert SystemHandler.is_deep_command(command)
+def test_cataloged_system_commands_are_routable() -> None:
+    for command in sorted(SYSTEM_COMMANDS):
+        match = SlashCommandParser.parse(command)
+        assert SystemHandler.is_interceptable_command_match(match), (
+            f"{command!r} was not interceptable"
+        )
 
 
-@pytest.mark.parametrize("command", sorted(SPEC_COMMANDS))
-def test_cataloged_spec_commands_are_routable(command: str) -> None:
-    assert SystemHandler.is_spec_command(command)
+def test_cataloged_workflow_commands_are_routable() -> None:
+    for command in sorted(WORKFLOW_COMMANDS):
+        assert command in TOPIC_ENGINE_COMMANDS, f"{command!r} was not routable"
 
 
-@pytest.mark.parametrize("command", sorted(WORKFLOW_COMMANDS))
-def test_cataloged_workflow_commands_are_routable(command: str) -> None:
-    assert command in TOPIC_ENGINE_COMMANDS
-
-
-@pytest.mark.parametrize("command", sorted(SLOCK_COMMANDS))
-def test_cataloged_slock_commands_are_routable(command: str) -> None:
-    assert parse_slock_command(command).action is not SlockCommandAction.UNKNOWN
+def test_cataloged_slock_commands_are_routable() -> None:
+    for command in sorted(SLOCK_COMMANDS):
+        assert parse_slock_command(command).action is not SlockCommandAction.UNKNOWN, (
+            f"{command!r} was not routable"
+        )
 
 
 @pytest.mark.asyncio

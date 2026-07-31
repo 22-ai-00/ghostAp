@@ -1,17 +1,12 @@
 """Security tests: Runner isolation, worker sandboxing, oracle timeouts."""
 
-import json
-import os
-import sys
 import tempfile
-import time
 
 import pytest
 
-from src.autonomous.runtime.runner import RunResult, SandboxRunner
-from src.autonomous.runtime.worker import APPROVED_MODULES, execute_task, main
-from src.autonomous.verifier.oracle_runner import OracleRunner, OracleResult
-
+from src.autonomous.runtime.runner import SandboxRunner
+from src.autonomous.runtime.worker import APPROVED_MODULES, execute_task
+from src.autonomous.verifier.oracle_runner import OracleRunner
 
 # ---------------------------------------------------------------------------
 # SandboxRunner isolation tests
@@ -35,12 +30,14 @@ class TestSandboxRunnerIsolation:
         assert "hello" in result.stdout
         assert result.timed_out is False
 
+    @pytest.mark.slow
     def test_timeout_kills_process(self) -> None:
         runner = SandboxRunner()
         result = runner.run(["sleep", "60"], timeout=1.0)
         assert result.timed_out is True
         assert result.elapsed_seconds < 5.0  # Should not wait full 60s
 
+    @pytest.mark.slow
     def test_timeout_kills_child_processes(self) -> None:
         """Process-group kill ensures descendants are also terminated."""
         runner = SandboxRunner()
@@ -166,7 +163,6 @@ class TestWorkerIsolation:
 
     def test_worker_does_not_import_autonomous_internals(self) -> None:
         """Worker module must not import journal, broker, domain etc."""
-        import importlib
         import src.autonomous.runtime.worker as worker_mod
 
         # Get all names defined in worker
@@ -212,6 +208,7 @@ class TestOracleRunnerIsolation:
         assert result.passed is False
         assert result.exit_code == 1
 
+    @pytest.mark.slow
     def test_oracle_timeout_kills_all_descendants(self) -> None:
         """Oracle timeout MUST kill entire process group."""
         runner = OracleRunner(timeout=1.0)

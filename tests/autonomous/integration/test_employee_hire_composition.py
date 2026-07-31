@@ -1716,6 +1716,7 @@ def _persist_queued_team_assignment_then_crash(root: str, pipe) -> None:
     os._exit(0)
 
 
+@pytest.mark.slow
 def test_queued_team_assignment_restart_never_dispatches_acp(tmp_path: Path) -> None:
     """A real process crash is recovered before Context/Slock/ACP dispatch."""
 
@@ -3314,6 +3315,7 @@ def test_duplicate_hire_during_recovery_does_not_start_second_configuration(
     restarted.close()
 
 
+@pytest.mark.slow
 def test_transient_recovery_failure_is_supervised_and_converges_in_process(
     tmp_path: Path,
 ) -> None:
@@ -3365,6 +3367,7 @@ def test_transient_recovery_failure_is_supervised_and_converges_in_process(
     restarted.close()
 
 
+@pytest.mark.slow
 def test_exhausted_hire_recovery_is_isolated_as_action_required(
     tmp_path: Path,
 ) -> None:
@@ -4399,6 +4402,7 @@ def test_active_notification_retries_after_unacknowledged_reply(tmp_path: Path) 
     runtime.close()
 
 
+@pytest.mark.slow
 def test_new_hire_reports_action_required_after_bounded_retries(tmp_path: Path) -> None:
     statuses: list[str] = []
     settings = _settings(tmp_path, limit=1)
@@ -4431,6 +4435,7 @@ def test_new_hire_reports_action_required_after_bounded_retries(tmp_path: Path) 
     runtime.close()
 
 
+@pytest.mark.slow
 def test_action_required_notification_retries_automatically(tmp_path: Path) -> None:
     attempts: list[str] = []
 
@@ -5489,6 +5494,7 @@ def test_early_status_unknown_reply_recovers_original_decision_after_restart(
     restarted.close()
 
 
+@pytest.mark.slow
 def test_stale_generation_status_prompts_once_then_current_status_activates(
     tmp_path: Path,
 ) -> None:
@@ -6027,6 +6033,7 @@ def test_hard_closed_nonterminal_replay_cannot_resubmit_external_activity(
     recovered.close()
 
 
+@pytest.mark.slow
 def test_crashed_active_channel_advances_generation_and_requires_reverification(
     tmp_path: Path,
 ) -> None:

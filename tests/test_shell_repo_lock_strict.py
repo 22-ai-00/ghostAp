@@ -96,6 +96,7 @@ def test_strict_shell_same_chat_cannot_overlap_programming_run(tmp_path) -> None
         manager.shutdown()
 
 
+@pytest.mark.slow
 def test_short_repo_lease_is_renewed_while_strict_task_is_active(
     tmp_path,
 ) -> None:

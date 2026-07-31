@@ -363,78 +363,45 @@ def test_project_chat_programming_mode_is_not_stolen_by_slock_managed_chat(mock_
     )
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "/deep 深入完成复杂任务",
-        "/spec 按规格迭代直到收敛",
-        "/wt 在隔离分支实现任务",
-        "/wf 编排多个代理完成任务",
-    ],
-)
-def test_explicit_engine_commands_override_persistent_programming_mode(
-    mock_ws_client: FeishuWSClient,
-    text: str,
-):
-    """An explicit engine request must never become normal Traex conversation."""
-    project = ProjectContext("proj_1", "GhostAP", "/tmp")
-    mock_ws_client._process_with_intent = MagicMock()
-    mock_ws_client._traex_handler = MagicMock()
-
-    mock_ws_client._dispatch_message_logic(
-        "msg_engine",
-        "chat_456",
-        text,
-        project,
-        "traex",
-        command_match=SlashCommandParser.parse(text),
-    )
-
-    mock_ws_client._process_with_intent.assert_called_once()
-    mock_ws_client._traex_handler.handle_message.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    "programming_mode",
-    ["coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk"],
-)
-@pytest.mark.parametrize(
-    ("text", "expected_handler"),
-    [
-        ("/deep 深入完成复杂任务", "_handle_deep_command"),
-        ("/spec 按规格迭代直到收敛", "_handle_spec_command"),
-        ("/wt 在隔离分支实现任务", "worktree"),
-        ("/wf 编排多个代理完成任务", "_handle_workflow_command"),
-    ],
-)
 def test_explicit_engine_command_reaches_its_final_handler_in_every_programming_mode(
     mock_ws_client: FeishuWSClient,
-    programming_mode: str,
-    text: str,
-    expected_handler: str,
 ):
     """Persistent programming state may not consume any explicit engine command."""
     project = ProjectContext("proj_1", "GhostAP", "/tmp")
     mock_ws_client._get_mode_handler = MagicMock()
-
-    if expected_handler == "worktree":
-        mock_ws_client._worktree_handler.handle_worktree_command_match = MagicMock()
-        target = mock_ws_client._worktree_handler.handle_worktree_command_match
-    else:
-        target = MagicMock()
-        setattr(mock_ws_client, expected_handler, target)
-
-    mock_ws_client._dispatch_message_logic(
-        "msg_engine_final",
-        "chat_456",
-        text,
-        project,
-        programming_mode,
-        command_match=SlashCommandParser.parse(text),
+    programming_modes = ("coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk")
+    engine_cases = (
+        ("/deep 深入完成复杂任务", "_handle_deep_command"),
+        ("/spec 按规格迭代直到收敛", "_handle_spec_command"),
+        ("/wt 在隔离分支实现任务", "worktree"),
+        ("/wf 编排多个代理完成任务", "_handle_workflow_command"),
     )
 
-    assert target.call_count == 1
-    mock_ws_client._get_mode_handler.assert_not_called()
+    for text, expected_handler in engine_cases:
+        for programming_mode in programming_modes:
+            if expected_handler == "worktree":
+                target = MagicMock()
+                mock_ws_client._worktree_handler.handle_worktree_command_match = target
+            else:
+                target = MagicMock()
+                setattr(mock_ws_client, expected_handler, target)
+
+            mock_ws_client._dispatch_message_logic(
+                "msg_engine_final",
+                "chat_456",
+                text,
+                project,
+                programming_mode,
+                command_match=SlashCommandParser.parse(text),
+            )
+
+            assert target.call_count == 1, (
+                f"{text!r} did not reach {expected_handler!r} from "
+                f"{programming_mode!r}"
+            )
+            assert not mock_ws_client._get_mode_handler.called, (
+                f"{text!r} fell back to {programming_mode!r}"
+            )
 
 
 @pytest.mark.parametrize(
@@ -472,79 +439,90 @@ def test_deep_and_spec_topic_plain_text_keeps_engine_strategy(
     mock_ws_client._process_with_intent.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("engine", "expected_method"),
-    [
-        ("worktree", "_handle_worktree_execute"),
-        ("deep", "_start_deep_engine"),
-        ("spec", "_start_spec_engine"),
-        ("workflow", "_workflow_handler.handle_message"),
-    ],
-)
-@pytest.mark.parametrize("has_slash_command", [False, True])
 def test_topic_engine_without_resolved_project_never_falls_back_to_smart(
     mock_ws_client: FeishuWSClient,
-    engine: str,
-    expected_method: str,
-    has_slash_command: bool,
 ):
     """A topic-owned engine resolves/rejects its project instead of changing strategy."""
     mock_ws_client._process_with_intent = MagicMock()
     mock_ws_client._reply_text = MagicMock()
-    if expected_method == "_workflow_handler.handle_message":
-        mock_ws_client._workflow_handler.handle_message = MagicMock()
-        target = mock_ws_client._workflow_handler.handle_message
-    else:
-        target = MagicMock()
-        setattr(mock_ws_client, expected_method, target)
-
-    slash_text = {
+    engine_cases = (
+        ("worktree", "_handle_worktree_execute"),
+        ("deep", "_start_deep_engine"),
+        ("spec", "_start_spec_engine"),
+        ("workflow", "_workflow_handler.handle_message"),
+    )
+    slash_texts = {
         "worktree": "/wt 继续执行",
         "deep": "/deep 继续执行",
         "spec": "/spec 继续执行",
         "workflow": "/wf 继续执行",
-    }[engine]
-    text = slash_text if has_slash_command else "继续执行"
-    command_match = SlashCommandParser.parse(text) if has_slash_command else None
+    }
 
-    mock_ws_client._dispatch_message_logic(
-        "msg_missing_project",
-        "chat_456",
-        text,
-        None,
-        engine,
-        command_match=command_match,
-    )
+    for engine, expected_method in engine_cases:
+        for has_slash_command in (False, True):
+            mock_ws_client._process_with_intent.reset_mock()
+            mock_ws_client._reply_text.reset_mock()
+            if expected_method == "_workflow_handler.handle_message":
+                target = MagicMock()
+                mock_ws_client._workflow_handler.handle_message = target
+            else:
+                target = MagicMock()
+                setattr(mock_ws_client, expected_method, target)
 
-    target.assert_not_called()
-    mock_ws_client._reply_text.assert_called_once()
-    assert "未执行" in mock_ws_client._reply_text.call_args.args[1]
-    mock_ws_client._process_with_intent.assert_not_called()
+            text = slash_texts[engine] if has_slash_command else "继续执行"
+            command_match = (
+                SlashCommandParser.parse(text) if has_slash_command else None
+            )
+            mock_ws_client._dispatch_message_logic(
+                "msg_missing_project",
+                "chat_456",
+                text,
+                None,
+                engine,
+                command_match=command_match,
+            )
+
+            assert not target.called, f"{engine!r} ran without a project"
+            assert mock_ws_client._reply_text.call_count == 1, (
+                f"{engine!r} did not explain the missing project"
+            )
+            assert "未执行" in mock_ws_client._reply_text.call_args.args[1]
+            assert not mock_ws_client._process_with_intent.called, (
+                f"{engine!r} fell back to SMART"
+            )
 
 
-@pytest.mark.parametrize(
-    "text",
-    ["/projects", "/status", "/help", "/deep_status --all", "/stop_deep --all"],
-)
 def test_missing_topic_project_allows_safe_recovery_and_diagnostics_commands(
     mock_ws_client: FeishuWSClient,
-    text: str,
 ):
     mock_ws_client._process_with_intent = MagicMock()
     mock_ws_client._reply_text = MagicMock()
-    command_match = SlashCommandParser.parse(text)
-
-    mock_ws_client._dispatch_message_logic(
-        "msg_recover",
-        "chat_456",
-        text,
-        None,
-        "deep",
-        command_match=command_match,
+    commands = (
+        "/projects",
+        "/status",
+        "/help",
+        "/deep_status --all",
+        "/stop_deep --all",
     )
 
-    mock_ws_client._process_with_intent.assert_called_once()
-    mock_ws_client._reply_text.assert_not_called()
+    for text in commands:
+        mock_ws_client._process_with_intent.reset_mock()
+        mock_ws_client._reply_text.reset_mock()
+        mock_ws_client._dispatch_message_logic(
+            "msg_recover",
+            "chat_456",
+            text,
+            None,
+            "deep",
+            command_match=SlashCommandParser.parse(text),
+        )
+
+        assert mock_ws_client._process_with_intent.call_count == 1, (
+            f"{text!r} was not routed as a safe recovery command"
+        )
+        assert not mock_ws_client._reply_text.called, (
+            f"{text!r} was rejected as an unsafe missing-project command"
+        )
 
 
 def test_process_message_async_auto_enter_mode(mock_ws_client: FeishuWSClient):

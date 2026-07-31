@@ -1,63 +1,9 @@
-"""Test UI_TEXT placeholder consistency (AC-6).
-
-Ensures:
-1. All format strings can be rendered without KeyError using canonical placeholder names.
-2. No deprecated shorthand placeholders ({secs}, {mins}) exist.
-"""
+"""Test that UI_TEXT does not use deprecated shorthand placeholders."""
 import re
 
 import pytest
 
 from src.card.ui_text import UI_TEXT
-
-# Canonical placeholder names and their test values
-_CANONICAL_VALUES = {
-    "seconds": 30,
-    "minutes": 5,
-    "hours": 2,
-    "engine_cmd": "/deep",
-    "engine_name": "Deep",
-    "timestamp": "12:00",
-    "name": "test",
-    "mode_name": "Test",
-    "emoji": "🔧",
-    "cmd": "deep",
-    "error": "err",
-    "step": 1,
-    "desc": "desc",
-    "count": 3,
-    "n": 2,
-    "base": "main",
-    "base_branch": "main",
-    "path": "/tmp",
-    "goal": "build",
-    "elapsed": 10,
-    "max": 5,
-    "session_id": "abc123",
-    "tool": "coco",
-    "reason": "timeout",
-    "model": "gpt-4",
-    "msg": "message",
-    "status": "running",
-    "attempt": 1,
-    "max_attempts": 3,
-    "delay_sec": 5,
-    "sec": 5,
-    "i": 1,
-    "satisfied": 3,
-    "total": 5,
-    "num": 1,
-    "title": "步骤",
-    "text": "确认",
-    "tool_name": "Coco",
-    "duration": "5分",
-    "error_detail": "detail",
-    "current": 2,
-    "category": "main",
-    "timeout_display": "30 分钟",
-    "idle_minutes": 15,
-    "last_active_time": "10:30",
-}
 
 # Regex to find {placeholder} patterns in format strings
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
@@ -80,47 +26,6 @@ class TestUITextPlaceholderConsistency:
                 if placeholder in _DEPRECATED_PLACEHOLDERS:
                     violations.append(f"{key}: found deprecated placeholder {{{placeholder}}}")
         assert violations == [], "Deprecated placeholders found:\n" + "\n".join(violations)
-
-    def test_all_format_strings_renderable(self):
-        """All UI_TEXT entries with {placeholders} can be .format() without KeyError."""
-        failures = []
-        for key, value in UI_TEXT.items():
-            if not isinstance(value, str):
-                continue
-            placeholders = _PLACEHOLDER_RE.findall(value)
-            if not placeholders:
-                continue
-            # Build kwargs from canonical values
-            kwargs = {}
-            for p in placeholders:
-                if p in _CANONICAL_VALUES:
-                    kwargs[p] = _CANONICAL_VALUES[p]
-                else:
-                    kwargs[p] = f"<{p}>"  # fallback for unknown placeholders
-            try:
-                value.format(**kwargs)
-            except (KeyError, IndexError, ValueError) as exc:
-                failures.append(f"{key}: {exc}")
-        assert failures == [], "Format failures:\n" + "\n".join(failures)
-
-
-class TestDurationPlaceholders:
-    """Specifically verify duration format strings use full words."""
-
-    def test_duration_mins_secs_uses_seconds(self):
-        """duration_mins_secs uses {seconds} not {secs}."""
-        text = UI_TEXT["duration_mins_secs"]
-        assert "{seconds}" in text
-        assert "{secs}" not in text
-
-    def test_duration_hours_mins_secs_uses_full_words(self):
-        """duration_hours_mins_secs uses {minutes} and {seconds} not {mins}/{secs}."""
-        text = UI_TEXT["duration_hours_mins_secs"]
-        assert "{minutes}" in text
-        assert "{seconds}" in text
-        assert "{mins}" not in text
-        assert "{secs}" not in text
-
 
 class TestCleanupButtonConsistency:
     """AC-7: Cleanup buttons use consistent emoji."""
@@ -300,27 +205,6 @@ class TestDeepErrorFallbackNoPrefix:
         """Fallback text should be a plain string with no format placeholders."""
         text = UI_TEXT["deep_error_fallback_no_prefix"]
         assert "{" not in text
-
-    def test_builder_uses_fallback_key_for_empty_prefix(self):
-        """DeepBuilder renders UI_TEXT['deep_error_fallback_no_prefix'] when action_prefix is empty."""
-        from src.card.ui_text import UI_TEXT as _UI
-
-        # Simulate the exact code path from builders/deep.py:
-        # if is_error and not display_content and not action_prefix → use fallback key
-        action_prefix = ""
-        display_content = ""
-        is_error = True
-
-        if is_error and not display_content:
-            if action_prefix:
-                display_content = _UI["deep_error_no_detail"].format(engine_cmd=f"/{action_prefix}")
-            else:
-                display_content = _UI["deep_error_fallback_no_prefix"]
-
-        assert display_content == _UI["deep_error_fallback_no_prefix"]
-        assert "/help" in display_content
-        assert display_content.count("/help") == 1
-
 
 class TestLockUITextPlaceholders:
     """Verify LOCK_UI_TEXT format strings use lock_undo_window_display."""

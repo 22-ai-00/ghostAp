@@ -145,6 +145,7 @@ async def test_description_or_usage_drift_is_patched() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_second_reconcile_has_zero_mutations_and_stable_hashes() -> None:
     api = _InMemorySlashAPI()
     desired = (
@@ -184,6 +185,7 @@ async def test_cleanup_deletes_every_command_and_verifies_empty_server_state() -
 
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_final_get_mismatch_fails_without_leaking_transport_error() -> None:
     api = _InMemorySlashAPI(apply_mutations=False)
 

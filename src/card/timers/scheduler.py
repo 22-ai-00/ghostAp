@@ -73,6 +73,11 @@ class TimerScheduler:
                 logger.exception("TimerScheduler callback error (session=%s)", session_id)
 
         with self._lock:
+            # Close the race where schedule() passed the fast-path check just
+            # before shutdown began, then waited for the scheduler lock.
+            if self._shutdown_event.is_set():
+                handle._cancelled = True
+                return handle
             event = self._scheduler.enter(delay, 1, _wrapped)
             handle._event = event
 
@@ -95,15 +100,18 @@ class TimerScheduler:
     def shutdown(self, timeout: float = 2.0) -> None:
         """Stop the scheduler thread. Pending callbacks are discarded."""
         self._shutdown_event.set()
-        self._wake_event.set()
-        self._thread.join(timeout=timeout)
-        # Clear remaining events
+        # Remove future events before waking the worker.  Otherwise
+        # sched.scheduler.run() observes the still-pending event after the
+        # first wake and goes straight back to sleep, forcing join() to wait
+        # for its timeout and leaving the daemon thread alive.
         with self._lock:
             for event in list(self._scheduler.queue):
                 try:
                     self._scheduler.cancel(event)
                 except ValueError:
                     pass
+        self._wake_event.set()
+        self._thread.join(timeout=timeout)
 
     @property
     def pending_count(self) -> int:

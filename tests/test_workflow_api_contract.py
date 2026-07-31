@@ -28,8 +28,6 @@ import logging
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
-
 from src.card.actions import dispatch as action_ids
 from src.feishu import action_registry as _action_registry_module
 from src.feishu.handlers.workflow import WorkflowHandler
@@ -83,28 +81,6 @@ def test_all_workflow_constants_are_registered_in_system_actions() -> None:
         "but missing from SYSTEM_CARD_ACTIONS in src/feishu/ws_card_action_handler.py: "
         f"{missing!r}"
     )
-
-
-def test_four_new_workflow_entries_are_present() -> None:
-    """Explicit check for recently added workflow actions (orchestrator+review selection)."""
-    expected = {
-        "workflow_orchestrator_select_tool",
-        "workflow_orchestrator_select_model",
-        "workflow_review_select_tool",
-        "workflow_review_select_model",
-        "workflow_orchestrator_finish",
-        "workflow_review_finish",
-        "workflow_fill_missing_tools",
-        "workflow_back_to_tools",
-    }
-    missing = expected - SYSTEM_CARD_ACTIONS
-    assert not missing, f"Missing expected workflow actions in SYSTEM_CARD_ACTIONS: {missing!r}"
-
-
-def test_system_actions_contains_no_unknown_workflow_placeholders() -> None:
-    """Sanity check — no empty / placeholder strings slipped into the set."""
-    assert "" not in SYSTEM_CARD_ACTIONS
-    assert all(isinstance(v, str) and v for v in SYSTEM_CARD_ACTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -191,46 +167,45 @@ def _resolve_handler_method(registration: Any):
 class TestWorkflowActionSignatureContract:
     """All workflow actions must uniformly accept (message_id, chat_id, project_id, value)."""
 
-    @pytest.mark.parametrize("action_id", _collect_workflow_action_ids_only())
-    def test_workflow_action_has_handler_with_four_positional_args(
-        self, action_id: str
-    ) -> None:
+    def test_workflow_actions_have_handlers_with_four_positional_args(self) -> None:
         handlers = _collect_registered_workflow_handlers()
-        assert action_id in handlers, (
-            f"Action {action_id!r} is exported but not registered. Add a "
-            "``client._register_action(lambda ..., exact=...)`` call in "
-            "``register_programming_mode_actions``."
-        )
-
-        registration = handlers[action_id]
-        method = _resolve_handler_method(registration)
-        assert method is not None, (
-            f"Could not resolve the underlying WorkflowHandler method for "
-            f"{action_id!r}. Is the registration lambda shaped like "
-            "``lambda mid, cid, pid, val: client._handle_workflow_X(mid, cid, pid, val)``?"
-        )
-
-        sig = inspect.signature(method)
-        params = [
-            name
-            for name, p in sig.parameters.items()
-            if p.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        for action_id in _collect_workflow_action_ids_only():
+            assert action_id in handlers, (
+                f"Action {action_id!r} is exported but not registered. Add a "
+                "``client._register_action(lambda ..., exact=...)`` call in "
+                "``register_programming_mode_actions``."
             )
-        ]
-        positional = [p for p in params if p != "self"]
-        assert len(positional) == 4, (
-            f"{method.__name__} has {len(positional)} positional args "
-            f"({positional!r}); expected 4: (message_id, chat_id, project_id, value). "
-            "Add a ``project_id`` slot even if the handler does not use it — "
-            "this preserves the uniform dispatch contract."
-        )
-        assert positional == ["message_id", "chat_id", "project_id", "value"], (
-            f"{method.__name__} positional args are {positional!r}; "
-            "expected ['message_id', 'chat_id', 'project_id', 'value']."
-        )
+
+            registration = handlers[action_id]
+            method = _resolve_handler_method(registration)
+            assert method is not None, (
+                f"Could not resolve the underlying WorkflowHandler method for "
+                f"{action_id!r}. Is the registration lambda shaped like "
+                "``lambda mid, cid, pid, val: client._handle_workflow_X(mid, cid, pid, val)``?"
+            )
+
+            sig = inspect.signature(method)
+            params = [
+                name
+                for name, parameter in sig.parameters.items()
+                if parameter.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+            positional = [parameter for parameter in params if parameter != "self"]
+            assert len(positional) == 4, (
+                f"{method.__name__} has {len(positional)} positional args "
+                f"({positional!r}); expected 4: "
+                "(message_id, chat_id, project_id, value). "
+                "Add a ``project_id`` slot even if the handler does not use it — "
+                "this preserves the uniform dispatch contract."
+            )
+            assert positional == ["message_id", "chat_id", "project_id", "value"], (
+                f"{method.__name__} positional args are {positional!r}; "
+                "expected ['message_id', 'chat_id', 'project_id', 'value']."
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -109,6 +109,7 @@ def _accepted(pid: int) -> SandboxAttestation:
     return SandboxAttestation(pid=pid, verified=True, mechanism="test-fixture")
 
 
+@pytest.mark.slow
 def test_default_sandbox_attestation_fails_closed_before_secret_resolution(tmp_path: Path) -> None:
     resolved = False
 

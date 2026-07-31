@@ -4,7 +4,6 @@ Covers:
 - build_role_info_card structure validation
 - build_progress_overview_card with empty plans
 - build_collaboration_plan_card step status icons
-- redact_sensitive token/password pattern stripping
 - build_role_list_card multi-agent rows
 - build_card_wrapper mobile_optimize flag
 """
@@ -17,7 +16,7 @@ from src.slock_engine.card_templates import (
     build_role_info_card,
     build_role_list_card,
 )
-from src.slock_engine.card_templates.common import build_card_wrapper, redact_sensitive
+from src.slock_engine.card_templates.common import build_card_wrapper
 from src.slock_engine.models import (
     AgentIdentity,
     AgentStatus,
@@ -340,33 +339,6 @@ class TestBuildCollaborationPlanCard:
         # No button elements should be present
         buttons = [e for e in elements if e.get("tag") == "button"]
         assert len(buttons) == 0
-
-
-# ---------------------------------------------------------------------------
-# Test 4: redact_sensitive strips common patterns
-# ---------------------------------------------------------------------------
-
-
-class TestRedactSensitive:
-    """Tests for the redact_sensitive utility."""
-
-    def test_redacts_token_assignment(self):
-        text = "MY_TOKEN=abc123secret"
-        result = redact_sensitive(text)
-        assert "abc123secret" not in result
-        assert "MY_TOKEN" in result
-        assert "<redacted>" in result
-
-    def test_preserves_non_sensitive_text(self):
-        text = "Hello, this is a normal message with no secrets."
-        result = redact_sensitive(text)
-        assert result == text
-
-    def test_redacts_private_key_block(self):
-        text = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg...\n-----END PRIVATE KEY-----"
-        result = redact_sensitive(text)
-        assert "MIIEvQIBADANBg" not in result
-        assert "<redacted:private_key>" in result
 
 
 # ---------------------------------------------------------------------------

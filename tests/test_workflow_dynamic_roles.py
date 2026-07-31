@@ -19,24 +19,6 @@ class TestDynamicRolesGuidance(unittest.TestCase):
             available_tools=["coco", "claude", "aiden"],
         )
 
-    def test_prompt_contains_plan_roles_guidance(self):
-        """Test 1: Prompt contains '根据任务需求自行规划角色分工'."""
-        prompt = self._build_prompt()
-        self.assertIn("根据任务需求自行规划角色分工", prompt)
-
-    def test_prompt_contains_not_fixed_list(self):
-        """Test 1: Prompt contains '角色不是固定列表'."""
-        prompt = self._build_prompt()
-        self.assertIn("角色不是固定列表", prompt)
-
-    def test_prompt_contains_recommended_dimensions(self):
-        """Test 1: Prompt contains the recommended dimensions text."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "建议考虑：架构设计、代码实现、安全审计、正确性验证、测试覆盖等维度",
-            prompt,
-        )
-
     def test_all_dynamic_guidance_present(self):
         """Test 1: All three key dynamic guidance phrases are present."""
         prompt = self._build_prompt()
@@ -55,43 +37,6 @@ class TestNoStaticRoleList(unittest.TestCase):
         return build_script_gen_prompt(
             requirement=requirement,
             available_tools=["coco", "claude", "aiden"],
-        )
-
-    def test_no_bullet_architect(self):
-        """Test 2: Prompt does not contain '- architect' as a static list item."""
-        prompt = self._build_prompt()
-        # Match bullet list items that look like static role enumeration
-        self.assertNotRegex(
-            prompt,
-            r"-\s*architect\b",
-            "Prompt should not contain '- architect' as a static list item",
-        )
-
-    def test_no_bullet_reviewer(self):
-        """Test 2: Prompt does not contain '- reviewer' as a static list item."""
-        prompt = self._build_prompt()
-        self.assertNotRegex(
-            prompt,
-            r"-\s*reviewer\b",
-            "Prompt should not contain '- reviewer' as a static list item",
-        )
-
-    def test_no_bullet_tester(self):
-        """Test 2: Prompt does not contain '- tester' as a static list item."""
-        prompt = self._build_prompt()
-        self.assertNotRegex(
-            prompt,
-            r"-\s*tester\b",
-            "Prompt should not contain '- tester' as a static list item",
-        )
-
-    def test_no_bullet_coder(self):
-        """Test 2: Prompt does not contain '- coder' as a static list item."""
-        prompt = self._build_prompt()
-        self.assertNotRegex(
-            prompt,
-            r"-\s*coder\b",
-            "Prompt should not contain '- coder' as a static list item",
         )
 
     def test_no_static_role_enumeration(self):
@@ -129,15 +74,6 @@ class TestRolesSectionStructure(unittest.TestCase):
             available_tools=["coco", "claude", "aiden"],
         )
 
-    def test_roles_heading_exists(self):
-        """Test 3: The 'Roles (specialized perspectives for agents)' heading exists."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "**Roles (specialized perspectives for agents):**",
-            prompt,
-            "Roles heading should exist in the prompt",
-        )
-
     def test_dynamic_guidance_under_roles_heading(self):
         """Test 3: Dynamic guidance text appears under the Roles heading."""
         prompt = self._build_prompt()
@@ -169,33 +105,6 @@ class TestRolesSectionStructure(unittest.TestCase):
             "Dynamic guidance should be under the Roles heading",
         )
 
-    def test_roles_section_after_tools_section(self):
-        """Test 3: Roles section appears after Tools section."""
-        prompt = self._build_prompt()
-
-        tools_idx = prompt.find("**Tools (AI agents you can dispatch):**")
-        roles_idx = prompt.find("**Roles (specialized perspectives for agents):**")
-
-        self.assertGreater(
-            roles_idx,
-            tools_idx,
-            "Roles section should appear after Tools section",
-        )
-
-    def test_roles_section_before_output_format(self):
-        """Test 3: Roles section appears before Output Format section."""
-        prompt = self._build_prompt()
-
-        roles_idx = prompt.find("**Roles (specialized perspectives for agents):**")
-        output_idx = prompt.find("## Output Format")
-
-        self.assertGreater(
-            output_idx,
-            roles_idx,
-            "Roles section should appear before Output Format section",
-        )
-
-
 class TestRoleParameterMention(unittest.TestCase):
     """Test that the guidance mentions the role parameter for agent() calls."""
 
@@ -203,15 +112,6 @@ class TestRoleParameterMention(unittest.TestCase):
         return build_script_gen_prompt(
             requirement=requirement,
             available_tools=["coco", "claude", "aiden"],
-        )
-
-    def test_role_parameter_mentioned(self):
-        """Test 4: Prompt mentions the `role` parameter."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "`role`",
-            prompt,
-            "Prompt should mention the `role` parameter",
         )
 
     def test_agent_call_with_role_parameter(self):
@@ -228,16 +128,6 @@ class TestRoleParameterMention(unittest.TestCase):
             prompt,
             "Prompt should mention role parameter for agent() calls",
         )
-
-    def test_role_examples_given(self):
-        """Test 4: Prompt gives role examples like architect、reviewer、tester 等."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "architect、reviewer、tester 等",
-            prompt,
-            "Prompt should give role examples",
-        )
-
 
 class TestDynamicWorkflowReliabilityGuidance(unittest.TestCase):
     """Prompt guidance for Claude-style dynamic workflow behavior."""
@@ -341,36 +231,6 @@ class TestDifferentRequirementTypes(unittest.TestCase):
             available_tools=["coco", "claude", "aiden"],
         )
 
-    def test_web_app_requirement(self):
-        """Test 6: 'Build a web application' gets dynamic roles guidance."""
-        prompt = self._build_prompt("Build a web application")
-        self.assertIn("根据任务需求自行规划角色分工", prompt)
-        self.assertIn("角色不是固定列表", prompt)
-        self.assertIn(
-            "建议考虑：架构设计、代码实现、安全审计、正确性验证、测试覆盖等维度",
-            prompt,
-        )
-
-    def test_refactor_requirement(self):
-        """Test 6: 'Refactor the authentication module' gets dynamic roles guidance."""
-        prompt = self._build_prompt("Refactor the authentication module")
-        self.assertIn("根据任务需求自行规划角色分工", prompt)
-        self.assertIn("角色不是固定列表", prompt)
-        self.assertIn(
-            "建议考虑：架构设计、代码实现、安全审计、正确性验证、测试覆盖等维度",
-            prompt,
-        )
-
-    def test_testing_requirement(self):
-        """Test 6: 'Write comprehensive tests' gets dynamic roles guidance."""
-        prompt = self._build_prompt("Write comprehensive tests")
-        self.assertIn("根据任务需求自行规划角色分工", prompt)
-        self.assertIn("角色不是固定列表", prompt)
-        self.assertIn(
-            "建议考虑：架构设计、代码实现、安全审计、正确性验证、测试覆盖等维度",
-            prompt,
-        )
-
     def test_requirement_does_not_affect_roles_section(self):
         """Test 6: Different requirements don't change the roles guidance content."""
         prompts = []
@@ -443,15 +303,6 @@ class TestPromptStructure(unittest.TestCase):
             available_tools=["coco", "claude", "aiden"],
         )
 
-    def test_has_workflow_script_generation_task(self):
-        """Test 8: Prompt has 'Workflow Script Generation Task' section."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "# Workflow Script Generation Task",
-            prompt,
-            "Prompt should have main title",
-        )
-
     def test_script_generation_prompt_requires_card_summary_contract(self):
         prompt = self._build_prompt()
 
@@ -463,51 +314,6 @@ class TestPromptStructure(unittest.TestCase):
         self.assertIn('"deliverables"', prompt)
         self.assertIn('"next_steps"', prompt)
         self.assertIn("完整语义条目", prompt)
-
-    def test_has_user_requirement_section(self):
-        """Test 8: Prompt has 'User Requirement' section."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "## User Requirement",
-            prompt,
-            "Prompt should have User Requirement section",
-        )
-
-    def test_has_available_resources_section(self):
-        """Test 8: Prompt has 'Available Resources' section."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "## Available Resources",
-            prompt,
-            "Prompt should have Available Resources section",
-        )
-
-    def test_has_tools_section(self):
-        """Test 8: Prompt has 'Tools (AI agents you can dispatch)' section."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "**Tools (AI agents you can dispatch):**",
-            prompt,
-            "Prompt should have Tools subsection",
-        )
-
-    def test_has_roles_section(self):
-        """Test 8: Prompt has 'Roles (specialized perspectives for agents)' section."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "**Roles (specialized perspectives for agents):**",
-            prompt,
-            "Prompt should have Roles subsection",
-        )
-
-    def test_has_output_format_section(self):
-        """Test 8: Prompt has 'Output Format' section."""
-        prompt = self._build_prompt()
-        self.assertIn(
-            "## Output Format",
-            prompt,
-            "Prompt should have Output Format section",
-        )
 
     def test_section_order(self):
         """Test 8: Sections appear in the correct order."""

@@ -14,8 +14,6 @@ Protected regression scenarios:
 
 from __future__ import annotations
 
-import pytest
-
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
 
@@ -167,49 +165,42 @@ EXPECTED_INTERCEPTABLE_PREFIX = frozenset({
 class TestExactCommandRegistry:
     """Verify exact command handlers are not accidentally removed."""
 
-    def test_all_expected_exact_commands_exist(self):
+    def test_all_expected_exact_commands_are_interceptable(self):
         """Every expected exact command must be interceptable without args."""
-        for cmd in EXPECTED_EXACT_COMMANDS:
+        for cmd in EXPECTED_EXACT_COMMANDS | EXPECTED_INTERCEPTABLE_EXACT:
             match = SlashCommandParser.parse(cmd)
             assert SystemHandler.is_interceptable_command_match(match), (
                 f"Command '{cmd}' should be interceptable but is not"
-            )
-
-    def test_no_unexpected_removal(self):
-        """Snapshot: the interceptable exact set must be a superset of expected."""
-        for cmd in EXPECTED_INTERCEPTABLE_EXACT:
-            match = SlashCommandParser.parse(cmd)
-            assert SystemHandler.is_interceptable_command_match(match), (
-                f"Interceptable exact command '{cmd}' was removed"
             )
 
 
 class TestPrefixCommandRegistry:
     """Verify prefix command handlers are not accidentally removed."""
 
-    @pytest.mark.parametrize("cmd", sorted(EXPECTED_INTERCEPTABLE_PREFIX))
-    def test_prefix_command_with_args_interceptable(self, cmd):
+    def test_prefix_commands_with_args_are_interceptable(self):
         """Prefix commands with args must be interceptable."""
-        match = SlashCommandParser.parse(f"{cmd} some_arg")
-        assert SystemHandler.is_interceptable_command_match(match), (
-            f"Prefix command '{cmd} some_arg' should be interceptable"
-        )
+        for cmd in sorted(EXPECTED_INTERCEPTABLE_PREFIX):
+            match = SlashCommandParser.parse(f"{cmd} some_arg")
+            assert SystemHandler.is_interceptable_command_match(match), (
+                f"Prefix command '{cmd} some_arg' should be interceptable"
+            )
 
 
 class TestDeepCommandRouting:
     """Verify deep engine command routing is preserved."""
 
-    @pytest.mark.parametrize("cmd", [
-        "/deep hello",
-        "/deep_status",
-        "/stop_deep",
-        "/deep_update some context",
-    ])
-    def test_deep_commands_recognized(self, cmd):
+    def test_deep_commands_recognized(self):
         """Deep commands must be recognized by is_deep_command."""
-        assert SystemHandler.is_deep_command(cmd), (
-            f"'{cmd}' should be recognized as deep command"
+        commands = (
+            "/deep hello",
+            "/deep_status",
+            "/stop_deep",
+            "/deep_update some context",
         )
+        for cmd in commands:
+            assert SystemHandler.is_deep_command(cmd), (
+                f"'{cmd}' should be recognized as deep command"
+            )
 
     def test_non_deep_not_recognized(self):
         """Non-deep commands must not be falsely recognized."""
@@ -220,12 +211,12 @@ class TestDeepCommandRouting:
 class TestSpecCommandRouting:
     """Verify spec engine command routing is preserved."""
 
-    @pytest.mark.parametrize("cmd", sorted(EXPECTED_SPEC_COMMANDS))
-    def test_spec_commands_recognized(self, cmd):
+    def test_spec_commands_recognized(self):
         """All spec commands must be recognized by is_spec_command."""
-        assert SystemHandler.is_spec_command(cmd), (
-            f"'{cmd}' should be recognized as spec command"
-        )
+        for cmd in sorted(EXPECTED_SPEC_COMMANDS):
+            assert SystemHandler.is_spec_command(cmd), (
+                f"'{cmd}' should be recognized as spec command"
+            )
 
     def test_spec_with_args_recognized(self):
         """Spec commands with arguments must still be recognized."""
@@ -241,12 +232,12 @@ class TestSpecCommandRouting:
 class TestExitCommandRouting:
     """Verify exit command routing covers all tool variants."""
 
-    @pytest.mark.parametrize("cmd", sorted(EXPECTED_EXIT_COMMANDS))
-    def test_exit_commands_recognized(self, cmd):
+    def test_exit_commands_recognized(self):
         """All exit commands must be recognized by is_exit_command."""
-        assert SystemHandler.is_exit_command(cmd), (
-            f"'{cmd}' should be recognized as exit command"
-        )
+        for cmd in sorted(EXPECTED_EXIT_COMMANDS):
+            assert SystemHandler.is_exit_command(cmd), (
+                f"'{cmd}' should be recognized as exit command"
+            )
 
     def test_non_exit_not_recognized(self):
         """Non-exit commands must not trigger exit."""

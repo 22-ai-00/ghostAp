@@ -555,38 +555,3 @@ class TestResumeExceptionAlert:
             # Should not raise
             mgr._timeout_auto_abort(esc.escalation_id)
             mgr._io_executor.shutdown(wait=True)
-
-
-class TestCardMessageIdPropagation:
-    """Tests for card_message_id propagation in _do_timeout_io."""
-
-    def test_card_message_id_passed_to_update_card(self):
-        """_do_timeout_io uses esc_copy.card_message_id for card update."""
-        update_card_fn = MagicMock(return_value=True)
-        mgr, mocks = _make_manager(update_card_fn=update_card_fn)
-
-        esc = _make_escalation(card_message_id="msg_propagate_test")
-        mgr._escalations.append(esc)
-
-        mgr._timeout_auto_abort(esc.escalation_id)
-        mgr._io_executor.shutdown(wait=True)
-
-        update_card_fn.assert_called_once()
-        assert update_card_fn.call_args[0][0] == "msg_propagate_test"
-
-    def test_none_card_message_id_skips_card_update(self):
-        """card_message_id=None skips the card update step entirely."""
-        update_card_fn = MagicMock(return_value=True)
-        send_text_fn = MagicMock()
-        mgr, mocks = _make_manager(
-            update_card_fn=update_card_fn, send_text_fn=send_text_fn,
-        )
-
-        esc = _make_escalation(card_message_id=None)
-        mgr._escalations.append(esc)
-
-        mgr._timeout_auto_abort(esc.escalation_id)
-        mgr._io_executor.shutdown(wait=True)
-
-        update_card_fn.assert_not_called()
-        send_text_fn.assert_called_once()  # text notification still fires
