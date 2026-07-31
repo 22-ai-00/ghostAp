@@ -180,14 +180,18 @@ class CardEvent(Generic[P]):
         sequence: int = 0,
         new_message_id: str = "",
         bridge_phrase: str | None = None,
+        *,
+        append_hint: bool = True,
     ) -> CardEvent[Mapping[str, Any]]:
         """Signal that the session has been archived (rotated out by SessionRotator).
 
-        Payload: {summary?: str, sequence?: int, new_message_id?: str}
+        Payload: {summary?: str, sequence?: int, new_message_id?: str,
+        append_hint: bool}
         Triggered when: SessionRotator replaces active session with a new one.
         new_message_id: the message_id of the new (replacement) card, for navigation URL.
+        append_hint: whether lifecycle reduction may add navigation content blocks.
         """
-        payload = {}
+        payload = {"append_hint": append_hint}
         if summary:
             payload["summary"] = summary
         if sequence:

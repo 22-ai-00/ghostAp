@@ -1104,24 +1104,41 @@ class ProgrammingModeHandler(BaseHandler):
         # Create card delivery + session
         delivery = create_card_delivery(api_client)
         from src.card.session.config import SessionConfig
-        config = SessionConfig(metadata=metadata, reply_to=message_id)
         card_callbacks = build_programming_session_callbacks(
             reply_text_fn=self.reply_text,
             add_reaction=self.add_reaction,
             message_id=message_id,
             chat_id=chat_id,
         )
-        card_session = CardSession(
-            chat_id=chat_id,
-            config=config,
-            delivery=delivery,
-            callbacks=card_callbacks,
-        )
+        try:
+            delivery_timeout = max(
+                2.0,
+                2.0 * float(self.settings.card.delivery_api_timeout) + 2.0,
+            )
+        except Exception:
+            delivery_timeout = 12.0
+
+        def _create_programming_card_session(
+            session_metadata,
+        ) -> CardSession:
+            return CardSession(
+                chat_id=chat_id,
+                config=SessionConfig(
+                    metadata=session_metadata,
+                    reply_to=message_id,
+                ),
+                delivery=delivery,
+                callbacks=card_callbacks,
+            )
+
+        card_session = _create_programming_card_session(metadata)
 
         prog_session = ProgrammingCardSession(
             card_session,
             base_metadata=metadata,
             image_uploader=self.upload_acp_image,
+            session_factory=_create_programming_card_session,
+            continuation_visibility_timeout=delivery_timeout,
         )
 
         # Start card (creates in Feishu)
@@ -1137,13 +1154,6 @@ class ProgrammingModeHandler(BaseHandler):
             )
             return
 
-        try:
-            delivery_timeout = max(
-                2.0,
-                2.0 * float(self.settings.card.delivery_api_timeout) + 2.0,
-            )
-        except Exception:
-            delivery_timeout = 12.0
         if not prog_session.wait_until_visible(delivery_timeout):
             logger.warning("首张 lark-channel 编程卡片未成功投递，回退到非流式文本输出")
             prog_session.abort()
@@ -1328,10 +1338,16 @@ class ProgrammingModeHandler(BaseHandler):
                     exc_info=True,
                 )
             prompt_stop_reason = "timeout"
-            final_response = UI_TEXT["mode_exec_timeout_msg"].format(error=get_error_detail(e))
+            notice = UI_TEXT["mode_exec_timeout_msg"].format(
+                error=get_error_detail(e)
+            )
+            final_response = _append_execution_notice(
+                prog_session.get_final_text(),
+                notice,
+            )
             log_exception(logger, f"{self.mode_name} ACP执行超时", e, level=logging.WARNING)
             prog_session.fail(
-                final_response,
+                notice,
                 unfinished_subagent_status="cancelled",
             )
         except Exception as e:
@@ -1345,10 +1361,16 @@ class ProgrammingModeHandler(BaseHandler):
                         exc_info=True,
                     )
             prompt_stop_reason = "exception"
-            final_response = UI_TEXT["mode_exec_exception_msg"].format(error=get_error_detail(e))
+            notice = UI_TEXT["mode_exec_exception_msg"].format(
+                error=get_error_detail(e)
+            )
+            final_response = _append_execution_notice(
+                prog_session.get_final_text(),
+                notice,
+            )
             log_exception(logger, f"{self.mode_name} ACP执行异常", e)
             prog_session.fail(
-                final_response,
+                notice,
                 unfinished_subagent_status=(
                     "cancelled" if entered_finalization[0] else "failed"
                 ),

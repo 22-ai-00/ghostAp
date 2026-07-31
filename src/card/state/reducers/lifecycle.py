@@ -330,10 +330,15 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                     subtitle=header.subtitle,
                     template=header.template,
                 )
-            # Add navigation hint so user knows to look at the latest card
-            blocks = state.blocks + (TextBlock(
-                block_id="_archived_hint", content=UI_TEXT["card_lifecycle_archived_hint"]
-            ),)
+            # Capacity rollover can archive a card that is already exactly at
+            # the block limit.  In that path the frozen header/footer/button
+            # provide navigation without mutating the preserved content.
+            append_hint = bool((event.payload or {}).get("append_hint", True))
+            blocks = state.blocks
+            if append_hint:
+                blocks = blocks + (TextBlock(
+                    block_id="_archived_hint", content=UI_TEXT["card_lifecycle_archived_hint"]
+                ),)
             footer = FooterState(
                 status="idle",
                 status_text=_archived_status_text(event.payload or {}),
@@ -349,7 +354,7 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                     type="default",
                     url=f"https://applink.feishu.cn/client/message/link?msgId={new_message_id}",
                 ),)
-            else:
+            elif append_hint:
                 # Graceful degradation: no message_id available, show text hint
                 blocks = blocks + (TextBlock(
                     block_id="_archived_nav_hint",

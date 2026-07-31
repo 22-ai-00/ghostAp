@@ -19,36 +19,60 @@ class MockClient:
     def __init__(self):
         self._counter = 0
         self.creates = []
+        self.operations = []
 
     def create_card(self, chat_id, card_json, *, reply_to=None, reply_in_thread=None, idempotency_key=None):
         self._counter += 1
+        message_id = f"msg_{self._counter}"
+        card_id = f"card_{self._counter}"
         self.creates.append({"chat_id": chat_id, "card_json": card_json, "reply_to": reply_to})
-        return (f"msg_{self._counter}", f"card_{self._counter}")
+        self.operations.append(("create_card", card_id, card_json))
+        return (message_id, card_id)
 
     def update_card(self, card_id, card_json, *, sequence=0):
-        pass
+        self.operations.append(("update_card", card_id, card_json))
 
     def update_element(self, card_id, element_id, content, *, sequence=0):
-        pass
+        self.operations.append(("update_element", card_id, content))
 
 
-def _make_programming_session(mode_name="coco", image_uploader=None, **kwargs):
-    client = MockClient()
+def _make_programming_session(
+    mode_name="coco",
+    image_uploader=None,
+    *,
+    client=None,
+    sync_delivery=True,
+    **kwargs,
+):
+    client = client or MockClient()
     delivery = CardDelivery(client)
     metadata = build_programming_metadata(mode_name, **kwargs)
-    config = SessionConfig(metadata=metadata, reply_to="origin_msg", sync_delivery=True)
-    session = CardSession(
-        chat_id="chat_prog",
-        config=config,
-        delivery=delivery,
-        session_id=f"prog_{mode_name}",
-    )
+    session_count = 0
+
+    def session_factory(session_metadata):
+        nonlocal session_count
+        session_count += 1
+        suffix = "" if session_count == 1 else f"_{session_count}"
+        return CardSession(
+            chat_id="chat_prog",
+            config=SessionConfig(
+                metadata=session_metadata,
+                reply_to="origin_msg",
+                sync_delivery=sync_delivery,
+            ),
+            delivery=delivery,
+            session_id=f"prog_{mode_name}{suffix}",
+        )
+
+    session = session_factory(metadata)
 
     return (
         ProgrammingCardSession(
             session,
             base_metadata=metadata,
             image_uploader=image_uploader,
+            session_factory=session_factory,
+            continuation_visibility_timeout=(2.0 if not sync_delivery else 0.5),
         ),
         client,
     )
@@ -389,6 +413,25 @@ class TestProgrammingCardSession:
         assert [b.content for b in text_blocks] == ["Alpha Beta", "甲乙"]
         assert len({b.block_id for b in text_blocks}) == 2
 
+    def test_main_transcript_preserves_interleaved_source_arrival_order(self):
+        from src.acp.models import ACPEvent, ACPEventType
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        for source_id, text in (
+            ("provider-a", "A1"),
+            ("provider-b", "B1"),
+            ("provider-a", "A2"),
+            ("provider-b", "B2"),
+        ):
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text=text,
+                source_id=source_id,
+            ))
+
+        assert pcs.get_final_text() == "A1\nB1\nA2\nB2"
+
     def test_subagent_text_captures_task_attribution_without_opaque_source_id(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
         from src.card.render.budget import RenderBudget
@@ -726,6 +769,908 @@ class TestProgrammingCardSession:
             "_turn_2_reasoning",
         ]
         assert all(block.status == "completed" for block in reasoning_blocks)
+
+    def test_total_block_capacity_creates_visible_continuation_before_freezing_old_card(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        pcs, client = _make_programming_session()
+        pcs.start()
+        old_session = pcs.session
+        old_binding = old_session._delivery.get_binding(old_session.session_id)
+        old_card_id = old_binding.pages[0].card_id
+
+        pcs.on_text("early-main-text")
+        pcs._flush_now()
+
+        crossing_tool_id = None
+        for index in range(MAX_TOTAL_BLOCKS + 2):
+            tool_id = f"failed-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content=f"false # {index}",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="failed",
+                    content=f"failed {index}",
+                ),
+            ))
+            if pcs.session is not old_session:
+                crossing_tool_id = tool_id
+                break
+
+        assert pcs.session is not old_session
+        assert old_session.state.metadata.frozen is True
+        assert old_session.closed is True
+        assert len(old_session.state.blocks) <= MAX_TOTAL_BLOCKS
+        assert any(
+            block.kind == "text" and "early-main-text" in block.content
+            for block in old_session.state.blocks
+        )
+        assert any(
+            block.kind == "tool_call" and block.block_id == "failed-0"
+            for block in old_session.state.blocks
+        )
+        assert crossing_tool_id is not None
+        assert any(
+            block.kind == "tool_call" and block.block_id == crossing_tool_id
+            for block in pcs.session.state.blocks
+        )
+        assert pcs.session._reply_to == old_session._reply_to == "origin_msg"
+
+        new_binding = pcs.session._delivery.get_binding(pcs.session.session_id)
+        new_card_id = new_binding.pages[0].card_id
+        new_create_index = next(
+            index
+            for index, operation in enumerate(client.operations)
+            if operation[0] == "create_card" and operation[1] == new_card_id
+        )
+        old_archive_index = next(
+            index
+            for index, operation in enumerate(client.operations)
+            if operation[0] == "update_card"
+            and operation[1] == old_card_id
+            and "已归档" in json.dumps(operation[2], ensure_ascii=False)
+        )
+        assert new_create_index < old_archive_index
+        assert "early-main-text" in json.dumps(
+            client.operations[old_archive_index][2],
+            ensure_ascii=False,
+        )
+
+        old_version_after_archive = old_session.state.version
+        old_operations_after_archive = sum(
+            operation[1] == old_card_id
+            for operation in client.operations
+            if operation[0] in {"update_card", "update_element"}
+        )
+
+        pcs.on_text("late-main-text")
+        pcs._flush_now()
+
+        assert old_session.state.version == old_version_after_archive
+        assert sum(
+            operation[1] == old_card_id
+            for operation in client.operations
+            if operation[0] in {"update_card", "update_element"}
+        ) == old_operations_after_archive
+        assert not any(
+            operation[1] == old_card_id
+            for operation in client.operations[old_archive_index + 1:]
+            if operation[0] in {"update_card", "update_element"}
+        )
+        assert any(
+            operation[1] == new_card_id
+            for operation in client.operations[old_archive_index + 1:]
+            if operation[0] in {"update_card", "update_element"}
+        )
+        final_text = pcs.get_final_text()
+        assert "early-main-text" in final_text
+        assert "late-main-text" in final_text
+        assert final_text.index("early-main-text") < final_text.index("late-main-text")
+
+    def test_completed_tool_capacity_rotates_without_deleting_oldest_tool(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_COMPLETED_TOOL_BLOCKS
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        old_session = pcs.session
+
+        for index in range(MAX_COMPLETED_TOOL_BLOCKS + 1):
+            tool_id = f"success-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="read",
+                    kind="read",
+                    status="running",
+                    content=f"src/file_{index}.py",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="read",
+                    kind="read",
+                    status="completed",
+                    content=f"done {index}",
+                ),
+            ))
+
+        assert pcs.session is not old_session
+        assert old_session.state.metadata.frozen is True
+        old_completed = [
+            block
+            for block in old_session.state.blocks
+            if block.kind == "tool_call" and block.status == "completed"
+        ]
+        new_completed = [
+            block
+            for block in pcs.session.state.blocks
+            if block.kind == "tool_call" and block.status == "completed"
+        ]
+        assert len(old_completed) == MAX_COMPLETED_TOOL_BLOCKS
+        assert old_completed[0].block_id == "success-0"
+        assert old_completed[-1].block_id == "success-49"
+        assert [block.block_id for block in new_completed] == ["success-50"]
+
+    def test_image_capacity_event_uses_the_same_visible_first_rotation_gate(self):
+        from src.acp.models import ACPEvent, ACPEventType, ACPImageInfo, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        pcs, _ = _make_programming_session(
+            image_uploader=lambda _image: "img-continuation",
+        )
+        pcs.start()
+        pcs.on_text("image-boundary-history")
+        pcs._flush_now()
+        old_session = pcs.session
+
+        index = 0
+        while len(old_session.state.blocks) < MAX_TOTAL_BLOCKS:
+            tool_id = f"image-boundary-failed-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content="false",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="failed",
+                    content="failed",
+                ),
+            ))
+            index += 1
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.IMAGE_CHUNK,
+            image=ACPImageInfo(
+                image_id="image-at-capacity",
+                mime_type="image/png",
+                data="aW1hZ2U=",
+                name="capacity.png",
+            ),
+        ))
+
+        assert pcs.session is not old_session
+        assert old_session.closed is True
+        assert any(
+            block.kind == "text" and "image-boundary-history" in block.content
+            for block in old_session.state.blocks
+        )
+        image_block = next(
+            block
+            for block in pcs.session.state.blocks
+            if block.kind == "image"
+        )
+        assert image_block.block_id == "image:image-at-capacity"
+        assert image_block.image_key == "img-continuation"
+
+    def test_capacity_handoff_serializes_concurrent_text_until_old_card_is_frozen(self):
+        import threading
+
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        class BlockingContinuationClient(MockClient):
+            def __init__(self):
+                super().__init__()
+                self.second_create_started = threading.Event()
+                self.allow_second_create = threading.Event()
+
+            def create_card(self, *args, **kwargs):
+                if self._counter == 1:
+                    self.second_create_started.set()
+                    if not self.allow_second_create.wait(timeout=2.0):
+                        raise TimeoutError("continuation create was not released")
+                return super().create_card(*args, **kwargs)
+
+        client = BlockingContinuationClient()
+        pcs, _ = _make_programming_session(client=client)
+        pcs.start()
+        pcs.on_text("concurrent-old-history")
+        pcs._flush_now()
+        old_session = pcs.session
+
+        index = 0
+        while len(old_session.state.blocks) < MAX_TOTAL_BLOCKS:
+            tool_id = f"concurrent-failed-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content="false",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="failed",
+                    content="failed",
+                ),
+            ))
+            index += 1
+
+        overflow_done = threading.Event()
+
+        def cross_capacity():
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="concurrent-overflow",
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content="false",
+                ),
+            ))
+            overflow_done.set()
+
+        overflow_thread = threading.Thread(target=cross_capacity)
+        overflow_thread.start()
+        assert client.second_create_started.wait(timeout=1.0)
+        old_version_during_create = old_session.state.version
+        assert pcs.session is old_session
+        assert old_session.state.metadata.frozen is False
+
+        late_done = threading.Event()
+
+        def send_late_text():
+            pcs.on_text("concurrent-new-text")
+            pcs._flush_now()
+            late_done.set()
+
+        late_thread = threading.Thread(target=send_late_text)
+        late_thread.start()
+        assert late_done.wait(timeout=0.05) is False
+        assert old_session.state.version == old_version_during_create
+
+        client.allow_second_create.set()
+        overflow_thread.join(timeout=2.0)
+        late_thread.join(timeout=2.0)
+        assert overflow_done.is_set()
+        assert late_done.is_set()
+        assert not overflow_thread.is_alive()
+        assert not late_thread.is_alive()
+
+        assert pcs.session is not old_session
+        assert old_session.closed is True
+        assert not any(
+            block.kind == "text" and "concurrent-new-text" in block.content
+            for block in old_session.state.blocks
+        )
+        assert any(
+            block.kind == "text" and "concurrent-new-text" in block.content
+            for block in pcs.session.state.blocks
+        )
+
+    def test_async_delivery_confirms_new_card_before_archiving_old(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        pcs, client = _make_programming_session(sync_delivery=False)
+        pcs.start()
+        assert pcs.wait_until_visible(2.0)
+        old_session = pcs.session
+        old_card_id = old_session._delivery.get_binding(
+            old_session.session_id
+        ).pages[0].card_id
+
+        pcs.on_text("async-history")
+        pcs._flush_now()
+        index = 0
+        while len(old_session.state.blocks) < MAX_TOTAL_BLOCKS:
+            tool_id = f"async-failed-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content="false",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="failed",
+                    content="failed",
+                ),
+            ))
+            index += 1
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="async-overflow",
+                title="bash",
+                kind="execute",
+                status="running",
+                content="false",
+            ),
+        ))
+
+        assert pcs.session is not old_session
+        assert old_session.closed is True
+        new_card_id = pcs.session._delivery.get_binding(
+            pcs.session.session_id
+        ).pages[0].card_id
+        new_create_index = next(
+            operation_index
+            for operation_index, operation in enumerate(client.operations)
+            if operation[0] == "create_card" and operation[1] == new_card_id
+        )
+        old_archive_index = next(
+            operation_index
+            for operation_index, operation in enumerate(client.operations)
+            if operation[0] == "update_card"
+            and operation[1] == old_card_id
+            and "已归档" in json.dumps(operation[2], ensure_ascii=False)
+        )
+        assert new_create_index < old_archive_index
+
+        pcs.on_text("async-late-text")
+        pcs.finish()
+        assert pcs.wait_delivery_idle(2.0)
+        assert pcs.terminal_delivery_succeeded() is True
+        assert pcs.get_final_text() == "async-history\nasync-late-text"
+
+    def test_main_transcript_survives_rotation_and_excludes_subagent_text(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_text("early-main-text")
+        pcs._flush_now()
+
+        subagent_id = "transcript-subagent"
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id=subagent_id,
+                title="Agent",
+                kind="other",
+                status="running",
+                content="审查 transcript",
+            ),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            text="subagent-private-text",
+            source_id=subagent_id,
+        ))
+        pcs._flush_now()
+
+        first_session = pcs.session
+        for index in range(MAX_TOTAL_BLOCKS + 2):
+            tool_id = f"transcript-failed-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content="false",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="failed",
+                    content="failed",
+                ),
+            ))
+            if pcs.session is not first_session:
+                break
+
+        pcs.on_text("late-main-text")
+        pcs._flush_now()
+
+        assert pcs.get_final_text() == "early-main-text\nlate-main-text"
+
+    def test_historical_main_text_prevents_fallback_injection_after_rotation(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_text("historical-main-answer")
+        pcs._flush_now()
+        first_session = pcs.session
+
+        for index in range(MAX_TOTAL_BLOCKS + 2):
+            tool_id = f"fallback-failed-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content="false",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="failed",
+                    content="failed",
+                ),
+            ))
+            if pcs.session is not first_session:
+                break
+
+        assert pcs.session is not first_session
+        pcs.finish(fallback_text="must-not-be-injected")
+
+        assert pcs.get_final_text() == "historical-main-answer"
+        assert not any(
+            block.block_id == "_summary"
+            for block in pcs.session.state.blocks
+        )
+
+    def test_capacity_rotation_bypasses_semantic_rotation_ceiling(self):
+        from unittest.mock import patch
+
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        with patch("src.card.session.rotator.get_settings") as mock_settings:
+            mock_settings.return_value.card.session_max_rotations = 1
+            pcs, client = _make_programming_session()
+            pcs.start()
+
+            sessions = [pcs.session]
+            for page in range(2):
+                current = pcs.session
+                for index in range(MAX_TOTAL_BLOCKS + 2):
+                    tool_id = f"page-{page}-failed-{index}"
+                    pcs.on_event(ACPEvent(
+                        event_type=ACPEventType.TOOL_CALL_START,
+                        tool_call=ToolCallInfo(
+                            id=tool_id,
+                            title="bash",
+                            kind="execute",
+                            status="running",
+                            content="false",
+                        ),
+                    ))
+                    pcs.on_event(ACPEvent(
+                        event_type=ACPEventType.TOOL_CALL_DONE,
+                        tool_call=ToolCallInfo(
+                            id=tool_id,
+                            title="bash",
+                            kind="execute",
+                            status="failed",
+                            content="failed",
+                        ),
+                    ))
+                    if pcs.session is not current:
+                        sessions.append(pcs.session)
+                        break
+
+            assert len(sessions) == 3
+            assert len(client.creates) == 3
+            assert all(session.state.metadata.frozen for session in sessions[:-1])
+
+    def test_capacity_rotation_replays_task_list_and_active_tools(self):
+        from src.acp.models import (
+            ACPEvent,
+            ACPEventType,
+            PlanEntryInfo,
+            PlanInfo,
+            ToolCallInfo,
+        )
+        from src.card.state.reducer import MAX_COMPLETED_TOOL_BLOCKS
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.PLAN_UPDATE,
+            plan=PlanInfo(entries=[
+                PlanEntryInfo(content="旧计划", status="in_progress"),
+            ]),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.PLAN_UPDATE,
+            plan=PlanInfo(entries=[
+                PlanEntryInfo(content="已完成准备", status="completed"),
+                PlanEntryInfo(content="保留最新计划", status="in_progress"),
+            ]),
+        ))
+
+        for index in range(MAX_COMPLETED_TOOL_BLOCKS - 1):
+            tool_id = f"replay-completed-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="read",
+                    kind="read",
+                    status="running",
+                    content=str(index),
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="read",
+                    kind="read",
+                    status="completed",
+                    content="done",
+                ),
+            ))
+
+        for tool_id in ("active-completing", "active-replayed"):
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="read",
+                    kind="read",
+                    status="running",
+                    content=tool_id,
+                ),
+            ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="active-replayed",
+                title="read",
+                kind="read",
+                status="running",
+                content="streamed-active-output",
+            ),
+        ))
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="active-completing",
+                title="read",
+                kind="read",
+                status="completed",
+                content="done",
+            ),
+        ))
+
+        old_session = pcs.session
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="new-page-tool",
+                title="read",
+                kind="read",
+                status="running",
+                content="new",
+            ),
+        ))
+
+        assert pcs.session is not old_session
+        new_blocks = pcs.session.state.blocks
+        task_list = next(block for block in new_blocks if block.kind == "task_list")
+        assert [task["name"] for task in task_list.tasks] == [
+            "已完成准备",
+            "保留最新计划",
+        ]
+        assert task_list.current_task_id == "step_1"
+        active_ids = {
+            block.block_id
+            for block in new_blocks
+            if block.kind == "tool_call" and block.status == "active"
+        }
+        assert active_ids == {"active-replayed", "new-page-tool"}
+
+        replayed = next(
+            block
+            for block in new_blocks
+            if block.kind == "tool_call" and block.block_id == "active-replayed"
+        )
+        assert replayed.tool_input == "active-replayed"
+        assert replayed.content == "streamed-active-output"
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="active-replayed",
+                title="read",
+                kind="read",
+                status="completed",
+                content="final-active-output",
+            ),
+        ))
+        replayed = next(
+            block
+            for block in pcs.session.state.blocks
+            if block.kind == "tool_call" and block.block_id == "active-replayed"
+        )
+        assert replayed.status == "completed"
+        assert replayed.tool_input == "active-replayed"
+        assert replayed.content == "streamed-active-output"
+        assert replayed.tool_output == "final-active-output"
+
+    def test_more_than_one_hundred_active_tools_never_trim_and_late_completion_materializes(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        pcs, client = _make_programming_session()
+        pcs.start()
+        sessions = [pcs.session]
+        tool_ids = [f"parallel-active-{index}" for index in range(101)]
+
+        for tool_id in tool_ids:
+            prior = pcs.session
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="read",
+                    kind="read",
+                    status="running",
+                    content=f"input:{tool_id}",
+                ),
+            ))
+            if pcs.session is not prior:
+                sessions.append(pcs.session)
+
+        assert len(sessions) == 3
+        assert len(client.creates) == 3
+        assert all(
+            len(session.state.blocks) <= MAX_TOTAL_BLOCKS
+            for session in sessions
+        )
+        historical_tool_ids = {
+            block.block_id
+            for session in sessions
+            for block in session.state.blocks
+            if block.kind == "tool_call"
+        }
+        assert historical_tool_ids.issuperset(tool_ids)
+        assert not any(
+            block.block_id == tool_ids[0]
+            for block in pcs.session.state.blocks
+            if block.kind == "tool_call"
+        )
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id=tool_ids[0],
+                title="read",
+                kind="read",
+                status="completed",
+                content="late-completion-output",
+            ),
+        ))
+
+        assert len(client.creates) == 4
+        assert len(pcs.session.state.blocks) <= MAX_TOTAL_BLOCKS
+        completed = next(
+            block
+            for block in pcs.session.state.blocks
+            if block.kind == "tool_call" and block.block_id == tool_ids[0]
+        )
+        assert completed.status == "completed"
+        assert completed.tool_input == f"input:{tool_ids[0]}"
+        assert completed.tool_output == "late-completion-output"
+        assert tool_ids[0] not in pcs._active_tool_snapshots
+        assert pcs._failed_retired_sessions == []
+        assert not hasattr(pcs, "_retired_sessions")
+
+    def test_invisible_continuation_fences_capacity_event_without_trimming_old_card(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_text("must-stay-on-old-card")
+        pcs._flush_now()
+        old_session = pcs.session
+
+        class InvisibleClient(MockClient):
+            def create_card(self, *args, **kwargs):
+                raise RuntimeError("continuation is invisible")
+
+        invisible_delivery = CardDelivery(InvisibleClient())
+        candidate_sessions = []
+
+        def invisible_factory(metadata):
+            candidate = CardSession(
+                chat_id="chat_prog",
+                config=SessionConfig(
+                    metadata=metadata,
+                    reply_to="origin_msg",
+                    sync_delivery=True,
+                ),
+                delivery=invisible_delivery,
+                session_id="invisible-continuation",
+            )
+            candidate_sessions.append(candidate)
+            return candidate
+
+        pcs._session_factory = invisible_factory
+        pcs._continuation_visibility_timeout = 0.01
+
+        for index in range(MAX_TOTAL_BLOCKS + 2):
+            tool_id = f"invisible-failed-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content="false",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="failed",
+                    content="failed",
+                ),
+            ))
+            if len(old_session.state.blocks) == MAX_TOTAL_BLOCKS:
+                break
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="invisible-overflow",
+                title="bash",
+                kind="execute",
+                status="running",
+                content="false",
+            ),
+        ))
+
+        assert pcs.session is old_session
+        assert old_session.state.metadata.frozen is False
+        assert len(old_session.state.blocks) == MAX_TOTAL_BLOCKS
+        assert not any(
+            block.block_id == "invisible-overflow"
+            for block in old_session.state.blocks
+        )
+        assert any(
+            block.kind == "text" and "must-stay-on-old-card" in block.content
+            for block in old_session.state.blocks
+        )
+        assert len(candidate_sessions) == 1
+        assert candidate_sessions[0].closed is True
+
+        pcs.on_text("after-failure-main")
+        pcs.finish(fallback_text="must-not-replace-transcript")
+        assert pcs.get_final_text() == (
+            "must-stay-on-old-card\nafter-failure-main"
+        )
+        assert pcs.terminal_delivery_succeeded() is False
+
+    def test_failed_old_card_archive_does_not_claim_terminal_delivery_success(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        class ArchiveFailClient(MockClient):
+            def update_card(self, card_id, card_json, *, sequence=0):
+                super().update_card(card_id, card_json, sequence=sequence)
+                if "已归档" in json.dumps(card_json, ensure_ascii=False):
+                    raise RuntimeError("old card archive failed")
+
+        client = ArchiveFailClient()
+        pcs, _ = _make_programming_session(client=client)
+        pcs.start()
+        pcs.on_text("archive-failure-history")
+        pcs._flush_now()
+        old_session = pcs.session
+
+        index = 0
+        while len(old_session.state.blocks) < MAX_TOTAL_BLOCKS:
+            tool_id = f"archive-failure-tool-{index}"
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="running",
+                    content="false",
+                ),
+            ))
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title="bash",
+                    kind="execute",
+                    status="failed",
+                    content="failed",
+                ),
+            ))
+            index += 1
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="archive-failure-overflow",
+                title="bash",
+                kind="execute",
+                status="running",
+                content="false",
+            ),
+        ))
+
+        assert pcs.session is not old_session
+        assert old_session.closed is False
+        assert not any(
+            block.block_id == "archive-failure-overflow"
+            for block in pcs.session.state.blocks
+        )
+        assert pcs.get_final_text() == "archive-failure-history"
+        assert pcs.terminal_delivery_succeeded() is False
+        pcs.abort()
 
     def test_tool_calls_split_reasoning_into_chronological_turns(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo

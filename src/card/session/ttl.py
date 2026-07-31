@@ -28,6 +28,7 @@ class TTLHandler:
     __slots__ = ("_d", "_a", "_reduce_failure_count")
 
     _MAX_REDUCE_FAILURES: int = 3
+    _MAX_TERMINAL_STATE_RETRIES: int = 3
 
     def __init__(self, decider: TTLDecider, actuator: TTLActuator) -> None:
         self._d = decider
@@ -154,22 +155,46 @@ class TTLHandler:
         """Schedule a single delayed retry for terminal event delivery failure."""
         d, a = self._d, self._a
         a.flag_retry_pending()
+        state_retry_count = 0
 
         def _retry() -> None:
+            nonlocal state_retry_count
             # Check if already closed (state=None means lock contention, skip)
             state = d.get_ttl_state()
-            if state is None or state.closed:
+            if state is None:
+                if state_retry_count < self._MAX_TERMINAL_STATE_RETRIES:
+                    state_retry_count += 1
+                    a.schedule_retry(_retry)
+                    return
+                logger.error(
+                    "CardSession terminal retry state remained contended after %d retries",
+                    state_retry_count,
+                )
+                try:
+                    a.mark_closed()
+                    notice_text = UI_TEXT["card_session_terminal_fallback_notice"].format(
+                        engine_cmd=d.engine_cmd
+                    )
+                    a.notify_user(notice_text)
+                    a.close_delivery()
+                finally:
+                    d.release_terminal_resources()
+                return
+            if state.closed:
                 return
             try:
-                reason = getattr(state.state_snapshot, "terminal_reason", None) or "completed"
-                a.force_deliver(rendered)
-                a.mark_closed()
-                a.fire_terminal_hook(reason)
-            except Exception as exc:
-                logger.error("CardSession %s: terminal retry failed: %s", state.session_id, repr(exc))
-                a.mark_closed()
-                notice_text = UI_TEXT["card_session_terminal_fallback_notice"].format(engine_cmd=d.engine_cmd)
-                a.notify_user(notice_text)
-            a.close_delivery()
+                try:
+                    reason = getattr(state.state_snapshot, "terminal_reason", None) or "completed"
+                    a.force_deliver(rendered)
+                    a.mark_closed()
+                    a.fire_terminal_hook(reason)
+                except Exception as exc:
+                    logger.error("CardSession %s: terminal retry failed: %s", state.session_id, repr(exc))
+                    a.mark_closed()
+                    notice_text = UI_TEXT["card_session_terminal_fallback_notice"].format(engine_cmd=d.engine_cmd)
+                    a.notify_user(notice_text)
+                a.close_delivery()
+            finally:
+                d.release_terminal_resources()
 
         a.schedule_retry(_retry)

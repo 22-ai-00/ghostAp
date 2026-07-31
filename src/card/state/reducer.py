@@ -327,18 +327,8 @@ def _refresh_runtime_stats(state: CardState, event: CardEvent) -> CardState:
     return replace(state, runtime_stats=refreshed)
 
 
-def reduce_card_state(state: CardState | None, event: CardEvent, metadata: CardMetadata | None = None) -> CardState:
-    """
-    Pure function: old state + event → new state. No side effects.
-
-    If state is None, creates initial state (expects STARTED event or provides defaults).
-    metadata is only used for initial state creation.
-    """
-    if state is None:
-        # Initialize with metadata
-        meta = metadata or CardMetadata()
-        state = CardState(metadata=meta)
-
+def _reduce_card_state_untrimmed(state: CardState, event: CardEvent) -> CardState:
+    """Project one event without applying either card-capacity window."""
     # Auto-initialize engine_ext for engine-specific events if not yet set
     if state.engine_ext is None and event.type in _ENGINE_EXT_EVENTS:
         state = replace(state, engine_ext=EngineExtState())
@@ -362,24 +352,89 @@ def reduce_card_state(state: CardState | None, event: CardEvent, metadata: CardM
             new_structural = state.structural_version
         new_state = replace(new_state, version=new_version, structural_version=new_structural)
 
-        # Sliding window: trim completed tool blocks to MAX_COMPLETED_TOOL_BLOCKS
-        # Only run on events that can produce new completed tool blocks (perf optimization)
-        if event.type in (CardEventType.TOOL_DONE, CardEventType.TOOL_FAILED):
-            completed_tool_blocks = [b for b in new_state.blocks if b.kind == "tool_call" and b.status == "completed"]
-            if len(completed_tool_blocks) > MAX_COMPLETED_TOOL_BLOCKS:
-                excess = len(completed_tool_blocks) - MAX_COMPLETED_TOOL_BLOCKS
-                # Identify block_ids to remove (oldest completed tools)
-                to_remove = {b.block_id for b in completed_tool_blocks[:excess]}
-                trimmed = tuple(b for b in new_state.blocks if b.block_id not in to_remove)
-                new_state = replace(new_state, blocks=trimmed)
+    return new_state
 
-        # Safety cap: prevent unbounded block accumulation from any path.
-        # Keep the active phase anchor plus the most recent content so a long
-        # run can still close its phase lifecycle without a false warning.
-        if len(new_state.blocks) > MAX_TOTAL_BLOCKS:
-            new_state = replace(
-                new_state,
-                blocks=_trim_blocks_to_safety_cap(new_state.blocks),
+
+def card_state_requires_continuation(
+    state: CardState,
+    event: CardEvent,
+    *,
+    total_block_limit: int = MAX_TOTAL_BLOCKS,
+    completed_tool_limit: int = MAX_COMPLETED_TOOL_BLOCKS,
+) -> bool:
+    """Return whether reducing ``event`` would cross a destructive trim limit.
+
+    The projection deliberately uses the same reducers and version semantics as
+    :func:`reduce_card_state`, but observes the result before either retention
+    window is applied.  Both inputs are immutable, so callers can safely use
+    this as a capacity preflight before deciding whether to start a new card.
+    """
+    projected = _reduce_card_state_untrimmed(state, event)
+
+    if len(projected.blocks) > total_block_limit:
+        return True
+
+    if event.type in (CardEventType.TOOL_DONE, CardEventType.TOOL_FAILED):
+        completed_tools = sum(
+            1
+            for block in projected.blocks
+            if block.kind == "tool_call" and block.status == "completed"
+        )
+        if completed_tools > completed_tool_limit:
+            return True
+
+    return False
+
+
+def reduce_card_state(state: CardState | None, event: CardEvent, metadata: CardMetadata | None = None) -> CardState:
+    """
+    Pure function: old state + event → new state. No side effects.
+
+    If state is None, creates initial state (expects STARTED event or provides defaults).
+    metadata is only used for initial state creation.
+    """
+    if state is None:
+        # Initialize with metadata
+        meta = metadata or CardMetadata()
+        state = CardState(metadata=meta)
+
+    previous_version = state.version
+    new_state = _reduce_card_state_untrimmed(state, event)
+
+    # The existing retention windows only run when the reducer changed state.
+    # Version advancement is the reducer's canonical signal for that condition.
+    if new_state.version == previous_version:
+        return new_state
+
+    # Sliding window: trim completed tool blocks to MAX_COMPLETED_TOOL_BLOCKS.
+    # Only run on events that can produce new completed tool blocks (perf optimization).
+    if event.type in (CardEventType.TOOL_DONE, CardEventType.TOOL_FAILED):
+        completed_tool_blocks = [
+            block
+            for block in new_state.blocks
+            if block.kind == "tool_call" and block.status == "completed"
+        ]
+        if len(completed_tool_blocks) > MAX_COMPLETED_TOOL_BLOCKS:
+            excess = len(completed_tool_blocks) - MAX_COMPLETED_TOOL_BLOCKS
+            # Identify block_ids to remove (oldest completed tools)
+            to_remove = {
+                block.block_id
+                for block in completed_tool_blocks[:excess]
+            }
+            trimmed = tuple(
+                block
+                for block in new_state.blocks
+                if block.block_id not in to_remove
             )
+            new_state = replace(new_state, blocks=trimmed)
+
+    # Safety cap: prevent unbounded block accumulation from any path.
+    # Keep the active phase anchor plus the most recent content so a long
+    # run can still close its phase lifecycle without a false warning.
+    if len(new_state.blocks) > MAX_TOTAL_BLOCKS:
+        new_state = replace(
+            new_state,
+            blocks=_trim_blocks_to_safety_cap(new_state.blocks),
+        )
 
     return new_state

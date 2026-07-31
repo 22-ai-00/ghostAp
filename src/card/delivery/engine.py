@@ -570,24 +570,26 @@ class CardDelivery:
         if session_lock is None:
             session_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
 
-        with session_lock:
-            binding = self._bindings.get(session_id)
-            if binding is not None:
-                for page in list(binding.pages.values()):
-                    if page.is_streaming:
-                        outcome = self._mutator.finish_streaming_page(session_id, page)
-                        if outcome.kind == "reconcile":
-                            logger.warning(
-                                "Card stream cleanup failed during close for %s: %s",
-                                page.card_id,
-                                outcome.message,
-                            )
-                    if page.card_id:
-                        self._sequences.reset(page.card_id)
-            self._bindings.remove(session_id)
-
-        # Remove lock entry
-        self._lock_pool.release(session_id)
+        try:
+            with session_lock:
+                binding = self._bindings.get(session_id)
+                if binding is not None:
+                    for page in list(binding.pages.values()):
+                        if page.is_streaming:
+                            outcome = self._mutator.finish_streaming_page(session_id, page)
+                            if outcome.kind == "reconcile":
+                                logger.warning(
+                                    "Card stream cleanup failed during close for %s: %s",
+                                    page.card_id,
+                                    outcome.message,
+                                )
+                        if page.card_id:
+                            self._sequences.reset(page.card_id)
+                self._bindings.remove(session_id)
+        finally:
+            # The per-session lock is independent of binding cleanup.  Never
+            # retain it when finalizing a session, even if a mutator raises.
+            self.release_session_lock(session_id)
 
     def get_binding(self, session_id: str):
         """Get the current binding for inspection/testing."""

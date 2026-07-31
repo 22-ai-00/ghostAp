@@ -19,7 +19,13 @@ from src.card.media_bridge import ACPImagePublisher
 from src.card.render.live_ticker import LiveTicker
 from src.card.session import CardSession
 from src.card.session.rotator import SessionRotator
-from src.card.state.models import CardMetadata
+from src.card.state.models import CardMetadata, CardState, TaskListBlock, ToolBlock
+from src.card.state.reducer import (
+    MAX_COMPLETED_TOOL_BLOCKS,
+    MAX_TOTAL_BLOCKS,
+    card_state_requires_continuation,
+)
+from src.card.text_stream import append_stream_text
 from src.card.tool_display import (
     extract_agent_tool_name,
     extract_tool_call_label,
@@ -47,6 +53,12 @@ _AGENT_TOOL_TITLES = {"agent", "subagent", "task"}
 _GENERIC_TASK_LABELS = {"", "agent", "subagent", "task", "子任务"}
 _TERMINAL_AGENT_STATUSES = {"completed", "failed", "cancelled"}
 _GENERIC_AGENT_FAILURE_DETAIL = "子任务执行失败"
+_TOOL_CARD_EVENT_TYPES = frozenset({
+    CardEventType.TOOL_STARTED,
+    CardEventType.TOOL_DELTA,
+    CardEventType.TOOL_DONE,
+    CardEventType.TOOL_FAILED,
+})
 
 
 def build_programming_metadata(
@@ -98,14 +110,26 @@ class ProgrammingCardSession:
         flush_interval: float | None = None,
         base_metadata: CardMetadata | None = None,
         image_uploader: Callable[["ACPImageInfo"], str | None] | None = None,
+        session_factory: Callable[[CardMetadata], CardSession] | None = None,
+        continuation_visibility_timeout: float = 12.0,
     ) -> None:
         self._rotator = SessionRotator(session)
         self._base_metadata = (
-            base_metadata
-            or getattr(session, "_metadata", None)
+            getattr(session, "_metadata", None)
+            or base_metadata
             or CardMetadata()
         )
-        self._image_publisher = ACPImagePublisher(self._rotator, image_uploader)
+        self._session_factory = session_factory
+        self._continuation_visibility_timeout = max(
+            0.01,
+            float(continuation_visibility_timeout),
+        )
+        self._dispatch_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._capacity_delivery_failed = False
+        self._capacity_failure_reason: str | None = None
+        self._failed_retired_sessions: list[CardSession] = []
+        self._active_tool_snapshots: dict[str, ToolBlock] = {}
+        self._image_publisher = ACPImagePublisher(self, image_uploader)
         self._routed_image_ids: set[str] = set()
         self._text_active = False
         self._active_text_block_id = "_active_text"
@@ -122,6 +146,7 @@ class ProgrammingCardSession:
         # Text batching state
         self._pending_text = ""
         self._pending_text_by_block: dict[str, str] = {}
+        self._main_text_transcript: list[tuple[str, str]] = []
         self._flush_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._flush_lock_holder = threading.local()  # per-thread flag for lock ownership assertion
         self._flush_timer: threading.Timer | None = None
@@ -151,8 +176,8 @@ class ProgrammingCardSession:
 
     def start(self) -> None:
         """Start the card (creates initial card in Feishu)."""
-        self._rotator.dispatch(CardEvent.started())
-        self._rotator.dispatch(CardEvent.text_started("_active_text"))
+        self._dispatch_card_event(CardEvent.started())
+        self._dispatch_card_event(CardEvent.text_started("_active_text"))
         self._text_active = True
         self._text_turn_seq = max(self._text_turn_seq, 1)
         self._text_blocks_by_source["main"] = "_active_text"
@@ -201,6 +226,8 @@ class ProgrammingCardSession:
                     self._flush_lock_holder.held = True
                     try:
                         block_id = self._ensure_text_block(source_key)
+                        if self._is_main_source(source_key):
+                            self._record_main_text(block_id, text)
                         self._pending_text_block_id = block_id
                         self._pending_text_by_block[block_id] = self._pending_text_by_block.get(block_id, "") + text
                         self._schedule_flush()
@@ -222,7 +249,7 @@ class ProgrammingCardSession:
                 type=card_event.type,
                 payload={**card_event.payload, "block_id": block_id, "text": reasoning_text},
             )
-            self._rotator.dispatch(card_event)
+            self._dispatch_card_event(card_event)
             if reasoning_text.strip():
                 self._reasoning_sources_with_content.add(source_key)
             return
@@ -247,7 +274,10 @@ class ProgrammingCardSession:
             self._text_blocks_by_source["main"] = block_id
             self._active_text_sources.add("main")
 
-        self._rotator.dispatch(card_event)
+        if card_event.type in _TOOL_CARD_EVENT_TYPES:
+            self._dispatch_tool_event(card_event)
+        else:
+            self._dispatch_card_event(card_event)
 
     def on_text(self, text: str) -> None:
         """Append text directly (for simple text-only streams)."""
@@ -256,6 +286,7 @@ class ProgrammingCardSession:
                 self._flush_lock_holder.held = True
                 try:
                     block_id = self._ensure_text_block("main")
+                    self._record_main_text(block_id, text)
                     self._pending_text_block_id = block_id
                     self._pending_text_by_block[block_id] = (
                         self._pending_text_by_block.get(block_id, "") + text
@@ -304,20 +335,10 @@ class ProgrammingCardSession:
         # completion summary. Subagent prose does not replace the parent answer.
         summary = ""
         if fallback_text:
-            state = self._rotator.current.state
-            has_main_text = (
-                any(
-                    block.kind == "text"
-                    and getattr(block, "source_kind", "main") == "main"
-                    and bool(str(block.content or "").strip())
-                    for block in state.blocks
-                )
-                if state
-                else False
-            )
-            if not has_main_text:
+            if not self._has_main_text():
                 summary = fallback_text
-        self._rotator.dispatch(CardEvent.completed(summary=summary))
+                self._record_main_text("_summary", fallback_text)
+        self._dispatch_card_event(CardEvent.completed(summary=summary))
         self._stop_ticker()
 
     def fail(
@@ -339,7 +360,7 @@ class ProgrammingCardSession:
             else "failed"
         )
         self._finish_agent_summaries(terminal_status=terminal_status)
-        self._rotator.dispatch(CardEvent.failed(error))
+        self._dispatch_card_event(CardEvent.failed(error))
         self._stop_ticker()
 
     def wait_for_user_confirmation(self, reason: str) -> None:
@@ -351,7 +372,7 @@ class ProgrammingCardSession:
         if self._text_active:
             self._close_text_blocks()
         self._finish_agent_summaries(terminal_status="cancelled")
-        self._rotator.dispatch(CardEvent.blocked(reason))
+        self._dispatch_card_event(CardEvent.blocked(reason))
         self._stop_ticker()
 
     def cancel(self, *, reason: str = "cancelled") -> None:
@@ -374,7 +395,7 @@ class ProgrammingCardSession:
             summary_changed = True
         if summary_changed and not self._rotator.current.closed:
             try:
-                self._rotator.dispatch(
+                self._dispatch_card_event(
                     CardEvent.tool_model_changed(
                         subagents=tuple(self._agent_summaries.values())
                     )
@@ -384,13 +405,13 @@ class ProgrammingCardSession:
                     "Failed to publish cancelled subagent summary; "
                     "continuing parent terminal transition"
                 )
-        self._rotator.dispatch(CardEvent.cancelled(reason=reason))
+        self._dispatch_card_event(CardEvent.cancelled(reason=reason))
         self._stop_ticker()
 
     def update_tool_model(self, tool_name: str | None = None, model_name: str | None = None) -> None:
         """Update the displayed tool/model in header subtitle."""
         self._flush_now()
-        self._rotator.dispatch(CardEvent.tool_model_changed(tool_name, model_name))
+        self._dispatch_card_event(CardEvent.tool_model_changed(tool_name, model_name))
 
     def get_message_id(self) -> str | None:
         """Get the message_id of the first card page (for message linking)."""
@@ -410,30 +431,351 @@ class ProgrammingCardSession:
         return self.get_message_id() is not None
 
     def wait_delivery_idle(self, timeout: float) -> bool:
-        """Wait until the single programming card has completed delivery."""
-        return self._rotator.current.wait_delivery_idle(timeout=timeout)
+        """Wait until every programming-card page has completed delivery."""
+        deadline = time.monotonic() + timeout
+        with self._dispatch_lock:
+            sessions = (*self._failed_retired_sessions, self._rotator.current)
+        for session in sessions:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not session.wait_delivery_idle(timeout=remaining):
+                return False
+        return True
 
     def terminal_delivery_succeeded(self) -> bool:
         """Return whether the terminal programming card closed successfully."""
-        return self._rotator.current.closed
+        with self._dispatch_lock:
+            return (
+                not self._capacity_delivery_failed
+                and self._rotator.current.closed
+                and all(
+                    session.closed
+                    for session in self._failed_retired_sessions
+                )
+            )
 
     def abort(self) -> None:
         """Stop local activity and close the card session without more delivery."""
         self._cancel_timer()
         self._stop_ticker()
-        self._rotator.close()
+        with self._dispatch_lock:
+            retired = tuple(self._failed_retired_sessions)
+            self._rotator.close()
+            for session in retired:
+                session.close()
+            self._failed_retired_sessions.clear()
+            self._active_tool_snapshots.clear()
 
     def get_final_text(self) -> str:
-        """Extract accumulated text content from card state for context recording."""
+        """Return the complete ordered main-Agent transcript."""
         self._flush_now()
+        with self._flush_lock:
+            return "\n".join(
+                content
+                for _, content in self._main_text_transcript
+                if content
+            )
+
+    def dispatch(self, event: CardEvent) -> None:
+        """Route media-bridge events through the same capacity handoff gate."""
+        self._dispatch_card_event(event)
+
+    def _dispatch_card_event(self, event: CardEvent) -> bool:
+        """Serialize projection, visible-first rotation, and event dispatch."""
+        with self._dispatch_lock:
+            if self._capacity_delivery_failed:
+                return False
+            current = self._rotator.current
+            if current.closed:
+                return False
+            state = current.state
+            if state is not None and self._requires_capacity_rotation(state, event):
+                if not self._rotate_for_capacity(current, event):
+                    self._capacity_delivery_failed = True
+                    if self._capacity_failure_reason is None:
+                        self._capacity_failure_reason = (
+                            "continuation card could not be made visible and archived"
+                        )
+                    return False
+            self._rotator.dispatch(event)
+            return True
+
+    def _dispatch_tool_event(self, event: CardEvent) -> bool:
+        """Dispatch one tool event and retain active state across card pages."""
+        with self._dispatch_lock:
+            block_id = str((event.payload or {}).get("block_id") or "")
+            if (
+                event.type in {
+                    CardEventType.TOOL_DELTA,
+                    CardEventType.TOOL_DONE,
+                    CardEventType.TOOL_FAILED,
+                }
+                and block_id
+                and not self._current_card_has_tool(block_id)
+            ):
+                snapshot = self._active_tool_snapshots.get(block_id)
+                tool_name = (
+                    snapshot.tool_name
+                    if snapshot is not None
+                    else str((event.payload or {}).get("tool_summary") or "tool")
+                )
+                tool_input = snapshot.tool_input if snapshot is not None else ""
+                if not self._dispatch_card_event(CardEvent.tool_started(
+                    block_id,
+                    tool_name or "tool",
+                    tool_input or "",
+                )):
+                    return False
+                if (
+                    snapshot is not None
+                    and snapshot.content
+                    and not self._dispatch_card_event(CardEvent.tool_delta(
+                        block_id,
+                        snapshot.content,
+                    ))
+                ):
+                    return False
+
+            dispatched = self._dispatch_card_event(event)
+            if dispatched:
+                self._sync_active_tool_snapshot(event)
+            return dispatched
+
+    def _current_card_has_tool(self, block_id: str) -> bool:
         state = self._rotator.current.state
-        if not state:
-            return ""
-        parts = []
-        for block in state.blocks:
-            if block.kind == "text" and block.content:
-                parts.append(block.content)
-        return "\n".join(parts)
+        if state is None:
+            return False
+        index = state.block_index.get(block_id)
+        return (
+            index is not None
+            and index < len(state.blocks)
+            and isinstance(state.blocks[index], ToolBlock)
+        )
+
+    def _sync_active_tool_snapshot(self, event: CardEvent) -> None:
+        block_id = str((event.payload or {}).get("block_id") or "")
+        if not block_id:
+            return
+        if event.type in {CardEventType.TOOL_DONE, CardEventType.TOOL_FAILED}:
+            self._active_tool_snapshots.pop(block_id, None)
+            return
+        state = self._rotator.current.state
+        if state is None:
+            return
+        index = state.block_index.get(block_id)
+        if index is None or index >= len(state.blocks):
+            return
+        block = state.blocks[index]
+        if isinstance(block, ToolBlock) and block.status == "active":
+            self._active_tool_snapshots[block_id] = block
+
+    @staticmethod
+    def _requires_capacity_rotation(state: CardState, event: CardEvent) -> bool:
+        if event.type is CardEventType.TOOL_STARTED:
+            completed_tools = sum(
+                block.kind == "tool_call" and block.status == "completed"
+                for block in state.blocks
+            )
+            if completed_tools >= MAX_COMPLETED_TOOL_BLOCKS:
+                return True
+        return card_state_requires_continuation(state, event)
+
+    def _rotate_for_capacity(
+        self,
+        old_session: CardSession,
+        crossing_event: CardEvent,
+    ) -> bool:
+        factory = self._session_factory
+        if factory is None:
+            logger.error(
+                "Programming card reached capacity without a continuation factory"
+            )
+            return False
+
+        self._close_active_streams_for_capacity(old_session)
+        old_state = old_session.state
+        if old_state is None:
+            logger.error("Programming card capacity rotation has no source state")
+            return False
+
+        task_list, active_tools = self._continuation_seed(
+            old_state,
+            crossing_event,
+        )
+        continuation_metadata = self._continuation_metadata(old_state)
+
+        def create_visible_session() -> CardSession:
+            new_session = factory(continuation_metadata)
+            try:
+                new_session.dispatch(CardEvent.started())
+                if task_list is not None:
+                    new_session.dispatch(CardEvent(
+                        type=CardEventType.TASK_LIST_UPDATED,
+                        payload={
+                            "tasks": list(task_list.tasks),
+                            "current_task_id": task_list.current_task_id,
+                        },
+                    ))
+                for tool in active_tools:
+                    new_session.dispatch(CardEvent.tool_started(
+                        tool.block_id,
+                        tool.tool_name or "tool",
+                        tool.tool_input or "",
+                    ))
+                    if tool.content:
+                        new_session.dispatch(CardEvent.tool_delta(
+                            tool.block_id,
+                            tool.content,
+                        ))
+                if not new_session.wait_delivery_idle(
+                    timeout=self._continuation_visibility_timeout
+                ):
+                    raise RuntimeError("continuation delivery did not become idle")
+                if not new_session.delivered_message_id:
+                    raise RuntimeError("continuation card is not visible")
+                return new_session
+            except Exception:
+                new_session.close()
+                raise
+
+        new_session = self._rotator.rotate(
+            create_visible_session,
+            enforce_max_rotations=False,
+            archive_with_hint=False,
+        )
+        if new_session is None or new_session is old_session:
+            logger.error(
+                "Programming card capacity rotation failed; preserving full old card"
+            )
+            return False
+
+        if not old_session.wait_delivery_idle(
+            timeout=self._continuation_visibility_timeout
+        ) or not old_session.closed:
+            self._failed_retired_sessions.append(old_session)
+            logger.error(
+                "Programming card continuation is visible but old card archival failed"
+            )
+            return False
+
+        self._reset_stream_state_after_capacity_rotation()
+        return True
+
+    def _close_active_streams_for_capacity(
+        self,
+        old_session: CardSession,
+    ) -> None:
+        """Close bounded stream blocks before freezing the old full card."""
+        for source_key in list(self._active_text_sources):
+            block_id = self._text_blocks_by_source.get(
+                source_key,
+                self._active_text_block_id,
+            )
+            old_session.dispatch(CardEvent.text_done(block_id))
+        for source_key in list(self._active_reasoning_sources):
+            block_id = self._reasoning_blocks_by_source.get(source_key)
+            if block_id:
+                old_session.dispatch(CardEvent.reasoning_done(block_id))
+        self._reset_stream_state_after_capacity_rotation()
+
+    def _reset_stream_state_after_capacity_rotation(self) -> None:
+        self._text_active = False
+        self._reasoning_active = False
+        self._text_blocks_by_source.clear()
+        self._reasoning_blocks_by_source.clear()
+        self._active_text_sources.clear()
+        self._active_reasoning_sources.clear()
+        self._reasoning_sources_with_content.clear()
+        self._pending_reasoning_item_breaks.clear()
+
+    def _continuation_seed(
+        self,
+        state: CardState,
+        crossing_event: CardEvent,
+    ) -> tuple[TaskListBlock | None, tuple[ToolBlock, ...]]:
+        task_list = next(
+            (
+                block
+                for block in state.blocks
+                if isinstance(block, TaskListBlock)
+            ),
+            None,
+        )
+        active_by_id = {
+            block.block_id: block
+            for block in state.blocks
+            if isinstance(block, ToolBlock) and block.status == "active"
+        }
+        active_by_id.update(self._active_tool_snapshots)
+
+        crossing_tool_id = str(
+            (crossing_event.payload or {}).get("block_id") or ""
+        )
+        if crossing_event.type is CardEventType.TOOL_STARTED:
+            active_by_id.pop(crossing_tool_id, None)
+
+        # STARTED itself has no content block.  Keep one slot free for the
+        # event that triggered this rollover, and one more for the task list
+        # when present.  Older active tools remain visible on frozen cards and
+        # stay in the adapter registry so a later update/completion can
+        # materialize them on the then-current card without losing the event.
+        active_slots = MAX_TOTAL_BLOCKS - 1 - int(task_list is not None)
+        candidates = list(active_by_id.values())
+        prioritized: list[ToolBlock] = []
+        if crossing_tool_id and crossing_tool_id in active_by_id:
+            prioritized.append(active_by_id[crossing_tool_id])
+        prioritized.extend(
+            block
+            for block in reversed(candidates)
+            if block.block_id != crossing_tool_id
+        )
+        selected_ids = {
+            block.block_id
+            for block in prioritized[:active_slots]
+        }
+        active_tools = tuple(
+            block
+            for block in candidates
+            if block.block_id in selected_ids
+        )
+        return task_list, active_tools
+
+    def _continuation_metadata(self, state: CardState) -> CardMetadata:
+        continuation_seq = self._rotator.rotation_count + 1
+        return replace(
+            state.metadata,
+            continuation_seq=continuation_seq,
+            card_sequence=continuation_seq + 1,
+            final_state_for_freeze=None,
+            frozen=False,
+            frozen_total_elapsed=None,
+            bridge_phrase="续接：",
+        )
+
+    def _record_main_text(self, block_id: str, text: str) -> None:
+        if not text:
+            return
+        with self._flush_lock:
+            if (
+                self._main_text_transcript
+                and self._main_text_transcript[-1][0] == block_id
+            ):
+                previous_id, previous_text = self._main_text_transcript[-1]
+                self._main_text_transcript[-1] = (
+                    previous_id,
+                    append_stream_text(previous_text, text),
+                )
+            else:
+                self._main_text_transcript.append((block_id, text.lstrip("\n")))
+
+    def _has_main_text(self) -> bool:
+        with self._flush_lock:
+            return any(
+                bool(content.strip())
+                for _, content in self._main_text_transcript
+            )
+
+    def _is_main_source(self, source_key: str) -> bool:
+        return source_key == "main" or source_key not in self._agent_summaries
 
     # ---- Internal flush mechanism ----
 
@@ -471,84 +813,107 @@ class ProgrammingCardSession:
         if not self._rotator.current.closed:
             for pending_block_id, pending_text in pending_by_block.items():
                 if pending_text:
-                    self._rotator.dispatch(CardEvent.text_delta(pending_block_id, pending_text))
+                    self._dispatch_card_event(
+                        CardEvent.text_delta(pending_block_id, pending_text)
+                    )
 
     def _ensure_text_block(self, source_key: str) -> str:
         """Open or reuse the current logical text block for one source."""
-        if source_key in self._active_text_sources:
-            return self._text_blocks_by_source.get(source_key, self._active_text_block_id)
-        block_id = self._current_text_block_id(source_key)
-        self._active_text_block_id = block_id
-        self._text_blocks_by_source[source_key] = block_id
-        source_kind = "main"
-        source_sequence = None
-        source_label = None
-        source_ref = "main"
-        if source_key != "main":
-            source_ref = self._safe_source_suffix(source_key)
-            summary = self._agent_summaries.get(source_key)
-            if summary is not None:
-                source_kind = "subagent"
-                source_sequence = str(
-                    summary.get("sequence") or ""
-                ).strip() or None
-                source_label = str(
-                    summary.get("label") or ""
-                ).strip() or None
-        self._rotator.dispatch(
-            CardEvent.text_started(
-                block_id,
-                source_kind=source_kind,
-                source_sequence=source_sequence,
-                source_label=source_label,
-                source_ref=source_ref,
+        with self._dispatch_lock:
+            if source_key in self._active_text_sources:
+                return self._text_blocks_by_source.get(
+                    source_key,
+                    self._active_text_block_id,
+                )
+            block_id = self._current_text_block_id(source_key)
+            source_kind = "main"
+            source_sequence = None
+            source_label = None
+            source_ref = "main"
+            if source_key != "main":
+                source_ref = self._safe_source_suffix(source_key)
+                summary = self._agent_summaries.get(source_key)
+                if summary is not None:
+                    source_kind = "subagent"
+                    source_sequence = str(
+                        summary.get("sequence") or ""
+                    ).strip() or None
+                    source_label = str(
+                        summary.get("label") or ""
+                    ).strip() or None
+            dispatched = self._dispatch_card_event(
+                CardEvent.text_started(
+                    block_id,
+                    source_kind=source_kind,
+                    source_sequence=source_sequence,
+                    source_label=source_label,
+                    source_ref=source_ref,
+                )
             )
-        )
-        self._active_text_sources.add(source_key)
-        self._text_active = True
-        return block_id
+            if dispatched:
+                self._active_text_block_id = block_id
+                self._text_blocks_by_source[source_key] = block_id
+                self._active_text_sources.add(source_key)
+                self._text_active = True
+            return block_id
 
     def _ensure_reasoning_block(self, source_key: str) -> str:
         """Open or reuse the current logical reasoning block for one source."""
-        if source_key in self._active_reasoning_sources:
-            return self._reasoning_blocks_by_source.get(source_key, self._active_reasoning_block_id)
-        block_id = self._reasoning_blocks_by_source.get(source_key) or self._current_reasoning_block_id(source_key)
-        self._active_reasoning_block_id = block_id
-        self._reasoning_blocks_by_source[source_key] = block_id
-        self._rotator.dispatch(CardEvent.reasoning_started(block_id))
-        self._active_reasoning_sources.add(source_key)
-        self._reasoning_active = True
-        return block_id
+        with self._dispatch_lock:
+            if source_key in self._active_reasoning_sources:
+                return self._reasoning_blocks_by_source.get(
+                    source_key,
+                    self._active_reasoning_block_id,
+                )
+            block_id = (
+                self._reasoning_blocks_by_source.get(source_key)
+                or self._current_reasoning_block_id(source_key)
+            )
+            dispatched = self._dispatch_card_event(
+                CardEvent.reasoning_started(block_id)
+            )
+            if dispatched:
+                self._active_reasoning_block_id = block_id
+                self._reasoning_blocks_by_source[source_key] = block_id
+                self._active_reasoning_sources.add(source_key)
+                self._reasoning_active = True
+            return block_id
 
     def _close_text_blocks(self) -> None:
-        for source_key in list(self._active_text_sources):
-            block_id = self._text_blocks_by_source.get(source_key, self._active_text_block_id)
-            self._rotator.dispatch(CardEvent.text_done(block_id))
-        self._active_text_sources.clear()
-        self._text_active = False
+        with self._dispatch_lock:
+            for source_key in list(self._active_text_sources):
+                block_id = self._text_blocks_by_source.get(
+                    source_key,
+                    self._active_text_block_id,
+                )
+                self._dispatch_card_event(CardEvent.text_done(block_id))
+            self._active_text_sources.clear()
+            self._text_active = False
 
     def _close_reasoning_blocks(self, *, retire: bool = False) -> None:
-        source_keys = (
-            self._reasoning_blocks_by_source
-            if retire
-            else self._active_reasoning_sources
-        )
-        for source_key in list(source_keys):
-            self._close_reasoning_source(source_key, retire=retire)
+        with self._dispatch_lock:
+            source_keys = (
+                self._reasoning_blocks_by_source
+                if retire
+                else self._active_reasoning_sources
+            )
+            for source_key in list(source_keys):
+                self._close_reasoning_source(source_key, retire=retire)
 
     def _close_reasoning_source(self, source_key: str, *, retire: bool = False) -> None:
         """Close one source's reasoning block and optionally retire its ID."""
-        block_id = self._reasoning_blocks_by_source.get(source_key)
-        if source_key in self._active_reasoning_sources and block_id:
-            self._rotator.dispatch(CardEvent.reasoning_done(block_id))
-            self._active_reasoning_sources.discard(source_key)
-            if source_key in self._reasoning_sources_with_content and not retire:
-                self._pending_reasoning_item_breaks.add(source_key)
-        if retire:
-            self._reasoning_blocks_by_source.pop(source_key, None)
-            self._pending_reasoning_item_breaks.discard(source_key)
-            self._reasoning_sources_with_content.discard(source_key)
-        self._reasoning_active = bool(self._active_reasoning_sources)
+        with self._dispatch_lock:
+            block_id = self._reasoning_blocks_by_source.get(source_key)
+            if source_key in self._active_reasoning_sources and block_id:
+                self._dispatch_card_event(CardEvent.reasoning_done(block_id))
+                self._active_reasoning_sources.discard(source_key)
+                if source_key in self._reasoning_sources_with_content and not retire:
+                    self._pending_reasoning_item_breaks.add(source_key)
+            if retire:
+                self._reasoning_blocks_by_source.pop(source_key, None)
+                self._pending_reasoning_item_breaks.discard(source_key)
+                self._reasoning_sources_with_content.discard(source_key)
+            self._reasoning_active = bool(self._active_reasoning_sources)
 
     def _current_text_block_id(self, source_key: str = "main") -> str:
         """Return the stable text block ID for the current ACP turn."""
@@ -648,18 +1013,20 @@ class ProgrammingCardSession:
     def _dispatch_ticker_frame(self, frame: str) -> None:
         if not frame or self._rotator.current.closed:
             return
-        self._rotator.dispatch(CardEvent.tool_model_changed(live_ticker_frame=frame))
+        self._dispatch_card_event(
+            CardEvent.tool_model_changed(live_ticker_frame=frame)
+        )
 
     def _handle_plan_update(self, acp_event: "ACPEvent") -> None:
         """Update the in-card task list in place.
 
         Plan/task changes never spawn a new Feishu card — the whole task list
-        lives in one streaming card and is updated as the agent works through it.
-        A new continuation card is only created when the current card nears the
-        Feishu element/byte limit (handled by render-time pagination).
+        is updated in place until the current card reaches its state capacity;
+        capacity rollover then replays only the latest task-list snapshot.
         """
+        self._flush_now()
         card_event = CardEvent.from_acp(acp_event)
-        self._rotator.dispatch(card_event)
+        self._dispatch_card_event(card_event)
 
     def _handle_agent_task_event(self, acp_event: "ACPEvent") -> bool:
         tool_call = getattr(acp_event, "tool_call", None)
@@ -771,7 +1138,11 @@ class ProgrammingCardSession:
             summary.setdefault("model", self._base_metadata.model_name)
         self._agent_summaries[tool_call.id] = summary
         if not self._rotator.current.closed:
-            self._rotator.dispatch(CardEvent.tool_model_changed(subagents=tuple(self._agent_summaries.values())))
+            self._dispatch_card_event(
+                CardEvent.tool_model_changed(
+                    subagents=tuple(self._agent_summaries.values())
+                )
+            )
 
     def _refresh_failed_agent_error(self, tool_call: "ToolCallInfo") -> None:
         existing = self._agent_summaries.get(tool_call.id)
@@ -791,7 +1162,7 @@ class ProgrammingCardSession:
             "error": detail,
         }
         if not self._rotator.current.closed:
-            self._rotator.dispatch(
+            self._dispatch_card_event(
                 CardEvent.tool_model_changed(
                     subagents=tuple(self._agent_summaries.values())
                 )
@@ -845,7 +1216,11 @@ class ProgrammingCardSession:
             summary_changed = True
         if summary_changed and not self._rotator.current.closed:
             try:
-                self._rotator.dispatch(CardEvent.tool_model_changed(subagents=tuple(self._agent_summaries.values())))
+                self._dispatch_card_event(
+                    CardEvent.tool_model_changed(
+                        subagents=tuple(self._agent_summaries.values())
+                    )
+                )
             except Exception:
                 logger.exception("Failed to publish final subagent summary; continuing parent terminal transition")
 

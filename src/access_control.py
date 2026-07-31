@@ -210,7 +210,7 @@ class IngressAccessPolicyProvider:
             raise TypeError("initial must be an IngressAccessPolicy")
         self._current = initial
         self._blocking_findings: tuple[SecurityFinding, ...] = ()
-        self._swap_lock = threading.Lock()
+        self._swap_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
     @property
     def current(self) -> IngressAccessPolicy:

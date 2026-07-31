@@ -724,8 +724,11 @@ class CardSession:
 
         # Finalize only on successful terminal delivery
         if is_terminal:
-            self._coordinator.finalize_terminal(self._state, self._terminal_reason)
-            self._fire_card_split_completed_if_pending()
+            try:
+                self._coordinator.finalize_terminal(self._state, self._terminal_reason)
+                self._fire_card_split_completed_if_pending()
+            finally:
+                self.release_terminal_resources()
 
     def _fire_card_split_completed_if_pending(self) -> None:
         """Fire card_split completion callback after terminal delivery/hooks."""
@@ -762,19 +765,34 @@ class CardSession:
                 except Exception as exc:
                     logger.debug("CardSession %s: close() cancel reduce failed: %s", self._session_id, repr(exc))
             self._closed.set()
-        # Cancel all timers outside lock
-        self._timers.cancel_all()
-        self._cancel_stop_escalation()
-        # Detach the weakref finalizer (no longer needed after explicit close)
-        self._finalizer.detach()
         try:
             self._delivery.close(self._session_id)
         except Exception as exc:
             logger.exception("CardSession %s: delivery.close() failed in close(): %s", self._session_id, repr(exc))
+        self.release_terminal_resources()
         # Fire terminal hooks if we have state
         if self._state is not None:
             reason = self._terminal_reason or "cancelled"
             self._hook_firer.fire_terminal(self._state, reason)
+
+    def release_terminal_resources(self) -> None:
+        """Release timer/finalizer references after a session becomes terminal."""
+        self._timers.close()
+        self._cancel_stop_escalation()
+        release_lock = getattr(self._delivery, "release_session_lock", None)
+        lock_released = release_lock is None
+        if release_lock is not None:
+            try:
+                release_lock(self._session_id)
+                lock_released = True
+            except Exception as exc:
+                logger.warning(
+                    "CardSession %s: delivery session-lock release failed: %s",
+                    self._session_id,
+                    repr(exc),
+                )
+        if lock_released:
+            self._finalizer.detach()
 
     def snapshot(self) -> tuple[str, str] | None:
         """Render current state without delivering (for status commands).

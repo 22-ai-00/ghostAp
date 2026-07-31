@@ -577,6 +577,33 @@ class TestSessionRotatorMaxRotationsTruncation:
         event = s2.dispatch.call_args[0][0]
         assert event.type.value == "warning_updated"
 
+    @patch("src.card.session.rotator.get_settings")
+    def test_capacity_rotation_can_bypass_limit_without_archive_content_hint(
+        self,
+        mock_settings,
+    ):
+        """Programming capacity rollover can exceed the semantic rotation cap."""
+        mock_settings.return_value.card.session_max_rotations = 1
+        s1 = self._make_mock_session()
+        s2 = self._make_mock_session()
+        s3 = self._make_mock_session()
+        rotator = SessionRotator(s1)
+
+        rotator.rotate(lambda: s2)
+        s2.dispatch.reset_mock()
+
+        result = rotator.rotate(
+            lambda: s3,
+            enforce_max_rotations=False,
+            archive_with_hint=False,
+        )
+
+        assert result is s3
+        assert rotator.current is s3
+        archived = s2.dispatch.call_args[0][0]
+        assert archived.type is CardEventType.ARCHIVED
+        assert archived.payload["append_hint"] is False
+
 
 class TestFactoryWallClockWarning:
     """Verify WARNING is logged when factory() takes >500ms."""

@@ -182,15 +182,18 @@ class TTLActuator:
         """Treat currently active engine work as fresh activity and reschedule TTL."""
         ctx = self._ctx
         with ctx.lock:
+            if ctx.closed.is_set():
+                return
             ctx.mutable.last_dispatch_time = ctx.clock()
             ctx.mutable.ttl_warned = False
-        ctx.timers.reset_ttl_timer(on_expired=on_expired, on_prewarning=on_prewarning)
+            ctx.timers.reset_ttl_timer(
+                on_expired=on_expired,
+                on_prewarning=on_prewarning,
+            )
 
     def mark_closed(self) -> None:
-        """Mark the session as closed (under lock)."""
-        ctx = self._ctx
-        with ctx.lock:
-            ctx.closed.set()
+        """Mark the session closed without waiting on a contended state lock."""
+        self._ctx.closed.set()
 
     def force_terminate(self, reason: str) -> None:
         """Force-close the session when lock cannot be acquired normally.
@@ -201,7 +204,7 @@ class TTLActuator:
         ctx = self._ctx
         logger.warning("CardSession %s: force-close (reason=%s)", ctx.session_id, reason)
         ctx.closed.set()
-        ctx.timers.cancel_all()
+        ctx.timers.close()
 
         # Late import to use same binding as core.py (supports monkeypatch)
         import src.card.session.core as _core
@@ -318,7 +321,7 @@ class TTLActuator:
         self._ctx.hook_firer.fire_terminal(self._ctx.mutable.state, reason)
 
     def schedule_ttl_retry(self, callback: Callable[[], None]) -> bool:
-        """Schedule a TTL retry timer. Returns False if max retries exceeded."""
+        """Handle a TTL retry; False only means an open session exhausted it."""
         return self._ctx.timers.schedule_ttl_retry(callback)
 
     def cancel_timers(self) -> None:

@@ -18,12 +18,13 @@ from src.feishu.handlers.programming import ClaudeModeHandler, Tui2acpModeHandle
 class _FakeProgrammingCardSession:
     last = None
 
-    def __init__(self, *_args, **_kwargs):
+    def __init__(self, *_args, **kwargs):
         self.failed_text = None
         self.finished = False
         self.waiting_reason = None
         self.cancelled_reason = None
         self.continuation_boundaries = 0
+        self.kwargs = kwargs
         type(self).last = self
 
     def start(self):
@@ -48,7 +49,7 @@ class _FakeProgrammingCardSession:
         return None
 
     def get_final_text(self):
-        return ""
+        return getattr(self, "final_text", "")
 
     def finish(self, **_kwargs):
         self.finished = True
@@ -141,7 +142,7 @@ def _make_handler():
 
 
 @contextmanager
-def _streaming_environment():
+def _streaming_environment(adapter_cls=_FakeProgrammingCardSession):
     with ExitStack() as stack:
         stack.enter_context(
             patch(
@@ -161,7 +162,7 @@ def _streaming_environment():
         stack.enter_context(
             patch(
                 "src.card.programming_adapter.ProgrammingCardSession",
-                _FakeProgrammingCardSession,
+                adapter_cls,
             )
         )
         stack.enter_context(
@@ -208,6 +209,8 @@ def test_streaming_pending_plan_continues_on_same_session_and_finishes():
     assert adapter.finished is True
     assert adapter.failed_text is None
     assert adapter.waiting_reason is None
+    assert callable(adapter.kwargs["session_factory"])
+    assert adapter.kwargs["continuation_visibility_timeout"] >= 2.0
 
 
 def test_streaming_second_pending_plan_waits_without_failing():
@@ -505,6 +508,11 @@ def test_programming_falls_back_when_initial_async_channel_card_is_not_visible()
 def test_programming_terminal_delivery_failure_aborts_retry_and_replies_text():
     handler = _make_handler()
     handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler._update_snapshot_on_project = MagicMock()
+    project = MagicMock()
+    project.project_name = "ghostAp"
+    project.root_path = "/tmp/ghostAp"
+    project.project_id = "project-1"
     session = MagicMock()
     session.session_id = "sid-1"
     session.message_count = 1
@@ -516,6 +524,7 @@ def test_programming_terminal_delivery_failure_aborts_retry_and_replies_text():
         def __init__(self, *_args, **_kwargs):
             super().__init__()
             self.aborted = False
+            self.final_text = "early-main-before-exception"
             type(self).last = self
 
         def terminal_delivery_succeeded(self):
@@ -542,7 +551,7 @@ def test_programming_terminal_delivery_failure_aborts_retry_and_replies_text():
             "chat-1",
             "hello",
             session,
-            None,
+            project,
             "/tmp",
             "/tmp",
         )
@@ -550,4 +559,54 @@ def test_programming_terminal_delivery_failure_aborts_retry_and_replies_text():
     assert _FailedTerminalProgrammingCardSession.last.aborted is True
     handler.reply_text.assert_called_once()
     assert handler.reply_text.call_args.args[0] == "msg-1"
+    assert "early-main-before-exception" in handler.reply_text.call_args.args[1]
     assert "terminal delivery test" in handler.reply_text.call_args.args[1]
+    assistant_conversation = next(
+        call
+        for call in project.add_conversation.call_args_list
+        if call.args[0] == "assistant"
+    )
+    assert "early-main-before-exception" in assistant_conversation.args[1]
+    assert "terminal delivery test" in assistant_conversation.args[1]
+
+
+def test_programming_timeout_fallback_keeps_earlier_main_transcript():
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler._retire_finalization_session = MagicMock()
+    session = MagicMock()
+    session.session_id = "sid-timeout"
+    session.message_count = 1
+    session.send_prompt.side_effect = TimeoutError("stream deadline")
+
+    class _TranscriptTimeoutProgrammingCardSession(_FakeProgrammingCardSession):
+        last = None
+
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+            self.aborted = False
+            self.final_text = "early-main-before-timeout"
+            type(self).last = self
+
+        def terminal_delivery_succeeded(self):
+            return False
+
+        def abort(self):
+            self.aborted = True
+
+    with _streaming_environment(_TranscriptTimeoutProgrammingCardSession):
+        handler.handle_response(
+            "msg-timeout",
+            "chat-1",
+            "hello",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    assert _TranscriptTimeoutProgrammingCardSession.last.aborted is True
+    handler.reply_text.assert_called_once()
+    fallback = handler.reply_text.call_args.args[1]
+    assert "early-main-before-timeout" in fallback
+    assert "stream deadline" in fallback

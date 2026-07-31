@@ -62,6 +62,7 @@ class SessionTimerManager:
         self._ttl_handle: TimerHandle | None = None
         self._ttl_prewarning_handle: TimerHandle | None = None
         self._retry_handle: TimerHandle | None = None
+        self._terminal_closed: bool = False
 
         # TTL retry counter (guards against infinite timer spawning)
         self._ttl_retry_count: int = 0
@@ -83,6 +84,8 @@ class SessionTimerManager:
         """Cancel existing TTL timer and schedule a new one (idle-timeout)."""
         scheduler = get_timer_scheduler()
         with self._timer_lock:
+            if self._terminal_closed:
+                return
             if self._ttl_handle is not None:
                 scheduler.cancel(self._ttl_handle)
             if self._ttl_prewarning_handle is not None:
@@ -107,10 +110,15 @@ class SessionTimerManager:
         """Schedule a retry for TTL expiry lock acquisition failure.
 
         Returns:
-            True if retry was scheduled, False if max retries exceeded.
+            True if handled (scheduled, or already terminal-fenced); False
+            only when an open session has exhausted its retry budget.
         """
         scheduler = get_timer_scheduler()
         with self._timer_lock:
+            # True means the request is fully handled.  A terminal-fenced
+            # manager needs no retry; False is reserved for retry exhaustion.
+            if self._terminal_closed:
+                return True
             self._ttl_retry_count += 1
             if self._ttl_retry_count > _MAX_TTL_RETRIES:
                 logger.warning(
@@ -132,6 +140,8 @@ class SessionTimerManager:
         """Schedule a terminal delivery retry timer."""
         scheduler = get_timer_scheduler()
         with self._timer_lock:
+            if self._terminal_closed:
+                return
             if self._retry_handle is not None:
                 scheduler.cancel(self._retry_handle)
             self._retry_handle = scheduler.schedule(
@@ -141,7 +151,10 @@ class SessionTimerManager:
     def schedule_immediate(self, callback: Callable[[], None]) -> None:
         """Schedule a callback to run immediately (delay=0) on the timer thread."""
         scheduler = get_timer_scheduler()
-        scheduler.schedule(0, callback, session_id=self._session_id)
+        with self._timer_lock:
+            if self._terminal_closed:
+                return
+            scheduler.schedule(0, callback, session_id=self._session_id)
 
     def cancel_all(self) -> None:
         """Cancel all active timers. Thread-safe via internal _timer_lock."""
@@ -156,3 +169,21 @@ class SessionTimerManager:
         for h in handles:
             if h is not None:
                 scheduler.cancel(h)
+
+    def close(self) -> None:
+        """Permanently fence scheduling and cancel every active timer."""
+        scheduler = get_timer_scheduler()
+        with self._timer_lock:
+            self._terminal_closed = True
+            handles = [
+                self._retry_handle,
+                self._ttl_handle,
+                self._ttl_prewarning_handle,
+            ]
+            self._retry_handle = None
+            self._ttl_handle = None
+            self._ttl_prewarning_handle = None
+
+        for handle in handles:
+            if handle is not None:
+                scheduler.cancel(handle)

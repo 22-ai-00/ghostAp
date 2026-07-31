@@ -1576,10 +1576,7 @@ class FeishuWSClient:
         # Authorization still precedes project/thread lookup, origin linking,
         # scheduler submission, image download, Shell, and all handlers.
         text = self._extract_text_from_message(data)
-        try:
-            command_match = SlashCommandParser.parse(text)
-        except Exception:
-            command_match = None
+        command_match = SlashCommandParser.parse(text)
         ingress_decision = self._decide_ingress_access(
             message_id=message_id,
             sender_id=_sender_id,

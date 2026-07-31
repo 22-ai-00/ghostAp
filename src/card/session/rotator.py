@@ -107,7 +107,13 @@ class SessionRotator:
             except Exception:
                 logger.warning("SessionRotator: retry dispatch failed (session may be closed), event dropped", exc_info=True)
 
-    def rotate(self, factory: Callable[[], "CardSession"]) -> "CardSession | None":
+    def rotate(
+        self,
+        factory: Callable[[], "CardSession"],
+        *,
+        enforce_max_rotations: bool = True,
+        archive_with_hint: bool = True,
+    ) -> "CardSession | None":
         """Atomically rotate to a new session.
 
         Strategy: pre-create outside lock → swap reference inside lock → archive old.
@@ -121,6 +127,12 @@ class SessionRotator:
 
         Args:
             factory: Callable that creates a new CardSession.
+            enforce_max_rotations: Apply the configured semantic rotation cap.
+                Capacity-driven continuation cards disable this limit because
+                retaining user-visible history is a correctness requirement.
+            archive_with_hint: Allow ARCHIVED reduction to append navigation
+                content blocks. Capacity rotations disable this when the old
+                card is already full.
 
         Returns:
             The new active session, or None if closed/failed.
@@ -131,7 +143,7 @@ class SessionRotator:
                 logger.debug("SessionRotator: rotate ignored after close")
                 return None
             max_rotations = get_settings().card.session_max_rotations
-            if self._rotation_count >= max_rotations:
+            if enforce_max_rotations and self._rotation_count >= max_rotations:
                 logger.warning(
                     "SessionRotator: max rotations reached (%d/%d), entering truncation mode — "
                     "no new session will be created",
@@ -207,6 +219,7 @@ class SessionRotator:
                 sequence=rotation_seq,
                 new_message_id=new_msg_id,
                 bridge_phrase=f"续接 #{rotation_seq + 1} ↓",
+                append_hint=archive_with_hint,
             ))
         except Exception:
             logger.warning(

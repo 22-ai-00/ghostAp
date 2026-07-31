@@ -977,6 +977,10 @@ class TestTerminalRetry:
 
         assert session.closed
         assert delivery.close_calls >= 1
+        assert session._timers._ttl_handle is None
+        assert session._timers._ttl_prewarning_handle is None
+        assert session._timers._retry_handle is None
+        assert not session._finalizer.alive
 
     def test_terminal_retry_failure_notifies(self):
         """AC24: retry also fails → notify_callback called, session closed."""
@@ -998,6 +1002,10 @@ class TestTerminalRetry:
         assert session.closed
         assert len(notify_calls) >= 1
         assert "任务已结束" in notify_calls[-1]
+        assert session._timers._ttl_handle is None
+        assert session._timers._ttl_prewarning_handle is None
+        assert session._timers._retry_handle is None
+        assert not session._finalizer.alive
 
 
 class TestRetryConcurrentClose:
@@ -1954,6 +1962,121 @@ class TestCloseDoesNotFireTerminalHooks:
         assert terminal_calls == ["completed"]  # Only once
 
 
+class TestTerminalResourceCleanup:
+    """Successful terminal delivery must release session-owned resources."""
+
+    def test_archived_delivery_cancels_timers_and_detaches_finalizer(self):
+        """A frozen continuation page must not stay retained by idle timers."""
+        client = MockDeliveryClient()
+        delivery = CardDelivery(client)
+        session = CardSession(
+            chat_id="chat_archived_cleanup",
+            config=SessionConfig(
+                metadata=CardMetadata(mode_name="Test"),
+                ttl_seconds=60.0,
+                warn_before_seconds=10.0,
+                sync_delivery=True,
+            ),
+            delivery=delivery,
+            session_id="archived_cleanup",
+        )
+
+        session.dispatch(CardEvent.started())
+        assert session._timers._ttl_handle is not None
+        assert session._timers._ttl_prewarning_handle is not None
+        assert session._finalizer.alive
+
+        session.dispatch(CardEvent.archived(summary="continued"))
+
+        assert session.closed
+        assert session._timers._ttl_handle is None
+        assert session._timers._ttl_prewarning_handle is None
+        assert session._timers._retry_handle is None
+        assert not session._finalizer.alive
+
+    def test_stale_idle_defer_cannot_rearm_timers_after_close(self):
+        """A prewarning callback delayed behind the session lock sees closure."""
+        client = MockDeliveryClient()
+        session = CardSession(
+            chat_id="chat_stale_defer",
+            config=SessionConfig(
+                metadata=CardMetadata(mode_name="Test"),
+                ttl_seconds=60.0,
+                warn_before_seconds=10.0,
+                sync_delivery=True,
+            ),
+            delivery=CardDelivery(client),
+            session_id="stale_defer_cleanup",
+        )
+        session._timers.cancel_all()
+        callback_started = threading.Event()
+
+        def stale_defer():
+            callback_started.set()
+            session._ttl_actuator.defer_idle_timeout(
+                session._ttl_handler.on_ttl_expired,
+                session._ttl_handler.on_ttl_prewarning,
+            )
+
+        with session._lock:
+            worker = threading.Thread(target=stale_defer)
+            worker.start()
+            assert callback_started.wait(timeout=1.0)
+            session._closed.set()
+        worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+        assert session._timers._ttl_handle is None
+        assert session._timers._ttl_prewarning_handle is None
+        session.release_terminal_resources()
+
+    def test_terminal_timer_fence_wins_after_defer_passes_closed_check(
+        self,
+        monkeypatch,
+    ):
+        """Terminal cleanup linearizes with a defer already entering reset."""
+        session = CardSession(
+            chat_id="chat_defer_interleave",
+            config=SessionConfig(
+                metadata=CardMetadata(mode_name="Test"),
+                ttl_seconds=60.0,
+                warn_before_seconds=10.0,
+                sync_delivery=True,
+            ),
+            delivery=CardDelivery(MockDeliveryClient()),
+            session_id="defer_interleave_cleanup",
+        )
+        session._timers.cancel_all()
+        entered_reset = threading.Event()
+        allow_reset = threading.Event()
+        original_reset = session._timers.reset_ttl_timer
+
+        def delayed_reset(*args, **kwargs):
+            entered_reset.set()
+            assert allow_reset.wait(timeout=1.0)
+            original_reset(*args, **kwargs)
+
+        monkeypatch.setattr(session._timers, "reset_ttl_timer", delayed_reset)
+        worker = threading.Thread(
+            target=lambda: session._ttl_actuator.defer_idle_timeout(
+                session._ttl_handler.on_ttl_expired,
+                session._ttl_handler.on_ttl_prewarning,
+            )
+        )
+        worker.start()
+        assert entered_reset.wait(timeout=1.0)
+
+        session._ttl_actuator.mark_closed()
+        session.release_terminal_resources()
+        allow_reset.set()
+        worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+        assert session._timers._ttl_handle is None
+        assert session._timers._ttl_prewarning_handle is None
+        assert session._timers._retry_handle is None
+
+
 # ==============================================================================
 # Task 6: max_failures_banner does not contain raw {timestamp}
 # ==============================================================================
@@ -2601,6 +2724,58 @@ class TestFinalizeTerminalCloseException:
         time.sleep(0.2)
         # on_terminal hook should still have been called
         assert hook.on_terminal.call_count == 1
+
+    def test_close_exception_still_releases_delivery_session_lock(self):
+        """Detaching the finalizer must retain its delivery-lock safety net."""
+        client = MockDeliveryClient()
+        delivery = CardDelivery(client)
+        session = CardSession(
+            chat_id="chat_close_lock",
+            config=SessionConfig(
+                metadata=CardMetadata(mode_name="Test", engine_type="deep"),
+                sync_delivery=True,
+            ),
+            delivery=delivery,
+            session_id="close_lock_sess",
+        )
+        session.dispatch(CardEvent.started())
+        assert delivery._lock_pool.contains("close_lock_sess")
+
+        with patch.object(delivery, "close", side_effect=RuntimeError("close boom")):
+            session.dispatch(CardEvent.completed())
+
+        assert session.closed
+        assert not delivery._lock_pool.contains("close_lock_sess")
+        assert not session._finalizer.alive
+
+    def test_lock_release_exception_keeps_finalizer_safety_net(self):
+        """Detach only after the explicit delivery-lock release succeeds."""
+        delivery = CardDelivery(MockDeliveryClient())
+        session = CardSession(
+            chat_id="chat_release_failure",
+            config=SessionConfig(
+                metadata=CardMetadata(mode_name="Test", engine_type="deep"),
+                sync_delivery=True,
+            ),
+            delivery=delivery,
+            session_id="release_failure_sess",
+        )
+        session.dispatch(CardEvent.started())
+
+        with (
+            patch.object(delivery, "close", side_effect=RuntimeError("close boom")),
+            patch.object(
+                delivery,
+                "release_session_lock",
+                side_effect=RuntimeError("release boom"),
+            ),
+        ):
+            session.dispatch(CardEvent.completed())
+
+        assert session.closed
+        assert session._finalizer.alive
+        session.release_terminal_resources()
+        assert not session._finalizer.alive
 
 
 # ---------------------------------------------------------------------------

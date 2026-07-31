@@ -268,6 +268,30 @@ class TestReduceLifecycle:
         assert new.terminal == "cancelled"
         assert new.buttons == ()
 
+    def test_archived_can_freeze_full_card_without_appending_content(self):
+        from src.card.state.models import TextBlock
+        from src.card.state.reducer import MAX_TOTAL_BLOCKS
+
+        state = _base_state(blocks=tuple(
+            TextBlock(block_id=f"history-{index}", content=str(index))
+            for index in range(MAX_TOTAL_BLOCKS)
+        ))
+
+        archived = reduce_lifecycle(
+            state,
+            CardEvent.archived(
+                sequence=1,
+                new_message_id="next-message",
+                append_hint=False,
+            ),
+        )
+
+        assert archived.metadata.frozen is True
+        assert len(archived.blocks) == MAX_TOTAL_BLOCKS
+        assert archived.blocks[0].block_id == "history-0"
+        assert not any(block.block_id == "_archived_hint" for block in archived.blocks)
+        assert archived.buttons[0].url.endswith("next-message")
+
     def test_unrelated_event_returns_state_unchanged(self):
         state = _base_state()
         event = CardEvent(type=CardEventType.TEXT_DELTA, payload={"block_id": "b", "text": "t"})
@@ -560,3 +584,89 @@ class TestSlidingWindowGating:
         new_state = reduce_card_state(state, event)
         completed = [b for b in new_state.blocks if b.kind == "tool_call" and b.status == "completed"]
         assert len(completed) <= MAX_COMPLETED_TOOL_BLOCKS
+
+
+class TestCardStateContinuationProjection:
+    def test_exact_total_block_boundary_does_not_rotate_early(self):
+        from src.card.state import reducer as reducer_module
+        from src.card.state.models import TextBlock
+
+        state = _base_state(blocks=tuple(
+            TextBlock(block_id=f"text-{index}", content=str(index))
+            for index in range(reducer_module.MAX_TOTAL_BLOCKS - 1)
+        ))
+
+        assert reducer_module.card_state_requires_continuation(
+            state,
+            CardEvent.text_started("exact-boundary"),
+        ) is False
+
+    def test_total_block_projection_detects_trim_without_mutating_state(self):
+        from src.card.state import reducer as reducer_module
+        from src.card.state.models import TextBlock
+
+        assert hasattr(reducer_module, "card_state_requires_continuation")
+        state = _base_state(blocks=tuple(
+            TextBlock(block_id=f"text-{index}", content=str(index))
+            for index in range(reducer_module.MAX_TOTAL_BLOCKS)
+        ))
+        original_blocks = state.blocks
+
+        requires_continuation = reducer_module.card_state_requires_continuation(
+            state,
+            CardEvent.text_started("overflow-text"),
+        )
+
+        assert requires_continuation is True
+        assert state.blocks is original_blocks
+        assert len(state.blocks) == reducer_module.MAX_TOTAL_BLOCKS
+
+    def test_completed_tool_projection_detects_fifty_first_completion(self):
+        from src.card.state import reducer as reducer_module
+        from src.card.state.models import ToolBlock
+
+        assert hasattr(reducer_module, "card_state_requires_continuation")
+        completed = tuple(
+            ToolBlock(
+                block_id=f"completed-{index}",
+                status="completed",
+                tool_name="read",
+            )
+            for index in range(reducer_module.MAX_COMPLETED_TOOL_BLOCKS)
+        )
+        active = ToolBlock(
+            block_id="active-tool",
+            status="active",
+            tool_name="read",
+        )
+        state = _base_state(blocks=completed + (active,))
+
+        assert reducer_module.card_state_requires_continuation(
+            state,
+            CardEvent.tool_done("active-tool", "done"),
+        ) is True
+        assert state.blocks[-1].status == "active"
+
+    def test_exact_completed_tool_boundary_does_not_rotate_early(self):
+        from src.card.state import reducer as reducer_module
+        from src.card.state.models import ToolBlock
+
+        completed = tuple(
+            ToolBlock(
+                block_id=f"completed-{index}",
+                status="completed",
+                tool_name="read",
+            )
+            for index in range(reducer_module.MAX_COMPLETED_TOOL_BLOCKS - 1)
+        )
+        active = ToolBlock(
+            block_id="active-tool",
+            status="active",
+            tool_name="read",
+        )
+        state = _base_state(blocks=completed + (active,))
+
+        assert reducer_module.card_state_requires_continuation(
+            state,
+            CardEvent.tool_done("active-tool", "done"),
+        ) is False

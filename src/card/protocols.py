@@ -67,7 +67,7 @@ class TTLState(NamedTuple):
 
 
 class TTLDecider(Protocol):
-    """Read-only state query interface for TTL decision-making.
+    """Session interface for TTL decisions and terminal resource cleanup.
 
     TTLHandler uses this to inspect session state without modifying it.
     """
@@ -90,6 +90,10 @@ class TTLDecider(Protocol):
         """User-facing engine display name (e.g. 'Deep')."""
         ...
 
+    def release_terminal_resources(self) -> None:
+        """Cancel timers and detach the completed session's GC finalizer."""
+        ...
+
 
 class TTLActuator(Protocol):
     """Combined TTL actuator protocol for TTL lifecycle management.
@@ -110,7 +114,7 @@ class TTLActuator(Protocol):
         ...
 
     def mark_closed(self) -> None:
-        """Mark the session as closed (under lock)."""
+        """Mark the session closed without waiting on the state lock."""
         ...
 
     def force_terminate(self, reason: str) -> None:
@@ -166,7 +170,7 @@ class TTLActuator(Protocol):
         ...
 
     def schedule_ttl_retry(self, callback: Callable[[], None]) -> bool:
-        """Schedule a TTL retry timer. Returns False if max retries exceeded."""
+        """Handle a TTL retry; False only means an open session exhausted it."""
         ...
 
     def cancel_timers(self) -> None:

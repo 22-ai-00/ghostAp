@@ -382,6 +382,7 @@ class TestScheduleTerminalRetry:
         s.force_deliver.assert_called_once_with(rendered)
         s.fire_terminal_hook.assert_called_once_with("completed")
         s.close_delivery.assert_called_once()
+        s.release_terminal_resources.assert_called_once()
 
     def test_retry_callback_notifies_on_failure(self):
         """When retry delivery fails, notify_user is called with fallback message."""
@@ -401,6 +402,7 @@ class TestScheduleTerminalRetry:
         s.notify_user.assert_called_once()
         assert "任务已结束" in s.notify_user.call_args[0][0]
         s.close_delivery.assert_called_once()
+        s.release_terminal_resources.assert_called_once()
 
     def test_retry_callback_skips_when_closed(self):
         """When session is already closed at retry time, callback is a no-op."""
@@ -421,23 +423,52 @@ class TestScheduleTerminalRetry:
         s.force_deliver.assert_not_called()
         s.fire_terminal_hook.assert_not_called()
 
-    def test_terminal_retry_state_none(self):
-        """When get_ttl_state() returns None during retry, callback returns without crashing."""
+    def test_terminal_retry_lock_contention_recovers_on_bounded_retry(self):
+        """One contended state read is rescheduled and can still deliver."""
         s = _make_mock_session()
         handler = TTLHandler(decider=s, actuator=s)
 
         handler.schedule_terminal_retry([{"card": "data"}])
         retry_callback = s.schedule_retry.call_args[0][0]
+        s.get_ttl_state.side_effect = [
+            None,
+            TTLState(
+                closed=False,
+                ttl_warned=True,
+                idle_seconds=2000.0,
+                ttl_seconds=1800.0,
+                session_id="test",
+                state_snapshot=None,
+            ),
+        ]
 
-        # Simulate lock contention: get_ttl_state returns None
-        s.get_ttl_state.return_value = None
-
-        # Should not raise AttributeError
         retry_callback()
+        assert s.schedule_retry.call_count == 2
+        rescheduled_callback = s.schedule_retry.call_args[0][0]
+        rescheduled_callback()
+
+        s.force_deliver.assert_called_once_with([{"card": "data"}])
+        s.mark_closed.assert_called_once()
+        s.close_delivery.assert_called_once()
+        s.release_terminal_resources.assert_called_once()
+
+    def test_terminal_retry_lock_contention_exhaustion_fails_closed(self):
+        """Persistent state-lock contention closes and notifies after the bound."""
+        s = _make_mock_session()
+        s.get_ttl_state.return_value = None
+        handler = TTLHandler(decider=s, actuator=s)
+
+        handler.schedule_terminal_retry([{"card": "data"}])
+        for _ in range(handler._MAX_TERMINAL_STATE_RETRIES + 1):
+            retry_callback = s.schedule_retry.call_args[0][0]
+            retry_callback()
 
         s.force_deliver.assert_not_called()
         s.fire_terminal_hook.assert_not_called()
-        s.close_delivery.assert_not_called()
+        s.mark_closed.assert_called_once()
+        s.notify_user.assert_called_once()
+        s.close_delivery.assert_called_once()
+        s.release_terminal_resources.assert_called_once()
 
     def test_terminal_retry_closure_captures_rendered_immutably(self):
         """The retry closure should use the rendered list captured at schedule time,
@@ -496,4 +527,5 @@ class TestScheduleTerminalRetry:
         # Should still call mark_closed and close_delivery even on failure
         s.mark_closed.assert_called_once()
         s.close_delivery.assert_called_once()
+        s.release_terminal_resources.assert_called_once()
         s.notify_user.assert_called_once()

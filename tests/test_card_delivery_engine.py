@@ -714,6 +714,30 @@ class TestClose:
         outcomes = delivery.deliver("sess_1", "chat_abc", r1)
         assert outcomes == []
 
+    def test_close_releases_session_lock_when_binding_cleanup_raises(self):
+        """The delivery lock is released even if internal cleanup fails."""
+        delivery = CardDelivery(MockCardClient())
+        rendered = [
+            RenderedCard(
+                _card_json={},
+                structure_signature="sig_close_failure",
+                page_index=0,
+                total_pages=1,
+            )
+        ]
+        delivery.deliver("sess_close_failure", "chat_abc", rendered)
+        assert delivery._lock_pool.contains("sess_close_failure")
+
+        with patch.object(
+            delivery._bindings,
+            "remove",
+            side_effect=RuntimeError("binding cleanup failed"),
+        ):
+            with pytest.raises(RuntimeError, match="binding cleanup failed"):
+                delivery.close("sess_close_failure")
+
+        assert not delivery._lock_pool.contains("sess_close_failure")
+
 
 class TestTransportError:
     def test_transport_error_returns_reconcile(self):

@@ -61,7 +61,7 @@ class AdminBootstrapService:
     again before rate limiting or touching persistence.
     """
 
-    _global_lock = threading.Lock()  # leaf lock: never acquire LockLevel locks here
+    _global_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
     _last_attempt: dict[str, float] = {}
 
     def __init__(

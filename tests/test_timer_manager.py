@@ -49,6 +49,28 @@ class TestTimerManagerBasic:
         assert not mgr._retry_handle.cancelled
         mgr.cancel_all()
 
+    def test_terminal_close_permanently_fences_all_future_scheduling(self):
+        """Terminal cleanup cannot be undone by a stale callback."""
+        mgr = SessionTimerManager(
+            session_id="terminal-fence",
+            ttl_seconds=10.0,
+            retry_delay=0.5,
+        )
+        mgr.reset_ttl_timer(MagicMock(), MagicMock())
+        mgr.schedule_retry(MagicMock())
+
+        mgr.close()
+        mgr.reset_ttl_timer(MagicMock(), MagicMock())
+        ttl_retry_handled = mgr.schedule_ttl_retry(MagicMock())
+        mgr.schedule_retry(MagicMock())
+
+        # True means handled: after terminal close no retry is needed, while
+        # False remains reserved for an open session exhausting its retry cap.
+        assert ttl_retry_handled is True
+        assert mgr._ttl_handle is None
+        assert mgr._ttl_prewarning_handle is None
+        assert mgr._retry_handle is None
+
 
 class TestTTLRetry:
     """TTL retry scheduling logic."""
