@@ -1746,23 +1746,9 @@ class FeishuWSClient:
     @staticmethod
     def _is_programming_entry_command(text: str) -> bool:
         """是否为编程模式初始化命令（用于与 /spec 串行化控制面执行）。"""
-        text_lower = (text or "").strip().lower()
-        return text_lower in {
-            "/coco",
-            "/enter_coco",
-            "/claude",
-            "/enter_claude",
-            "/aiden",
-            "/enter_aiden",
-            "/codex",
-            "/enter_codex",
-            "/gemini",
-            "/enter_gemini",
-            "/traex",
-            "/enter_traex",
-            "/ttadk",
-            "/acp",
-        }
+        from .product_catalog import is_programming_entry_command
+
+        return is_programming_entry_command(text)
 
     def _build_control_queue_key(self, *, chat_id: str, project_id: Optional[str], text: str) -> Optional[str]:
         """为编程初始化与 spec 命令构造串行控制队列 key。"""
@@ -2333,17 +2319,9 @@ class FeishuWSClient:
                     chat_type=chat_type,
                 )
                 return
-            normalized_entry = (text or "").strip().lower()
-            same_mode_entries = {
-                "coco": {"/coco", "/enter_coco"},
-                "claude": {"/claude", "/enter_claude"},
-                "aiden": {"/aiden", "/enter_aiden"},
-                "codex": {"/codex", "/enter_codex"},
-                "gemini": {"/gemini", "/enter_gemini"},
-                "traex": {"/traex", "/enter_traex"},
-                "ttadk": {"/ttadk", "/acp"},
-            }
-            if normalized_entry in same_mode_entries.get(auto_enter_mode, set()):
+            from .product_catalog import is_same_programming_mode_entry
+
+            if is_same_programming_mode_entry(auto_enter_mode, text):
                 self._reply_text(
                     message_id,
                     UI_TEXT["ws_topic_hint_msg"],

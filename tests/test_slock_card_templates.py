@@ -465,7 +465,7 @@ class TestBuildWelcomeCard:
         blob = json.dumps(card, ensure_ascii=False)
         assert "/hire" in blob
         assert "/role add" in blob
-        assert "/goal" in blob
+        assert "/goal" not in blob
         assert "/slock status" in blob
         assert "/role list" in blob
 

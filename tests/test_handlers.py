@@ -540,7 +540,10 @@ class TestSystemHandlerRouting:
         assert "已退役" in response
         assert "未执行" in response
         assert "Slock" in response
-        assert "/goal" in response
+        assert "/goal" not in response
+        assert "/task" in response
+        if text.startswith("/goal "):
+            assert "/task refactor auth" in response
         h.reply_card.assert_not_called()
 
     @patch("src.thread.get_current_thread_id", return_value=None)

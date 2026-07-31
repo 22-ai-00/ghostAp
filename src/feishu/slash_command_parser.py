@@ -14,12 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-_ALIAS_TO_CANONICAL: dict[str, str] = {
-    # Worktree aliases
-    "/wt": "/worktree",
-    # Keep canonical itself mapped to itself (explicit for readability)
-    "/worktree": "/worktree",
-}
+from .product_catalog import resolve_command
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +64,12 @@ class SlashCommandParser:
         args = parts[1].strip() if len(parts) > 1 else ""
 
         raw_cmd = token.lower()
-        canonical = _ALIAS_TO_CANONICAL.get(raw_cmd, raw_cmd)
+        resolved = resolve_command(raw_cmd, args)
+        canonical = (
+            resolved.rewritten_command
+            if resolved and resolved.rewritten_command
+            else raw_cmd
+        )
 
         return CommandMatch(
             raw_text=raw,

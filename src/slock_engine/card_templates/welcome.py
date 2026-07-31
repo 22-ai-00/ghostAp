@@ -19,7 +19,7 @@ def build_welcome_card(*, team_name: str) -> dict:
         "• `/hire <名字>` — 雇佣新员工（选工具+模型）\n"
         "• `/role add` — 添加已有员工到本群\n"
         "• `/role list` — 查看群内员工\n"
-        "• `/goal <描述>` — 创建自主目标\n"
+        "• 直接发送任务描述 — 创建团队任务\n"
         "• 直接 @员工名 发消息 — 指定员工执行任务\n\n"
         "**管理命令:**\n"
         "`/role remove <名字>` · `/task status` · `/slock status` · `/team dissolve`"

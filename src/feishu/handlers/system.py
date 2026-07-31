@@ -23,6 +23,7 @@ from ...tasking import TaskPriority, TaskSpec
 from ...utils.errors import safe_error_message
 from ..emoji import EmojiReaction
 from ..message_formatter import FeishuMessageFormatter as fmt
+from ..product_catalog import retired_command_tokens
 from ..slash_command_parser import CommandMatch, SlashCommandParser
 from .base import BaseHandler
 from .lock_commands import LockCommandsMixin
@@ -54,15 +55,7 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
     # Standalone v5 Manager was superseded by the Journal-backed employee/Slock
     # runtime. Keep its old spellings fail-closed with an explicit migration
     # message instead of reviving the obsolete process-local command surface.
-    _RETIRED_AUTONOMOUS_MANAGER_COMMANDS = frozenset({
-        "/goal",
-        "/goals",
-        "/run",
-        "/runs",
-        "/approve",
-        "/approvals",
-        "/decisions",
-    })
+    _RETIRED_AUTONOMOUS_MANAGER_COMMANDS = retired_command_tokens()
 
     def __init__(self, ctx: "HandlerContext") -> None:
         super().__init__(ctx)
@@ -535,7 +528,13 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         project: "Optional[ProjectContext]" = None,
     ) -> None:
         """Fail closed for the retired standalone Autonomous Manager surface."""
-        del chat_id, m, project
+        del chat_id, project
+        if m.command == "/goal" and m.args:
+            self.reply_text(
+                message_id,
+                UI_TEXT["system_autonomous_manager_retired_goal"].format(task=m.args),
+            )
+            return
         self.reply_text(message_id, UI_TEXT["system_autonomous_manager_retired"])
 
     def _handle_setadmin_command(self, message_id: str, chat_id: str, args: str = "") -> None:

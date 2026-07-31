@@ -119,10 +119,10 @@ class TestWelcomeCardCommands:
         content = self._get_markdown_content(card)
         assert "/slock status" in content
 
-    def test_has_goal_command(self):
+    def test_does_not_advertise_retired_goal_command(self):
         card = build_welcome_card(team_name="Alpha")
         content = self._get_markdown_content(card)
-        assert "/goal" in content
+        assert "/goal" not in content
 
     def test_has_role_list_command(self):
         """AC: welcome card includes /role list command."""

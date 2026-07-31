@@ -78,7 +78,11 @@ UI_TEXT = {
     "system_help_project_section": "\n\n📋 **项目管理命令**\n• `/projects` - 查看项目看板\n• `/new 名称 路径` - 创建新项目\n• `/switch 名称` - 切换项目\n• `/status` - 查看所有引擎任务状态（Deep/Spec）\n• `/status <task_id>` - 查看指定任务详情\n• `/diff` - 查看最近两次版本变更（Diff 报告）",
     "system_autonomous_manager_retired": (
         "⚠️ 独立 Autonomous Manager 命令面已退役，本次命令未执行。"
-        "请在 Slock 团队群使用 `/goal <描述>`；团队与任务状态使用 `/slock status`、`/task status`。"
+        "请在 Slock 团队群使用 `/task <描述>`；团队与任务状态使用 `/slock status`、`/task status`。"
+    ),
+    "system_autonomous_manager_retired_goal": (
+        "⚠️ 独立 Autonomous Manager 命令面已退役；原命令未执行。"
+        "请在 Slock 团队群改用 `/task {task}` 创建团队任务。"
     ),
     "system_new_project_usage": "用法: `/new 项目名 [路径]`",
     "system_close_project_usage": "用法: `/close <项目名>`\n例如: `/close myApp`",

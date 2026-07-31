@@ -116,7 +116,7 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 | F6 群上下文作用域 | missing | folded → 0.10/D4 | ACTIVE managed group + project/thread scope + secret 过滤 |
 | F7 topic/mode 转换 | partial | active → CP-P0 | 编程入口优先、完整别名、stale callback revision |
 | F8 onboarding 真相 | missing | active → 0.1/E5 | 文案/命令迁移，无退休入口漂移 |
-| F9 ProductAction catalog | missing | folded → 0.1 | 单一 catalog、Owner surface |
+| F9 ProductAction catalog | complete | folded → 0.1 | `src/feishu/product_catalog.py` 提供单一 Owner 执行通道事实源 |
 | F10 菜单/帮助 | missing | folded → 0.1 | trust zone/project 信息；删除角色权限矩阵 |
 | F11 EffectiveContext | partial | folded → 0.8/0.10 | trust 解析一次、immutable context、dispatch 静默 revision check |
 | F12 RouteDecision/Executor | partial | folded → 0.8/0.10 | deep-freeze、reason enum、唯一副作用执行器 |
@@ -137,7 +137,7 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 
 | Task | 状态 | 处置 | 硬验收 |
 | --- | --- | --- | --- |
-| 0.1 执行通道产品合同 | missing | active | maturity/health/visibility；managed group 可见且零提示 |
+| 0.1 执行通道产品合同 | complete | evidence-only | maturity/health/visibility；Owner 无完成度门禁，显式保护命令不被 Slock 截获 |
 | 0.2 Direct 纵向合同 | missing | active | 单目标 prompt、零 planner hop、真实 cancel/retry/session |
 | 0.3 Claude CLI 模型真实性 | partial | active | argv/env 真正绑定 model/1M；失败不污染选择 |
 | 0.4 Workflow binding/reviewer | complete (`ffeb2e82`) | evidence-only | immutable RunSpec、真实 binding/reviewer；Workflow 全集 945 passed |
@@ -149,6 +149,27 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 | 0.10 ingress/callback cutover | missing | active | trust 早于业务副作用；managed group 零 enrollment；external 零副作用 |
 
 CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
+
+### Task 0.1 evidence
+
+- Production wiring: `src/feishu/product_catalog.py` defines the only local
+  execution-lane completion/health metadata; the `/menu` card renders its
+  Owner surface; `src/feishu/dispatcher.py` uses the protected-command
+  projection before Slock handling; both Slock welcome templates no longer
+  advertise retired `/goal`.
+- TDD RED: `uv run pytest tests/test_product_action_catalog.py -q` produced
+  `1 failed, 5 passed`; the expected failure showed Slock detection captured
+  explicit `/codex` instead of calling the system route.
+- GREEN: the focused catalog contract was `7 passed`; adjacent menu, catalog,
+  welcome-card, WebSocket routing, and document regressions were `150 passed`.
+  Touched-file Ruff and `git diff --check` passed.
+- The completion label only annotates product support.  All implemented lane
+  entries remain Owner-visible and directly accessible; no allowlist, rollout,
+  approval, sandbox, or release-state gate was added.
+- Real Feishu/manual evidence: `not_tested`.  No local test result is recorded
+  as a tenant or manual delivery pass.  This task does not change recovery,
+  cancel, unknown-effect, or permission-prompt behavior; their runtime/manual
+  evidence remains outside this narrow catalog task.
 
 ## Phase A disposition
 

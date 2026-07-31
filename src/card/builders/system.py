@@ -1852,6 +1852,9 @@ class SystemBuilder:
     @staticmethod
     def build_command_menu_card(project: Optional[ProjectContext] = None) -> tuple[str, str]:
         """Build a mobile-friendly command menu card."""
+        # Local import preserves the card -> Feishu initialization boundary.
+        from src.feishu.product_catalog import format_owner_execution_lane_summary
+
         project_id = project.project_id if project else None
 
         buttons = [
@@ -1915,6 +1918,24 @@ class SystemBuilder:
             CoreBuilder._build_directory_element(project),
             {"tag": "hr"},
             {"tag": "markdown", "content": UI_TEXT["system_menu_header"]},
+            {
+                "tag": "collapsible_panel",
+                "expanded": False,
+                "header": {
+                    "title": {
+                        "tag": "markdown",
+                        "content": "**执行通道与完成度**",
+                    },
+                    "vertical_align": "center",
+                },
+                "border": {"color": "grey", "corner_radius": PANEL_STYLES["corner_radius"]},
+                "vertical_spacing": PANEL_STYLES["vertical_spacing"],
+                "padding": PANEL_STYLES["padding_standard"],
+                "elements": [{
+                    "tag": "markdown",
+                    "content": format_owner_execution_lane_summary(),
+                }],
+            },
         ]
         elements.extend(build_responsive_layout(card_buttons))
 

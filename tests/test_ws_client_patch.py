@@ -1324,6 +1324,49 @@ class TestThreadPersistentProgramming(unittest.TestCase):
 
         client._exit_current_mode.assert_called_once()
 
+    def test_same_mode_topic_entries_use_the_catalog_identity(self):
+        """Live same-mode replies must not fall through generic entry routing."""
+        cases = (
+            ("coco", "/coco"),
+            ("coco", "/enter_coco"),
+            ("claude", "/claude"),
+            ("claude", "/enter_claude"),
+            ("aiden", "/aiden"),
+            ("aiden", "/enter_aiden"),
+            ("codex", "/codex"),
+            ("codex", "/enter_codex"),
+            ("gemini", "/gemini"),
+            ("gemini", "/enter_gemini"),
+            ("traex", "/traex"),
+            ("traex", "/enter_traex"),
+            ("ttadk", "/ttadk"),
+            ("ttadk", "/enter_ttadk"),
+            ("ttadk", "/acp"),
+            ("tui2acp", "/tui2acp"),
+            ("tui2acp", "/enter_tui2acp"),
+        )
+        for mode, command in cases:
+            with self.subTest(mode=mode, command=command):
+                client = self._make_client()
+                client._reply_text = MagicMock()
+                client._process_with_intent = MagicMock()
+                client._is_interceptable_command_match = MagicMock(return_value=False)
+                client._is_programming_entry_command = MagicMock(return_value=True)
+                client._reply_if_topic_engine_switch_blocked = MagicMock(return_value=False)
+
+                client._dispatch_message_logic(
+                    "m_same_mode",
+                    "c1",
+                    command,
+                    MagicMock(),
+                    auto_enter_mode=mode,
+                    command_match=SlashCommandParser.parse(command),
+                )
+
+                client._reply_text.assert_called_once()
+                client._is_programming_entry_command.assert_not_called()
+                client._process_with_intent.assert_not_called()
+
     def test_dispatch_message_logic_all_modes_skip_enter(self):
         client = self._make_client()
         client._add_reaction = MagicMock()

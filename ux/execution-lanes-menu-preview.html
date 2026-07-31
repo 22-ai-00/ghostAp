@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>GhostAP execution lanes menu preview</title>
+<style>
+  body { background: #f5f7fa; color: #1f2329; font: 15px/1.5 -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 32px; }
+  .card { background: #fff; border-radius: 12px; box-shadow: 0 3px 12px #1f23291a; margin: auto; max-width: 640px; overflow: hidden; }
+  h1 { background: #3370ff; color: #fff; font-size: 18px; margin: 0; padding: 16px 20px; }
+  .body { padding: 20px; }
+  .panel { border: 1px solid #d0d3d6; border-radius: 8px; margin-top: 16px; padding: 14px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  ul { margin: 0; padding-left: 20px; }
+  li { margin: 8px 0; }
+  code { background: #f2f3f5; border-radius: 3px; padding: 1px 4px; }
+  .gap { color: #646a73; font-size: 13px; margin-left: 4px; }
+</style>
+<main class="card">
+  <h1>📱 快捷菜单</h1>
+  <section class="body">
+    <strong>📱 常用指令菜单</strong>
+    <section class="panel">
+      <h2>执行通道（完成度不影响 Owner 访问）</h2>
+      <ul>
+        <li><strong>Direct 编程</strong> <code>/acp · /coco · /claude · /aiden · /codex · /gemini · /traex · /ttadk · /tui2acp</code> · mature · available</li>
+        <li><strong>Deep</strong> <code>/deep</code> · mature · available</li>
+        <li><strong>Spec</strong> <code>/spec</code> · mature · available</li>
+        <li><strong>Worktree</strong> <code>/worktree · /wt</code> · developing · available<br><span class="gap">当前缺口：统一 Worktree adapter 合同尚未完成；当前入口仍按既有终态与评审门禁执行。</span></li>
+        <li><strong>Workflow</strong> <code>/wf · /workflow</code> · developing · available<br><span class="gap">当前缺口：冻结 IR v2 与耐久执行端口尚未完成；当前 Workflow 保持既有 RunSpec 与 reviewer 合同。</span></li>
+        <li><strong>Team</strong> <code>/team · /new-team</code> · developing · available<br><span class="gap">当前缺口：Team 的统一耐久任务图尚未收敛；当前群协作入口仍按现有员工运行时执行。</span></li>
+        <li><strong>Slock</strong> <code>/slock</code> · developing · available<br><span class="gap">当前缺口：Slock 尚未收敛到唯一执行事实源；当前命令和卡片动作继续保持兼容。</span></li>
+      </ul>
+    </section>
+  </section>
+</main>

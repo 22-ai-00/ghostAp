@@ -16,6 +16,7 @@ from ..slock_engine.gateway import NEEDS_ACTIVATION
 from ..utils.errors import get_error_detail
 from .emoji import EmojiReaction
 from .message_formatter import FeishuMessageFormatter as fmt
+from .product_catalog import is_explicit_protected_command
 from .request_context import RequestContext
 from .route_decision import CommandRouter, RouteDecision, RouteTarget
 from .slash_command_parser import CommandMatch
@@ -195,13 +196,24 @@ class MessageDispatcher:
                         self.client._workflow_handler.handle_message(message_id, chat_id, text, project)
                         return
 
-        _slock_result = self.client._is_slock_command(text, chat_id)
-        if _slock_result:
+        # Protected explicit entries are routed before any Slock detection.
+        # This is intentionally independent from catalog completion labels.
+        _is_protected_explicit_command = is_explicit_protected_command(text)
+        _slock_result = (
+            False
+            if _is_protected_explicit_command
+            else self.client._is_slock_command(text, chat_id)
+        )
+        if _slock_result and not _is_protected_explicit_command:
             self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
             self.client._add_reaction(message_id, EmojiReaction.on_processing())
             self.client._handle_slock_command(message_id, chat_id, text, project)
             return
-        if _slock_result == NEEDS_ACTIVATION and slock_context_allowed:
+        if (
+            _slock_result == NEEDS_ACTIVATION
+            and slock_context_allowed
+            and not _is_protected_explicit_command
+        ):
             self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
             # In passive mode, auto-activate instead of asking user to run /slock
             _passive_mode = getattr(self.client.settings, "slock_passive_mode", True)

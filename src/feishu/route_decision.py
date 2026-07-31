@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+from .product_catalog import is_programming_entry_command
+
 
 class RouteTarget(str, Enum):
     """All possible message routing destinations."""
@@ -78,10 +80,4 @@ class CommandRouter:
 
     @staticmethod
     def is_programming_entry(text: str) -> bool:
-        normalized = (text or "").strip().lower()
-        entry_commands = {
-            "/coco", "/claude", "/aiden", "/codex", "/gemini", "/traex",
-            "/enter_coco", "/enter_claude", "/enter_aiden", "/enter_codex",
-            "/enter_gemini", "/enter_traex",
-        }
-        return normalized in entry_commands
+        return is_programming_entry_command(text)
