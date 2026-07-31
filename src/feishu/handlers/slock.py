@@ -1956,6 +1956,24 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         # Step 1: Create Feishu group
         lark_client = LarkChatClient(api_client_factory=self.ctx.api_client_factory)
         if recovered_chat_id is not None:
+            from ...project_chat.lark_chat_client import ManagedChatValidation
+
+            validation = lark_client.validate_managed_chat(
+                recovered_chat_id,
+                self._managed_group_owner_id(),
+            )
+            if validation is not ManagedChatValidation.VALID:
+                manager.block_team_name_for_cleanup(
+                    name,
+                    recovered_chat_id,
+                    "recovered_chat_invalid",
+                )
+                self.reply_text(
+                    message_id,
+                    "⚠️ 无法确认重试群仍存在且 Owner/接收 Bot 均在群内，已停止激活。",
+                )
+                manager.release_team_name(name)
+                return
             new_chat_id = recovered_chat_id
         else:
             if managed_groups is not None and not managed_groups.prepare_create_dispatch(
@@ -2376,13 +2394,14 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 target_chat_id,
                 redact_sensitive(str(e)),
             )
-            cancelled = _cancel_revoke()
+            marker_restored = bool(getattr(e, "restored", True))
+            cancelled = _cancel_revoke() if marker_restored else False
             self.reply_text(
                 message_id,
                 (
                     f"❌ 团队 **{team_name}** 未解散：本地状态归档失败，撤销意图已取消，请重试。"
                     if cancelled
-                    else f"⚠️ 团队 **{team_name}** 未解散，但撤销取消无法持久化；该群保持失败关闭，请人工检查。"
+                    else f"⚠️ 团队 **{team_name}** 未解散，但 active marker 恢复或撤销取消失败；该群保持失败关闭，请人工检查。"
                 ),
             )
             return

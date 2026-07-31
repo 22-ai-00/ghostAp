@@ -338,6 +338,9 @@ class ProjectHandler(BaseHandler):
                     target_chat_id,
                     created_at=now.timestamp(),
                     operation_id=provision_id,
+                    expected_origin=ManagedGroupOrigin.OWNER_ADOPTED,
+                    expected_owner_id=owner_id,
+                    expected_receiving_bot_ref=receiving_bot_ref,
                 )
             )
             if not bound or binding_snapshot is None:
@@ -357,9 +360,12 @@ class ProjectHandler(BaseHandler):
                 )
                 return
         except Exception as exc:
+            from ...project.manager import ProjectCommitUncertainError
             from ...trust.registry import RegistryCommitUncertainError
 
-            if isinstance(exc, RegistryCommitUncertainError) and exc.committed:
+            if isinstance(
+                exc, (RegistryCommitUncertainError, ProjectCommitUncertainError)
+            ) and exc.committed:
                 logger.error(
                     "managed group adoption commit uncertain chat=%s; "
                     "preserving durable project binding",
@@ -373,10 +379,8 @@ class ProjectHandler(BaseHandler):
             logger.exception("managed group adoption failed chat=%s", target_chat_id)
             restored = True
             if binding_snapshot is not None:
-                restored = self.project_manager.restore_managed_chat_binding(
-                    project.project_id,
-                    binding_snapshot,
-                    operation_id=provision_id,
+                restored = self.project_manager.restore_managed_chat_binding_saga(
+                    provision_id
                 )
             if restored:
                 try:

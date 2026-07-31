@@ -25,6 +25,14 @@ class SlockEngineResolutionError(RuntimeError):
     """Activated Slock identity is absent, ambiguous, or mismatched."""
 
 
+class MarkerArchiveError(OSError):
+    """Marker rename durability failed; ``restored`` controls revoke cancel."""
+
+    def __init__(self, message: str, *, restored: bool) -> None:
+        super().__init__(message)
+        self.restored = restored
+
+
 @dataclass(frozen=True, slots=True)
 class ActivatedSlockBinding:
     engine_identity: str
@@ -133,20 +141,16 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
             "created_at_ns": time.time_ns(),
         }
         try:
+            records_dir_existed = os.path.isdir(records_dir)
             os.makedirs(records_dir, mode=0o700, exist_ok=True)
+            if not records_dir_existed:
+                self._fsync_directory(self._storage_base_path)
             with open(temp_path, "w", encoding="utf-8") as handle:
                 json.dump(record, handle, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, record_path)
-            directory_fd = os.open(
-                records_dir,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            self._fsync_directory(records_dir)
             return True
         except OSError:
             logger.exception(
@@ -213,7 +217,23 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
             f".slock_channel.dissolved.{time.time_ns()}.json",
         )
         os.replace(marker_path, archived_path)
-        self._fsync_directory(group_dir)
+        try:
+            self._fsync_directory(group_dir)
+        except OSError as archive_error:
+            restored = False
+            try:
+                os.replace(archived_path, marker_path)
+                self._fsync_directory(group_dir)
+                restored = True
+            except OSError:
+                logger.exception(
+                    "failed to restore marker after archive durability error chat=%s",
+                    chat_id,
+                )
+            raise MarkerArchiveError(
+                str(archive_error),
+                restored=restored,
+            ) from archive_error
         return archived_path
 
     def prepare_revoke_marker(self, chat_id: str) -> RevokeMarkerDisposition:

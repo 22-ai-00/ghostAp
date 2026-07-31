@@ -371,6 +371,15 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   and Slock supporting stores expose parent-directory durability failures.
   AMBIGUOUS Owner notification is at-least-once, not exactly-once. Employee
   principal rotation remains the same production model blocker.
+- Fourth review: Project binding uses a project-scoped generation CAS and one
+  durable create+bind+saga snapshot; `/new-chat` serializes by canonical root,
+  remotely revalidates recovered chats, and guards every compensation delete.
+  Startup compares origin/Owner/receiving-Bot/grant facts and excludes pending
+  sagas from legacy migration. Slock restores a marker before canceling revoke
+  after archive-fsync failure. This covers a single GhostAP primary process and
+  restart replay, not distributed multi-process ProjectManager transactions.
+  Employee principal rotation remains the same model blocker; Task 0.10 is
+  still `missing`.
 - Managed permission prompts remain a Task 0.8 matrix property with
   `permission_prompt_count(managed project task) = 0`; Task 0.9 adds no
   approval/tenant ACL. Real Feishu membership/receiving-bot validation,

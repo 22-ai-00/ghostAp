@@ -247,3 +247,54 @@ than being guessed from membership events.
   result is not represented as verification of this new diff.
 - The warnings remain the existing pinned Lark SDK Python 3.13 deprecations.
 - Real Feishu tenant/mobile execution remains `not_tested`.
+
+## Fourth review correction
+
+- The Project binding saga is now a project-scoped compare-and-swap. It
+  persists the complete expected post-bind snapshot plus a monotonic binding
+  generation and the expected Registry origin/Owner/receiving-Bot/root facts.
+  A second saga for the same project is rejected. Complete, restore, and
+  removal-aware compensation first verify the expected state; a mismatch
+  preserves the newer project, retains the saga, and quarantines both relevant
+  chat bindings.
+- New-project creation, managed-chat binding, and the removal-aware saga now
+  share one Project snapshot write. Project snapshot replace followed by a
+  parent-fsync error uses target readback and reports typed committed
+  uncertainty, so callers preserve the Project and remote chat rather than
+  rolling back memory and deleting a possibly committed group.
+- `/new-chat` serializes by canonical root instead of source chat. Retry paths
+  reread state under that lock. Remote deletion is guarded by raw ACTIVE
+  Registry state, other provision bindings, and pending sagas; every rejected,
+  unknown, or guarded deletion writes a durable residual. Recovered Project
+  and Team chats are remotely revalidated before activation.
+- Startup consumes saga origin instead of merely loading it. ACTIVE completion
+  compares Project/root/origin/Owner/receiving Bot and the empty creation grant;
+  provision continuation compares the corresponding intent facts. Mismatched
+  ACTIVE records stay quarantined and pending sagas are excluded from legacy
+  migration. The runtime already-ACTIVE path also finalizes a matching saga and
+  reports a retryable fail-closed result if local finalization fails.
+- Slock marker archive now compensates a rename when its parent fsync fails.
+  Revoke cancellation is permitted only after that marker is restored; failed
+  restoration leaves the revoke pending. The first `pending_cleanup`
+  directory creation fsyncs the storage-base parent before residual records are
+  accepted.
+
+### Fourth-correction boundary and verification
+
+- Deployment boundary: one GhostAP primary process/single writer. In-process
+  races and restart replay are covered; a distributed ProjectManager
+  reload-before-mutate protocol across multiple GhostAP processes is explicitly
+  out of scope for this personal deployment.
+- Initial focused RED: `11 failed`; the additional Team recovered-chat RED and
+  the two rejected/unknown activation-delete residual parameters were also
+  observed before their implementations. Focused GREEN: `11 passed`, the Team
+  case, and `3 passed` for the activation-delete parameter set.
+- Registry/ProjectGrant core: `79 passed, 2 warnings`.
+- Project/ProjectChat/Lark adjacency: `71 passed, 2 warnings`.
+- WS routing/handler/Slock adjacency: `292 passed, 2 warnings`.
+- Touched-file Ruff and `git diff --check`: passed.
+- No brief-wide or external slow suite was run or used as evidence because the
+  shared worktree contains concurrent unrelated test edits. Real Feishu tenant
+  and mobile execution remain `not_tested`.
+- Employee principal rotation remains the documented production-model blocker;
+  Task 0.10 was not started and Task 0.9 remains partial on that item.

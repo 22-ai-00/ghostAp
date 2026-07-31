@@ -18,6 +18,14 @@ from .context import ADD_CHAT_ID_REJECTED, ProjectContext, ProjectStatus
 logger = logging.getLogger(__name__)
 
 
+class ProjectCommitUncertainError(OSError):
+    """A Project snapshot replace committed but parent durability is unknown."""
+
+    def __init__(self, message: str, *, committed: bool) -> None:
+        super().__init__(message)
+        self.committed = committed
+
+
 @dataclass(frozen=True, slots=True)
 class ManagedChatBindingSnapshot:
     bound_chat_id: str
@@ -26,6 +34,7 @@ class ManagedChatBindingSnapshot:
     allowed_chat_ids: tuple[tuple[str, float], ...]
     owner_chat_id: str = ""
     project_name: str = ""
+    binding_generation: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +43,11 @@ class ManagedChatBindingSaga:
     project_id: str
     chat_id: str
     snapshot: ManagedChatBindingSnapshot
+    expected: ManagedChatBindingSnapshot
+    expected_origin: str = ""
+    expected_owner_id: str = ""
+    expected_receiving_bot_ref: str = ""
+    expected_root_ref: str = ""
     remove_project_on_restore: bool = False
 
 
@@ -79,17 +93,32 @@ class ProjectManager:
 
     def _write_atomic(self, payload: dict):
         tmp_path = Path(f"{self._storage_path}.tmp")
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        replaced = False
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
+                f.write(serialized)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self._storage_path)
+            replaced = True
             dir_fd = os.open(self._storage_path.parent, os.O_DIRECTORY)
             try:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
+        except OSError as exc:
+            if replaced:
+                try:
+                    committed = self._storage_path.read_text(encoding="utf-8") == serialized
+                except OSError:
+                    committed = False
+                if committed:
+                    raise ProjectCommitUncertainError(
+                        "project snapshot parent durability is uncertain",
+                        committed=True,
+                    ) from exc
+            raise
         finally:
             if tmp_path.exists():
                 try:
@@ -157,6 +186,101 @@ class ProjectManager:
                 self._projects.pop(project_id, None)
                 if chat_id and self._active_project.get(chat_id) == project_id:
                     self._active_project.pop(chat_id, None)
+                self._color_index = previous_color_index
+                self._rebuild_bound_chat_index()
+                return False, f"项目 {project_name} 持久化失败", None
+            return True, f"项目 {project_name} 创建成功", ctx
+
+    def create_project_with_managed_chat_saga(
+        self,
+        *,
+        project_id: Optional[str],
+        project_name: str,
+        root_path: str,
+        owner_chat_id: str,
+        managed_chat_id: str,
+        managed_chat_name: str,
+        created_at: float,
+        operation_id: str,
+        expected_origin: object,
+        expected_owner_id: str,
+        expected_receiving_bot_ref: str,
+        additional_chat_id: str = "",
+    ) -> tuple[bool, str, Optional[ProjectContext]]:
+        """Create, bind, and prepare one removal-aware saga in one snapshot."""
+
+        with self._lock:
+            resolved_id = project_id or self.generate_id(project_name)
+            if resolved_id in self._projects:
+                return False, f"项目 {resolved_id} 已存在", None
+            if any(
+                saga.project_id == resolved_id
+                for saga in self._managed_chat_binding_sagas.values()
+            ):
+                return False, f"项目 {resolved_id} 已有未完成的群绑定事务", None
+            expanded_path = os.path.expanduser(root_path)
+            if not os.path.isdir(expanded_path):
+                try:
+                    os.makedirs(expanded_path, exist_ok=True)
+                except Exception as exc:
+                    return (
+                        False,
+                        f"无法创建目录 {expanded_path}: {get_error_detail(exc)}",
+                        None,
+                    )
+            previous_color_index = self._color_index
+            theme_color, emoji_prefix = self._get_next_theme()
+            settings = get_settings()
+            ctx = ProjectContext(
+                project_id=resolved_id,
+                project_name=project_name,
+                root_path=expanded_path,
+                working_dir=expanded_path,
+                status=ProjectStatus.ACTIVE,
+                theme_color=theme_color,
+                emoji_prefix=emoji_prefix,
+                ttadk_yolo_enabled=bool(
+                    getattr(settings, "ttadk_yolo_default_enabled", False)
+                ),
+                owner_chat_id=owner_chat_id,
+                allowed_chat_ids=(
+                    OrderedDict([(owner_chat_id, time.time())])
+                    if owner_chat_id
+                    else OrderedDict()
+                ),
+            )
+            before = self._binding_snapshot(ctx)
+            ctx.bound_chat_id = managed_chat_id
+            ctx.bound_chat_name = managed_chat_name
+            ctx.bound_chat_created_at = created_at
+            ctx.managed_binding_generation += 1
+            ctx.add_chat_id(managed_chat_id)
+            if additional_chat_id and additional_chat_id != managed_chat_id:
+                ctx.add_chat_id(additional_chat_id)
+            expected = self._binding_snapshot(ctx)
+            saga = ManagedChatBindingSaga(
+                operation_id=operation_id,
+                project_id=resolved_id,
+                chat_id=managed_chat_id,
+                snapshot=before,
+                expected=expected,
+                expected_origin=self._origin_value(expected_origin),
+                expected_owner_id=expected_owner_id,
+                expected_receiving_bot_ref=expected_receiving_bot_ref,
+                expected_root_ref=expanded_path,
+                remove_project_on_restore=True,
+            )
+            self._projects[resolved_id] = ctx
+            self._active_project[managed_chat_id] = resolved_id
+            self._managed_chat_binding_sagas[operation_id] = saga
+            try:
+                saved = self._save_projects(raise_uncertain=True)
+            except ProjectCommitUncertainError:
+                raise
+            if not saved:
+                self._projects.pop(resolved_id, None)
+                self._active_project.pop(managed_chat_id, None)
+                self._managed_chat_binding_sagas.pop(operation_id, None)
                 self._color_index = previous_color_index
                 self._rebuild_bound_chat_index()
                 return False, f"项目 {project_name} 持久化失败", None
@@ -502,6 +626,42 @@ class ProjectManager:
             ]
             return matches[0] if len(matches) == 1 else None
 
+    @staticmethod
+    def _origin_value(origin: object) -> str:
+        return str(getattr(origin, "value", origin) or "")
+
+    @staticmethod
+    def _binding_snapshot(project: ProjectContext) -> ManagedChatBindingSnapshot:
+        return ManagedChatBindingSnapshot(
+            bound_chat_id=project.bound_chat_id,
+            bound_chat_name=project.bound_chat_name,
+            bound_chat_created_at=project.bound_chat_created_at,
+            allowed_chat_ids=tuple(project.allowed_chat_ids.items()),
+            owner_chat_id=project.owner_chat_id,
+            project_name=project.project_name,
+            binding_generation=project.managed_binding_generation,
+        )
+
+    @classmethod
+    def _saga_matches_project(
+        cls,
+        saga: ManagedChatBindingSaga,
+        project: ProjectContext,
+    ) -> bool:
+        return cls._binding_snapshot(project) == saga.expected
+
+    def _quarantine_saga_locked(
+        self,
+        saga: ManagedChatBindingSaga,
+        project: ProjectContext | None,
+    ) -> bool:
+        self._quarantined_bound_chat_ids.add(saga.chat_id)
+        if project is not None and project.bound_chat_id:
+            self._quarantined_bound_chat_ids.add(project.bound_chat_id)
+        self._save_projects()
+        self._rebuild_bound_chat_index()
+        return False
+
     def bind_managed_chat(
         self,
         project_id: str,
@@ -531,6 +691,9 @@ class ProjectManager:
         additional_chat_id: str = "",
         project_name: str = "",
         remove_project_on_restore: bool = False,
+        expected_origin: object = "",
+        expected_owner_id: str = "",
+        expected_receiving_bot_ref: str = "",
     ) -> tuple[bool, ManagedChatBindingSnapshot | None]:
         """Bind and return the durable pre-bind state for compensation."""
 
@@ -550,44 +713,57 @@ class ProjectManager:
                     is not remove_project_on_restore
                 ):
                     return False, None
-                snapshot = existing_saga.snapshot
+                if not self._saga_matches_project(existing_saga, project):
+                    self._quarantine_saga_locked(existing_saga, project)
+                    return False, None
+                return True, existing_saga.snapshot
             else:
-                snapshot = ManagedChatBindingSnapshot(
-                    bound_chat_id=project.bound_chat_id,
-                    bound_chat_name=project.bound_chat_name,
-                    bound_chat_created_at=project.bound_chat_created_at,
-                    allowed_chat_ids=tuple(project.allowed_chat_ids.items()),
-                    owner_chat_id=project.owner_chat_id,
-                    project_name=project.project_name,
-                )
-                if operation_id:
-                    self._managed_chat_binding_sagas[operation_id] = (
-                        ManagedChatBindingSaga(
-                            operation_id=operation_id,
-                            project_id=project_id,
-                            chat_id=chat_id,
-                            snapshot=snapshot,
-                            remove_project_on_restore=remove_project_on_restore,
-                        )
-                    )
+                if any(
+                    saga.project_id == project_id
+                    and saga.operation_id != operation_id
+                    for saga in self._managed_chat_binding_sagas.values()
+                ):
+                    return False, None
+                snapshot = self._binding_snapshot(project)
             project.bound_chat_id = chat_id
             project.bound_chat_name = chat_name
             project.bound_chat_created_at = created_at
+            project.managed_binding_generation += 1
             if project_name:
                 project.project_name = project_name
             project.add_chat_id(chat_id)
             if additional_chat_id and additional_chat_id != chat_id:
                 project.add_chat_id(additional_chat_id)
+            expected = self._binding_snapshot(project)
+            if operation_id:
+                self._managed_chat_binding_sagas[operation_id] = (
+                    ManagedChatBindingSaga(
+                        operation_id=operation_id,
+                        project_id=project_id,
+                        chat_id=chat_id,
+                        snapshot=snapshot,
+                        expected=expected,
+                        expected_origin=self._origin_value(expected_origin),
+                        expected_owner_id=expected_owner_id,
+                        expected_receiving_bot_ref=expected_receiving_bot_ref,
+                        expected_root_ref=project.root_path,
+                        remove_project_on_restore=remove_project_on_restore,
+                    )
+                )
             was_quarantined = chat_id in self._quarantined_bound_chat_ids
             self._quarantined_bound_chat_ids.discard(chat_id)
-            if self._save_projects():
-                return True, snapshot
+            try:
+                if self._save_projects(raise_uncertain=True):
+                    return True, snapshot
+            except ProjectCommitUncertainError:
+                raise
             project.bound_chat_id = snapshot.bound_chat_id
             project.bound_chat_name = snapshot.bound_chat_name
             project.bound_chat_created_at = snapshot.bound_chat_created_at
             project.allowed_chat_ids = OrderedDict(snapshot.allowed_chat_ids)
             project.owner_chat_id = snapshot.owner_chat_id
             project.project_name = snapshot.project_name
+            project.managed_binding_generation = snapshot.binding_generation
             if was_quarantined:
                 self._quarantined_bound_chat_ids.add(chat_id)
             if operation_id and existing_saga is None:
@@ -614,6 +790,7 @@ class ProjectManager:
                 allowed_chat_ids=tuple(project.allowed_chat_ids.items()),
                 owner_chat_id=project.owner_chat_id,
                 project_name=project.project_name,
+                binding_generation=project.managed_binding_generation,
             )
             project.bound_chat_id = snapshot.bound_chat_id
             project.bound_chat_name = snapshot.bound_chat_name
@@ -621,6 +798,7 @@ class ProjectManager:
             project.allowed_chat_ids = OrderedDict(snapshot.allowed_chat_ids)
             project.owner_chat_id = snapshot.owner_chat_id
             project.project_name = snapshot.project_name
+            project.managed_binding_generation = snapshot.binding_generation
             old_saga = self._managed_chat_binding_sagas.pop(operation_id, None)
             if self._save_projects():
                 return True
@@ -630,6 +808,7 @@ class ProjectManager:
             project.allowed_chat_ids = OrderedDict(current.allowed_chat_ids)
             project.owner_chat_id = current.owner_chat_id
             project.project_name = current.project_name
+            project.managed_binding_generation = current.binding_generation
             if old_saga is not None:
                 self._managed_chat_binding_sagas[operation_id] = old_saga
             self._rebuild_bound_chat_index()
@@ -654,6 +833,8 @@ class ProjectManager:
             project = self._projects.get(saga.project_id)
             if project is None:
                 return False
+            if not self._saga_matches_project(saga, project):
+                return self._quarantine_saga_locked(saga, project)
             if saga.remove_project_on_restore:
                 removed_active = {
                     chat_id: active_id
@@ -681,13 +862,33 @@ class ProjectManager:
         if not operation_id:
             return True
         with self._lock:
-            previous = self._managed_chat_binding_sagas.pop(operation_id, None)
-            if previous is None:
+            saga = self._managed_chat_binding_sagas.get(operation_id)
+            if saga is None:
                 return True
+            project = self._projects.get(saga.project_id)
+            if project is None or not self._saga_matches_project(saga, project):
+                return self._quarantine_saga_locked(saga, project)
+            previous = self._managed_chat_binding_sagas.pop(operation_id)
             if self._save_projects():
                 return True
             self._managed_chat_binding_sagas[operation_id] = previous
             return False
+
+    def managed_chat_binding_saga(self, operation_id: str) -> ManagedChatBindingSaga | None:
+        with self._lock:
+            return self._managed_chat_binding_sagas.get(operation_id)
+
+    def validate_managed_chat_binding_saga(self, operation_id: str) -> bool:
+        """CAS-check one pending saga and quarantine any mismatched binding."""
+
+        with self._lock:
+            saga = self._managed_chat_binding_sagas.get(operation_id)
+            if saga is None:
+                return False
+            project = self._projects.get(saga.project_id)
+            if project is not None and self._saga_matches_project(saga, project):
+                return True
+            return self._quarantine_saga_locked(saga, project)
 
     def revoke_managed_chat(self, chat_id: str) -> bool:
         """Clear a Project binding after durable Registry revocation."""
@@ -738,6 +939,8 @@ class ProjectManager:
                 "create_outcome_unknown",
                 "delete_rejected",
                 "delete_unknown",
+                "delete_guarded",
+                "recovered_chat_invalid",
                 "registry_bind_uncertain",
             }
         ):
@@ -782,7 +985,7 @@ class ProjectManager:
                 return None, "该项目已绑定到其他群聊，如需在当前群使用同一仓库，请使用 /new 创建新项目"
         return None, None
 
-    def _save_projects(self) -> bool:
+    def _save_projects(self, *, raise_uncertain: bool = False) -> bool:
         try:
             data = {
                 "projects": {pid: ctx.to_snapshot() for pid, ctx in self._projects.items()},
@@ -812,7 +1015,21 @@ class ProjectManager:
                             "bound_chat_name": saga.snapshot.bound_chat_name,
                             "owner_chat_id": saga.snapshot.owner_chat_id,
                             "project_name": saga.snapshot.project_name,
+                            "binding_generation": saga.snapshot.binding_generation,
                         },
+                        "expected": {
+                            "allowed_chat_ids": list(saga.expected.allowed_chat_ids),
+                            "bound_chat_created_at": saga.expected.bound_chat_created_at,
+                            "bound_chat_id": saga.expected.bound_chat_id,
+                            "bound_chat_name": saga.expected.bound_chat_name,
+                            "owner_chat_id": saga.expected.owner_chat_id,
+                            "project_name": saga.expected.project_name,
+                            "binding_generation": saga.expected.binding_generation,
+                        },
+                        "expected_origin": saga.expected_origin,
+                        "expected_owner_id": saga.expected_owner_id,
+                        "expected_receiving_bot_ref": saga.expected_receiving_bot_ref,
+                        "expected_root_ref": saga.expected_root_ref,
                     }
                     for operation_id, saga in sorted(
                         self._managed_chat_binding_sagas.items()
@@ -823,6 +1040,11 @@ class ProjectManager:
                 self._write_atomic(data)
             self._rebuild_bound_chat_index()
             return True
+        except ProjectCommitUncertainError as exc:
+            logger.error("保存项目数据耐久性不确定: %s", get_error_detail(exc))
+            if raise_uncertain:
+                raise
+            return False
         except Exception as e:
             logger.error("保存项目数据失败: %s", get_error_detail(e))
             return False
@@ -915,6 +1137,8 @@ class ProjectManager:
                         "create_outcome_unknown",
                         "delete_rejected",
                         "delete_unknown",
+                        "delete_guarded",
+                        "recovered_chat_invalid",
                         "registry_bind_uncertain",
                     }
                 ):
@@ -939,6 +1163,19 @@ class ProjectManager:
                             "snapshot",
                         }
                     ),
+                    frozenset(
+                        {
+                            "chat_id",
+                            "project_id",
+                            "remove_project_on_restore",
+                            "snapshot",
+                            "expected",
+                            "expected_origin",
+                            "expected_owner_id",
+                            "expected_receiving_bot_ref",
+                            "expected_root_ref",
+                        }
+                    ),
                 }:
                     raise ValueError("invalid managed chat binding saga")
                 snapshot = value["snapshot"]
@@ -954,6 +1191,17 @@ class ProjectManager:
                     frozenset(
                         {
                             "allowed_chat_ids",
+                            "bound_chat_created_at",
+                            "bound_chat_id",
+                            "bound_chat_name",
+                            "owner_chat_id",
+                            "project_name",
+                        }
+                    ),
+                    frozenset(
+                        {
+                            "allowed_chat_ids",
+                            "binding_generation",
                             "bound_chat_created_at",
                             "bound_chat_id",
                             "bound_chat_name",
@@ -978,26 +1226,76 @@ class ProjectManager:
                     or type(value.get("remove_project_on_restore", False)) is not bool
                 ):
                     raise ValueError("invalid managed chat binding saga identity")
+                parsed_snapshot = ManagedChatBindingSnapshot(
+                    bound_chat_id=snapshot["bound_chat_id"],
+                    bound_chat_name=snapshot["bound_chat_name"],
+                    bound_chat_created_at=float(snapshot["bound_chat_created_at"]),
+                    allowed_chat_ids=tuple(
+                        (str(item[0]), float(item[1]))
+                        for item in snapshot["allowed_chat_ids"]
+                    ),
+                    owner_chat_id=snapshot.get(
+                        "owner_chat_id",
+                        project.owner_chat_id if project is not None else "",
+                    ),
+                    project_name=snapshot.get(
+                        "project_name",
+                        project.project_name if project is not None else "",
+                    ),
+                    binding_generation=int(snapshot.get("binding_generation", 0)),
+                )
+                expected_raw = value.get("expected")
+                if expected_raw is None:
+                    expected_snapshot = (
+                        self._binding_snapshot(project)
+                        if project is not None
+                        else parsed_snapshot
+                    )
+                else:
+                    if not isinstance(expected_raw, dict) or frozenset(
+                        expected_raw
+                    ) != frozenset(
+                        {
+                            "allowed_chat_ids",
+                            "binding_generation",
+                            "bound_chat_created_at",
+                            "bound_chat_id",
+                            "bound_chat_name",
+                            "owner_chat_id",
+                            "project_name",
+                        }
+                    ):
+                        raise ValueError("invalid managed chat binding saga expected")
+                    expected_snapshot = ManagedChatBindingSnapshot(
+                        bound_chat_id=expected_raw["bound_chat_id"],
+                        bound_chat_name=expected_raw["bound_chat_name"],
+                        bound_chat_created_at=float(
+                            expected_raw["bound_chat_created_at"]
+                        ),
+                        allowed_chat_ids=tuple(
+                            (str(item[0]), float(item[1]))
+                            for item in expected_raw["allowed_chat_ids"]
+                        ),
+                        owner_chat_id=expected_raw["owner_chat_id"],
+                        project_name=expected_raw["project_name"],
+                        binding_generation=int(
+                            expected_raw["binding_generation"]
+                        ),
+                    )
                 parsed_sagas[operation_id] = ManagedChatBindingSaga(
                     operation_id=operation_id,
                     project_id=project_id,
                     chat_id=chat_id,
-                    snapshot=ManagedChatBindingSnapshot(
-                        bound_chat_id=snapshot["bound_chat_id"],
-                        bound_chat_name=snapshot["bound_chat_name"],
-                        bound_chat_created_at=float(snapshot["bound_chat_created_at"]),
-                        allowed_chat_ids=tuple(
-                            (str(item[0]), float(item[1]))
-                            for item in snapshot["allowed_chat_ids"]
-                        ),
-                        owner_chat_id=snapshot.get(
-                            "owner_chat_id",
-                            project.owner_chat_id if project is not None else "",
-                        ),
-                        project_name=snapshot.get(
-                            "project_name",
-                            project.project_name if project is not None else "",
-                        ),
+                    snapshot=parsed_snapshot,
+                    expected=expected_snapshot,
+                    expected_origin=str(value.get("expected_origin") or ""),
+                    expected_owner_id=str(value.get("expected_owner_id") or ""),
+                    expected_receiving_bot_ref=str(
+                        value.get("expected_receiving_bot_ref") or ""
+                    ),
+                    expected_root_ref=str(
+                        value.get("expected_root_ref")
+                        or (project.root_path if project is not None else "")
                     ),
                     remove_project_on_restore=value.get(
                         "remove_project_on_restore", False

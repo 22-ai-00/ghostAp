@@ -3320,19 +3320,50 @@ class FeishuWSClient:
         from ..trust.registry import RegistryCommitUncertainError
 
         for saga in self._project_manager.pending_managed_chat_binding_sagas():
+            if not self._project_manager.validate_managed_chat_binding_saga(
+                saga.operation_id
+            ):
+                continue
             project = self._project_manager.get_project_for_diagnostics(
                 saga.project_id
             )
             active = self._managed_group_registry.active_record(saga.chat_id)
+            grant = self._managed_group_registry.grant_for_chat(saga.chat_id)
+            expected_origin = saga.expected_origin or (
+                "owner_adopted"
+                if saga.operation_id.startswith("adopt:")
+                else "ghostap_created"
+            )
+            expected_owner = saga.expected_owner_id or self._managed_group_owner_id
+            expected_bot = (
+                saga.expected_receiving_bot_ref
+                or self._managed_group_receiving_bot_ref
+            )
+            expected_root = saga.expected_root_ref or (
+                project.root_path if project is not None else ""
+            )
             if (
                 project is not None
                 and active is not None
+                and grant is not None
                 and active.project_id == saga.project_id
-                and active.canonical_root_ref == project.root_path
+                and active.canonical_root_ref == expected_root
+                and active.origin.value == expected_origin
+                and active.owner_id == expected_owner
+                and active.receiving_bot_ref == expected_bot
+                and grant.managed_group_id == saga.chat_id
+                and grant.owner_id == expected_owner
+                and grant.project_id == saga.project_id
+                and grant.canonical_root_ref == expected_root
+                and not grant.backend_binding_ids
+                and not grant.connected_target_refs
             ):
                 self._project_manager.complete_managed_chat_binding_saga(
                     saga.operation_id
                 )
+                continue
+            if active is not None:
+                self._project_manager.quarantine_bound_chat(saga.chat_id)
                 continue
 
             binding = self._managed_group_registry.provision_binding(
@@ -3343,14 +3374,17 @@ class FeishuWSClient:
                 and binding is not None
                 and binding.chat_id == saga.chat_id
                 and binding.project_id == saga.project_id
-                and binding.canonical_root_ref == project.root_path
+                and binding.canonical_root_ref == expected_root
+                and binding.origin.value == expected_origin
+                and binding.owner_id == expected_owner
+                and binding.receiving_bot_ref == expected_bot
             ):
                 try:
                     self._managed_group_registry.activate(
                         provision_id=saga.operation_id,
                         chat_id=saga.chat_id,
                         project_id=saga.project_id,
-                        canonical_root_ref=project.root_path,
+                        canonical_root_ref=expected_root,
                     )
                 except RegistryCommitUncertainError as exc:
                     if exc.committed:
@@ -3398,6 +3432,10 @@ class FeishuWSClient:
                 continue
             self._managed_group_registry.complete_revoke(chat_id)
 
+        pending_saga_chat_ids = {
+            saga.chat_id
+            for saga in self._project_manager.pending_managed_chat_binding_sagas()
+        }
         candidates_by_chat: dict[str, list[dict]] = {}
         for project in self._project_manager.get_all_projects(
             sort_by_recent=False,
@@ -3410,6 +3448,8 @@ class FeishuWSClient:
             if candidate is None:
                 continue
             chat_id = candidate["chat_id"]
+            if chat_id in pending_saga_chat_ids:
+                continue
             candidates_by_chat.setdefault(chat_id, []).append(candidate)
 
         for chat_id, candidates in sorted(candidates_by_chat.items()):

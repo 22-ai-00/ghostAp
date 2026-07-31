@@ -123,6 +123,7 @@ class ProjectContext:
     bound_chat_id: str = ""
     bound_chat_name: str = ""
     bound_chat_created_at: float = 0.0
+    managed_binding_generation: int = 0
 
     worktree_state: Any = None
     spec_review_selection_state: Any = None
@@ -485,6 +486,7 @@ class ProjectContext:
             "bound_chat_id": self.bound_chat_id,
             "bound_chat_name": self.bound_chat_name,
             "bound_chat_created_at": self.bound_chat_created_at,
+            "managed_binding_generation": self.managed_binding_generation,
             "conversation_history": [
                 {
                     "role": item.role,
@@ -558,6 +560,7 @@ class ProjectContext:
             bound_chat_id=data.get("bound_chat_id", ""),
             bound_chat_name=data.get("bound_chat_name", ""),
             bound_chat_created_at=data.get("bound_chat_created_at", 0.0),
+            managed_binding_generation=data.get("managed_binding_generation", 0),
         )
         if data.get("coco_session_snapshot"):
             snap = data["coco_session_snapshot"]

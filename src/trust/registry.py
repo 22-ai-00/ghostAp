@@ -122,6 +122,8 @@ class ManagedGroupProvisionBinding:
     project_id: str
     canonical_root_ref: str
     origin: ManagedGroupOrigin
+    owner_id: str
+    receiving_bot_ref: str
 
 
 def single_owner_id(value: object) -> str:
@@ -444,6 +446,19 @@ class ManagedGroupRegistry:
                 project_id=intent["project_id"],
                 canonical_root_ref=intent["canonical_root_ref"],
                 origin=ManagedGroupOrigin(intent["origin"]),
+                owner_id=intent["owner_id"],
+                receiving_bot_ref=intent["receiving_bot_ref"],
+            )
+
+    def provision_ids_for_chat(self, chat_id: str) -> tuple[str, ...]:
+        chat = self._runtime_string(chat_id, "chat_id")
+        with self._disk_transaction():
+            return tuple(
+                sorted(
+                    provision_id
+                    for provision_id, intent in self._intents.items()
+                    if intent.get("remote_chat_id") == chat
+                )
             )
 
     def provision_create_state(self, provision_id: str) -> str | None:
