@@ -40,6 +40,17 @@ class AdaptiveReviewResult(ReviewResult):
     completion_gate_met: bool = False
     completion_gate_confidence: str = ""
     completion_gate_evidence: str = ""
+    completion_gate_enabled: bool = False
+    completion_gate_valid: bool = True
+    completion_gate_error: str = ""
+    requires_manual_confirmation: bool = False
+    manual_confirmation_reason: str = ""
+
+    @property
+    def all_passed(self) -> bool:
+        reviews_passed = len(self.reviews) > 0 and all(review.passed for review in self.reviews)
+        gate_passed = not self.completion_gate_enabled or self.completion_gate_valid
+        return reviews_passed and gate_passed
 
 
 def _build_completion_control_prompt(role: ReviewRoleSpec, artifacts: ReviewArtifacts) -> str:
@@ -208,6 +219,8 @@ def parse_role_review_output(role: ReviewRoleSpec, raw: str) -> RoleReviewOutcom
 
     try:
         data = _extract_json_object(raw)
+        if not isinstance(data, dict):
+            raise ValueError("review output JSON must be an object")
     except Exception as exc:
         return _parse_role_review_text_fallback(role, raw, exc)
 
@@ -238,22 +251,49 @@ def parse_role_review_output(role: ReviewRoleSpec, raw: str) -> RoleReviewOutcom
             )
         )
 
-    has_blocking = any(s.blocking for s in suggestions)
     verdict = str(data.get("verdict") or "").strip().upper()
-    passed = verdict == "PASS" or not has_blocking
-
     goal_verdict = str(data.get("goal_verdict") or "").strip().upper()
     goal_confidence = str(data.get("goal_confidence") or "").strip().lower()
     goal_evidence = str(data.get("evidence_summary") or "").strip()
+    has_blocking = any(s.blocking for s in suggestions)
+
+    format_error = ""
+    response_role_id = str(data.get("role_id") or "").strip()
+    if not response_role_id:
+        format_error = "missing_role_id"
+    elif response_role_id != role.role_id:
+        format_error = "role_id_mismatch"
+    elif verdict not in {"PASS", "FAIL"}:
+        format_error = "missing_or_invalid_verdict"
+    elif role.role_id == COMPLETION_CONTROL_ROLE_ID:
+        if goal_verdict not in {"GOAL_MET", "GOAL_NOT_MET"}:
+            format_error = "missing_or_invalid_goal_verdict"
+        elif verdict == "PASS" and goal_verdict == "GOAL_MET" and not goal_evidence:
+            format_error = "missing_goal_evidence"
+
+    passed = (
+        not format_error
+        and verdict == "PASS"
+        and not has_blocking
+        and (
+            role.role_id != COMPLETION_CONTROL_ROLE_ID
+            or goal_verdict == "GOAL_MET"
+        )
+    )
+    summary = str(data.get("summary") or goal_evidence or "")
+    if format_error:
+        format_summary = "审查结构缺少有效完成判定，需重试或人工确认"
+        summary = f"{summary}；{format_summary}" if summary else format_summary
 
     return RoleReviewOutcome(
         role_id=role.role_id,
         role_display_name=role.display_name,
         role_category=role.category,
         passed=passed,
-        summary=str(data.get("summary") or goal_evidence or ""),
+        summary=summary,
         suggestions=suggestions,
         raw_preview=(raw or "")[:500],
+        error=f"format_failure:{format_error}" if format_error else "",
         blocking=role.blocking,
         base_perspective_value=role.base_perspective.value if role.base_perspective else "",
         goal_verdict=goal_verdict,
@@ -263,7 +303,7 @@ def parse_role_review_output(role: ReviewRoleSpec, raw: str) -> RoleReviewOutcom
 
 
 def _parse_role_review_text_fallback(role: ReviewRoleSpec, raw: str, exc: Exception) -> RoleReviewOutcome:
-    """Best-effort parse for role outputs that missed the JSON contract."""
+    """Keep plain-text diagnostics while failing closed on invalid output."""
     text = raw or ""
     verdict = normalize_review_verdict(text)
     raw_suggestions = extract_suggestions_from_body(text, limit=max(1, int(role.max_suggestions or 5)))
@@ -283,22 +323,20 @@ def _parse_role_review_text_fallback(role: ReviewRoleSpec, raw: str, exc: Except
         ]
 
     if suggestions:
-        summary = f"非 JSON 审查输出已降级解析：{len(suggestions)} 条建议"
-    elif verdict == "PASS":
-        summary = "非 JSON 审查输出已按 PASS 解析"
+        summary = f"非 JSON 审查输出保留了 {len(suggestions)} 条诊断，需重试或人工确认"
     else:
-        summary = "审查输出格式异常（已跳过）"
+        summary = "审查输出格式异常，需重试或人工确认"
 
     return RoleReviewOutcome(
         role_id=role.role_id,
         role_display_name=role.display_name,
         role_category=role.category,
-        passed=True,
+        passed=False,
         summary=summary,
         suggestions=suggestions,
         raw_preview=text[:500],
-        error=f"parse_degraded:{get_error_detail(exc)}",
-        blocking=False,
+        error=f"format_failure:{get_error_detail(exc)}",
+        blocking=role.blocking,
         base_perspective_value=role.base_perspective.value if role.base_perspective else "",
     )
 
@@ -306,9 +344,16 @@ def _parse_role_review_text_fallback(role: ReviewRoleSpec, raw: str, exc: Except
 class RoleReviewWorker:
     """Runs one review role using a caller-provided prompt runner."""
 
-    def __init__(self, role: ReviewRoleSpec, *, timeout: float):
+    def __init__(
+        self,
+        role: ReviewRoleSpec,
+        *,
+        timeout: float,
+        format_retry_max_attempts: int = 0,
+    ):
         self.role = role
         self.timeout = float(timeout)
+        self.format_retry_max_attempts = max(0, int(format_retry_max_attempts or 0))
         self._buf: list[str] = []
 
     def _on_event(self, event) -> None:
@@ -321,10 +366,32 @@ class RoleReviewWorker:
         raw = ""
         t0 = time.monotonic()
         try:
-            raw = prompt_runner(prompt, self._on_event, self.timeout) or ""
-            if not raw:
-                raw = "".join(self._buf)
-            return parse_role_review_output(self.role, raw)
+            for attempt in range(self.format_retry_max_attempts + 1):
+                self._buf.clear()
+                raw = prompt_runner(prompt, self._on_event, self.timeout) or ""
+                if not raw:
+                    raw = "".join(self._buf)
+                outcome = parse_role_review_output(self.role, raw)
+                if not outcome.error.startswith("format_failure:"):
+                    return outcome
+                if attempt < self.format_retry_max_attempts:
+                    logger.warning(
+                        "[RoleReviewWorker:%s] invalid output format "
+                        "(attempt %d/%d), retrying with the same role runner",
+                        self.role.role_id,
+                        attempt + 1,
+                        self.format_retry_max_attempts + 1,
+                    )
+                    continue
+                outcome.error = (
+                    f"{outcome.error};retry_exhausted={self.format_retry_max_attempts}"
+                )
+                outcome.summary = (
+                    f"{outcome.summary}；格式重试已耗尽，需人工确认"
+                    if outcome.summary
+                    else "格式重试已耗尽，需人工确认"
+                )
+                return outcome
         except Exception as exc:
             err = get_error_detail(exc)
             startup_elapsed = getattr(exc, "startup_elapsed_s", None)
@@ -435,9 +502,36 @@ def _fallback_perspective(role: ReviewRoleSpec) -> ReviewPerspective:
     return ReviewPerspective.TESTER
 
 
-def _outcomes_to_review_result(outcomes: list[RoleReviewOutcome], iteration: int) -> AdaptiveReviewResult:
+def validate_completion_gate_outcomes(
+    outcomes: list[RoleReviewOutcome],
+) -> tuple[bool, str, RoleReviewOutcome | None]:
+    """Validate the completion-control role contract without trusting projections."""
+
+    completion_outcomes = [
+        outcome
+        for outcome in outcomes
+        if outcome.role_id == COMPLETION_CONTROL_ROLE_ID
+    ]
+    if not completion_outcomes:
+        return False, "completion_control_missing", None
+    if len(completion_outcomes) != 1:
+        return False, "completion_control_duplicate", None
+
+    outcome = completion_outcomes[0]
+    if outcome.error.startswith("format_failure:"):
+        return False, "completion_control_format_failure", outcome
+    if outcome.goal_verdict not in {"GOAL_MET", "GOAL_NOT_MET"}:
+        return False, "completion_control_invalid", outcome
+    return True, "", outcome
+
+
+def _outcomes_to_review_result(
+    outcomes: list[RoleReviewOutcome],
+    iteration: int,
+    *,
+    completion_gate_enabled: bool = False,
+) -> AdaptiveReviewResult:
     aggregated = aggregate_role_outcomes(outcomes)
-    {outcome.role_id: outcome for outcome in outcomes}
     reviews: list[PerspectiveReview] = []
     blocking_by_role: dict[str, list[str]] = {}
     observation_by_role: dict[str, list[str]] = {}
@@ -467,7 +561,7 @@ def _outcomes_to_review_result(outcomes: list[RoleReviewOutcome], iteration: int
         reviews.append(
             PerspectiveReview(
                 perspective=_fallback_perspective(role),
-                passed=not bool(blocking_by_role.get(outcome.role_id)),
+                passed=outcome.passed and not bool(blocking_by_role.get(outcome.role_id)),
                 suggestions=suggestions,
                 summary=outcome.summary,
                 role_id=outcome.role_id,
@@ -477,18 +571,61 @@ def _outcomes_to_review_result(outcomes: list[RoleReviewOutcome], iteration: int
             )
         )
 
-    # Extract completion gate from completion_control role
+    # Extract and validate completion gate from exactly one completion_control role.
     completion_gate_met = False
     completion_gate_confidence = ""
     completion_gate_evidence = ""
-    for outcome in outcomes:
-        if outcome.role_id == COMPLETION_CONTROL_ROLE_ID and outcome.goal_verdict:
-            completion_gate_met = outcome.goal_verdict == "GOAL_MET"
-            completion_gate_confidence = outcome.goal_confidence
-            completion_gate_evidence = outcome.goal_evidence
-            break
+    completion_gate_valid = True
+    completion_gate_error = ""
+    completion_outcome: RoleReviewOutcome | None = None
+    if completion_gate_enabled:
+        (
+            completion_gate_valid,
+            completion_gate_error,
+            completion_outcome,
+        ) = validate_completion_gate_outcomes(outcomes)
+    else:
+        completion_outcome = next(
+            (
+                outcome
+                for outcome in outcomes
+                if outcome.role_id == COMPLETION_CONTROL_ROLE_ID
+            ),
+            None,
+        )
+    if completion_outcome is not None:
+        completion_gate_met = (
+            completion_gate_valid
+            and completion_outcome.passed
+            and completion_outcome.goal_verdict == "GOAL_MET"
+        )
+        completion_gate_confidence = completion_outcome.goal_confidence
+        completion_gate_evidence = completion_outcome.goal_evidence
+
+    format_failure_roles = [
+        outcome.role_id
+        for outcome in outcomes
+        if outcome.error.startswith("format_failure:")
+    ]
+    manual_reasons: list[str] = []
+    if format_failure_roles:
+        manual_reasons.append(
+            "审查输出格式重试已耗尽"
+            f"（角色：{', '.join(format_failure_roles)}）"
+        )
+    if completion_gate_enabled and not completion_gate_valid:
+        manual_reasons.append(
+            f"完成度闸门契约无效（{completion_gate_error}）"
+        )
+    requires_manual_confirmation = bool(manual_reasons)
+    manual_confirmation_reason = "；".join(manual_reasons)
+    if manual_confirmation_reason:
+        manual_confirmation_reason = f"{manual_confirmation_reason}，需人工确认"
 
     skipped_roles_count = sum(1 for o in outcomes if o.skipped)
+    blocking_review_passed = all(pr.passed for pr in reviews)
+    if completion_gate_enabled:
+        blocking_review_passed = blocking_review_passed and completion_gate_valid
 
     return AdaptiveReviewResult(
         reviews=reviews,
@@ -496,11 +633,16 @@ def _outcomes_to_review_result(outcomes: list[RoleReviewOutcome], iteration: int
         role_outcomes=outcomes,
         aggregated=aggregated,
         blocking_suggestion_hash=aggregated.blocking_hash(),
-        blocking_review_passed=all(pr.passed for pr in reviews),
+        blocking_review_passed=blocking_review_passed,
         skipped_roles_count=skipped_roles_count,
         completion_gate_met=completion_gate_met,
         completion_gate_confidence=completion_gate_confidence,
         completion_gate_evidence=completion_gate_evidence,
+        completion_gate_enabled=completion_gate_enabled,
+        completion_gate_valid=completion_gate_valid,
+        completion_gate_error=completion_gate_error,
+        requires_manual_confirmation=requires_manual_confirmation,
+        manual_confirmation_reason=manual_confirmation_reason,
     )
 
 
@@ -512,6 +654,7 @@ def _run_batch(
     max_parallel: int,
     timeout: float,
     role_timeout_multipliers: dict[str, float] | None = None,
+    format_retry_max_attempts: int = 0,
 ) -> list[RoleReviewOutcome]:
     outcomes: list[RoleReviewOutcome] = []
     max_parallel = max(1, int(max_parallel or 1))
@@ -521,7 +664,11 @@ def _run_batch(
         with ThreadPoolExecutor(max_workers=len(wave), thread_name_prefix="role-review-") as pool:
             futures = {
                 pool.submit(
-                    RoleReviewWorker(role, timeout=timeout * multipliers.get(role.role_id, 1.0)).run,
+                    RoleReviewWorker(
+                        role,
+                        timeout=timeout * multipliers.get(role.role_id, 1.0),
+                        format_retry_max_attempts=format_retry_max_attempts,
+                    ).run,
                     artifacts,
                     prompt_runner_factory(role),
                 ): role
@@ -543,6 +690,8 @@ def run_adaptive_role_review_pipeline(
     timeout: float = 240.0,
     role_timeout_multipliers: dict[str, float] | None = None,
     iteration: int | None = None,
+    completion_gate_enabled: bool = False,
+    format_retry_max_attempts: int = 0,
 ) -> AdaptiveReviewResult:
     """Run adaptive roles with dependency batching and parallel workers."""
 
@@ -556,8 +705,13 @@ def run_adaptive_role_review_pipeline(
                 max_parallel=max_parallel,
                 timeout=timeout,
                 role_timeout_multipliers=role_timeout_multipliers,
+                format_retry_max_attempts=format_retry_max_attempts,
             )
         )
     order = {role.role_id: idx for idx, role in enumerate(roles)}
     outcomes.sort(key=lambda outcome: order.get(outcome.role_id, 999))
-    return _outcomes_to_review_result(outcomes, iteration or artifacts.cycle_number)
+    return _outcomes_to_review_result(
+        outcomes,
+        iteration or artifacts.cycle_number,
+        completion_gate_enabled=completion_gate_enabled,
+    )

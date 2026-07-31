@@ -1322,11 +1322,59 @@ class SpecEngine(BaseEngine):
         # --- COMPLETION GATE (Phase 3): evidence-backed early stop / veto ---
         completion_gate_met = False
         completion_gate_confidence = ""
-        if getattr(self.settings, "spec_completion_gate_enabled", True) and cycle.review_result:
-            from .adaptive_review import AdaptiveReviewResult
+        completion_gate_enabled = getattr(
+            self.settings,
+            "spec_completion_gate_enabled",
+            True,
+        )
+        if cycle.review_result:
+            from .adaptive_review import (
+                AdaptiveReviewResult,
+                validate_completion_gate_outcomes,
+            )
             if isinstance(cycle.review_result, AdaptiveReviewResult):
-                completion_gate_met = cycle.review_result.completion_gate_met
-                completion_gate_confidence = cycle.review_result.completion_gate_confidence
+                if completion_gate_enabled:
+                    (
+                        completion_gate_valid,
+                        completion_gate_error,
+                        _completion_outcome,
+                    ) = validate_completion_gate_outcomes(
+                        cycle.review_result.role_outcomes
+                    )
+                else:
+                    completion_gate_valid = True
+                    completion_gate_error = ""
+
+                manual_confirmation_reason = str(
+                    cycle.review_result.manual_confirmation_reason or ""
+                )
+                if completion_gate_enabled and not completion_gate_valid:
+                    manual_confirmation_reason = manual_confirmation_reason or (
+                        "完成度闸门契约无效"
+                        f"（{completion_gate_error}）"
+                    )
+                if cycle.review_result.requires_manual_confirmation or manual_confirmation_reason:
+                    message = (
+                        f"{manual_confirmation_reason or '审查输出无法可靠判定'}；"
+                        "已暂停，需人工确认后再恢复执行"
+                    )
+                    logger.warning(
+                        "[Spec:%s] %s",
+                        self._project.name,
+                        message,
+                    )
+                    self._project.pause()
+                    self._project.error = message
+                    self._persist_state_best_effort()
+                    return True, "paused"
+
+                completion_gate_met = (
+                    completion_gate_valid
+                    and cycle.review_result.completion_gate_met
+                )
+                completion_gate_confidence = (
+                    cycle.review_result.completion_gate_confidence
+                )
 
         # Evidence-backed early stop: bypass streak requirement when completion_control
         # confirms GOAL_MET with high confidence AND objective verify passed AND
@@ -1346,24 +1394,25 @@ class SpecEngine(BaseEngine):
             )
             effective_review_passed = True
 
-        # Completion control veto: if completion_control says GOAL_NOT_MET with
-        # blocking suggestions, prevent success even if other signals say stop.
+        # Completion control veto: an explicit rejection, invalid/missing
+        # verdict, or format failure must prevent success even when there is no
+        # high-confidence blocking suggestion.
         if (
             all_satisfied
             and effective_review_passed
             and not completion_gate_met
             and cycle.review_result
-            and getattr(self.settings, "spec_completion_gate_enabled", True)
+            and completion_gate_enabled
         ):
-            from .adaptive_review import AdaptiveReviewResult
             if isinstance(cycle.review_result, AdaptiveReviewResult):
-                has_cc_blockers = any(
-                    o.role_id == "completion_control" and not o.passed
+                completion_control_rejected = any(
+                    o.role_id == "completion_control"
+                    and (not o.passed or o.goal_verdict != "GOAL_MET")
                     for o in cycle.review_result.role_outcomes
                 )
-                if has_cc_blockers:
+                if completion_control_rejected:
                     logger.info(
-                        "[Spec:%s] 完成度闸门否决：completion_control 有 blocking 建议",
+                        "[Spec:%s] 完成度闸门否决：completion_control 未提供有效通过判定",
                         self._project.name,
                     )
                     effective_review_passed = False

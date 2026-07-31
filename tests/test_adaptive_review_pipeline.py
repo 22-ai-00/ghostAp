@@ -98,7 +98,7 @@ def test_dependency_layers_run_after_prerequisites_finish():
     ]
 
 
-def test_evidence_less_blocker_is_downgraded_and_does_not_block_review_result():
+def test_evidence_less_blocker_is_downgraded_but_explicit_fail_stays_closed():
     roles = [_role("fact_checker")]
 
     def factory(role):
@@ -125,30 +125,32 @@ def test_evidence_less_blocker_is_downgraded_and_does_not_block_review_result():
         timeout=5,
     )
 
-    assert result.all_passed
-    assert result.reviews[0].passed is True
+    assert result.all_passed is False
+    assert result.reviews[0].passed is False
     assert "observation" in result.reviews[0].suggestions[0]
 
 
-def test_invalid_role_json_is_skipped_without_user_visible_evidence_suggestion():
+def test_invalid_role_json_requires_retry_or_manual_confirmation():
     outcome = parse_role_review_output(
         _role("fact_checker"),
         "I cannot provide JSON for this role review.",
     )
 
-    assert outcome.passed is True
+    assert outcome.passed is False
+    assert outcome.blocking is True
     assert outcome.suggestions == []
-    assert "role output was not valid JSON" not in outcome.summary
-    assert "role output was not valid JSON" not in outcome.error
+    assert "重试或人工确认" in outcome.summary
+    assert outcome.error.startswith("format_failure:")
 
 
-def test_non_json_role_output_degrades_to_plain_text_suggestions():
+def test_non_json_role_output_keeps_plain_text_diagnostics_but_fails_closed():
     outcome = parse_role_review_output(
         _role("tester"),
         "FAIL\n- 补充工具流式更新回归测试\n- 明确多角色审查建议和角色面板的关系",
     )
 
-    assert outcome.passed is True
+    assert outcome.passed is False
+    assert outcome.blocking is True
     assert [item.recommendation for item in outcome.suggestions] == [
         "补充工具流式更新回归测试",
         "明确多角色审查建议和角色面板的关系",

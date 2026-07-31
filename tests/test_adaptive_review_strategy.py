@@ -56,7 +56,14 @@ def _ctx(**overrides):
 
 
 def _factory(runner):
-    return lambda role: (lambda prompt, on_event=None, timeout=30: runner(prompt, on_event=on_event, timeout=timeout))
+    return lambda role: (
+        lambda prompt, on_event=None, timeout=30: runner(
+            prompt,
+            role_id=role.role_id,
+            on_event=on_event,
+            timeout=timeout,
+        )
+    )
 
 
 def test_select_default_is_adaptive_roles():
@@ -74,7 +81,25 @@ def test_adaptive_strategy_uses_artifacts_and_records_hashes():
 
     def runner(prompt, **kwargs):
         seen_prompts.append(prompt)
-        return json.dumps({"verdict": "PASS", "summary": "ok", "suggestions": []})
+        if '"role_id": "completion_control"' in prompt:
+            return json.dumps(
+                {
+                    "role_id": kwargs["role_id"],
+                    "verdict": "PASS",
+                    "goal_verdict": "GOAL_MET",
+                    "goal_confidence": "high",
+                    "evidence_summary": "验收证据完整",
+                    "suggestions": [],
+                }
+            )
+        return json.dumps(
+            {
+                "role_id": kwargs["role_id"],
+                "verdict": "PASS",
+                "summary": "ok",
+                "suggestions": [],
+            }
+        )
 
     result = AdaptiveRoleReviewStrategy().run(_ctx(prompt_runner_factory=_factory(runner)))
 
@@ -87,10 +112,11 @@ def test_adaptive_strategy_uses_artifacts_and_records_hashes():
     assert any(review.role_id for review in result.reviews)
 
 
-def test_adaptive_strategy_downgrades_evidence_less_blocker():
+def test_adaptive_strategy_downgrades_evidence_less_suggestion_but_keeps_fail_closed():
     def runner(prompt, **kwargs):
         return json.dumps(
             {
+                "role_id": kwargs["role_id"],
                 "verdict": "FAIL",
                 "summary": "claim without evidence",
                 "suggestions": [
@@ -122,7 +148,7 @@ def test_adaptive_strategy_downgrades_evidence_less_blocker():
         )
     )
 
-    assert result.all_passed is True
+    assert result.all_passed is False
     assert result.blocking_suggestion_hash == ""
     assert "missing evidence" in result.reviews[0].suggestions[0]
 
@@ -132,7 +158,25 @@ def test_adaptive_strategy_falls_back_to_fixed_roles_when_planner_fails(monkeypa
 
     def runner(prompt, **kwargs):
         prompts.append(prompt)
-        return json.dumps({"verdict": "PASS", "summary": "ok", "suggestions": []})
+        if '"role_id": "completion_control"' in prompt:
+            return json.dumps(
+                {
+                    "role_id": kwargs["role_id"],
+                    "verdict": "PASS",
+                    "goal_verdict": "GOAL_MET",
+                    "goal_confidence": "high",
+                    "evidence_summary": "验收证据完整",
+                    "suggestions": [],
+                }
+            )
+        return json.dumps(
+            {
+                "role_id": kwargs["role_id"],
+                "verdict": "PASS",
+                "summary": "ok",
+                "suggestions": [],
+            }
+        )
 
     monkeypatch.setattr(
         "src.spec_engine.review_strategy.build_adaptive_role_plan",
