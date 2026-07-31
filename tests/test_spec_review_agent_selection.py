@@ -1,4 +1,5 @@
 import json
+import re
 from random import Random
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -86,8 +87,16 @@ def test_adaptive_review_uses_selected_agents_for_role_sessions(monkeypatch):
             return None
 
         def send_prompt(self, prompt: str, on_event=None, timeout: float = 240.0):
+            role_id = re.search(r'"role_id": "([^"]+)"', prompt).group(1)
             return SimpleNamespace(
-                text='{"role_id":"x","verdict":"PASS","summary":"ok","suggestions":[]}'
+                text=json.dumps(
+                    {
+                        "role_id": role_id,
+                        "verdict": "PASS",
+                        "summary": "ok",
+                        "suggestions": [],
+                    }
+                )
             )
 
     monkeypatch.setattr("src.spec_engine.review_strategy.EphemeralReviewSession", FakeReviewSession)
@@ -99,6 +108,7 @@ def test_adaptive_review_uses_selected_agents_for_role_sessions(monkeypatch):
         spec_review_failure_circuit_enabled=False,
         spec_review_max_parallel=3,
         spec_review_timeout=30,
+        spec_completion_gate_enabled=False,
     )
     artifacts = ReviewArtifacts(cycle_number=1, requirement="build", cwd="/tmp")
     result = AdaptiveRoleReviewStrategy().run(
@@ -163,6 +173,7 @@ def test_adaptive_review_falls_back_to_default_agent_when_selected_agent_times_o
         spec_review_failure_circuit_enabled=False,
         spec_review_max_parallel=1,
         spec_review_timeout=30,
+        spec_completion_gate_enabled=False,
     )
     artifacts = ReviewArtifacts(cycle_number=1, requirement="build", cwd="/tmp")
     result = AdaptiveRoleReviewStrategy().run(
