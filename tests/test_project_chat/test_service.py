@@ -231,12 +231,16 @@ class TestRollback:
     """Verify rollback on failure after chat creation."""
 
     def test_rollback_on_project_create_failure(self, service, project_manager, mock_lark_client, tmp_path):
-        """If create_project fails, delete_chat should be called."""
+        """A known remote group is retained untrusted when local creation fails."""
         path = "/nonexistent/impossible/path/that/will/fail_create"
 
         # ProjectManager.create_project will fail for this path (can't mkdir)
         # Actually, let's mock it to fail
-        with patch.object(project_manager, "create_project", return_value=(False, "disk error", None)):
+        with patch.object(
+            project_manager,
+            "create_project_with_managed_chat_saga",
+            return_value=(False, "disk error", None),
+        ):
             service.handle(
                 message_id="msg_3",
                 chat_id="oc_main",
@@ -244,7 +248,12 @@ class TestRollback:
                 data={"name": "broken", "path": path},
             )
 
-        mock_lark_client.delete_chat.assert_called_once_with("oc_new_group_123")
+        mock_lark_client.delete_chat.assert_not_called()
+        operation_id = f"new-chat::broken:{os.path.normpath(path)}"
+        assert project_manager.managed_group_residual(operation_id) == (
+            "oc_new_group_123",
+            "untrusted_retained",
+        )
 
     def test_no_rollback_on_chat_create_failure(self, service, mock_lark_client, tmp_path):
         """If create_chat fails, no rollback needed."""

@@ -450,17 +450,6 @@ class ManagedGroupRegistry:
                 receiving_bot_ref=intent["receiving_bot_ref"],
             )
 
-    def provision_ids_for_chat(self, chat_id: str) -> tuple[str, ...]:
-        chat = self._runtime_string(chat_id, "chat_id")
-        with self._disk_transaction():
-            return tuple(
-                sorted(
-                    provision_id
-                    for provision_id, intent in self._intents.items()
-                    if intent.get("remote_chat_id") == chat
-                )
-            )
-
     def provision_create_state(self, provision_id: str) -> str | None:
         key = self._runtime_string(provision_id, "provision_id")
         with self._disk_transaction():

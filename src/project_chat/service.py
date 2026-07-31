@@ -121,6 +121,15 @@ class ProjectChatService:
         if ctx is None:
             ctx = self._pm.find_project_by_name(name, chat_id=None)
             if ctx:
+                if self._pm.pending_managed_chat_binding_sagas_for_project(
+                    ctx.project_id
+                ):
+                    self._reply(
+                        message_id,
+                        "⚠️ 项目存在未完成的受管群绑定事务，禁止修改根目录；请先重试原绑定。",
+                        None,
+                    )
+                    return
                 # Update root_path/working_dir to current path for legacy project
                 ctx.root_path = path
                 ctx.working_dir = path
@@ -165,17 +174,33 @@ class ProjectChatService:
                         None,
                     )
                     return
-                saga = self._pm.managed_chat_binding_saga(provision_id)
-                if saga is not None and (
-                    not self._pm.validate_managed_chat_binding_saga(provision_id)
-                    or not self._pm.complete_managed_chat_binding_saga(provision_id)
-                ):
-                    self._reply(
-                        message_id,
-                        "⚠️ 项目群已登记，但本地绑定事务尚未安全收尾，请重试。",
-                        None,
+                pending = self._pm.pending_managed_chat_binding_sagas_for_project(
+                    ctx.project_id,
+                    ctx.bound_chat_id,
+                )
+                if pending:
+                    saga = self._pm.resolve_managed_chat_binding_saga(
+                        project_id=ctx.project_id,
+                        chat_id=ctx.bound_chat_id,
+                        expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+                        expected_owner_id=self._owner_id,
+                        expected_receiving_bot_ref=self._receiving_bot_ref,
+                        expected_root_ref=ctx.root_path,
                     )
-                    return
+                    if saga is None or (
+                        not self._pm.validate_managed_chat_binding_saga(
+                            saga.operation_id
+                        )
+                        or not self._pm.complete_managed_chat_binding_saga(
+                            saga.operation_id
+                        )
+                    ):
+                        self._reply(
+                            message_id,
+                            "⚠️ 项目群已登记，但本地绑定事务尚未安全收尾，请重试。",
+                            None,
+                        )
+                        return
             # Branch A: already bound → ensure originating chat can see it, then return jump card
             if chat_id and chat_id not in ctx.allowed_chat_ids:
                 ctx.add_chat_id(chat_id)
@@ -323,24 +348,11 @@ class ProjectChatService:
                             None,
                         )
                         return
-                    delete_result = self._delete_remote_if_exclusive(
-                        provision_id, new_chat_id
-                    )
-                    if delete_result is True:
-                        self._abandon_provision(provision_id)
-                    else:
-                        self._pm.record_managed_group_residual(
-                            provision_id,
-                            new_chat_id,
-                            (
-                                "delete_rejected"
-                                if delete_result is False
-                                else "delete_unknown"
-                            ),
-                        )
+                    self._record_untrusted_remote(provision_id, new_chat_id)
                     self._reply(
                         message_id,
-                        "❌ 受管群远端绑定持久化失败，请重试或人工确认残留群。",
+                        "⚠️ 受管群远端绑定持久化失败；为避免竞态删错群，"
+                        "已保留该群但不授予信任，请重试验证或由 Owner 处理。",
                         None,
                     )
                     return
@@ -368,16 +380,12 @@ class ProjectChatService:
                     expected_receiving_bot_ref=self._receiving_bot_ref,
                 )
                 if not success or not ctx_new:
-                    delete_result = self._delete_remote_if_exclusive(
-                        provision_id, new_chat_id
+                    self._record_untrusted_remote(provision_id, new_chat_id)
+                    self._reply(
+                        message_id,
+                        f"⚠️ 创建项目失败: {msg}；远端群已保留但不授予信任，请由 Owner 核对。",
+                        None,
                     )
-                    self._reply(message_id, f"❌ 创建项目失败: {msg}", None)
-                    if delete_result is True:
-                        self._abandon_provision(provision_id)
-                    elif delete_result is not True:
-                        self._record_delete_residual(
-                            provision_id, new_chat_id, delete_result
-                        )
                     return
                 created_project = True
                 ctx = ctx_new
@@ -448,22 +456,8 @@ class ProjectChatService:
                     remote_chat_id=new_chat_id,
                 )
             )
-            delete_result = (
-                self._delete_remote_if_exclusive(provision_id, new_chat_id)
-                if rollback_ok
-                else "guarded"
-            )
-            if delete_result is True:
-                self._abandon_provision(provision_id)
-                detail = "飞书群已删除"
-            elif delete_result is False:
-                detail = "飞书群删除失败，请手动删除；该群未获得信任"
-            else:
-                detail = "飞书删群未执行或结果未知，请人工确认；该群未获得信任"
-            if delete_result is not True:
-                self._record_delete_residual(
-                    provision_id, new_chat_id, delete_result
-                )
+            self._record_untrusted_remote(provision_id, new_chat_id)
+            detail = "远端群已保留但未获得信任，请由 Owner 重试验证或处理"
             if not rollback_ok:
                 detail += "；本地补偿持久化失败，绑定已隔离，请人工检查"
             self._reply(message_id, f"❌ 项目群绑定失败，{detail}", None)
@@ -481,45 +475,16 @@ class ProjectChatService:
         except Exception:
             logger.exception("failed to abandon managed group provision")
 
-    def _delete_remote_if_exclusive(
+    def _record_untrusted_remote(
         self,
         provision_id: str,
         chat_id: str,
-    ) -> bool | None | str:
-        if self._managed_groups is not None:
-            record = self._managed_groups.record(chat_id)
-            if record is not None and record.status.value == "active":
-                return "guarded"
-            if any(
-                provision_id != bound_operation
-                for bound_operation in self._managed_groups.provision_ids_for_chat(
-                    chat_id
-                )
-            ):
-                return "guarded"
-            if any(
-                saga.chat_id == chat_id and saga.operation_id != provision_id
-                for saga in self._pm.pending_managed_chat_binding_sagas()
-            ):
-                return "guarded"
-            if self._pm.managed_chat_binding_saga(provision_id) is not None:
-                return "guarded"
-        return self._lark.delete_chat(chat_id)
-
-    def _record_delete_residual(
-        self,
-        provision_id: str,
-        chat_id: str,
-        result: bool | None | str,
     ) -> None:
-        state = (
-            "delete_rejected"
-            if result is False
-            else "delete_guarded"
-            if result == "guarded"
-            else "delete_unknown"
+        self._pm.record_managed_group_residual(
+            provision_id,
+            chat_id,
+            "untrusted_retained",
         )
-        self._pm.record_managed_group_residual(provision_id, chat_id, state)
 
     @staticmethod
     def _binding_snapshot(ctx: ProjectContext) -> dict[str, Any]:

@@ -5,10 +5,9 @@
 - Status: PARTIAL — lifecycle is hardened; Employee principal rotation production source is blocked
 - Branch: `dev`
 - Baseline: `7c34a2d9c4ec2a2d4051b9f69ea3340d3cbcbd5c`
-- Commit: `073e9c32c36ad3d3d8f1c0e8062ba63aa8823623`
-- Subject: `feat(trust): persist managed group lifecycle`
-- Review fix: `4970193c` (`fix(trust): harden managed group lifecycle`)
-- Second review fix: this commit (`fix(trust): close managed group crash windows`)
+- Initial commit: `073e9c32` (`feat(trust): persist managed group lifecycle`)
+- Review fixes: `4970193c`, `71d7d3cc`, `b8e39873`, `5ba6a7ce`
+- Fifth review fix: this commit (`fix(trust): retain unsafe managed group failures`)
 - Push: not performed
 
 Task 0.9's Registry and Project/Team lifecycle are implemented and hardened.
@@ -251,7 +250,7 @@ than being guessed from membership events.
 ## Fourth review correction
 
 - The Project binding saga is now a project-scoped compare-and-swap. It
-  persists the complete expected post-bind snapshot plus a monotonic binding
+  persists the complete expected post-bind snapshot plus a binding generation
   generation and the expected Registry origin/Owner/receiving-Bot/root facts.
   A second saga for the same project is rejected. Complete, restore, and
   removal-aware compensation first verify the expected state; a mismatch
@@ -259,14 +258,12 @@ than being guessed from membership events.
   chat bindings.
 - New-project creation, managed-chat binding, and the removal-aware saga now
   share one Project snapshot write. Project snapshot replace followed by a
-  parent-fsync error uses target readback and reports typed committed
+  parent-fsync error reports typed committed
   uncertainty, so callers preserve the Project and remote chat rather than
   rolling back memory and deleting a possibly committed group.
 - `/new-chat` serializes by canonical root instead of source chat. Retry paths
-  reread state under that lock. Remote deletion is guarded by raw ACTIVE
-  Registry state, other provision bindings, and pending sagas; every rejected,
-  unknown, or guarded deletion writes a durable residual. Recovered Project
-  and Team chats are remotely revalidated before activation.
+  reread state under that lock. Recovered Project and Team chats are remotely
+  revalidated before activation.
 - Startup consumes saga origin instead of merely loading it. ACTIVE completion
   compares Project/root/origin/Owner/receiving Bot and the empty creation grant;
   provision continuation compares the corresponding intent facts. Mismatched
@@ -298,3 +295,41 @@ than being guessed from membership events.
   and mobile execution remain `not_tested`.
 - Employee principal rotation remains the documented production-model blocker;
   Task 0.10 was not started and Task 0.9 remains partial on that item.
+
+## Fifth review correction
+
+- Any exception after the Project snapshot `os.replace` boundary now raises a
+  typed committed-but-uncertain error. Callers retain the in-memory Project and
+  saga and never reinterpret a parent-durability failure as an ordinary save
+  failure eligible for rollback.
+- Legacy binding sagas without the complete expected post-bind snapshot are
+  loaded as incompatible. Restore, removal-aware restore, and completion all
+  fail closed and quarantine their chat instead of manufacturing an expected
+  state from current mutable Project data.
+- The runtime already-ACTIVE path resolves exactly one pending saga by durable
+  project/chat/provenance/Owner/receiving-Bot/root facts. It finalizes that saga
+  before expanding visibility or reporting success, even when the display name
+  changed. Root is part of the saga CAS, and legacy name fallback cannot mutate
+  a Project root while any saga for that Project remains pending.
+- Once a remote Project or Team group is known to have been created, automatic
+  compensation never deletes it. Local failure rolls back or quarantines local
+  state, persists `untrusted_retained`, blocks blind same-name retries, and
+  tells the Owner that the group was retained without trust. Explicit Owner
+  dissolution remains the only lifecycle path here that dispatches deletion.
+
+### Fifth-correction verification
+
+- Initial focused RED: `13 failed, 54 deselected`; the broader post-replace
+  exception check then produced `1 failed, 1 passed` before the catch boundary
+  was widened from `OSError` to all ordinary exceptions. A propagation check
+  then produced `1 failed` before `_save_projects()` stopped converting typed
+  committed uncertainty into an ordinary `False` result.
+- Registry/ProjectGrant core: `86 passed, 2 warnings`.
+- Project/ProjectChat/Lark adjacency: `71 passed, 2 warnings`.
+- WS routing/handler/Slock adjacency: `292 passed, 2 warnings`.
+- Touched-file Ruff and `git diff --check`: passed.
+- No brief-wide or external slow suite was used as evidence because unrelated
+  test files are concurrently modified in the shared worktree. Real Feishu
+  tenant/mobile execution remains `not_tested`.
+- Employee principal rotation remains the documented production-model blocker;
+  Task 0.10 was not started and Task 0.9 remains partial.

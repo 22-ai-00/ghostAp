@@ -2028,23 +2028,18 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     )
                     manager.release_team_name(name)
                     return
-                self.reply_text(message_id, f"❌ 创建团队群失败: {safe_error_message(e)}")
                 if "new_chat_id" in locals():
-                    delete_result = lark_client.delete_chat(new_chat_id)
-                    if delete_result is True:
-                        self._abandon_managed_group_provision(
-                            managed_groups, provision_id
-                        )
-                    else:
-                        manager.block_team_name_for_cleanup(
-                            name,
-                            new_chat_id,
-                            (
-                                "delete_rejected"
-                                if delete_result is False
-                                else "delete_unknown"
-                            ),
-                        )
+                    manager.block_team_name_for_cleanup(
+                        name,
+                        new_chat_id,
+                        "untrusted_retained",
+                    )
+                    self.reply_text(
+                        message_id,
+                        f"⚠️ 创建团队群失败: {safe_error_message(e)}；"
+                        "为避免竞态删错群，已保留远端群但不授予信任，"
+                        "请由 Owner 核对。",
+                    )
                 elif (
                     managed_groups is not None
                     and isinstance(e, CreateChatError)
@@ -2058,6 +2053,10 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                         "create_outcome_unknown",
                     )
                 else:
+                    self.reply_text(
+                        message_id,
+                        f"❌ 创建团队群失败: {safe_error_message(e)}",
+                    )
                     self._abandon_managed_group_provision(
                         managed_groups, provision_id
                     )
@@ -2187,7 +2186,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     "服务恢复核对前该群不获得信任。",
                 )
                 return
-            logger.error("create_team: 激活失败, 回滚建群 chat=%s err=%s", new_chat_id, redact_sensitive(str(e)))
+            logger.error("create_team: 激活失败, 回滚本地状态 chat=%s err=%s", new_chat_id, redact_sensitive(str(e)))
             local_rollback_ok = True
             if engine is not None:
                 try:
@@ -2198,24 +2197,17 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 except Exception:
                     local_rollback_ok = False
                     logger.exception("create_team: 本地回滚失败 chat=%s", new_chat_id)
-            delete_result = lark_client.delete_chat(new_chat_id)
             detail = safe_error_message(e)
             local_state = "本地状态已回滚" if local_rollback_ok else "本地状态回滚失败"
-            if delete_result is True:
-                self._abandon_managed_group_provision(managed_groups, provision_id)
-                self.reply_text(message_id, f"❌ 团队激活失败，飞书群已删除，{local_state}: {detail}")
-            elif delete_result is False:
-                persisted = manager.block_team_name_for_cleanup(
-                    name, new_chat_id, "delete_rejected"
-                )
-                release_reservation = persisted
-                self.reply_text(message_id, f"⚠️ 团队激活失败，{local_state}，但飞书群删除失败，请手动删除: {detail}")
-            else:
-                persisted = manager.block_team_name_for_cleanup(
-                    name, new_chat_id, "delete_unknown"
-                )
-                release_reservation = persisted
-                self.reply_text(message_id, f"⚠️ 团队激活失败，{local_state}；飞书删群结果未知，请人工确认: {detail}")
+            persisted = manager.block_team_name_for_cleanup(
+                name, new_chat_id, "untrusted_retained"
+            )
+            release_reservation = persisted
+            self.reply_text(
+                message_id,
+                f"⚠️ 团队激活失败，{local_state}；"
+                f"远端群已保留但不授予信任，请由 Owner 核对: {detail}",
+            )
         finally:
             if release_reservation:
                 manager.release_team_name(name)

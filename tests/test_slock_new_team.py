@@ -373,7 +373,7 @@ class TestCreateTeamRollback:
     @patch("src.slock_engine.engine.create_engine_session")
     @patch("src.thread.manager.get_current_sender_id", return_value="ou_sender123")
     @patch("src.project_chat.lark_chat_client.LarkChatClient")
-    def test_activation_failure_rolls_back_group(
+    def test_activation_failure_retains_untrusted_group(
         self, MockLarkChatClient, mock_sender, mock_session, tmp_path
     ):
         ctx = _make_handler_ctx(tmp_path)
@@ -392,13 +392,17 @@ class TestCreateTeamRollback:
 
         handler.create_team("msg1", "oc_origin", "BadTeam")
 
-        # Group should be rolled back
-        mock_lark.delete_chat.assert_called_once_with("oc_to_delete")
+        # Automatic deletion is unsafe against concurrent lifecycle changes.
+        mock_lark.delete_chat.assert_not_called()
+        restarted = SlockEngineManager(
+            storage_base_path=ctx.settings.slock_memory_base_path
+        )
+        assert restarted.reserve_team_name("BadTeam") is False
 
         # Error reported to user
         handler.reply_text.assert_called_once()
         err_text = handler.reply_text.call_args[0][1]
-        assert "飞书群已删除" in err_text
+        assert "保留" in err_text
 
     @patch("src.slock_engine.engine.create_engine_session")
     @patch("src.thread.manager.get_current_sender_id", return_value="ou_sender123")

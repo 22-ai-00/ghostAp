@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.project.manager import ProjectManager
+from src.project.manager import ProjectCommitUncertainError, ProjectManager
 from src.project_chat.lark_chat_client import CreateChatResult
 from src.project_chat.service import ProjectChatService
 from src.trust.models import ManagedGroupOrigin, ManagedGroupStatus
@@ -211,6 +211,7 @@ def test_team_bind_failure_persists_residual_name_block(
 
     handler.create_team("om_new_team", "oc_owner_p2p", "Residual")
 
+    lark.delete_chat.assert_not_called()
     restarted = SlockEngineManager(
         storage_base_path=handler.ctx.settings.slock_memory_base_path
     )
@@ -293,17 +294,16 @@ def test_create_bind_registry_failure_never_reports_false_success(
 
     assert not any(event[0] == "welcome" for event in events)
     assert len([event for event in events if event[0] == "reply"]) == 1
-    lark_client.delete_chat.assert_called_once_with("oc_project_group")
+    lark_client.delete_chat.assert_not_called()
     assert registry.active_record("oc_project_group") is None
     project = project_manager.find_project_by_path(root, chat_id=None)
     assert project is None or not project.bound_chat_id
-    if delete_result is not True:
-        provision_id = f"new-chat:ou_owner:broken:{os.path.normpath(root)}"
-        restarted = ProjectManager(storage_path=str(tmp_path / "projects.json"))
-        assert restarted.managed_group_residual(provision_id) == (
-            "oc_project_group",
-            "delete_rejected" if delete_result is False else "delete_unknown",
-        )
+    provision_id = f"new-chat:ou_owner:broken:{os.path.normpath(root)}"
+    restarted = ProjectManager(storage_path=str(tmp_path / "projects.json"))
+    assert restarted.managed_group_residual(provision_id) == (
+        "oc_project_group",
+        "untrusted_retained",
+    )
 
 
 def test_project_registry_commit_uncertain_never_deletes_remote_chat(
@@ -1304,7 +1304,7 @@ def test_project_quarantine_survives_restart_and_blocks_bound_index(
     assert restarted.find_by_bound_chat_id("oc_quarantined") is None
 
 
-def test_project_parent_directory_fsync_open_failure_is_not_success(
+def test_project_parent_directory_fsync_open_failure_is_committed_uncertain(
     project_manager, monkeypatch
 ):
     monkeypatch.setattr(
@@ -1312,7 +1312,10 @@ def test_project_parent_directory_fsync_open_failure_is_not_success(
         MagicMock(side_effect=OSError("directory unavailable")),
     )
 
-    assert project_manager.quarantine_bound_chat("oc_unconfirmed") is False
+    with pytest.raises(ProjectCommitUncertainError) as raised:
+        project_manager.quarantine_bound_chat("oc_unconfirmed")
+
+    assert raised.value.committed is True
 
 
 def test_slock_residual_requires_parent_directory_fsync(tmp_path, monkeypatch):
@@ -1699,6 +1702,217 @@ def test_recovered_team_chat_is_revalidated_before_activation(
     assert "确认" in handler.reply_text.call_args.args[1]
 
 
+@pytest.mark.parametrize("failure_type", [OSError, RuntimeError])
+def test_project_post_replace_failure_is_committed_uncertain(
+    failure_type, tmp_path, project_manager, monkeypatch
+):
+    original_fsync = os.fsync
+
+    def fail_parent_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise failure_type("parent fsync failed")
+        original_fsync(fd)
+
+    monkeypatch.setattr("src.project.manager.os.fsync", fail_parent_fsync)
+
+    with pytest.raises(ProjectCommitUncertainError) as raised:
+        project_manager.create_project_with_managed_chat_saga(
+            project_id="double-uncertain",
+            project_name="double-uncertain",
+            root_path=str(tmp_path / "double-uncertain"),
+            owner_chat_id="oc_double_uncertain",
+            managed_chat_id="oc_double_uncertain",
+            managed_chat_name="double-uncertain-dev",
+            created_at=123.0,
+            operation_id="new-chat:ou_owner:double-uncertain",
+            expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+            expected_owner_id="ou_owner",
+            expected_receiving_bot_ref="cli_main_bot",
+        )
+
+    assert raised.value.committed is True
+    assert project_manager.get_project_for_diagnostics("double-uncertain") is not None
+    assert len(project_manager.pending_managed_chat_binding_sagas()) == 1
+
+
+@pytest.mark.parametrize("action", ["restore", "complete"])
+def test_legacy_binding_saga_without_expected_is_non_destructive(
+    action, tmp_path, project_manager
+):
+    operation_id = f"legacy:{action}"
+    success, _, project = project_manager.create_project_with_managed_chat_saga(
+        project_id=f"legacy-{action}",
+        project_name=f"legacy-{action}",
+        root_path=str(tmp_path / f"legacy-{action}"),
+        owner_chat_id="oc_legacy",
+        managed_chat_id="oc_legacy",
+        managed_chat_name="legacy-dev",
+        created_at=123.0,
+        operation_id=operation_id,
+        expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        expected_owner_id="ou_owner",
+        expected_receiving_bot_ref="cli_main_bot",
+    )
+    assert success and project is not None
+    storage = tmp_path / "projects.json"
+    payload = json.loads(storage.read_text(encoding="utf-8"))
+    saga = payload["managed_chat_binding_sagas"][operation_id]
+    payload["managed_chat_binding_sagas"][operation_id] = {
+        "chat_id": saga["chat_id"],
+        "project_id": saga["project_id"],
+        "remove_project_on_restore": True,
+        "snapshot": saga["snapshot"],
+    }
+    storage.write_text(json.dumps(payload), encoding="utf-8")
+    restarted = ProjectManager(storage_path=str(storage))
+
+    result = (
+        restarted.restore_managed_chat_binding_saga(operation_id)
+        if action == "restore"
+        else restarted.complete_managed_chat_binding_saga(operation_id)
+    )
+
+    assert result is False
+    assert restarted.get_project_for_diagnostics(f"legacy-{action}") is not None
+    assert len(restarted.pending_managed_chat_binding_sagas()) == 1
+    assert restarted.find_by_bound_chat_id("oc_legacy") is None
+
+
+def test_runtime_active_fast_path_finalizes_unique_saga_after_name_change(
+    tmp_path, project_manager, lark_client, registry
+):
+    root = str(tmp_path / "renamed-active")
+    os.makedirs(root)
+    success, _, project = project_manager.create_project(
+        "renamed-active", "original-name", root
+    )
+    assert success and project is not None
+    operation_id = f"new-chat:ou_owner:original_name:{os.path.normpath(root)}"
+    registry.begin_provision(
+        provision_id=operation_id,
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        receiving_bot_ref="cli_main_bot",
+        project_id=project.project_id,
+        canonical_root_ref=root,
+        created_at=datetime.now(UTC),
+    )
+    registry.bind_provision_chat(operation_id, "oc_renamed_active")
+    bound, _ = project_manager.bind_managed_chat_for_saga(
+        project.project_id,
+        "oc_renamed_active",
+        created_at=123.0,
+        operation_id=operation_id,
+        expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        expected_owner_id="ou_owner",
+        expected_receiving_bot_ref="cli_main_bot",
+    )
+    assert bound
+    registry.activate(
+        provision_id=operation_id,
+        chat_id="oc_renamed_active",
+        project_id=project.project_id,
+        canonical_root_ref=root,
+    )
+    service = _project_service(project_manager, lark_client, registry, [])
+
+    service.handle(
+        "om_renamed",
+        "oc_new_source",
+        "ou_owner",
+        {"name": "renamed-name", "path": root},
+    )
+
+    assert project_manager.pending_managed_chat_binding_sagas() == ()
+    assert "oc_new_source" in project.allowed_chat_ids
+    lark_client.create_chat.assert_not_called()
+
+
+def test_legacy_name_fallback_refuses_root_mutation_with_pending_saga(
+    tmp_path, project_manager, lark_client, registry
+):
+    original_root = str(tmp_path / "original-root")
+    new_root = str(tmp_path / "new-root")
+    os.makedirs(original_root)
+    os.makedirs(new_root)
+    success, _, project = project_manager.create_project(
+        "root-locked", "root-locked", original_root
+    )
+    assert success and project is not None
+    bound, _ = project_manager.bind_managed_chat_for_saga(
+        project.project_id,
+        "oc_root_locked",
+        created_at=123.0,
+        operation_id="pending-root-lock",
+        expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        expected_owner_id="ou_owner",
+        expected_receiving_bot_ref="cli_main_bot",
+    )
+    assert bound
+    events = []
+    service = _project_service(project_manager, lark_client, registry, events)
+
+    service.handle(
+        "om_root_change",
+        "oc_owner_p2p",
+        "ou_owner",
+        {"name": "root-locked", "path": new_root},
+    )
+
+    assert project.root_path == original_root
+    assert len(project_manager.pending_managed_chat_binding_sagas()) == 1
+    lark_client.create_chat.assert_not_called()
+
+
+def test_startup_quarantines_pending_saga_when_project_root_changed(
+    tmp_path, project_manager, registry
+):
+    from src.slock_engine.manager import SlockEngineManager
+
+    original_root = str(tmp_path / "startup-root-original")
+    changed_root = str(tmp_path / "startup-root-changed")
+    success, _, project = project_manager.create_project(
+        "startup-root", "startup-root", original_root
+    )
+    assert success and project is not None
+    operation_id = "startup-root-mismatch"
+    registry.begin_provision(
+        provision_id=operation_id,
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        receiving_bot_ref="cli_main_bot",
+        project_id=project.project_id,
+        canonical_root_ref=original_root,
+        created_at=datetime.now(UTC),
+    )
+    registry.bind_provision_chat(operation_id, "oc_startup_root")
+    bound, _ = project_manager.bind_managed_chat_for_saga(
+        project.project_id,
+        "oc_startup_root",
+        created_at=123.0,
+        operation_id=operation_id,
+        expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        expected_owner_id="ou_owner",
+        expected_receiving_bot_ref="cli_main_bot",
+    )
+    assert bound
+    project.root_path = changed_root
+    project.working_dir = changed_root
+    assert project_manager._save_projects()
+    manager = SlockEngineManager(storage_base_path=str(tmp_path / "slock"))
+    remote = MagicMock()
+    client = _startup_reconciler(
+        tmp_path, registry, manager, remote, project_manager
+    )
+
+    client._reconcile_managed_groups_before_slock_restore()
+
+    assert registry.active_record("oc_startup_root") is None
+    assert len(project_manager.pending_managed_chat_binding_sagas()) == 1
+    assert project_manager.find_by_bound_chat_id("oc_startup_root") is None
+    remote.delete_chat.assert_not_called()
+
+
 def test_lark_create_chat_uses_deterministic_operation_uuid():
     from src.project_chat.lark_chat_client import LarkChatClient
 
@@ -1748,13 +1962,14 @@ def test_project_bind_failure_persists_residual_and_blocks_blind_retry(
         {"name": "residual-project", "path": root},
     )
 
+    lark_client.delete_chat.assert_not_called()
     restarted = ProjectManager(storage_path=str(tmp_path / "projects.json"))
     provision_id = (
         f"new-chat:ou_owner:residual_project:{os.path.normpath(root)}"
     )
     assert restarted.managed_group_residual(provision_id) == (
         "oc_project_group",
-        "delete_rejected" if delete_result is False else "delete_unknown",
+        "untrusted_retained",
     )
 
     lark_client.create_chat.reset_mock()

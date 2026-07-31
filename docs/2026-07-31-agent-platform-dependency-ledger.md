@@ -312,10 +312,12 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
 - Lifecycle wiring: `/new-chat` and `/new-team` persist provision intent, create
   the Feishu group, durably bind Project/Team state, atomically activate one
   group+grant revision, then deliver welcome/success. Registry/bind failure
-  sends no success, compensates Project/Slock state, attempts Feishu deletion,
-  and leaves `False`/`None` deletion outcomes untrusted with one clear Owner
-  error. Confirmed/unknown Team dissolution writes a tombstone; a rejected
-  deletion restores the prior local/ACTIVE team.
+  sends no success and compensates Project/Slock state. Once the remote group
+  ID is known, compensation never auto-deletes it: the group is durably marked
+  `untrusted_retained`, blind retries are blocked, and the Owner receives one
+  clear error. Explicit Team dissolution still dispatches deletion; a
+  confirmed/unknown result writes a tombstone and rejection restores the prior
+  local/ACTIVE team.
 - TDD RED: the two required modules initially failed collection with two
   `ModuleNotFoundError: No module named 'src.trust.registry'` errors. Lifecycle
   wiring then produced `7 failed` on missing constructor injection, Team
@@ -373,13 +375,21 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   principal rotation remains the same production model blocker.
 - Fourth review: Project binding uses a project-scoped generation CAS and one
   durable create+bind+saga snapshot; `/new-chat` serializes by canonical root,
-  remotely revalidates recovered chats, and guards every compensation delete.
+  and remotely revalidates recovered chats.
   Startup compares origin/Owner/receiving-Bot/grant facts and excludes pending
   sagas from legacy migration. Slock restores a marker before canceling revoke
   after archive-fsync failure. This covers a single GhostAP primary process and
   restart replay, not distributed multi-process ProjectManager transactions.
   Employee principal rotation remains the same model blocker; Task 0.10 is
   still `missing`.
+- Fifth review: post-Project-replace exceptions are always typed
+  committed-uncertain; legacy sagas without a complete expected snapshot are
+  incompatible and non-destructive; saga CAS includes canonical root; and the
+  already-ACTIVE fast path resolves a unique saga from durable
+  project/chat/provenance facts before visibility or success. Known-created
+  Project/Team groups are retained untrusted on local failure rather than
+  automatically deleted. The focused lifecycle regressions and adjacent suites
+  pass; real tenant/mobile behavior remains `not_tested`.
 - Managed permission prompts remain a Task 0.8 matrix property with
   `permission_prompt_count(managed project task) = 0`; Task 0.9 adds no
   approval/tenant ACL. Real Feishu membership/receiving-bot validation,

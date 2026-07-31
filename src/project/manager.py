@@ -43,7 +43,7 @@ class ManagedChatBindingSaga:
     project_id: str
     chat_id: str
     snapshot: ManagedChatBindingSnapshot
-    expected: ManagedChatBindingSnapshot
+    expected: ManagedChatBindingSnapshot | None
     expected_origin: str = ""
     expected_owner_id: str = ""
     expected_receiving_bot_ref: str = ""
@@ -107,17 +107,12 @@ class ProjectManager:
                 os.fsync(dir_fd)
             finally:
                 os.close(dir_fd)
-        except OSError as exc:
+        except Exception as exc:
             if replaced:
-                try:
-                    committed = self._storage_path.read_text(encoding="utf-8") == serialized
-                except OSError:
-                    committed = False
-                if committed:
-                    raise ProjectCommitUncertainError(
-                        "project snapshot parent durability is uncertain",
-                        committed=True,
-                    ) from exc
+                raise ProjectCommitUncertainError(
+                    "project snapshot parent durability is uncertain",
+                    committed=True,
+                ) from exc
             raise
         finally:
             if tmp_path.exists():
@@ -274,7 +269,7 @@ class ProjectManager:
             self._active_project[managed_chat_id] = resolved_id
             self._managed_chat_binding_sagas[operation_id] = saga
             try:
-                saved = self._save_projects(raise_uncertain=True)
+                saved = self._save_projects()
             except ProjectCommitUncertainError:
                 raise
             if not saved:
@@ -648,7 +643,12 @@ class ProjectManager:
         saga: ManagedChatBindingSaga,
         project: ProjectContext,
     ) -> bool:
-        return cls._binding_snapshot(project) == saga.expected
+        return (
+            saga.expected is not None
+            and bool(saga.expected_root_ref)
+            and project.root_path == saga.expected_root_ref
+            and cls._binding_snapshot(project) == saga.expected
+        )
 
     def _quarantine_saga_locked(
         self,
@@ -753,7 +753,7 @@ class ProjectManager:
             was_quarantined = chat_id in self._quarantined_bound_chat_ids
             self._quarantined_bound_chat_ids.discard(chat_id)
             try:
-                if self._save_projects(raise_uncertain=True):
+                if self._save_projects():
                     return True, snapshot
             except ProjectCommitUncertainError:
                 raise
@@ -878,6 +878,47 @@ class ProjectManager:
         with self._lock:
             return self._managed_chat_binding_sagas.get(operation_id)
 
+    def pending_managed_chat_binding_sagas_for_project(
+        self,
+        project_id: str,
+        chat_id: str = "",
+    ) -> tuple[ManagedChatBindingSaga, ...]:
+        with self._lock:
+            return tuple(
+                saga
+                for saga in self._managed_chat_binding_sagas.values()
+                if saga.project_id == project_id
+                and (not chat_id or saga.chat_id == chat_id)
+            )
+
+    def resolve_managed_chat_binding_saga(
+        self,
+        *,
+        project_id: str,
+        chat_id: str,
+        expected_origin: object,
+        expected_owner_id: str,
+        expected_receiving_bot_ref: str,
+        expected_root_ref: str,
+    ) -> ManagedChatBindingSaga | None:
+        """Resolve exactly one compatible saga independent of display name."""
+
+        origin = self._origin_value(expected_origin)
+        with self._lock:
+            matches = tuple(
+                saga
+                for saga in self._managed_chat_binding_sagas.values()
+                if saga.project_id == project_id
+                and saga.chat_id == chat_id
+                and saga.expected is not None
+                and saga.expected_origin == origin
+                and saga.expected_owner_id == expected_owner_id
+                and saga.expected_receiving_bot_ref
+                == expected_receiving_bot_ref
+                and saga.expected_root_ref == expected_root_ref
+            )
+            return matches[0] if len(matches) == 1 else None
+
     def validate_managed_chat_binding_saga(self, operation_id: str) -> bool:
         """CAS-check one pending saga and quarantine any mismatched binding."""
 
@@ -942,6 +983,7 @@ class ProjectManager:
                 "delete_guarded",
                 "recovered_chat_invalid",
                 "registry_bind_uncertain",
+                "untrusted_retained",
             }
         ):
             return False
@@ -985,7 +1027,7 @@ class ProjectManager:
                 return None, "该项目已绑定到其他群聊，如需在当前群使用同一仓库，请使用 /new 创建新项目"
         return None, None
 
-    def _save_projects(self, *, raise_uncertain: bool = False) -> bool:
+    def _save_projects(self) -> bool:
         try:
             data = {
                 "projects": {pid: ctx.to_snapshot() for pid, ctx in self._projects.items()},
@@ -1017,15 +1059,21 @@ class ProjectManager:
                             "project_name": saga.snapshot.project_name,
                             "binding_generation": saga.snapshot.binding_generation,
                         },
-                        "expected": {
-                            "allowed_chat_ids": list(saga.expected.allowed_chat_ids),
-                            "bound_chat_created_at": saga.expected.bound_chat_created_at,
-                            "bound_chat_id": saga.expected.bound_chat_id,
-                            "bound_chat_name": saga.expected.bound_chat_name,
-                            "owner_chat_id": saga.expected.owner_chat_id,
-                            "project_name": saga.expected.project_name,
-                            "binding_generation": saga.expected.binding_generation,
-                        },
+                        "expected": (
+                            None
+                            if saga.expected is None
+                            else {
+                                "allowed_chat_ids": list(
+                                    saga.expected.allowed_chat_ids
+                                ),
+                                "bound_chat_created_at": saga.expected.bound_chat_created_at,
+                                "bound_chat_id": saga.expected.bound_chat_id,
+                                "bound_chat_name": saga.expected.bound_chat_name,
+                                "owner_chat_id": saga.expected.owner_chat_id,
+                                "project_name": saga.expected.project_name,
+                                "binding_generation": saga.expected.binding_generation,
+                            }
+                        ),
                         "expected_origin": saga.expected_origin,
                         "expected_owner_id": saga.expected_owner_id,
                         "expected_receiving_bot_ref": saga.expected_receiving_bot_ref,
@@ -1042,9 +1090,7 @@ class ProjectManager:
             return True
         except ProjectCommitUncertainError as exc:
             logger.error("保存项目数据耐久性不确定: %s", get_error_detail(exc))
-            if raise_uncertain:
-                raise
-            return False
+            raise
         except Exception as e:
             logger.error("保存项目数据失败: %s", get_error_detail(e))
             return False
@@ -1140,6 +1186,7 @@ class ProjectManager:
                         "delete_guarded",
                         "recovered_chat_invalid",
                         "registry_bind_uncertain",
+                        "untrusted_retained",
                     }
                 ):
                     raise ValueError("invalid managed group residual")
@@ -1246,11 +1293,7 @@ class ProjectManager:
                 )
                 expected_raw = value.get("expected")
                 if expected_raw is None:
-                    expected_snapshot = (
-                        self._binding_snapshot(project)
-                        if project is not None
-                        else parsed_snapshot
-                    )
+                    expected_snapshot = None
                 else:
                     if not isinstance(expected_raw, dict) or frozenset(
                         expected_raw
