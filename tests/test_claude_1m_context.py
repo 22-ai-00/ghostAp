@@ -9,7 +9,7 @@ the provider config flag that finally makes ``--model`` reach the CLI.
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.acp.claude_capabilities import (
     CONTEXT_1M_BETA,
@@ -28,6 +28,43 @@ from src.acp.providers import (
 )
 from src.ttadk.models import ACPModelOption
 from src.utils.env import apply_anthropic_betas
+
+
+def test_claude_1m_selection_reaches_real_cli_environment():
+    from src.agent_session.claude_cli import ClaudeCLIConfig, SyncClaudeCLISession
+
+    process = MagicMock()
+    process.stdout = iter([])
+    process.stderr = MagicMock()
+    process.stderr.read.return_value = ""
+    process.returncode = 0
+    process.poll.return_value = 0
+    process.wait.return_value = None
+    process.pid = 1234
+    session = SyncClaudeCLISession(
+        cwd="/tmp",
+        model_name="claude-opus-4-8[1m]",
+        config=ClaudeCLIConfig(add_dir=False, bypass_permissions=False),
+    )
+    session.session_id = "session-1"
+
+    with (
+        patch(
+            "src.agent_session.claude_cli.subprocess.Popen",
+            return_value=process,
+        ) as popen,
+        patch(
+            "src.utils.env.build_clean_env",
+            return_value={"ANTHROPIC_BETAS": "existing-beta"},
+        ),
+    ):
+        result = session.send_prompt("use the long context")
+
+    assert result.stop_reason == "end_turn"
+    argv = popen.call_args.args[0]
+    env = popen.call_args.kwargs["env"]
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
+    assert env["ANTHROPIC_BETAS"] == f"existing-beta,{CONTEXT_1M_BETA}"
 
 
 # ---------------------------------------------------------------------------

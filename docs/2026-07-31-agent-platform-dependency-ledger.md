@@ -140,7 +140,7 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 | --- | --- | --- | --- |
 | 0.1 执行通道产品合同 | complete | evidence-only | maturity/health/visibility；Owner 无完成度门禁，显式保护命令不被 Slock 截获 |
 | 0.2 Direct 纵向合同 | complete | evidence-only | 单目标 prompt、零 planner hop、真实 cancel/retry/session |
-| 0.3 Claude CLI 模型真实性 | partial | active | argv/env 真正绑定 model/1M；失败不污染选择 |
+| 0.3 Claude CLI 模型真实性 | complete | evidence-only | argv/env 真正绑定 model/1M；失败不污染选择 |
 | 0.4 Workflow binding/reviewer | complete (`ffeb2e82`) | evidence-only | immutable RunSpec、真实 binding/reviewer；Workflow 全集 945 passed |
 | 0.5 Worktree 终态/超时/评审 | complete (`9054d221`) | evidence-only | hard timeout、cancel ack、证据 review、无部分自动 merge |
 | 0.6 Spec completion fail-closed | complete (`93a52598`) | evidence-only | 明确失败不能被空建议转成通过 |
@@ -199,6 +199,35 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
 - Real Feishu/mobile and managed-project permission-prompt evidence:
   `not_tested`; the recorder is a local transport boundary and this task does
   not make a tenant or mobile-delivery claim.
+
+### Task 0.3 evidence
+
+- Production wiring: `SyncClaudeCLISession` retains the selected model. Its
+  real `subprocess.Popen` argv includes `--model <base-model>`; a `[1m]`
+  selection strips only the UI capability suffix from argv and merges
+  `context-1m-2025-08-07` into the actual Popen environment. The normal
+  session factory, engine factory, and Direct manager startup coordinator all
+  pass the selected model without changing resume/session-id, sandbox wrapping,
+  cancellation, or the one-factory/one-prompt topology.
+- TDD RED: the required three-file run produced `2 failed, 48 passed`; both
+  failures were `SyncClaudeCLISession.__init__() got an unexpected keyword
+  argument 'model_name'`. Expanded factory/Direct RED was `5 failed, 28
+  passed`, proving the normal factory, engine factory, and Direct recorder all
+  observed a missing Claude model.
+- GREEN: the required files were `52 passed`; Direct contract was `30 passed`;
+  manager/model/session/terminal/rate-limit adjacent tests were `167 passed`;
+  protected-lane, Deep, and review-factory adjacent tests were `47 passed`.
+  Existing capability tests continue to exclude unsupported 1M variants from
+  the UI model list.
+- Failure state: `test_failed_claude_restart_keeps_previous_project_selection`
+  proves a failed Claude activation leaves the prior project tool/model/mode/
+  snapshot and handler model unchanged and never calls the atomic project
+  commit. Task 0.3 reuses Task 0.2's request-token/start-before-commit flow;
+  it does not replace that transaction.
+- Real Feishu/manual and real remote Claude execution evidence: `not_tested`.
+  Local Popen-boundary tests are not tenant, mobile, or production CLI proof.
+  This is Task 0.3 local evidence only: it is not CP-T evidence and does not
+  claim that CP-P0 as a whole has passed.
 
 ### Task 0.8 evidence
 

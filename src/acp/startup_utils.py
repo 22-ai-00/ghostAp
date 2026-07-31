@@ -312,7 +312,7 @@ class AcpRetryStarter:
         cli_session_cls: Any,
     ) -> Any:
         if backend == StartupBackend.CLI:
-            return cli_session_cls(cwd=cwd or ".")
+            return cli_session_cls(cwd=cwd or ".", model_name=model_name)
         if model_name:
             try:
                 return acp_session_cls(agent_type=agent_type, cwd=cwd or ".", model_name=model_name)

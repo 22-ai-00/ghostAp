@@ -31,7 +31,7 @@ uv run python scripts/test_inventory.py tests/
 同 session 的真实首尝试超时后重试、factory 与 process-local pause/resume 路径。
 它不宣称 durable recovery，也不要求两条引擎改为同一内部算法。
 
-运行 `uv run python scripts/benchmark_direct_lane.py --runs 20` 会输出 Direct 远端调用拓扑分布。它只拒绝多出的 factory/prompt hop，不设置墙钟毫秒阈值；本地调度、CPU 与缓存差异不应改变该合同。当前 Claude CLI 的实际 factory model 记录为 `null`，是 Task 0.3 需要收紧的既知事实，不得在此合同中伪装成已绑定模型。
+运行 `uv run python scripts/benchmark_direct_lane.py --runs 20` 会输出 Direct 远端调用拓扑分布。它只拒绝多出的 factory/prompt hop，不设置墙钟毫秒阈值；本地调度、CPU 与缓存差异不应改变该合同。Claude CLI 的 Direct factory/prompt 记录必须保留所选 model；`[1m]` 选择在真实进程 argv 中使用基础 model，并在真实进程环境中携带对应 Anthropic beta。
 
 ## 准入与删减规则
 

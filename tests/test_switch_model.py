@@ -549,6 +549,49 @@ def _make_system_handler(is_coco_mode=False):
 
 
 class TestEnterModeWithAcpModelRouting(unittest.TestCase):
+    def test_failed_claude_restart_keeps_previous_project_selection(self):
+        handler = _make_system_handler(is_coco_mode=False)
+        project = ProjectContext(
+            project_id="project-1",
+            project_name="truthful-claude-model",
+            root_path="/tmp",
+        )
+        project.acp_tool_name = "coco"
+        project.acp_model_name = "previous-model"
+        project.set_programming_mode("coco", True, "previous-session", 4)
+        claude_handler = handler.ctx.handlers["claude"]
+        claude_handler.current_model = "previous-handler-model"
+        claude_handler.enter_mode.return_value = False
+        handler.update_card = MagicMock(return_value=True)
+        before = (
+            project.acp_tool_name,
+            project.acp_model_name,
+            project.coco_mode,
+            project.claude_mode,
+            project.coco_session_snapshot,
+            project.claude_session_snapshot,
+        )
+
+        handler.handle_select_acp_model(
+            "selection-card",
+            "chat-1",
+            "claude",
+            "claude-opus-4-8[1m]",
+            project,
+            run_immediately=True,
+        )
+
+        assert (
+            project.acp_tool_name,
+            project.acp_model_name,
+            project.coco_mode,
+            project.claude_mode,
+            project.coco_session_snapshot,
+            project.claude_session_snapshot,
+        ) == before
+        assert claude_handler.current_model == "previous-handler-model"
+        handler.ctx.project_manager.commit_acp_programming_activation.assert_not_called()
+
     def test_calls_enter_mode_when_not_in_coco_mode(self):
         handler = _make_system_handler(is_coco_mode=False)
         handler._enter_mode_with_acp_model("msg1", "chat1", "coco", "gpt-5.2")

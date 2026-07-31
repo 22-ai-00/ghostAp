@@ -13,6 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from ..acp.claude_capabilities import strip_1m_suffix
 from ..acp.client import (
     emit_referenced_changed_local_image_events,
     snapshot_local_image_artifacts,
@@ -67,10 +68,12 @@ class SyncClaudeCLISession:
         cwd: str,
         config: Optional[ClaudeCLIConfig] = None,
         *,
+        model_name: Optional[str] = None,
         employee_process_env: Mapping[str, str] | None = None,
     ):
         self._cwd = cwd
         self._cfg = config or ClaudeCLIConfig()
+        self._model_name = (model_name or "").strip() or None
         self._proc: Optional[subprocess.Popen] = None
         self._proc_group_id: int | None = None
         self._cancel_event = threading.Event()
@@ -179,6 +182,8 @@ class SyncClaudeCLISession:
                 args += ["--add-dir", self._cwd]
             if self._resolve_bypass_permissions():
                 args.append("--dangerously-skip-permissions")
+            if self._model_name:
+                args += ["--model", strip_1m_suffix(self._model_name)]
 
             if resumed:
                 args += ["--resume", self.session_id]
@@ -205,6 +210,9 @@ class SyncClaudeCLISession:
                     from ..utils.env import build_clean_env
 
                     env = build_clean_env()
+                from ..utils.env import apply_anthropic_betas
+
+                apply_anthropic_betas(env, self._model_name)
 
                 self._proc = subprocess.Popen(
                     args,
@@ -442,6 +450,7 @@ class SyncClaudeCLISession:
             "last_query": self.last_query,
             "is_resumed": self.is_resumed,
             "backend": "cli",
+            "model_name": self._model_name,
         }
 
     def get_session_info(self) -> str:

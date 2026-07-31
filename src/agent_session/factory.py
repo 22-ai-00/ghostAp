@@ -154,7 +154,7 @@ def create_sync_session(agent_type: str, cwd: str, model_name: Optional[str] = N
     except Exception:
         logger.debug("create_sync_session: cwd debug logging failed", exc_info=True)
     if agent_type == "claude":
-        return SyncClaudeCLISession(cwd=cwd)
+        return SyncClaudeCLISession(cwd=cwd, model_name=model_name)
 
     effective_model = model_name
     if not effective_model and agent_type in ("coco", ""):
@@ -263,6 +263,7 @@ def create_engine_session(
     if agent_type == "claude" and (not require_tool_filter or employee_env is not None):
         session: SyncSession = SyncClaudeCLISession(
             cwd=cwd,
+            model_name=model_name,
             employee_process_env=employee_env,
         )
         session.start()

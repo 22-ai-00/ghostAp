@@ -76,7 +76,7 @@ def test_public_direct_slash_route_then_current_mode_text_uses_one_factory_and_p
         f"factory:{expected_backend}",
         f"prompt:{expected_backend}",
     )
-    assert recorder.prompt_calls[0].model == (None if backend == "claude" else model)
+    assert recorder.prompt_calls[0].model == model
 
 
 @pytest.mark.parametrize(
@@ -341,10 +341,9 @@ def test_explicit_backend_keeps_single_target_factory_and_prompt(
         f"factory:{expected_backend}",
         f"prompt:{expected_backend}",
     )
-    # Claude's current CLI factory accepts only cwd; its selected model is
-    # intentionally recorded as absent here so Task 0.3 can tighten that
-    # separate, known transport contract without disguising the baseline.
-    assert recorder.prompt_calls[0].model == (None if backend == "claude" else model)
+    # Every backend, including Claude CLI, must retain the selected model at
+    # the real factory/prompt boundary.
+    assert recorder.prompt_calls[0].model == model
 
 
 def test_direct_lane_preserves_chat_project_thread_session_key(monkeypatch: pytest.MonkeyPatch):
