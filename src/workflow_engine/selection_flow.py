@@ -138,6 +138,8 @@ class SelectionFlowController:
     def set_step(self, step: int) -> None:
         if step not in (1, 2, 3):
             raise ValueError(f"step must be 1, 2, or 3, got {step!r}")
+        if step == self.step:
+            return
         self.step = step
         self.pending_tool_name = None
         self.model_page = 0
@@ -183,6 +185,8 @@ class SelectionFlowController:
         tool that is already expanded collapses it (clears the pending
         tool name).
         """
+        if is_review and tool_name:
+            self.review_auto_mode = False
         if not tool_name:
             self.pending_tool_name = None
             self.model_page = 0
@@ -199,14 +203,16 @@ class SelectionFlowController:
 
     def select_tool(self, tool_name: str, *, is_review: bool) -> None:
         """Select ``tool_name`` from a dropdown and keep its model panel open."""
-        del is_review
         self.pending_tool_name = str(tool_name or "").strip() or None
+        if is_review and self.pending_tool_name:
+            self.review_auto_mode = False
         self.model_page = 0
         self._reset_model_cascade()
 
     def set_model_page(self, tool_name: str, page: int, *, is_review: bool) -> None:
         """Keep ``tool_name`` expanded and move its inline model panel page."""
-        del is_review
+        if is_review and tool_name:
+            self.review_auto_mode = False
         if not tool_name:
             self.pending_tool_name = None
             self.model_page = 0
@@ -217,7 +223,8 @@ class SelectionFlowController:
 
     def set_model_group(self, tool_name: str, model_group: str, *, is_review: bool) -> None:
         """Select the base model/family in the cascading model picker."""
-        del is_review
+        if is_review and tool_name:
+            self.review_auto_mode = False
         self.pending_tool_name = str(tool_name or "").strip() or self.pending_tool_name
         self.pending_model_group = str(model_group or "").strip() or None
         self.pending_model_profile = None
@@ -226,7 +233,8 @@ class SelectionFlowController:
 
     def set_model_profile(self, tool_name: str, model_profile: str, *, is_review: bool) -> None:
         """Select the profile dimension for the current model family."""
-        del is_review
+        if is_review and tool_name:
+            self.review_auto_mode = False
         self.pending_tool_name = str(tool_name or "").strip() or self.pending_tool_name
         self.pending_model_profile = str(model_profile or "").strip() or None
         self.pending_model_effort = None
@@ -234,7 +242,8 @@ class SelectionFlowController:
 
     def set_model_effort(self, tool_name: str, model_effort: str, *, is_review: bool) -> None:
         """Select the effort dimension for the current model family/profile."""
-        del is_review
+        if is_review and tool_name:
+            self.review_auto_mode = False
         self.pending_tool_name = str(tool_name or "").strip() or self.pending_tool_name
         self.pending_model_effort = str(model_effort or "").strip() or None
         self.model_page = 0
@@ -270,6 +279,7 @@ class SelectionFlowController:
         # Dedup: reject if exact tool+model combo already exists
         store = self._selection_store(is_review=is_review)
         if is_review:
+            self.review_auto_mode = False
             tool = normalized.get("tool_name", "")
             model = normalized.get("model_name", "")
             use_default = normalized.get("use_default_model", False)
@@ -304,6 +314,9 @@ class SelectionFlowController:
             # Auto mode obviates the explicit review list; clear it so the
             # card no longer renders stale entries.
             self.review_selections.clear()
+            self.pending_tool_name = None
+            self.model_page = 0
+            self._reset_model_cascade()
 
     # ------------------------------------------------------------------
     # Validation
@@ -351,6 +364,14 @@ class SelectionFlowController:
         self.orchestrator_selections = dict(data.get("orchestrator_selections", {}))
         self.review_selections = dict(data.get("review_selections", {}))
         self.review_auto_mode = bool(data.get("review_auto_mode", False))
+        if self.review_auto_mode and self.review_selections:
+            # Legacy snapshots could contain both after an explicit selection
+            # was added from an Auto card. Preserve that latest explicit choice.
+            self.review_auto_mode = False
+        elif self.review_auto_mode:
+            self.pending_tool_name = None
+            self.model_page = 0
+            self._reset_model_cascade()
 
     # ------------------------------------------------------------------
     # Card construction — orchestrator step

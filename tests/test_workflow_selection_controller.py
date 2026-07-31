@@ -110,6 +110,68 @@ class TestStepNavigation:
         ctrl.set_step(3)
         assert ctrl.step == 3
 
+    def test_review_step_adds_two_distinct_traex_models_and_finishes(self):
+        ctrl = SelectionFlowController(step=2)
+        available_tools = [{"tool_name": "traex", "display_name": "Traex"}]
+        available_models = [
+            {
+                "name": "DeepSeek-V4-Flash/standard/high",
+                "display_name": "DeepSeek-V4-Flash/standard/high",
+            },
+            {
+                "name": "DeepSeek-V4-Flash/standard/low",
+                "display_name": "DeepSeek-V4-Flash/standard/low",
+            },
+        ]
+        ctrl.select_tool("traex", is_review=True)
+        ctrl.set_model_group("traex", "DeepSeek-V4-Flash", is_review=True)
+        ctrl.set_model_effort("traex", "high", is_review=True)
+
+        first_card = ctrl.build_review_combined_card(
+            available_tools=available_tools,
+            available_models=available_models,
+        )
+        first_model = next(
+            action
+            for action in _find_actions(first_card, "workflow_review_select_model")
+            if action.get("model_name") == "DeepSeek-V4-Flash/standard/high"
+        )
+        ctrl.set_step(2)
+        ctrl.add_or_update_selection(first_model, is_review=True, keep_panel_open=True)
+
+        assert ctrl.pending_tool_name == "traex"
+        assert ctrl.pending_model_group == "DeepSeek-V4-Flash"
+        ctrl.set_model_effort("traex", "low", is_review=True)
+        second_card = ctrl.build_review_combined_card(
+            available_tools=available_tools,
+            available_models=available_models,
+        )
+        second_model = next(
+            action
+            for action in _find_actions(second_card, "workflow_review_select_model")
+            if action.get("model_name") == "DeepSeek-V4-Flash/standard/low"
+        )
+        ctrl.set_step(2)
+        ctrl.add_or_update_selection(second_model, is_review=True, keep_panel_open=True)
+
+        assert {
+            selection["model_name"] for selection in ctrl.review_selections.values()
+        } == {
+            "DeepSeek-V4-Flash/standard/high",
+            "DeepSeek-V4-Flash/standard/low",
+        }
+        ok, error = ctrl.validate_non_empty(is_review=True)
+        assert ok is True
+        assert error == ""
+        finish_card = ctrl.build_review_combined_card(
+            available_tools=available_tools,
+            available_models=available_models,
+        )
+        assert _find_actions(finish_card, "workflow_review_finish")
+        next_step, snapshot = ctrl.finish_step()
+        assert next_step == 3
+        assert len(snapshot) == 2
+
     def test_set_step_invalid_raises(self):
         ctrl = _basic_controller()
         with pytest.raises(ValueError):
@@ -282,6 +344,78 @@ class TestReviewAutoMode:
         ctrl.set_review_auto_mode(True)
         assert ctrl.review_selections == {}
 
+    def test_set_auto_mode_closes_explicit_review_picker(self):
+        ctrl = _basic_controller(step=2)
+        ctrl.select_tool("traex", is_review=True)
+        ctrl.set_model_group("traex", "DeepSeek-V4-Flash", is_review=True)
+        ctrl.set_model_profile("traex", "standard", is_review=True)
+        ctrl.set_model_effort("traex", "high", is_review=True)
+        ctrl.model_page = 2
+
+        ctrl.set_review_auto_mode(True)
+
+        assert ctrl.review_auto_mode is True
+        assert ctrl.pending_tool_name is None
+        assert ctrl.pending_model_group is None
+        assert ctrl.pending_model_profile is None
+        assert ctrl.pending_model_effort is None
+        assert ctrl.model_page == 0
+        card = ctrl.build_review_combined_card(
+            available_tools=[{"tool_name": "traex", "display_name": "Traex"}],
+            available_models=[
+                {
+                    "name": "DeepSeek-V4-Flash/standard/high",
+                    "display_name": "DeepSeek-V4-Flash/standard/high",
+                }
+            ],
+        )
+        assert not _find_actions(card, "workflow_review_select_model")
+
+    def test_explicit_review_selection_disables_auto_mode(self):
+        ctrl = _basic_controller(step=2)
+        ctrl.set_review_auto_mode(True)
+
+        ctrl.add_or_update_selection(
+            {
+                "tool_name": "traex",
+                "display_name": "Traex",
+                "model_name": "DeepSeek-V4-Flash/standard/high",
+            },
+            is_review=True,
+            keep_panel_open=True,
+        )
+
+        assert ctrl.review_auto_mode is False
+        assert len(ctrl.review_selections) == 1
+
+    @pytest.mark.parametrize("method_name", ["select_tool", "toggle_tool_expand"])
+    def test_opening_review_tool_disables_auto_mode(self, method_name):
+        ctrl = _basic_controller(step=2)
+        ctrl.set_review_auto_mode(True)
+
+        getattr(ctrl, method_name)("traex", is_review=True)
+
+        assert ctrl.review_auto_mode is False
+        assert ctrl.pending_tool_name == "traex"
+
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        [
+            ("set_model_page", ("traex", 1)),
+            ("set_model_group", ("traex", "DeepSeek-V4-Flash")),
+            ("set_model_profile", ("traex", "standard")),
+            ("set_model_effort", ("traex", "high")),
+        ],
+    )
+    def test_changing_review_picker_disables_auto_mode(self, method_name, args):
+        ctrl = _basic_controller(step=2)
+        ctrl.set_review_auto_mode(True)
+
+        getattr(ctrl, method_name)(*args, is_review=True)
+
+        assert ctrl.review_auto_mode is False
+        assert ctrl.pending_tool_name == "traex"
+
     def test_set_auto_mode_false_keeps_state(self):
         ctrl = _basic_controller()
         ctrl.set_review_auto_mode(True)
@@ -366,6 +500,44 @@ class TestSnapshotRestore:
         assert ctrl.step == 1
         assert len(ctrl.orchestrator_selections) == 1
         assert ctrl.review_auto_mode is False
+
+    def test_restore_prefers_explicit_reviewers_over_legacy_auto_conflict(self):
+        ctrl = _basic_controller(step=2)
+
+        ctrl.restore({
+            "step": 2,
+            "review_auto_mode": True,
+            "review_selections": {
+                "review_1": {
+                    "selection_key": "review_1",
+                    "tool_name": "traex",
+                    "model_name": "DeepSeek-V4-Flash/standard/high",
+                }
+            },
+        })
+
+        assert ctrl.review_auto_mode is False
+        assert list(ctrl.review_selections) == ["review_1"]
+
+    def test_restore_auto_mode_closes_legacy_picker_state(self):
+        ctrl = _basic_controller(step=2)
+
+        ctrl.restore({
+            "step": 2,
+            "review_auto_mode": True,
+            "pending_tool_name": "traex",
+            "pending_model_group": "DeepSeek-V4-Flash",
+            "pending_model_profile": "standard",
+            "pending_model_effort": "high",
+            "model_page": 2,
+        })
+
+        assert ctrl.review_auto_mode is True
+        assert ctrl.pending_tool_name is None
+        assert ctrl.pending_model_group is None
+        assert ctrl.pending_model_profile is None
+        assert ctrl.pending_model_effort is None
+        assert ctrl.model_page == 0
 
     def test_snapshot_is_detached_copy(self):
         ctrl = _basic_controller()
