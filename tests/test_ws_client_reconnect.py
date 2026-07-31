@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-import inspect
+import json
 import os
 import threading
 import time
@@ -125,6 +125,42 @@ def test_employee_hire_status_uuid_is_stable_per_intent_and_status() -> None:
     assert _employee_hire_status_uuid("hire-intent-1", "active") == expected
     assert _employee_hire_status_uuid("hire-intent-1", "active") == expected
     assert _employee_hire_status_uuid("hire-intent-1", "ready") != expected
+
+
+def test_main_dispatcher_consumes_p2p_chat_entered_event_without_error() -> None:
+    """The Channel SDK still delivers this subscribed informational event."""
+    from src.feishu.ws_client import FeishuWSClient
+
+    client = object.__new__(FeishuWSClient)
+    entered = []
+    client._handle_message = lambda _event: None
+    client._handle_reaction_created = lambda _event: None
+    client._handle_bot_deleted = lambda _event: None
+    client._handle_message_read = lambda _event: None
+    client._handle_card_action = lambda _event: None
+    client._handle_chat_entered = entered.append
+
+    event_handler = client._build_event_handler()
+    payload = {
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt-p2p-entered",
+            "event_type": "im.chat.access_event.bot_p2p_chat_entered_v1",
+            "create_time": "1785500978668",
+            "token": "",
+            "app_id": "cli_test",
+            "tenant_key": "tenant_test",
+        },
+        "event": {"operator_id": {"open_id": "ou_test"}},
+    }
+
+    result = event_handler._do_without_validation(
+        json.dumps(payload).encode("utf-8")
+    )
+
+    assert result is None
+    assert len(entered) == 1
+    assert entered[0].event == payload["event"]
 
 
 def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
@@ -322,9 +358,35 @@ def test_channel_client_factory_returns_one_outbound_webhook_client(monkeypatch)
 def test_main_ws_acknowledges_bot_deleted_events() -> None:
     from src.feishu.ws_client import FeishuWSClient
 
-    source = inspect.getsource(FeishuWSClient.start)
+    client = object.__new__(FeishuWSClient)
+    deleted = []
+    client._handle_message = lambda _event: None
+    client._handle_reaction_created = lambda _event: None
+    client._handle_bot_deleted = deleted.append
+    client._handle_message_read = lambda _event: None
+    client._handle_card_action = lambda _event: None
+    client._handle_chat_entered = lambda _event: None
+    event_handler = client._build_event_handler()
+    payload = {
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt-bot-deleted",
+            "event_type": "im.chat.member.bot.deleted_v1",
+            "create_time": "1785500978668",
+            "token": "",
+            "app_id": "cli_test",
+            "tenant_key": "tenant_test",
+        },
+        "event": {"chat_id": "oc_deleted"},
+    }
 
-    assert "register_p2_im_chat_member_bot_deleted_v1" in source
+    result = event_handler._do_without_validation(
+        json.dumps(payload).encode("utf-8")
+    )
+
+    assert result is None
+    assert len(deleted) == 1
+    assert deleted[0].event.chat_id == "oc_deleted"
 
 
 def test_main_bot_deleted_event_retires_persisted_slock_marker() -> None:

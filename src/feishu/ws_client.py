@@ -3297,12 +3297,9 @@ class FeishuWSClient:
             )
         return self._restart_participation_id
 
-    def start(self):
-        """启动 WS 长连接并进入重连循环。
+    def _build_event_handler(self):
+        """Build the main Bot dispatcher with every subscribed event consumed."""
 
-        注意：该方法是阻塞的；通常在主线程调用。
-        """
-        self._publish_restart_participation()
         event_builder = (
             ChannelEventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._handle_message)
@@ -3311,9 +3308,10 @@ class FeishuWSClient:
             .register_p2_im_message_message_read_v1(self._handle_message_read)
             .register_p2_card_action_trigger(self._handle_card_action)
         )
-        # lark-channel-sdk intentionally omits the legacy p2p-chat-entered
-        # callback. GhostAP's handler is a no-op, so register it only when a
-        # compatible SDK build exposes the old method.
+        # lark-channel-sdk 1.1.0 omits the typed p2p-chat-entered registrar,
+        # while Feishu still delivers the subscribed event. Falling back to a
+        # customized processor preserves the previous no-op/ACK behavior and
+        # prevents the SDK from returning 500 (which triggers event retries).
         register_chat_entered = getattr(
             event_builder,
             "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1",
@@ -3321,7 +3319,20 @@ class FeishuWSClient:
         )
         if callable(register_chat_entered):
             event_builder = register_chat_entered(self._handle_chat_entered)
-        event_handler = event_builder.build()
+        else:
+            event_builder = event_builder.register_p2_customized_event(
+                "im.chat.access_event.bot_p2p_chat_entered_v1",
+                self._handle_chat_entered,
+            )
+        return event_builder.build()
+
+    def start(self):
+        """启动 WS 长连接并进入重连循环。
+
+        注意：该方法是阻塞的；通常在主线程调用。
+        """
+        self._publish_restart_participation()
+        event_handler = self._build_event_handler()
 
         self._message_cache.start_cleanup_thread()
         self._card_event_cache.start_cleanup_thread()
