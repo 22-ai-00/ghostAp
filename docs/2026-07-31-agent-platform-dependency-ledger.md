@@ -50,9 +50,9 @@ tenant beta、签名晋级或 48 小时发布门。
 
 | Task | 状态 | 直接依赖 | 完成证据 |
 | --- | --- | --- | --- |
-| F1 公共产品合同 | missing | 无 | 文档合同测试；README/metadata/命令叙述一致 |
-| F2 类型化安全姿态 | missing | F1 | posture 单测、配置校验、结构化输出 |
-| F3 入站默认拒绝与引导 | partial | F2 | user/chat 双维 deny-by-default、原子持久化、并发测试 |
+| F1 公共产品合同 | complete (`4b998c09`) | 无 | 文档合同 6 passed；README/metadata/命令叙述一致；独立复审通过 |
+| F2 类型化安全姿态 | complete (`4b998c09`) | F1 | posture/config/validate 121 passed；实际 validate 与独立复审通过 |
+| F3 入站默认拒绝与引导 | complete (`b3e30b4f`) | F2 | 专项复审 93 + 合并 ingress 回归 593 passed；四层事实校验、原子持久化、跨进程 RMW |
 | F4 Host Shell 显式授权 | missing | F2、F3 | P2P/管理员/聊天授权矩阵与拒绝回归 |
 | F5 Employee 显式启用 | partial | F2 | enable flag 默认关闭且早于 Vault/Journal 构造 |
 | F6 群上下文作用域与过期 | missing | F3、F5 | membership/consent/retention/tombstone/restart 测试 |
@@ -67,7 +67,7 @@ tenant beta、签名晋级或 48 小时发布门。
 | F15 provider/mode 漂移 | missing | F14 | 由 A6 与持久 binding 合同共同验收 |
 | F16 Spec provider-local retry | missing | F14、F15 | provider-local candidates/fingerprint 回归 |
 | F17 共享 run/checkpoint | missing | F13、F14 | 由 B1–B6 共同验收 |
-| F18 Worktree timeout/terminal | partial | F17 | 由 0.5/B8 共同验收 |
+| F18 Worktree timeout/terminal | partial | F17 | 0.5 保护门已完成：计划 26、相邻 91、Worktree 全集 347 passed；F17/B8 尚未完成 |
 | F19 Deep progress recovery | missing | F17 | checkpoint/restart/reconcile、无重复派发 |
 | F20 Workflow truthful recovery | partial | F17 | 由 0.4/B4/B5/B10 共同验收 |
 | F21 退休 Autonomous 隔离 | partial | F12 | legacy import boundary、中性 presentation |
@@ -82,12 +82,27 @@ tenant beta、签名晋级或 48 小时发布门。
 | 0.1 执行通道产品合同 | missing | 合并 F9；保护 A/B 迁移边界 | maturity/health/visibility 合同，无退休入口广告 |
 | 0.2 Direct 纵向合同 | missing | A3 cutover 前置 | 单目标 prompt、零额外 LLM hop、真实 cancel/retry/session |
 | 0.3 Claude CLI 模型真实性 | partial | F14/F15/A3 | argv/env 真正绑定 model/1M；失败不污染选择 |
-| 0.4 Workflow binding/reviewer | partial | B4/B9a 前置 | immutable RunSpec、真实 binding、真实 reviewer call |
-| 0.5 Worktree 终态/超时/评审 | partial | 合并 F18/B8 | hard wall clock、session cancel ack、无部分自动合并 |
-| 0.6 Spec completion fail-closed | partial | 保护 Spec | FAIL/非 JSON/无证据均拒绝完成 |
-| 0.7 辅助 Agent 权限 | missing | A1/A5 安全前置 | classifier/coordinator/summarizer deny-all 工具合同 |
+| 0.4 Workflow binding/reviewer | complete (`ffeb2e82`) | B4/B9a 前置 | immutable RunSpec、真实 binding 与 reviewer call；专项 16 + Workflow 全集 945 passed |
+| 0.5 Worktree 终态/超时/评审 | complete (`9054d221`) | 合并 F18/B8 | hard wall clock、requested/ack 分离、证据绑定评审、无部分自动合并；计划 26 + Worktree 全集 347 passed |
+| 0.6 Spec completion fail-closed | complete (`93a52598`) | 保护 Spec | 计划 229 + 相邻 114 passed；格式重试耗尽进入 PAUSED；独立复审通过 |
+| 0.7 辅助 Agent 权限 | complete (`f69acc90`) | A1/A5 安全前置 | 计划安全测试 17 + ACP 组合回归 97 passed；真实 permission bridge 全 kind fail-closed；独立复审通过 |
 
 CP-P0 必须在任何成熟路径迁移前通过。
+
+### 0.5 / F18 当前完成证据
+
+- 红测：未知 stop reason `6 failed`；review fail-closed `4 failed`；ACP cancel ack
+  `2 failed`；legacy CLI requested/ack `1 failed`；伪造 test provenance `3 failed`；
+  同命令旧成功覆盖最新失败 `1 failed`。
+- 生产接线：`worktree_engine/dispatcher.py` 做显式 executor、逐 session 有界 cancel、
+  generation/terminal fencing；`manager.py`/`reporter.py` 阻断失败、取消、评审失败和
+  部分自动合并；`review_adapter.py` 绑定真实 diff 与最新结构化 command/exit-code
+  证据；ACP/CLI session 明确取消确认返回合同；卡片渲染显示 WT 分支优先冲突规则。
+- 绿测：计划指定 `26 passed`；Task 18 与相邻 Worktree `91 passed`；完整 Worktree
+  `347 passed`；ACP/RateLimit/Claude CLI/TTADK CLI 取消相邻 `211 passed`；相关 Ruff
+  和 `git diff --check` 通过。
+- 范围：0.5 已完成；F18 保持 partial，因为 F17 共享 lifecycle 与 B8 black-box node
+  仍是后继工作，未在本任务内实现。
 
 ## Phase A status
 
