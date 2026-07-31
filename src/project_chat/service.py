@@ -201,6 +201,19 @@ class ProjectChatService:
                             None,
                         )
                         return
+                residual = self._pm.managed_group_residual(provision_id)
+                if residual == (ctx.bound_chat_id, "untrusted_retained"):
+                    cleanup_error = self._consume_residual_error(
+                        provision_id,
+                        residual,
+                    )
+                    if cleanup_error is not None:
+                        self._reply(
+                            message_id,
+                            f"⚠️ 项目群已获得信任，但{cleanup_error}",
+                            None,
+                        )
+                        return
             # Branch A: already bound → ensure originating chat can see it, then return jump card
             if chat_id and chat_id not in ctx.allowed_chat_ids:
                 ctx.add_chat_id(chat_id)
@@ -240,7 +253,68 @@ class ProjectChatService:
                 return
 
         residual = self._pm.managed_group_residual(provision_id)
-        if residual is not None and residual[1] not in {
+        recovering_residual: tuple[str, str] | None = None
+        if residual is not None and residual[1] == "untrusted_retained":
+            from .lark_chat_client import ManagedChatValidation
+
+            validation = self._lark.validate_managed_chat(
+                residual[0],
+                self._owner_id,
+            )
+            if validation is ManagedChatValidation.UNKNOWN:
+                self._reply(
+                    message_id,
+                    "⚠️ 无法确认上次保留群的 Owner/接收 Bot 身份，"
+                    "已继续阻止新建；请稍后重试。",
+                    None,
+                )
+                return
+            if validation is ManagedChatValidation.INVALID:
+                if not self._abandon_provision(provision_id):
+                    self._reply(
+                        message_id,
+                        "⚠️ 上次保留群校验失败，但 Registry 创建意图未能持久清理；"
+                        "已保留恢复记录并失败关闭。",
+                        None,
+                    )
+                    return
+                cleanup_error = self._consume_residual_error(
+                    provision_id,
+                    residual,
+                )
+                if cleanup_error is not None:
+                    self._reply(message_id, f"⚠️ {cleanup_error}", None)
+                    return
+                self._reply(
+                    message_id,
+                    "⚠️ 上次保留群已无法通过 Owner/接收 Bot 校验，"
+                    "本地恢复记录已清理；请重试原命令以明确新建。",
+                    None,
+                )
+                return
+            if self._managed_groups is None:
+                self._reply(message_id, "❌ 受管群服务未就绪，已保持阻断。", None)
+                return
+            try:
+                self._managed_groups.bind_provision_chat(
+                    provision_id,
+                    residual[0],
+                )
+            except Exception:
+                logger.exception(
+                    "retained project group recovery bind failed operation=%s",
+                    provision_id,
+                )
+                self._reply(
+                    message_id,
+                    "⚠️ 保留群已通过身份校验，但 Registry 绑定仍未确认；"
+                    "未新建群，请稍后重试。",
+                    None,
+                )
+                return
+            recovered_chat_id = residual[0]
+            recovering_residual = residual
+        elif residual is not None and residual[1] not in {
             "create_outcome_unknown",
             "registry_bind_uncertain",
         }:
@@ -261,11 +335,14 @@ class ProjectChatService:
                 self._owner_id,
             )
             if validation is not ManagedChatValidation.VALID:
-                self._pm.record_managed_group_residual(
+                residual_error = self._record_residual_error(
                     provision_id,
                     recovered_chat_id,
                     "recovered_chat_invalid",
                 )
+                if residual_error is not None:
+                    self._reply(message_id, f"⚠️ {residual_error}", None)
+                    return
                 self._reply(
                     message_id,
                     "⚠️ 无法确认重试群仍存在且 Owner/接收 Bot 均在群内，已停止激活。",
@@ -281,11 +358,14 @@ class ProjectChatService:
                     dispatched_at=datetime.now(UTC),
                 )
             ):
-                self._pm.record_managed_group_residual(
+                residual_error = self._record_residual_error(
                     provision_id,
                     "outcome_unknown",
                     "create_outcome_unknown",
                 )
+                if residual_error is not None:
+                    self._reply(message_id, f"⚠️ {residual_error}", None)
+                    return
                 self._reply(
                     message_id,
                     "⚠️ 上次建群结果仍不确定且去重窗口已过，已阻止重复建群；"
@@ -311,11 +391,13 @@ class ProjectChatService:
                     is CreateChatFailureDisposition.OUTCOME_UNKNOWN
                 ):
                     self._managed_groups.mark_create_outcome_unknown(provision_id)
-                    self._pm.record_managed_group_residual(
+                    residual_error = self._record_residual_error(
                         provision_id,
                         "outcome_unknown",
                         "create_outcome_unknown",
                     )
+                    if residual_error is not None:
+                        self._reply(message_id, f"⚠️ {residual_error}", None)
                 else:
                     self._abandon_provision(provision_id)
                 return
@@ -336,11 +418,14 @@ class ProjectChatService:
                         isinstance(exc, RegistryCommitUncertainError)
                         and exc.committed
                     ):
-                        self._pm.record_managed_group_residual(
+                        residual_error = self._record_residual_error(
                             provision_id,
                             new_chat_id,
                             "registry_bind_uncertain",
                         )
+                        if residual_error is not None:
+                            self._reply(message_id, f"⚠️ {residual_error}", None)
+                            return
                         self._reply(
                             message_id,
                             "⚠️ 受管群远端绑定结果不确定，已保留飞书群且不会执行删除；"
@@ -348,7 +433,12 @@ class ProjectChatService:
                             None,
                         )
                         return
-                    self._record_untrusted_remote(provision_id, new_chat_id)
+                    residual_error = self._record_untrusted_remote(
+                        provision_id, new_chat_id
+                    )
+                    if residual_error is not None:
+                        self._reply(message_id, f"⚠️ {residual_error}", None)
+                        return
                     self._reply(
                         message_id,
                         "⚠️ 受管群远端绑定持久化失败；为避免竞态删错群，"
@@ -380,7 +470,12 @@ class ProjectChatService:
                     expected_receiving_bot_ref=self._receiving_bot_ref,
                 )
                 if not success or not ctx_new:
-                    self._record_untrusted_remote(provision_id, new_chat_id)
+                    residual_error = self._record_untrusted_remote(
+                        provision_id, new_chat_id
+                    )
+                    if residual_error is not None:
+                        self._reply(message_id, f"⚠️ {residual_error}", None)
+                        return
                     self._reply(
                         message_id,
                         f"⚠️ 创建项目失败: {msg}；远端群已保留但不授予信任，请由 Owner 核对。",
@@ -422,6 +517,18 @@ class ProjectChatService:
                     None,
                 )
                 return
+            if recovering_residual is not None:
+                cleanup_error = self._consume_residual_error(
+                    provision_id,
+                    recovering_residual,
+                )
+                if cleanup_error is not None:
+                    self._reply(
+                        message_id,
+                        f"⚠️ 项目群已获得信任，但{cleanup_error}",
+                        None,
+                    )
+                    return
         except Exception as e:
             from ..project.manager import ProjectCommitUncertainError
             from ..trust.registry import RegistryCommitUncertainError
@@ -456,7 +563,12 @@ class ProjectChatService:
                     remote_chat_id=new_chat_id,
                 )
             )
-            self._record_untrusted_remote(provision_id, new_chat_id)
+            residual_error = self._record_untrusted_remote(
+                provision_id, new_chat_id
+            )
+            if residual_error is not None:
+                self._reply(message_id, f"⚠️ {residual_error}", None)
+                return
             detail = "远端群已保留但未获得信任，请由 Owner 重试验证或处理"
             if not rollback_ok:
                 detail += "；本地补偿持久化失败，绑定已隔离，请人工检查"
@@ -467,24 +579,64 @@ class ProjectChatService:
         self._reply_jump_card(message_id, ctx)
         self._send_welcome(new_chat_id, ctx)
 
-    def _abandon_provision(self, provision_id: str) -> None:
+    def _abandon_provision(self, provision_id: str) -> bool:
         if self._managed_groups is None:
-            return
+            return False
         try:
-            self._managed_groups.abandon_provision(provision_id)
+            return bool(self._managed_groups.abandon_provision(provision_id))
         except Exception:
             logger.exception("failed to abandon managed group provision")
+            return False
 
     def _record_untrusted_remote(
         self,
         provision_id: str,
         chat_id: str,
-    ) -> None:
-        self._pm.record_managed_group_residual(
+    ) -> str | None:
+        return self._record_residual_error(
             provision_id,
             chat_id,
             "untrusted_retained",
         )
+
+    def _record_residual_error(
+        self,
+        provision_id: str,
+        chat_id: str,
+        state: str,
+    ) -> str | None:
+        from ..project.manager import ProjectCommitUncertainError
+
+        try:
+            saved = self._pm.record_managed_group_residual(
+                provision_id,
+                chat_id,
+                state,
+            )
+        except ProjectCommitUncertainError:
+            return "远端群已保留且未授信，但本地恢复记录耐久性不确定；已失败关闭"
+        if not saved:
+            return "远端群已保留且未授信，但本地恢复记录持久化失败；当前进程已失败关闭"
+        return None
+
+    def _consume_residual_error(
+        self,
+        provision_id: str,
+        residual: tuple[str, str],
+    ) -> str | None:
+        from ..project.manager import ProjectCommitUncertainError
+
+        try:
+            consumed = self._pm.consume_managed_group_residual(
+                provision_id,
+                residual[0],
+                residual[1],
+            )
+        except ProjectCommitUncertainError:
+            return "本地恢复记录清理耐久性不确定；请重试核对"
+        if not consumed:
+            return "本地恢复记录未能持久清理；请重试核对"
+        return None
 
     @staticmethod
     def _binding_snapshot(ctx: ProjectContext) -> dict[str, Any]:

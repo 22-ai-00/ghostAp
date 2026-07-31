@@ -1894,7 +1894,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         Flow: validate → create group → promote sender → init engine →
               activate channel (workspace) → register managed chat →
               send welcome in new group → send jump card in original group.
-        On failure: rollback by deleting the created group.
+        On failure: roll back local state and retain the remote group untrusted.
         """
         if not name:
             self.reply_text(message_id, "请提供团队名称\n\n用法: `/new-team <团队名称>`")
@@ -1911,7 +1911,8 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         settings = self.ctx.settings
         group_name = self._format_slock_group_name(name, getattr(settings, "slock_team_name_suffix", "[Slock]"))
         manager = self._get_engine_manager()
-        if not manager.reserve_team_name(name):
+        retained_chat_id = manager.reserve_retained_team_name(name)
+        if retained_chat_id is None and not manager.reserve_team_name(name):
             self.reply_text(message_id, f"❌ 团队名称 **{name}** 已存在或正在创建，请换一个名称。")
             return
 
@@ -1922,6 +1923,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             f"new-team:{self._managed_group_owner_id()}:"
             f"{name.casefold()}:{root_path}"
         )
+        persisted = True
         if managed_groups is not None:
             from ...trust.models import ManagedGroupOrigin
 
@@ -1955,6 +1957,15 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
 
         # Step 1: Create Feishu group
         lark_client = LarkChatClient(api_client_factory=self.ctx.api_client_factory)
+        if retained_chat_id is not None:
+            if recovered_chat_id not in (None, retained_chat_id):
+                self.reply_text(
+                    message_id,
+                    "⚠️ 保留群与 Registry operation 记录不一致，已保持阻断。",
+                )
+                manager.release_team_name(name)
+                return
+            recovered_chat_id = retained_chat_id
         if recovered_chat_id is not None:
             from ...project_chat.lark_chat_client import ManagedChatValidation
 
@@ -1962,34 +1973,104 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 recovered_chat_id,
                 self._managed_group_owner_id(),
             )
+            if (
+                retained_chat_id is not None
+                and validation is ManagedChatValidation.INVALID
+            ):
+                if not self._abandon_managed_group_provision(
+                    managed_groups,
+                    provision_id,
+                ):
+                    self.reply_text(
+                        message_id,
+                        "⚠️ 保留团队群校验失败，但 Registry 创建意图未能持久清理；"
+                        "已保留恢复记录并失败关闭。",
+                    )
+                    return
+                consumed = manager.consume_retained_team_name(
+                    name,
+                    retained_chat_id,
+                )
+                if consumed:
+                    manager.release_team_name(name)
+                    self.reply_text(
+                        message_id,
+                        "⚠️ 上次保留团队群已无法通过 Owner/接收 Bot 校验，"
+                        "恢复记录已清理；请重试原命令明确新建。",
+                    )
+                else:
+                    self.reply_text(
+                        message_id,
+                        "⚠️ 保留团队群校验失败，且恢复记录未能持久清理；"
+                        "当前进程已失败关闭。",
+                    )
+                return
             if validation is not ManagedChatValidation.VALID:
-                manager.block_team_name_for_cleanup(
+                if retained_chat_id is not None:
+                    self.reply_text(
+                        message_id,
+                        "⚠️ 无法确认上次保留团队群的 Owner/接收 Bot 身份，"
+                        "已继续阻止新建；请稍后重试。",
+                    )
+                    manager.release_team_name(name)
+                    return
+                persisted = manager.block_team_name_for_cleanup(
                     name,
                     recovered_chat_id,
                     "recovered_chat_invalid",
                 )
                 self.reply_text(
                     message_id,
-                    "⚠️ 无法确认重试群仍存在且 Owner/接收 Bot 均在群内，已停止激活。",
+                    "⚠️ 无法确认重试群仍存在且 Owner/接收 Bot 均在群内，已停止激活。"
+                    + (
+                        ""
+                        if persisted
+                        else " 恢复记录持久化失败，当前进程已失败关闭。"
+                    ),
                 )
-                manager.release_team_name(name)
+                if persisted:
+                    manager.release_team_name(name)
                 return
+            if retained_chat_id is not None and managed_groups is not None:
+                try:
+                    managed_groups.bind_provision_chat(
+                        provision_id,
+                        retained_chat_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "create_team: retained Registry bind failed name=%s",
+                        name,
+                    )
+                    self.reply_text(
+                        message_id,
+                        "⚠️ 保留团队群已通过身份校验，但 Registry 绑定仍未确认；"
+                        "未新建群，请稍后重试。",
+                    )
+                    manager.release_team_name(name)
+                    return
             new_chat_id = recovered_chat_id
         else:
             if managed_groups is not None and not managed_groups.prepare_create_dispatch(
                 provision_id,
                 dispatched_at=datetime.now(UTC),
             ):
-                manager.block_team_name_for_cleanup(
+                persisted = manager.block_team_name_for_cleanup(
                     name,
                     "outcome_unknown",
                     "create_window_expired",
                 )
                 self.reply_text(
                     message_id,
-                    "⚠️ 上次建群结果仍不确定且去重窗口已过，已阻止重复建群；请人工核对飞书群。",
+                    "⚠️ 上次建群结果仍不确定且去重窗口已过，已阻止重复建群；请人工核对飞书群。"
+                    + (
+                        ""
+                        if persisted
+                        else " 恢复记录持久化失败，当前进程已失败关闭。"
+                    ),
                 )
-                manager.release_team_name(name)
+                if persisted:
+                    manager.release_team_name(name)
                 return
             try:
                 result = lark_client.create_chat(
@@ -2016,7 +2097,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     and e.committed
                     and "new_chat_id" in locals()
                 ):
-                    manager.block_team_name_for_cleanup(
+                    persisted = manager.block_team_name_for_cleanup(
                         name,
                         new_chat_id,
                         "registry_bind_uncertain",
@@ -2024,12 +2105,17 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     self.reply_text(
                         message_id,
                         "⚠️ 受管团队远端绑定结果不确定，已保留飞书群且不会执行删除；"
-                        "服务恢复核对后可安全重试。",
+                        + (
+                            "服务恢复核对后可安全重试。"
+                            if persisted
+                            else "恢复记录持久化失败，当前进程已失败关闭。"
+                        ),
                     )
-                    manager.release_team_name(name)
+                    if persisted:
+                        manager.release_team_name(name)
                     return
                 if "new_chat_id" in locals():
-                    manager.block_team_name_for_cleanup(
+                    persisted = manager.block_team_name_for_cleanup(
                         name,
                         new_chat_id,
                         "untrusted_retained",
@@ -2038,7 +2124,11 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                         message_id,
                         f"⚠️ 创建团队群失败: {safe_error_message(e)}；"
                         "为避免竞态删错群，已保留远端群但不授予信任，"
-                        "请由 Owner 核对。",
+                        + (
+                            "请由 Owner 核对。"
+                            if persisted
+                            else "本地恢复记录持久化失败，当前进程已失败关闭。"
+                        ),
                     )
                 elif (
                     managed_groups is not None
@@ -2047,10 +2137,19 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     is CreateChatFailureDisposition.OUTCOME_UNKNOWN
                 ):
                     managed_groups.mark_create_outcome_unknown(provision_id)
-                    manager.block_team_name_for_cleanup(
+                    persisted = manager.block_team_name_for_cleanup(
                         name,
                         "outcome_unknown",
                         "create_outcome_unknown",
+                    )
+                    self.reply_text(
+                        message_id,
+                        "⚠️ 建群结果不确定，已保持失败关闭；"
+                        + (
+                            "请在去重窗口内重试原命令。"
+                            if persisted
+                            else "恢复记录持久化失败，当前进程不会释放同名保留。"
+                        ),
                     )
                 else:
                     self.reply_text(
@@ -2060,7 +2159,8 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     self._abandon_managed_group_provision(
                         managed_groups, provision_id
                     )
-                manager.release_team_name(name)
+                if persisted:
+                    manager.release_team_name(name)
                 return
 
         engine = None
@@ -2103,6 +2203,16 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                     canonical_root_ref=root_path,
                 )
                 registry_committed = True
+                if retained_chat_id is not None and not (
+                    manager.consume_retained_team_name(name, new_chat_id)
+                ):
+                    release_reservation = False
+                    self.reply_text(
+                        message_id,
+                        f"⚠️ 团队 **{name}** 已获得信任，但恢复记录未能持久清理；"
+                        "请重试原命令完成核对。",
+                    )
+                    return
 
             # Runtime bootstrap follows durable Team bind + Registry ACTIVE.
             self._bootstrap_default_roles_if_configured(
@@ -2206,7 +2316,12 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             self.reply_text(
                 message_id,
                 f"⚠️ 团队激活失败，{local_state}；"
-                f"远端群已保留但不授予信任，请由 Owner 核对: {detail}",
+                f"远端群已保留但不授予信任，"
+                + (
+                    f"请由 Owner 核对: {detail}"
+                    if persisted
+                    else f"恢复记录持久化失败，当前进程已失败关闭: {detail}"
+                ),
             )
         finally:
             if release_reservation:
@@ -2250,13 +2365,14 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         return value if isinstance(value, str) else ""
 
     @staticmethod
-    def _abandon_managed_group_provision(registry, provision_id: str) -> None:
+    def _abandon_managed_group_provision(registry, provision_id: str) -> bool:
         if registry is None:
-            return
+            return False
         try:
-            registry.abandon_provision(provision_id)
+            return bool(registry.abandon_provision(provision_id))
         except Exception:
             logger.exception("failed to abandon Team managed-group provision")
+            return False
 
     @staticmethod
     def _format_slock_group_name(name: str, suffix: str = "[Slock]") -> str:
@@ -2459,7 +2575,11 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             return
         if delete_result is None:
             manager = self._get_engine_manager()
-            manager.block_team_name_for_cleanup(team_name, target_chat_id, "unknown")
+            residual_persisted = manager.block_team_name_for_cleanup(
+                team_name,
+                target_chat_id,
+                "unknown",
+            )
             if not self._tombstone_managed_team(
                 message_id, target_chat_id, team_name
             ):
@@ -2467,7 +2587,11 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             self.reply_text(
                 message_id,
                 f"⚠️ 团队 **{team_name}** 的飞书删群结果未知；本地已停止且不会自动恢复，请人工确认群状态。\n"
-                f"同名团队创建已阻止，直到人工处理完成。",
+                + (
+                    "同名团队创建已持久阻止，直到人工处理完成。"
+                    if residual_persisted
+                    else "同名团队当前进程已阻止，但恢复记录持久化失败。"
+                ),
             )
             return
 

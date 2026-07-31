@@ -341,6 +341,7 @@ class ProjectHandler(BaseHandler):
                     expected_origin=ManagedGroupOrigin.OWNER_ADOPTED,
                     expected_owner_id=owner_id,
                     expected_receiving_bot_ref=receiving_bot_ref,
+                    replace_legacy_saga=True,
                 )
             )
             if not bound or binding_snapshot is None:

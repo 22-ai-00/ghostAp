@@ -103,6 +103,30 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
             self._reserved_team_names.add(normalized)
             return True
 
+    def reserve_retained_team_name(self, team_name: str) -> Optional[str]:
+        """Claim an exact durable retained-group retry despite its name block."""
+
+        record = self._pending_cleanup_record(team_name)
+        if record is None or record.get("delete_state") != "untrusted_retained":
+            return None
+        chat_id = record.get("chat_id")
+        if not isinstance(chat_id, str) or not chat_id:
+            return None
+        normalized = (team_name or "").strip().casefold()
+        with self._lock:
+            if normalized in self._reserved_team_names:
+                return None
+            for engine in self._engines.values():
+                channel = engine.channel
+                if (
+                    channel
+                    and (channel.team_name or channel.name or "").strip().casefold()
+                    == normalized
+                ):
+                    return None
+            self._reserved_team_names.add(normalized)
+            return chat_id
+
     def release_team_name(self, team_name: str) -> None:
         normalized = (team_name or "").strip().casefold()
         with self._lock:
@@ -162,6 +186,55 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
             except OSError:
                 pass
             return False
+
+    def consume_retained_team_name(self, team_name: str, chat_id: str) -> bool:
+        """Durably consume one exact retained-group block after activation."""
+
+        record = self._pending_cleanup_record(team_name)
+        if (
+            record is None
+            or record.get("delete_state") != "untrusted_retained"
+            or record.get("chat_id") != chat_id
+        ):
+            return False
+        normalized = (team_name or "").strip().casefold()
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        records_dir = os.path.join(self._storage_base_path, "pending_cleanup")
+        record_path = os.path.join(records_dir, f"{digest}.json")
+        try:
+            os.unlink(record_path)
+            self._fsync_directory(records_dir)
+        except OSError:
+            logger.exception(
+                "consume_retained_team_name: cannot persist cleanup chat=%s",
+                chat_id,
+            )
+            return False
+        with self._lock:
+            self._blocked_team_names.discard(normalized)
+        return True
+
+    def _pending_cleanup_record(self, team_name: str) -> Optional[dict]:
+        normalized = (team_name or "").strip().casefold()
+        if not normalized:
+            return None
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        records_dir = os.path.join(self._storage_base_path, "pending_cleanup")
+        record_path = os.path.join(records_dir, f"{digest}.json")
+        if not os.path.isfile(record_path) or os.path.islink(record_path):
+            return None
+        try:
+            with open(record_path, "r", encoding="utf-8") as handle:
+                record = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if (
+            not isinstance(record, dict)
+            or str(record.get("team_name") or "").strip().casefold()
+            != normalized
+        ):
+            return None
+        return record
 
     def _load_pending_cleanup_names(self) -> set[str]:
         """Load durable residual-group name blocks, ignoring unsafe records."""

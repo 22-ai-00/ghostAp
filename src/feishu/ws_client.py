@@ -3320,10 +3320,6 @@ class FeishuWSClient:
         from ..trust.registry import RegistryCommitUncertainError
 
         for saga in self._project_manager.pending_managed_chat_binding_sagas():
-            if not self._project_manager.validate_managed_chat_binding_saga(
-                saga.operation_id
-            ):
-                continue
             project = self._project_manager.get_project_for_diagnostics(
                 saga.project_id
             )
@@ -3342,8 +3338,10 @@ class FeishuWSClient:
             expected_root = saga.expected_root_ref or (
                 project.root_path if project is not None else ""
             )
-            if (
+            active_matches = (
                 project is not None
+                and project.bound_chat_id == saga.chat_id
+                and project.root_path == expected_root
                 and active is not None
                 and grant is not None
                 and active.project_id == saga.project_id
@@ -3357,7 +3355,22 @@ class FeishuWSClient:
                 and grant.canonical_root_ref == expected_root
                 and not grant.backend_binding_ids
                 and not grant.connected_target_refs
+            )
+            if saga.expected is None:
+                if active_matches:
+                    self._project_manager.complete_exact_active_legacy_saga(
+                        saga.operation_id
+                    )
+                else:
+                    self._project_manager.mark_legacy_saga_resolution_required(
+                        saga.operation_id
+                    )
+                continue
+            if not self._project_manager.validate_managed_chat_binding_saga(
+                saga.operation_id
             ):
+                continue
+            if active_matches:
                 self._project_manager.complete_managed_chat_binding_saga(
                     saga.operation_id
                 )

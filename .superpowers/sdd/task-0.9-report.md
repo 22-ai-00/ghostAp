@@ -6,8 +6,8 @@
 - Branch: `dev`
 - Baseline: `7c34a2d9c4ec2a2d4051b9f69ea3340d3cbcbd5c`
 - Initial commit: `073e9c32` (`feat(trust): persist managed group lifecycle`)
-- Review fixes: `4970193c`, `71d7d3cc`, `b8e39873`, `5ba6a7ce`
-- Fifth review fix: this commit (`fix(trust): retain unsafe managed group failures`)
+- Review fixes: `4970193c`, `71d7d3cc`, `b8e39873`, `5ba6a7ce`, `8c22339a`
+- Sixth review fix: this commit (`fix(trust): recover retained managed groups`)
 - Push: not performed
 
 Task 0.9's Registry and Project/Team lifecycle are implemented and hardened.
@@ -231,8 +231,6 @@ than being guessed from membership events.
 - Project snapshot writes no longer treat parent-directory open/fsync failure
   as success. Slock residual writes now fsync their parent directory after
   replace and return failure when that durability boundary is unconfirmed.
-- Employee principal rotation remains the same documented model blocker;
-  Task 0.10 was not started.
 
 ### Third-correction verification
 
@@ -251,15 +249,15 @@ than being guessed from membership events.
 
 - The Project binding saga is now a project-scoped compare-and-swap. It
   persists the complete expected post-bind snapshot plus a binding generation
-  generation and the expected Registry origin/Owner/receiving-Bot/root facts.
+  token and the expected Registry origin/Owner/receiving-Bot/root facts.
   A second saga for the same project is rejected. Complete, restore, and
   removal-aware compensation first verify the expected state; a mismatch
   preserves the newer project, retains the saga, and quarantines both relevant
   chat bindings.
 - New-project creation, managed-chat binding, and the removal-aware saga now
   share one Project snapshot write. Project snapshot replace followed by a
-  parent-fsync error reports typed committed
-  uncertainty, so callers preserve the Project and remote chat rather than
+  parent-fsync error reports typed committed uncertainty, so callers preserve
+  the Project and remote chat rather than
   rolling back memory and deleting a possibly committed group.
 - `/new-chat` serializes by canonical root instead of source chat. Retry paths
   reread state under that lock. Recovered Project and Team chats are remotely
@@ -293,8 +291,6 @@ than being guessed from membership events.
 - No brief-wide or external slow suite was run or used as evidence because the
   shared worktree contains concurrent unrelated test edits. Real Feishu tenant
   and mobile execution remain `not_tested`.
-- Employee principal rotation remains the documented production-model blocker;
-  Task 0.10 was not started and Task 0.9 remains partial on that item.
 
 ## Fifth review correction
 
@@ -331,5 +327,41 @@ than being guessed from membership events.
 - No brief-wide or external slow suite was used as evidence because unrelated
   test files are concurrently modified in the shared worktree. Real Feishu
   tenant/mobile execution remains `not_tested`.
-- Employee principal rotation remains the documented production-model blocker;
-  Task 0.10 was not started and Task 0.9 remains partial.
+
+## Sixth review correction
+
+- `untrusted_retained` is now a recovery state, not a permanent dead end.
+  Project and Team retries resolve the exact operation and retained chat, use
+  the official membership validator, and reuse the existing group only on
+  `VALID`. `UNKNOWN` remains blocked without creating a second group.
+  `INVALID` durably consumes the local recovery record and provision intent,
+  then tells the Owner to retry the same command for an explicit new create.
+- A successful recovered Project/Team activation durably consumes its residual
+  or same-name block before ordinary success delivery. Project residual writes
+  check `False` and typed committed uncertainty. Team block writes check their
+  boolean result. A failed durability write keeps the current process
+  reservation/fail-closed state and reports the failure instead of claiming a
+  recoverable record exists.
+- Startup handles incompatible legacy sagas before the ordinary expected-state
+  CAS. Exact Project/ACTIVE/grant/chat/root/origin/Owner/receiving-Bot facts
+  safely consume the saga. Any mismatch persists
+  `legacy_saga_resolution_required` and quarantine. Owner `/access adopt-chat`
+  validates the remote group first, then atomically replaces the matching
+  legacy saga with a new `OWNER_ADOPTED` binding saga.
+
+### Sixth-correction verification
+
+- Initial focused run: `8 failed, 1 passed, 68 deselected`; the one weak
+  `UNKNOWN` assertion was tightened to require official validator use and then
+  failed independently. Focused GREEN: `9 passed, 68 deselected`; two explicit
+  `INVALID` cleanup/new-create checks also passed.
+- Registry/ProjectGrant core: `97 passed, 2 warnings`.
+- Project/ProjectChat/Lark adjacency: `71 passed, 2 warnings`.
+- WS routing/handler/Slock adjacency: `292 passed, 2 warnings`.
+- Touched-file Ruff and `git diff --check`: passed.
+- No brief-wide or external slow suite was used as evidence because unrelated
+  test files remain modified in the shared worktree. Real Feishu tenant/mobile
+  execution remains `not_tested`.
+- Scope remains one GhostAP primary process/single writer. Employee principal
+  rotation is still blocked on a trustworthy production event/rebind saga;
+  Task 0.9 remains partial, Task 0.10 was not started, and CP-T is not complete.

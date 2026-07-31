@@ -314,8 +314,9 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   group+grant revision, then deliver welcome/success. Registry/bind failure
   sends no success and compensates Project/Slock state. Once the remote group
   ID is known, compensation never auto-deletes it: the group is durably marked
-  `untrusted_retained`, blind retries are blocked, and the Owner receives one
-  clear error. Explicit Team dissolution still dispatches deletion; a
+  `untrusted_retained`; an exact same-operation retry remotely validates and
+  reuses it, while `UNKNOWN` or any blind new create remains blocked. The Owner
+  receives one clear error. Explicit Team dissolution still dispatches deletion; a
   confirmed/unknown result writes a tombstone and rejection restores the prior
   local/ACTIVE team.
 - TDD RED: the two required modules initially failed collection with two
@@ -390,6 +391,15 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   Project/Team groups are retained untrusted on local failure rather than
   automatically deleted. The focused lifecycle regressions and adjacent suites
   pass; real tenant/mobile behavior remains `not_tested`.
+- Sixth review: retained Project/Team retries resolve the exact Registry
+  operation and official-validator result. `VALID` reuses and activates the
+  existing chat, `UNKNOWN` stays blocked, and `INVALID` durably clears local
+  recovery state before an explicit same-command new create. Residual/block
+  write failures keep the current process fail closed and are disclosed.
+  Startup consumes an exact ACTIVE legacy saga or persists
+  `legacy_saga_resolution_required`; remotely validated Owner adoption replaces
+  that incompatible saga with `OWNER_ADOPTED` provenance. The implementation
+  remains single-primary-process and does not start Task 0.10.
 - Managed permission prompts remain a Task 0.8 matrix property with
   `permission_prompt_count(managed project task) = 0`; Task 0.9 adds no
   approval/tenant ACL. Real Feishu membership/receiving-bot validation,

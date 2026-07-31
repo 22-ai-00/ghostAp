@@ -694,6 +694,7 @@ class ProjectManager:
         expected_origin: object = "",
         expected_owner_id: str = "",
         expected_receiving_bot_ref: str = "",
+        replace_legacy_saga: bool = False,
     ) -> tuple[bool, ManagedChatBindingSnapshot | None]:
         """Bind and return the durable pre-bind state for compensation."""
 
@@ -705,6 +706,8 @@ class ProjectManager:
             if indexed not in (None, project_id):
                 return False, None
             existing_saga = self._managed_chat_binding_sagas.get(operation_id)
+            replaced_legacy_saga = None
+            replaced_legacy_residual = None
             if existing_saga is not None:
                 if (
                     existing_saga.project_id != project_id
@@ -718,12 +721,23 @@ class ProjectManager:
                     return False, None
                 return True, existing_saga.snapshot
             else:
-                if any(
-                    saga.project_id == project_id
-                    and saga.operation_id != operation_id
+                project_sagas = tuple(
+                    saga
                     for saga in self._managed_chat_binding_sagas.values()
-                ):
-                    return False, None
+                    if saga.project_id == project_id
+                    and saga.operation_id != operation_id
+                )
+                if project_sagas:
+                    if (
+                        replace_legacy_saga
+                        and len(project_sagas) == 1
+                        and project_sagas[0].expected is None
+                        and project_sagas[0].chat_id == chat_id
+                        and project_sagas[0].expected_root_ref == project.root_path
+                    ):
+                        replaced_legacy_saga = project_sagas[0]
+                    else:
+                        return False, None
                 snapshot = self._binding_snapshot(project)
             project.bound_chat_id = chat_id
             project.bound_chat_name = chat_name
@@ -736,6 +750,15 @@ class ProjectManager:
                 project.add_chat_id(additional_chat_id)
             expected = self._binding_snapshot(project)
             if operation_id:
+                if replaced_legacy_saga is not None:
+                    self._managed_chat_binding_sagas.pop(
+                        replaced_legacy_saga.operation_id,
+                        None,
+                    )
+                    replaced_legacy_residual = self._managed_group_residuals.pop(
+                        replaced_legacy_saga.operation_id,
+                        None,
+                    )
                 self._managed_chat_binding_sagas[operation_id] = (
                     ManagedChatBindingSaga(
                         operation_id=operation_id,
@@ -768,6 +791,14 @@ class ProjectManager:
                 self._quarantined_bound_chat_ids.add(chat_id)
             if operation_id and existing_saga is None:
                 self._managed_chat_binding_sagas.pop(operation_id, None)
+            if replaced_legacy_saga is not None:
+                self._managed_chat_binding_sagas[
+                    replaced_legacy_saga.operation_id
+                ] = replaced_legacy_saga
+                if replaced_legacy_residual is not None:
+                    self._managed_group_residuals[
+                        replaced_legacy_saga.operation_id
+                    ] = replaced_legacy_residual
             self._rebuild_bound_chat_index()
             return False, None
 
@@ -931,6 +962,52 @@ class ProjectManager:
                 return True
             return self._quarantine_saga_locked(saga, project)
 
+    def mark_legacy_saga_resolution_required(self, operation_id: str) -> bool:
+        """Persist a fail-closed Owner-resolution marker for one legacy saga."""
+
+        with self._lock:
+            saga = self._managed_chat_binding_sagas.get(operation_id)
+            if saga is None or saga.expected is not None:
+                return False
+            self._quarantined_bound_chat_ids.add(saga.chat_id)
+            self._managed_group_residuals[operation_id] = (
+                saga.chat_id,
+                "legacy_saga_resolution_required",
+            )
+            saved = self._save_projects()
+            self._rebuild_bound_chat_index()
+            return saved
+
+    def complete_exact_active_legacy_saga(self, operation_id: str) -> bool:
+        """Consume a legacy saga only after its Registry facts were verified."""
+
+        with self._lock:
+            saga = self._managed_chat_binding_sagas.get(operation_id)
+            if saga is None:
+                return True
+            project = self._projects.get(saga.project_id)
+            if (
+                saga.expected is not None
+                or project is None
+                or project.bound_chat_id != saga.chat_id
+                or project.root_path != saga.expected_root_ref
+            ):
+                return False
+            residual = self._managed_group_residuals.get(operation_id)
+            self._managed_chat_binding_sagas.pop(operation_id)
+            self._managed_group_residuals.pop(operation_id, None)
+            was_quarantined = saga.chat_id in self._quarantined_bound_chat_ids
+            self._quarantined_bound_chat_ids.discard(saga.chat_id)
+            if self._save_projects():
+                return True
+            self._managed_chat_binding_sagas[operation_id] = saga
+            if residual is not None:
+                self._managed_group_residuals[operation_id] = residual
+            if was_quarantined:
+                self._quarantined_bound_chat_ids.add(saga.chat_id)
+            self._rebuild_bound_chat_index()
+            return False
+
     def revoke_managed_chat(self, chat_id: str) -> bool:
         """Clear a Project binding after durable Registry revocation."""
 
@@ -984,6 +1061,7 @@ class ProjectManager:
                 "recovered_chat_invalid",
                 "registry_bind_uncertain",
                 "untrusted_retained",
+                "legacy_saga_resolution_required",
             }
         ):
             return False
@@ -1001,6 +1079,24 @@ class ProjectManager:
     ) -> tuple[str, str] | None:
         with self._lock:
             return self._managed_group_residuals.get(operation_id)
+
+    def consume_managed_group_residual(
+        self,
+        operation_id: str,
+        chat_id: str,
+        delete_state: str,
+    ) -> bool:
+        """CAS-consume one exact residual after successful reconciliation."""
+
+        with self._lock:
+            expected = (chat_id, delete_state)
+            if self._managed_group_residuals.get(operation_id) != expected:
+                return False
+            self._managed_group_residuals.pop(operation_id)
+            if self._save_projects():
+                return True
+            self._managed_group_residuals[operation_id] = expected
+            return False
 
     def find_project_by_name_with_hint(
         self, name: str, chat_id: Optional[str] = None
@@ -1187,6 +1283,7 @@ class ProjectManager:
                         "recovered_chat_invalid",
                         "registry_bind_uncertain",
                         "untrusted_retained",
+                        "legacy_saga_resolution_required",
                     }
                 ):
                     raise ValueError("invalid managed group residual")
