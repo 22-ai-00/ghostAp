@@ -73,3 +73,39 @@ def test_engine_factory_passes_selected_model_to_claude_cli() -> None:
         model_name="claude-opus-4-8[1m]",
         employee_process_env=None,
     )
+
+
+def test_sandboxed_claude_1m_uses_wrapped_base_model_and_copied_env() -> None:
+    original_env = {
+        "PATH": "/usr/bin",
+        "HOME": "/tmp/employee",
+        "ANTHROPIC_BETAS": "existing-beta",
+    }
+    original_snapshot = dict(original_env)
+    session = SyncClaudeCLISession(
+        cwd="/tmp",
+        model_name="claude-opus-4-8[1m]",
+        config=ClaudeCLIConfig(add_dir=False, bypass_permissions=False),
+        employee_process_env=original_env,
+    )
+    session.session_id = "session-1"
+    assert session._employee_sandbox is not None
+    session._employee_sandbox.wrap_argv = MagicMock(
+        side_effect=lambda argv: ["bwrap", "--", *argv]
+    )
+
+    with patch(
+        "src.agent_session.claude_cli.subprocess.Popen",
+        return_value=_completed_process(),
+    ) as popen:
+        result = session.send_prompt("review in sandbox")
+
+    assert result.stop_reason == "end_turn"
+    argv = popen.call_args.args[0]
+    env = popen.call_args.kwargs["env"]
+    assert argv[:4] == ["bwrap", "--", "claude", "-p"]
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
+    assert env["ANTHROPIC_BETAS"] == (
+        "existing-beta,context-1m-2025-08-07"
+    )
+    assert original_env == original_snapshot

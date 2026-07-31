@@ -467,6 +467,90 @@ def test_scheduled_acp_startup_failure_keeps_previous_project_selection(
     assert manager.get_session("chat-direct", project_id=project.project_id) is None
 
 
+def test_scheduled_claude_startup_failure_keeps_previous_project_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    """The real Claude manager startup boundary cannot pre-commit selection."""
+    attempts: list[tuple[str, str | None]] = []
+
+    class FailingClaudeSession:
+        def __init__(self, *, cwd: str, model_name: str | None = None):
+            attempts.append((cwd, model_name))
+            self.session_id = ""
+
+        def describe_agent(self) -> str:
+            return "claude cli startup failure"
+
+        def start(self, startup_timeout: float = 60) -> str:
+            raise OSError("claude unavailable")
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "src.acp.manager.SyncClaudeCLISession",
+        FailingClaudeSession,
+    )
+    manager = ACPSessionManager("claude")
+    ctx = _context("claude", manager)
+    project_manager = ProjectManager(str(tmp_path / "projects.json"))
+    _, _, project = project_manager.create_project(
+        "project-direct",
+        "direct-contract",
+        str(tmp_path),
+        "chat-direct",
+    )
+    assert project is not None
+    project.acp_tool_name = "coco"
+    project.acp_model_name = "previous-model"
+    project.set_programming_mode("coco", True, "previous-session", 2)
+    ctx.project_manager = project_manager
+
+    handler = ClaudeModeHandler(ctx)
+    handler.reply_text = MagicMock()
+    handler.reply_card = MagicMock()
+    handler.add_reaction = MagicMock()
+    handler.record_mode_transition = MagicMock()
+    handler.current_model = "previous-handler-model"
+    ctx.handlers["claude"] = handler
+    system = SystemHandler(ctx)
+    system.reply_text = MagicMock()
+    system.reply_card = MagicMock()
+    system.update_card = MagicMock(return_value=True)
+    submitted = []
+    ctx.scheduler.submit.side_effect = lambda spec, callback: submitted.append(callback)
+    before = (
+        project.acp_tool_name,
+        project.acp_model_name,
+        project.coco_mode,
+        project.claude_mode,
+        project.coco_session_snapshot,
+        project.claude_session_snapshot,
+    )
+
+    system.handle_select_acp_model(
+        "selection-card",
+        "chat-direct",
+        "claude",
+        "claude-opus-4-8[1m]",
+        project,
+    )
+
+    assert submitted and submitted[0](MagicMock()) is False
+    assert attempts == [(str(tmp_path), "claude-opus-4-8[1m]")]
+    assert (
+        project.acp_tool_name,
+        project.acp_model_name,
+        project.coco_mode,
+        project.claude_mode,
+        project.coco_session_snapshot,
+        project.claude_session_snapshot,
+    ) == before
+    assert handler.current_model == "previous-handler-model"
+    assert manager.get_session("chat-direct", project_id=project.project_id) is None
+
+
 def test_later_scheduled_selection_owns_project_commit(monkeypatch: pytest.MonkeyPatch, tmp_path):
     recorder = SessionCallRecorder()
     manager = ACPSessionManager("codex", session_starter=recorder.session_factory)

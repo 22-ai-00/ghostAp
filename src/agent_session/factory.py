@@ -482,7 +482,10 @@ def create_review_session(
     )
 
     if agent_type == "claude":
-        session: SyncSession = SyncClaudeCLISession(cwd=cwd)
+        session: SyncSession = SyncClaudeCLISession(
+            cwd=cwd,
+            model_name=model_name,
+        )
         session.start()
         return session
 

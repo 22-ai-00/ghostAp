@@ -229,6 +229,34 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   This is Task 0.3 local evidence only: it is not CP-T evidence and does not
   claim that CP-P0 as a whole has passed.
 
+#### Task 0.3 review remediation
+
+- Review and generic session factories now pass the selected Claude model.
+  A production `create_review_session` test drives its first prompt through the
+  actual Popen call and observes base-model argv plus the 1M beta environment;
+  this covers the factory used by Spec and Worktree reviewers rather than only
+  constructor mocks.
+- `SystemHandler.handle_select_acp_model` is the shared trusted activation
+  boundary for `/model`, card callbacks, and saved selections. Before claiming
+  a request token, rendering an initializing card, scheduling work, starting a
+  session, or committing project state, it rejects a Claude `[1m]` selection
+  whose base model is not 1M-capable.
+- Review RED was `4 failed, 70 passed`: review Popen argv lacked `--model`, the
+  default session factory omitted `model_name`, and both forged callback and
+  direct `/model` paths reached activation without rejection. The same focused
+  set became `74 passed` after the minimal fix.
+- Required Task 0.3 plus Direct was `86 passed`; review/Spec/Worktree/manager
+  adjacent tests were `128 passed`; UI text and employee sandbox adjacent tests
+  were `116 passed`. A real manager startup-failure regression observes the
+  selected Claude model at the failing session constructor while preserving all
+  prior project state. A sandbox Popen regression proves wrapped base-model
+  argv, beta env, and an unchanged caller-owned input mapping.
+- Final combined Task 0.3, Direct, review/Spec/Worktree, manager, UI, sandbox,
+  and handler run was `537 passed`; the 20-run Direct benchmark retained
+  exactly one `factory:codex -> prompt:codex` topology in every sample.
+- Real Feishu/manual and real Claude service execution remain `not_tested`.
+  These review tests still do not constitute CP-T or complete CP-P0 evidence.
+
 ### Task 0.8 evidence
 
 - Production wiring: `src/trust/models.py` defines frozen trust, grant,

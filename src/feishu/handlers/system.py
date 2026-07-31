@@ -9,6 +9,11 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+from ...acp.claude_capabilities import (
+    is_1m_variant,
+    model_supports_1m,
+    strip_1m_suffix,
+)
 from ...acp.helper import (
     fetch_acp_models,
     invalidate_acp_model_cache,
@@ -1199,6 +1204,19 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         model = None if use_default_model else (model_name or "").strip()
         if not tool or (not use_default_model and not model):
             self.reply_error(message_id, UI_TEXT["system_acp_select_model_prompt"])
+            return
+        if (
+            tool == "claude"
+            and model
+            and is_1m_variant(model)
+            and not model_supports_1m(strip_1m_suffix(model))
+        ):
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_acp_unsupported_1m_model"].format(
+                    model=strip_1m_suffix(model),
+                ),
+            )
             return
 
         target_project = project or self.project_manager.get_active_project(chat_id)

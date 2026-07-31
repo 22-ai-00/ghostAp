@@ -188,6 +188,7 @@ UI_TEXT = {
     "system_btw_usage": "请在 `/btw` 后补充要追加给当前编程会话的内容。",
     "system_btw_no_active_session": "当前没有活跃编程会话。请先发送 `/coco`、`/codex` 等进入编程模式。",
     "system_acp_unsupported_tool": "不支持的 ACP 工具: {tool_name}",
+    "system_acp_unsupported_1m_model": "Claude 模型 `{model}` 不支持 1M 上下文，请选择标准版本。",
     "system_acp_no_available_tools": "未检测到可用 ACP 工具",
     "system_acp_select_tool_prompt": "请选择 ACP 工具",
     "system_acp_select_model_prompt": "请选择 ACP 模型",

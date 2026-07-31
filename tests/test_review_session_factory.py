@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -30,6 +30,43 @@ def test_create_review_session_claude(tmp_path):
         s = create_review_session("claude", str(tmp_path))
         assert s is fake
         assert fake.started is True
+
+
+def test_claude_review_model_reaches_first_prompt_argv_and_env(tmp_path):
+    process = MagicMock()
+    process.stdout = iter([])
+    process.stderr = MagicMock()
+    process.stderr.read.return_value = ""
+    process.returncode = 0
+    process.poll.return_value = 0
+    process.wait.return_value = None
+    process.pid = 1234
+
+    with (
+        patch("src.agent_session.claude_cli.shutil.which", return_value="/usr/bin/claude"),
+        patch(
+            "src.agent_session.claude_cli.subprocess.Popen",
+            return_value=process,
+        ) as popen,
+        patch(
+            "src.utils.env.build_clean_env",
+            return_value={"ANTHROPIC_BETAS": "existing-beta"},
+        ),
+    ):
+        session = create_review_session(
+            "claude",
+            str(tmp_path),
+            model_name="claude-opus-4-8[1m]",
+        )
+        result = session.send_prompt("review this change")
+
+    assert result.stop_reason == "end_turn"
+    argv = popen.call_args.args[0]
+    env = popen.call_args.kwargs["env"]
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
+    assert env["ANTHROPIC_BETAS"] == (
+        "existing-beta,context-1m-2025-08-07"
+    )
 
 
 def test_create_review_session_ttadk(tmp_path):

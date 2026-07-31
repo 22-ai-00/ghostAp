@@ -17,8 +17,15 @@ class TestDefaultACPSessionFactory:
     @patch("src.utils.path.normalize_ttadk_cwd", return_value=None)
     def test_claude_type_creates_cli_session(self, _mock_norm, mock_cli):
         factory = self._make_factory()
-        factory.create_session("claude", "/tmp")
-        mock_cli.assert_called_once_with(cwd="/tmp")
+        factory.create_session(
+            "claude",
+            "/tmp",
+            model_name="claude-sonnet-4-5",
+        )
+        mock_cli.assert_called_once_with(
+            cwd="/tmp",
+            model_name="claude-sonnet-4-5",
+        )
 
     @patch("src.agent_session.SyncTTADKCLISession")
     @patch("src.utils.path.normalize_ttadk_cwd", return_value=None)

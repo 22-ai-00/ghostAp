@@ -61,7 +61,7 @@ class DefaultACPSessionFactory:
         cwd = norm_cwd or raw_cwd
 
         if agent_type == "claude":
-            return SyncClaudeCLISession(cwd=cwd)
+            return SyncClaudeCLISession(cwd=cwd, model_name=model_name)
 
         if agent_type.startswith("ttadk_"):
             try:

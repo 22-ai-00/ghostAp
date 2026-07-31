@@ -549,6 +549,54 @@ def _make_system_handler(is_coco_mode=False):
 
 
 class TestEnterModeWithAcpModelRouting(unittest.TestCase):
+    def test_forged_callback_rejects_unsupported_claude_1m_before_scheduling(self):
+        handler = _make_system_handler(is_coco_mode=False)
+        project = ProjectContext(
+            project_id="project-1",
+            project_name="truthful-claude-model",
+            root_path="/tmp",
+        )
+        project.acp_tool_name = "claude"
+        project.acp_model_name = "claude-haiku-4-5"
+
+        handler.handle_select_acp_model(
+            "selection-card",
+            "chat-1",
+            "claude",
+            "claude-haiku-4-5[1m]",
+            project,
+        )
+
+        handler.reply_error.assert_called_once()
+        assert "不支持 1M" in handler.reply_error.call_args.args[1]
+        handler.ctx.scheduler.submit.assert_not_called()
+        handler.ctx.handlers["claude"].enter_mode.assert_not_called()
+        handler.ctx.handlers["claude"].switch_model.assert_not_called()
+        handler.ctx.project_manager.commit_acp_programming_activation.assert_not_called()
+
+    def test_model_command_rejects_unsupported_claude_1m_before_activation(self):
+        handler = _make_system_handler(is_coco_mode=False)
+        project = ProjectContext(
+            project_id="project-1",
+            project_name="truthful-claude-model",
+            root_path="/tmp",
+        )
+        project.acp_tool_name = "claude"
+        project.acp_model_name = "claude-haiku-4-5"
+
+        handler.handle_model_command(
+            "command-message",
+            "chat-1",
+            "/model claude-haiku-4-5[1m]",
+            project,
+        )
+
+        handler.reply_error.assert_called_once()
+        assert "不支持 1M" in handler.reply_error.call_args.args[1]
+        handler.ctx.scheduler.submit.assert_not_called()
+        handler.ctx.handlers["claude"].enter_mode.assert_not_called()
+        handler.ctx.project_manager.commit_acp_programming_activation.assert_not_called()
+
     def test_failed_claude_restart_keeps_previous_project_selection(self):
         handler = _make_system_handler(is_coco_mode=False)
         project = ProjectContext(
