@@ -252,6 +252,11 @@ class ProjectHandler(BaseHandler):
         # Lazy-init service
         if not hasattr(self, "_project_chat_service"):
             lark_client = LarkChatClient(api_client_factory=self.ctx.api_client_factory)
+            shared_registry = vars(self.ctx).get("managed_group_registry")
+            owner_id = vars(self.ctx).get("managed_group_owner_id", "")
+            receiving_bot_ref = vars(self.ctx).get(
+                "managed_group_receiving_bot_ref", ""
+            )
             self._project_chat_service = ProjectChatService(
                 project_manager=self.project_manager,
                 lark_chat_client=lark_client,
@@ -263,6 +268,9 @@ class ProjectHandler(BaseHandler):
                     self.send_card_to_chat(cid, text) if msg_type == "interactive"
                     else self.send_text_to_chat(cid, text)
                 ),
+                managed_group_registry=shared_registry,
+                owner_id=owner_id,
+                receiving_bot_ref=receiving_bot_ref,
             )
 
         # Inject shell working directory so service uses the same default as /new

@@ -151,6 +151,37 @@ class ProjectContext:
     def touch(self):
         self.last_active = time.time()
 
+    def managed_group_migration_candidate(
+        self,
+        *,
+        owner_id: str,
+        receiving_bot_ref: str,
+    ) -> dict[str, object] | None:
+        """Return legacy binding facts that still require external validation.
+
+        The candidate is deliberately inert: callers must pass it through the
+        Registry's membership/receiving-bot validator before it can establish
+        trust.  ``allowed_chat_ids`` and the bound group name are excluded.
+        """
+
+        if (
+            not self.bound_chat_id
+            or self.bound_chat_created_at <= 0
+            or not self.root_path
+            or not owner_id
+            or not receiving_bot_ref
+        ):
+            return None
+        return {
+            "bound_chat_created_at": self.bound_chat_created_at,
+            "canonical_root_ref": self.root_path,
+            "chat_id": self.bound_chat_id,
+            "origin": "ghostap_created",
+            "owner_id": owner_id,
+            "project_id": self.project_id,
+            "receiving_bot_ref": receiving_bot_ref,
+        }
+
     def _chat_id_set(self) -> frozenset[str]:
         """Return a frozenset of chat_ids — **test-only helper**.
 

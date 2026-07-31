@@ -65,9 +65,9 @@ Canonical trust model：
 - Foundation 原相邻回归：`24 passed`。
 - 已完成且保留证据的任务：Foundation F1–F3（其中 F3 为旧合同）和
   Phase 0 的 0.4–0.8。
-- 新三信任域与 `ProjectGrant/ActionMatrix` 纯类型/决策层已有实现证据；
-  ManagedGroup Registry 与 ingress/callback production cutover 尚未实现，因此
-  CP-T 未通过。
+- 新三信任域、`ProjectGrant/ActionMatrix` 纯决策层和 ManagedGroup Registry/
+  建群生命周期已有实现证据；ingress/callback production cutover 尚未实现，因此
+  CP-T 仍未通过。
 
 ## Canonical ownership and overlap decisions
 
@@ -146,7 +146,7 @@ A7、B9b、cron/DST、daily digest/quiet hours、D1–D3/D5、8/50 负载与多�
 | 0.6 Spec completion fail-closed | complete (`93a52598`) | evidence-only | 明确失败不能被空建议转成通过 |
 | 0.7 辅助 Agent 权限 | complete (`f69acc90`) | evidence-only | coordinator/classifier deny-all；不产生用户交互 |
 | 0.8 TrustZone/Actor/ActionMatrix | complete (`77a70c17`, fix `124749de`) | evidence-only | `ALLOW/DENY` only；Owner/Employee/unknown + stale revision |
-| 0.9 ManagedGroup Registry/lifecycle | missing | active | ACTIVE 早于 welcome；Project/Team 共用；tombstone/replay |
+| 0.9 ManagedGroup Registry/lifecycle | complete | evidence-only | ACTIVE 早于 welcome；Project/Team 共用；tombstone/replay |
 | 0.10 ingress/callback cutover | missing | active | trust 早于业务副作用；managed group 零 enrollment；external 零副作用 |
 
 CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
@@ -294,8 +294,55 @@ CP-T 与 CP-P0 必须在 A/B/C 的生产 cutover 前通过。
   `permission_prompt_count(managed project task) = 0` is proven at the pure
   matrix boundary only; no tenant/UI prompt count is claimed.
 - Real Feishu managed-group/manual/mobile evidence: `not_tested`. ManagedGroup
-  Registry/lifecycle (0.9) and ingress/callback production cutover (0.10) are
-  still missing, so this evidence does not pass CP-T.
+  Registry/lifecycle (0.9) is complete, but ingress/callback production cutover
+  (0.10) is still missing, so this evidence does not pass CP-T.
+
+### Task 0.9 evidence
+
+- Production wiring: `src/trust/registry.py` is the only durable managed-group
+  provenance/grant store. It replays a strict versioned JSON snapshot during
+  `FeishuWSClient` composition before handlers are created, uses a leaf
+  `RLock`, random no-follow temporary files, file/parent fsync and atomic
+  replace, and exposes immutable Task 0.8 `ManagedGroupRecord`/
+  `ProjectGrant` snapshots. `HandlerContext` shares that one instance with
+  `ProjectHandler`/`ProjectChatService` and `SlockHandler`; no second Registry
+  or marker-derived trust path exists.
+- Lifecycle wiring: `/new-chat` and `/new-team` persist provision intent, create
+  the Feishu group, durably bind Project/Team state, atomically activate one
+  group+grant revision, then deliver welcome/success. Registry/bind failure
+  sends no success, compensates Project/Slock state, attempts Feishu deletion,
+  and leaves `False`/`None` deletion outcomes untrusted with one clear Owner
+  error. Confirmed/unknown Team dissolution writes a tombstone; a rejected
+  deletion restores the prior local/ACTIVE team.
+- TDD RED: the two required modules initially failed collection with two
+  `ModuleNotFoundError: No module named 'src.trust.registry'` errors. Lifecycle
+  wiring then produced `7 failed` on missing constructor injection, Team
+  activation, migration and ledger guard. Shared composition produced
+  `2 failed` for absent ProjectHandler injection/composition. Self-review
+  observed `1 failed` proving a dangling provision retry changed its timestamp
+  and was not idempotent, plus `1 failed` proving Settings' frozen
+  `admin_user_ids` parsed to an empty Owner. A final fail-closed RED showed a
+  `None` candidate chat ID was stringified into trust. The Registry now retains
+  the first timestamp while rejecting changes to stable facts, accepts exactly
+  one configured Owner from serialized/frozen settings, and validates raw
+  candidate types before calling the external membership validator.
+- GREEN: required Registry/ProjectGrant/ProjectChat tests are `24 passed`;
+  Slock plus autonomous group-adjacent tests are `2407 passed`; WS routing and
+  handler compatibility tests are `253 passed`. Touched-file Ruff and
+  `git diff --check` pass. Only the two pre-existing Lark SDK Python 3.13
+  deprecation warnings remain.
+- Replay/failure evidence: restart reconstructs exactly one ACTIVE record and
+  one grant; corrupt/duplicate-key/unsupported snapshots fail closed. Register,
+  provision, Owner adoption, expected Bot rotation and tombstone are
+  idempotent with monotonic revisions. `allowed_chat_ids`, bound chat fields,
+  group name/description and Slock marker cannot register trust; legacy import
+  requires complete bound-chat timestamp/root facts plus an injected
+  membership/receiving-bot validator. Tombstones dominate stale candidates.
+- Managed permission prompts remain a Task 0.8 matrix property with
+  `permission_prompt_count(managed project task) = 0`; Task 0.9 adds no
+  approval/tenant ACL. Real Feishu membership/receiving-bot validation,
+  tenant/mobile delivery and residual-group manual cleanup are `not_tested`.
+  Task 0.10 ingress/callback cutover remains `missing`, so CP-T is not complete.
 
 ## Phase A disposition
 

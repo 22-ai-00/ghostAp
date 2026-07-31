@@ -8,6 +8,7 @@ import logging
 import re
 import shlex
 import threading
+from datetime import UTC, datetime
 from numbers import Real
 from typing import TYPE_CHECKING, Optional
 
@@ -1914,6 +1915,41 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             self.reply_text(message_id, f"❌ 团队名称 **{name}** 已存在或正在创建，请换一个名称。")
             return
 
+        root_path = project.root_path if project else self.get_working_dir(chat_id)
+        project_id = project.project_id if project else f"team:{name}"
+        managed_groups = self._managed_group_registry()
+        provision_id = (
+            f"new-team:{self._managed_group_owner_id()}:"
+            f"{name.casefold()}:{root_path}"
+        )
+        if managed_groups is not None:
+            from ...trust.models import ManagedGroupOrigin
+
+            owner_id = self._managed_group_owner_id()
+            receiving_bot_ref = self._managed_group_receiving_bot_ref()
+            if not owner_id or not receiving_bot_ref:
+                self.reply_text(
+                    message_id,
+                    "❌ 受管群 Owner 或接收 Bot 身份未配置，无法创建团队。",
+                )
+                manager.release_team_name(name)
+                return
+            try:
+                managed_groups.begin_provision(
+                    provision_id=provision_id,
+                    owner_id=owner_id,
+                    origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+                    receiving_bot_ref=receiving_bot_ref,
+                    project_id=project_id,
+                    canonical_root_ref=root_path,
+                    created_at=datetime.now(UTC),
+                )
+            except Exception:
+                logger.exception("create_team: managed group provision intent failed")
+                self.reply_text(message_id, "❌ 受管团队登记准备失败，请重试")
+                manager.release_team_name(name)
+                return
+
         # Step 1: Create Feishu group
         lark_client = LarkChatClient(api_client_factory=self.ctx.api_client_factory)
         try:
@@ -1926,12 +1962,12 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             from src.utils.errors import redact_sensitive
             logger.error("create_team: 建群失败 name=%s err=%s", name, redact_sensitive(str(e)))
             self.reply_text(message_id, f"❌ 创建团队群失败: {safe_error_message(e)}")
+            self._abandon_managed_group_provision(managed_groups, provision_id)
             manager.release_team_name(name)
             return
 
         new_chat_id = result.chat_id
         engine = None
-        root_path = ""
         release_reservation = True
 
         try:
@@ -1939,7 +1975,6 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             lark_client.add_managers(new_chat_id, [sender_open_id])
 
             # Step 3: Initialize slock engine for the new group
-            root_path = project.root_path if project else self.get_working_dir(chat_id)
             engine_name = self.get_engine_name(
                 new_chat_id, project_id=(project.project_id if project else None)
             )
@@ -1957,13 +1992,23 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 engine_name=engine_name,
             )
 
-            # Bootstrap default roles asynchronously (non-blocking)
-            self._bootstrap_default_roles_if_configured(engine, channel.channel_id, new_chat_id)
-
             # Wire UI callbacks for escalation timeout notifications
             engine.set_escalation_ui_callbacks(
                 update_card_fn=self.update_card,
                 send_text_fn=self.send_text_to_chat,
+            )
+
+            if managed_groups is not None:
+                managed_groups.activate(
+                    provision_id=provision_id,
+                    chat_id=new_chat_id,
+                    project_id=project_id,
+                    canonical_root_ref=root_path,
+                )
+
+            # Runtime bootstrap follows durable Team bind + Registry ACTIVE.
+            self._bootstrap_default_roles_if_configured(
+                engine, channel.channel_id, new_chat_id
             )
 
             # Step 6: Send welcome card in the new group
@@ -2007,6 +2052,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         except Exception as e:
             from src.utils.errors import redact_sensitive
             logger.error("create_team: 激活失败, 回滚建群 chat=%s err=%s", new_chat_id, redact_sensitive(str(e)))
+            self._abandon_managed_group_provision(managed_groups, provision_id)
             local_rollback_ok = True
             if engine is not None:
                 try:
@@ -2037,6 +2083,41 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         finally:
             if release_reservation:
                 manager.release_team_name(name)
+
+    def _managed_group_registry(self):
+        """Return only the Registry explicitly injected on shared context."""
+
+        registry = vars(self.ctx).get("managed_group_registry")
+        if registry is None:
+            return None
+        required = ("begin_provision", "activate", "record", "tombstone")
+        if all(callable(getattr(registry, name, None)) for name in required):
+            return registry
+        return None
+
+    def _managed_group_owner_id(self) -> str:
+        explicit = vars(self.ctx).get("managed_group_owner_id")
+        if isinstance(explicit, str) and explicit:
+            return explicit
+        from ...trust.registry import single_owner_id
+
+        return single_owner_id(getattr(self.ctx.settings, "admin_user_ids", ""))
+
+    def _managed_group_receiving_bot_ref(self) -> str:
+        explicit = vars(self.ctx).get("managed_group_receiving_bot_ref")
+        if isinstance(explicit, str) and explicit:
+            return explicit
+        value = getattr(self.ctx.settings, "app_id", "")
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _abandon_managed_group_provision(registry, provision_id: str) -> None:
+        if registry is None:
+            return
+        try:
+            registry.abandon_provision(provision_id)
+        except Exception:
+            logger.exception("failed to abandon Team managed-group provision")
 
     @staticmethod
     def _format_slock_group_name(name: str, suffix: str = "[Slock]") -> str:
@@ -2193,6 +2274,10 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
         if delete_result is None:
             manager = self._get_engine_manager()
             manager.block_team_name_for_cleanup(team_name, target_chat_id, "unknown")
+            if not self._tombstone_managed_team(
+                message_id, target_chat_id, team_name
+            ):
+                return
             self.reply_text(
                 message_id,
                 f"⚠️ 团队 **{team_name}** 的飞书删群结果未知；本地已停止且不会自动恢复，请人工确认群状态。\n"
@@ -2200,7 +2285,34 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             )
             return
 
+        if not self._tombstone_managed_team(
+            message_id, target_chat_id, team_name
+        ):
+            return
+
         self.reply_text(message_id, f"✅ 团队 **{team_name}** 已解散并归档本地状态")
+
+    def _tombstone_managed_team(
+        self,
+        message_id: str,
+        chat_id: str,
+        team_name: str,
+    ) -> bool:
+        registry = self._managed_group_registry()
+        if registry is None or registry.record(chat_id) is None:
+            return True
+        try:
+            registry.tombstone(chat_id)
+            return True
+        except Exception:
+            logger.exception(
+                "dissolve_team: Registry tombstone failed chat=%s", chat_id
+            )
+            self.reply_text(
+                message_id,
+                f"⚠️ 团队 **{team_name}** 已停止，但受管群撤销记录失败；请立即重试。",
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Role / Agent management

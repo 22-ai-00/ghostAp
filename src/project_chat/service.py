@@ -5,7 +5,9 @@ import os
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Optional
+from collections import OrderedDict
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ..config import get_settings
 from ..project.context import ProjectContext
@@ -13,6 +15,9 @@ from ..project.manager import ProjectManager
 from .errors import CreateChatError
 from .group_naming import format_group_name, validate_name_part
 from .lark_chat_client import LarkChatClient
+
+if TYPE_CHECKING:
+    from ..trust.registry import ManagedGroupRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +43,23 @@ class ProjectChatService:
         lark_chat_client: LarkChatClient,
         reply_fn: Callable[[str, str, Optional[str]], Any],
         send_to_chat_fn: Callable[[str, str, str, Optional[str]], Any],
+        managed_group_registry: Optional["ManagedGroupRegistry"] = None,
+        owner_id: str = "",
+        receiving_bot_ref: str = "",
     ):
         self._pm = project_manager
         self._lark = lark_chat_client
         self._reply = reply_fn
         self._send_to_chat = send_to_chat_fn
+        self._managed_groups = managed_group_registry
+        self._owner_id = owner_id
+        self._receiving_bot_ref = receiving_bot_ref
+        if managed_group_registry is not None and (
+            not owner_id or not receiving_bot_ref
+        ):
+            raise ValueError(
+                "owner_id and receiving_bot_ref are required with managed_group_registry"
+            )
 
     def handle(
         self,
@@ -100,22 +117,65 @@ class ProjectChatService:
                 # Update root_path/working_dir to current path for legacy project
                 ctx.root_path = path
                 ctx.working_dir = path
-                self._pm._save_projects()
+                if self._pm._save_projects() is False:
+                    self._reply(message_id, "❌ 更新历史项目失败，请重试", None)
+                    return
                 logger.info(
                     "Legacy project %s found by name, updated root_path to %s",
                     ctx.project_id, path,
                 )
 
         if ctx and ctx.bound_chat_id:
+            if self._managed_groups is not None:
+                active = self._managed_groups.active_record(ctx.bound_chat_id)
+                if (
+                    active is None
+                    or active.project_id != ctx.project_id
+                    or active.canonical_root_ref != ctx.root_path
+                ):
+                    self._reply(
+                        message_id,
+                        "❌ 现有项目群尚未通过受管群校验，请由 Owner 在私聊中导入或重新绑定。",
+                        None,
+                    )
+                    return
             # Branch A: already bound → ensure originating chat can see it, then return jump card
             if chat_id and chat_id not in ctx.allowed_chat_ids:
                 ctx.add_chat_id(chat_id)
-                self._pm._save_projects()
+                if self._pm._save_projects() is False:
+                    self._reply(message_id, "❌ 更新项目可见范围失败，请重试", None)
+                    return
             self._reply_jump_card(message_id, ctx)
             return
 
         group_name = format_group_name(name, suffix)
         description = self._build_description(name, path)
+        provision_id = (
+            f"new-chat:{self._owner_id}:{ProjectManager.generate_id(name)}:"
+            f"{os.path.normpath(path)}"
+        )
+        intended_project_id = ctx.project_id if ctx else ProjectManager.generate_id(name)
+
+        if self._managed_groups is not None:
+            from ..trust.models import ManagedGroupOrigin
+
+            try:
+                self._managed_groups.begin_provision(
+                    provision_id=provision_id,
+                    owner_id=self._owner_id,
+                    origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+                    receiving_bot_ref=self._receiving_bot_ref,
+                    project_id=intended_project_id,
+                    canonical_root_ref=path,
+                    created_at=datetime.now(UTC),
+                )
+            except Exception:
+                logger.exception(
+                    "managed group provision intent failed for project=%s",
+                    intended_project_id,
+                )
+                self._reply(message_id, "❌ 受管群登记准备失败，请重试", None)
+                return
 
         # 4. Create chat
         try:
@@ -127,6 +187,7 @@ class ProjectChatService:
         except CreateChatError as e:
             logger.warning("create_chat failed for path=%s: %s", path, str(e))
             self._reply(message_id, f"❌ 建群失败: {e}", None)
+            self._abandon_provision(provision_id)
             return
 
         new_chat_id = result.chat_id
@@ -135,7 +196,9 @@ class ProjectChatService:
         # 4.5 Promote sender to group manager (best-effort, enables dissolve permission)
         self._lark.add_managers(new_chat_id, [sender_open_id])
 
-        # 5. Bind
+        # 5. Bind, then atomically activate Registry before any success delivery.
+        created_project = False
+        existing_snapshot = self._binding_snapshot(ctx) if ctx else None
         try:
             if ctx:
                 # Branch B: legacy project without bound chat
@@ -147,7 +210,8 @@ class ProjectChatService:
                 # Ensure the originating chat can still see this project
                 if chat_id != new_chat_id:
                     ctx.add_chat_id(chat_id)
-                self._pm._save_projects()
+                if self._pm._save_projects() is False:
+                    raise OSError("project binding persistence failed")
             else:
                 # Branch C: new project
                 success, msg, ctx_new = self._pm.create_project(
@@ -160,25 +224,92 @@ class ProjectChatService:
                     # Rollback: delete the created chat
                     self._lark.delete_chat(new_chat_id)
                     self._reply(message_id, f"❌ 创建项目失败: {msg}", None)
+                    self._abandon_provision(provision_id)
                     return
+                created_project = True
                 ctx_new.bound_chat_id = new_chat_id
                 ctx_new.bound_chat_name = new_chat_name
                 ctx_new.bound_chat_created_at = time.time()
                 # Ensure the originating chat can also see this project
                 if chat_id != new_chat_id:
                     ctx_new.add_chat_id(chat_id)
-                self._pm._save_projects()
+                if self._pm._save_projects() is False:
+                    raise OSError("project binding persistence failed")
                 ctx = ctx_new
+
+            if self._managed_groups is not None:
+                self._managed_groups.activate(
+                    provision_id=provision_id,
+                    chat_id=new_chat_id,
+                    project_id=ctx.project_id,
+                    canonical_root_ref=ctx.root_path,
+                )
         except Exception as e:
-            # Rollback chat on any bind failure
-            logger.error("bind failed, rolling back chat %s: %s", new_chat_id[:12], str(e))
-            self._lark.delete_chat(new_chat_id)
-            self._reply(message_id, f"❌ 绑定失败: {e}", None)
+            logger.error(
+                "bind/registry activation failed, rolling back chat %s: %s",
+                new_chat_id[:12],
+                str(e),
+            )
+            self._rollback_binding(
+                ctx=ctx,
+                created_project=created_project,
+                existing_snapshot=existing_snapshot,
+            )
+            self._abandon_provision(provision_id)
+            delete_result = self._lark.delete_chat(new_chat_id)
+            if delete_result is True:
+                detail = "飞书群已删除"
+            elif delete_result is False:
+                detail = "飞书群删除失败，请手动删除；该群未获得信任"
+            else:
+                detail = "飞书删群结果未知，请人工确认；该群未获得信任"
+            self._reply(message_id, f"❌ 项目群绑定失败，{detail}", None)
             return
 
         # 6. Reply in main chat + welcome in new chat
         self._reply_jump_card(message_id, ctx)
         self._send_welcome(new_chat_id, ctx)
+
+    def _abandon_provision(self, provision_id: str) -> None:
+        if self._managed_groups is None:
+            return
+        try:
+            self._managed_groups.abandon_provision(provision_id)
+        except Exception:
+            logger.exception("failed to abandon managed group provision")
+
+    @staticmethod
+    def _binding_snapshot(ctx: ProjectContext) -> dict[str, Any]:
+        return {
+            "allowed_chat_ids": OrderedDict(ctx.allowed_chat_ids),
+            "bound_chat_created_at": ctx.bound_chat_created_at,
+            "bound_chat_id": ctx.bound_chat_id,
+            "bound_chat_name": ctx.bound_chat_name,
+            "owner_chat_id": ctx.owner_chat_id,
+            "project_name": ctx.project_name,
+        }
+
+    def _rollback_binding(
+        self,
+        *,
+        ctx: ProjectContext | None,
+        created_project: bool,
+        existing_snapshot: dict[str, Any] | None,
+    ) -> None:
+        if ctx is None:
+            return
+        if created_project:
+            self._pm.close_project(ctx.project_id)
+            return
+        if existing_snapshot is None:
+            return
+        ctx.allowed_chat_ids = OrderedDict(existing_snapshot["allowed_chat_ids"])
+        ctx.bound_chat_created_at = existing_snapshot["bound_chat_created_at"]
+        ctx.bound_chat_id = existing_snapshot["bound_chat_id"]
+        ctx.bound_chat_name = existing_snapshot["bound_chat_name"]
+        ctx.owner_chat_id = existing_snapshot["owner_chat_id"]
+        ctx.project_name = existing_snapshot["project_name"]
+        self._pm._save_projects()
 
     def _build_description(self, name: str, path: str) -> str:
         git_remote = self._detect_git_remote(path)

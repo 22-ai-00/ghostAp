@@ -75,6 +75,7 @@ from ..thread import (
     get_thread_manager,
     set_current_tenant_key,
 )
+from ..trust.registry import ManagedGroupRegistry, single_owner_id
 from ..utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpenException
 from ..utils.errors import get_error_detail
 from ..utils.rate_limit import RateLimiter, RateLimitExceededException
@@ -118,6 +119,26 @@ from .ws_event_router import MessageIngressGuard, WSErrorAction, classify_ws_err
 from .ws_health import WSHealthMonitor
 from .ws_lifecycle import ObservedLarkWSClient
 from .ws_resource_manager import EngineResourceGroup
+
+
+def _build_managed_group_registry(
+    project_manager: ProjectManager,
+) -> ManagedGroupRegistry | None:
+    """Compose the one Registry beside the injected Project storage.
+
+    Some unit tests replace ProjectManager with an unconfigured mock.  Those
+    compatibility contexts intentionally receive no registry instead of
+    writing through a synthesized mock path.
+    """
+
+    project_storage = getattr(project_manager, "_storage_path", None)
+    if not isinstance(project_storage, Path):
+        return None
+    return ManagedGroupRegistry(project_storage.parent / "managed-groups.json")
+
+
+def _configured_managed_group_owner_id(settings: Any) -> str:
+    return single_owner_id(getattr(settings, "admin_user_ids", ""))
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("ghostap.audit")
@@ -385,6 +406,18 @@ class FeishuWSClient:
 
         self._project_manager = ProjectManager()
         self._project_manager.on_eviction = self._on_project_evicted
+        # Registry replay completes during composition, before any handler or
+        # ingress subscriber can observe a managed group.
+        self._managed_group_registry = _build_managed_group_registry(
+            self._project_manager
+        )
+        self._managed_group_owner_id = _configured_managed_group_owner_id(
+            self.settings
+        )
+        app_id = getattr(self.settings, "app_id", "")
+        self._managed_group_receiving_bot_ref = (
+            app_id if isinstance(app_id, str) else ""
+        )
         self._message_mapper = MessageProjectMapper()
         self._message_linker = MessageLinker()
 
@@ -566,6 +599,11 @@ class FeishuWSClient:
                 self._ingress_access_policy_provider
             ),
             ingress_env_store=self._ingress_env_store,
+            managed_group_registry=self._managed_group_registry,
+            managed_group_owner_id=self._managed_group_owner_id,
+            managed_group_receiving_bot_ref=(
+                self._managed_group_receiving_bot_ref
+            ),
         )
 
         # Instantiate handlers (temp locals for registry population)

@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from ..spec_engine import SpecEngineManager, SpecReporter
     from ..tasking import TaskScheduler
     from ..thread import ThreadContextManager
+    from ..trust.registry import ManagedGroupRegistry
     from ..workflow_engine.manager import WorkflowEngineManager
     from .image_handler import FeishuImageHandler
 
@@ -114,6 +115,9 @@ class HandlerContext:
     channel_client_factory: Optional[Callable[[], "FeishuChannel"]] = None
     ingress_access_policy_provider: Optional["IngressAccessPolicyProvider"] = None
     ingress_env_store: Optional["AtomicEnvFileStore"] = None
+    managed_group_registry: Optional["ManagedGroupRegistry"] = None
+    managed_group_owner_id: str = ""
+    managed_group_receiving_bot_ref: str = ""
 
     def dependency_view(self) -> HandlerDependencyView:
         """Return a minimal service view while keeping existing fields compatible."""
