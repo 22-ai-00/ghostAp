@@ -7,8 +7,6 @@ Validates:
 import unittest
 from unittest.mock import MagicMock
 
-import pytest
-
 from src.workflow_engine.script_gen import (
     _get_agent_capability_note,
     build_script_gen_prompt,
@@ -247,96 +245,6 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
 
         self.assertIn("If the user asks for analysis only", script)
         self.assertIn("do not change code", script)
-
-
-@pytest.mark.skip(reason="Budget/roles selection removed; build_script_gen_prompt no longer accepts budget tokens or static roles.")
-class TestBudgetConstraintAndAgentCapability(unittest.TestCase):
-    """Test budget hard constraint and orchestrator agent capability adaptation.
-
-    SKIPPED — budget/roles selection has been removed; script generation now
-    uses dynamic roles and no budget hard constraints.
-    """
-
-    def test_budget_section_included_when_budget_tokens_provided(self):
-        """Budget constraint section should appear when budget_tokens is provided."""
-        prompt = build_script_gen_prompt(
-            requirement="Test requirement",
-            available_tools=["coco"],
-        )
-        self.assertIn("## 预算硬约束", prompt)
-        self.assertIn("Token 预算硬约束", prompt)
-        self.assertIn("2,000,000", prompt)
-
-    def test_budget_section_not_included_when_budget_tokens_none(self):
-        """Budget constraint section should NOT appear when budget_tokens is None."""
-        prompt = build_script_gen_prompt(
-            requirement="Test requirement",
-            available_tools=["coco"],
-            available_roles=["architect"],
-            budget_total=2_000_000,
-            budget_tokens=None,
-        )
-        self.assertNotIn("## 预算硬约束", prompt)
-        self.assertNotIn("Token 预算硬约束", prompt)
-
-    def test_budget_section_contains_tiered_guidance(self):
-        """Budget section should contain tiered guidance for different budget sizes."""
-        prompt = build_script_gen_prompt(
-            requirement="Test requirement",
-            available_tools=["coco"],
-            available_roles=["architect"],
-            budget_total=1_500_000,
-            budget_tokens=1_500_000,
-        )
-        self.assertIn("预算紧张时", prompt)
-        self.assertIn("预算适中时", prompt)
-        self.assertIn("预算充足时", prompt)
-        self.assertIn("50K-200K", prompt)
-        self.assertIn("严禁超出预算", prompt)
-
-    def test_agent_capability_section_included(self):
-        """Agent capability section should always be included."""
-        prompt = build_script_gen_prompt(
-            requirement="Test requirement",
-            available_tools=["coco"],
-            available_roles=["architect"],
-            budget_total=2_000_000,
-            orchestrator_agent="coco",
-        )
-        self.assertIn("## 主编排 Agent 能力", prompt)
-        self.assertIn("coco", prompt)
-
-    def test_prompt_contains_both_sections_in_correct_order(self):
-        """Both sections should appear in the prompt in the correct order."""
-        prompt = build_script_gen_prompt(
-            requirement="Test requirement",
-            available_tools=["coco"],
-            available_roles=["architect"],
-            budget_total=2_000_000,
-            budget_tokens=2_000_000,
-            orchestrator_agent="claude",
-        )
-        # Budget section should come before agent capability section
-        budget_pos = prompt.index("## 预算硬约束")
-        agent_pos = prompt.index("## 主编排 Agent 能力")
-        self.assertLess(budget_pos, agent_pos)
-        # Both should come before user requirement
-        req_pos = prompt.index("## User Requirement")
-        self.assertLess(agent_pos, req_pos)
-
-    def test_backward_compatibility_without_new_params(self):
-        """Existing calls without new params should still work (defaults)."""
-        prompt = build_script_gen_prompt(
-            requirement="Test requirement",
-            available_tools=["coco"],
-            available_roles=["architect"],
-            budget_total=2_000_000,
-        )
-        # Should still contain agent capability section with default "coco"
-        self.assertIn("## 主编排 Agent 能力", prompt)
-        self.assertIn("coco", prompt)
-        # Should NOT contain budget section (budget_tokens defaults to None)
-        self.assertNotIn("## 预算硬约束", prompt)
 
 
 class TestAgentCapabilityNotes(unittest.TestCase):

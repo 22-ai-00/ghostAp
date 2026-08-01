@@ -10,8 +10,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from src.workflow_engine.models import PendingConfirmation, WorkflowProject, WorkflowStatus
 
 
@@ -146,6 +144,7 @@ class TestHandlerInvalidPayloadRoutesToUnifiedError(unittest.TestCase):
         handler._reply_workflow_error.assert_called()  # type: ignore[attr-defined]
         handler.reply_text.assert_not_called()  # type: ignore[attr-defined]
 
+
     def _make_invalid_payload_project(self) -> MagicMock:
         return _make_project(
             WorkflowStatus.AWAITING_TOOL_SELECT,
@@ -201,9 +200,6 @@ class TestHandlerInvalidPayloadRoutesToUnifiedError(unittest.TestCase):
             )
         handler._reply_workflow_error.assert_called()  # type: ignore[attr-defined]
         handler.reply_text.assert_not_called()  # type: ignore[attr-defined]
-
-    def test_handle_workflow_apply_budget_regenerate_wrong_user(self) -> None:
-        pytest.skip("budget regenerate removed in favor of 2-step orchestrator+review selection")
 
     def test_handle_workflow_fill_missing_tools_wrong_user(self) -> None:
         from src.feishu.handlers.workflow import WorkflowHandler

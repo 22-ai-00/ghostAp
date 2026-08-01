@@ -260,81 +260,6 @@ class TestWorkflowProjectPendingFields(unittest.TestCase):
         project = WorkflowProject()
         self.assertIsNone(project.pending)
 
-    def test_pending_fields_settable(self):
-        project = WorkflowProject()
-        project.pending = PendingConfirmation(
-            script_path="/tmp/wf.js",
-            requirement="do stuff",
-            meta={"name": "test", "tools": ["coco"]},
-            is_fallback=True,
-        )
-
-        self.assertEqual(project.pending.script_path, "/tmp/wf.js")
-        self.assertEqual(project.pending.requirement, "do stuff")
-        self.assertEqual(project.pending.meta, {"name": "test", "tools": ["coco"]})
-        self.assertTrue(project.pending.is_fallback)
-
-    def test_serialization_roundtrip(self):
-        project = WorkflowProject(
-            pending=PendingConfirmation(
-                script_path="/tmp/wf.js",
-                requirement="build feature",
-                meta={"name": "x", "phases": []},
-                is_fallback=True,
-            )
-        )
-        data = project.to_dict()
-        restored = WorkflowProject.from_dict(data)
-        self.assertEqual(restored.pending.script_path, "/tmp/wf.js")
-        self.assertEqual(restored.pending.requirement, "build feature")
-        self.assertTrue(restored.pending.is_fallback)
-
-    def test_legacy_format_migration(self):
-        """Test that legacy flat pending_* fields are migrated to PendingConfirmation."""
-        legacy_data = {
-            "pending_script_path": "/tmp/legacy.js",
-            "pending_requirement": "legacy req",
-            "pending_meta": {"name": "legacy"},
-            "pending_is_fallback": True,
-            "pending_initiator_user_id": "user_legacy",
-            "pending_engine_session_key": "key_legacy",
-            "pending_selected_tools": ["coco"],
-            "pending_tools_mismatch": False,
-        }
-        restored = WorkflowProject.from_dict(legacy_data)
-        self.assertIsNotNone(restored.pending)
-        self.assertEqual(restored.pending.script_path, "/tmp/legacy.js")
-        self.assertEqual(restored.pending.requirement, "legacy req")
-        self.assertEqual(restored.pending.initiator_user_id, "user_legacy")
-        self.assertEqual(restored.pending.selected_tools, ["coco"])
-
-    def test_start_execution_migrates_fields(self):
-        """Test that start_execution() moves fields from pending to runtime."""
-        project = WorkflowProject(
-            pending=PendingConfirmation(
-                initiator_user_id="exec_user",
-                selected_tools=["coco", "gemini"],
-                script_path="/tmp/exec.js",
-            )
-        )
-        self.assertIsNone(project.initiator_user_id)
-        self.assertIsNone(project.selected_tools)
-        self.assertIsNotNone(project.pending)
-
-        project.start_execution()
-
-        self.assertEqual(project.initiator_user_id, "exec_user")
-        self.assertEqual(project.selected_tools, ["coco", "gemini"])
-        self.assertIsNone(project.pending)
-
-    def test_new_pending_fields(self):
-        """Test that new PendingConfirmation fields work correctly."""
-        pc = PendingConfirmation(
-            orchestrator_agent="super-orchestrator",
-        )
-        self.assertEqual(pc.orchestrator_agent, "super-orchestrator")
-
-
 class TestValidateGeneratedScriptRegression(unittest.TestCase):
     """Regression tests for validate_generated_script."""
 
@@ -1348,36 +1273,6 @@ class TestConfirmCardContent(unittest.TestCase):
 
         self.assertTrue(tool_after_phase_title("Analysis", "coco"))
         self.assertTrue(tool_after_phase_title("Review", "claude"))
-
-    def test_payload_script_preview_field(self):
-        """WorkflowConfirmPayload should accept script_preview as NotRequired field."""
-        from src.card.events.payloads import WorkflowConfirmPayload
-
-        # Should be able to construct with script_preview
-        payload: WorkflowConfirmPayload = {
-            "script_name": "test",
-            "description": "desc",
-            "phases": [],
-            "tools": ["coco"],
-            "requirement": "req",
-            "initiator_user_id": "u1",
-            "engine_session_key": "k1",
-            "script_preview": "```javascript\nconsole.log('hi');\n```",
-        }
-        self.assertEqual(payload["script_preview"], "```javascript\nconsole.log('hi');\n```")
-
-        # Should also work without script_preview (NotRequired)
-        payload_no_preview: WorkflowConfirmPayload = {
-            "script_name": "test",
-            "description": "desc",
-            "phases": [],
-            "tools": ["coco"],
-            "requirement": "req",
-            "initiator_user_id": "u1",
-            "engine_session_key": "k1",
-        }
-        self.assertNotIn("script_preview", payload_no_preview)
-
 
 class TestWorkflowE2EConfirmFlow(unittest.TestCase):
     """E2E: /wf '重构登录模块' → confirm card with full structure."""

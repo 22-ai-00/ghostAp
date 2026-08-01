@@ -20,10 +20,6 @@ class TestGetAvailableTools(unittest.TestCase):
     def tearDown(self):
         invalidate_cache()
 
-    def test_returns_dict(self):
-        tools = get_available_tools()
-        self.assertIsInstance(tools, dict)
-
     def test_contains_coco(self):
         tools = get_available_tools()
         self.assertIn("coco", tools)

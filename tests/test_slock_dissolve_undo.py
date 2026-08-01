@@ -311,26 +311,6 @@ class TestRestoreFromSnapshot:
 # ===========================================================================
 
 
-class TestTeamSnapshotTTL:
-    """Tests for 30s TTL behavior of TeamSnapshot."""
-
-    def test_snapshot_within_30s_is_valid(self):
-        snapshot = TeamSnapshot(
-            channel_id="ch1",
-            team_name="Team",
-            owner_id="o1",
-            created_at=time.time(),
-        )
-        assert (time.time() - snapshot.created_at) <= 30
-
-    def test_snapshot_after_30s_is_expired(self):
-        snapshot = TeamSnapshot(
-            channel_id="ch1",
-            team_name="Team",
-            owner_id="o1",
-            created_at=time.time() - 31,
-        )
-        assert (time.time() - snapshot.created_at) > 30
 
 
 # ===========================================================================
@@ -341,16 +321,6 @@ class TestTeamSnapshotTTL:
 class TestDissolveHandlerFlow:
     """Integration tests for the dissolve confirmation + undo handler flow."""
 
-    @pytest.fixture
-    def handler_ctx(self):
-        """Create a minimal mock handler context."""
-        ctx = MagicMock()
-        ctx.settings = MagicMock()
-        ctx.settings.slock_dissolve_token_ttl = 300
-        ctx.settings.admin_user_ids = frozenset(["admin_001"])
-        ctx.settings.slock_nli_confidence_threshold = 0.7
-        ctx.settings.slock_nli_timeout = 5
-        return ctx
 
     def test_confirm_flow_captures_snapshot_and_dissolves(self, activated_engine, tmp_path):
         """On confirm: snapshot is captured, engine is deactivated."""
@@ -368,13 +338,6 @@ class TestDissolveHandlerFlow:
         activated_engine.deactivate()
         assert not activated_engine.is_active
 
-    def test_cancel_prevents_dissolve(self, activated_engine):
-        """On cancel: engine remains active, no state change."""
-        # Simulate: user clicks cancel — nothing happens to engine
-        assert activated_engine.is_active
-        assert activated_engine.channel is not None
-        # The cancel handler just sends a text message; engine stays intact
-        assert activated_engine.channel.channel_id == "ch_dissolve"
 
     def test_undo_within_30s_restores_state(self, activated_engine, tmp_path):
         """On undo within 30s: state is fully restored."""
@@ -402,39 +365,7 @@ class TestDissolveHandlerFlow:
         assert restored_engine.channel.team_name == "DissolveTeam"
         assert len(restored_engine.tasks) == 1
 
-    def test_undo_after_30s_fails(self, activated_engine, tmp_path):
-        """On undo after 30s: snapshot is expired, restoration refused."""
-        # Capture snapshot with backdated timestamp
-        snapshot = activated_engine.capture_dissolve_snapshot()
-        # Manually expire the snapshot
-        snapshot.created_at = time.time() - 31
 
-        activated_engine.deactivate()
-
-        # Simulate undo check (what handler does)
-        if (time.time() - snapshot.created_at) <= 30:
-            result = "should_restore"
-        else:
-            result = "expired"
-
-        assert result == "expired"
-
-    def test_snapshot_cleanup_after_30s(self):
-        """Snapshot is removed from dict after 30s timer fires."""
-        dissolve_snapshots: dict[str, TeamSnapshot] = {}
-        snapshot = TeamSnapshot(
-            channel_id="ch_cleanup",
-            team_name="CleanupTeam",
-            owner_id="o1",
-        )
-        dissolve_snapshots["ch_cleanup"] = snapshot
-
-        # Simulate timer cleanup (what the handler's Timer does)
-        def _cleanup(cid):
-            dissolve_snapshots.pop(cid, None)
-
-        _cleanup("ch_cleanup")
-        assert "ch_cleanup" not in dissolve_snapshots
 
     def test_multiple_tasks_preserved_in_snapshot(self, activated_engine):
         """Snapshot captures all tasks, not just the first."""

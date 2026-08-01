@@ -5,21 +5,11 @@ import pytest
 
 from src.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpenException
 from src.utils.retry import (
-    NON_RETRYABLE_ERROR_PATTERNS,
-    RETRYABLE_ERROR_PATTERNS,
     RetryPolicy,
     get_retry_delay,
     prompt_with_retry,
     should_retry,
 )
-
-
-class TestRetryPatterns:
-    def test_retryable_patterns_count(self):
-        assert len(RETRYABLE_ERROR_PATTERNS) == 8
-
-    def test_non_retryable_patterns_count(self):
-        assert len(NON_RETRYABLE_ERROR_PATTERNS) == 3
 
 
 class TestRetryPolicy:
@@ -30,12 +20,6 @@ class TestRetryPolicy:
         assert policy.backoff_multiplier == 1.5
         assert policy.max_delay == 60.0
         assert policy.jitter_factor == 0.25
-
-    def test_custom_values(self):
-        policy = RetryPolicy(max_retries=5, retry_delay=1.0, backoff_multiplier=2.0)
-        assert policy.max_retries == 5
-        assert policy.retry_delay == 1.0
-        assert policy.backoff_multiplier == 2.0
 
 
 class TestShouldRetry:

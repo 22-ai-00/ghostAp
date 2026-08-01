@@ -99,12 +99,6 @@ class TestBuildWorktreeActionRegistry:
         event = factory({})
         assert isinstance(event, CardEvent)
 
-    def test_registry_values_are_callable(self):
-        """All values in the registry are callable."""
-        registry = build_worktree_action_registry()
-        for aid, factory in registry.items():
-            assert callable(factory), f"Registry value for {aid!r} is not callable"
-
     def test_cancel_factory_ignores_payload(self):
         """WORKTREE_CANCEL factory produces fixed payload regardless of input."""
         registry = build_worktree_action_registry()

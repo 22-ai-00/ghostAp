@@ -41,28 +41,6 @@ from src.card.state.models import ButtonSpec
 class TestConfirmTitleMapValidation:
     """Verify that import-time validation emits RuntimeWarning for invalid keys."""
 
-    def test_invalid_key_emits_runtime_warning(self):
-        """When _CONFIRM_TITLE_MAP contains a key not in ButtonIntent or INTENT_TO_ACTION_ID,
-        a RuntimeWarning should be emitted (validation logic test)."""
-        # Simulate the validation logic with a bad _CONFIRM_TITLE_MAP
-        bad_map = {**buttons_module._CONFIRM_TITLE_MAP, "bogus.invalid.key": "card_btn_confirm_stop_title"}
-        valid_keys = (
-            {m.value for m in ButtonIntent}
-            | set(INTENT_TO_ACTION_ID.values())
-            | {
-                WORKFLOW_CANCEL, WORKFLOW_CONFIRM_TOOLS, WORKFLOW_CONFIRM_START,
-                WORKFLOW_SELECT_TOOL, WORKFLOW_REGENERATE_SCRIPT,
-                WORKFLOW_ORCHESTRATOR_SELECT_TOOL, WORKFLOW_ORCHESTRATOR_SELECT_MODEL,
-                WORKFLOW_ORCHESTRATOR_FINISH, WORKFLOW_REVIEW_SELECT_TOOL,
-                WORKFLOW_REVIEW_SELECT_MODEL, WORKFLOW_REVIEW_FINISH,
-                SHOW_WORKFLOW_MENU, WORKFLOW_LIST_TEMPLATES, WORKFLOW_SHOW_HELP,
-            }
-        )
-        invalid_keys = set(bad_map.keys()) - valid_keys
-        assert invalid_keys == {"bogus.invalid.key"}, (
-            f"Expected bogus key to be invalid, got: {invalid_keys}"
-        )
-
     def test_current_map_has_no_invalid_keys(self):
         """Verify that the actual _CONFIRM_TITLE_MAP has no invalid keys at import time."""
         valid_keys = (

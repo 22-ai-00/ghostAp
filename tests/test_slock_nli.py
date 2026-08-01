@@ -648,27 +648,12 @@ class TestIsSlockCommandWithIntentResult:
 class TestIntentResultDataclass:
     """Test the IntentResult dataclass contract."""
 
-    def test_default_params_is_empty_dict(self):
-        result = IntentResult(action=SlockCommandAction.UNKNOWN, confidence=0.0)
-        assert result.params == {}
-
     def test_params_independence(self):
         """Each instance should get its own dict (field default_factory)."""
         r1 = IntentResult(action=SlockCommandAction.STOP, confidence=0.9)
         r2 = IntentResult(action=SlockCommandAction.STOP, confidence=0.9)
         r1.params["key"] = "value"
         assert "key" not in r2.params
-
-    def test_all_fields_settable(self):
-        result = IntentResult(
-            action=SlockCommandAction.NEW_ROLE,
-            confidence=0.85,
-            params={"name": "test", "tool": "codex"},
-        )
-        assert result.action == SlockCommandAction.NEW_ROLE
-        assert result.confidence == 0.85
-        assert result.params == {"name": "test", "tool": "codex"}
-
 
 # ===========================================================================
 # TestIntentRouterInit

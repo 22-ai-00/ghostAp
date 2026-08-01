@@ -11,8 +11,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from src.workflow_engine.models import PendingConfirmation, WorkflowProject, WorkflowStatus
 
 
@@ -151,25 +149,6 @@ class TestWorkflowConfirmSecurity(unittest.TestCase):
         # State should NOT be reset
         self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_CONFIRM)
         handler._reply_workflow_error.assert_called_once()
-
-    @pytest.mark.skip(reason="Budget/roles selection removed — no pending.budget to reset.")
-    @patch("src.thread.get_current_sender_id", return_value="user_123")
-    def test_cancel_resets_pending_budget(self, mock_sender):
-        """Cancel should reset pending_budget to None. SKIPPED: budget removed."""
-        handler = self._make_handler()
-        engine = self._make_engine_awaiting(session_key="valid_key", initiator="user_123")
-        if engine.project.pending is None:
-            engine.project.pending = PendingConfirmation()
-        handler.ctx.workflow_engine_manager.get.return_value = engine
-
-        handler.handle_workflow_cancel(
-            "msg_1", "chat_1", "proj_1",
-            {"action": "workflow_cancel", "engine_session_key": "valid_key"},
-        )
-
-        # pending_budget should be cleared
-        self.assertIsNone(engine.project.pending.budget if engine.project.pending else None)
-        self.assertEqual(engine.project.status, WorkflowStatus.IDLE)
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     def test_confirm_uses_project_id_for_routing(self, mock_sender):

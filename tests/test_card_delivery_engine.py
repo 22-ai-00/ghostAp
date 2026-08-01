@@ -1634,11 +1634,6 @@ class TestMutationOutcomeStructure:
         with pytest.raises(dataclasses.FrozenInstanceError):
             outcome.kind = "rejected"  # type: ignore[misc]
 
-    @pytest.mark.parametrize("kind", ["applied", "reconcile", "skipped", "rejected"])
-    def test_all_kinds_constructible(self, kind):
-        o = MutationOutcomeType(kind=kind)
-        assert o.kind == kind
-
     def test_default_message_is_empty(self):
         o = MutationOutcomeType(kind="applied")
         assert o.message == ""

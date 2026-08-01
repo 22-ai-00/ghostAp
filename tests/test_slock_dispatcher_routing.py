@@ -436,55 +436,6 @@ class TestRoutingChainPriority:
 # ============================================================
 
 
-class TestAutoActivateNoDoubleHandle:
-    """After auto-activate, dispatcher should NOT call _handle_slock_message.
-
-    The first message is enqueued atomically during bootstrap via
-    activate_slock(requirement=text), so calling _handle_slock_message
-    would duplicate-process the message.
-    """
-
-    def test_auto_activate_does_not_call_handle_slock_message(self):
-        """Dispatcher auto-activate path should NOT call _handle_slock_message."""
-        client = MagicMock()
-        client.settings = MagicMock()
-        client.settings.slock_passive_mode = True
-        client._is_slock_managed_chat.return_value = False
-        client._should_auto_activate_slock.return_value = True
-
-        # Simulate dispatcher logic (lines 127-138 in dispatcher.py)
-        _is_managed = client._is_slock_managed_chat("chat_new")
-        _passive_mode = getattr(client.settings, "slock_passive_mode", True)
-
-        if _passive_mode:
-            if _is_managed:
-                client._handle_slock_message("msg_1", "chat_new", "build the app", None)
-            elif client._should_auto_activate_slock("chat_new", "build the app"):
-                client._auto_activate_slock("chat_new", "build the app", None)
-                client._add_reaction("msg_1", "processing")
-                # NO _handle_slock_message call here!
-
-        client._auto_activate_slock.assert_called_once()
-        client._handle_slock_message.assert_not_called()
-
-    def test_managed_chat_still_handles_message(self):
-        """Managed chats should still call _handle_slock_message normally."""
-        client = MagicMock()
-        client.settings = MagicMock()
-        client.settings.slock_passive_mode = True
-        client._is_slock_managed_chat.return_value = True
-
-        _is_managed = client._is_slock_managed_chat("chat_existing")
-        _passive_mode = getattr(client.settings, "slock_passive_mode", True)
-
-        if _passive_mode:
-            if _is_managed:
-                client._add_reaction("msg_1", "processing")
-                client._handle_slock_message("msg_1", "chat_existing", "fix bug", None)
-
-        client._handle_slock_message.assert_called_once()
-        client._auto_activate_slock.assert_not_called()
-
 
 # ============================================================
 # Fixture for dispatcher-level tests

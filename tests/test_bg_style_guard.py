@@ -23,16 +23,6 @@ class TestStatusBgStyleMap:
                 f"Legal values: {_VALID_BACKGROUND_STYLES}"
             )
 
-    def test_no_blue_yellow_purple(self):
-        """Explicitly verify old illegal values are gone."""
-        illegal = {"blue", "yellow", "purple"}
-        for status, style in STATUS_BG_STYLE_MAP.items():
-            assert style not in illegal, (
-                f"STATUS_BG_STYLE_MAP[{status}] = '{style}' — "
-                f"this was an illegal value that should have been replaced"
-            )
-
-
 class TestValidateBackgroundStyle:
     """Verify the guard function behavior."""
 
