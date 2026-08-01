@@ -201,6 +201,85 @@ def test_employee_owner_p2p_status_survives_production_registry_gate(tmp_path) -
     ingress.record_disposition.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("text", "expect_status"),
+    [
+        ("/status", True),
+        ("implement project work", False),
+    ],
+)
+def test_employee_owner_p2p_drain_only_admits_read_only_status(
+    tmp_path,
+    text: str,
+    expect_status: bool,
+) -> None:
+    raw_chat_id = "chat-owner-employee-dm"
+    raw_message_id = "om-owner-control"
+    metadata = SimpleNamespace(
+        chat_id="oc_" + hashlib.sha256(raw_chat_id.encode()).hexdigest(),
+        message_id="om_" + hashlib.sha256(raw_message_id.encode()).hexdigest(),
+        thread_root_message_id="",
+    )
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "p2p",
+                "content": {"text": text},
+                "sender_id": OWNER_ID,
+                "remote_chat_id": raw_chat_id,
+                "remote_message_id": raw_message_id,
+                "remote_root_id": "",
+            },
+        )
+    )
+    record = SimpleNamespace(metadata=metadata, disposition=None)
+    ingress = MagicMock()
+    ingress.state.by_acceptance_id = {"acceptance-1": record}
+    ingress.get_payload.return_value = payload
+    ingress.gc_terminal_payloads.return_value = 0
+    router = MagicMock()
+    router.state.by_acceptance_id = {}
+    router.claim_control.return_value = True
+    dispatch = MagicMock()
+    dispatch.employee_runtime = None
+    dispatch.dispatch_next.return_value = None
+    runtime = EmployeeDepartmentRuntime(
+        managed_group_registry=_registry(tmp_path),
+        managed_group_owner_id=OWNER_ID,
+    )
+    runtime._ingress = ingress
+    runtime._router = router
+    runtime._dispatch = dispatch
+    runtime._handle_durable_activation_status = MagicMock(return_value=True)
+    runtime._record_employee_ingress_group_event = MagicMock()
+    runtime._reconcile_terminal_ingress = MagicMock(return_value=0)
+    runtime._drain_employee_outbox_once = MagicMock(return_value=False)
+    runtime._outbox = None
+
+    assert runtime._drain_employee_dispatch_once() is True
+
+    if expect_status:
+        router.claim_control.assert_called_once_with(
+            "acceptance-1",
+            command="/status",
+        )
+        runtime._handle_durable_activation_status.assert_called_once_with(
+            "acceptance-1"
+        )
+        ingress.record_disposition.assert_not_called()
+    else:
+        router.claim_control.assert_not_called()
+        runtime._handle_durable_activation_status.assert_not_called()
+        ingress.record_disposition.assert_called_once_with(
+            "acceptance-1",
+            state="ignored",
+            reason_code="authority_denied",
+        )
+    router.route.assert_not_called()
+    runtime._record_employee_ingress_group_event.assert_not_called()
+
+
 def test_managed_topic_cannot_replace_registry_project(tmp_path) -> None:
     client = _client(_registry(tmp_path), enforced=True)
     client.settings.thread_programming_enabled = True
@@ -348,6 +427,95 @@ def test_recognizer_rotation_fences_single_executor(tmp_path) -> None:
     )
 
     client._handle_coco_message.assert_not_called()
+
+
+def _slock_dispatch_client(
+    registry: ManagedGroupRegistry,
+) -> tuple[FeishuWSClient, object, EffectiveTrust]:
+    client = _client(registry, enforced=True)
+    project = client._project_manager.get_project_for_chat.return_value
+    trust = client._resolve_effective_trust(
+        sender_id=OWNER_ID,
+        chat_id=GROUP_ID,
+        chat_type="group",
+    )
+    client._get_effective_mode = MagicMock(
+        return_value=(InteractionMode.SMART, False)
+    )
+    client._is_deep_command = MagicMock(return_value=False)
+    client._is_spec_command = MagicMock(return_value=False)
+    client._is_workflow_command = MagicMock(return_value=False)
+    client._is_topic_engine_context = MagicMock(return_value=False)
+    client._is_interceptable_command_match = MagicMock(return_value=False)
+    client._is_worktree_awaiting_goal = MagicMock(return_value=False)
+    client._is_exit_command = MagicMock(return_value=False)
+    client._add_reaction = MagicMock()
+    client._handle_slock_command = MagicMock()
+    client._handle_slock_message = MagicMock()
+    return client, project, trust
+
+
+def test_explicit_slock_rechecks_trust_after_command_detection(tmp_path) -> None:
+    registry = _registry(tmp_path)
+    client, project, trust = _slock_dispatch_client(registry)
+
+    def detect_and_rotate(*_args):
+        registry.rotate_receiving_bot(
+            chat_id=GROUP_ID,
+            expected_bot_ref="cli_main_bot",
+            new_bot_ref="cli_rotated_bot",
+        )
+        return True
+
+    client._is_slock_command = MagicMock(side_effect=detect_and_rotate)
+
+    MessageDispatcher(client).process_with_intent(
+        "om_managed",
+        GROUP_ID,
+        "/slock status",
+        project,
+        effective_trust=trust,
+    )
+
+    client._handle_slock_command.assert_not_called()
+    client._handle_slock_message.assert_not_called()
+
+
+@pytest.mark.parametrize("passive_mode", [True, False], ids=["passive", "legacy"])
+def test_slock_classifier_rotation_fences_real_message_handler(
+    tmp_path,
+    passive_mode: bool,
+) -> None:
+    registry = _registry(tmp_path)
+    client, project, trust = _slock_dispatch_client(registry)
+    client.settings.slock_passive_mode = passive_mode
+    client._is_slock_command = MagicMock(return_value=False)
+    client._is_slock_managed_chat = MagicMock(return_value=True)
+    client._is_slock_active = MagicMock(return_value=True)
+
+    def classify_and_rotate(*_args, **_kwargs):
+        registry.rotate_receiving_bot(
+            chat_id=GROUP_ID,
+            expected_bot_ref="cli_main_bot",
+            new_bot_ref="cli_rotated_bot",
+        )
+        return False, 1.0
+
+    with patch(
+        "src.slock_engine.task_classifier.TaskClassifier.classify",
+        side_effect=classify_and_rotate,
+    ):
+        MessageDispatcher(client).process_with_intent(
+            "om_managed",
+            GROUP_ID,
+            "Please coordinate the release plan",
+            project,
+            command_match=None,
+            effective_trust=trust,
+        )
+
+    client._handle_slock_message.assert_not_called()
+    client._handle_slock_command.assert_not_called()
 
 
 def test_multi_task_rechecks_trust_before_every_step(tmp_path) -> None:

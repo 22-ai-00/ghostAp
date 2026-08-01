@@ -2455,6 +2455,9 @@ class EmployeeDepartmentRuntime:
                     )
                 except Exception:
                     trust = self._unknown_employee_ingress_trust()
+                if self._handle_control_ingress(acceptance_id):
+                    worked = True
+                    continue
                 if trust is not None and trust.zone is not TrustZone.MANAGED_AGENT_GROUP:
                     try:
                         ingress.record_disposition(
@@ -2478,9 +2481,6 @@ class EmployeeDepartmentRuntime:
                         )
                     except IngressConflictError:
                         pass
-                    worked = True
-                    continue
-                if self._handle_control_ingress(acceptance_id):
                     worked = True
                     continue
                 # Employee Bot subscriptions also observe group slash commands

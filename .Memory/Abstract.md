@@ -1,6 +1,8 @@
 # GhostAP 项目记忆索引
 
 > **维护性 Backlog**: 后续 Review/Audit 发现的非紧急维护项按分级规则录入 [Backlog.md](Backlog.md) 并在维护窗口集中处理；本轮 Refactoring Analysis 1–28 的问题矩阵入口是 [.Memory/2026-05-11.md](2026-05-11.md) 顶部最终矩阵，2026-05-12 是执行验证日志。
+## 2026-08-01
+- **Task 0.10 终审门禁收口** - Slock重检、撤销卡片失败关闭与Owner只读控制 → [2026-08-01.md](2026-08-01.md)
 ## 2026-07-31
 - **Task 0.10 竞态评审修复** - Project唯一来源、effect重检与长卡revision冻结 → [2026-07-31.md](2026-07-31.md)
 - **Task 0.10 信任区切换** - Registry-first ingress、Outbox 因果、card revision fence → [2026-07-31.md](2026-07-31.md)

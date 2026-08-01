@@ -47,6 +47,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _ManagedCardTrustUnavailable(RuntimeError):
+    """Raised when a card with managed provenance cannot be safely issued."""
+
+
+def _has_managed_trust_revisions(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        group_revision = value.get("group_revision")
+        grant_revision = value.get("grant_revision")
+        if (
+            type(group_revision) is int
+            and group_revision > 0
+            and type(grant_revision) is int
+            and grant_revision > 0
+        ):
+            return True
+        return any(_has_managed_trust_revisions(child) for child in value.values())
+    if isinstance(value, list):
+        return any(_has_managed_trust_revisions(child) for child in value)
+    return False
+
+
 class BaseHandler:
     """Shared utilities available to every handler."""
 
@@ -284,6 +305,13 @@ class BaseHandler:
         registry = getattr(self.ctx, "managed_group_registry", None)
         if registry is None:
             return card_content
+        raw = card_content
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                raw = None
+        issued_managed_stamp = _has_managed_trust_revisions(raw)
         if not chat_id and origin_message_id:
             try:
                 provenance = self.ctx.message_linker.query(origin_message_id)
@@ -293,20 +321,33 @@ class BaseHandler:
                 candidate = provenance.get("chat_id")
                 chat_id = candidate if isinstance(candidate, str) else ""
         if not chat_id:
+            if issued_managed_stamp:
+                raise _ManagedCardTrustUnavailable(
+                    "managed card origin is unavailable"
+                )
             return card_content
         try:
             group, grant = registry.trust_snapshot(chat_id)
-        except Exception:
-            logger.warning("managed card trust snapshot unavailable", exc_info=True)
+        except Exception as exc:
+            raise _ManagedCardTrustUnavailable(
+                "managed card trust snapshot unavailable"
+            ) from exc
+        if group is None and grant is None:
+            try:
+                managed_origin = registry.record(chat_id) is not None
+            except Exception as exc:
+                raise _ManagedCardTrustUnavailable(
+                    "managed card origin lookup unavailable"
+                ) from exc
+            if managed_origin or issued_managed_stamp:
+                raise _ManagedCardTrustUnavailable(
+                    "managed card trust snapshot is no longer active"
+                )
             return card_content
         if group is None or grant is None:
-            return card_content
-        raw = card_content
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                return card_content
+            raise _ManagedCardTrustUnavailable(
+                "incomplete managed card trust snapshot"
+            )
         if not isinstance(raw, dict):
             return card_content
         return bind_managed_trust_revisions(
@@ -322,11 +363,28 @@ class BaseHandler:
         registry = getattr(self.ctx, "managed_group_registry", None)
         if registry is None:
             return None
-        group, grant = registry.trust_snapshot(chat_id)
+        try:
+            group, grant = registry.trust_snapshot(chat_id)
+        except Exception as exc:
+            raise _ManagedCardTrustUnavailable(
+                "managed card trust snapshot unavailable"
+            ) from exc
         if group is None and grant is None:
+            try:
+                managed_origin = registry.record(chat_id) is not None
+            except Exception as exc:
+                raise _ManagedCardTrustUnavailable(
+                    "managed card origin lookup unavailable"
+                ) from exc
+            if managed_origin:
+                raise _ManagedCardTrustUnavailable(
+                    "managed card trust snapshot is no longer active"
+                )
             return None
         if group is None or grant is None:
-            raise RuntimeError("incomplete managed card trust snapshot")
+            raise _ManagedCardTrustUnavailable(
+                "incomplete managed card trust snapshot"
+            )
         return group.revision, grant.revision
 
     # ------------------------------------------------------------------
@@ -409,20 +467,20 @@ class BaseHandler:
         Raises:
             No exceptions raised; errors are logged and None is returned.
         """
-        origin = self._resolve_origin(message_id)
-        audit_aliases = self._reply_audit_aliases(origin)
-        request_id = self.ensure_request_id(origin)
-        ref_note = self.format_ref_note(origin, request_id, None)
-        card_content = self._bind_managed_card_revisions(
-            card_content,
-            origin_message_id=origin,
-        )
-        content_str = self._inject_ref_note(card_content, "interactive", ref_note)
-
-        if reply_in_thread is None:
-            reply_in_thread = self.settings.default_reply_mode == "thread"
-
         try:
+            origin = self._resolve_origin(message_id)
+            audit_aliases = self._reply_audit_aliases(origin)
+            request_id = self.ensure_request_id(origin)
+            ref_note = self.format_ref_note(origin, request_id, None)
+            card_content = self._bind_managed_card_revisions(
+                card_content,
+                origin_message_id=origin,
+            )
+            content_str = self._inject_ref_note(card_content, "interactive", ref_note)
+
+            if reply_in_thread is None:
+                reply_in_thread = self.settings.default_reply_mode == "thread"
+
             response = self.im_client.reply_message(
                 message_id, content_str, msg_type="interactive",
                 reply_in_thread=reply_in_thread,

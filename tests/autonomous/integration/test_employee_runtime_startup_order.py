@@ -14,6 +14,7 @@ from src.autonomous.supervisor import (
     EmployeeRecoverySnapshot,
 )
 from src.autonomous.workspace import EmployeeWorkspaceProjector
+from src.trust.models import ActorKind, TrustZone
 from tests.autonomous.workforce_helpers import (
     commit_events,
     employee_created,
@@ -249,6 +250,12 @@ def test_production_dispatch_projects_group_context_before_routing_and_gc(
         def rebuild_projection(self):
             return None
 
+        def get_payload(self, observed_acceptance_id: str):
+            assert observed_acceptance_id == acceptance_id
+            return SimpleNamespace(
+                normalized_parts=({"type": "message"},),
+            )
+
         def gc_terminal_payloads(self):
             calls.append("gc_payload")
             return 0
@@ -285,6 +292,14 @@ def test_production_dispatch_projects_group_context_before_routing_and_gc(
         runtime,
         "_handle_control_ingress",
         lambda observed_acceptance_id: calls.append("handle_control") or False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_managed_employee_ingress_trust",
+        lambda _record, _payload: SimpleNamespace(
+            zone=TrustZone.MANAGED_AGENT_GROUP,
+            actor=ActorKind.OWNER,
+        ),
     )
     monkeypatch.setattr(
         runtime,

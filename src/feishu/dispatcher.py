@@ -241,6 +241,8 @@ class MessageDispatcher:
             else self.client._is_slock_command(text, chat_id)
         )
         if _slock_result and not _is_protected_explicit_command:
+            if not current_dispatch_allowed():
+                return
             self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
             self.client._add_reaction(message_id, EmojiReaction.on_processing())
             self.client._handle_slock_command(message_id, chat_id, text, project)
@@ -300,6 +302,8 @@ class MessageDispatcher:
                 is_ambient, ambient_confidence = TaskClassifier.classify(
                     text or "", managed_chat=True
                 )
+                if not current_dispatch_allowed():
+                    return
                 if is_ambient and ambient_confidence >= 0.7:
                     # The durable group ledger above remains the only effect.
                     return
@@ -393,6 +397,8 @@ class MessageDispatcher:
                 is_ambient, ambient_confidence = TaskClassifier.classify(
                     text or "", managed_chat=True
                 )
+                if not current_dispatch_allowed():
+                    return
                 if is_ambient and ambient_confidence >= 0.7:
                     return
                 self.client._add_reaction(message_id, EmojiReaction.on_processing())

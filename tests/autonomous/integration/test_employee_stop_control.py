@@ -755,9 +755,14 @@ def test_runtime_reconciles_membership_event_with_hash_bound_remote_chat() -> No
     runtime = EmployeeDepartmentRuntime()
     runtime._ingress = ingress
     runtime._membership = membership
+    runtime._membership_event_transport_is_current = MagicMock(return_value=True)
 
     assert runtime._handle_control_ingress(acceptance_id) is True
 
+    runtime._membership_event_transport_is_current.assert_called_once_with(
+        metadata,
+        remote_chat_id,
+    )
     membership.reconcile_event.assert_called_once_with(
         tenant_key="tenant_1",
         chat_id=remote_chat_id,

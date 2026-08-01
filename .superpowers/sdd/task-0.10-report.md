@@ -93,6 +93,47 @@ git diff --check: passed
 
 The only warnings are the existing pinned Lark SDK Python 3.13 deprecations.
 
+## Push-gate final review correction
+
+The final pre-push review found one Critical and two Important gaps. They were
+reproduced in the real production entrypoints before implementation. The
+focused collection was `12 failed, 1 passed`:
+
+- Explicit Slock command detection and both passive/legacy classifier paths
+  could rotate Registry trust and still call the real Slock handler.
+- A new continuation or static card session after begin-revoke/tombstone could
+  interpret `(None, None)` as unmanaged. Direct BaseHandler reply/update/send
+  also passed cards through on missing/error snapshots, including previously
+  issued managed revision stamps.
+- The production Employee drain rejected Owner P2P `/status` at its outer zone
+  gate before the existing read-only control handler. The non-control Owner P2P
+  baseline already passed and never entered project work.
+
+The correction adds current-trust checks immediately after all three Slock
+decision points; treats a historical Registry record or issued revision stamp
+as an explicit managed-card expectation; rejects unavailable, incomplete,
+revoking, or tombstoned snapshots for CardSession and direct BaseHandler
+transports; and consumes exact Employee controls before the drain's ordinary
+managed-project gate. It does not grant project routing to Owner P2P.
+
+Two older autonomous adjacent fixtures were updated to provide the managed
+payload/trust and current membership-transport evidence required by the
+existing default-deny production contract. No production gate was relaxed.
+
+Final verification:
+
+```text
+Core ingress/card/dispatcher focused and adjacent: 154 passed
+Employee drain/control and BaseHandler adjacent: 271 passed
+Total: 425 passed, 0 failed
+Touched-file Ruff: All checks passed
+git diff --check: passed
+```
+
+The two warnings remain the pinned Lark SDK Python 3.13 deprecations. Real
+Feishu tenant/mobile execution is still `not_tested`; Task 0.9 Employee
+principal rotation remains the workforce-model blocker.
+
 ## Boundaries and residual risk
 
 - Task 0.9 Employee principal rotation remains blocked by the workforce model.

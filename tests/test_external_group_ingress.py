@@ -8,8 +8,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.card.delivery.engine import CardDelivery
+from src.card.events import CardEvent
+from src.card.session import CardSession, SessionConfig
 from src.card.session.static import StaticCardSession
+from src.card.state.models import CardMetadata
 from src.card.types import RenderedCard
+from src.feishu.handlers.base import BaseHandler
 from src.feishu.ws_card_action_handler import bind_managed_trust_revisions
 from src.feishu.ws_client import FeishuWSClient
 from src.slock_engine.activation_guard import ActivationGuard
@@ -33,6 +37,49 @@ def _registry(tmp_path) -> ManagedGroupRegistry:
         backend_binding_ids=("codex",),
     )
     return registry
+
+
+def _revoke_registry(registry: ManagedGroupRegistry, state: str) -> None:
+    if state == "revoking":
+        registry.begin_revoke(
+            GROUP_ID,
+            requested_at=datetime(2026, 8, 1, tzinfo=UTC),
+        )
+    else:
+        registry.tombstone(GROUP_ID)
+
+
+def _card_handler(registry) -> BaseHandler:
+    handler = BaseHandler.__new__(BaseHandler)
+    handler.ctx = SimpleNamespace(
+        managed_group_registry=registry,
+        message_linker=MagicMock(),
+        settings=SimpleNamespace(default_reply_mode="thread"),
+    )
+    handler.ctx.message_linker.query.return_value = {"chat_id": GROUP_ID}
+    handler.im_client = MagicMock()
+    handler._resolve_origin = MagicMock(return_value="om_origin")
+    handler._reply_audit_aliases = MagicMock(return_value=())
+    handler.ensure_request_id = MagicMock(return_value="request-1")
+    handler.format_ref_note = MagicMock(return_value="")
+    handler._inject_ref_note = MagicMock(return_value="{}")
+    handler._link_reply_response = MagicMock()
+    return handler
+
+
+def _handler_card_delivery(handler: BaseHandler) -> tuple[CardDelivery, MagicMock]:
+    client = MagicMock()
+    client.create_card.return_value = ("om_card", "om_card")
+    delivery = CardDelivery(
+        client,
+        registry=MagicMock(),
+        payload_transform=lambda chat_id, card: handler._bind_managed_card_revisions(
+            card,
+            chat_id=chat_id,
+        ),
+        trust_revision_provider=handler._managed_card_trust_revisions,
+    )
+    return delivery, client
 
 
 def _message(*, chat_id: str, sender_id: str) -> MagicMock:
@@ -417,6 +464,104 @@ def test_card_session_start_snapshot_fails_closed_before_first_send(next_snapsho
 
     assert session.send({"schema": "2.0", "body": {"elements": []}}) is None
     client.create_card.assert_not_called()
+
+
+@pytest.mark.parametrize("registry_state", ["revoking", "tombstoned"])
+@pytest.mark.parametrize("session_kind", ["continuation", "static"])
+def test_new_card_sessions_fail_closed_after_managed_group_revoke(
+    tmp_path,
+    registry_state: str,
+    session_kind: str,
+) -> None:
+    registry = _registry(tmp_path)
+    _revoke_registry(registry, registry_state)
+    handler = _card_handler(registry)
+    delivery, client = _handler_card_delivery(handler)
+
+    if session_kind == "continuation":
+        session = CardSession(
+            GROUP_ID,
+            SessionConfig(
+                metadata=CardMetadata(mode_name="Test"),
+                sync_delivery=True,
+            ),
+            delivery,
+            session_id=f"{registry_state}-continuation",
+        )
+        session.dispatch(CardEvent.started())
+    else:
+        session = StaticCardSession(
+            delivery,
+            GROUP_ID,
+            session_id=f"{registry_state}-static",
+        )
+        assert session.send({"schema": "2.0", "body": {"elements": []}}) is None
+
+    client.create_card.assert_not_called()
+    client.update_card.assert_not_called()
+    session.close()
+
+
+@pytest.mark.parametrize("registry_state", ["revoking", "tombstoned"])
+def test_direct_base_handler_cards_fail_closed_after_managed_group_revoke(
+    tmp_path,
+    registry_state: str,
+) -> None:
+    registry = _registry(tmp_path)
+    _revoke_registry(registry, registry_state)
+    handler = _card_handler(registry)
+    card = {"schema": "2.0", "body": {"elements": []}}
+
+    assert handler.reply_card("om_origin", card) is None
+    assert handler.update_card("om_card", card) is False
+    assert handler.send_card_to_chat(GROUP_ID, card) is None
+
+    handler.im_client.reply_message.assert_not_called()
+    handler.im_client.patch_message.assert_not_called()
+    handler.im_client.send_message.assert_not_called()
+
+
+def test_direct_base_handler_rejects_issued_stamp_without_current_snapshot(
+    tmp_path,
+) -> None:
+    registry = _registry(tmp_path)
+    group, grant = registry.trust_snapshot(GROUP_ID)
+    assert group is not None and grant is not None
+    stamped = bind_managed_trust_revisions(
+        {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "Run"},
+                        "value": {"action": "run"},
+                    }
+                ]
+            },
+        },
+        group_revision=group.revision,
+        grant_revision=grant.revision,
+    )
+    handler = _card_handler(registry)
+
+    assert handler.send_card_to_chat("oc_never_managed", stamped) is None
+    handler.im_client.send_message.assert_not_called()
+
+
+def test_direct_base_handler_fails_closed_on_snapshot_read_error() -> None:
+    registry = MagicMock()
+    registry.trust_snapshot.side_effect = OSError("registry unavailable")
+    handler = _card_handler(registry)
+    card = {"schema": "2.0", "body": {"elements": []}}
+
+    assert handler.reply_card("om_origin", card) is None
+    assert handler.update_card("om_card", card) is False
+    assert handler.send_card_to_chat(GROUP_ID, card) is None
+
+    handler.im_client.reply_message.assert_not_called()
+    handler.im_client.patch_message.assert_not_called()
+    handler.im_client.send_message.assert_not_called()
 
 
 def test_activation_guard_denies_external_trust_before_rate_limit() -> None:
