@@ -20,12 +20,13 @@ All notable changes to this project will be documented in this file.
 
 ### ⚠️ Breaking Changes
 
+- **Worktree mode removed**: `/worktree` and `/wt`, the Worktree engine, its cards, and its dedicated tests are gone. Existing historical cards are read-only and non-executable; use `/wf` as the supported multi-Agent orchestration entry. Legacy local branches and worktree directories are not deleted or migrated automatically.
 - **`DirectCardSession` 已删除**: `src/card/direct_session.py` 已移除。所有引擎渲染器现使用 `BaseRenderer.create_session()` → `CardSession.dispatch()`。
 - **`CardBuilder.build_engine_card()` 已移除**: 访问将触发 `AttributeError`。使用新管线 `renderer.create_session()` + `session.dispatch(CardEvent.*)` 替代。
 - **`src/card/adapter.py` 已删除**: 适配逻辑迁移至 `src/card/events/acp_adapter.py` 及 `src/card/protocols.py`。
 - **`src/card/events.py` 顶层模块已删除**: 重构为 `src/card/events/` 包。
 - **`BaseHandler` 旧方法已移除**: `reply_message`/`patch_message`/`send_message` 调用将 raise `NotImplementedError`。
-- **Loop Engine 已完整移除**: `/loop`、`/loop_status`、`/loop_update`、`/stop_loop` 命令不再可用。Loop 模式的迭代工作流由 Spec 模式替代，并行执行由 Worktree 模式替代。相关源码（`src/loop_engine/`、`src/feishu/handlers/loop.py`、`src/feishu/renderers/loop_renderer.py`）及 15 个测试文件已删除。
+- **Loop Engine 已完整移除**: `/loop`、`/loop_status`、`/loop_update`、`/stop_loop` 命令不再可用。Loop 模式的迭代工作流由 Spec 模式替代，多 Agent 编排由 Workflow 模式承接。相关源码（`src/loop_engine/`、`src/feishu/handlers/loop.py`、`src/feishu/renderers/loop_renderer.py`）及 15 个测试文件已删除。
 
 ### Removed
 

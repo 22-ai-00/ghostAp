@@ -46,7 +46,6 @@ uv run python scripts/test_inventory.py tests/
 - 当代码库或工具不再需要时，删除过时规则。
 - 将 Coco/Claude/Aiden/Codex/Gemini/TTADK 视为 GhostAP 编程抽象背后的工具后端。除非传输或功能确实不同，否则避免添加后端特定分支。
 - 机器人管理员引导是单向的：仅当 `ADMIN_USER_IDS` 为空时，才接受任意用户在主 Bot 私聊中发送 `/setadmin`；群聊中的首次设置一律拒绝。之后只有配置的管理员可以替换 `.env` 中的单个管理员。
-- Worktree 模式应生成直接可用的代码，无需手动解决冲突。WT 输出创建的合并冲突自动以 WT 分支为准解决，卡片必须披露此影响，以便用户决定是否启动额外的修复任务。
 
 ## 架构指针
 
@@ -57,7 +56,7 @@ uv run python scripts/test_inventory.py tests/
 - `src/mode/`：`InteractionMode` 和每聊天/项目模式状态。
 - `src/acp/`：ACP 会话、提供者、诊断和支持 ACP 的编程工具的模型/工具发现。
 - `src/ttadk/`：TTADK 工具/模型选择和启动策略。`ttadk_*` 代理类型仅支持 CLI 桥接；不要直接为它们启动 ACP。
-- `src/deep_engine/`、`src/spec_engine/`、`src/worktree_engine/`、`src/workflow_engine/`：长时间运行的执行策略。
+- `src/deep_engine/`、`src/spec_engine/`、`src/workflow_engine/`：长时间运行的执行策略。
   - `src/workflow_engine/`：JS 编排的多代理并行执行。关键模块：`commands.py`（SSOT 命令集）、`engine.py`（桥接 + 运行时）、`executor.py`（每代理调用会话）、`tool_registry.py`（动态发现）、`script_gen.py`（提示模板 + 验证）、`renderer.py`（飞书卡片）。需要 Node.js >= `NODE_MIN_VERSION`（在 `src/workflow_engine/constants.py` 中定义）；所有面向用户的"Node 版本过旧"消息都源自此常量。
 - `src/card/`：飞书卡片构建器、渲染管道、会话编排和交付。
 - `src/project/`、`src/project_chat/`、`src/thread/`：项目上下文、项目聊天绑定和线程上下文。
@@ -107,7 +106,7 @@ uv run ruff check src/autonomous/           # 0 错误
 
 GhostAP 有两个独立的维度：
 
-- 执行策略：普通编程、Deep、Spec、Worktree、Workflow 和 Autonomous。
+- 执行策略：普通编程、Deep、Spec、Workflow 和 Autonomous。
 - 工具传输：ACP 直接模式、shell CLI 桥接模式和 TTADK CLI 桥接。
 
 保持这些维度分离。新的编程功能通常应在 Coco、Claude、Aiden、Codex、Gemini 和 TTADK 上工作，除非用户明确限定范围或后端不支持。
@@ -116,7 +115,7 @@ GhostAP 有两个独立的维度：
 
 - SMART 是默认聊天/项目状态，可直接路由简单意图或类 shell 命令。
 - 普通工具入口如 `/coco`、`/codex`、`/aiden`、`/claude`、`/gemini` 和 `/ttadk` 设置持久聊天+项目编程状态，直到 `/exit`。
-- Deep、Spec、Worktree 和 Workflow 是作用于飞书话题/根线程的引擎策略；它们不得替换聊天+项目编程状态。Autonomous 同理。
+- Deep、Spec 和 Workflow 是作用于飞书话题/根线程的引擎策略；它们不得替换聊天+项目编程状态。Autonomous 同理。
 - SMART 中的类 shell 文本必须保持 shell 执行，包括 `./restart.sh rr` 等命令，而不是被项目聊天自由文本编程路由窃取。
 
 ## 卡片与 UI 规则
@@ -146,7 +145,7 @@ handler -> session -> render
 ## 当前注意事项
 
 - `CardBuilder.build_engine_card()` 已移除。静态卡片使用 `build_info_card()`；引擎/进度卡片通过 `CardSession` 管道。
-- Spec 通过 `SpecManager.persist_result` 持久化上下文；Deep 使用 `ContextPersistenceHook`；Worktree 通过其报告路径持久化。
+- Spec 通过 `SpecManager.persist_result` 持久化上下文；Deep 使用 `ContextPersistenceHook`。
 - `ACPSessionManager` 负责会话密钥解析和锁定。不要在业务代码中手动解析会话密钥。
 - 飞书卡片 JSON 严格。如果 `logs.log` 中出现模式错误，修复发出的结构并在构建器或渲染器周围添加回归测试。
 - 对于重启/启动问题，在更改应用代码前检查 `logs.log` 和 `[RESTART]` 标记；将脚本延迟与 Python 冷启动分开。

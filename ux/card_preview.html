@@ -326,33 +326,6 @@ body {
   text-decoration: line-through;
 }
 
-/* === Worktree Stepper === */
-.stepper {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-bottom: 8px;
-}
-.step-dot {
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: 600;
-}
-.step-done { background: #16a34a; color: #fff; }
-.step-active { background: #2563eb; color: #fff; border: 2px solid #93c5fd; }
-.step-pending { background: #e5e7eb; color: #8f959e; }
-.step-connector {
-  width: 16px;
-  height: 2px;
-  background: #e5e7eb;
-}
-.step-connector.done { background: #16a34a; }
-
 /* === Compact Tool === */
 .compact-tool {
   font-size: 13px;
@@ -401,8 +374,8 @@ body {
   gap: 4px;
 }
 
-/* === Worktree Selection Preview === */
-.wt-option-row {
+/* === Model Selection Preview === */
+.model-option-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
@@ -412,63 +385,13 @@ body {
   border: 1px solid #eef0f3;
   border-radius: 6px;
 }
-.wt-option-title {
+.model-option-title {
   font-size: 13px;
   font-weight: 600;
 }
-.wt-option-desc {
+.model-option-desc {
   font-size: 12px;
   color: #646a73;
-}
-.wt-selected-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.wt-selected-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 10px;
-  background: #f7f9ff;
-  border: 1px solid #d6e4ff;
-  border-radius: 6px;
-  font-size: 13px;
-}
-.wt-native-box {
-  border: 1px solid #d8dce2;
-  border-radius: 8px;
-  padding: 10px 12px;
-  background: #fff;
-}
-.wt-native-choice {
-  display: grid;
-  grid-template-columns: 22px minmax(0, 1fr);
-  align-items: start;
-  gap: 8px;
-  padding: 7px 0;
-  font-size: 14px;
-}
-.wt-native-check {
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: 2px solid #8f959e;
-  margin-top: 1px;
-}
-.wt-native-check.checked {
-  border-color: #3370ff;
-  background: radial-gradient(circle at center, #3370ff 0 42%, transparent 45%);
-}
-.wt-native-submit {
-  margin-top: 10px;
-  padding: 8px 12px;
-  border: 1px solid #c9cdd4;
-  border-radius: 6px;
-  color: #8f959e;
-  text-align: center;
-  font-size: 14px;
 }
 
 /* === Activity Summary === */
@@ -857,9 +780,9 @@ tests/test_tools.py::test_tool_history_fold PASSED
         </div>
       </div>
       <div class="help-section help-section-collapsed">
-        <div class="help-section-summary">› 📋 Spec / 🌳 Worktree</div>
+        <div class="help-section-summary">› 📋 Spec / ⚡ Workflow</div>
         <div class="help-section-body">
-          <code>/spec &lt;需求&gt;</code> · <code>/wt &lt;目标&gt;</code> · <code>/worktree &lt;目标&gt;</code>
+          <code>/spec &lt;需求&gt;</code> · <code>/wf &lt;需求&gt;</code> · <code>/workflow &lt;需求&gt;</code>
         </div>
       </div>
       <div class="help-section help-section-collapsed">
@@ -1217,249 +1140,6 @@ tests/test_tools.py::test_tool_history_fold PASSED
 </div>
 </div>
 
-<!-- ==================== Worktree Engine ==================== -->
-<h2 class="section-title">Worktree Engine 卡片</h2>
-<div class="cards-grid">
-
-<div class="card-wrapper">
-  <div class="card-label">Worktree · 工具选择阶段（当前真实实现）</div>
-  <div class="feishu-card">
-    <div class="card-header header-wathet">
-      <div class="title">📁 ghostAp · 🤖 Worktree · #1</div>
-      <div class="subtitle">项目: ghostAp</div>
-    </div>
-    <div class="card-body">
-      <!-- Stepper -->
-      <div style="text-align:center;margin-bottom:8px;">
-        <div class="stepper" style="justify-content:center;">
-          <div class="step-dot step-active">1</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">2</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">3</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">4</div>
-        </div>
-        <div style="font-size:13px;font-weight:600;margin-top:4px;">步骤 1/4 · 选择工具</div>
-        <div style="font-size:12px;color:#646a73;">可重复选择多个工具组成并行组合，每点一项即加入下方已选区</div>
-      </div>
-
-      <div class="wt-option-row">
-        <div>
-          <div class="wt-option-title">Coco</div>
-          <div class="wt-option-desc">ACP direct · 支持模型选择</div>
-        </div>
-        <button class="btn btn-default" style="flex:initial;">+ 添加 Coco</button>
-      </div>
-      <div class="wt-option-row">
-        <div>
-          <div class="wt-option-title">Claude</div>
-          <div class="wt-option-desc">CLI bridge · 默认模型</div>
-        </div>
-        <button class="btn btn-default" style="flex:initial;">+ 添加 Claude</button>
-      </div>
-      <div class="wt-option-row">
-        <div>
-          <div class="wt-option-title">Gemini</div>
-          <div class="wt-option-desc">ACP direct · 支持模型选择</div>
-        </div>
-        <button class="btn btn-default" style="flex:initial;">+ 添加 Gemini</button>
-      </div>
-
-      <hr class="card-hr">
-
-      <div class="text-content"><strong>已选组合 (2)</strong></div>
-      <div class="wt-selected-list">
-        <div class="wt-selected-row">
-          <span>• ACP · Coco / Doubao Pro</span>
-          <button class="btn btn-default" style="flex:initial;padding:5px 10px;">✕</button>
-        </div>
-        <div class="wt-selected-row">
-          <span>• CLI · Claude / 默认模型</span>
-          <button class="btn btn-default" style="flex:initial;padding:5px 10px;">✕</button>
-        </div>
-      </div>
-
-      <div class="button-row">
-        <button class="btn btn-primary">✅ 确认选择</button>
-        <button class="btn btn-default">🗑️ 清空选择</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="card-wrapper">
-  <div class="card-label">Worktree · 模型选择阶段（选 Coco 后弹出，与工具选择卡视觉区分）</div>
-  <div class="feishu-card">
-    <div class="card-header header-wathet">
-      <div class="title">📁 ghostAp · 🤖 Worktree · #1</div>
-      <div class="subtitle">选择模型</div>
-    </div>
-    <div class="card-body">
-      <div style="text-align:center;margin-bottom:8px;">
-        <div class="stepper" style="justify-content:center;">
-          <div class="step-dot step-active">1</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">2</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">3</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">4</div>
-        </div>
-        <div style="font-size:13px;font-weight:600;margin-top:4px;">步骤 1/4 · 选择模型</div>
-        <div style="font-size:12px;color:#646a73;">为刚选中的工具挑选模型，点击模型即可加入组合；可点击下方“返回工具选择”取消</div>
-      </div>
-
-      <!-- 醒目 banner：让用户立刻意识到这是 Coco 的模型选择，而非又一张工具卡 -->
-      <div style="background:#dbeafe;border:1px solid #93c5fd;border-radius:6px;padding:10px 12px;margin-bottom:8px;">
-        <div style="font-weight:600;font-size:14px;color:#1d4ed8;">🎯 为 Coco 选择模型</div>
-        <div style="font-size:12px;color:#1e3a8a;margin-top:4px;">点击下方任一模型即可加入组合，点击下方“← 返回工具选择”可取消本次添加。</div>
-      </div>
-
-      <!-- 标题只放模型名（加粗），metadata 走 notation 单独一行；按钮文本始终是“选择 <模型名>”，不被长描述挤出截断 -->
-      <div class="wt-option-row">
-        <div>
-          <div class="wt-option-title">GPT-5.2</div>
-          <div class="wt-option-desc">Model load: 14%</div>
-        </div>
-        <button class="btn btn-primary" style="flex:initial;">选择 GPT-5.2</button>
-      </div>
-      <div class="wt-option-row">
-        <div>
-          <div class="wt-option-title">openrouter-1</div>
-          <div class="wt-option-desc">Context window: 168k, Max tool turns: 200, Quota: 48% used…</div>
-        </div>
-        <button class="btn btn-primary" style="flex:initial;">选择 openrouter-1</button>
-      </div>
-      <div class="wt-option-row">
-        <div>
-          <div class="wt-option-title">Gemini-3.1-Pro-Preview</div>
-          <div class="wt-option-desc">Model load: 9%</div>
-        </div>
-        <button class="btn btn-primary" style="flex:initial;">选择 Gemini-3.1-Pro-Preview</button>
-      </div>
-      <div class="wt-option-row">
-        <div>
-          <div class="wt-option-title">Doubao 1.5 Pro</div>
-          <div class="wt-option-desc">默认模型</div>
-        </div>
-        <button class="btn btn-primary" style="flex:initial;">选择 Doubao 1.5 Pro</button>
-      </div>
-
-      <hr class="card-hr">
-      <!-- 已选组合保留展示，让用户看到正在累积的选择 -->
-      <div class="text-content notation"><strong>已选组合 (1)</strong></div>
-      <div class="text-content notation">• ACP · Aiden / 默认模型</div>
-
-      <hr class="card-hr">
-      <div class="button-row">
-        <button class="btn btn-default">← 返回工具选择</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="card-wrapper">
-  <div class="card-label">Worktree · 原生多选尝试（checker / form 方向）</div>
-  <div class="feishu-card">
-    <div class="card-header header-wathet">
-      <div class="title">📁 ghostAp · 🤖 Worktree · #1</div>
-      <div class="subtitle">项目: ghostAp</div>
-    </div>
-    <div class="card-body">
-      <div style="text-align:center;margin-bottom:8px;">
-        <div class="stepper" style="justify-content:center;">
-          <div class="step-dot step-active">1</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">2</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">3</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">4</div>
-        </div>
-        <div style="font-size:13px;font-weight:600;margin-top:4px;">步骤 1/4 · 选择工具</div>
-        <div style="font-size:12px;color:#646a73;">更接近投票卡片的平铺选择形态</div>
-      </div>
-
-      <div class="wt-native-box">
-        <div class="wt-native-choice">
-          <span class="wt-native-check checked"></span>
-          <span><strong>Coco</strong><br><span class="notation">ACP direct · 选择后继续选模型</span></span>
-        </div>
-        <div class="wt-native-choice">
-          <span class="wt-native-check checked"></span>
-          <span><strong>Claude</strong><br><span class="notation">CLI bridge · 默认模型</span></span>
-        </div>
-        <div class="wt-native-choice">
-          <span class="wt-native-check"></span>
-          <span><strong>Gemini</strong><br><span class="notation">ACP direct · 选择后继续选模型</span></span>
-        </div>
-        <div class="wt-native-choice">
-          <span class="wt-native-check"></span>
-          <span><strong>Cursor</strong><br><span class="notation">当前不可用</span></span>
-        </div>
-        <div class="wt-native-submit">请选择后确认</div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<div class="card-wrapper">
-  <div class="card-label">Worktree · 执行中</div>
-  <div class="feishu-card">
-    <div class="card-header header-wathet">
-      <div class="title">第 2 轮</div>
-      <div class="subtitle">Worktree · #1 · 页 1/2 · 3 个并行任务同步更新</div>
-    </div>
-    <div class="card-body">
-      <!-- Stepper -->
-      <div style="text-align:center;margin-bottom:8px;">
-        <div class="stepper" style="justify-content:center;">
-          <div class="step-dot step-done">✓</div>
-          <div class="step-connector done"></div>
-          <div class="step-dot step-done">✓</div>
-          <div class="step-connector done"></div>
-          <div class="step-dot step-active">3</div>
-          <div class="step-connector"></div>
-          <div class="step-dot step-pending">4</div>
-        </div>
-        <div style="font-size:13px;font-weight:600;margin-top:4px;">步骤 3/4 · 执行任务</div>
-        <div style="font-size:12px;color:#646a73;">执行中，完成后可查看各分支结果并合并</div>
-      </div>
-
-      <!-- Worktree branches status -->
-      <div class="panel panel-wathet">
-        <div class="panel-header">
-          <span class="arrow">▼</span>
-          <span class="panel-title">🌿 <strong>分支状态</strong> (1/3 完成)</span>
-        </div>
-        <div class="panel-content" style="font-size:13px;">
-          ✅ <strong>wt/coco-task1</strong> — 实现紧凑渲染 (Coco)<br>
-          ⏳ <strong>wt/claude-task2</strong> — 修复折叠逻辑 (Claude)<br>
-          ⏳ <strong>wt/gemini-task3</strong> — 添加单元测试 (Gemini)
-        </div>
-      </div>
-
-      <hr class="card-hr">
-      <div class="card-footer">
-        <div class="footer-status">
-          🔄 执行中 · 分支:
-          <span class="progress-bar">
-            <span class="progress-filled" style="color:#0891b2;">▰▰▰</span><span class="progress-empty">▱▱▱▱▱▱▱</span> 33%
-          </span>
-          　1/3
-        </div>
-        <div class="footer-meta">🔧 coco, claude, gemini · ⏱ 4 分钟 12 秒</div>
-      </div>
-
-      <div class="button-row">
-        <button class="btn btn-danger">⏹️ 停止全部</button>
-      </div>
-    </div>
-  </div>
-</div>
-</div>
-
 <!-- ==================== Component Details ==================== -->
 <h2 class="section-title">组件细节</h2>
 <div class="cards-grid">
@@ -1714,17 +1394,17 @@ tests/test_tools.py::test_tool_history_fold PASSED
         <div class="subtitle">长工具名不会挤压按钮区</div>
       </div>
       <div class="card-body">
-        <div class="wt-option-row">
+        <div class="model-option-row">
           <div style="min-width:0;">
-            <div class="wt-option-title" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Coco Enterprise Ultra Long Agent Name With Context Window 168k</div>
-            <div class="wt-option-desc" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">Context window: 168k, Max tool turns: 200, 适合大型代码库重构与多阶段任务；描述被两行截断，避免误导用户以为按钮不可点击。</div>
+            <div class="model-option-title" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Coco Enterprise Ultra Long Agent Name With Context Window 168k</div>
+            <div class="model-option-desc" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">Context window: 168k, Max tool turns: 200, 适合大型代码库重构与多阶段任务；描述被两行截断，避免误导用户以为按钮不可点击。</div>
           </div>
           <button class="btn btn-primary" style="flex:0 0 auto;min-width:86px;">选择 Coco</button>
         </div>
-        <div class="wt-option-row">
+        <div class="model-option-row">
           <div style="min-width:0;">
-            <div class="wt-option-title" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">claude-sonnet-4-20250514-super-long-model-id</div>
-            <div class="wt-option-desc" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">模型说明很长时保留关键 quota/能力摘要，完整值仍通过 callback payload 传递。</div>
+            <div class="model-option-title" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">claude-sonnet-4-20250514-super-long-model-id</div>
+            <div class="model-option-desc" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">模型说明很长时保留关键 quota/能力摘要，完整值仍通过 callback payload 传递。</div>
           </div>
           <button class="btn btn-default" style="flex:0 0 auto;min-width:86px;">选择模型</button>
         </div>
@@ -1878,7 +1558,6 @@ tests/test_tools.py::test_tool_history_fold PASSED
     <span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#7c3aed;vertical-align:middle;"></span> violet — Deep Engine</span>
     <span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#4f46e5;vertical-align:middle;"></span> indigo — Spec Iteration</span>
     <span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#16a34a;vertical-align:middle;"></span> green — Spec Engine / Completed</span>
-    <span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#0891b2;vertical-align:middle;"></span> wathet — Worktree Engine</span>
     <span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#2563eb;vertical-align:middle;"></span> blue — Coco</span>
     <span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#9333ea;vertical-align:middle;"></span> purple — Claude</span>
     <span><span style="display:inline-block;width:12px;height:12px;border-radius:2px;background:#0d9488;vertical-align:middle;"></span> turquoise — Gemini</span>
@@ -1889,7 +1568,7 @@ tests/test_tools.py::test_tool_history_fold PASSED
   </div>
   <h3 style="font-size:16px;margin:16px 0 12px;">📐 布局规范</h3>
   <div style="font-size:13px;color:#646a73;line-height:1.8;">
-    • <strong>Header</strong>：Deep 主卡使用用户问题的 ≤15 字摘要；Spec/Worktree 有迭代时标题保留轮次，任务/子任务 + 卡片序号/分页下沉到副标题或 footer<br>
+    • <strong>Header</strong>：Deep 主卡使用用户问题的 ≤15 字摘要；Spec 有迭代时标题保留轮次，任务/子任务 + 卡片序号/分页下沉到副标题或 footer<br>
     • <strong>Body 三段式排列</strong>：Status区（任务列表/阶段/验收标准/告警）→ Body区（文本/思考/计划）→ Appendix区（工具面板/历史）<br>
     • <strong>Footer</strong>：工具名 · 模型名 · 执行时长 · 进度条<br>
     • <strong>按钮</strong>：底部操作栏，破坏性操作需确认对话框<br>

@@ -325,7 +325,7 @@
 
           <rect class="danger" x="1085" y="68" width="140" height="52" rx="6"></rect>
           <text class="label" x="1155" y="90" text-anchor="middle">Switch Gate</text>
-          <text class="sub" x="1155" y="107" text-anchor="middle">block WT/Deep mix</text>
+          <text class="sub" x="1155" y="107" text-anchor="middle">block strategy mix</text>
 
           <path class="line" d="M 180 250 H 270"></path>
           <path class="line" d="M 450 250 H 540"></path>
@@ -412,7 +412,7 @@
         <ul>
           <li><code>/spec &lt;需求&gt;</code> 会绑定当前 Feishu topic 为 <code>mode=spec</code>。</li>
           <li>同 topic 普通文本继续走 Spec 策略，不回 SMART 意图识别。</li>
-          <li>同 topic 里切 WT/Deep 会被拦截；<code>/exit</code> 只退出话题策略。</li>
+          <li>同 topic 里切到其他执行策略会被拦截；<code>/exit</code> 只退出话题策略。</li>
         </ul>
       </article>
 
@@ -510,7 +510,7 @@
             </div>
           </article>
         </div>
-        <div class="review-warning" style="margin-top: 12px;">禁止链路：Spec Review 选择完成后不能触发 Worktree 四步骤、Worktree 标题、等待目标卡，也不能在群里另发一张 Worktree 卡。详细单页图：<a href="./spec-review-card-flow.html" style="color:#bfdbfe;">spec-review-card-flow.html</a></div>
+        <div class="review-warning" style="margin-top: 12px;">禁止链路：Spec Review 选择完成后不能切换到另一种执行策略、展示其他策略标题或等待目标卡，也不能在群里另发其他策略的卡片。详细单页图：<a href="./spec-review-card-flow.html" style="color:#bfdbfe;">spec-review-card-flow.html</a></div>
       </div>
     </section>
 

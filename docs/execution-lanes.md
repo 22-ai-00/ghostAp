@@ -15,7 +15,6 @@ does not hide the Owner's entry from the product surface.
 | Direct | `/acp`, explicit Agent commands | mature | Keeps the selected Agent session and adds no planner/router LLM call or remote discovery hop. |
 | Deep | `/deep` | mature | Existing protected Deep execution strategy. |
 | Spec | `/spec` | mature | Existing protected Spec execution strategy. |
-| Worktree | `/worktree`, `/wt` | developing | Existing execution stays visible; the unified adapter contract is unfinished. |
 | Workflow | `/wf`, `/workflow` | developing | Existing RunSpec/reviewer execution stays visible; IR v2 and durable ports are unfinished. |
 | Team | `/team`, `/new-team` | developing | Existing employee collaboration stays visible; its unified durable task graph is unfinished. |
 | Slock | `/slock` | developing | Existing group collaboration stays visible; the unique execution fact source is unfinished. |
@@ -26,7 +25,7 @@ validation.
 
 Explicit Direct, Deep, and Spec commands always take priority over SMART or
 Slock automatic activation.  This is a routing-safety rule, not a maturity or
-release policy.  Existing aliases and card actions remain compatible.
+release policy.  Listed aliases and card actions remain compatible.
 
 `/goal` is a retired standalone-Manager command.  It remains a deterministic,
 non-executing migration response for compatibility, but it is not advertised as

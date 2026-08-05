@@ -276,7 +276,7 @@
         <span class="title-mark"></span>
         <h1>Spec Review 工具选择卡片流程</h1>
       </div>
-      <p class="lead">目标交互：`/spec <需求>` 已经携带目标。review-agent 工具/模型只是 Spec 启动前的可选配置，必须在同一个话题、同一张选择卡内完成；确认后直接进入原 Spec 执行卡片，不出现 Worktree 的等待目标卡。</p>
+      <p class="lead">目标交互：`/spec <需求>` 已经携带目标。review-agent 工具/模型只是 Spec 启动前的可选配置，必须在同一个话题、同一张选择卡内完成；确认后直接进入原 Spec 执行卡片，不能切换到另一种执行策略或出现其他策略的等待目标卡。</p>
     </header>
 
     <section class="grid">
@@ -378,8 +378,8 @@
         <div class="rule"><span class="ok">✓</span><span>`/spec <需求>` 的需求就是目标，确认后直接开始 Spec。</span></div>
         <div class="rule"><span class="ok">✓</span><span>review agent 池只影响 REVIEW 阶段多角色审查分配。</span></div>
         <div class="rule"><span class="ok">✓</span><span>Auto 不额外选择工具，沿用主任务 agent + 模型。</span></div>
-        <div class="rule"><span class="no">✕</span><span>不能展示 Worktree 四步骤、Worktree 标题或等待目标。</span></div>
-        <div class="rule"><span class="no">✕</span><span>不能在群里另发一张 Worktree 等待目标卡。</span></div>
+        <div class="rule"><span class="no">✕</span><span>不能切换到另一种执行策略，或展示其他策略的步骤、标题与等待目标。</span></div>
+        <div class="rule"><span class="no">✕</span><span>不能在群里另发一张其他执行策略的等待目标卡。</span></div>
       </aside>
     </section>
 
@@ -413,8 +413,8 @@
         </div>
         <div class="step">
           <span class="badge danger">禁止</span>
-          <strong>`worktree_confirm`</strong>
-          <span>Spec 不允许进入 WT confirm/awaiting-goal/reply 新卡链路。</span>
+          <strong>other strategy confirmation</strong>
+          <span>Spec 不允许进入其他执行策略的确认、等待目标或另发新卡链路。</span>
         </div>
       </div>
     </section>

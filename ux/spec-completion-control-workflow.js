@@ -51,7 +51,7 @@ export default async function() {
       2. How is a spec task initiated? What parameters does it accept?
       3. How is progress shown to users? Card updates, message streams?
       4. What user controls exist (stop, cancel, review, approve)?
-      5. How does spec mode interact with other modes (deep, worktree, workflow)?
+      5. How does spec mode remain isolated from other execution strategies (deep, workflow)?
 
       Search for spec-related handlers, card builders for spec (src/card/), and any spec-specific UI.
       Report: handler flow, UI/card rendering, user controls, interaction protocol.`,
@@ -61,9 +61,8 @@ export default async function() {
       `Analyze other engines for completion control patterns to learn from:
       1. src/deep_engine/ - how does deep mode handle completion? Look at ContextPersistenceHook
       2. src/workflow_engine/ - how does workflow track phase completion and verify task success?
-      3. src/worktree_engine/ - worktree completion and reporting
-      4. src/slock_engine/ - task classifier and autonomous resolver patterns for intent confidence
-      5. Any verification/validation loops in other engines (e.g., verify patterns, checkpoints)
+      3. src/slock_engine/ - task classifier and autonomous resolver patterns for intent confidence
+      4. Any verification/validation loops in other engines (e.g., verify patterns, checkpoints)
 
       Compare: which engines have the strongest completion guarantees? What patterns do they use?
       Report: patterns from other engines that could be adapted for spec mode.`,
@@ -118,7 +117,7 @@ export default async function() {
       6. User expectation mismatch: AI's "done" differs from user's "done"
 
       For each failure mode, identify: frequency (high/med/low), detectability, and which code path allows it.
-      Reference how other engines (deep, worktree, workflow) prevent or detect similar failures.`,
+      Reference how other engines (deep, workflow) prevent or detect similar failures.`,
       { tool: "traex", role: "failure-analyst", label: "failure-modes", phase: "Problem Diagnosis", timeout: 240 }
     ),
     () => agent(

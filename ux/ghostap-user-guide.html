@@ -571,18 +571,17 @@
     <section class="hero">
       <div class="hero-main">
         <div class="hero-kicker"><span class="pulse"></span><span>GhostAP 使用说明书</span></div>
-        <h1>普通编程模式与 Spec 模式实际操作流程</h1>
+        <h1>普通编程、Spec 与 Workflow 实际操作流程</h1>
         <p class="lead">
           这份说明面向日常使用：普通模式适合直接对话编程、修 bug、跑命令和持续迭代；
-          Spec 模式适合目标较明确、需要多轮规划、执行、审查和收敛的复杂任务。
-          WT 仍在迭代中，本页只保留当前使用边界。
+          Spec 模式适合目标较明确、需要多轮规划、执行、审查和收敛的复杂任务；
+          Workflow 适合需要多个 Agent 协同编排的任务。
         </p>
         <div class="hero-actions">
           <a class="pill cyan" href="#normal">普通模式流程</a>
           <a class="pill violet" href="#spec">Spec 模式流程</a>
           <a class="pill amber" href="#commands">常用命令速查</a>
           <a class="pill" href="spec-flow.html">Spec 深入流程图</a>
-          <a class="pill" href="worktree-flow.html">WT 当前流程图</a>
         </div>
       </div>
       <aside class="hero-side">
@@ -597,8 +596,8 @@
             <span>需求有多步、需要反复审查并收敛：用 <code>/spec &lt;目标&gt;</code>。</span>
           </div>
           <div class="decision-row">
-            <strong>WT 模式</strong>
-            <span>当前仍在迭代，适合隔离 worktree 并行尝试；暂不作为本说明主路径。</span>
+            <strong>Workflow</strong>
+            <span>需要多个 Agent 分工、评审和汇总：用 <code>/wf &lt;目标&gt;</code>。</span>
           </div>
         </div>
       </aside>
@@ -685,15 +684,15 @@
 
             <rect x="360" y="388" width="160" height="84" rx="8" fill="#0f172a"/>
             <rect x="360" y="388" width="160" height="84" rx="8" fill="rgba(120,53,15,0.30)" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="5 4"/>
-            <text x="440" y="422" fill="#f8fafc" font-size="14" font-weight="700" text-anchor="middle">WT 模式</text>
-            <text x="440" y="447" fill="#94a3b8" font-size="10" text-anchor="middle">当前仍在迭代</text>
+            <text x="440" y="422" fill="#f8fafc" font-size="14" font-weight="700" text-anchor="middle">Workflow</text>
+            <text x="440" y="447" fill="#94a3b8" font-size="10" text-anchor="middle">/wf &lt;目标&gt;</text>
 
             <rect x="684" y="388" width="196" height="84" rx="8" fill="#0f172a"/>
             <rect x="684" y="388" width="196" height="84" rx="8" fill="rgba(30,41,59,0.50)" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 4"/>
-            <text x="782" y="422" fill="#f8fafc" font-size="14" font-weight="700" text-anchor="middle">worktree 隔离执行</text>
-            <text x="782" y="447" fill="#94a3b8" font-size="10" text-anchor="middle">多工具组合仍在打磨</text>
+            <text x="782" y="422" fill="#f8fafc" font-size="14" font-weight="700" text-anchor="middle">多 Agent 编排执行</text>
+            <text x="782" y="447" fill="#94a3b8" font-size="10" text-anchor="middle">选择编排与评审 Agent</text>
 
-            <text x="42" y="520" fill="#64748b" font-size="11">原则：普通工具入口改变 chat+project 编程状态；Spec/WT 是 Feishu 话题级策略，不覆盖主群普通模式。</text>
+            <text x="42" y="520" fill="#64748b" font-size="11">原则：普通工具入口改变 chat+project 编程状态；Spec/Workflow 是 Feishu 话题级策略，不覆盖主群普通模式。</text>
           </svg>
         </div>
       </section>
@@ -991,7 +990,7 @@
               <div class="step-no">3</div>
               <div>
                 <strong>确认并启动</strong>
-                <span>确认后同一张选择卡会 PATCH 成“正在启动”，随后进入原 Spec 流程，不会跳到 Worktree，也不会要求再次输入目标。</span>
+                <span>确认后同一张选择卡会 PATCH 成“正在启动”，随后进入原 Spec 流程，不能切换到另一种执行策略，也不会要求再次输入目标。</span>
               </div>
             </div>
             <div class="step">
@@ -1045,7 +1044,7 @@
       <section id="commands" class="panel">
         <div class="panel-head">
           <h2 class="panel-title">常用命令速查</h2>
-          <span class="panel-note">普通模式 + Spec 模式</span>
+          <span class="panel-note">普通模式 + Spec + Workflow</span>
         </div>
         <div class="panel-body">
           <table class="command-table">
@@ -1075,7 +1074,7 @@
               <tr>
                 <td><code>/exit</code></td>
                 <td>退出当前模式</td>
-                <td>普通编程模式回到 SMART；在 Spec/WT/Deep 话题内会退出对应话题策略。</td>
+                <td>普通编程模式回到 SMART；在 Spec/Deep/Workflow 话题内会退出对应话题策略。</td>
               </tr>
               <tr>
                 <td><code>/spec &lt;目标&gt;</code></td>
@@ -1108,9 +1107,9 @@
                 <td>保存当前状态；导出会生成 Markdown 报告。</td>
               </tr>
               <tr>
-                <td><code>/wt &lt;目标&gt;</code></td>
-                <td>Worktree 隔离尝试</td>
-                <td>当前仍在迭代：选择工具/模型后在独立 worktree 执行、合并和清理流程仍需关注卡片结果。</td>
+                <td><code>/wf &lt;目标&gt;</code></td>
+                <td>多 Agent 编排</td>
+                <td>选择主编排 Agent 与评审 Agent（或 Auto），自动生成并执行受校验的 Workflow 脚本。</td>
               </tr>
             </tbody>
           </table>
@@ -1119,7 +1118,7 @@
 
       <section class="panel">
         <div class="panel-head">
-          <h2 class="panel-title">普通模式、Spec、WT 的边界</h2>
+          <h2 class="panel-title">普通模式、Spec、Workflow 的边界</h2>
           <span class="panel-note">避免把三种工作方式混在一起</span>
         </div>
         <div class="panel-body">
@@ -1141,16 +1140,16 @@
               </ul>
             </div>
             <div class="mode-tile">
-              <h3><span class="dot amber"></span>WT 仍在迭代中</h3>
-              <p>WT 的核心是隔离 worktree 和多工具组合执行，目前正在优化交互与合并体验。</p>
+              <h3><span class="dot amber"></span>Workflow 更像“多 Agent 编排器”</h3>
+              <p>Workflow 根据目标生成受校验的 JS 编排脚本，让多个 Agent 分工执行、评审并汇总结果。</p>
               <ul>
-                <li>适合：需要隔离分支尝试的任务。</li>
-                <li>详细状态暂看 <a class="pill amber" href="worktree-flow.html">WT 流程图</a>。</li>
+                <li>适合：可拆成多个并行或顺序阶段、需要独立评审的复杂任务。</li>
+                <li>状态与帮助：<code>/wf_status</code>、<code>/wf_help</code>。</li>
               </ul>
             </div>
           </div>
           <div class="callout" style="margin-top: 14px;">
-            推荐经验：能一句话清楚描述“改哪、怎么验”的任务先用普通模式；目标复杂但验收明确的任务用 Spec；需要隔离 worktree 并行尝试时再使用 WT。
+            推荐经验：能一句话清楚描述“改哪、怎么验”的任务先用普通模式；目标复杂但验收明确的任务用 Spec；需要多个 Agent 分工、评审和汇总时使用 Workflow。
           </div>
         </div>
       </section>
