@@ -10,6 +10,7 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Callable, Optional
 
 from ..engine_base import BaseEngineManager
@@ -722,13 +723,10 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
                     managed_group_active is not None
                     and not managed_group_active(channel_id)
                 ):
-                    try:
-                        self.prepare_revoke_marker(channel_id)
-                    except (OSError, ValueError):
-                        logger.exception(
-                            "restore_from_disk: cannot retire untrusted marker %s",
-                            marker_path,
-                        )
+                    logger.info(
+                        "restore_from_disk: leaving untrusted marker inactive: %s",
+                        marker_path,
+                    )
                     continue
 
                 # Skip if already managed (idempotent)
@@ -745,6 +743,7 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
                         name=marker.get("name", ""),
                         team_name=marker.get("team_name", ""),
                         owner_id=marker.get("owner_id", ""),
+                        project_id=marker.get("project_id", ""),
                     )
                     self.get_or_create_activated(
                         channel_id,
@@ -766,6 +765,112 @@ class SlockEngineManager(BaseEngineManager["SlockEngine"]):
         if restored:
             logger.info("restore_from_disk: restored %d slock engine(s)", restored)
         return restored
+
+    def managed_group_migration_candidates(
+        self,
+        *,
+        owner_id: str,
+        receiving_bot_ref: str,
+        archived_after_ns: int | None = None,
+    ) -> tuple[dict, ...]:
+        """Return locally anchored Team candidates without granting trust.
+
+        A post-cutover archive is eligible only to repair the historical
+        startup regression that retired legacy markers before validation.
+        Remote Owner/Bot validation and Registry import remain the caller's
+        responsibility.
+        """
+
+        if not isinstance(owner_id, str) or not owner_id.startswith("ou_"):
+            return ()
+        if not isinstance(receiving_bot_ref, str) or not receiving_bot_ref:
+            return ()
+        groups_dir = os.path.realpath(
+            os.path.join(self._storage_base_path, "groups")
+        )
+        if not os.path.isdir(groups_dir) or os.path.islink(groups_dir):
+            return ()
+        candidates: list[dict] = []
+        try:
+            entries = sorted(os.listdir(groups_dir))
+        except OSError:
+            logger.warning("cannot list Slock migration marker directory", exc_info=True)
+            return ()
+        for entry in entries:
+            if not _LARK_CHAT_ID_RE.fullmatch(entry):
+                continue
+            channel_dir = os.path.join(groups_dir, entry)
+            if os.path.islink(channel_dir) or not os.path.isdir(channel_dir):
+                continue
+            marker_path = os.path.join(channel_dir, ".slock_channel.json")
+            archived_path = ""
+            if not os.path.isfile(marker_path) or os.path.islink(marker_path):
+                if archived_after_ns is None:
+                    continue
+                try:
+                    archived = []
+                    for filename in os.listdir(channel_dir):
+                        match = re.fullmatch(
+                            r"\.slock_channel\.dissolved\.(\d+)\.json",
+                            filename,
+                        )
+                        if match is None:
+                            continue
+                        timestamp_ns = int(match.group(1))
+                        path = os.path.join(channel_dir, filename)
+                        if (
+                            timestamp_ns >= archived_after_ns
+                            and os.path.isfile(path)
+                            and not os.path.islink(path)
+                        ):
+                            archived.append((timestamp_ns, path))
+                    if not archived:
+                        continue
+                    archived_path = max(archived)[1]
+                    marker_path = archived_path
+                except OSError:
+                    continue
+            try:
+                with open(marker_path, "r", encoding="utf-8") as handle:
+                    marker = json.load(handle)
+                if (
+                    not isinstance(marker, dict)
+                    or marker.get("channel_id") != entry
+                    or marker.get("owner_id") != owner_id
+                ):
+                    continue
+                team_name = marker.get("team_name")
+                if not isinstance(team_name, str) or not team_name.strip():
+                    continue
+                root_path = self._resolve_marker_root_path(marker, channel_dir)
+                activated_at = marker.get("activated_at")
+                if not isinstance(activated_at, str):
+                    continue
+                created_at = datetime.strptime(
+                    activated_at,
+                    "%Y-%m-%dT%H:%M:%SZ",
+                ).replace(tzinfo=UTC).timestamp()
+                project_id = marker.get("project_id")
+                if not isinstance(project_id, str) or not project_id.strip():
+                    project_id = f"team:{team_name.strip()}"
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                logger.warning(
+                    "skipping invalid Slock migration marker: %s",
+                    marker_path,
+                )
+                continue
+            candidate = {
+                "bound_chat_created_at": created_at,
+                "canonical_root_ref": root_path,
+                "chat_id": entry,
+                "owner_id": owner_id,
+                "project_id": project_id,
+                "receiving_bot_ref": receiving_bot_ref,
+            }
+            if archived_path:
+                candidate["_archived_path"] = archived_path
+            candidates.append(candidate)
+        return tuple(candidates)
 
     @staticmethod
     def _resolve_marker_root_path(marker: dict, channel_dir: str) -> str:

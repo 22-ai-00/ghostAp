@@ -406,6 +406,37 @@ def test_card_delivery_stamps_rendered_payload_before_transport() -> None:
     }
 
 
+def test_managed_delivery_allows_passive_card_without_callback_stamps() -> None:
+    client = MagicMock()
+    client.create_card.return_value = ("om_card", "om_card")
+    delivery = CardDelivery(
+        client,
+        registry=MagicMock(),
+        payload_transform=lambda _chat_id, card: bind_managed_trust_revisions(
+            card,
+            group_revision=7,
+            grant_revision=11,
+        ),
+        trust_revision_provider=lambda _chat_id: (7, 11),
+    )
+    rendered = RenderedCard(
+        _card_json={
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": "working"},
+                ]
+            },
+        },
+        structure_signature="stable",
+    )
+
+    outcomes = delivery.deliver("session-passive", GROUP_ID, [rendered])
+
+    assert [outcome.kind for outcome in outcomes] == ["applied"]
+    client.create_card.assert_called_once()
+
+
 def test_long_card_run_cannot_be_reblessed_after_rotation() -> None:
     client = MagicMock()
     client.create_card.return_value = ("om_card", "om_card")

@@ -1602,6 +1602,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
             name=project.project_name if project else "slock",
             team_name=project.project_name if project else "Team",
             owner_id=sender_open_id,
+            project_id=project.project_id if project else "team:Team",
         )
         engine = manager.get_or_create_activated(
             chat_id,
@@ -2222,6 +2223,7 @@ class SlockHandler(SlockRoleMixin, SlockTaskMixin, BaseEngineHandler):
                 name=group_name,
                 team_name=name,
                 owner_id=sender_open_id,
+                project_id=project_id,
             )
             engine = manager.get_or_create_activated(
                 new_chat_id,

@@ -267,6 +267,10 @@ _SILENT_DEDUP_ACTIONS = {
 _CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
 _SHUTDOWN_SCHEDULER_DRAIN_S = 5.0
 _SHUTDOWN_DELEGATED_DRAIN_S = 5.0
+# The managed-trust cutover first shipped at 2026-07-31 20:25 UTC.  Archives
+# created after this boundary may be the startup regression repaired by the
+# legacy Slock migration; older dissolved markers remain permanently retired.
+_LEGACY_SLOCK_TRUST_CUTOVER_NS = 1_785_529_500_000_000_000
 
 
 def _build_task_scheduler(
@@ -2296,16 +2300,30 @@ class FeishuWSClient:
                 current_trust is not None
                 and current_trust.managed_group is not None
             ):
+                managed_group = current_trust.managed_group
                 trusted_project = self._project_manager.get_project_for_chat(
-                    current_trust.managed_group.project_id,
+                    managed_group.project_id,
                     chat_id,
                 )
+                standalone_team = False
                 if (
                     trusted_project is None
-                    or getattr(trusted_project, "project_id", None)
-                    != current_trust.managed_group.project_id
+                    and managed_group.project_id.startswith("team:")
+                ):
+                    engine = self._slock_engine_manager.get_activated_engine(chat_id)
+                    standalone_team = bool(
+                        self._slock_engine_manager.is_managed_chat(chat_id)
+                        and engine is not None
+                        and os.path.realpath(getattr(engine, "root_path", ""))
+                        == os.path.realpath(managed_group.canonical_root_ref)
+                    )
+                if trusted_project is None and not standalone_team:
+                    return
+                if trusted_project is not None and (
+                    getattr(trusted_project, "project_id", None)
+                    != managed_group.project_id
                     or getattr(trusted_project, "root_path", None)
-                    != current_trust.managed_group.canonical_root_ref
+                    != managed_group.canonical_root_ref
                 ):
                     return
             if parse_result.image_keys:
@@ -3971,6 +3989,8 @@ class FeishuWSClient:
                 continue
             self._managed_group_registry.complete_revoke(chat_id)
 
+        self._migrate_legacy_slock_groups(remote)
+
         pending_saga_chat_ids = {
             saga.chat_id
             for saga in self._project_manager.pending_managed_chat_binding_sagas()
@@ -4054,6 +4074,70 @@ class FeishuWSClient:
             )
             if sent:
                 self._managed_group_registry.mark_migration_reported(chat_id)
+
+    def _migrate_legacy_slock_groups(self, remote) -> None:
+        """Validate and import pre-Registry Slock markers before restoration."""
+
+        from ..project_chat.lark_chat_client import ManagedChatValidation
+
+        candidates = self._slock_engine_manager.managed_group_migration_candidates(
+            owner_id=self._managed_group_owner_id,
+            receiving_bot_ref=self._managed_group_receiving_bot_ref,
+            archived_after_ns=_LEGACY_SLOCK_TRUST_CUTOVER_NS,
+        )
+        for raw_candidate in candidates:
+            candidate = dict(raw_candidate)
+            chat_id = candidate.get("chat_id")
+            project_id = candidate.get("project_id")
+            if not isinstance(chat_id, str) or not isinstance(project_id, str):
+                continue
+            # Any Registry record, including a tombstone, is authoritative.
+            if self._managed_group_registry.record(chat_id) is not None:
+                continue
+            validation = remote.validate_managed_chat(
+                chat_id,
+                self._managed_group_owner_id,
+            )
+            if validation is not ManagedChatValidation.VALID:
+                self._managed_group_registry.record_migration_disposition(
+                    chat_id,
+                    project_id=project_id,
+                    status=validation.value,
+                )
+                logger.warning(
+                    "legacy Slock migration remains inactive chat=%s disposition=%s",
+                    chat_id[:12],
+                    validation.value,
+                )
+                continue
+            archived_path = candidate.pop("_archived_path", "")
+            if archived_path:
+                try:
+                    self._slock_engine_manager.restore_archived_chat_marker(
+                        chat_id,
+                        archived_path,
+                    )
+                except (OSError, ValueError):
+                    logger.exception(
+                        "legacy Slock marker restore failed chat=%s",
+                        chat_id[:12],
+                    )
+                    continue
+            imported = self._managed_group_registry.import_candidate(
+                candidate,
+                validator=lambda _facts: True,
+            )
+            if imported is None:
+                logger.warning(
+                    "legacy Slock Registry import rejected chat=%s",
+                    chat_id[:12],
+                )
+                continue
+            logger.info(
+                "legacy Slock group validated and imported chat=%s project=%s",
+                chat_id[:12],
+                project_id,
+            )
 
     def rotate_main_managed_group_bot(
         self,

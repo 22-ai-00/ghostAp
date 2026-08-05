@@ -420,6 +420,7 @@ class CardDelivery:
         if not isinstance(payload, dict):
             raise TypeError("card payload transform must return dict")
         revisions: set[tuple[int, int]] = set()
+        callback_revisions: list[tuple[int, int] | None] = []
 
         def collect(node) -> None:
             if isinstance(node, dict):
@@ -427,7 +428,23 @@ class CardDelivery:
                 grant_revision = node.get("grant_revision")
                 if type(group_revision) is int and type(grant_revision) is int:
                     revisions.add((group_revision, grant_revision))
-                for value in node.values():
+                for key, value in node.items():
+                    if (
+                        key == "value"
+                        and isinstance(value, dict)
+                        and ("action" in value or "action_id" in value)
+                    ):
+                        callback_group_revision = value.get("group_revision")
+                        callback_grant_revision = value.get("grant_revision")
+                        callback_revisions.append(
+                            (
+                                callback_group_revision,
+                                callback_grant_revision,
+                            )
+                            if type(callback_group_revision) is int
+                            and type(callback_grant_revision) is int
+                            else None
+                        )
                     collect(value)
             elif isinstance(node, list):
                 for value in node:
@@ -439,8 +456,13 @@ class CardDelivery:
         if self._trust_revision_provider is not None:
             if expected is None and revisions:
                 raise ValueError("unmanaged card payload contains managed trust revisions")
-            if expected is not None and revisions != {expected}:
-                raise ValueError("managed card payload trust revision mismatch")
+            if expected is not None:
+                if revisions - {expected}:
+                    raise ValueError("managed card payload trust revision mismatch")
+                if any(revision != expected for revision in callback_revisions):
+                    raise ValueError("managed card callback trust revision mismatch")
+                if not callback_revisions and revisions:
+                    raise ValueError("passive managed card contains trust revisions")
         revision_suffix = ""
         if revisions:
             revision_suffix = ":trust:" + ",".join(

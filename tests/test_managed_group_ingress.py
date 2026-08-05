@@ -37,6 +37,20 @@ def _registry(tmp_path) -> ManagedGroupRegistry:
     return registry
 
 
+def _team_registry(tmp_path) -> ManagedGroupRegistry:
+    registry = ManagedGroupRegistry(tmp_path / "managed-team-groups.json")
+    registry.register(
+        chat_id=GROUP_ID,
+        owner_id=OWNER_ID,
+        origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+        receiving_bot_ref="cli_main_bot",
+        project_id="team:Alpha",
+        canonical_root_ref="/srv/project-1",
+        created_at=datetime(2026, 7, 31, tzinfo=UTC),
+    )
+    return registry
+
+
 def _message(*, text: str = "implement the task", sender_id: str = OWNER_ID) -> MagicMock:
     data = MagicMock()
     data.header.tenant_key = "tenant-1"
@@ -298,6 +312,113 @@ def test_managed_topic_cannot_replace_registry_project(tmp_path) -> None:
     project = client._dispatch_message_logic.call_args.args[3]
     assert project.project_id == "project-1"
     assert project.root_path == "/srv/project-1"
+
+
+def test_standalone_managed_team_routes_without_legacy_project_context(tmp_path) -> None:
+    client = _client(_team_registry(tmp_path), enforced=True)
+    client._project_manager.get_project_for_chat.return_value = None
+    client._slock_engine_manager = MagicMock()
+    client._slock_engine_manager.is_managed_chat.return_value = True
+    client._slock_engine_manager.get_activated_engine.return_value = SimpleNamespace(
+        root_path="/srv/project-1"
+    )
+    client._current_worker_text = "coordinate the release"
+
+    client._process_message_async(_message(text="coordinate the release"))
+
+    client._dispatch_message_logic.assert_called_once()
+    assert client._dispatch_message_logic.call_args.args[3] is None
+
+
+def test_validated_legacy_slock_marker_is_imported_before_restore(tmp_path) -> None:
+    client = FeishuWSClient.__new__(FeishuWSClient)
+    client._managed_group_registry = ManagedGroupRegistry(
+        tmp_path / "managed-groups.json"
+    )
+    client._managed_group_owner_id = OWNER_ID
+    client._managed_group_receiving_bot_ref = "cli_main_bot"
+    candidate = {
+        "bound_chat_created_at": 1_768_448_332.0,
+        "canonical_root_ref": str(tmp_path.resolve()),
+        "chat_id": GROUP_ID,
+        "owner_id": OWNER_ID,
+        "project_id": "team:Alpha",
+        "receiving_bot_ref": "cli_main_bot",
+        "_archived_path": str(tmp_path / ".slock_channel.dissolved.1.json"),
+    }
+    client._slock_engine_manager = MagicMock()
+    client._slock_engine_manager.managed_group_migration_candidates.return_value = (
+        candidate,
+    )
+    remote = MagicMock()
+    from src.project_chat.lark_chat_client import ManagedChatValidation
+
+    remote.validate_managed_chat.return_value = ManagedChatValidation.VALID
+
+    client._migrate_legacy_slock_groups(remote)
+
+    record = client._managed_group_registry.active_record(GROUP_ID)
+    assert record is not None
+    assert record.project_id == "team:Alpha"
+    client._slock_engine_manager.restore_archived_chat_marker.assert_called_once_with(
+        GROUP_ID,
+        candidate["_archived_path"],
+    )
+
+
+def test_unknown_legacy_slock_marker_stays_untrusted(tmp_path) -> None:
+    client = FeishuWSClient.__new__(FeishuWSClient)
+    client._managed_group_registry = ManagedGroupRegistry(
+        tmp_path / "managed-groups.json"
+    )
+    client._managed_group_owner_id = OWNER_ID
+    client._managed_group_receiving_bot_ref = "cli_main_bot"
+    client._slock_engine_manager = MagicMock()
+    client._slock_engine_manager.managed_group_migration_candidates.return_value = (
+        {
+            "bound_chat_created_at": 1_768_448_332.0,
+            "canonical_root_ref": str(tmp_path.resolve()),
+            "chat_id": GROUP_ID,
+            "owner_id": OWNER_ID,
+            "project_id": "team:Alpha",
+            "receiving_bot_ref": "cli_main_bot",
+        },
+    )
+    remote = MagicMock()
+    from src.project_chat.lark_chat_client import ManagedChatValidation
+
+    remote.validate_managed_chat.return_value = ManagedChatValidation.UNKNOWN
+
+    client._migrate_legacy_slock_groups(remote)
+
+    assert client._managed_group_registry.record(GROUP_ID) is None
+    client._slock_engine_manager.restore_archived_chat_marker.assert_not_called()
+
+
+def test_tombstoned_slock_group_is_never_reimported(tmp_path) -> None:
+    registry = _team_registry(tmp_path)
+    registry.tombstone(GROUP_ID)
+    client = FeishuWSClient.__new__(FeishuWSClient)
+    client._managed_group_registry = registry
+    client._managed_group_owner_id = OWNER_ID
+    client._managed_group_receiving_bot_ref = "cli_main_bot"
+    client._slock_engine_manager = MagicMock()
+    client._slock_engine_manager.managed_group_migration_candidates.return_value = (
+        {
+            "bound_chat_created_at": 1_768_448_332.0,
+            "canonical_root_ref": str(tmp_path.resolve()),
+            "chat_id": GROUP_ID,
+            "owner_id": OWNER_ID,
+            "project_id": "team:Alpha",
+            "receiving_bot_ref": "cli_main_bot",
+        },
+    )
+    remote = MagicMock()
+
+    client._migrate_legacy_slock_groups(remote)
+
+    assert registry.active_record(GROUP_ID) is None
+    remote.validate_managed_chat.assert_not_called()
 
 
 def test_managed_bound_chat_cannot_replace_registry_project(tmp_path) -> None:

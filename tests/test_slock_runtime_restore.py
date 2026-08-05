@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -108,6 +109,72 @@ class TestRestoreFromDiskHappyPath:
         engine = manager.get_activated_engine("oc_chat_1")
         assert engine is not None
         assert engine.root_path == str(project_root.resolve())
+
+    def test_untrusted_marker_is_left_durable_for_validated_migration(self, tmp_path):
+        root = str(tmp_path)
+        storage_base = str(tmp_path / "ghostap_config" / "slock")
+        marker_path = _write_marker(
+            storage_base,
+            "oc_legacy_team",
+            {
+                "channel_id": "oc_legacy_team",
+                "team_name": "Legacy",
+                "name": "Legacy Group",
+            },
+        )
+        manager = SlockEngineManager(storage_base_path=storage_base)
+
+        restored = manager.restore_from_disk(
+            root,
+            managed_group_active=lambda _chat_id: False,
+        )
+
+        assert restored == 0
+        assert Path(marker_path).is_file()
+        assert not list(Path(marker_path).parent.glob(".slock_channel.dissolved.*.json"))
+
+    def test_managed_group_migration_candidates_include_cutover_archive(self, tmp_path):
+        project_root = tmp_path / "legacy-project"
+        project_root.mkdir()
+        storage_base = str(tmp_path / "ghostap_config" / "slock")
+        marker_path = Path(
+            _write_marker(
+                storage_base,
+                "oc_legacy_team",
+                {
+                    "channel_id": "oc_legacy_team",
+                    "team_name": "Legacy",
+                    "name": "Legacy Group",
+                    "owner_id": "ou_owner",
+                    "root_path": str(project_root),
+                    "activated_at": "2026-07-17T03:38:52Z",
+                },
+            )
+        )
+        archived_ns = 1_785_548_041_819_419_550
+        archived_path = marker_path.with_name(
+            f".slock_channel.dissolved.{archived_ns}.json"
+        )
+        marker_path.replace(archived_path)
+        manager = SlockEngineManager(storage_base_path=storage_base)
+
+        candidates = manager.managed_group_migration_candidates(
+            owner_id="ou_owner",
+            receiving_bot_ref="cli_main_bot",
+            archived_after_ns=1_785_000_000_000_000_000,
+        )
+
+        assert candidates == (
+            {
+                "bound_chat_created_at": 1_784_259_532.0,
+                "canonical_root_ref": str(project_root.resolve()),
+                "chat_id": "oc_legacy_team",
+                "owner_id": "ou_owner",
+                "project_id": "team:Legacy",
+                "receiving_bot_ref": "cli_main_bot",
+                "_archived_path": str(archived_path),
+            },
+        )
 
 
 class TestRestoreFromDiskErrorHandling:

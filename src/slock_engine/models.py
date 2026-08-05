@@ -417,6 +417,7 @@ class SlockChannel:
     shared_memory_path: str = ""
     team_name: str = ""
     owner_id: str = ""  # User who created this team (for permission checks)
+    project_id: str = ""  # Durable grant identity; standalone teams use team:<name>.
     created_at: float = field(default_factory=time.time)
     bootstrap_failed: bool = False
     # Channel-level wake policy override: "" inherits settings default. Effective
@@ -431,6 +432,7 @@ class SlockChannel:
             "shared_memory_path": self.shared_memory_path,
             "team_name": self.team_name,
             "owner_id": self.owner_id,
+            "project_id": self.project_id,
             "created_at": self.created_at,
             "bootstrap_failed": self.bootstrap_failed,
             "wake_policy": self.wake_policy,

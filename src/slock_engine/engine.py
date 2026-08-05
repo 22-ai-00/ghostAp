@@ -2064,6 +2064,7 @@ class SlockEngine(BaseEngine):
             "team_name": channel.team_name,
             "name": channel.name,
             "owner_id": channel.owner_id,
+            "project_id": channel.project_id,
             "root_path": self.root_path,
             "bootstrap_failed": channel.bootstrap_failed,
             "activated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

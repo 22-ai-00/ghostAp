@@ -15,6 +15,10 @@ class TestCardDeduplication(unittest.TestCase):
         self.client._project_manager = MagicMock()
         self.client._message_linker = MagicMock()
         self.client._message_linker.resolve_origin.return_value = "msg_123"
+        # This unit exercises only cache semantics.  Do not let production
+        # managed-group state turn its synthetic chat/message IDs into an
+        # ingress authorization test.
+        self.client._managed_group_registry = MagicMock()
         self.client._scheduler = MagicMock()
         self.client._ensure_request_id = MagicMock(return_value="req_123")
 
