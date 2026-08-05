@@ -252,6 +252,11 @@ class CardDelivery:
             message_high_watermark >= 0
             and message_high_watermark not in binding.pages
         ):
+            replacement_page = binding.stale_replacement_pages.get(
+                binding.latest_source_page_index
+            )
+            if replacement_page == message_high_watermark:
+                return [self._stale_recovery_exhausted()]
             return self._append_from_source(
                 session_id,
                 chat_id,
@@ -309,16 +314,19 @@ class CardDelivery:
                 is_terminal=is_terminal,
             )
             if self._is_stale_binding_outcome(outcome):
-                outcome = self._append_visible_page(
+                outcome = self._recover_stale_page(
                     session_id,
                     chat_id,
                     binding,
                     ordered[-1],
+                    outcome,
+                    stale_page_index=latest_page.page_index,
                     reply_to=reply_to,
                     reply_in_thread=reply_in_thread,
                     is_terminal=is_terminal,
                 )
             elif outcome.kind == "applied":
+                binding.stale_replacement_pages.pop(latest_rendered_idx, None)
                 self._bindings.update_source_page_index(
                     session_id,
                     message_high_watermark,
@@ -376,16 +384,24 @@ class CardDelivery:
                     is_terminal=is_terminal,
                 )
             if self._is_stale_binding_outcome(outcome):
-                outcome = self._append_visible_page(
+                outcome = self._recover_stale_page(
                     session_id,
                     chat_id,
                     binding,
                     card,
+                    outcome,
+                    stale_page_index=(
+                        existing_page.page_index
+                        if existing_page is not None
+                        else binding.message_high_watermark
+                    ),
                     reply_to=reply_to,
                     reply_in_thread=reply_in_thread,
                     is_terminal=is_terminal,
                 )
                 mutated_visible_index = binding.message_high_watermark
+            elif outcome.kind == "applied":
+                binding.stale_replacement_pages.pop(page_idx, None)
             outcomes.append(outcome)
             if outcome.kind == "reconcile":
                 break
@@ -602,6 +618,53 @@ class CardDelivery:
             is_terminal=is_terminal,
         )
 
+    def _recover_stale_page(
+        self,
+        session_id: str,
+        chat_id: str,
+        binding,
+        card: RenderedCard,
+        stale_outcome: MutationOutcome,
+        *,
+        stale_page_index: int,
+        reply_to: str | None,
+        reply_in_thread: bool | None,
+        is_terminal: bool,
+    ) -> MutationOutcome:
+        """Append once unless the current physical page is already a replacement."""
+        source_page_index = card.page_index
+        if (
+            binding.stale_replacement_pages.get(source_page_index)
+            == stale_page_index
+        ):
+            return self._stale_recovery_exhausted(stale_outcome)
+        replacement_page_index = binding.message_high_watermark + 1
+        binding.stale_replacement_pages[source_page_index] = replacement_page_index
+        replacement_outcome = self._append_visible_page(
+            session_id,
+            chat_id,
+            binding,
+            card,
+            reply_to=reply_to,
+            reply_in_thread=reply_in_thread,
+            is_terminal=is_terminal,
+        )
+        if self._is_stale_binding_outcome(replacement_outcome):
+            return self._stale_recovery_exhausted(replacement_outcome)
+        return replacement_outcome
+
+    @staticmethod
+    def _stale_recovery_exhausted(
+        stale_outcome: MutationOutcome | None = None,
+    ) -> MutationOutcome:
+        code = "99992354"
+        if stale_outcome is not None:
+            code = stale_outcome.message.removeprefix(_RECREATE_OUTCOME_PREFIX)
+        return MutationOutcome(
+            kind="reconcile",
+            message=f"stale_replacement_exhausted:{code}",
+        )
+
     @staticmethod
     def _remap_latest_card(
         card: RenderedCard,
@@ -664,7 +727,9 @@ class CardDelivery:
             card.active_element is not None
             and sanitize_card_text_for_audit(card.active_element.text) != page.last_text
         ):
-            return self._stream_element(session_id, page, card)
+            if page.supports_element_update:
+                return self._stream_element(session_id, page, card)
+            return self._update_page(session_id, page, card)
         return MutationOutcome(kind="skipped")
 
     def _freeze_page(

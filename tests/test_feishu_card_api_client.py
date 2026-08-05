@@ -36,6 +36,15 @@ class _FakeMessageApi:
         return _FakeResponse()
 
 
+class _FakeCardApi:
+    def __init__(self) -> None:
+        self.updated_request = None
+
+    def update(self, request):
+        self.updated_request = request
+        return _FakeResponse()
+
+
 def _client_for(message_api: _FakeMessageApi):
     return SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=message_api)))
 
@@ -190,14 +199,15 @@ def test_created_card_remembers_recipient_aliases_for_later_patch() -> None:
     ]
 
 
-def test_streaming_card_entity_remembers_recipient_aliases_for_later_patch() -> None:
-    """CardKit patches target the entity id, not the message id carrying it."""
+def test_streaming_card_entity_update_uses_cardkit_and_remembers_aliases() -> None:
+    """CardKit structure updates target the entity, not its carrier message."""
     message_api = _FakeMessageApi()
-    message_api.patch = lambda _request: _FakeResponse()
+    message_api.patch = MagicMock(return_value=_FakeResponse())
+    card_api = _FakeCardApi()
     element_api = SimpleNamespace(content=lambda _request: _FakeResponse())
     sdk_client = _client_for(message_api)
     sdk_client.cardkit = SimpleNamespace(
-        v1=SimpleNamespace(card_element=element_api),
+        v1=SimpleNamespace(card=card_api, card_element=element_api),
     )
     events: list[tuple[str, str]] = []
     resolver_calls = 0
@@ -226,6 +236,10 @@ def test_streaming_card_entity_remembers_recipient_aliases_for_later_patch() -> 
     client.update_element("card_entity_1", "element_1", "done")
 
     assert message_id == "msg_1"
+    assert card_api.updated_request.card_id == "card_entity_1"
+    assert card_api.updated_request.request_body.sequence == 0
+    assert json.loads(card_api.updated_request.request_body.card.data) == {"body": {}}
+    message_api.patch.assert_not_called()
     assert resolver_calls == 1
     assert events[-4:] == [
         ("patch", "card_entity_1"),

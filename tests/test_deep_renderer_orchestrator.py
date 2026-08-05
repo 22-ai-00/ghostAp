@@ -1,8 +1,8 @@
-"""Integration tests: DeepRenderer main-card and subagent-card behavior.
+"""Integration tests for DeepRenderer's single-main-card behavior.
 
-Deep keeps the ordered main flow on one paginated card stream. Plan and subagent
-progress remain visible in its sticky task list, while subagent details use
-independent, explicitly marked child cards.
+Deep keeps plan and subagent progress in its sticky task list while all ACP
+text, reasoning, tools, and images share the main execution stream. Only the
+shared delivery capacity policy may append a continuation message.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from src.acp.models import ACPEvent, ACPEventType, PlanEntryInfo, PlanInfo, ToolCallInfo
 from src.card.events import CardEventType
+from src.card.state.reducer import reduce_card_state
 
 # ---------------------------------------------------------------------------
 # Fakes and Fixtures
@@ -146,7 +147,7 @@ def _make_text_event(text: str = "hello") -> ACPEvent:
 
 
 class TestDeepRendererSingleCard:
-    """Verify Deep keeps one ordered main flow plus explicit subagent cards."""
+    """Verify Deep keeps one ordered main-card execution flow."""
 
     def _setup_renderer(self):
         """Create a DeepRenderer with mocked dependencies and session tracking."""
@@ -171,15 +172,11 @@ class TestDeepRendererSingleCard:
         self,
         renderer,
         *,
-        task_level_cards_enabled: bool = False,
         project=None,
         engine_name: str = "Coco",
         requirement_text: str | None = None,
-        max_task_cards: int = 8,
     ):
         mock_settings = MagicMock()
-        mock_settings.card.task_level_cards_enabled = task_level_cards_enabled
-        mock_settings.card.max_task_cards = max_task_cards
         mock_settings.card.build_heartbeat_interval = 5.0
         with patch(
             "src.feishu.renderers._deep_stream_processor.get_settings",
@@ -214,27 +211,6 @@ class TestDeepRendererSingleCard:
         self._create_callbacks(renderer)
 
         assert tracker.sessions_created[0]._metadata.question_title == "Deep 任务"
-
-    def test_multi_task_plan_stays_single_card_by_default(self):
-        """3 plan steps stay in one Feishu card by default."""
-        renderer, tracker = self._setup_renderer()
-
-        callbacks = self._create_callbacks(renderer)
-
-        from src.deep_engine.models import DeepProjectStatus
-        dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
-        callbacks.on_analyzing_done(dp)
-
-        assert tracker.create_card_count == 1
-
-        plan_event = _make_plan_event([
-            ("Analyze requirements", "in_progress"),
-            ("Write implementation", "in_progress"),
-            ("Run tests", "in_progress"),
-        ])
-        callbacks.on_event(plan_event)
-
-        assert tracker.create_card_count == 1
 
     def test_deep_start_uses_spec_style_cycle_phase_events(self):
         """Deep cards should use the same cycle/phase structure as Spec cards."""
@@ -355,11 +331,11 @@ class TestDeepRendererSingleCard:
             {"task_id": "step_1", "name": "Write implementation", "status": "in_progress"},
         ]
 
-    def test_multi_task_plan_stays_single_card_even_when_task_cards_enabled(self):
+    def test_multi_task_plan_stays_single_card(self):
         """Deep ignores task-card fanout and renders plan tasks on the main card."""
         renderer, tracker = self._setup_renderer()
 
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
 
         from src.deep_engine.models import DeepProjectStatus
         dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
@@ -388,62 +364,11 @@ class TestDeepRendererSingleCard:
             {"task_id": "step_2", "name": "Run tests", "status": "in_progress"},
         ]
 
-    def test_single_step_plan_stays_single_card(self):
-        """A plan with only 1 step stays in single-card mode (no split)."""
-        renderer, tracker = self._setup_renderer()
-
-        callbacks = self._create_callbacks(renderer)
-
-        from src.deep_engine.models import DeepProjectStatus
-        dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
-        callbacks.on_analyzing_done(dp)
-
-        # Only 1 step
-        plan_event = _make_plan_event([("Single task", "pending")])
-        callbacks.on_event(plan_event)
-
-        # Should still be just 1 card (thinking session)
-        assert tracker.create_card_count == 1
-
-    def test_no_plan_stays_single_card(self):
-        """Without any PLAN_UPDATE, stays in single-card mode."""
-        renderer, tracker = self._setup_renderer()
-
-        callbacks = self._create_callbacks(renderer)
-
-        from src.deep_engine.models import DeepProjectStatus
-        dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
-        callbacks.on_analyzing_done(dp)
-
-        # Send text events, no plan
-        callbacks.on_event(_make_text_event("thinking..."))
-        callbacks.on_event(_make_text_event("more thinking..."))
-
-        # Still just 1 card
-        assert tracker.create_card_count == 1
-
-    def test_empty_plan_entries_stays_single_card(self):
-        """Plan with empty entries (no content) stays single-card (fallback)."""
-        renderer, tracker = self._setup_renderer()
-
-        callbacks = self._create_callbacks(renderer)
-
-        from src.deep_engine.models import DeepProjectStatus
-        dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
-        callbacks.on_analyzing_done(dp)
-
-        # Plan with empty content entries
-        plan_event = _make_plan_event([("", "pending"), ("  ", "pending"), ("", "pending")])
-        callbacks.on_event(plan_event)
-
-        # All entries have empty content → factory converts to 0 valid tasks → no split
-        assert tracker.create_card_count == 1
-
     def test_project_done_completes_main_card(self):
         """on_project_done completes the same Deep card."""
         renderer, tracker = self._setup_renderer()
 
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
 
         from src.deep_engine.models import DeepProjectStatus
         dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
@@ -466,6 +391,8 @@ class TestDeepRendererSingleCard:
             if call.args and hasattr(call.args[0], "type") and call.args[0].type == CardEventType.COMPLETED
         ]
         assert len(completed_calls) == 1
+        assert "执行完成" in completed_calls[0].args[0].payload["summary"]
+        renderer.handler.add_reaction.assert_called_once_with("msg_1", "PARTY")
         task_updates = [
             call.args[0]
             for call in main_session.dispatch.call_args_list
@@ -501,57 +428,11 @@ class TestDeepRendererSingleCard:
         }]
         assert task_updates[-1].payload["current_task_id"] == ""
 
-    def test_project_done_adds_done_reaction_to_original_message(self):
-        """Deep completion sends the user-visible done reaction immediately."""
-        renderer, _ = self._setup_renderer()
-
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
-
-        from src.deep_engine.models import DeepProjectStatus
-        dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
-        callbacks.on_analyzing_done(dp)
-
-        dp.status = DeepProjectStatus.COMPLETED
-        callbacks.on_project_done(dp)
-
-        renderer.handler.add_reaction.assert_called_once_with("msg_1", "PARTY")
-
-    def test_project_done_keeps_final_summary_on_main_card(self):
-        """Deep completion summary is delivered on the main card, not a new card."""
-        renderer, tracker = self._setup_renderer()
-
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
-
-        from src.deep_engine.models import DeepProjectStatus
-        dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
-        callbacks.on_analyzing_done(dp)
-
-        callbacks.on_event(_make_plan_event([
-            ("Task A", "in_progress"),
-            ("Task B", "in_progress"),
-        ]))
-        assert tracker.create_card_count == 1
-
-        dp.status = DeepProjectStatus.COMPLETED
-        callbacks.on_project_done(dp)
-
-        assert tracker.create_card_count == 1
-        summary_session = tracker.sessions_created[0]
-        summary_events = [
-            call.args[0]
-            for call in summary_session.dispatch.call_args_list
-            if call.args and hasattr(call.args[0], "type")
-        ]
-        assert any(
-            event.type == CardEventType.COMPLETED and "执行完成" in event.payload.get("summary", "")
-            for event in summary_events
-        )
-
     def test_project_done_failed_formats_incomplete_summary(self):
         """Deep incomplete terminal text should not leak format placeholders."""
         renderer, tracker = self._setup_renderer()
 
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
 
         from src.deep_engine.models import DeepProjectStatus
         dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
@@ -585,9 +466,9 @@ class TestDeepRendererSingleCard:
             "failed",
         ]
 
-    def test_paused_project_cancels_main_and_only_unfinished_child_card(self):
+    def test_paused_project_cancels_unfinished_subagent_tasks_on_main_card(self):
         renderer, tracker = self._setup_renderer()
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
         callbacks.on_analyzing_start("pause with mixed child states")
 
         callbacks.on_event(ACPEvent(
@@ -624,23 +505,19 @@ class TestDeepRendererSingleCard:
         from src.deep_engine.models import DeepProjectStatus
         callbacks.on_project_done(FakeDeepProject(status=DeepProjectStatus.PAUSED))
 
-        terminal_types = {
-            CardEventType.COMPLETED,
-            CardEventType.FAILED,
-            CardEventType.CANCELLED,
-        }
-
-        def _terminals(session):
-            return [
-                call.args[0].type
-                for call in session.dispatch.call_args_list
-                if call.args
-                and getattr(call.args[0], "type", None) in terminal_types
-            ]
-
-        assert _terminals(tracker.sessions_created[0]) == [CardEventType.CANCELLED]
-        assert _terminals(tracker.sessions_created[1]) == [CardEventType.COMPLETED]
-        assert _terminals(tracker.sessions_created[2]) == [CardEventType.CANCELLED]
+        assert tracker.create_card_count == 1
+        terminal_types = [
+            call.args[0].type
+            for call in tracker.sessions_created[0].dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None)
+            in {
+                CardEventType.COMPLETED,
+                CardEventType.FAILED,
+                CardEventType.CANCELLED,
+            }
+        ]
+        assert terminal_types == [CardEventType.CANCELLED]
         main_task_updates = [
             call.args[0]
             for call in tracker.sessions_created[0].dispatch.call_args_list
@@ -655,16 +532,12 @@ class TestDeepRendererSingleCard:
         assert by_id["agent_active"] == "cancelled"
         processor = callbacks.on_event.__self__
         assert processor._task_registry.get("agent_active").status == "cancelled"
-        assert (
-            processor._subagent_orchestrator.registry.get("agent_active").status
-            == "cancelled"
-        )
 
-    def test_agent_tool_call_uses_marked_child_card_and_main_task_summary(self):
-        """Subagent details use a child card while main keeps only task progress."""
+    def test_subagent_output_and_summary_stay_on_main_card(self):
+        """Management wrappers stay compact while child output uses the main flow."""
         renderer, tracker = self._setup_renderer()
 
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
 
         from src.deep_engine.models import DeepProjectStatus
         dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
@@ -697,6 +570,33 @@ class TestDeepRendererSingleCard:
             ),
         ))
         callbacks.on_event(ACPEvent(
+            event_type=ACPEventType.TEXT_CHUNK,
+            source_id="agent_call_1",
+            text="子代理正在核对投递边界。",
+        ))
+        callbacks.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            source_id="agent_call_1",
+            tool_call=ToolCallInfo(
+                id="child_shell_1",
+                title="shell",
+                kind="execute",
+                status="in_progress",
+                content="uv run pytest tests/test_card_delivery_engine.py -q",
+            ),
+        ))
+        callbacks.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            source_id="agent_call_1",
+            tool_call=ToolCallInfo(
+                id="child_shell_1",
+                title="shell",
+                kind="execute",
+                status="completed",
+                content="all passed",
+            ),
+        ))
+        callbacks.on_event(ACPEvent(
             event_type=ACPEventType.TOOL_CALL_DONE,
             tool_call=ToolCallInfo(
                 id="agent_call_1",
@@ -707,16 +607,17 @@ class TestDeepRendererSingleCard:
             ),
         ))
 
-        assert tracker.create_card_count == 2
+        assert tracker.create_card_count == 1
         main_session = tracker.sessions_created[0]
         main_event_types = [
             call.args[0].type
             for call in main_session.dispatch.call_args_list
             if call.args and hasattr(call.args[0], "type")
         ]
-        assert CardEventType.TOOL_STARTED not in main_event_types
-        assert CardEventType.TOOL_DELTA not in main_event_types
-        assert CardEventType.TOOL_DONE not in main_event_types
+        assert CardEventType.TEXT_STARTED in main_event_types
+        assert CardEventType.TEXT_DELTA in main_event_types
+        assert CardEventType.TOOL_STARTED in main_event_types
+        assert CardEventType.TOOL_DONE in main_event_types
         task_updates = [
             call.args[0]
             for call in main_session.dispatch.call_args_list
@@ -728,24 +629,10 @@ class TestDeepRendererSingleCard:
             "status": "completed",
         }
 
-        child_session = tracker.sessions_created[1]
-        assert child_session._metadata.is_subagent is True
-        assert child_session._metadata.unit_kind == "subagent"
-        assert child_session._metadata.unit_id == "agent_call_1"
-        child_event_types = [
-            call.args[0].type
-            for call in child_session.dispatch.call_args_list
-            if call.args and hasattr(call.args[0], "type")
-        ]
-        assert CardEventType.TOOL_STARTED in child_event_types
-        assert CardEventType.TOOL_DELTA in child_event_types
-        assert CardEventType.TOOL_DONE in child_event_types
-        assert CardEventType.COMPLETED in child_event_types
-
     def test_codex_activity_uses_stable_thread_id_without_false_completion(self):
         """Activity calls are operations on one child, not child terminal frames."""
         renderer, tracker = self._setup_renderer()
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
         callbacks.on_analyzing_start("track Codex child activity")
 
         source_id = "thread-stable-card-audit"
@@ -786,11 +673,11 @@ class TestDeepRendererSingleCard:
             "name": "🧬 card-audit",
             "status": "in_progress",
         }]
-        assert tracker.create_card_count == 2
+        assert tracker.create_card_count == 1
 
     def test_failed_codex_interrupt_activity_keeps_deep_child_running(self):
         renderer, tracker = self._setup_renderer()
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
         callbacks.on_analyzing_start("failed interrupt must not cancel child")
 
         source_id = "thread-stable-card-audit"
@@ -825,11 +712,12 @@ class TestDeepRendererSingleCard:
             "name": "🧬 card-audit",
             "status": "in_progress",
         }]
+        assert tracker.create_card_count == 1
 
     def test_codex_collaboration_state_finalizes_stable_deep_task(self):
         """The collaboration snapshot, not activity DONE, owns child terminal state."""
         renderer, tracker = self._setup_renderer()
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
         callbacks.on_analyzing_start("finish Codex child from collaboration state")
 
         source_id = "thread-stable-card-audit"
@@ -878,12 +766,100 @@ class TestDeepRendererSingleCard:
             "name": "🧬 card-audit",
             "status": "completed",
         }]
+        assert tracker.create_card_count == 1
+
+    def test_failed_collaboration_without_child_keeps_error_on_main_card(self):
+        renderer, tracker = self._setup_renderer()
+        callbacks = self._create_callbacks(renderer)
+        callbacks.on_analyzing_start("show failed spawn")
+
+        failed_event = ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="spawn_failed",
+                title="spawn_agent",
+                kind="agent",
+                status="failed",
+                content="子代理启动失败：并发槽位不足",
+                collaboration_tool="spawn_agent",
+            ),
+        )
+        callbacks.on_event(failed_event)
+        callbacks.on_event(failed_event)
+
+        main_session = tracker.sessions_created[0]
+        tool_events = [
+            call.args[0]
+            for call in main_session.dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None) in {
+                CardEventType.TOOL_STARTED,
+                CardEventType.TOOL_FAILED,
+            }
+        ]
+        tool_event_types = [event.type for event in tool_events]
+        state = None
+        for event in tool_events:
+            state = reduce_card_state(state, event)
+
+        assert tracker.create_card_count == 1
+        assert tool_event_types == [
+            CardEventType.TOOL_STARTED,
+            CardEventType.TOOL_FAILED,
+            CardEventType.TOOL_FAILED,
+        ]
+        failed_blocks = [
+            block
+            for block in state.blocks
+            if block.kind == "tool_call" and block.block_id == "spawn_failed"
+        ]
+        assert len(failed_blocks) == 1
+        failed_block = failed_blocks[0]
+        assert failed_block.status == "failed"
+        assert "并发槽位不足" in failed_block.tool_output
+
+    def test_collaboration_receivers_without_states_create_task_summary(self):
+        renderer, tracker = self._setup_renderer()
+        callbacks = self._create_callbacks(renderer)
+        callbacks.on_analyzing_start("track receiver-only spawn")
+
+        callbacks.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="spawn_receiver",
+                title="spawn_agent",
+                kind="agent",
+                status="in_progress",
+                content="检查投递边界\n子代理：Explore",
+                collaboration_tool="spawn_agent",
+                collaboration_receivers=("thread_receiver",),
+            ),
+        ))
+
+        task_updates = [
+            call.args[0]
+            for call in tracker.sessions_created[0].dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None)
+            == CardEventType.TASK_LIST_UPDATED
+        ]
+        receiver = next(
+            task
+            for task in task_updates[-1].payload["tasks"]
+            if task["task_id"] == "thread_receiver"
+        )
+        assert tracker.create_card_count == 1
+        assert receiver == {
+            "task_id": "thread_receiver",
+            "name": "🧬 检查投递边界",
+            "status": "in_progress",
+        }
 
     def test_completed_parent_does_not_fabricate_running_child_completion(self):
         from src.deep_engine.models import DeepProjectStatus
 
         renderer, tracker = self._setup_renderer()
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
         callbacks.on_analyzing_start("running child terminal truth")
         source_id = "thread-still-running"
         callbacks.on_event(ACPEvent(
@@ -920,23 +896,11 @@ class TestDeepRendererSingleCard:
             if task["task_id"] == source_id
         )
         assert child["status"] == "cancelled"
-        child_session = tracker.sessions_created[1]
-        child_terminals = [
-            call.args[0].type
-            for call in child_session.dispatch.call_args_list
-            if call.args
-            and getattr(call.args[0], "type", None)
-            in {
-                CardEventType.COMPLETED,
-                CardEventType.FAILED,
-                CardEventType.CANCELLED,
-            }
-        ]
-        assert child_terminals == [CardEventType.CANCELLED]
+        assert tracker.create_card_count == 1
 
-    def test_execute_failure_output_with_subagent_source_marker_does_not_create_child_card(self):
+    def test_execute_failure_with_subagent_marker_does_not_create_task_summary(self):
         renderer, tracker = self._setup_renderer()
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
         callbacks.on_analyzing_start("verify ordinary execute routing")
         execute_call_id = "call_zXAT0JlJc0dqRewiUJK8nHYL"
         initial_card_count = tracker.create_card_count
@@ -976,12 +940,25 @@ class TestDeepRendererSingleCard:
             for event in task_updates
             for task in event.payload["tasks"]
         )
+        tool_events = [
+            call.args[0].type
+            for call in main_session.dispatch.call_args_list
+            if call.args
+            and getattr(call.args[0], "type", None) in {
+                CardEventType.TOOL_STARTED,
+                CardEventType.TOOL_FAILED,
+            }
+        ]
+        assert tool_events == [
+            CardEventType.TOOL_STARTED,
+            CardEventType.TOOL_FAILED,
+        ]
 
-    def test_parallel_subagents_create_independent_cards_without_reordering_main(self):
-        """Each parallel subagent gets its own card; main receives summary events only."""
+    def test_parallel_subagents_stay_in_single_main_card(self):
+        """Parallel child summaries never allocate independent Feishu cards."""
         renderer, tracker = self._setup_renderer()
 
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
 
         from src.deep_engine.models import DeepProjectStatus
         dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
@@ -1018,7 +995,7 @@ class TestDeepRendererSingleCard:
             ),
         ))
 
-        assert tracker.create_card_count == 3
+        assert tracker.create_card_count == 1
         main_session = tracker.sessions_created[0]
         task_updates = [
             call.args[0]
@@ -1039,42 +1016,6 @@ class TestDeepRendererSingleCard:
         ]
         assert CardEventType.TOOL_STARTED not in main_event_types
         assert CardEventType.TOOL_DONE not in main_event_types
-        assert [session._metadata.unit_kind for session in tracker.sessions_created[1:]] == [
-            "subagent",
-            "subagent",
-        ]
-
-    def test_subagent_card_limit_folds_overflow_into_latest_child_card(self):
-        renderer, tracker = self._setup_renderer()
-        callbacks = self._create_callbacks(
-            renderer,
-            task_level_cards_enabled=True,
-            max_task_cards=1,
-        )
-        callbacks.on_analyzing_start("limit parallel subagent cards")
-
-        for task_id, label in (("agent_1", "first"), ("agent_2", "second")):
-            callbacks.on_event(ACPEvent(
-                event_type=ACPEventType.TOOL_CALL_START,
-                tool_call=ToolCallInfo(
-                    id=task_id,
-                    title="subagent",
-                    kind="execute",
-                    status="in_progress",
-                    content=f"{label} task\n子代理：Explore",
-                ),
-            ))
-
-        assert tracker.create_card_count == 2
-        child_session = tracker.sessions_created[1]
-        child_tool_ids = [
-            call.args[0].payload.get("block_id")
-            for call in child_session.dispatch.call_args_list
-            if call.args
-            and hasattr(call.args[0], "type")
-            and call.args[0].type == CardEventType.TOOL_STARTED
-        ]
-        assert child_tool_ids == ["agent_1", "agent_2"]
 
     def test_deep_does_not_emit_long_running_retry_warning(self):
         renderer, tracker = self._setup_renderer()
@@ -1175,7 +1116,7 @@ class TestDeepRendererSingleCard:
         """on_error fails the same Deep card."""
         renderer, tracker = self._setup_renderer()
 
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
 
         from src.deep_engine.models import DeepProjectStatus
         dp = FakeDeepProject(status=DeepProjectStatus.EXECUTING)
@@ -1208,9 +1149,9 @@ class TestDeepRendererSingleCard:
             "failed",
         ]
 
-    def test_parent_error_cancels_unconfirmed_active_subagent_card(self):
+    def test_parent_error_cancels_unconfirmed_subagent_task_on_main_card(self):
         renderer, tracker = self._setup_renderer()
-        callbacks = self._create_callbacks(renderer, task_level_cards_enabled=True)
+        callbacks = self._create_callbacks(renderer)
         callbacks.on_analyzing_start("fail active child")
         callbacks.on_event(ACPEvent(
             event_type=ACPEventType.TOOL_CALL_START,
@@ -1225,108 +1166,18 @@ class TestDeepRendererSingleCard:
 
         callbacks.on_error("parent failed")
 
-        child_session = tracker.sessions_created[1]
-        child_terminal_types = [
-            call.args[0].type
-            for call in child_session.dispatch.call_args_list
+        assert tracker.create_card_count == 1
+        main_session = tracker.sessions_created[0]
+        task_updates = [
+            call.args[0]
+            for call in main_session.dispatch.call_args_list
             if call.args
-            and hasattr(call.args[0], "type")
-            and call.args[0].type
-            in {
-                CardEventType.COMPLETED,
-                CardEventType.FAILED,
-                CardEventType.CANCELLED,
-            }
+            and getattr(call.args[0], "type", None)
+            == CardEventType.TASK_LIST_UPDATED
         ]
-        assert child_terminal_types == [CardEventType.CANCELLED]
-
-
-# ---------------------------------------------------------------------------
-# Tests merged from test_deep_renderer_split.py
-# ---------------------------------------------------------------------------
-
-
-def _build_split_renderer():
-    """Build a DeepRenderer for card-split tests."""
-    from src.feishu.renderers.deep_renderer import DeepRenderer
-
-    handler = MagicMock()
-    handler.ctx = MagicMock()
-    handler.settings = MagicMock()
-    handler.settings.engine_timeout_warning_seconds = 0
-    handler.add_reaction = MagicMock()
-    handler.send_text_to_chat = MagicMock()
-    handler.reply_text = MagicMock()
-    handler.context_manager = MagicMock()
-    handler.ensure_request_id = MagicMock(return_value="req1")
-    handler.get_card_delivery = MagicMock()
-    handler.project_manager = MagicMock()
-    handler.get_engine_name = MagicMock(return_value="Coco")
-    renderer = DeepRenderer(handler)
-    renderer.create_session = MagicMock(return_value=MagicMock(closed=False))
-    return renderer
-
-
-def test_deep_renderer_does_not_split_on_task_done_in_single_card_mode():
-    """Single-card mode keeps task transitions inside the same Feishu card."""
-    renderer = _build_split_renderer()
-    captured: list[tuple[str, str | None, str | None]] = []
-    renderer._dispatch_card_split = lambda sess, *, reason, hint=None, bridge_phrase=None: captured.append((reason, hint, bridge_phrase))
-
-    mock_settings = MagicMock()
-    mock_settings.card.task_level_cards_enabled = False
-
-    with patch("src.config.get_settings", return_value=mock_settings):
-        callbacks = renderer.create_deep_callbacks(
-            message_id="m1",
-            chat_id="c1",
-            project=None,
-            engine_name="Coco",
+        agent_task = next(
+            task
+            for task in task_updates[-1].payload["tasks"]
+            if task["task_id"] == "agent_live"
         )
-
-    initial_plan = PlanInfo(entries=[
-        PlanEntryInfo(content="task 1", status="in_progress"),
-        PlanEntryInfo(content="task 2", status="pending"),
-    ])
-    callbacks.on_event(ACPEvent(event_type=ACPEventType.PLAN_UPDATE, plan=initial_plan))
-
-    updated_plan = PlanInfo(entries=[
-        PlanEntryInfo(content="task 1", status="completed"),
-        PlanEntryInfo(content="task 2", status="in_progress"),
-    ])
-    callbacks.on_event(ACPEvent(event_type=ACPEventType.PLAN_UPDATE, plan=updated_plan))
-
-    assert captured == []
-
-
-def test_deep_renderer_no_split_in_multi_card_mode():
-    """Multi-card mode must not use task_done card_split either."""
-    renderer = _build_split_renderer()
-    captured: list[tuple[str, str | None, str | None]] = []
-    renderer._dispatch_card_split = lambda sess, *, reason, hint=None, bridge_phrase=None: captured.append((reason, hint, bridge_phrase))
-
-    mock_settings = MagicMock()
-    mock_settings.card.task_level_cards_enabled = True
-
-    with patch("src.config.get_settings", return_value=mock_settings):
-        callbacks = renderer.create_deep_callbacks(
-            message_id="m1",
-            chat_id="c1",
-            project=None,
-            engine_name="Coco",
-        )
-
-    initial_plan = PlanInfo(entries=[
-        PlanEntryInfo(content="task 1", status="in_progress"),
-        PlanEntryInfo(content="task 2", status="pending"),
-    ])
-    callbacks.on_event(ACPEvent(event_type=ACPEventType.PLAN_UPDATE, plan=initial_plan))
-
-    updated_plan = PlanInfo(entries=[
-        PlanEntryInfo(content="task 1", status="completed"),
-        PlanEntryInfo(content="task 2", status="in_progress"),
-    ])
-    callbacks.on_event(ACPEvent(event_type=ACPEventType.PLAN_UPDATE, plan=updated_plan))
-
-    # No card_split should have been dispatched
-    assert not any(reason == "task_done" for reason, _, _ in captured)
+        assert agent_task["status"] == "cancelled"

@@ -18,6 +18,7 @@ class PageBinding:
     source_page_index: int = 0
     is_frozen: bool = False
     is_streaming: bool = False
+    supports_element_update: bool = False
 
 
 @dataclass
@@ -30,6 +31,7 @@ class DeliveryBinding:
     segment_index: int = 0
     message_high_watermark: int = -1
     latest_source_page_index: int = -1
+    stale_replacement_pages: dict[int, int] = field(default_factory=dict)
 
 
 class BindingStore:
@@ -66,6 +68,7 @@ class BindingStore:
         last_text: str = "",
         source_page_index: int | None = None,
         is_streaming: bool = False,
+        supports_element_update: bool = False,
     ) -> None:
         """Set or update a page binding."""
         with self._lock:
@@ -82,6 +85,7 @@ class BindingStore:
                     page_index if source_page_index is None else source_page_index
                 ),
                 is_streaming=is_streaming,
+                supports_element_update=supports_element_update,
             )
             if page_index >= binding.message_high_watermark:
                 binding.message_high_watermark = page_index

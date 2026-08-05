@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...acp import ACPEvent, ACPEventType
 from ...card.events import CardEvent, CardEventType
-from ...card.orchestrator import (
-    UNCONFIRMED_SUBAGENT_SUMMARY,
-    TaskOrchestrator,
-)
+from ...card.orchestrator import TaskOrchestrator
 from ...card.render.build_heartbeat import BuildHeartbeat
-from ...card.stream_bridge import ACPStreamBridge
 from ...card.task_registry import TaskRegistry, tasks_from_plan_entries
 from ...card.ui_text import UI_TEXT
 from ...config import get_settings
@@ -62,18 +57,10 @@ class DeepStreamProcessor(BaseStreamProcessor):
         self._phase = "analyzing"
         self._current_task_id = self._MAIN_TASK_ID
         self._has_real_plan = False
+        self._subagent_task_ids: set[str] = set()
+        self._materialized_tool_ids: set[str] = set()
 
         settings = get_settings()
-        self._subagent_orchestrator = TaskOrchestrator(
-            chat_id=chat_id,
-            session_creator=self._create_subagent_session,
-            bridge_factory=lambda session: ACPStreamBridge(
-                session,
-                image_uploader=self._image_uploader,
-            ),
-            max_task_cards=max(1, int(settings.card.max_task_cards)),
-        )
-        self._subagent_orchestrator.set_thinking_session(rotator.current)
         self._heartbeat = BuildHeartbeat(
             session_id=rotator.session_id,
             on_tick=self._on_heartbeat_tick,
@@ -120,22 +107,6 @@ class DeepStreamProcessor(BaseStreamProcessor):
         self._phase = "analyzing"
         self._heartbeat.start()
 
-    def _create_subagent_session(self, task_id: str):
-        """Create a child card without inheriting main-session terminal hooks."""
-        parent = self._rotator.current
-        metadata = replace(
-            parent._metadata,
-            unit_id=task_id,
-            unit_kind="subagent",
-        )
-        return self._renderer.create_session(
-            self._chat_id,
-            self._message_id,
-            metadata,
-            hooks=(),
-            budget=parent._budget,
-        )
-
     def _resolve_project_name(self, deep_project: DeepProject | None) -> str:
         if deep_project and deep_project.name:
             return deep_project.name
@@ -177,13 +148,11 @@ class DeepStreamProcessor(BaseStreamProcessor):
             self._tool_count += 1
             self._ensure_build_phase()
 
-        if event.event_type != ACPEventType.TOOL_CALL_DONE:
-            self._handle_agent_task_list(event)
-
-        self._subagent_orchestrator.route_acp_event(event, self._stream_bridge)
-
-        if event.event_type == ACPEventType.TOOL_CALL_DONE:
-            self._handle_agent_task_list(event)
+        is_subagent_wrapper = self._handle_agent_task_list(event)
+        self._forward_main_stream_event(
+            event,
+            suppress_wrapper=is_subagent_wrapper,
+        )
 
         if event.event_type == ACPEventType.TOOL_CALL_START:
             self._rotator.dispatch(CardEvent.progress_updated(
@@ -191,6 +160,44 @@ class DeepStreamProcessor(BaseStreamProcessor):
                 total=max(self._plan_steps, self._tool_count),
                 label=UI_TEXT["deep_phase_executing"],
             ))
+
+    def _forward_main_stream_event(
+        self,
+        event: ACPEvent,
+        *,
+        suppress_wrapper: bool,
+    ) -> None:
+        """Forward visible ACP output with programming-card tool pairing."""
+        tool_call = event.tool_call
+        tool_id = str(getattr(tool_call, "id", "") or "").strip()
+        is_tool_terminal = event.event_type == ACPEventType.TOOL_CALL_DONE
+
+        # A wrapper that was visible before later collaboration metadata arrived
+        # still needs its terminal event; otherwise its tool panel stays active.
+        if suppress_wrapper and not (
+            is_tool_terminal and tool_id in self._materialized_tool_ids
+        ):
+            return
+
+        if (
+            event.event_type in {
+                ACPEventType.TOOL_CALL_UPDATE,
+                ACPEventType.TOOL_CALL_DONE,
+            }
+            and tool_id
+            and tool_id not in self._materialized_tool_ids
+        ):
+            # Match ordinary programming cards: an orphan delta/terminal event
+            # must materialize a tool block before the reducer can update it.
+            self._rotator.dispatch(CardEvent.tool_started(
+                tool_id,
+                str(getattr(tool_call, "title", "") or "tool"),
+            ))
+            self._materialized_tool_ids.add(tool_id)
+
+        self._stream_bridge.on_event(event)
+        if event.event_type == ACPEventType.TOOL_CALL_START and tool_id:
+            self._materialized_tool_ids.add(tool_id)
 
     def on_project_done(self, deep_project: DeepProject) -> None:
         self._heartbeat.stop()
@@ -204,9 +211,7 @@ class DeepStreamProcessor(BaseStreamProcessor):
         duration_seconds = self._project_duration(deep_project)
 
         if deep_project.status == DeepProjectStatus.COMPLETED:
-            self._cancel_unfinished_subagent_cards(
-                reason=UNCONFIRMED_SUBAGENT_SUMMARY,
-            )
+            self._cancel_unfinished_subagent_tasks()
             self._finalize_main_tasks(success=True)
             self._rotator.dispatch(CardEvent.completed(
                 summary=summary,
@@ -221,12 +226,10 @@ class DeepStreamProcessor(BaseStreamProcessor):
                 total=len(tasks),
             )
             if deep_project.status == DeepProjectStatus.PAUSED:
-                self._cancel_unfinished_subagent_cards(reason=failure)
+                self._cancel_unfinished_subagent_tasks()
                 self._rotator.dispatch(CardEvent.cancelled(reason=failure))
             else:
-                self._cancel_unfinished_subagent_cards(
-                    reason=UNCONFIRMED_SUBAGENT_SUMMARY,
-                )
+                self._cancel_unfinished_subagent_tasks()
                 self._finalize_main_tasks(success=False)
                 self._rotator.dispatch(CardEvent.failed(
                     failure,
@@ -234,15 +237,10 @@ class DeepStreamProcessor(BaseStreamProcessor):
                 ))
         self._renderer._current_session = None
 
-    def _cancel_unfinished_subagent_cards(self, *, reason: str) -> None:
-        """Cancel open child cards while preserving their existing terminals."""
-        orchestrator = self._subagent_orchestrator
-        cancelled_ids = orchestrator.finalize_unfinished_subagents(
-            status="cancelled",
-            summary=reason,
-        )
+    def _cancel_unfinished_subagent_tasks(self) -> None:
+        """Settle unconfirmed child summaries without creating child sessions."""
         changed = False
-        for task_id in cancelled_ids:
+        for task_id in self._subagent_task_ids:
             item = self._task_registry.get(task_id)
             if item is None or item.status in {"completed", "failed", "cancelled"}:
                 continue
@@ -250,13 +248,10 @@ class DeepStreamProcessor(BaseStreamProcessor):
             changed = True
         if changed:
             self._dispatch_task_list()
-        orchestrator.close(terminal_status="cancelled", summary=reason)
 
     def on_error(self, error: str) -> None:
         self._heartbeat.stop()
-        self._cancel_unfinished_subagent_cards(
-            reason=UNCONFIRMED_SUBAGENT_SUMMARY,
-        )
+        self._cancel_unfinished_subagent_tasks()
         self._finalize_main_tasks(success=False)
         self._dispatch_failed(
             error,
@@ -412,8 +407,9 @@ class DeepStreamProcessor(BaseStreamProcessor):
         tool_call = event.tool_call
         if tool_call is None:
             return False
-        if self._handle_collaboration_task_states(tool_call):
-            return True
+        collaboration_route = self._handle_collaboration_task_states(tool_call)
+        if collaboration_route is not None:
+            return collaboration_route
 
         is_agent_task_event = TaskOrchestrator.is_agent_task_event(event)
         task_id = str(
@@ -425,6 +421,7 @@ class DeepStreamProcessor(BaseStreamProcessor):
             return False
         if not is_agent_task_event and self._task_registry.get(task_id) is None:
             return False
+        self._subagent_task_ids.add(task_id)
         activity = str(getattr(tool_call, "subagent_activity", "") or "").strip().lower()
         if activity in {"started", "interacted"}:
             status = "in_progress"
@@ -447,8 +444,8 @@ class DeepStreamProcessor(BaseStreamProcessor):
         self._dispatch_task_list(task_id)
         return True
 
-    def _handle_collaboration_task_states(self, tool_call) -> bool:
-        """Project stable child states from a parent collaboration snapshot."""
+    def _handle_collaboration_task_states(self, tool_call) -> bool | None:
+        """Project child summaries and decide whether to hide the wrapper."""
         states = tuple(getattr(tool_call, "subagent_states", ()) or ())
         is_collaboration = bool(
             getattr(tool_call, "collaboration_tool", None)
@@ -456,7 +453,27 @@ class DeepStreamProcessor(BaseStreamProcessor):
             or states
         )
         if not is_collaboration:
-            return False
+            return None
+
+        states_by_source = {
+            str(state.get("source_id") or "").strip(): state
+            for state in states
+            if isinstance(state, dict)
+            and str(state.get("source_id") or "").strip()
+        }
+        source_ids = [
+            str(source_id or "").strip()
+            for source_id in getattr(tool_call, "collaboration_receivers", ())
+            if str(source_id or "").strip()
+        ]
+        source_ids.extend(
+            source_id
+            for source_id in states_by_source
+            if source_id not in source_ids
+        )
+        provider_status = str(getattr(tool_call, "status", "") or "").lower()
+        if not source_ids:
+            return provider_status != "failed"
 
         status_map = {
             "pendinginit": "in_progress",
@@ -471,24 +488,26 @@ class DeepStreamProcessor(BaseStreamProcessor):
             "not_found": "failed",
             "interrupted": "cancelled",
         }
+        label = TaskOrchestrator._extract_agent_task_label(tool_call)
+        if not label.startswith("🧬 "):
+            label = f"🧬 {label}"
         current_task_id = ""
-        for state in states:
-            if not isinstance(state, dict):
-                continue
-            task_id = str(state.get("source_id") or "").strip()
-            if not task_id:
-                continue
-            raw_status = str(state.get("status") or "pending").strip().lower()
+        for task_id in source_ids:
+            self._subagent_task_ids.add(task_id)
+            state = states_by_source.get(task_id, {})
+            raw_status = str(
+                state.get("status")
+                or ("failed" if provider_status == "failed" else "running")
+            ).strip().lower()
             status = status_map.get(raw_status, "pending")
             existing = self._task_registry.get(task_id)
-            name = existing.name if existing is not None else "🧬 子任务"
+            name = existing.name if existing is not None else label
             self._upsert_task(task_id, name, status)
             if not current_task_id and status == "in_progress":
                 current_task_id = task_id
 
-        if states:
-            self._dispatch_task_list(current_task_id)
-        return True
+        self._dispatch_task_list(current_task_id)
+        return provider_status != "failed"
 
     def _ensure_build_phase(self) -> None:
         if self._phase == "build":

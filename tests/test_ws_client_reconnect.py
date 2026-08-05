@@ -295,7 +295,10 @@ def test_main_dispatcher_consumes_p2p_chat_entered_event_without_error() -> None
     assert entered[0].event == payload["event"]
 
 
-def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
+def test_ws_client_start_reconnects_if_underlying_start_returns(
+    tmp_path,
+    monkeypatch,
+):
     """Ensure WS client doesn't stop the whole service when lark client exits.
 
     We simulate lark-channel WS client's `.start()` returning unexpectedly. GhostAP
@@ -304,6 +307,10 @@ def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
 
     from src.feishu import ws_client as ws
 
+    isolated_checkout = tmp_path / "checkout"
+    isolated_checkout.mkdir()
+    isolated_restart_gate = tmp_path / "restart-gate"
+    monkeypatch.setattr(ws, "_CHECKOUT_ROOT", isolated_checkout)
     fake_settings = SimpleNamespace(
         app_id="test_app_id",
         app_secret="test_secret",
@@ -326,6 +333,7 @@ def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
         thread_programming_enabled=False,
         feishu_ws_reconnect_delay_s=0.02,
         feishu_ws_watchdog_interval=999,
+        restart_gate_dir=str(isolated_restart_gate),
     )
     monkeypatch.setattr(ws, "get_settings", lambda: fake_settings)
 
@@ -366,6 +374,7 @@ def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
     )
 
     client = ws.FeishuWSClient(message_callback=lambda *a, **k: None)
+    assert client._restart_gate.directory == isolated_restart_gate
     membership_audits = []
     client._employee_department_runtime = SimpleNamespace(
         membership_service=SimpleNamespace(

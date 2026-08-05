@@ -701,78 +701,42 @@ tests/test_tools.py::test_tool_history_fold PASSED
   </div>
 </div>
 
-<!-- Deep - Subtask: Running -->
+<!-- Deep - Subagent output stays in the main card -->
 <div class="card-wrapper">
-  <div class="card-label">Deep · 子任务独立卡 · 执行中</div>
+  <div class="card-label">Deep 主流程 · 子代理统一进入主卡</div>
   <div class="feishu-card">
-    <div class="card-header header-orange">
-      <div class="title">🧬 子任务 · 完成独立最终代码审查</div>
-      <div class="subtitle">执行中 · 子卡 #1.e · 来自主卡 #1</div>
+    <div class="card-header header-violet">
+      <div class="title">优化Deep卡片标题</div>
+      <div class="subtitle">执行中 · #1 · 单主卡</div>
     </div>
     <div class="card-body">
-      <div class="panel panel-grey">
-        <div class="panel-header collapsed">
+      <div class="panel panel-indigo">
+        <div class="panel-header">
           <span class="arrow">▼</span>
-          <span class="panel-title"><strong>整体 4/5 · 当前 5/5 最终代码审查</strong></span>
+          <span class="panel-title">📋 <strong>任务进展（实时）</strong></span>
         </div>
-        <div class="panel-content hidden"></div>
+        <div class="panel-content task-list">
+          <div class="task-done">✅ 1. 完成主流程实现</div>
+          <div class="task-current">🧬 完成独立最终代码审查</div>
+        </div>
       </div>
+      <div class="text-content">
+        <strong>🧬 代码审查：</strong>正在检查投递边界与并发终态，输出直接追加到主卡执行流。
+      </div>
+      <div class="panel panel-grey">
+        <div class="panel-header">
+          <span class="arrow">▼</span>
+          <span class="panel-title">⏳ <strong>pytest</strong> — 验证卡片投递回归</span>
+        </div>
+        <div class="panel-content">
+          <div class="code-block">uv run pytest tests/test_card_delivery_engine.py -q</div>
+        </div>
+      </div>
+      <div class="notation">一个用户任务只维护一张主卡；仅在达到飞书卡片容量上限时创建续接卡。</div>
       <hr class="card-hr">
       <div class="card-footer">
-        <div class="footer-status">🔄 执行中</div>
+        <div class="footer-status">🔄 执行中 · 子代理 1 个</div>
         <div class="footer-meta">🔧 codex · 🧩 gpt-5 · ⏱ 46 秒</div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Deep - Subtask: Completed -->
-<div class="card-wrapper">
-  <div class="card-label">Deep · 子任务独立卡 · 已完成</div>
-  <div class="feishu-card">
-    <div class="card-header header-green">
-      <div class="title">🧬 子任务 · 完成独立最终代码审查</div>
-      <div class="subtitle">已完成 · 子卡 #1.e · 来自主卡 #1</div>
-    </div>
-    <div class="card-body">
-      <div class="panel panel-grey">
-        <div class="panel-header collapsed">
-          <span class="arrow">▼</span>
-          <span class="panel-title"><strong>整体 5/5 · 当前 5/5 最终代码审查</strong></span>
-        </div>
-        <div class="panel-content hidden"></div>
-      </div>
-      <div class="text-content">独立审查完成，未发现阻塞问题。</div>
-      <hr class="card-hr">
-      <div class="card-footer">
-        <div class="footer-status">✅ 已完成</div>
-        <div class="footer-meta">🔧 codex · 🧩 gpt-5 · ⏱ 2 分钟 18 秒</div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Deep - Subtask: Failed -->
-<div class="card-wrapper">
-  <div class="card-label">Deep · 子任务独立卡 · 执行失败</div>
-  <div class="feishu-card">
-    <div class="card-header header-red">
-      <div class="title">🧬 子任务 · 完成独立最终代码审查</div>
-      <div class="subtitle">执行失败 · 子卡 #1.e · 来自主卡 #1</div>
-    </div>
-    <div class="card-body">
-      <div class="panel panel-grey">
-        <div class="panel-header collapsed">
-          <span class="arrow">▼</span>
-          <span class="panel-title"><strong>整体 4/5 · 当前 5/5 最终代码审查</strong></span>
-        </div>
-        <div class="panel-content hidden"></div>
-      </div>
-      <div class="warning-banner banner-error">审查未完成：执行会话意外中断。</div>
-      <hr class="card-hr">
-      <div class="card-footer">
-        <div class="footer-status">❌ 执行失败</div>
-        <div class="footer-meta">🔧 codex · 🧩 gpt-5 · ⏱ 1 分钟 07 秒</div>
       </div>
     </div>
   </div>

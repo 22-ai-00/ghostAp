@@ -338,6 +338,7 @@ class PageMutator:
                 last_text=last_text,
                 source_page_index=source_page_index,
                 is_streaming=stream_open,
+                supports_element_update=stream_open,
             )
             return MutationOutcome(kind="applied", message=f"created:{message_id}")
         except TransportError as e:

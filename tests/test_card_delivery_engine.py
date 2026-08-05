@@ -165,7 +165,7 @@ class TestCardDeliveryUpdate:
         assert outcomes[0].kind == "applied"
         assert len(client.updates) == 1
 
-    def test_text_only_triggers_element_content(self):
+    def test_non_streaming_message_text_change_uses_full_patch(self):
         client = MockCardClient()
         delivery = CardDelivery(client)
 
@@ -178,8 +178,9 @@ class TestCardDeliveryUpdate:
         outcomes = delivery.deliver("sess_1", "chat_abc", r2)
 
         assert outcomes[0].kind == "applied"
-        assert len(client.elements) == 1
-        assert client.elements[0]["content"] == "hello world"
+        assert len(client.creates) == 1
+        assert len(client.updates) == 1
+        assert client.elements == []
 
     def test_nested_programming_section_uses_element_content_update(self):
         client = MockCardClient()
@@ -789,6 +790,139 @@ class TestTransportError:
         outcomes = delivery.deliver("sess_stale", "chat_abc", rendered_v2)
         assert [outcome.kind for outcome in outcomes] == ["skipped", "skipped"]
         assert [item["card_json"]["page"] for item in client.creates] == [0, 1, 1]
+
+    def test_second_consecutive_stale_stops_creating_replacement_messages(self):
+        client = MockCardClient()
+        delivery = CardDelivery(client)
+        initial = RenderedCard(
+            _card_json={"version": 1},
+            structure_signature="version_1",
+            page_index=0,
+            total_pages=1,
+        )
+        delivery.deliver("sess_stale_storm", "chat_abc", [initial])
+        client._raise_on_update = TransportError(
+            "message not found",
+            code=99992354,
+        )
+
+        first = delivery.deliver(
+            "sess_stale_storm",
+            "chat_abc",
+            [dataclasses.replace(
+                initial,
+                _card_json={"version": 2},
+                structure_signature="version_2",
+            )],
+        )
+        second = delivery.deliver(
+            "sess_stale_storm",
+            "chat_abc",
+            [dataclasses.replace(
+                initial,
+                _card_json={"version": 3},
+                structure_signature="version_3",
+            )],
+        )
+
+        assert [outcome.kind for outcome in first] == ["applied"]
+        assert [outcome.kind for outcome in second] == ["reconcile"]
+        assert second[0].message == "stale_replacement_exhausted:99992354"
+        assert len(client.creates) == 2
+
+    def test_terminal_streaming_replacement_stale_is_bounded(self):
+        client = MockCardClient()
+        delivery = CardDelivery(client)
+        running = RenderedCard(
+            _card_json={"config": {"streaming_mode": True}, "version": 1},
+            structure_signature="streaming_1",
+            page_index=0,
+            total_pages=1,
+        )
+        delivery.deliver("sess_terminal_stale", "chat_abc", [running])
+        client._raise_on_update = TransportError(
+            "card entity not found",
+            code=99992354,
+        )
+        terminal = dataclasses.replace(
+            running,
+            _card_json={"config": {"streaming_mode": True}, "version": 2},
+            structure_signature="streaming_2",
+        )
+
+        first = delivery.deliver(
+            "sess_terminal_stale",
+            "chat_abc",
+            [terminal],
+            is_terminal=True,
+        )
+        second = delivery.deliver(
+            "sess_terminal_stale",
+            "chat_abc",
+            [terminal],
+            is_terminal=True,
+        )
+
+        assert first == [
+            MutationOutcomeType(
+                kind="reconcile",
+                message="stale_replacement_exhausted:99992354",
+            )
+        ]
+        assert second == first
+        assert len(client.card_references) == 2
+
+    def test_stale_replacement_lineage_resets_after_page_growth(self):
+        client = MockCardClient()
+        delivery = CardDelivery(client)
+        initial = RenderedCard(
+            _card_json={"content": "initial"},
+            structure_signature="initial",
+            page_index=0,
+            total_pages=1,
+        )
+        delivery.deliver("sess_stale_lineage", "chat_abc", [initial])
+        client._raise_on_update = TransportError(
+            "message not found",
+            code=99992354,
+        )
+        page_zero = dataclasses.replace(
+            initial,
+            _card_json={"content": "replacement"},
+            structure_signature="replacement",
+        )
+        delivery.deliver("sess_stale_lineage", "chat_abc", [page_zero])
+
+        client._raise_on_update = None
+        page_one = RenderedCard(
+            _card_json={"content": "new live page"},
+            structure_signature="new_live_page",
+            page_index=1,
+            total_pages=2,
+        )
+        delivery.deliver(
+            "sess_stale_lineage",
+            "chat_abc",
+            [dataclasses.replace(page_zero, total_pages=2), page_one],
+        )
+
+        client._raise_on_update = TransportError(
+            "new live page became stale",
+            code=99992354,
+        )
+        compact = dataclasses.replace(
+            initial,
+            _card_json={"content": "compacted result"},
+            structure_signature="compacted_result",
+        )
+        outcome = delivery.deliver(
+            "sess_stale_lineage",
+            "chat_abc",
+            [compact],
+        )
+
+        assert [item.kind for item in outcome] == ["applied"]
+        assert len(client.creates) == 4
 
     def test_stale_compacted_latest_appends_replacement_without_history_waterfall(
         self, caplog

@@ -19,6 +19,7 @@ from src.config import get_settings
 logger = logging.getLogger(__name__)
 
 _DEFAULT_API_TIMEOUT_SECONDS = 35.0
+_UPDATE_NAMESPACE = _uuid.UUID("7a988460-9101-492a-bdb6-98b8d27f998d")
 
 
 def _sanitize_card_content(content: str) -> str:
@@ -41,9 +42,8 @@ class FeishuCardAPIClient:
 
     Maps the abstract card operations to concrete Feishu IM APIs:
     - create_card → im.v1.message.reply / im.v1.message.create
-    - update_card → im.v1.message.patch
-    - update_element → im.v1.message.patch (full card rebuild;
-      can be upgraded to cardkit/v2/elements API later)
+    - update_card → IM patch for message cards, CardKit update for entities
+    - update_element → CardKit element content update
 
     Note: In Feishu's API, card_id == message_id for interactive messages.
     The `create_card` returns (message_id, message_id) since there's no
@@ -68,6 +68,7 @@ class FeishuCardAPIClient:
         self._tenant_key_resolver = tenant_key_resolver
         self._outbound_target_aliases = outbound_target_aliases
         self._audit_aliases_by_message: dict[str, tuple[str, ...]] = {}
+        self._cardkit_entity_ids: set[str] = set()
         self._audit_alias_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
     def _audit_outbound(self, operation: str, target: str) -> tuple[str, ...]:
@@ -243,11 +244,18 @@ class FeishuCardAPIClient:
         return message_id, message_id
 
     def update_card(self, card_id: str, card_json: dict, *, sequence: int = 0) -> None:
-        """Update (PATCH) a card by card_id (== message_id).
+        """Replace a card through the API matching its transport identity.
 
-        Uses im.v1.message.patch to replace the entire card content.
+        IM interactive cards use ``message.patch``. CardKit entities learned
+        during entity creation/reference use ``card.update``.
         Sequence conflicts (code 300317) are raised as SequenceConflictError.
         """
+        with self._audit_alias_lock:
+            is_cardkit_entity = card_id in self._cardkit_entity_ids
+        if is_cardkit_entity:
+            self._update_cardkit_entity(card_id, card_json, sequence=sequence)
+            return
+
         from lark_oapi.api.im.v1 import PatchMessageRequest, PatchMessageRequestBody
 
         content = _sanitize_card_content(json.dumps(card_json, ensure_ascii=False))
@@ -274,6 +282,52 @@ class FeishuCardAPIClient:
                 raise SequenceConflictError(next_floor=sequence + 1)
             raise TransportError(
                 f"Patch failed: code={response.code}, msg={response.msg}, card_id={card_id}",
+                code=response.code,
+            )
+
+    def _update_cardkit_entity(
+        self,
+        card_id: str,
+        card_json: dict,
+        *,
+        sequence: int,
+    ) -> None:
+        from lark_oapi.api.cardkit.v1 import (
+            Card,
+            UpdateCardRequest,
+            UpdateCardRequestBody,
+        )
+
+        entity = (
+            Card.builder()
+            .type("card_json")
+            .data(_sanitize_card_content(json.dumps(card_json, ensure_ascii=False)))
+            .build()
+        )
+        request = (
+            UpdateCardRequest.builder()
+            .card_id(card_id)
+            .request_body(
+                UpdateCardRequestBody.builder()
+                .card(entity)
+                .uuid(str(_uuid.uuid5(_UPDATE_NAMESPACE, f"{card_id}:{sequence}")))
+                .sequence(sequence)
+                .build()
+            )
+            .build()
+        )
+
+        self._audit_outbound("patch", card_id)
+        response = self._call_api(
+            "cardkit.card.update",
+            lambda: self._client.cardkit.v1.card.update(request),
+        )
+        if not response.success():
+            if response.code == 300317:
+                raise SequenceConflictError(next_floor=sequence + 1)
+            raise TransportError(
+                f"CardKit update failed: code={response.code}, msg={response.msg}, "
+                f"card_id={card_id}",
                 code=response.code,
             )
 
@@ -350,7 +404,10 @@ class FeishuCardAPIClient:
                 f"Streaming card create failed: code={response.code}, msg={response.msg}"
             )
 
-        return response.data.card_id
+        card_id = response.data.card_id
+        with self._audit_alias_lock:
+            self._cardkit_entity_ids.add(card_id)
+        return card_id
 
     def send_card_reference(
         self,
@@ -426,4 +483,6 @@ class FeishuCardAPIClient:
         # separate message id.  Both targets represent the same recipient scope
         # and must survive provenance lookup failures after the initial send.
         self._remember_message_audit_aliases(card_id, audit_aliases)
+        with self._audit_alias_lock:
+            self._cardkit_entity_ids.add(card_id)
         return message_id
