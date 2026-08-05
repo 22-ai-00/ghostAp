@@ -167,7 +167,6 @@ def test_help_card_omits_quick_action_buttons():
         if button.get("value", {}).get("action")
         in {
             "enter_deep_prompt",
-            "show_worktree_menu",
             "show_acp_menu",
             "show_ttadk_menu",
             "show_status",

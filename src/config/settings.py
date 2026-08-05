@@ -446,11 +446,8 @@ class Settings(BaseSettings):
             pass_streak_required=self.spec_review_pass_streak_required,
         )
 
-    # Worktree dispatcher pool-level timeout (seconds)
-    worktree_pool_timeout: int = 600
-
     # Streaming card collapsible panels (tool calls / thoughts folded by default)
-    # Engine card collapsible panels (Deep/Spec/Worktree: structured content with collapsible panels)
+    # Engine card collapsible panels (Deep/Spec: structured content with collapsible panels)
     engine_collapsible_enabled: bool = True
 
     # Streaming card auto-continuation (create new card when content exceeds threshold)

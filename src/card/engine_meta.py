@@ -11,21 +11,18 @@ from __future__ import annotations
 ENGINE_CMD_MAP: dict[str, str] = {
     "deep": "/deep",
     "spec": "/spec",
-    "worktree": "/wt",
 }
 
 # Engine type → user-facing display name
 ENGINE_NAME_MAP: dict[str, str] = {
     "deep": "Deep",
     "spec": "Spec",
-    "worktree": "Worktree",
 }
 
 # Engine type → restart button label (with emoji prefix)
 ENGINE_LABELS: dict[str, str] = {
     "deep": "🔄 重新开始 /deep",
     "spec": "🔄 重新开始 /spec",
-    "worktree": "🔄 重新开始 /wt",
 }
 
 # Default fallback label when engine_type is unknown

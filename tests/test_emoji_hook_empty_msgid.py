@@ -1,7 +1,7 @@
 """Tests for EmojiHook behavior when message_id is empty.
 
 Validates that EmojiHook gracefully skips add_reaction calls when
-message_id is falsy (degraded mode for worktree without reply_to).
+message_id is falsy (degraded delivery mode without reply_to).
 """
 
 import unittest

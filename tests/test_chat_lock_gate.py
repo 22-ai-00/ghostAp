@@ -79,13 +79,13 @@ class TestCheckMessage(unittest.TestCase):
         assert gate.check("chat", "user", "msg") is True
         host._reply_text.assert_called_once()
 
-    def test_blocked_wt_goal_with_tab_still_sends_visible_intercept_feedback(self):
+    def test_blocked_spec_goal_with_tab_still_sends_visible_intercept_feedback(self):
         clm = MagicMock()
         clm.should_block.return_value = True
         handler = MagicMock()
         gate, _ = _make_gate(clm=clm, handler=handler)
 
-        m = SlashCommandParser.parse("/wt\t实现登录功能")
+        m = SlashCommandParser.parse("/spec\t实现登录功能")
         assert m is not None
         assert gate.check("chat", "user", "msg", command_match=m) is True
         handler.send_chat_lock_intercept_card.assert_called_once_with("msg", "chat", clm)
@@ -98,10 +98,10 @@ class TestCheckMessage(unittest.TestCase):
         gate, _ = _make_gate(clm=clm, handler=handler)
 
         m = CommandMatch(
-            raw_text="/wt",
-            normalized_text="/wt",
-            raw_command="/wt",
-            command="/worktree",
+            raw_text="/spec",
+            normalized_text="/spec",
+            raw_command="/spec",
+            command="/spec",
             args="",
             has_args=False,
         )

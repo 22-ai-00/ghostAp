@@ -14,7 +14,6 @@ from .lifecycle import _compute_duration
 _RETRY_ACTIONS: dict[str, str] = {
     "deep": ButtonIntent.DEEP_RESUME,
     "spec": ButtonIntent.SPEC_RESUME,
-    "worktree": ButtonIntent.WORKTREE_RETRY_FAILED,
 }
 
 

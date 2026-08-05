@@ -263,25 +263,6 @@ def register_programming_mode_actions(client: 'FeishuWSClient') -> None:
         exact=action_ids.SHOW_TUI2ACP_MENU,
     )
 
-    # Worktree
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_command(
-            mid, cid, _resolve_project(client, pid, cid), True
-        ),
-        exact=action_ids.SHOW_WORKTREE_MENU,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_finish_worktree_selection(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_FINISH_SELECTION,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_select_tool(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_SELECT_TOOL,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_select_model(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_SELECT_MODEL,
-    )
     client._register_action(
         lambda mid, cid, pid, val: client._handle_spec_review_use_auto(mid, cid, pid, val),
         exact=action_ids.SPEC_REVIEW_USE_AUTO,
@@ -310,43 +291,6 @@ def register_programming_mode_actions(client: 'FeishuWSClient') -> None:
         lambda mid, cid, pid, val: client._handle_spec_review_menu(mid, cid, pid, val),
         exact=action_ids.SHOW_SPEC_REVIEW_MENU,
     )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_remove_item(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_REMOVE_ITEM,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_clear_items(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_CLEAR_ITEMS,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_confirm_start(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_CONFIRM_START,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_merge(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_MERGE,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_show_worktree_merge_entry(mid, cid, pid, val),
-        exact=action_ids.SHOW_WORKTREE_MERGE_ENTRY,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_cleanup(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_CLEANUP,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_execute_action(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_EXECUTE_ACTION,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_retry_failed(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_RETRY_FAILED,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_worktree_retry_all(mid, cid, pid, val),
-        exact=action_ids.WORKTREE_RETRY_ALL,
-    )
-
     # Workflow
     client._register_action(
         lambda mid, cid, pid, val: client._handle_show_workflow_menu(mid, cid, pid, val),

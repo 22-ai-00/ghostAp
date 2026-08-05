@@ -311,8 +311,8 @@ def fetch_acp_models(
 
     For Coco, prefer the cached list maintained by ``CocoModelManager`` (the
     same source ``show_coco_status`` and the agent session bootstrap rely on).
-    A successful probe there is cached for 5 minutes, so subsequent /wt and
-    /model clicks reuse the real ACP model list instead of degrading to the
+    A successful probe there is cached for 5 minutes, so subsequent model
+    selectors reuse the real ACP model list instead of degrading to the
     6-entry static ``DEFAULT_MODELS`` fallback.
 
     For non-Coco tools the live probe is guarded by three layers (positive
@@ -456,7 +456,7 @@ def _coco_models_from_manager(current_model: Optional[str]) -> list[ACPModelOpti
     """Read Coco models from ``CocoModelManager`` (cache + ACP probe + static).
 
     Returns the same list ``/coco_status`` and the agent bootstrap rely on,
-    so the worktree model card stays in sync with the rest of the system.
+    so model selection cards stay in sync with the rest of the system.
     Returns an empty list when CocoModelManager has not yet populated and
     the caller should still attempt a fresh probe.
     """

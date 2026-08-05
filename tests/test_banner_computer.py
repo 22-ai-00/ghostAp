@@ -36,12 +36,6 @@ def test_banner_spec_cycle_perspective():
     assert compute_banner(md, rs) == "📐 Spec · cycle 2/code · 8m4s"
 
 
-def test_banner_worktree_subagent():
-    md = CardMetadata(mode_name="Worktree", mode_emoji="🌲", engine_type="worktree")
-    rs = RuntimeStats(elapsed_seconds=138.0, worktree_subagent="aiden")
-    assert compute_banner(md, rs) == "🌲 Worktree · wt·aiden · 2m18s"
-
-
 def test_banner_omits_plain_programming_context():
     md = CardMetadata(mode_name=None, mode_emoji=None, engine_type=None)  # type: ignore[arg-type]
     rs = RuntimeStats(elapsed_seconds=5.0)

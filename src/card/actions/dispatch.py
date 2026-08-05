@@ -1,8 +1,8 @@
 """Action dispatch: centralized action_id constants + action registries.
 
 All action_id strings used in reducers, handlers, and action registries
-are defined here. Registry factories (e.g. build_worktree_action_registry)
-map action_ids to CardEvent constructors for CardSession injection.
+are defined here. Registry factories map action_ids to CardEvent constructors
+for CardSession injection.
 """
 from __future__ import annotations
 
@@ -47,24 +47,6 @@ MODE_FULL = "mode_full"  # Switch card to full (detailed) view mode
 MODE_COMPACT = "mode_compact"  # Switch card to compact (minimal) view mode
 
 # ---------------------------------------------------------------------------
-# Worktree actions
-# ---------------------------------------------------------------------------
-WORKTREE_FINISH_SELECTION = "worktree_finish_selection"  # Confirm tool selection and proceed to config
-WORKTREE_CONFIRM_START = "worktree_confirm_start"  # Confirm config and start parallel execution
-WORKTREE_MERGE = "worktree_merge"  # Trigger merge of all worktree branches into base
-WORKTREE_CLEANUP = "worktree_cleanup"  # Delete worktree branches and local refs (irreversible)
-WORKTREE_RETRY_FAILED = "worktree_retry_failed"  # Retry only failed execution units
-WORKTREE_RETRY_ALL = "worktree_retry_all"  # Retry all execution units from scratch
-WORKTREE_CANCEL = "worktree_cancel"  # Cancel worktree flow before execution starts
-WORKTREE_SELECT_TOOL = "worktree_select_tool"  # Toggle selection of a specific tool in the tool list
-WORKTREE_SELECT_MODEL = "worktree_select_model"  # Select a model for the chosen tool
-WORKTREE_REMOVE_ITEM = "worktree_remove_item"  # Remove a single item from the selected list
-WORKTREE_CLEAR_ITEMS = "worktree_clear_items"  # Clear all selected items and restart selection
-WORKTREE_EXECUTE_ACTION = "worktree_execute_action"  # Trigger execution of ready units
-SHOW_WORKTREE_MENU = "show_worktree_menu"  # Return to tool selection menu
-SHOW_WORKTREE_MERGE_ENTRY = "show_worktree_merge_entry"  # Show merge entry card with branch details
-
-# ---------------------------------------------------------------------------
 # Workflow actions
 # ---------------------------------------------------------------------------
 # Design decision: Workflow card interactions are handled directly by the
@@ -72,7 +54,7 @@ SHOW_WORKTREE_MERGE_ENTRY = "show_worktree_merge_entry"  # Show merge entry card
 # CardSession event pipeline. This is intentional — Workflow's confirmation
 # and tool selection cards are built and updated by the handler layer without
 # a build_workflow_action_registry() factory. The rationale is that Workflow's
-# execution model (isolated JS runtime + bridge) differs from Worktree/Spec's
+# execution model (isolated JS runtime + bridge) differs from Spec's
 # CardSession-driven lifecycle, and adding a registry would require a
 # CardSession instance that doesn't naturally fit the workflow's fire-and-forget
 # execution pattern.
@@ -193,19 +175,4 @@ def build_common_action_registry() -> dict[str, Callable[[dict], CardEvent]]:
         MODE_FULL: lambda p: CardEvent.mode_toggled(compact=False),
         MODE_COMPACT: lambda p: CardEvent.mode_toggled(compact=True),
         ENGINE_STOP: lambda p: CardEvent(type=CardEventType.STOPPING),
-    }
-
-
-def build_worktree_action_registry() -> dict[str, Callable[[dict], CardEvent]]:
-    """Build the worktree-specific action_id → CardEvent factory registry."""
-    return {
-        **build_common_action_registry(),
-        WORKTREE_FINISH_SELECTION: lambda p: CardEvent(type=CardEventType.WORKTREE_CONFIRM, payload=p),
-        WORKTREE_CONFIRM_START: lambda p: CardEvent(type=CardEventType.STARTED, payload=p),
-        WORKTREE_MERGE: lambda p: CardEvent(type=CardEventType.WORKTREE_MERGE, payload=p),
-        WORKTREE_CLEANUP: lambda p: CardEvent(type=CardEventType.WORKTREE_CLEANUP, payload=p),
-        WORKTREE_RETRY_FAILED: lambda p: CardEvent(type=CardEventType.WORKTREE_PROGRESS, payload=p),
-        WORKTREE_RETRY_ALL: lambda p: CardEvent(type=CardEventType.WORKTREE_PROGRESS, payload=p),
-        SHOW_WORKTREE_MENU: lambda p: CardEvent(type=CardEventType.WORKTREE_TOOL_SELECT, payload=p),
-        WORKTREE_CANCEL: lambda p: CardEvent(type=CardEventType.CANCELLED, payload={"reason": "user_cancel"}),
     }

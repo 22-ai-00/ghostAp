@@ -143,8 +143,8 @@ def test_fetch_coco_models_timeout_uses_static_defaults(monkeypatch):
 
 def test_fetch_coco_models_uses_manager_cache_when_real_models_present(monkeypatch):
     """When CocoModelManager already cached real ACP models, fetch_acp_models
-    must return those (and skip the fresh probe) so /wt and /coco share the
-    same model list source — exactly what the user asked for."""
+    must return those (and skip the fresh probe) so selectors share the same
+    model list source."""
 
     real_models = ["GPT-5.2", "GPT-5.4", "Gemini-3.1-Pro-Preview", "Test-O-New"]
 

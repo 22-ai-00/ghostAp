@@ -27,7 +27,6 @@ class TestRenderFallbackCard:
     @pytest.mark.parametrize("engine_type,expected_cmd", [
         ("deep", "/deep"),
         ("spec", "/spec"),
-        ("worktree", "/wt"),
     ])
     def test_engine_specific_command_in_warning(self, engine_type, expected_cmd):
         """Fallback card includes the correct engine command in warning text."""

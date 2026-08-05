@@ -201,8 +201,8 @@ class TTLActuator(Protocol):
 class RendererProtocol(Protocol):
     """Protocol for engine renderer instances used by BaseEngineHandler.
 
-    Defines the minimal interface that DeepRenderer,
-    SpecRenderer, and WorktreeRenderer must implement to be used
+    Defines the minimal interface that DeepRenderer and SpecRenderer implement
+    to be used
     from handler toggle/error-handling methods.
     """
 

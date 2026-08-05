@@ -91,7 +91,6 @@ class TestTTLStreamingInterruption:
 
     @pytest.mark.parametrize("engine_type,engine_cmd", [
         ("deep", "/deep"),
-        ("worktree", "/worktree"),
         ("spec", "/spec"),
     ])
     def test_ttl_expires_during_streaming_dispatches_cancel(self, engine_type, engine_cmd):
@@ -128,7 +127,7 @@ class TestTTLStreamingInterruption:
         state = session2.state
         assert state.terminal == "cancelled"
 
-    @pytest.mark.parametrize("engine_type", ["deep", "worktree", "spec"])
+    @pytest.mark.parametrize("engine_type", ["deep", "spec"])
     def test_ttl_handler_expired_callback_mid_streaming(self, engine_type):
         """TTLHandler.on_ttl_expired works correctly regardless of engine type."""
         s = _make_ttl_mock()
@@ -155,7 +154,7 @@ class TestTTLStreamingInterruption:
 class TestCancellationPaths:
     """Cancellation dispatches correctly for all engine types."""
 
-    @pytest.mark.parametrize("engine_type", ["deep", "worktree", "spec"])
+    @pytest.mark.parametrize("engine_type", ["deep", "spec"])
     def test_cancel_during_running_transitions_to_cancelled(self, engine_type):
         """CANCELLED event transitions running session to cancelled terminal state."""
         session, client = _make_session(engine_type=engine_type)
@@ -168,7 +167,7 @@ class TestCancellationPaths:
         assert state.terminal == "cancelled"
         assert session.closed is True
 
-    @pytest.mark.parametrize("engine_type", ["deep", "worktree", "spec"])
+    @pytest.mark.parametrize("engine_type", ["deep", "spec"])
     def test_cancel_with_ttl_expired_reason(self, engine_type):
         """CANCELLED with reason='ttl_expired' sets terminal_reason correctly."""
         session, client = _make_session(engine_type=engine_type)
@@ -180,7 +179,7 @@ class TestCancellationPaths:
         assert state.terminal == "cancelled"
         assert state.terminal_reason == "ttl_expired"
 
-    @pytest.mark.parametrize("engine_type", ["deep", "worktree", "spec"])
+    @pytest.mark.parametrize("engine_type", ["deep", "spec"])
     def test_cancel_after_close_is_noop(self, engine_type):
         """Dispatching CANCELLED after session.close() is a no-op."""
         session, client = _make_session(engine_type=engine_type)

@@ -712,7 +712,7 @@ class BaseHandler:
             return True
 
         # Common extraction for UI state actions
-        # Note: 'deep_project_id' is the convention used in card buttons for Deep/Spec/Worktree engines
+        # Note: 'deep_project_id' is the convention used in card buttons for Deep/Spec engines
         engine_project_id = ctx.value.get("deep_project_id", "")
 
         # 2. Log expansion

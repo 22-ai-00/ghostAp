@@ -12,7 +12,6 @@ from src.feishu.route_decision import RouteTarget
 @pytest.fixture
 def dispatcher():
     client = MagicMock()
-    client._is_worktree_awaiting_goal.return_value = False
     client._slock_engine_manager = None
     return MessageDispatcher(client)
 
@@ -67,15 +66,3 @@ class TestResolveCommandRoute:
         ctx = RequestContext(message_id="m1", chat_id="c1", text="hello world")
         decision = dispatcher.resolve_command_route(ctx)
         assert decision is None
-
-    def test_worktree_awaiting_goal(self, dispatcher):
-        project = MagicMock()
-        project.project_id = "p1"
-        dispatcher.client._is_worktree_awaiting_goal.return_value = True
-        ctx = RequestContext(
-            message_id="m1", chat_id="c1", text="implement auth",
-            project=project,
-        )
-        decision = dispatcher.resolve_command_route(ctx)
-        assert decision is not None
-        assert decision.target == RouteTarget.WORKTREE_GOAL

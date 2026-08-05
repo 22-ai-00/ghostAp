@@ -103,20 +103,6 @@ FORWARDING_MAP: dict[str, tuple[str, str]] = {
     "_handle_select_tui2acp_adapter": ("system", "handle_select_tui2acp_adapter"),
     "_handle_select_tui2acp_custom_command": ("system", "handle_select_tui2acp_custom_command"),
     "_handle_ttadk_command": ("system", "handle_ttadk_command"),
-    "_handle_worktree_command": ("worktree", "handle_worktree_command"),
-    "_handle_worktree_execute": ("worktree", "handle_worktree_execute"),
-    "_handle_finish_worktree_selection": ("worktree", "handle_finish_worktree_selection"),
-    "_handle_worktree_select_tool": ("worktree", "handle_worktree_select_tool"),
-    "_handle_worktree_select_model": ("worktree", "handle_worktree_select_model"),
-    "_handle_worktree_remove_item": ("worktree", "handle_worktree_remove_item"),
-    "_handle_worktree_clear_items": ("worktree", "handle_worktree_clear_items"),
-    "_handle_worktree_confirm_start": ("worktree", "handle_worktree_confirm_start"),
-    "_handle_worktree_execute_action": ("worktree", "handle_worktree_execute_action"),
-    "_handle_worktree_merge": ("worktree", "handle_worktree_merge"),
-    "_handle_show_worktree_merge_entry": ("worktree", "handle_show_worktree_merge_entry"),
-    "_handle_worktree_cleanup": ("worktree", "handle_worktree_cleanup"),
-    "_handle_worktree_retry_failed": ("worktree", "handle_worktree_retry_failed"),
-    "_handle_worktree_retry_all": ("worktree", "handle_worktree_retry_all"),
     "_handle_select_ttadk_tool": ("system", "handle_select_ttadk_tool"),
     "_handle_select_ttadk_model": ("system", "handle_select_ttadk_model"),
     "_handle_refresh_ttadk_models": ("system", "handle_refresh_ttadk_models"),
@@ -249,7 +235,6 @@ def _handler_classes() -> dict[str, type]:
     from .handlers.spec import SpecHandler
     from .handlers.system import SystemHandler
     from .handlers.workflow import WorkflowHandler
-    from .handlers.worktree import WorktreeHandler
 
     return {
         "coco": CocoModeHandler,
@@ -261,7 +246,6 @@ def _handler_classes() -> dict[str, type]:
         "ttadk": TTADKModeHandler,
         "tui2acp": Tui2acpModeHandler,
         "system": SystemHandler,
-        "worktree": WorktreeHandler,
         "deep": DeepHandler,
         "spec": SpecHandler,
         "slock": SlockHandler,

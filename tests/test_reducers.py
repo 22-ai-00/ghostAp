@@ -258,7 +258,7 @@ class TestReduceLifecycle:
         state = _base_state(metadata=meta)
         event = CardEvent.failed("error")
         new = reduce_lifecycle(state, event)
-        assert not any(b.action_id in (ButtonIntent.DEEP_RESUME, ButtonIntent.SPEC_RESUME, ButtonIntent.WORKTREE_RETRY_FAILED) for b in new.buttons)
+        assert not any(b.action_id in (ButtonIntent.DEEP_RESUME, ButtonIntent.SPEC_RESUME) for b in new.buttons)
         assert any(b.action_id == ButtonIntent.SHOW_STATUS for b in new.buttons)
 
     def test_cancelled_clears_buttons(self):
@@ -307,7 +307,6 @@ class TestLifecycleStopButtons:
     @pytest.mark.parametrize("engine_type,expected_action", [
         ("deep", ButtonIntent.ENGINE_STOP),
         ("spec", ButtonIntent.ENGINE_STOP),
-        ("worktree", ButtonIntent.WORKTREE_CANCEL),
     ])
     def test_started_injects_stop_button(self, engine_type, expected_action):
         state = _base_state(metadata=CardMetadata(engine_type=engine_type))
@@ -397,7 +396,7 @@ class TestTextDeltaAutoCreate:
 class TestContentBlockFactory:
     """ContentBlock() factory creates correct subclass for each kind."""
 
-    @pytest.mark.parametrize("kind", ["text", "tool_call", "phase", "worktree_units"])
+    @pytest.mark.parametrize("kind", ["text", "tool_call", "phase"])
     def test_factory_creates_correct_kind(self, kind):
         block = ContentBlock(kind=kind, block_id="test_1")
         assert block.kind == kind
@@ -410,98 +409,6 @@ class TestContentBlockFactory:
         block = ContentBlock(kind="tool_call", block_id="t1", tool_name="read_file")
         assert block.kind == "tool_call"
         assert block.tool_name == "read_file"
-
-
-# ==============================================================================
-# reduce_worktree tests
-# ==============================================================================
-
-
-class TestReduceWorktree:
-    @pytest.fixture
-    def wt_state(self):
-        return _base_state(metadata=CardMetadata(engine_type="worktree"))
-
-    def test_tool_select_sets_block_no_reducer_buttons(self, wt_state):
-        from src.card.state.reducers.worktree import reduce_worktree
-        event = CardEvent(type=CardEventType.WORKTREE_TOOL_SELECT, payload={
-            "tools": [{"name": "coco"}, {"name": "claude"}],
-            "selected": ["coco"], "message": "请选择工具",
-        })
-        new = reduce_worktree(wt_state, event)
-        assert len(new.blocks) == 1
-        assert new.blocks[0].kind == "worktree_tool_select"
-        assert new.blocks[0].data["selected"] == ["coco"]
-        assert new.buttons == ()
-
-    def test_confirm_sets_block_and_action_buttons(self, wt_state):
-        from src.card.state.reducers.worktree import reduce_worktree
-        event = CardEvent(type=CardEventType.WORKTREE_CONFIRM, payload={
-            "selected_items": [{"tool": "coco", "model": "gpt-4o"}],
-            "goal": "Build feature X", "message": "确认配置",
-        })
-        new = reduce_worktree(wt_state, event)
-        assert new.blocks[0].kind == "worktree_confirm"
-        assert len(new.buttons) == 2
-        action_ids = [b.action_id for b in new.buttons]
-        assert ButtonIntent.WORKTREE_SHOW_MENU in action_ids
-        assert ButtonIntent.WORKTREE_CANCEL in action_ids
-
-    @pytest.mark.parametrize("units,expected_pct,has_retry", [
-        ([{"name": "A", "status": "running"}], 0, False),
-        ([{"name": "A", "status": "completed"}, {"name": "B", "status": "failed"}], 50, True),
-        ([{"name": "A", "status": "completed"}, {"name": "B", "status": "completed"}], 100, True),
-    ])
-    def test_progress_buttons_and_pct(self, wt_state, units, expected_pct, has_retry):
-        from src.card.state.reducers.worktree import reduce_worktree
-        event = CardEvent(type=CardEventType.WORKTREE_PROGRESS, payload={"units": units, "message": "progress"})
-        new = reduce_worktree(wt_state, event)
-        assert new.blocks[0].kind == "worktree_units"
-        assert new.footer.progress_pct == expected_pct
-        has_retry_btn = any(
-            b.action_id in (ButtonIntent.WORKTREE_RETRY_FAILED, ButtonIntent.WORKTREE_RETRY_ALL)
-            for b in new.buttons
-        )
-        assert has_retry_btn == has_retry
-
-    def test_merge_sets_block_and_merge_button(self, wt_state):
-        from src.card.state.reducers.worktree import reduce_worktree
-        event = CardEvent(type=CardEventType.WORKTREE_MERGE, payload={
-            "merge_notes": [{"branch": "feat/a", "status": "ready"}], "base_branch": "main",
-        })
-        new = reduce_worktree(wt_state, event)
-        assert new.blocks[0].kind == "worktree_merge"
-        assert any(b.action_id == ButtonIntent.WORKTREE_MERGE for b in new.buttons)
-
-    def test_cleanup_summary_and_actions_phases(self, wt_state):
-        from src.card.state.reducers.worktree import reduce_worktree
-
-        base_payload = {
-            "merge_notes": [{"branch": "feat/a", "status": "merged"}],
-            "base_branch": "main",
-            "merge_results": [{"branch": "feat/a", "success": True}],
-        }
-
-        # Summary phase
-        event_summary = CardEvent(type=CardEventType.WORKTREE_CLEANUP, payload={**base_payload, "cleanup_phase": "summary"})
-        new_summary = reduce_worktree(wt_state, event_summary)
-        assert new_summary.blocks[0].kind == "worktree_cleanup"
-        action_ids = [b.action_id for b in new_summary.buttons]
-        assert ButtonIntent.WORKTREE_MERGE in action_ids
-        assert ButtonIntent.WORKTREE_CANCEL in action_ids
-
-        # Actions phase
-        event_actions = CardEvent(type=CardEventType.WORKTREE_CLEANUP, payload={**base_payload, "cleanup_phase": "actions"})
-        new_actions = reduce_worktree(wt_state, event_actions)
-        action_ids = [b.action_id for b in new_actions.buttons]
-        assert ButtonIntent.WORKTREE_CLEANUP in action_ids
-        cleanup_btn = next(b for b in new_actions.buttons if b.action_id == ButtonIntent.WORKTREE_CLEANUP)
-        assert cleanup_btn.type == "danger"
-
-    def test_unrelated_event_returns_unchanged(self, wt_state):
-        from src.card.state.reducers.worktree import reduce_worktree
-        event = CardEvent(type=CardEventType.STARTED)
-        assert reduce_worktree(wt_state, event) is wt_state
 
 
 # ==============================================================================

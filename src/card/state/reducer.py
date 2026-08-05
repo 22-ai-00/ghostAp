@@ -23,7 +23,6 @@ from .reducers.spec_artifacts import reduce_spec_artifacts
 from .reducers.task_list import reduce_task_list
 from .reducers.text import reduce_text
 from .reducers.tool import reduce_tool
-from .reducers.worktree import reduce_worktree
 from .runtime_stats import RuntimeStats
 
 logger = logging.getLogger(__name__)
@@ -89,7 +88,7 @@ def _reduce_progress_updated(state: CardState, event: CardEvent) -> CardState:
         started_at = timestamp
 
     # Spec engine uses text-only progress (criteria satisfaction semantics)
-    # Deep/Worktree engines use visual ▰▱ progress bar (tool execution semantics)
+    # Other engines use visual ▰▱ progress bar (tool execution semantics)
     engine_type = state.metadata.engine_type
     use_visual_bar = engine_type not in ("spec",)
 
@@ -179,13 +178,6 @@ _REDUCER_DISPATCH: dict[CardEventType, Callable[[CardState, CardEvent], CardStat
     CardEventType.CRITERIA_UPDATED: reduce_criteria,
     CardEventType.WARNING_UPDATED: reduce_criteria,
     CardEventType.REVIEW_RETRY: reduce_criteria,
-    # Worktree events
-    CardEventType.WORKTREE_PROGRESS: reduce_worktree,
-    CardEventType.WORKTREE_TOOL_SELECT: reduce_worktree,
-    CardEventType.WORKTREE_CONFIRM: reduce_worktree,
-    CardEventType.WORKTREE_CLEANUP: reduce_worktree,
-    CardEventType.WORKTREE_MERGE: reduce_worktree,
-    CardEventType.WORKTREE_COMPLETED_NO_CHANGE: reduce_worktree,
     # Meta events (inline handlers)
     CardEventType.TOOL_MODEL_CHANGED: _reduce_tool_model_changed,
     CardEventType.PROGRESS_UPDATED: _reduce_progress_updated,
@@ -227,13 +219,6 @@ _STRUCTURAL_EVENTS = frozenset({
     # NOTE: TOOL_MODEL_CHANGED is conditionally structural — see _is_structural_event().
     # Tool/model/subagents change → structural (header/buttons change);
     # live_ticker_frame-only updates → non-structural (only footer markdown update).
-    # Worktree (all structural — different phases/buttons)
-    CardEventType.WORKTREE_PROGRESS,
-    CardEventType.WORKTREE_TOOL_SELECT,
-    CardEventType.WORKTREE_CONFIRM,
-    CardEventType.WORKTREE_CLEANUP,
-    CardEventType.WORKTREE_MERGE,
-    CardEventType.WORKTREE_COMPLETED_NO_CHANGE,
     # Cycle/phase (header/subtitle change)
     CardEventType.CYCLE_STARTED,
     CardEventType.CYCLE_DONE,
@@ -296,7 +281,6 @@ def _refresh_runtime_stats(state: CardState, event: CardEvent) -> CardState:
     spec_cycle = runtime.spec_cycle
     spec_perspective = runtime.spec_perspective
     deep_phase = runtime.deep_phase
-    worktree_subagent = runtime.worktree_subagent
 
     engine_type = state.metadata.engine_type
     if engine_type == "spec" and state.engine_ext is not None:
@@ -307,20 +291,11 @@ def _refresh_runtime_stats(state: CardState, event: CardEvent) -> CardState:
             spec_perspective = state.engine_ext.phase_info
     elif engine_type == "deep" and state.engine_ext is not None:
         deep_phase = state.engine_ext.phase_info or deep_phase
-    elif engine_type == "worktree":
-        worktree_subagent = (
-            state.metadata.unit_label
-            or state.metadata.unit_id
-            or state.metadata.tool_name
-            or worktree_subagent
-        )
-
     refreshed = RuntimeStats(
         elapsed_seconds=elapsed_seconds,
         deep_phase=deep_phase,
         spec_cycle=spec_cycle,
         spec_perspective=spec_perspective,
-        worktree_subagent=worktree_subagent,
     )
     if refreshed == runtime:
         return state

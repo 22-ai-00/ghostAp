@@ -38,7 +38,7 @@ MAIN_SLASH_COMMAND_BASELINE = frozenset({
     "/deep", "/deep_status", "/deep_update", "/stop_deep", "/spec",
     "/spec_status", "/spec_history", "/spec_metrics", "/spec_config",
     "/spec_export", "/spec_save", "/spec_pause", "/spec_resume",
-    "/spec_guide", "/spec_recover", "/stop_spec", "/worktree", "/wf",
+    "/spec_guide", "/spec_recover", "/stop_spec", "/wf",
     "/wf_status", "/wf_help", "/stop_wf", "/wf_save", "/wf_list",
     "/wf_delete", "/wf_history", "/slock", "/slocks", "/new-team",
     "/new-role", "/hire", "/fire", "/employees", "/history",

@@ -61,7 +61,6 @@ SYSTEM_COMMANDS = frozenset(
         "/unlock",
         "/setadmin",
         "/btw",
-        "/worktree",
     }
 )
 

@@ -125,7 +125,6 @@ class ProjectContext:
     bound_chat_created_at: float = 0.0
     managed_binding_generation: int = 0
 
-    worktree_state: Any = None
     spec_review_selection_state: Any = None
 
     def __post_init__(self):
@@ -138,9 +137,6 @@ class ProjectContext:
         # New code should pass OrderedDict directly (see create_project).
         if isinstance(self.allowed_chat_ids, list):
             self.allowed_chat_ids = OrderedDict(self.allowed_chat_ids)
-        if self.worktree_state is None:
-            from ..worktree_engine.models import WorktreeRuntimeState
-            self.worktree_state = WorktreeRuntimeState()
         if self.spec_review_selection_state is None:
             from ..spec_engine.review_selection import SpecReviewSelectionState
             self.spec_review_selection_state = SpecReviewSelectionState()

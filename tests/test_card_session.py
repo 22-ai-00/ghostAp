@@ -6,13 +6,6 @@ from unittest.mock import MagicMock, patch
 
 from src.card.delivery.engine import CardDelivery, MutationOutcome
 from src.card.events import CardEvent, CardEventType
-from src.card.events.worktree import (
-    worktree_cleanup,
-    worktree_confirm,
-    worktree_merge,
-    worktree_progress,
-    worktree_tool_select,
-)
 from src.card.session import CardSession
 from src.card.session.config import SessionCallbacks, SessionConfig
 from src.card.state.button_intent import ButtonIntent
@@ -1544,91 +1537,6 @@ class TestCancelledRetainsTimeoutText:
 
 
 
-class TestWorktreeStepperRender:
-    """Test worktree stepper subtitles in header state (Task 23)."""
-
-    def test_tool_select_has_stepper_subtitle(self):
-        """WORKTREE_TOOL_SELECT → header subtitle = step title (no hardcoded number)."""
-        from src.card.state.reducer import reduce_card_state
-        from src.card.ui_text import UI_TEXT
-
-        state = reduce_card_state(None, CardEvent.started(), CardMetadata(mode_name="Worktree"))
-        state = reduce_card_state(state, worktree_tool_select(
-            tools=[{"id": "t1", "name": "tool1", "description": "desc"}],
-            selected=["t1"],
-        ), CardMetadata(mode_name="Worktree"))
-
-        assert state.header.subtitle == UI_TEXT["worktree_step_tool_select"]
-        assert "选择工具" in state.header.subtitle
-
-    def test_confirm_has_stepper_subtitle(self):
-        """WORKTREE_CONFIRM → header subtitle = step title."""
-        from src.card.state.reducer import reduce_card_state
-        from src.card.ui_text import UI_TEXT
-
-        state = reduce_card_state(None, CardEvent.started(), CardMetadata(mode_name="Worktree"))
-        state = reduce_card_state(state, worktree_confirm(
-            selected_items=[{"tool": "t1", "model": "m1"}], goal="test"
-        ), CardMetadata(mode_name="Worktree"))
-
-        assert state.header.subtitle == UI_TEXT["worktree_step_confirm"]
-        assert "确认选择" in state.header.subtitle
-
-    def test_confirm_without_goal_has_awaiting_goal_subtitle(self):
-        """WORKTREE_CONFIRM without goal should tell users to send the goal in-topic."""
-        from src.card.state.reducer import reduce_card_state
-        from src.card.ui_text import UI_TEXT
-
-        state = reduce_card_state(None, CardEvent.started(), CardMetadata(mode_name="Worktree"))
-        state = reduce_card_state(state, worktree_confirm(
-            selected_items=[{"tool": "t1", "model": "m1"}], goal=""
-        ), CardMetadata(mode_name="Worktree"))
-
-        assert state.header.subtitle == UI_TEXT["worktree_step_awaiting_goal"]
-        assert state.footer.status_text == UI_TEXT["worktree_footer_awaiting_goal"]
-
-    def test_progress_has_stepper_subtitle(self):
-        """WORKTREE_PROGRESS → header subtitle = step title."""
-        from src.card.state.reducer import reduce_card_state
-        from src.card.ui_text import UI_TEXT
-
-        state = reduce_card_state(None, CardEvent.started(), CardMetadata(mode_name="Worktree"))
-        state = reduce_card_state(state, worktree_progress(
-            units=[{"name": "u1", "status": "running"}]
-        ), CardMetadata(mode_name="Worktree"))
-
-        assert state.header.subtitle == UI_TEXT["worktree_step_units"]
-        assert "执行任务" in state.header.subtitle
-
-    def test_merge_has_stepper_subtitle(self):
-        """WORKTREE_MERGE → header subtitle = step title."""
-        from src.card.state.reducer import reduce_card_state
-        from src.card.ui_text import UI_TEXT
-
-        state = reduce_card_state(None, CardEvent.started(), CardMetadata(mode_name="Worktree"))
-        state = reduce_card_state(state, worktree_merge(
-            merge_notes=[{"branch": "feat-1", "status": "ready", "summary": "ok"}],
-            base_branch="main",
-        ), CardMetadata(mode_name="Worktree"))
-
-        assert state.header.subtitle == UI_TEXT["worktree_step_merge"]
-        assert "集成与清理" in state.header.subtitle
-
-    def test_cleanup_has_stepper_subtitle(self):
-        """WORKTREE_CLEANUP → header subtitle = step title."""
-        from src.card.state.reducer import reduce_card_state
-        from src.card.ui_text import UI_TEXT
-
-        state = reduce_card_state(None, CardEvent.started(), CardMetadata(mode_name="Worktree"))
-        state = reduce_card_state(state, worktree_cleanup(
-            merge_notes=[{"branch": "feat-1", "status": "merged", "summary": "done"}],
-            base_branch="main",
-        ), CardMetadata(mode_name="Worktree"))
-
-        assert state.header.subtitle == UI_TEXT["worktree_step_cleanup"]
-        assert "清理与收尾" in state.header.subtitle
-
-
 class TestAtomRendererRegistry:
     """Test atom renderer registry completeness and fallback (Task 24)."""
 
@@ -2143,21 +2051,6 @@ class TestEngineAwareToast:
         result = session.inbound_action("any_action")
         assert "/deep" in result["toast"]["content"]
 
-    def test_worktree_engine_toast_contains_wt_cmd(self):
-        now = [0.0]
-        client = MockDeliveryClient()
-        delivery = CardDelivery(client)
-        metadata = CardMetadata(mode_name="Worktree", engine_type="worktree")
-        config = SessionConfig(metadata=metadata, clock=lambda: now[0])
-        session = CardSession(
-            chat_id="c1", config=config, delivery=delivery,
-            session_id="toast_wt",
-        )
-        session.dispatch(CardEvent.started())
-        session.dispatch(CardEvent.cancelled())
-        result = session.inbound_action("any_action")
-        assert "/wt" in result["toast"]["content"]
-
     def test_completed_returns_success_toast(self):
         """Completed sessions return a success toast without engine command."""
         now = [0.0]
@@ -2194,27 +2087,6 @@ class TestCancelledInjectsRestartButton:
         state = reduce_card_state(state, CardEvent.cancelled(), CardMetadata())
         assert state.terminal == "cancelled"
         assert state.buttons == ()
-
-
-class TestWorktreeRetryAllButton:
-    """All-completed worktree progress shows retry_all instead of retry_failed."""
-
-    def test_all_completed_shows_retry_all(self):
-        from src.card.state.models import CardState, EngineExtState
-        from src.card.state.reducers.worktree import reduce_worktree
-
-        state = CardState(
-            metadata=CardMetadata(engine_type="worktree"),
-            engine_ext=EngineExtState(),
-        )
-        units = [
-            {"name": "A", "status": "completed"},
-            {"name": "B", "status": "completed"},
-        ]
-        event = worktree_progress(units)
-        new = reduce_worktree(state, event)
-        assert any(b.action_id == ButtonIntent.WORKTREE_RETRY_ALL for b in new.buttons)
-        assert not any(b.action_id == ButtonIntent.WORKTREE_RETRY_FAILED for b in new.buttons)
 
 
 class TestCardDeliveryConcurrentCloseDeliver:

@@ -236,7 +236,7 @@ class ChatLockManager:
         """最小 slash DTO 契约（避免 core 反向依赖 feishu 包）。
 
         下游只依赖：
-        - command: canonical 命令（lowercase, e.g. "/worktree"）
+        - command: canonical 命令（lowercase, e.g. "/deep"）
         - has_args: 是否携带参数（args 非空）
         """
 
@@ -253,8 +253,6 @@ class ChatLockManager:
         """Return True if the message from *user_id* in *chat_id* should be blocked.
 
         - Read-only commands (``/status``, ``/help``, etc.) are always allowed.
-        - ``/wt`` and ``/worktree`` without subarguments are allowed (read-only list);
-          with subarguments (e.g. ``/wt merge``) they are blocked.
         - If chat is not locked → False (allow).
         - If chat is locked and user is admin → False (allow).
         - If chat is locked and user is NOT admin → True (block).
@@ -264,12 +262,6 @@ class ChatLockManager:
         # Read-only and safe-interrupt commands are never blocked.
         if cmd and (cmd in READONLY_COMMANDS or cmd in SAFE_INTERRUPT_COMMANDS):
             return False
-
-        # F-13: /wt and /worktree are read-only only when invoked without subarguments.
-        if cmd == "/worktree":
-            # No subargument → read-only (show worktree list)
-            if command_match is not None and getattr(command_match, "has_args", True) is False:
-                return False
 
         # Compute admin status outside the lock to avoid I/O inside the
         # critical section.  Note: get_settings() is a cached singleton

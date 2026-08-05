@@ -20,7 +20,6 @@ SPEC_UI_TEXT: dict[str, str] = {
     "btn_skip_retry": "跳过等待，立即重试",
     "skip_retry_ack": "已跳过等待，正在继续…",
     "no_active_retry": "当前无进行中的重试操作",
-    "timeout_busy_worktree": "当前系统较繁忙，操作已超时，可通过 /wt retry 重试",
     "review_parse_fail_system": "审查输出解析异常（系统侧），不影响执行，将在下轮自动重试",
     "review_budget_timeout": "部分审查未在限定时间内完成，已自动跳过并继续下一轮。如持续出现，可发送 /spec resume 手动恢复",
     "circuit_breaker_skip_with_count": "审查暂停：连续{count}次异常，系统已暂时跳过本轮审查。系统将在后续轮次自动恢复，无需手动操作。如需立即恢复，发送 /spec resume 继续",

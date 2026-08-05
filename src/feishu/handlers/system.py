@@ -207,8 +207,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/end_tui2acp": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/tui2acp_info": lambda m, c, t, p: self.get_handler("tui2acp").show_info(m, c, p),
             "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, p),
-            # Worktree: canonical command is /worktree (aliases like /wt are normalized by SlashCommandParser)
-            "/worktree": lambda m, c, t, p: self.get_handler("worktree").handle_worktree_command(m, c, p),
             "/ttadk_info": lambda m, c, t, p: self.show_ttadk_info(m, c),
             "/ttadk_refresh": lambda m, c, t, p: self.refresh_ttadk_models(m, c, p),
             "/menu": lambda m, c, t, p: self.handle_menu_command(m, c, p),
@@ -446,7 +444,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/trace",
             "/ttadk",
             "/acp",
-            "/worktree",
             "/ttadk_refresh",
             "/menu",
             "/tools",
@@ -464,7 +461,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         if not m.has_args and cmd in exact_commands:
             return True
         prefix_commands = {
-            "/worktree",
             "/switch",
             "/new",
             "/new-chat",
@@ -501,20 +497,9 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             # SSOT: intercepted commands must carry request-scoped CommandMatch.
             self.reply_error(message_id, UI_TEXT["system_slash_parse_missing"], title=UI_TEXT["system_internal_error"])
             return
-        # Use canonical command as routing key, but keep original text for handlers
-        # that still need it for legacy parsing (non-worktree).
+        # Use the canonical command as the routing key while preserving the
+        # original text for handlers that still need it for legacy parsing.
         text_lower = m.command
-
-        # Worktree is special: route directly with parsed goal to avoid handler-side slicing.
-        if text_lower == "/worktree" and m.has_args:
-            wt = self.get_handler("worktree")
-            if wt:
-                # Prefer passing the parsed CommandMatch through the chain.
-                if hasattr(wt, "handle_worktree_command_match"):
-                    wt.handle_worktree_command_match(message_id, chat_id, m, project=project)
-                else:
-                    wt.handle_worktree_command(message_id, chat_id, project, goal=m.args)
-                return
 
         # ACP model-select mode enter: /codex, /traex, ...
         if not m.has_args and text_lower in {"/codex", "/enter_codex", "/traex", "/enter_traex"}:
@@ -1596,11 +1581,10 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         thread_id = get_current_thread_id()
         if thread_id:
             thread_ctx = get_thread_manager().get(thread_id)
-            if thread_ctx and thread_ctx.mode in {"worktree", "deep", "spec", "workflow"}:
+            if thread_ctx and thread_ctx.mode in {"deep", "spec", "workflow"}:
                 removed = get_thread_manager().remove(thread_ctx.thread_root_id)
                 set_current_thread_id(None)
                 engine_name = {
-                    "worktree": "WT",
                     "deep": "Deep",
                     "spec": "Spec",
                     "workflow": "WF",

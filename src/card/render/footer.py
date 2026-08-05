@@ -128,7 +128,6 @@ def _format_timestamp(raw: str) -> str:
 _ENGINE_PROGRESS_COLOR: dict[str, str] = {
     "deep": "violet",
     "spec": "green",
-    "worktree": "wathet",
 }
 
 _TOOL_BRIEF = {
@@ -342,8 +341,6 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
             prefix = f"{UI_TEXT['card_progress_criteria_label']}: "
         elif state.metadata.engine_type == "deep":
             prefix = f"{UI_TEXT['card_progress_tool_label']}: "
-        elif state.metadata.engine_type == "worktree":
-            prefix = f"{UI_TEXT['card_progress_worktree_label']}: "
         # Merge status text + bar + progress count into single line
         parts = []
         if status_text:

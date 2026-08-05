@@ -266,7 +266,7 @@ class WorkflowProject(BaseModel):
     # the live engine keeps the frozen object itself.
     run_spec: Optional[dict[str, Any]] = None
     reviewer_evidence: list[ReviewerEvidence] = Field(default_factory=list)
-    # Selection state storage for WorktreeSelectionController
+    # Selection state storage for Workflow selection controllers
     orchestrator_selection_state: Optional[dict] = None
     review_selection_state: Optional[dict] = None
 

@@ -61,7 +61,6 @@ _SAMPLE_KWARGS = {
     "commands": "deep 或 loop",
     "duration": "3m 20s",
     "branch": "main",
-    "worktree_path": "/tmp/wt",
     "tool_name": "read",
     "input_preview": "...",
     "output_preview": "...",

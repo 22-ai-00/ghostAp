@@ -193,13 +193,10 @@ def test_budget_selection_removed():
     Budget selection has been removed in favor of 2-step orchestrator+review selection.
     This test documents that budget-related actions should no longer be registered.
     """
-    from src.card.actions.dispatch import build_common_action_registry, build_worktree_action_registry
+    from src.card.actions.dispatch import build_common_action_registry
 
     common_registry = build_common_action_registry()
-    worktree_registry = build_worktree_action_registry()
-
-    # Combine all action IDs
-    all_actions = set(common_registry.keys()) | set(worktree_registry.keys())
+    all_actions = set(common_registry.keys())
 
     # Verify no budget-related actions are registered
     budget_actions = [a for a in all_actions if "budget" in a.lower()]

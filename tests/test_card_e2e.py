@@ -216,62 +216,6 @@ class TestSpecEngineFlow:
         assert state.engine_ext.criteria_satisfied == 2
 
 
-class TestWorktreeEngineFlow:
-    """Simulates a Worktree Engine flow: tool_select → confirm → progress → completed."""
-
-    def test_worktree_tool_select_to_completed(self):
-        client = RecordingClient()
-        delivery = CardDelivery(client)
-        metadata = CardMetadata(
-            engine_type="worktree",
-            mode_name="Worktree",
-            mode_emoji="🌳",
-        )
-        config = SessionConfig(metadata=metadata)
-        session = CardSession(
-            chat_id="chat_wt",
-            config=config,
-            delivery=delivery,
-            session_id="e2e_wt",
-        )
-
-        # Started
-        session.dispatch(CardEvent(type=CardEventType.STARTED))
-        assert any(c["op"] == "create" for c in client.calls)
-
-        # Tool selection
-        session.dispatch(CardEvent(type=CardEventType.WORKTREE_TOOL_SELECT, payload={
-            "tools": [
-                {"name": "coco", "display_name": "Coco", "available": True},
-                {"name": "claude", "display_name": "Claude", "available": True},
-            ],
-        }))
-
-        # Confirm
-        session.dispatch(CardEvent(type=CardEventType.WORKTREE_CONFIRM, payload={
-            "selected_tools": [
-                {"tool": "coco", "model": "gpt-4o"},
-            ],
-            "goal": "Fix the bug",
-        }))
-
-        # Progress
-        session.dispatch(CardEvent(type=CardEventType.WORKTREE_PROGRESS, payload={
-            "units": [
-                {"tool": "coco", "status": "running", "progress": 50},
-            ],
-        }))
-
-        # Completed
-        session.dispatch(CardEvent(type=CardEventType.COMPLETED))
-
-        assert session.closed
-        state = session.state
-        assert state.terminal == "completed"
-        creates = [c for c in client.calls if c["op"] == "create"]
-        assert len(creates) >= 1
-
-
 class _SpyHook:
     """Test spy implementing SessionHook protocol for verifying hook calls."""
 

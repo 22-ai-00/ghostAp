@@ -9,7 +9,6 @@ import json
 import logging
 import re
 import threading
-from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -143,58 +142,6 @@ class TestSchedulerEmptyErrorGuard:
             assert len(state.error) > 0
         finally:
             scheduler.stop(shutdown_executor=True)
-
-
-class TestWorktreeDispatcherGetErrorDetail:
-    """dispatcher.py: TimeoutError uses get_error_detail() for consistent messages."""
-
-    def test_bare_timeout_uses_get_error_detail(self, tmp_path):
-        from src.worktree_engine.dispatcher import WorktreeDispatcher
-        from src.worktree_engine.models import WorktreeSelectionItem, WorktreeUnit
-
-        d = tmp_path / "wt"
-        d.mkdir()
-
-        @dataclass
-        class FakeResult:
-            stop_reason: str
-            text: str
-
-        class TimeoutSession:
-            def __init__(self, **kw):
-                pass
-
-            def start(self, startup_timeout=60):
-                return "ok"
-
-            def send_prompt(self, text, on_event=None, timeout=None):
-                raise TimeoutError()
-
-            def close(self):
-                pass
-
-        unit = WorktreeUnit(
-            unit_id="u0",
-            selection_key="acp:coco:d",
-            provider="acp",
-            tool_name="coco",
-            display_name="Coco",
-            worktree_path=str(d),
-        )
-        tool = WorktreeSelectionItem(
-            provider="acp",
-            tool_name="coco",
-            display_name="Coco",
-            supports_model=True,
-        )
-        dispatcher = WorktreeDispatcher(session_factory=lambda **kw: TimeoutSession(**kw))
-        planned = dispatcher.plan_user_goal("test", [unit], [tool])
-        executed = dispatcher.execute_units(planned, timeout=30)
-
-        assert executed[0].status == "failed"
-        assert executed[0].error
-        assert "超时" in executed[0].error
-        assert "操作超时" in executed[0].error
 
 
 class TestDeepHandlerProjectCreateEmptyGuard:
@@ -519,9 +466,8 @@ class TestRunAsyncTimeoutWrapping:
 # ---------------------------------------------------------------------------
 # get_error_detail: always non-empty for all exception variants
 # (consolidates: TestGetErrorDetailNeverEmpty, TestSpecEngineInternalEmptyGuard,
-#  TestWorktreeManagerEmptyGuard, TestMainAppEmptyGuard,
-#  TestSystemHandlerTTADKRefreshEmptyGuard, TestWorktreeDispatcherTimeoutContext,
-#  TestWorktreeManagerTimeoutContext, TestBaseHandlerFallbackTimeoutContext,
+#  TestMainAppEmptyGuard, TestSystemHandlerTTADKRefreshEmptyGuard,
+#  TestBaseHandlerFallbackTimeoutContext,
 #  TestTimeoutErrorE2EDetail)
 # ---------------------------------------------------------------------------
 

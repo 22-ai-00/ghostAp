@@ -1,6 +1,4 @@
-"""Tests for action_dispatch registries — ensure every worktree action_id constant
-has a matching factory in build_worktree_action_registry() and each factory returns a CardEvent.
-"""
+"""Tests for action-dispatch registries and Feishu wiring."""
 
 from __future__ import annotations
 
@@ -11,9 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.card.actions import dispatch as action_ids
-from src.card.actions.dispatch import build_worktree_action_registry
 from src.card.error_diagnostics import error_diagnostic_store
-from src.card.events import CardEvent
 
 
 class _RegistryCaptureClient:
@@ -46,41 +42,6 @@ class _RegistryCaptureClient:
             return None
 
         return _stub
-
-
-# All WORKTREE_* constants from action_ids that should be in the registry.
-_WORKTREE_ACTION_IDS = [
-    action_ids.WORKTREE_FINISH_SELECTION,
-    action_ids.WORKTREE_CONFIRM_START,
-    action_ids.WORKTREE_MERGE,
-    action_ids.WORKTREE_CLEANUP,
-    action_ids.WORKTREE_RETRY_FAILED,
-    action_ids.WORKTREE_RETRY_ALL,
-    action_ids.WORKTREE_CANCEL,
-    action_ids.SHOW_WORKTREE_MENU,
-    # Common actions (inherited from build_common_action_registry)
-    action_ids.MODE_FULL,
-    action_ids.MODE_COMPACT,
-    action_ids.ENGINE_STOP,
-]
-
-
-class TestBuildWorktreeActionRegistry:
-    """Validate build_worktree_action_registry() coverage and correctness."""
-
-    def test_registry_exactly_maps_every_action_to_a_card_event(self):
-        registry = build_worktree_action_registry()
-        assert set(registry) == set(_WORKTREE_ACTION_IDS)
-        for action_id in _WORKTREE_ACTION_IDS:
-            for payload in ({}, {"test": True}):
-                event = registry[action_id](payload)
-                assert isinstance(event, CardEvent), (action_id, payload)
-
-    def test_cancel_factory_ignores_payload(self):
-        """WORKTREE_CANCEL factory produces fixed payload regardless of input."""
-        registry = build_worktree_action_registry()
-        event = registry[action_ids.WORKTREE_CANCEL]({"arbitrary": "data"})
-        assert event.payload == {"reason": "user_cancel"}
 
 
 def test_feishu_action_registry_uses_canonical_core_action_ids():
@@ -125,19 +86,6 @@ def test_feishu_action_registry_uses_canonical_core_action_ids():
         action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_GROUP,
         action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_PROFILE,
         action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_EFFORT,
-        action_ids.SHOW_WORKTREE_MENU,
-        action_ids.WORKTREE_FINISH_SELECTION,
-        action_ids.WORKTREE_SELECT_TOOL,
-        action_ids.WORKTREE_SELECT_MODEL,
-        action_ids.WORKTREE_REMOVE_ITEM,
-        action_ids.WORKTREE_CLEAR_ITEMS,
-        action_ids.WORKTREE_CONFIRM_START,
-        action_ids.WORKTREE_MERGE,
-        action_ids.SHOW_WORKTREE_MERGE_ENTRY,
-        action_ids.WORKTREE_CLEANUP,
-        action_ids.WORKTREE_EXECUTE_ACTION,
-        action_ids.WORKTREE_RETRY_FAILED,
-        action_ids.WORKTREE_RETRY_ALL,
         action_ids.FORCE_RELEASE_REPO_LOCK,
         action_ids.CONFIRM_LOCK,
         action_ids.CANCEL_LOCK,

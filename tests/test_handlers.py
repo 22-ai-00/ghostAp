@@ -28,7 +28,6 @@ from src.feishu.handlers.project import ProjectHandler
 from src.feishu.handlers.spec import SpecHandler
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.handlers.workflow import WorkflowHandler
-from src.feishu.handlers.worktree import WorktreeHandler
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.mode.manager import InteractionMode
 from src.project.context import ProjectContext, SessionSnapshot
@@ -283,33 +282,6 @@ class TestTopicEngineProjectResolution:
         assert resolved is None
         handler.reply_error.assert_called_once()
         assert handler.reply_error.call_args.kwargs["title"] == "创建项目失败"
-
-    def test_worktree_handler_recovers_active_project_before_validating_goal(self):
-        ctx = _make_handler_context()
-        project = SimpleNamespace(project_id="p1", project_name="GhostAP", root_path="/repo")
-        ctx.project_manager.get_active_project.return_value = project
-        handler = WorktreeHandler(ctx)
-        handler.reply_text = MagicMock()
-        handler.reply_error = MagicMock()
-
-        handler.handle_worktree_execute("m1", "c1", "", project=None)
-
-        ctx.project_manager.get_active_project.assert_called_once_with("c1")
-        handler.reply_text.assert_called_once()
-        handler.reply_error.assert_not_called()
-
-    def test_worktree_handler_rejects_missing_active_project(self):
-        ctx = _make_handler_context()
-        ctx.project_manager.get_active_project.return_value = None
-        handler = WorktreeHandler(ctx)
-        handler.reply_text = MagicMock()
-        handler.reply_error = MagicMock()
-
-        handler.handle_worktree_execute("m1", "c1", "继续执行", project=None)
-
-        handler.reply_error.assert_called_once()
-        handler.reply_text.assert_not_called()
-
 
 class TestHandlerContextDependencyView:
     def test_dependency_view_exposes_narrow_core_services_without_removing_fields(self):
@@ -3293,49 +3265,3 @@ class TestSameSenderAutoDetection:
             ctx = helper._collect_lock_conflict_context(err)
 
         assert not hasattr(ctx, "chat_hint")
-
-
-# ======================================================================
-# Worktree Handler integration tests
-# ======================================================================
-
-
-class TestWorktreeHandler:
-    """Integration tests for WorktreeHandler command routing and renderer delegation."""
-
-    def _make(self):
-        ctx = _make_handler_context()
-        h = WorktreeHandler(ctx)
-        h.reply_text = MagicMock()
-        h.reply_card = MagicMock(return_value="reply_1")
-        h.reply_error = MagicMock()
-        h.update_card = MagicMock()
-        h.add_reaction = MagicMock()
-        h.register_message_project = MagicMock()
-        return h, ctx
-
-    def test_handle_worktree_command_no_project(self):
-        """Without active project, should reply error."""
-        h, ctx = self._make()
-        ctx.project_manager.get_active_project.return_value = None
-        h.handle_worktree_command("m1", "c1", project=None)
-        h.reply_error.assert_called_once()
-
-    def test_handle_worktree_command_with_project(self):
-        """With active project and tools, should start selection flow."""
-        h, ctx = self._make()
-        mock_project = MagicMock()
-        mock_project.project_id = "proj1"
-        mock_project.root_path = "/tmp/proj"
-        ctx.project_manager.get_active_project.return_value = mock_project
-
-        # Mock internal methods to avoid deep call chains
-        h._get_available_worktree_tools = MagicMock(return_value=[])
-        h.handle_worktree_command("m1", "c1", project=mock_project)
-        # With no tools, should reply error
-        h.reply_error.assert_called_once()
-
-    def test_renderer_is_worktree_renderer(self):
-        h, ctx = self._make()
-        from src.feishu.renderers.worktree_renderer import WorktreeRenderer
-        assert isinstance(h._renderer, WorktreeRenderer)

@@ -16,4 +16,3 @@ class RuntimeStats:
     deep_phase: str | None = None
     spec_cycle: int | None = None
     spec_perspective: str | None = None
-    worktree_subagent: str | None = None

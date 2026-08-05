@@ -26,7 +26,6 @@ from .factory import (
     create_engine_session,
     create_review_session,
     create_sync_session,
-    create_sync_session_for_worktree,
     resolve_ttadk_engine_startup_model,
 )
 from .model_diagnostics import (
@@ -58,7 +57,7 @@ __all__ = [
     "RateLimitAwareSession", "ModelFailureAwareSession", "EphemeralReviewSession",
     "classify_model_failure", "create_sync_session", "create_engine_session",
     "create_auxiliary_session",
-    "create_review_session", "create_sync_session_for_worktree",
+    "create_review_session",
     "close_session_safely", "resolve_ttadk_engine_startup_model",
     "_JSONTextExtractor", "_is_ttadk_preamble_line", "_build_ttadk_passthrough_prompt",
     "_detect_rate_limit", "_extract_model_from_agent_args", "_replace_model_in_agent_args",

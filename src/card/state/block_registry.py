@@ -40,4 +40,4 @@ BLOCK_KIND_MAP = _BLOCK_KIND_MAP
 
 # Derived at import time from BLOCK_KIND_MAP
 BLOCK_KIND_TO_ATOM = _build_atom_registry()
-"""kind string → atom kind (e.g. "text" → "text", "worktree_merge" → "worktree_panel")"""
+"""kind string → atom kind (e.g. "text" → "text", "spec_plan" → "spec_plan")"""

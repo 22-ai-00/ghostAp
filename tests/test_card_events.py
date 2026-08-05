@@ -11,13 +11,6 @@ from src.acp.models import (
     ToolCallInfo,
 )
 from src.card.events import CardEvent, CardEventType
-from src.card.events.worktree import (
-    worktree_cleanup,
-    worktree_confirm,
-    worktree_merge,
-    worktree_progress,
-    worktree_tool_select,
-)
 
 
 class TestCardEventCreation:
@@ -240,81 +233,6 @@ class TestFromACP:
         acp.event_type = "totally_unknown_type"
         ce = CardEvent.from_acp(acp)
         assert ce.type == CardEventType.TEXT_DELTA
-
-
-class TestWorktreePayloadValidation:
-    """Assert validations on worktree factory methods."""
-
-    def test_worktree_progress_valid(self):
-        e = worktree_progress(
-            units=[{"name": "u1", "status": "running"}],
-            project_id="p1",
-        )
-        assert e.type == CardEventType.WORKTREE_PROGRESS
-        assert e.payload["units"][0]["status"] == "running"
-
-    def test_worktree_progress_rejects_non_list(self):
-        with pytest.raises(TypeError, match="units must be a list"):
-            worktree_progress(units="bad", project_id="p1")
-
-    def test_worktree_progress_rejects_unit_without_status(self):
-        with pytest.raises(ValueError, match="must be a dict with 'status'"):
-            worktree_progress(units=[{"name": "u1"}], project_id="p1")
-
-    def test_worktree_tool_select_valid(self):
-        e = worktree_tool_select(
-            tools=[{"provider": "acp", "tool_name": "coco", "display_name": "Coco"}],
-            selected=["coco"],
-        )
-        assert e.type == CardEventType.WORKTREE_TOOL_SELECT
-        assert e.payload["selected"] == ["coco"]
-
-    def test_worktree_tool_select_rejects_non_dict_tool(self):
-        with pytest.raises(TypeError, match="each tool must be a dict"):
-            worktree_tool_select(tools=["not_a_dict"])
-
-    def test_worktree_confirm_valid(self):
-        e = worktree_confirm(
-            selected_items=[{"tool": "coco", "model": "gpt4"}],
-            goal="implement feature",
-        )
-        assert e.type == CardEventType.WORKTREE_CONFIRM
-        assert e.payload["goal"] == "implement feature"
-
-    def test_worktree_confirm_rejects_non_list(self):
-        with pytest.raises(TypeError, match="selected_items must be a list"):
-            worktree_confirm(selected_items="bad")
-
-    def test_worktree_cleanup_valid(self):
-        e = worktree_cleanup(
-            merge_notes=[{"branch": "feat-1", "status": "success", "summary": "done"}],
-            base_branch="main",
-        )
-        assert e.type == CardEventType.WORKTREE_CLEANUP
-        assert e.payload["base_branch"] == "main"
-
-    def test_worktree_cleanup_rejects_missing_branch(self):
-        with pytest.raises(ValueError, match="must have 'branch' and 'status'"):
-            worktree_cleanup(merge_notes=[{"status": "ok"}])
-
-    def test_worktree_cleanup_rejects_invalid_phase(self):
-        with pytest.raises(ValueError, match="cleanup_phase must be 'summary', 'actions', or 'completed'"):
-            worktree_cleanup(
-                merge_notes=[{"branch": "b", "status": "ok"}],
-                cleanup_phase="invalid",
-            )
-
-    def test_worktree_merge_valid(self):
-        e = worktree_merge(
-            merge_notes=[{"branch": "feat-1", "status": "ready"}],
-            base_branch="develop",
-        )
-        assert e.type == CardEventType.WORKTREE_MERGE
-        assert e.payload["base_branch"] == "develop"
-
-    def test_worktree_merge_rejects_missing_status(self):
-        with pytest.raises(ValueError, match="must have 'branch' and 'status'"):
-            worktree_merge(merge_notes=[{"branch": "feat-1"}])
 
 
 class TestCardEventCancelled:

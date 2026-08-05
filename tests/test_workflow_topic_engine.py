@@ -1,10 +1,10 @@
 """Tests for Workflow topic-engine scoping and state isolation.
 
-Validates that Workflow, like Deep, Spec, and Worktree, is a topic-scoped engine
+Validates that Workflow, like Deep and Spec, is a topic-scoped engine
 strategy that does not interfere with chat+project programming state.
 
 Key contract (AGENTS.md lines 124-125):
-  "Deep, Spec, Worktree, and Workflow are engine strategies scoped to the Feishu
+  "Deep, Spec, and Workflow are engine strategies scoped to the Feishu
   topic/root thread; they must not replace chat+project programming state."
 
 Test categories:
@@ -124,22 +124,6 @@ class TestAGENTSMDScopeStatement(unittest.TestCase):
         """Read AGENTS.md content."""
         with open(self.AGENTS_PATH, "r", encoding="utf-8") as f:
             return f.read()
-
-    def test_agents_md_includes_workflow_in_scope(self):
-        """Verify AGENTS.md lists Workflow alongside Deep, Spec, Worktree.
-
-        This is critical because it documents the product contract that
-        Workflow is a topic-scoped engine, not a chat-level programming mode.
-        If this fails, check that AGENTS.md was updated when Workflow was added.
-        """
-        content = self._read_agents_md()
-        # The scope statement should list all four topic engines
-        self.assertIn("Deep、Spec、Worktree 和 Workflow", content,
-            "AGENTS.md must list Workflow alongside Deep, Spec, Worktree in the scope statement")
-        self.assertIn("作用于飞书话题/根线程的引擎策略", content,
-            "AGENTS.md must state that these are topic-scoped engine strategies")
-        self.assertIn("话题/根线程", content,
-            "AGENTS.md must mention topic/root thread scoping")
 
     def test_agents_md_states_no_state_replacement(self):
         """Verify AGENTS.md explicitly forbids replacing chat+project state.
@@ -751,7 +735,6 @@ class TestWorkflowTopicRoutingAC22(unittest.TestCase):
         client._process_with_intent = MagicMock()
         client._execute_single_task = MagicMock()
         client._workflow_handler = MagicMock()
-        client._handle_worktree_execute = MagicMock()
         client._start_deep_engine = MagicMock()
         client._start_spec_engine = MagicMock()
         client._get_mode_handler = MagicMock()

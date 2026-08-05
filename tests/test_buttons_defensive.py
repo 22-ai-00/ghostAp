@@ -68,7 +68,6 @@ class TestIsStopIntent:
         "intent.engine.stop",
         "intent.deep.stop",
         "intent.spec.stop",
-        "intent.worktree.cancel",
     ])
     def test_all_stop_intents_return_true(self, action_id: str):
         """Every member of _STOP_INTENTS should make _is_stop_intent return True."""
@@ -77,7 +76,6 @@ class TestIsStopIntent:
         assert _is_stop_intent(spec) is True
 
     @pytest.mark.parametrize("action_id", [
-        "intent.worktree.confirm_start",
         "intent.approval.approve",
         "intent.approval.reject",
         "some_random_action",
@@ -93,7 +91,6 @@ class TestIsStopIntent:
             "intent.engine.stop",
             "intent.deep.stop",
             "intent.spec.stop",
-            "intent.worktree.cancel",
             WORKFLOW_CANCEL,
         }
         assert _STOP_INTENTS == expected, (
@@ -108,9 +105,6 @@ class TestDestructiveConfirm:
         "intent.engine.stop",
         "intent.deep.stop",
         "intent.spec.stop",
-        "intent.worktree.cleanup",
-        "intent.worktree.merge",
-        "intent.worktree.cancel",
         "intent.approval.approve",
     ])
     def test_destructive_buttons_have_confirm(self, intent: str):
@@ -121,8 +115,6 @@ class TestDestructiveConfirm:
         assert "complex_interaction" not in btn
 
     @pytest.mark.parametrize("intent", [
-        "intent.worktree.confirm_start",
-        "intent.worktree.finish_selection",
         "intent.deep.resume",
         "intent.spec.resume",
         "intent.show_status",
@@ -140,13 +132,9 @@ class TestDestructiveConfirm:
             DEEP_STOP,
             ENGINE_STOP,
             SPEC_STOP,
-            WORKTREE_CANCEL,
-            WORKTREE_CLEANUP,
-            WORKTREE_MERGE,
         )
         expected = frozenset({
             ENGINE_STOP, DEEP_STOP, SPEC_STOP,
-            WORKTREE_CLEANUP, WORKTREE_MERGE, WORKTREE_CANCEL,
             WORKFLOW_CANCEL,
             APPROVE_ACTION,
         })

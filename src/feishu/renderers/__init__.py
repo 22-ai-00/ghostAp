@@ -20,8 +20,5 @@ def get_renderer(engine_type: str, handler: "BaseHandler") -> "RendererProtocol"
     elif engine_type == "spec":
         from .spec_renderer import SpecRenderer
         return SpecRenderer(handler)
-    elif engine_type == "worktree":
-        from .worktree_renderer import WorktreeRenderer
-        return WorktreeRenderer(handler)
     else:
         raise ValueError(f"Unknown engine type: {engine_type!r}")

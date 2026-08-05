@@ -175,7 +175,6 @@ class TestSlockDoesNotStealProjectContext:
         client._should_auto_activate_slock.return_value = True
         client._is_exit_command.return_value = False
         client._is_interceptable_command_match.return_value = False
-        client._is_worktree_awaiting_goal.return_value = False
         client._intent_recognizer.recognize.return_value = IntentResult(
             confidence=0.9,
             tasks=[
@@ -1109,7 +1108,6 @@ class TestSmartShellBypassesPassiveSlock:
         client._is_slock_managed_chat.return_value = False
         client._should_auto_activate_slock.return_value = True
         client._is_interceptable_command_match.return_value = False
-        client._is_worktree_awaiting_goal.return_value = False
         client._pending_image_lock = MagicMock()
         client._pending_image_only = set()
         client._intent_recognizer = MagicMock(wraps=IntentRecognizer())

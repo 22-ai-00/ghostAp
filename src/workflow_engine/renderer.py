@@ -179,8 +179,7 @@ def _collapsible_panel(
     """Wrap elements in a Feishu collapsible_panel.
 
     The ``expanded`` flag matches the Feishu schema and the convention used
-    by the rest of the codebase (see ``card/render/tools.py`` and
-    ``card/render/worktree.py``). When ``expanded=True`` the panel is shown
+    by the rest of the codebase (see ``card/render/tools.py``). When ``expanded=True`` the panel is shown
     open on first render; when ``expanded=False`` it is collapsed by default.
     """
     if isinstance(header, str):

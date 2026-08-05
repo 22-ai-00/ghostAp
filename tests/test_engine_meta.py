@@ -22,7 +22,6 @@ class TestEngineMeta:
         cases = (
             ("deep", None, "/deep"),
             ("spec", None, "/spec"),
-            ("worktree", None, "/wt"),
             ("unknown", None, "命令"),
             ("", None, "命令"),
             (None, None, "命令"),
@@ -42,7 +41,6 @@ class TestEngineMeta:
         cases = (
             ("deep", None, "Deep"),
             ("spec", None, "Spec"),
-            ("worktree", None, "Worktree"),
             ("unknown", None, ""),
             (None, None, ""),
             (None, "Engine", "Engine"),

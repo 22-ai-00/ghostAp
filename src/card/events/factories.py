@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 
 # Whether to run expensive per-element payload validation (only in DEBUG/test mode).
-# In production this is False to skip O(n) list-traversal checks in worktree factories.
+# In production this is False to skip O(n) list-traversal checks in event factories.
 # Convention: top-level isinstance() type guards stay unconditional (cheap);
 # per-element structural checks (for-loop validators) MUST be wrapped with:
 #   if VALIDATE_PAYLOAD:

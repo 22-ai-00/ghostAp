@@ -74,7 +74,7 @@ def test_button_is_blocked_while_system_command_inflight():
         client.close()
 
 
-def test_same_worktree_action_with_different_tool_payloads_is_not_deduped():
+def test_same_spec_review_action_with_different_tool_payloads_is_not_deduped():
     with (
         patch("src.feishu.ws_client.get_settings") as mock_get_settings,
         patch("src.feishu.ws_client.ACPSessionManager"),
@@ -114,13 +114,13 @@ def test_same_worktree_action_with_different_tool_payloads_is_not_deduped():
         aiden = _make_card_action_data(
             open_message_id="om_1",
             open_chat_id="oc_1",
-            action="worktree_select_tool",
+            action="spec_review_select_tool",
             value_extra={"tool_name": "aiden", "provider": "acp"},
         )
         coco = _make_card_action_data(
             open_message_id="om_1",
             open_chat_id="oc_1",
-            action="worktree_select_tool",
+            action="spec_review_select_tool",
             value_extra={"tool_name": "coco", "provider": "acp"},
         )
 
@@ -135,7 +135,7 @@ def test_same_worktree_action_with_different_tool_payloads_is_not_deduped():
         client.close()
 
 
-def test_same_worktree_tool_after_selection_change_is_not_deduped():
+def test_same_spec_review_tool_after_selection_change_is_not_deduped():
     with (
         patch("src.feishu.ws_client.get_settings") as mock_get_settings,
         patch("src.feishu.ws_client.ACPSessionManager"),
@@ -175,13 +175,13 @@ def test_same_worktree_tool_after_selection_change_is_not_deduped():
         coco_before_selection = _make_card_action_data(
             open_message_id="om_1",
             open_chat_id="oc_1",
-            action="worktree_select_tool",
+            action="spec_review_select_tool",
             value_extra={"tool_name": "coco", "provider": "acp", "_selection_sig": "empty"},
         )
         coco_after_selection = _make_card_action_data(
             open_message_id="om_1",
             open_chat_id="oc_1",
-            action="worktree_select_tool",
+            action="spec_review_select_tool",
             value_extra={"tool_name": "coco", "provider": "acp", "_selection_sig": "coco-model-a"},
         )
 

@@ -6,8 +6,8 @@ Consolidates the ~15 scattered ThreadPoolExecutor instances into 3 shared pools:
 - background_pool: TTL cleanup, GC, health checks, heartbeats
 
 Modules should use these shared pools via get_*_pool() instead of creating
-their own ThreadPoolExecutor instances. Temporary fan-out pools (council,
-perspective review, worktree dispatch) remain as-is since they're short-lived.
+their own ThreadPoolExecutor instances. Temporary fan-out pools (council and
+perspective review) remain as-is since they're short-lived.
 """
 
 from __future__ import annotations

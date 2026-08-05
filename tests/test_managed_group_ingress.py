@@ -532,7 +532,6 @@ def test_recognizer_rotation_fences_single_executor(tmp_path) -> None:
     client._is_slock_managed_chat = MagicMock(return_value=False)
     client._is_slock_active = MagicMock(return_value=False)
     client._is_interceptable_command_match = MagicMock(return_value=False)
-    client._is_worktree_awaiting_goal = MagicMock(return_value=False)
     client._intent_recognizer = MagicMock()
     client._intent_recognizer.recognize.side_effect = recognize
     client._handle_coco_message = MagicMock()
@@ -569,7 +568,6 @@ def _slock_dispatch_client(
     client._is_workflow_command = MagicMock(return_value=False)
     client._is_topic_engine_context = MagicMock(return_value=False)
     client._is_interceptable_command_match = MagicMock(return_value=False)
-    client._is_worktree_awaiting_goal = MagicMock(return_value=False)
     client._is_exit_command = MagicMock(return_value=False)
     client._add_reaction = MagicMock()
     client._handle_slock_command = MagicMock()
@@ -679,7 +677,7 @@ def test_multi_task_rechecks_trust_before_every_step(tmp_path) -> None:
     dispatcher.execute_task_step.assert_called_once()
 
 
-@pytest.mark.parametrize("mode", ["worktree", "deep", "spec", "workflow", "coco"])
+@pytest.mark.parametrize("mode", ["deep", "spec", "workflow", "coco"])
 def test_stale_trust_fences_direct_engine_and_programming_dispatch(
     tmp_path,
     mode: str,
@@ -704,7 +702,6 @@ def test_stale_trust_fences_direct_engine_and_programming_dispatch(
     client._is_spec_command = MagicMock(return_value=False)
     client._is_workflow_command = MagicMock(return_value=False)
     client._add_reaction = MagicMock()
-    client._handle_worktree_execute = MagicMock()
     client._start_deep_engine = MagicMock()
     client._start_spec_engine = MagicMock()
     client._workflow_handler = MagicMock()
@@ -721,7 +718,6 @@ def test_stale_trust_fences_direct_engine_and_programming_dispatch(
         effective_trust=trust,
     )
 
-    client._handle_worktree_execute.assert_not_called()
     client._start_deep_engine.assert_not_called()
     client._start_spec_engine.assert_not_called()
     client._workflow_handler.handle_message.assert_not_called()
@@ -952,7 +948,6 @@ def test_dispatcher_denies_external_before_mode_or_intent_lookup() -> None:
         "/codex implement it",
         "/deep investigate it",
         "/spec define it",
-        "/wt isolate it",
         "/wf orchestrate it",
         "/team ship it",
         "/slock coordinate it",

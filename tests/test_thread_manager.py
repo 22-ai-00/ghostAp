@@ -163,19 +163,19 @@ class TestThreadContextManager:
         mgr = self._make_manager()
         try:
             mgr.register(
-                "thread-wt-1",
+                "thread-wf-1",
                 "chat1",
                 "proj1",
-                mode="worktree",
+                mode="workflow",
                 tool_name="coco",
                 model_name="m1",
             )
 
-            ctx = mgr.get_engine_context("thread-wt-1")
+            ctx = mgr.get_engine_context("thread-wf-1")
             assert ctx is not None
-            assert ctx.mode == "worktree"
+            assert ctx.mode == "workflow"
             assert mgr.get_engine_context("missing-thread") is None
-            assert [c.thread_root_id for c in mgr.get_by_chat("chat1")] == ["thread-wt-1"]
+            assert [c.thread_root_id for c in mgr.get_by_chat("chat1")] == ["thread-wf-1"]
         finally:
             mgr.close()
 
@@ -183,10 +183,10 @@ class TestThreadContextManager:
         mgr = self._make_manager()
         try:
             mgr.register("smart-root", "chat1", "proj1", mode="smart")
-            mgr.register("wt-root", "chat1", "proj1", mode="worktree")
+            mgr.register("wf-root", "chat1", "proj1", mode="workflow")
 
             assert mgr.has_active_engine("smart-root") is False
-            assert mgr.has_active_engine("wt-root") is True
+            assert mgr.has_active_engine("wf-root") is True
             assert mgr.has_active_engine("missing-root") is False
         finally:
             mgr.close()
@@ -198,13 +198,13 @@ class TestThreadContextManager:
                 thread_root_id="thread-1",
                 chat_id="chat1",
                 project_id="proj1",
-                mode="worktree",
+                mode="workflow",
                 tool_name="codex",
                 model_name="gpt-5.5",
             )
 
             assert ctx.thread_root_id == "thread-1"
-            assert ctx.mode == "worktree"
+            assert ctx.mode == "workflow"
             assert ctx.tool_name == "codex"
             assert ctx.model_name == "gpt-5.5"
             assert mgr.get_engine_context("thread-1") is ctx

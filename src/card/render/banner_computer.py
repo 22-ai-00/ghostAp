@@ -44,6 +44,4 @@ def _format_phase(metadata: CardMetadata, runtime: RuntimeStats) -> str:
         cycle = runtime.spec_cycle if runtime.spec_cycle is not None else "?"
         persp = runtime.spec_perspective or "—"
         return f"cycle {cycle}/{persp}"
-    if engine == "worktree":
-        return f"wt·{runtime.worktree_subagent or '?'}"
     return "进行中"

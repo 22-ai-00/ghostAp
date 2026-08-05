@@ -332,19 +332,10 @@ class TestAtomKindHandlers:
                 "p1",
                 "Build",
             ),
-            (
-                lambda: __import__("src.card.state.models", fromlist=["WorktreeUnitsBlock"]).WorktreeUnitsBlock(
-                    block_id="wt1", content="进度信息"
-                ),
-                "worktree_panel",
-                "wt1",
-                None,
-            ),
         ],
         ids=[
             "test_criteria_block_to_criteria_panel_atom",
             "test_phase_block_to_phase_panel_atom",
-            "test_worktree_block_to_worktree_panel_atom",
         ],
     )
     def test_block_to_panel_atom(

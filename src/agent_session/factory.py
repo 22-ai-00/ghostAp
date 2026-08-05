@@ -565,35 +565,3 @@ class EphemeralReviewSession:
             logger.debug("[EphemeralReviewSession] close failed: %s", repr(e))
         finally:
             self._session = None
-
-
-def create_sync_session_for_worktree(
-    *,
-    provider: str = "",
-    tool_name: str = "",
-    working_dir: str,
-    model_name: Optional[str] = None,
-) -> SyncSession:
-    """Create a sync session for a worktree unit.
-
-    Maps *provider*/*tool_name* to an ``agent_type`` understood by
-    :func:`create_sync_session` and uses *working_dir* as the session cwd
-    so the agent operates inside its dedicated worktree directory.
-
-    Provider mapping:
-    - ``"ttadk"`` → ``"ttadk_{tool_name}"``  (TTADK CLI bridge)
-    - ``"cli"``   → ``tool_name`` as-is, typically ``"claude"``
-    - ``"acp"``   → ``tool_name`` as-is, e.g. ``"coco"``/``"codex"``
-    - fallback    → ``tool_name or "coco"``
-    """
-    provider = (provider or "").strip().lower()
-    tool_name = (tool_name or "").strip().lower()
-
-    if provider == "ttadk":
-        agent_type = f"ttadk_{tool_name}" if tool_name else "ttadk_coco"
-    elif provider == "cli":
-        agent_type = tool_name or "claude"
-    else:
-        agent_type = tool_name or "coco"
-
-    return create_sync_session(agent_type=agent_type, cwd=working_dir, model_name=model_name)

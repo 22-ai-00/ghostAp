@@ -298,7 +298,7 @@ def build_employee_creation_card(
     """Build interactive card for creating a new employee via Feishu chat.
 
     Tool/model lists are discovered from the same ACP provider registry
-    that Deep, Spec, Worktree, and Workflow use. Falls back to static
+    that Deep, Spec, and Workflow use. Falls back to static
     defaults only when discovery fails.
     """
     roles = available_roles or ["coder", "reviewer", "planner", "tester", "researcher"]

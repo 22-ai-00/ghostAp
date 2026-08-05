@@ -6,12 +6,6 @@ renders correctly to card JSON.
 import json
 
 from src.card.events import CardEvent, CardEventType
-from src.card.events.worktree import (
-    worktree_cleanup,
-    worktree_merge,
-    worktree_progress,
-    worktree_tool_select,
-)
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import render_card
 from src.card.session.config import SessionConfig
@@ -118,34 +112,6 @@ class TestProgressPipeline:
         assert state.footer.progress is None
 
 
-class TestWorktreeProgressPipeline:
-    """Worktree progress events produce correct rendered output."""
-
-    def test_worktree_progress_renders_units(self):
-        meta = CardMetadata(engine_type="worktree", mode_name="Worktree")
-        units = [
-            {"name": "Unit A", "status": "completed", "summary": "done"},
-            {"name": "Unit B", "status": "running"},
-            {"name": "Unit C", "status": "pending"},
-        ]
-        state = _dispatch_sequence([
-            CardEvent.started(),
-            worktree_progress(units, project_id="p1", message="执行中"),
-        ], meta)
-
-        assert len(state.blocks) == 1
-        assert state.blocks[0].kind == "worktree_units"
-        block = state.blocks[0]
-        data = block.data if block.data is not None else __import__("json").loads(block.content)
-        assert data["units"][0]["name"] == "Unit A"
-        assert data["completed"] == 1
-        assert state.footer.progress is not None
-        assert state.footer.progress_pct == 33
-
-        rendered = render_card(state, RenderBudget())
-        assert len(rendered) >= 1
-
-
 class TestCriteriaUpdatedPipeline:
     """CRITERIA_UPDATED event inserts ContentBlock and renders criteria section."""
 
@@ -186,40 +152,6 @@ class TestCriteriaUpdatedPipeline:
         assert state.engine_ext.criteria_satisfied == 1
 
 
-class TestWorktreeProgressBoundary:
-    """WORKTREE_PROGRESS boundary paths: empty units, all 100% complete."""
-
-    def test_worktree_progress_empty_units(self):
-        meta = CardMetadata(engine_type="worktree", mode_name="Worktree")
-        state = _dispatch_sequence([
-            CardEvent.started(),
-            worktree_progress([], project_id="p1"),
-        ], meta)
-
-        assert len(state.blocks) == 1
-        block = state.blocks[0]
-        data = block.data if block.data is not None else json.loads(block.content)
-        assert data["units"] == []
-        # No progress when empty (None or 0)
-        assert state.footer.progress_pct is None or state.footer.progress_pct == 0
-
-    def test_worktree_progress_all_complete(self):
-        meta = CardMetadata(engine_type="worktree", mode_name="Worktree")
-        units = [
-            {"name": "A", "status": "completed"},
-            {"name": "B", "status": "completed"},
-            {"name": "C", "status": "completed"},
-        ]
-        state = _dispatch_sequence([
-            CardEvent.started(),
-            worktree_progress(units, project_id="p1", message="全部完成"),
-        ], meta)
-
-        assert state.footer.progress_pct == 100
-        # Footer should indicate finishing up
-        assert "正在收尾" in (state.footer.status_text or "")
-
-
 class TestCyclePhasePipeline:
     """Cycle/Phase events produce correct state and render."""
 
@@ -243,97 +175,6 @@ class TestCyclePhasePipeline:
 
         rendered = render_card(state, RenderBudget())
         assert len(rendered) >= 1
-
-
-class TestWorktreeEndToEndPipeline:
-    """Full pipeline: Reporter → CardEvent → Reducer → Render for worktree merge flow."""
-
-    def test_reporter_to_render_full_chain(self):
-        """Construct real WorktreeUnits, generate merge_notes, dispatch, render."""
-        from src.worktree_engine.models import WorktreeUnit, WorktreeUnitStatus
-        from src.worktree_engine.reporter import WorktreeReporter
-
-        # 1. Create realistic WorktreeUnit list
-        units = [
-            WorktreeUnit(
-                unit_id="u1",
-                display_name="Frontend",
-                branch_name="feat/frontend",
-                worktree_path="/tmp/wt/frontend",
-                status=WorktreeUnitStatus.COMPLETED,
-                task_title="Build UI",
-            ),
-            WorktreeUnit(
-                unit_id="u2",
-                display_name="Backend",
-                branch_name="feat/backend",
-                worktree_path="/tmp/wt/backend",
-                status=WorktreeUnitStatus.COMPLETED,
-                task_title="Build API",
-            ),
-        ]
-
-        # 2. Reporter generates merge_notes (list[dict])
-        merge_notes = WorktreeReporter().build_merge_notes(units, "main")
-        assert isinstance(merge_notes, list)
-        assert len(merge_notes) == 2
-        assert all(isinstance(mn, dict) for mn in merge_notes)
-        assert all("branch" in mn and "status" in mn for mn in merge_notes)
-        assert merge_notes[0]["branch"] == "feat/frontend"
-        assert merge_notes[1]["branch"] == "feat/backend"
-
-        # 3. Create CardEvent via factory (validates payload)
-        event = worktree_cleanup(
-            merge_notes=merge_notes,
-            base_branch="main",
-            cleanup_phase="summary",
-        )
-        assert event.type == CardEventType.WORKTREE_CLEANUP
-
-        # 4. Reduce: dispatch through the reducer
-        meta = CardMetadata(engine_type="worktree", mode_name="Worktree")
-        state = _dispatch_sequence([CardEvent.started(), event], meta)
-
-        # 5. Verify state contains merge data
-        wt_blocks = [b for b in state.blocks if b.kind == "worktree_cleanup"]
-        assert len(wt_blocks) == 1
-        block_data = wt_blocks[0].data
-        assert block_data is not None
-        assert block_data["merge_notes"] == merge_notes
-        assert block_data["base_branch"] == "main"
-
-        # 6. Render: should produce valid card JSON without errors
-        rendered = render_card(state, RenderBudget())
-        assert len(rendered) >= 1
-        card_json = rendered[0]._card_json
-        # Verify branch info appears in rendered output
-        card_str = json.dumps(card_json, ensure_ascii=False)
-        assert "feat/frontend" in card_str
-        assert "feat/backend" in card_str
-
-    def test_reporter_merge_notes_structure_matches_event_validation(self):
-        """Ensure reporter output directly passes event factory validation."""
-        from src.worktree_engine.models import WorktreeUnit, WorktreeUnitStatus
-        from src.worktree_engine.reporter import WorktreeReporter
-
-        units = [
-            WorktreeUnit(
-                unit_id="u1",
-                display_name="Service",
-                branch_name="feat/service",
-                status=WorktreeUnitStatus.COMPLETED,
-            ),
-        ]
-
-        merge_notes = WorktreeReporter().build_merge_notes(units, "develop")
-
-        # This should NOT raise — reporter output matches expected schema
-        event = worktree_merge(
-            merge_notes=merge_notes,
-            base_branch="develop",
-        )
-        assert event.type == CardEventType.WORKTREE_MERGE
-        assert event.payload["merge_notes"][0]["branch"] == "feat/service"
 
 
 class TestCancelledPipeline:
@@ -373,47 +214,6 @@ class TestCancelledPipeline:
         assert state.terminal == "cancelled"
         # Footer should reflect terminal state
         assert state.footer.status is None or state.footer.status == "idle"
-
-
-class TestCancelledWorktreePipeline:
-    """CANCELLED in worktree context preserves warning_banner and injects restart button."""
-
-    def test_cancelled_after_worktree_progress_preserves_banner(self):
-        meta = CardMetadata(engine_type="worktree", mode_name="Worktree")
-        units = [
-            {"name": "Unit A", "status": "running"},
-            {"name": "Unit B", "status": "completed"},
-        ]
-        state = _dispatch_sequence([
-            CardEvent.started(),
-            worktree_progress(units, project_id="p1", message="执行中"),
-            CardEvent(type=CardEventType.WARNING_UPDATED, payload={"warning": "⚠️ 资源紧张"}),
-            CardEvent.cancelled(),
-        ], meta)
-
-        assert state.terminal == "cancelled"
-        # Warning banner preserved across cancel
-        assert state.footer.warning_banner == "⚠️ 资源紧张"
-        # Restart button injected for worktree engine
-        assert len(state.buttons) == 1
-        assert state.buttons[0].action_id == ButtonIntent.WORKTREE_RETRY_FAILED
-
-    def test_cancelled_worktree_renders_without_error(self):
-        meta = CardMetadata(engine_type="worktree", mode_name="Worktree")
-        units = [{"name": "A", "status": "completed"}]
-        state = _dispatch_sequence([
-            CardEvent.started(),
-            worktree_progress(units, project_id="p1"),
-            CardEvent.cancelled(reason="ttl_expired"),
-        ], meta)
-
-        assert state.terminal == "cancelled"
-        assert state.terminal_reason == "ttl_expired"
-        rendered = render_card(state, RenderBudget())
-        assert len(rendered) >= 1
-        card_json = rendered[0]._card_json
-        json_str = json.dumps(card_json, ensure_ascii=False)
-        assert "已取消" in json_str
 
 
 class TestDeepProgressVisualBar:
@@ -526,68 +326,6 @@ class TestSpecEngineE2ESmokeTest:
         assert len(state.buttons) == 2
         assert "重新开始" in state.buttons[0].text
         assert "查看状态" in state.buttons[1].text
-        rendered = render_card(state, RenderBudget())
-        assert len(rendered) >= 1
-
-
-class TestWorktreeEngineE2ESmokeTest:
-    """Worktree engine full lifecycle: selection → execution → merge → cleanup → completed."""
-
-    def test_worktree_full_lifecycle_renders(self):
-        meta = CardMetadata(engine_type="worktree", mode_name="Worktree")
-        tools = [
-            {"id": "coco", "name": "Coco", "description": "AI coding assistant"},
-            {"id": "claude", "name": "Claude", "description": "Claude CLI"},
-        ]
-        units = [
-            {"name": "Coco", "status": "completed", "summary": "done"},
-            {"name": "Claude", "status": "completed", "summary": "done"},
-        ]
-        merge_notes = [
-            {"branch": "wt/coco-main", "status": "ready"},
-            {"branch": "wt/claude-main", "status": "ready"},
-        ]
-
-        state = _dispatch_sequence([
-            CardEvent.started(),
-            # Selection phase
-            worktree_tool_select(tools, selected=["coco", "claude"]),
-            # Execution phase
-            worktree_progress(units, project_id="p1", message="All done"),
-            # Merge phase
-            worktree_merge(merge_notes=merge_notes, base_branch="main"),
-            # Cleanup phase
-            worktree_cleanup(
-                merge_notes=merge_notes, base_branch="main", cleanup_phase="summary",
-                merge_results=[
-                    {"branch": "wt/coco-main", "success": True},
-                    {"branch": "wt/claude-main", "success": True},
-                ],
-            ),
-            # Final completion
-            CardEvent.completed(summary="Worktree execution complete"),
-        ], meta)
-
-        assert state.terminal == "completed"
-        rendered = render_card(state, RenderBudget())
-        assert len(rendered) >= 1
-        card_str = json.dumps(rendered[0]._card_json, ensure_ascii=False)
-        assert "Worktree" in card_str or "complete" in card_str
-
-    def test_worktree_failed_unit_shows_retry(self):
-        meta = CardMetadata(engine_type="worktree", mode_name="Worktree")
-        units = [
-            {"name": "Coco", "status": "completed"},
-            {"name": "Claude", "status": "failed", "error": "timeout"},
-        ]
-        state = _dispatch_sequence([
-            CardEvent.started(),
-            worktree_progress(units, project_id="p1"),
-            CardEvent.failed("1 unit failed"),
-        ], meta)
-
-        assert state.terminal == "failed"
-        assert any(b.action_id == ButtonIntent.WORKTREE_RETRY_FAILED for b in state.buttons)
         rendered = render_card(state, RenderBudget())
         assert len(rendered) >= 1
 

@@ -1,7 +1,7 @@
 """Slash command parsing and normalization.
 
 This module is the single source of truth for how GhostAP interprets
-user-entered slash commands (e.g. ``/wt <goal>``).
+user-entered slash commands (e.g. ``/deep <goal>``).
 
 Design goals:
 - Case-insensitive command matching (only the command token is normalized).
@@ -28,8 +28,8 @@ class CommandMatch:
     跨模块稳定字段（最小契约）：
     - raw_text: 原始输入文本（仅用于日志/回显；不要用它做业务解析）
     - normalized_text: strip 后的文本（保留内部空白，用于一致性回显）
-    - raw_command: 用户输入的命令 token（lower 后，例如 "/wt"）
-    - command: 规范化后的 canonical 命令（例如 "/worktree"）
+    - raw_command: 用户输入的命令 token（lower 后，例如 "/deep"）
+    - command: 规范化后的 canonical 命令（例如 "/deep"）
     - args: 命令 token 之后的参数串（strip 后，保留内部空白）
     - has_args: args 是否非空
 

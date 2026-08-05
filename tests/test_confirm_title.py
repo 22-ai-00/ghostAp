@@ -24,27 +24,6 @@ class TestGetConfirmTitleWhiteList:
     def test_spec_stop(self):
         assert _get_confirm_title("intent.spec.stop") == "确定停止当前任务？"
 
-    # --- Cancel intent (distinct from stop) ---
-
-    def test_worktree_cancel_is_cancel_not_stop(self):
-        """intent.worktree.cancel should map to '取消当前操作', NOT '强制停止当前任务'."""
-        result = _get_confirm_title("intent.worktree.cancel")
-        assert result == "取消当前操作"
-        assert result != "强制停止当前任务"
-
-    # --- Execute ---
-
-    def test_worktree_confirm_start(self):
-        assert _get_confirm_title("intent.worktree.confirm_start") == "开始执行任务"
-
-    # --- Merge/cleanup ---
-
-    def test_worktree_merge(self):
-        assert _get_confirm_title("intent.worktree.merge") == "合并分支"
-
-    def test_worktree_cleanup(self):
-        assert _get_confirm_title("intent.worktree.cleanup") == "清理 Worktree"
-
     # --- Approval ---
 
     def test_approval_approve(self):
@@ -69,13 +48,13 @@ class TestGetConfirmTitleNoSubstringMatching:
         assert result == "确认操作"
 
     def test_retry_substring_does_not_match(self):
-        """'worktree_retry_failed' (not a registered intent) should NOT match retry."""
-        result = _get_confirm_title("worktree_retry_failed")
+        """An unregistered retry action should not match a registered intent."""
+        result = _get_confirm_title("unknown_retry_failed")
         assert result == "确认操作"
 
     def test_merge_substring_does_not_match(self):
-        """'worktree_merge_branches' (not registered) should NOT match merge."""
-        result = _get_confirm_title("worktree_merge_branches")
+        """An unregistered merge action should not match a registered intent."""
+        result = _get_confirm_title("unknown_merge_branches")
         assert result == "确认操作"
 
 
@@ -109,7 +88,7 @@ class TestDeadKeyFallback:
     @pytest.mark.parametrize("dead_key", [
         "intent.spec.retry",
         "intent.deep.retry",
-        "intent.worktree.execute",
+        "intent.unknown.execute",
     ])
     def test_dead_key_returns_default(self, dead_key: str):
         """Removed dead key should return generic default fallback."""

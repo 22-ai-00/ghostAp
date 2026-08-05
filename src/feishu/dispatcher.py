@@ -117,10 +117,6 @@ class MessageDispatcher:
                 payload={"command_match": ctx.command_match},
             )
 
-        # Worktree awaiting goal
-        if ctx.has_project and self.client._is_worktree_awaiting_goal(ctx.project):
-            return RouteDecision(target=RouteTarget.WORKTREE_GOAL)
-
         # Active programming mode
         if ctx.is_in_programming:
             return RouteDecision(target=RouteTarget.PROGRAMMING_MODE)
@@ -434,14 +430,6 @@ class MessageDispatcher:
                 project,
                 command_match=command_match,
             )
-            return
-
-        # Worktree mode
-        if project and self.client._is_worktree_awaiting_goal(project):
-            if not current_dispatch_allowed():
-                return
-            self.client._add_reaction(message_id, EmojiReaction.on_processing())
-            self.client._handle_worktree_execute(message_id, chat_id, text, project)
             return
 
         # Programming mode (Coco / Claude / TTADK): exit or forward to active session

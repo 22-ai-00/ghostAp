@@ -151,8 +151,6 @@ class TestOnTTLExpired:
 
     @pytest.mark.parametrize("cmd,expected_key", [
         ("/deep", "card_session_ttl_expired_deep"),
-        ("/wt", "card_session_ttl_expired_worktree"),
-        ("/worktree", "card_session_ttl_expired_worktree"),
         ("/spec", "card_session_ttl_expired_spec"),
         ("/unknown", "card_session_ttl_expired"),
     ])

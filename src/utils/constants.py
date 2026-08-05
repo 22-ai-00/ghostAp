@@ -1,7 +1,7 @@
 """Shared constants used across engine and card layers."""
 
 # ──────────────────────────────────────────────────────────────
-# Worktree unit status → display text mapping
+# Engine unit status → display text mapping
 # ──────────────────────────────────────────────────────────────
 STATUS_DISPLAY_MAP: dict[str, str] = {
     "completed": "已完成",

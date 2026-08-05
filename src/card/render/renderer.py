@@ -27,7 +27,6 @@ from src.card.render.review import render_review_role_panel
 from src.card.render.spec_artifacts import render_spec_plan_panel, render_spec_task_panel
 from src.card.render.sticky_head import build_sticky_head
 from src.card.render.tools import build_subagent_dispatch_atom, render_tool_panel
-from src.card.render.worktree import render_worktree_panel
 from src.card.state.models import CardState, ContentBlock
 from src.card.text_stream import soft_join_text_fragments
 from src.card.themes import PANEL_STYLES
@@ -38,7 +37,7 @@ from src.utils.text import utf8_replace_bytes
 logger = logging.getLogger(__name__)
 
 _STATUS_ATOM_KINDS = frozenset({"warning_banner", "progress_bar", "phase_panel", "criteria_panel", "task_list"})
-_BODY_ATOM_KINDS = frozenset({"text", "image", "reasoning", "plan", "worktree_panel", "subagent_dispatch", "activity_digest", "tool_panel", "review_role", "spec_plan", "spec_task", "execution_current", "execution_history"})
+_BODY_ATOM_KINDS = frozenset({"text", "image", "reasoning", "plan", "subagent_dispatch", "activity_digest", "tool_panel", "review_role", "spec_plan", "spec_task", "execution_current", "execution_history"})
 _MIN_STREAMING_TEXT_CHARS = 2
 _FENCE_LINE_RE = re.compile(r"^(?P<indent>\s{0,3})(?P<escaped>\\?)(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 _FENCE_LANGUAGE_ALIASES = {
@@ -461,14 +460,6 @@ def _render_atom_phase_banner(atom: RenderAtom, state: CardState, budget: Render
     return {"tag": "markdown", "content": atom.content}
 
 
-def _render_atom_worktree_panel(atom: RenderAtom, state: CardState, budget: RenderBudget, block_index: dict) -> dict | None:
-    """Look up the ContentBlock for this atom and delegate to render_worktree_panel."""
-    block = block_index.get(atom.block_id)
-    if block is None:
-        return {"tag": "markdown", "content": atom.content}
-    return render_worktree_panel(block)
-
-
 def _render_atom_task_list(atom: RenderAtom, state: CardState, budget: RenderBudget, block_index: dict) -> dict | None:
     """Look up the ContentBlock for this atom and delegate to render_task_list_panel."""
     from src.card.render.task_list import render_task_list_panel
@@ -543,7 +534,6 @@ _ATOM_RENDERERS: dict[str, Callable[[RenderAtom, CardState, RenderBudget, dict],
     "warning_banner": _render_atom_warning_banner,
     "progress_bar": _render_atom_progress_bar,
     "phase_banner": _render_atom_phase_banner,
-    "worktree_panel": _render_atom_worktree_panel,
     "task_list": _render_atom_task_list,
     "activity_digest": _render_atom_activity_digest,
     "review_role": _render_atom_review_role,

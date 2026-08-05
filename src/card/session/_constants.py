@@ -13,8 +13,6 @@ from src.card.engine_meta import ENGINE_CMD_MAP, ENGINE_NAME_MAP
 TTL_ENGINE_KEY_MAP: dict[str, str] = {
     "/spec": "card_session_ttl_expired_spec",
     "/deep": "card_session_ttl_expired_deep",
-    "/wt": "card_session_ttl_expired_worktree",
-    "/worktree": "card_session_ttl_expired_worktree",
 }
 
 # Action ID for TTL keep-alive button (mirrors src.card.actions.dispatch.TTL_KEEP_ALIVE)

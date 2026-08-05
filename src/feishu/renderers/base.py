@@ -107,7 +107,7 @@ class EngineProfile:
     to ``BaseRenderer._setup_engine_session``.
     """
 
-    engine_type: str       # "deep" | "spec" | "worktree"
+    engine_type: str       # "deep" | "spec"
     mode_name: str         # "Deep" | "Spec"
     mode_emoji: str        # "🧠" | "📋"
     engine_cmd: str        # "/deep" | "/spec"

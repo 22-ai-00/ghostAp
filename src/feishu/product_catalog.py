@@ -26,7 +26,6 @@ class ExecutionLane(str, Enum):
     DIRECT = "direct"
     DEEP = "deep"
     SPEC = "spec"
-    WORKTREE = "worktree"
     WORKFLOW = "workflow"
     TEAM = "team"
     SLOCK = "slock"
@@ -166,7 +165,6 @@ PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/spec_guide", "补充 Spec Engine 引导", "/spec_guide <引导>", protects_from_auto_activation=True),
     _action("/spec_recover", "恢复失败的 Spec Engine 任务", "/spec_recover [任务ID]", protects_from_auto_activation=True),
     _action("/stop_spec", "停止 Spec Engine 任务", protects_from_auto_activation=True),
-    _action("/worktree", "启动 Worktree 多工具并行执行", "/worktree [目标]", aliases=("/wt",), compatibility=CompatibilityBehavior.REWRITE),
     _action("/wf", "启动多 Agent Workflow", "/wf <需求>", aliases=("/workflow",)),
     _action("/wf_status", "查看当前 Workflow 进度", aliases=("/workflow_status",)),
     _action("/wf_help", "查看 Workflow 使用帮助", aliases=("/workflow_help",)),
@@ -254,7 +252,6 @@ _EXECUTION_LANE_DESCRIPTORS: tuple[ExecutionLaneDescriptor, ...] = (
     ),
     ExecutionLaneDescriptor(ExecutionLane.DEEP, "deep", "Deep", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),
     ExecutionLaneDescriptor(ExecutionLane.SPEC, "spec", "Spec", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),
-    ExecutionLaneDescriptor(ExecutionLane.WORKTREE, "worktree", "Worktree", CompletionLabel.DEVELOPING, RuntimeHealth.AVAILABLE, compatibility_alias_action_ids=("worktree",), blocking_reason="统一 Worktree adapter 合同尚未完成；当前入口仍按既有终态与评审门禁执行。"),
     ExecutionLaneDescriptor(ExecutionLane.WORKFLOW, "wf", "Workflow", CompletionLabel.DEVELOPING, RuntimeHealth.AVAILABLE, compatibility_alias_action_ids=("wf",), blocking_reason="冻结 IR v2 与耐久执行端口尚未完成；当前 Workflow 保持既有 RunSpec 与 reviewer 合同。"),
     ExecutionLaneDescriptor(ExecutionLane.TEAM, "team", "Team", CompletionLabel.DEVELOPING, RuntimeHealth.AVAILABLE, ("new-team",), blocking_reason="Team 的统一耐久任务图尚未收敛；当前群协作入口仍按现有员工运行时执行。"),
     ExecutionLaneDescriptor(ExecutionLane.SLOCK, "slock", "Slock", CompletionLabel.DEVELOPING, RuntimeHealth.AVAILABLE, blocking_reason="Slock 尚未收敛到唯一执行事实源；当前命令和卡片动作继续保持兼容。"),

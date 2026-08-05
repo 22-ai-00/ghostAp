@@ -253,7 +253,7 @@ class EmojiHook:
         """Add emoji reaction based on terminal reason.
 
         Archived sessions (rotated out) get no emoji reaction.
-        When message_id is empty, gracefully skip (degraded mode for worktree without reply_to).
+        When message_id is empty, gracefully skip in degraded delivery mode.
         """
         if reason == "archived":
             return

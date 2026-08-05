@@ -421,7 +421,7 @@ class SpecHandler(BaseEngineHandler):
     ) -> None:
         project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
         if not project:
-            self.reply_error(message_id, UI_TEXT["system_worktree_project_not_found"])
+            self.reply_error(message_id, UI_TEXT["spec_review_project_not_found"])
             return
         requirement = self._spec_review_pending_requirement(project)
         if not requirement:
@@ -445,7 +445,7 @@ class SpecHandler(BaseEngineHandler):
         value = value or {}
         project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
         if not project:
-            self.reply_error(message_id, UI_TEXT["system_worktree_project_not_found"])
+            self.reply_error(message_id, UI_TEXT["spec_review_project_not_found"])
             return
         thread_root_id = self._spec_review_thread_root_id(
             self._spec_review_value_thread_root(value),
@@ -461,7 +461,7 @@ class SpecHandler(BaseEngineHandler):
         except (TypeError, ValueError):
             model_page = 0
         if not tool_name:
-            self.reply_error(message_id, UI_TEXT["system_worktree_select_tool_error"])
+            self.reply_error(message_id, UI_TEXT["spec_review_select_tool_error"])
             return
 
         ctrl = self._spec_review_selection_controller()
@@ -531,7 +531,7 @@ class SpecHandler(BaseEngineHandler):
                 project=project,
                 tools=model_tools,
                 selected=[item.to_dict() for item in ctrl._get_state(project).selected_items],
-                message=UI_TEXT["system_worktree_select_model_prompt"].format(tool=option.display_name),
+                message=UI_TEXT["spec_review_select_model_prompt"].format(tool=option.display_name),
                 select_action=SPEC_REVIEW_SELECT_MODEL,
                 pending_tool=option.display_name,
                 thread_root_id=thread_root_id,
@@ -569,7 +569,7 @@ class SpecHandler(BaseEngineHandler):
         value = value or {}
         project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
         if not project:
-            self.reply_error(message_id, UI_TEXT["system_worktree_project_not_found"])
+            self.reply_error(message_id, UI_TEXT["spec_review_project_not_found"])
             return
         thread_root_id = self._spec_review_thread_root_id(
             self._spec_review_value_thread_root(value),
@@ -611,7 +611,7 @@ class SpecHandler(BaseEngineHandler):
         value = value or {}
         project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
         if not project:
-            self.reply_error(message_id, UI_TEXT["system_worktree_project_not_found"])
+            self.reply_error(message_id, UI_TEXT["spec_review_project_not_found"])
             return
         thread_root_id = self._spec_review_thread_root_id(
             self._spec_review_value_thread_root(value),
@@ -638,7 +638,7 @@ class SpecHandler(BaseEngineHandler):
     ) -> None:
         project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
         if not project:
-            self.reply_error(message_id, UI_TEXT["system_worktree_project_not_found"])
+            self.reply_error(message_id, UI_TEXT["spec_review_project_not_found"])
             return
         thread_root_id = self._spec_review_thread_root_id(
             self._spec_review_value_thread_root(value),
@@ -665,7 +665,7 @@ class SpecHandler(BaseEngineHandler):
     ) -> None:
         project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
         if not project:
-            self.reply_error(message_id, UI_TEXT["system_worktree_project_not_found"])
+            self.reply_error(message_id, UI_TEXT["spec_review_project_not_found"])
             return
         thread_root_id = self._spec_review_thread_root_id(
             self._spec_review_value_thread_root(value),
@@ -692,7 +692,7 @@ class SpecHandler(BaseEngineHandler):
     ) -> None:
         project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
         if not project:
-            self.reply_error(message_id, UI_TEXT["system_worktree_project_not_found"])
+            self.reply_error(message_id, UI_TEXT["spec_review_project_not_found"])
             return
         start_message_id = self._spec_review_thread_root_id(
             self._spec_review_value_thread_root(value),
@@ -706,7 +706,7 @@ class SpecHandler(BaseEngineHandler):
             return
         state = ctrl.finalize_selection(project)
         if not state.selected_items:
-            self.reply_error(message_id, UI_TEXT["system_worktree_no_selection_error"])
+            self.reply_error(message_id, UI_TEXT["spec_review_no_selection_error"])
             return
         review_agents = [
             ReviewAgentBinding.from_selection_item(item)

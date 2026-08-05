@@ -34,19 +34,3 @@ def test_programming_direct_mode_omits_redundant_phase_banner():
         if element.get("tag") == "collapsible_panel"
     ]
     assert not any("任务列表" in title for title in panel_titles)
-
-
-def test_worktree_subagent_banner_prefix():
-    state = CardState(
-        metadata=CardMetadata(mode_name="Worktree", mode_emoji="🌲", engine_type="worktree"),
-        header=HeaderState(title="Worktree"),
-        blocks=(),
-        terminal="running",
-    )
-    object.__setattr__(state, "runtime_stats", RuntimeStats(elapsed_seconds=72.0, worktree_subagent="aiden"))
-
-    pages = render_card(state, RenderBudget())
-
-    body = pages[0]._card_json["body"]["elements"]
-    first = body[0]
-    assert "wt·aiden" in first.get("content", "")

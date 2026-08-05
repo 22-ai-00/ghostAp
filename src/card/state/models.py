@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Literal, TypeAlias, TypedDict, Union, get_args
+from typing import TYPE_CHECKING, ClassVar, Literal, TypeAlias, Union, get_args
 
 from .runtime_stats import RuntimeStats
 
@@ -43,7 +43,7 @@ class CardMetadata:
     iteration_total: int | None = None
     tool_name: str | None = None
     model_name: str | None = None
-    engine_type: str | None = None  # "deep" / "spec" / "worktree" / None
+    engine_type: str | None = None  # "deep" / "spec" / None
     compact: bool = False
     expanded: bool = False
     expand_ac: bool = False
@@ -213,100 +213,6 @@ class CriteriaBlock:
     status: BlockStatus = "active"
 
 
-# --- Worktree per-kind TypedDicts for structured data ---
-
-
-class WorktreeToolSelectData(TypedDict, total=False):
-    """Structured data for worktree_tool_select blocks."""
-    tools: list[dict]
-    selected: list[str]
-    message: str
-
-
-class WorktreeConfirmData(TypedDict, total=False):
-    """Structured data for worktree_confirm blocks."""
-    selected_items: list[dict]
-    goal: str
-    message: str
-
-
-class WorktreeUnitsData(TypedDict, total=False):
-    """Structured data for worktree_units blocks."""
-    units: list[dict]
-    message: str
-    completed: int
-    total: int
-
-
-class WorktreeMergeData(TypedDict, total=False):
-    """Structured data for worktree_merge blocks."""
-    merge_notes: list[dict]
-    base_branch: str
-
-
-class WorktreeCleanupData(TypedDict, total=False):
-    """Structured data for worktree_cleanup blocks."""
-    merge_notes: list[dict]
-    base_branch: str
-    merge_results: list[dict] | None
-    cleanup_phase: str
-
-
-@dataclass(frozen=True)
-class _WorktreeBlockBase:
-    """Base class for all worktree lifecycle blocks.
-
-    All worktree blocks share the same structure, differing only in
-    ``kind`` literal and ``data`` typing. Subclasses override these.
-    """
-    _atom_kind: ClassVar[str] = "worktree_panel"
-    kind: str = ""
-    block_id: str = ""
-    content: str = ""
-    element_id: str | None = None
-    status: BlockStatus = "active"
-    data: dict | None = None
-
-    def __post_init__(self) -> None:
-        if self.data is not None:
-            object.__setattr__(self, "data", copy.deepcopy(self.data))
-
-
-@dataclass(frozen=True)
-class WorktreeSelectBlock(_WorktreeBlockBase):
-    """Worktree tool selection block."""
-    kind: Literal["worktree_tool_select"] = "worktree_tool_select"
-    data: WorktreeToolSelectData | dict | None = None
-
-
-@dataclass(frozen=True)
-class WorktreeConfirmBlock(_WorktreeBlockBase):
-    """Worktree confirmation block."""
-    kind: Literal["worktree_confirm"] = "worktree_confirm"
-    data: WorktreeConfirmData | dict | None = None
-
-
-@dataclass(frozen=True)
-class WorktreeUnitsBlock(_WorktreeBlockBase):
-    """Worktree execution progress block."""
-    kind: Literal["worktree_units"] = "worktree_units"
-    data: WorktreeUnitsData | dict | None = None
-
-
-@dataclass(frozen=True)
-class WorktreeMergeBlock(_WorktreeBlockBase):
-    """Worktree merge block."""
-    kind: Literal["worktree_merge"] = "worktree_merge"
-    data: WorktreeMergeData | dict | None = None
-
-
-@dataclass(frozen=True)
-class WorktreeCleanupBlock(_WorktreeBlockBase):
-    """Worktree cleanup block."""
-    kind: Literal["worktree_cleanup"] = "worktree_cleanup"
-    data: WorktreeCleanupData | dict | None = None
-
-
 @dataclass(frozen=True)
 class TaskListBlock:
     """Task list block — shows all tasks and highlights current task."""
@@ -380,8 +286,7 @@ class SpecTaskBlock:
 # Tagged-union type alias
 AnyContentBlock: TypeAlias = Union[
     TextBlock, ToolBlock, ReasoningBlock, ImageBlock, PlanBlock, PhaseBlock, CriteriaBlock,
-    WorktreeSelectBlock, WorktreeConfirmBlock, WorktreeUnitsBlock,
-    WorktreeMergeBlock, WorktreeCleanupBlock, TaskListBlock, SeparatorBlock,
+    TaskListBlock, SeparatorBlock,
     ReviewRoleBlock, SpecPlanBlock, SpecTaskBlock,
 ]
 """Union of all content block types. Use isinstance() for type-safe dispatch."""
@@ -395,11 +300,6 @@ _BLOCK_KIND_MAP: dict[str, type] = {
     "plan": PlanBlock,
     "phase": PhaseBlock,
     "criteria": CriteriaBlock,
-    "worktree_tool_select": WorktreeSelectBlock,
-    "worktree_confirm": WorktreeConfirmBlock,
-    "worktree_units": WorktreeUnitsBlock,
-    "worktree_merge": WorktreeMergeBlock,
-    "worktree_cleanup": WorktreeCleanupBlock,
     "task_list": TaskListBlock,
     "separator": SeparatorBlock,
     "review_role": ReviewRoleBlock,
@@ -431,9 +331,8 @@ def ContentBlock(kind: str = "text", **kwargs) -> AnyContentBlock:  # noqa: N802
     Only passes kwargs that the target class accepts, silently ignoring extras.
 
     Extension pattern guidance:
-        - Use ``block.data`` (TypedDict) for UI-rendering-driven structured content
-          that is specific to a single block's visual representation (e.g. worktree
-          tool lists, unit progress, merge notes).
+        - Use ``block.data`` for UI-rendering-driven structured content that is
+          specific to a single block's visual representation.
         - Use ``CardState.engine_ext`` (EngineExtState) for cross-block aggregate
           metadata shared across the entire card (e.g. cycle count, phase info,
           criteria satisfaction counts).

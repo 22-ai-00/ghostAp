@@ -17,7 +17,6 @@ from ._shared import build_header
 _RETRY_ACTIONS: dict[str, str] = {
     "deep": ButtonIntent.DEEP_RESUME,
     "spec": ButtonIntent.SPEC_RESUME,
-    "worktree": ButtonIntent.WORKTREE_RETRY_FAILED,
 }
 
 # Engine type → user-facing command — imported from engine_meta
@@ -27,14 +26,12 @@ _ENGINE_CMD = ENGINE_CMD_MAP
 _STOP_ACTIONS: dict[str, str] = {
     "deep": ButtonIntent.ENGINE_STOP,
     "spec": ButtonIntent.ENGINE_STOP,
-    "worktree": ButtonIntent.WORKTREE_CANCEL,
 }
 
 # Engine-specific retry button CTA text (differentiated by engine_type)
 _RETRY_CTA_TEXT: dict[str, str] = {
     "deep": "🔁 重新执行",
     "spec": "🔁 重新 Build",
-    "worktree": "🔁 重试失败项",
 }
 
 
@@ -179,11 +176,6 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
             # For engines that own the header, preserve it and only change color
             if state.header.header_source == "engine" and state.header.title:
                 header = replace(state.header, template=TERMINAL_TEMPLATES.get("completed", "green"))
-                # For worktree, update title/subtitle to indicate final completion
-                if state.metadata.engine_type == "worktree":
-                    header = replace(header,
-                                     title=UI_TEXT["worktree_header_completed"],
-                                     subtitle=UI_TEXT.get("worktree_completed_subtitle", "全部完成"))
             else:
                 header = build_header(state.metadata, "completed")
             # Append summary content block if provided

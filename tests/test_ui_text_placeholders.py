@@ -1,8 +1,6 @@
 """Test that UI_TEXT does not use deprecated shorthand placeholders."""
 import re
 
-import pytest
-
 from src.card.ui_text import UI_TEXT
 
 # Regex to find {placeholder} patterns in format strings
@@ -26,32 +24,6 @@ class TestUITextPlaceholderConsistency:
                 if placeholder in _DEPRECATED_PLACEHOLDERS:
                     violations.append(f"{key}: found deprecated placeholder {{{placeholder}}}")
         assert violations == [], "Deprecated placeholders found:\n" + "\n".join(violations)
-
-class TestCleanupButtonConsistency:
-    """AC-7: Cleanup buttons use consistent emoji."""
-
-    def test_wt_btn_cleanup_uses_broom_emoji(self):
-        assert "🧹" in UI_TEXT["wt_btn_cleanup"]
-
-    def test_system_worktree_btn_cleanup_uses_broom_emoji(self):
-        assert "🧹" in UI_TEXT["system_worktree_btn_cleanup"]
-
-    def test_removed_system_worktree_alias_keys_do_not_return(self):
-        removed_aliases = {
-            "system_worktree_confirm_title",
-            "system_worktree_confirm_header",
-            "system_worktree_confirm_banner",
-            "system_worktree_btn_confirm",
-            "system_worktree_btn_reselect",
-            "system_worktree_progress_title",
-            "system_worktree_progress_header",
-            "system_worktree_progress_banner",
-            "system_worktree_btn_execute",
-            "system_worktree_btn_retry",
-        }
-
-        assert removed_aliases.isdisjoint(UI_TEXT)
-
 
 class TestTTLPrewarningText:
     """AC-8: TTL prewarning contains time-related closure hint."""
@@ -80,20 +52,6 @@ class TestErrorTextsActionable:
 
     def test_intent_unknown_has_help_hint(self):
         assert "/help" in UI_TEXT["intent_unknown_msg"]
-
-
-class TestWorktreeStepHints:
-    """AC-14: Worktree step hints exist in UI_TEXT."""
-
-    @pytest.mark.parametrize("key", [
-        "worktree_step_tool_select_hint",
-        "worktree_step_confirm_hint",
-        "worktree_step_units_hint",
-        "worktree_step_merge_hint",
-    ])
-    def test_step_hint_exists_and_non_empty(self, key):
-        assert key in UI_TEXT
-        assert len(UI_TEXT[key]) > 0
 
 
 class TestNewPhase3Keys:
@@ -162,7 +120,7 @@ class TestReviewRound2TextCorrections:
         # Generic fallback uses {expired_commands} (not engine_cmd)
         assert "{expired_commands}" in text, f"ttl_expired should include expired_commands placeholder: {text}"
         # Verify it formats without error
-        text.format(expired_commands="/spec /deep /wt")
+        text.format(expired_commands="/spec /deep")
 
     def test_help_tips_two_stage_close(self):
         """system_help_tips must mention advance notification before close."""

@@ -1,7 +1,6 @@
 """Workflow-specific CardEvent factory functions.
 
-Follows the same pattern as worktree.py — keeps workflow construction logic
-separate from the core CardEvent class.
+Keeps workflow construction logic separate from the core CardEvent class.
 
 NOTE: These factory functions define the typed event API for workflow lifecycle
 events. They are not yet wired into the handler layer (the handler currently

@@ -52,16 +52,21 @@ def test_card_styles_compat_module_removed_and_not_referenced_by_production() ->
     assert offenders == []
 
 
-def test_production_code_does_not_call_cardevent_worktree_compat_shims() -> None:
-    """Refactoring-analysis guard: production paths import src.card.events.worktree factories directly."""
-    root = Path(__file__).parent.parent / "src"
+def test_removed_worktree_runtime_modules_are_not_imported() -> None:
+    """Retired Worktree modules must not remain reachable from production imports."""
+    root = Path(__file__).parent.parent
     offenders: list[str] = []
-    for path in root.rglob("*.py"):
-        if path.parts[-3:] == ("card", "events", "factories.py"):
-            continue
-        text = path.read_text(encoding="utf-8")
-        if "CardEvent.worktree_" in text:
-            offenders.append(str(path.relative_to(root.parent)))
+    removed_import_fragments = (
+        "worktree_engine",
+        "handlers.worktree",
+        "renderers.worktree_renderer",
+    )
+    for path in (root / "src").rglob("*.py"):
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not re.match(r"^\s*(?:from|import)\s+", line):
+                continue
+            if any(fragment in line for fragment in removed_import_fragments):
+                offenders.append(f"{path.relative_to(root)}:{line_number}")
 
     assert offenders == []
 

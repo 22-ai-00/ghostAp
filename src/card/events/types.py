@@ -45,13 +45,6 @@ class CardEventType(str, Enum):
     REVIEW_RETRY = "review_retry"
     CRITERIA_UPDATED = "criteria_updated"
     WARNING_UPDATED = "warning_updated"
-    # Worktree engine
-    WORKTREE_PROGRESS = "worktree_progress"
-    WORKTREE_TOOL_SELECT = "worktree_tool_select"
-    WORKTREE_CONFIRM = "worktree_confirm"
-    WORKTREE_CLEANUP = "worktree_cleanup"
-    WORKTREE_MERGE = "worktree_merge"
-    WORKTREE_COMPLETED_NO_CHANGE = "worktree_completed_no_change"
     # Workflow engine
     WORKFLOW_PROGRESS = "workflow_progress"
     WORKFLOW_CONFIRM = "workflow_confirm"

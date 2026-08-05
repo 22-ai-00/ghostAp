@@ -9,7 +9,7 @@ Protected regression scenarios:
 - Deep engine commands (/deep, /deep_status, /stop_deep) must remain routable
 - Spec engine commands (/spec, /spec_status, /stop_spec, ...) must remain routable
 - Exit commands must cover all tool variants (coco/claude/aiden/codex/gemini/traex/ttadk)
-- Alias normalization (/wt -> /worktree) must be preserved
+- Removed Worktree commands must not hide the surviving engine routes
 """
 
 from __future__ import annotations
@@ -67,7 +67,6 @@ EXPECTED_EXACT_COMMANDS = frozenset({
     "/ttadk",
     "/enter_ttadk",
     "/acp",
-    "/worktree",
     "/ttadk_info",
     "/ttadk_refresh",
     "/menu",
@@ -150,14 +149,14 @@ EXPECTED_INTERCEPTABLE_EXACT = frozenset({
     "/ttadk_info",
     "/projects", "/status", "/project", "/switch", "/new-chat",
     "/tasks", "/diff", "/trace",
-    "/ttadk", "/acp", "/worktree",
+    "/ttadk", "/acp",
     "/ttadk_refresh",
     "/menu", "/tools", "/tools_status",
     "/model", "/lock", "/unlock", "/setadmin", "/btw",
 })
 
 EXPECTED_INTERCEPTABLE_PREFIX = frozenset({
-    "/worktree", "/switch", "/new", "/new-chat", "/close",
+    "/switch", "/new", "/new-chat", "/close",
     "/tasks", "/diff", "/trace", "/status", "/model", "/btw", "/setadmin",
 })
 
@@ -246,17 +245,14 @@ class TestExitCommandRouting:
         assert not SystemHandler.is_exit_command("/deep hello")
 
 
-class TestAliasNormalization:
-    """Verify command aliases are preserved."""
+def test_removed_worktree_commands_do_not_hide_active_engines():
+    from src.feishu.product_catalog import ExecutionLane, get_public_actions, resolve_command
 
-    def test_wt_alias_normalized_to_worktree(self):
-        """The /wt alias must normalize to /worktree."""
-        match = SlashCommandParser.parse("/wt")
-        assert match.command == "/worktree", (
-            f"/wt should normalize to /worktree, got '{match.command}'"
-        )
-
-    def test_wt_with_args_normalized(self):
-        """The /wt alias with args must normalize to /worktree."""
-        match = SlashCommandParser.parse("/wt list")
-        assert match.command == "/worktree"
+    assert "/worktree" not in {action.command for action in get_public_actions()}
+    assert {lane.value for lane in ExecutionLane}.isdisjoint({"worktree"})
+    for token in ("/worktree", "/wt"):
+        assert resolve_command(token, "legacy goal") is None
+    for token in ("/deep", "/spec", "/wf"):
+        resolved = resolve_command(token, "keep working")
+        assert resolved is not None
+        assert resolved.action.command == token

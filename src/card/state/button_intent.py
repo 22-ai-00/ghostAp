@@ -15,17 +15,6 @@ class ButtonIntent(str, Enum):
     These are decoupled from the concrete action_id strings used in
     Feishu card schemas. Mapping is handled by render/buttons.py.
     """
-    # Worktree flow
-    WORKTREE_FINISH_SELECTION = "intent.worktree.finish_selection"
-    WORKTREE_CONFIRM_START = "intent.worktree.confirm_start"
-    WORKTREE_MERGE = "intent.worktree.merge"
-    WORKTREE_CLEANUP = "intent.worktree.cleanup"
-    WORKTREE_RETRY_FAILED = "intent.worktree.retry_failed"
-    WORKTREE_RETRY_ALL = "intent.worktree.retry_all"
-    WORKTREE_CANCEL = "intent.worktree.cancel"
-    WORKTREE_SHOW_MENU = "intent.worktree.show_menu"
-    WORKTREE_MODIFY_TARGET = "intent.worktree.modify_target"
-
     # Engine control (shared across deep/spec)
     ENGINE_STOP = "intent.engine.stop"
 

@@ -1414,7 +1414,7 @@ class TestWorkflowToolSelectionFirstFlow(unittest.TestCase):
 
         In the new two-step selection flow, start_workflow() sets up the pending state
         with requirement and session_key, but defers orchestrator_agent and selected_tools
-        to the selection steps handled by WorktreeSelectionController.
+        to the Workflow selection controllers.
         """
         handler, ctx = self._make_handler()
 

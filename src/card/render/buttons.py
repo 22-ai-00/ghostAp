@@ -18,7 +18,6 @@ from src.card.actions.dispatch import (
     REJECT_ACTION,
     SHOW_STATUS,
     SHOW_WORKFLOW_MENU,
-    SHOW_WORKTREE_MENU,
     SPEC_RESUME,
     SPEC_SKIP_RETRY,
     SPEC_STOP,
@@ -35,13 +34,6 @@ from src.card.actions.dispatch import (
     WORKFLOW_REVIEW_SELECT_TOOL,
     WORKFLOW_SELECT_TOOL,
     WORKFLOW_SHOW_HELP,
-    WORKTREE_CANCEL,
-    WORKTREE_CLEANUP,
-    WORKTREE_CONFIRM_START,
-    WORKTREE_FINISH_SELECTION,
-    WORKTREE_MERGE,
-    WORKTREE_RETRY_ALL,
-    WORKTREE_RETRY_FAILED,
 )
 from src.card.engine_meta import ENGINE_LABEL_DEFAULT, ENGINE_LABELS
 from src.card.render.budget import RenderBudget
@@ -53,17 +45,6 @@ from src.card.ui_text import UI_TEXT
 # ButtonIntent → action_id mapping (single source of truth)
 # ---------------------------------------------------------------------------
 INTENT_TO_ACTION_ID: dict[str, str] = {
-    # Worktree
-    ButtonIntent.WORKTREE_FINISH_SELECTION: WORKTREE_FINISH_SELECTION,
-    ButtonIntent.WORKTREE_CONFIRM_START: WORKTREE_CONFIRM_START,
-    ButtonIntent.WORKTREE_MERGE: WORKTREE_MERGE,
-    ButtonIntent.WORKTREE_CLEANUP: WORKTREE_CLEANUP,
-    ButtonIntent.WORKTREE_RETRY_FAILED: WORKTREE_RETRY_FAILED,
-    ButtonIntent.WORKTREE_RETRY_ALL: WORKTREE_RETRY_ALL,
-    ButtonIntent.WORKTREE_CANCEL: WORKTREE_CANCEL,
-    ButtonIntent.WORKTREE_SHOW_MENU: SHOW_WORKTREE_MENU,
-    ButtonIntent.WORKTREE_MODIFY_TARGET: SHOW_WORKTREE_MENU,
-
     # Deep engine
     ButtonIntent.DEEP_RESUME: DEEP_RESUME,
     ButtonIntent.DEEP_STOP: DEEP_STOP,
@@ -104,7 +85,6 @@ logger = logging.getLogger(__name__)
 # Resolved action_ids that require confirm dialog (destructive/irreversible actions)
 _DESTRUCTIVE_ACTIONS = frozenset({
     ENGINE_STOP, DEEP_STOP, SPEC_STOP,
-    WORKTREE_CLEANUP, WORKTREE_MERGE, WORKTREE_CANCEL,
     WORKFLOW_CANCEL,
     APPROVE_ACTION,
 })
@@ -112,13 +92,8 @@ _DESTRUCTIVE_ACTIONS = frozenset({
 # Intents that represent "stop/cancel" actions
 _STOP_INTENTS = frozenset({
     "intent.engine.stop", "intent.deep.stop",
-    "intent.spec.stop", "intent.worktree.cancel",
+    "intent.spec.stop",
     WORKFLOW_CANCEL,
-})
-
-# Cancel intents (distinct from stop — these abort before execution starts)
-_CANCEL_INTENTS = frozenset({
-    "intent.worktree.cancel",
 })
 
 # White-list mapping: action_id (exact match) → confirm dialog title UI_TEXT key
@@ -131,17 +106,8 @@ _CONFIRM_TITLE_MAP: dict[str, str] = {
     # Retry/resume intents
     ButtonIntent.DEEP_RESUME: "card_btn_confirm_retry_title",
     ButtonIntent.SPEC_RESUME: "card_btn_confirm_retry_title",
-    ButtonIntent.WORKTREE_RETRY_FAILED: "card_btn_confirm_retry_title",
-    ButtonIntent.WORKTREE_RETRY_ALL: "card_btn_confirm_retry_title",
-    # Cancel intents — distinct from stop
-    ButtonIntent.WORKTREE_CANCEL: "card_btn_confirm_cancel_title",
     # Workflow
     WORKFLOW_CANCEL: "workflow_btn_confirm_cancel_title",
-    # Execute/start
-    ButtonIntent.WORKTREE_CONFIRM_START: "card_btn_confirm_execute_title",
-    # Merge/cleanup
-    ButtonIntent.WORKTREE_MERGE: "card_btn_confirm_merge_title",
-    ButtonIntent.WORKTREE_CLEANUP: "card_btn_confirm_cleanup_title",
     # Approval
     ButtonIntent.APPROVE: "card_btn_confirm_approve_title",
     ButtonIntent.REJECT: "card_btn_confirm_reject_title",

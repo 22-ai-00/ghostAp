@@ -95,7 +95,6 @@ from ..utils.errors import get_error_detail
 from ..utils.rate_limit import RateLimiter, RateLimitExceededException
 from ..utils.restart_gate import RestartGate
 from ..utils.trace import TraceContext, configure_logging_with_trace
-from ..worktree_engine.manager import WorktreeManager
 from .action_dispatcher import ActionDispatcher
 from .emoji import EmojiReaction
 from .handler_context import HandlerContext
@@ -116,13 +115,11 @@ from .handlers import (
     Tui2acpModeHandler,
     WorkflowHandler,
 )
-from .handlers.worktree import WorktreeHandler
 from .image_handler import FeishuImageHandler
 from .main_slash_commands import reconcile_main_agent_slash_commands
 from .message_cache import MessageCache
 from .renderers.deep_renderer import DeepRenderer
 from .renderers.spec_renderer import SpecRenderer
-from .renderers.worktree_renderer import WorktreeRenderer
 from .slash_command_parser import CommandMatch, SlashCommandParser
 from .ws_card_action_handler import (
     CardActionInspector,
@@ -252,8 +249,7 @@ _SILENT_DEDUP_ACTIONS = {
     "workflow_review_select_model_group",
     "workflow_review_select_model_profile",
     "workflow_review_select_model_effort",
-    "workflow_review_select_model", "worktree_select_tool",
-    "worktree_select_model", "spec_review_select_tool",
+    "workflow_review_select_model", "spec_review_select_tool",
     "spec_review_select_model", "select_ttadk_tool",
     "select_ttadk_model", "select_ttadk_combined",
     "select_ttadk_combined_tool", "select_acp_tool",
@@ -647,8 +643,6 @@ class FeishuWSClient:
         spec_handler.renderer = SpecRenderer(spec_handler)
         project_handler = ProjectHandler(self._handler_ctx)
         system_handler = SystemHandler(self._handler_ctx)
-        worktree_handler = WorktreeHandler(self._handler_ctx)
-        worktree_handler._renderer = WorktreeRenderer(worktree_handler)
         diagnostics_handler = DiagnosticsHandler(self._handler_ctx)
         slock_handler = SlockHandler(self._handler_ctx)
         workflow_handler = WorkflowHandler(self._handler_ctx)
@@ -669,7 +663,6 @@ class FeishuWSClient:
         self._spec_handler = spec_handler
         self._project_handler = project_handler
         self._system_handler = system_handler
-        self._worktree_handler = worktree_handler
         self._diagnostics_handler = diagnostics_handler
         self._slock_handler = slock_handler
         self._workflow_handler = workflow_handler
@@ -697,7 +690,6 @@ class FeishuWSClient:
             "spec": spec_handler,
             "project": project_handler,
             "system": system_handler,
-            "worktree": worktree_handler,
             "diagnostics": diagnostics_handler,
             "slock": slock_handler,
             "workflow": workflow_handler,
@@ -1553,21 +1545,6 @@ class FeishuWSClient:
         """SSOT variant: decide based on request-scoped CommandMatch."""
         return SystemHandler.is_interceptable_command_match(command_match)
 
-    def _is_worktree_awaiting_goal(self, project: "ProjectContext") -> bool:
-        """Return True when worktree journey is awaiting a goal.
-
-        具体判定逻辑下沉到 ``WorktreeManager.is_awaiting_goal``，避免在
-        WS 层拼装布尔条件，统一依赖 WorktreeRuntimeState / journey 状态机。
-        """
-
-        if not getattr(project, "project_id", None):
-            return WorktreeManager.is_awaiting_goal(getattr(project, "worktree_state", None))
-        try:
-            state = self._worktree_handler._worktree_manager().get_state(project)
-        except Exception:
-            state = getattr(project, "worktree_state", None)
-        return WorktreeManager.is_awaiting_goal(state)
-
     @staticmethod
     def _mode_to_context_source(mode) -> ContextSourceMode:
         """将 `InteractionMode` 映射到 `ContextSourceMode`（用于统一上下文记录）。"""
@@ -2263,7 +2240,7 @@ class FeishuWSClient:
 
             # Slash parsing is request-scoped: parse once and reuse.
             # This match becomes the single source of truth for downstream
-            # slash consumers (gate/system/worktree).
+            # slash consumers (gate/system/engines).
             try:
                 command_match = SlashCommandParser.parse(text)
             except Exception:
@@ -2440,7 +2417,7 @@ class FeishuWSClient:
                     **image_kwargs,
                 )
                 # Downloaded image references are part of the effective prompt.
-                # Refresh slash args so consumers such as Worktree receive the
+                # Refresh slash args so engine consumers receive the
                 # same evidence-rich goal as text-based engine handlers.
                 if command_match is not None:
                     enriched_match = SlashCommandParser.parse(text)
@@ -2469,7 +2446,7 @@ class FeishuWSClient:
                             _tctx.project_id,
                             chat_id,
                         )
-                        if _tctx.mode in {"worktree", "deep", "spec", "workflow"}:
+                        if _tctx.mode in {"deep", "spec", "workflow"}:
                             project = thread_project
                         elif not project:
                             project = thread_project or self._project_manager.get_active_project(chat_id)
@@ -2647,7 +2624,7 @@ class FeishuWSClient:
                 set_current_thread_id(thread_ctx.thread_root_id)
                 auto_enter_mode = thread_ctx.mode if thread_ctx.mode != "smart" else None
                 project = self._project_manager.get_project_for_chat(thread_ctx.project_id, chat_id)
-                if not project and thread_ctx.mode not in {"worktree", "deep", "spec", "workflow"}:
+                if not project and thread_ctx.mode not in {"deep", "spec", "workflow"}:
                     project = self._project_manager.get_active_project(chat_id)
                 logger.info(
                     "[Thread] Resolved context: msg_root=%s canonical=%s project=%s mode=%s project_found=%s",
@@ -2677,12 +2654,12 @@ class FeishuWSClient:
         )
 
     def _is_topic_engine_context(self) -> bool:
-        """Return True when the current Feishu topic is owned by Deep/Spec/WT."""
+        """Return True when the current Feishu topic is owned by an engine."""
         thread_id = get_current_thread_id()
         if not thread_id or not self.settings.thread_programming_enabled:
             return False
         thread_ctx = self._thread_manager.get(thread_id)
-        return bool(thread_ctx and thread_ctx.mode in {"worktree", "deep", "spec", "workflow"})
+        return bool(thread_ctx and thread_ctx.mode in {"deep", "spec", "workflow"})
 
     def _get_mode_handler(self, mode):
         from ..mode import InteractionMode
@@ -2806,14 +2783,14 @@ class FeishuWSClient:
             or is_missing_topic_exit
         )
         if (
-            auto_enter_mode in {"worktree", "deep", "spec", "workflow"}
+            auto_enter_mode in {"deep", "spec", "workflow"}
             and project is None
             and not can_recover_missing_topic
         ):
             self._reply_text(message_id, UI_TEXT["ws_topic_project_unavailable"])
             return
         if (
-            auto_enter_mode in {"worktree", "deep", "spec", "workflow"}
+            auto_enter_mode in {"deep", "spec", "workflow"}
             and project is None
             and is_missing_topic_exit
         ):
@@ -2843,7 +2820,7 @@ class FeishuWSClient:
                     return
                 self._exit_current_mode(message_id, chat_id, project=project)
                 return
-            # Interceptable system commands (/wt, /worktree, /help, /status, /codex, etc.)
+            # Interceptable system commands (/help, /status, /codex, etc.)
             # must be routed to the system handler even inside thread programming mode,
             # otherwise they can be hidden behind same-mode/topic-hint handling.
             if self._is_interceptable_command_match(command_match):
@@ -2870,7 +2847,7 @@ class FeishuWSClient:
             ):
                 forward_to_intent()
                 return
-        if auto_enter_mode in {"worktree", "deep", "spec", "workflow"}:
+        if auto_enter_mode in {"deep", "spec", "workflow"}:
             if command_match is not None:
                 forward_to_intent()
                 return
@@ -2880,9 +2857,7 @@ class FeishuWSClient:
                 project=project,
             ):
                 return
-            if auto_enter_mode == "worktree":
-                self._handle_worktree_execute(message_id, chat_id, text, project)
-            elif auto_enter_mode == "deep":
+            if auto_enter_mode == "deep":
                 self._start_deep_engine(message_id, chat_id, text, project)
             elif auto_enter_mode == "workflow":
                 self._workflow_handler.handle_message(message_id, chat_id, text, project)
@@ -2910,7 +2885,7 @@ class FeishuWSClient:
             # invocation, nor an image-only message, route free-form text into
             # the Coco programming flow (model-select card + pending prompt).
             # Slash commands (command_match is not None) always fall through to
-            # _process_with_intent so that /coco, /help, /deep, /wt, /exit, ...
+            # _process_with_intent so that /coco, /help, /deep, /exit, ...
             # keep their highest priority.
             has_registry_project_authority = (
                 effective_trust is not None
@@ -2970,8 +2945,6 @@ class FeishuWSClient:
     @staticmethod
     def _requested_topic_engine(command_match) -> Optional[str]:
         command = getattr(command_match, "command", None)
-        if command in {"/worktree", "/wt"}:
-            return "worktree"
         if command in {"/deep", "/deep_update", "/deep_status", "/stop_deep"}:
             return "deep"
         if command in {
@@ -2997,7 +2970,6 @@ class FeishuWSClient:
     @staticmethod
     def _engine_display_name(engine: str) -> str:
         return {
-            "worktree": "WT",
             "deep": "Deep",
             "spec": "Spec",
             "workflow": "WF",
@@ -3013,7 +2985,7 @@ class FeishuWSClient:
         requested = self._requested_topic_engine(command_match)
         if not requested or requested == current_engine:
             return False
-        if current_engine not in {"worktree", "deep", "spec", "workflow"}:
+        if current_engine not in {"deep", "spec", "workflow"}:
             return False
         self._reply_text(
             message_id,

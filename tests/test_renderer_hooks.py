@@ -6,7 +6,7 @@ Verifies that the correct hooks are assembled based on caller arguments:
 
 The injection *strategy* per engine (who passes context_update_fn) is:
 - Deep engine: passes context_update_fn → gets ContextPersistenceHook
-- Spec/Worktree: do NOT pass context_update_fn → no ContextPersistenceHook
+- Spec: does NOT pass context_update_fn → no ContextPersistenceHook
 """
 
 from unittest.mock import MagicMock
@@ -39,8 +39,8 @@ class TestBuildHooksWithContextFn:
 
     @pytest.mark.parametrize(
         "engine_type",
-        ["deep", "spec", "worktree"],
-        ids=["deep", "spec", "worktree"],
+        ["deep", "spec"],
+        ids=["deep", "spec"],
     )
     def test_includes_persistence_hook(self, renderer, engine_type):
         """Any engine type with context_update_fn gets ContextPersistenceHook."""
@@ -60,8 +60,8 @@ class TestBuildHooksWithoutContextFn:
 
     @pytest.mark.parametrize(
         "engine_type",
-        ["deep", "spec", "worktree"],
-        ids=["deep", "spec", "worktree"],
+        ["deep", "spec"],
+        ids=["deep", "spec"],
     )
     def test_only_emoji_hook(self, renderer, engine_type):
         """No ContextPersistenceHook without context_update_fn."""
@@ -80,7 +80,7 @@ class TestBuildHooksInjectionStrategy:
     """Test the injection strategy matching actual engine caller patterns.
 
     Deep engine passes context_update_fn → gets ContextPersistenceHook.
-    Spec/Worktree do NOT pass context_update_fn → no ContextPersistenceHook.
+    Spec does NOT pass context_update_fn → no ContextPersistenceHook.
     """
 
     def test_deep_engine_pattern(self, renderer):
@@ -100,13 +100,6 @@ class TestBuildHooksInjectionStrategy:
         hooks = renderer._build_hooks("msg_spec", chat_id="chat_spec", engine_type="spec")
         assert len(hooks) == 1
         assert isinstance(hooks[0], EmojiHook)
-
-    def test_worktree_engine_pattern(self, renderer):
-        """Worktree engine callers do NOT provide context_update_fn."""
-        hooks = renderer._build_hooks("msg_wt", chat_id="chat_wt", engine_type="worktree")
-        assert len(hooks) == 1
-        assert isinstance(hooks[0], EmojiHook)
-
 
 class TestBuildHooksWiring:
     """Verify hooks are wired correctly to handler methods."""

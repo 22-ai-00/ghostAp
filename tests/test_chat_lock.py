@@ -85,32 +85,6 @@ class TestChatLock:
             assert result.success is True  # not locked, still OK
             assert result.code == ChatLockCode.NOT_LOCKED
 
-    def test_locked_chat_allows_bare_wt_with_tab_whitespace(self, mgr: ChatLockManager):
-        """Case-insensitive: bare /wt or /WORKTREE with tab should not be blocked."""
-        with _mock_settings([ADMIN_ID]):
-            mgr.lock_chat("chat_1", ADMIN_ID)
-            m = SlashCommandParser.parse("/wt\t")
-            assert m is not None
-            assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m) is False
-            m2 = SlashCommandParser.parse("/WORKTREE\t")
-            assert m2 is not None
-            assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m2) is False
-
-    def test_locked_chat_blocks_wt_goal_with_tab_whitespace(self, mgr: ChatLockManager):
-        with _mock_settings([ADMIN_ID]):
-            mgr.lock_chat("chat_1", ADMIN_ID)
-            m = SlashCommandParser.parse("/wt\t实现登录功能")
-            assert m is not None
-            assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m) is True
-
-    def test_locked_chat_blocks_worktree_goal_uppercase_when_parsed(self, mgr: ChatLockManager):
-        with _mock_settings([ADMIN_ID]):
-            mgr.lock_chat("chat_1", ADMIN_ID)
-            m = SlashCommandParser.parse("/WORKTREE\tgoal")
-            assert m is not None
-            assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m) is True
-
-
 class TestHandleLockCommand:
     """Tests for SystemHandler._handle_lock_command integration."""
 
@@ -264,9 +238,6 @@ class TestReadonlyCommands:
         # Core readonly commands must be present
         for cmd in ("/status", "/help", "/menu", "/lock", "/unlock"):
             assert cmd in READONLY_COMMANDS, f"{cmd} should be in READONLY_COMMANDS"
-        # /wt and /worktree are NOT in READONLY_COMMANDS (F-13: conditional whitelist)
-        assert "/wt" not in READONLY_COMMANDS
-        assert "/worktree" not in READONLY_COMMANDS
         # Safe interrupt commands present
         for cmd in ("/stop_deep", "/stop_spec"):
             assert cmd in SAFE_INTERRUPT_COMMANDS, f"{cmd} should be in SAFE_INTERRUPT_COMMANDS"
@@ -282,23 +253,6 @@ class TestReadonlyCommands:
                 assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m) is False, (
                     f"SAFE_INTERRUPT command {cmd} should not be blocked"
                 )
-
-    def test_wt_worktree_conditional_blocking(self, mgr: ChatLockManager):
-        """F-13: /wt and /worktree without subargs pass; with subargs blocked."""
-        with _mock_settings([ADMIN_ID]):
-            mgr.lock_chat("chat_1", ADMIN_ID)
-            # Without subargs: not blocked
-            m1 = SlashCommandParser.parse("/wt")
-            m2 = SlashCommandParser.parse("/worktree")
-            assert m1 is not None and m2 is not None
-            assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m1) is False
-            assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m2) is False
-            # With subargs: blocked
-            m3 = SlashCommandParser.parse("/wt merge")
-            m4 = SlashCommandParser.parse("/worktree create feat")
-            assert m3 is not None and m4 is not None
-            assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m3) is True
-            assert mgr.should_block("chat_1", NON_ADMIN_ID, command_match=m4) is True
 
     def test_non_readonly_command_blocked(self, mgr: ChatLockManager):
         with _mock_settings([ADMIN_ID]):

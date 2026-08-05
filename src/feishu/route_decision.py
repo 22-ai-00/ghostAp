@@ -28,7 +28,6 @@ class RouteTarget(str, Enum):
     SLOCK_MESSAGE = "slock_message"
     SLOCK_AUTO_ACTIVATE = "slock_auto_activate"
     PROGRAMMING_MODE = "programming"
-    WORKTREE_GOAL = "worktree_goal"
     SHELL = "shell"
     SYSTEM_COMMAND = "system_command"
     EXIT_MODE = "exit_mode"

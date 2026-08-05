@@ -601,55 +601,6 @@ class TestIsP2PThreadLocalPropagation:
         finally:
             set_current_is_p2p(False)
 
-    def test_system_worktree_execute_reads_threadlocal_p2p(self):
-        """handle_worktree_execute() without explicit is_p2p should read thread-local."""
-        from unittest.mock import MagicMock
-
-        from src.thread import set_current_is_p2p
-
-        set_current_is_p2p(True)
-        try:
-            mock_ctx = MagicMock()
-            mock_ctx.settings.thread_programming_enabled = False
-
-            from src.feishu.handlers.worktree import WorktreeHandler
-            handler = WorktreeHandler(mock_ctx)
-
-            mock_project = MagicMock()
-            mock_project.project_id = "proj-1"
-            mock_project.root_path = f"{_TMP}/test"
-            mock_ctx.project_manager.get_active_project.return_value = mock_project
-
-            mock_lock_mgr = MagicMock()
-            mock_lock_result = MagicMock()
-            mock_lock_result.success = True
-            mock_lock_mgr.hold.return_value.__enter__ = MagicMock(return_value=mock_lock_result)
-            mock_lock_mgr.hold.return_value.__exit__ = MagicMock(return_value=False)
-            mock_ctx.repo_lock_manager = mock_lock_mgr
-
-            handler.reply_text = MagicMock()
-            handler.send_card_to_chat = MagicMock(return_value="progress-mid")
-            handler.update_card = MagicMock()
-
-            # Mock worktree manager
-            mock_wt_mgr = MagicMock()
-            mock_state = MagicMock()
-            mock_state.units = []
-            mock_state.last_error = None
-            mock_state.merge_entry_ready = False
-            mock_wt_mgr.get_state.return_value = mock_state
-            mock_wt_mgr.execute_goal.return_value = mock_state
-            handler._worktree_manager = MagicMock(return_value=mock_wt_mgr)
-
-            # Call without is_p2p — should read True from thread-local
-            handler.handle_worktree_execute("msg-1", "chat-1", "fix bug", project=mock_project)
-
-            mock_lock_mgr.hold.assert_called_once()
-            call_kwargs = mock_lock_mgr.hold.call_args
-            assert call_kwargs[1].get("is_p2p") is True
-        finally:
-            set_current_is_p2p(False)
-
     def test_default_threadlocal_is_false(self):
         """When thread-local is not set, is_p2p should default to False."""
         from unittest.mock import MagicMock

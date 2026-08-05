@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 AtomKind = Literal[
     "text", "tool_panel", "reasoning", "plan",
     "criteria_panel", "phase_panel", "warning_banner", "progress_bar",
-    "worktree_panel", "task_list", "phase_banner",
+    "task_list", "phase_banner",
     "subagent_dispatch", "activity_digest", "review_role", "spec_plan", "spec_task",
     "execution_current", "execution_history",
     "image",
@@ -378,15 +378,6 @@ def _block_to_phase_atom(block: ContentBlock) -> RenderAtom:
     return atom
 
 
-def _block_to_worktree_atom(block: ContentBlock) -> RenderAtom:
-    atom = RenderAtom(
-        kind="worktree_panel", block_id=block.block_id, content=block.content,
-        splittable=False, node_count=1,
-    )
-    atom.byte_size = estimate_atom_size(atom)
-    return atom
-
-
 def _block_to_task_list_atom(block: ContentBlock) -> RenderAtom:
     # Build content from tasks for size estimation
     tasks = getattr(block, "tasks", ())
@@ -505,12 +496,7 @@ def _get_block_kind_handlers() -> dict[str, Callable[[ContentBlock], RenderAtom]
         if _block_kind_handlers is None:
             from src.card.state.block_registry import BLOCK_KIND_TO_ATOM
 
-            handlers = {
-                **_ATOM_HANDLER_DISPATCH,
-                **{kind: _block_to_worktree_atom
-                   for kind, atom in BLOCK_KIND_TO_ATOM.items()
-                   if atom == "worktree_panel"},
-            }
+            handlers = _ATOM_HANDLER_DISPATCH.copy()
 
             # Startup assertion: all registered block kinds must have a handler
             # (tool_call is excluded — it has dedicated lookahead grouping logic)
@@ -518,7 +504,7 @@ def _get_block_kind_handlers() -> dict[str, Callable[[ContentBlock], RenderAtom]
             if missing:
                 raise RuntimeError(
                     f"BLOCK_KIND_TO_ATOM contains kinds with no handler registered: {missing}. "
-                    f"Add handlers in _ATOM_HANDLER_DISPATCH or worktree_panel merge."
+                    f"Add handlers in _ATOM_HANDLER_DISPATCH."
                 )
 
             _block_kind_handlers = handlers

@@ -47,7 +47,7 @@ def _item(tool: str, model: str | None = None) -> SpecReviewSelectionItem:
     )
 
 
-def test_spec_review_selection_is_owned_without_worktree_runtime():
+def test_spec_review_selection_owns_its_runtime_state():
     from src.acp.tool_discovery import AgentToolOption
     from src.spec_engine.review_selection import SpecReviewSelectionController
 
@@ -284,7 +284,6 @@ def test_spec_start_shows_review_agent_selection_before_submitting_task():
     actions = [button["value"].get("action") for button in buttons]
     assert SPEC_REVIEW_SELECT_TOOL in actions
     assert SPEC_REVIEW_USE_AUTO in actions
-    assert "worktree_select_tool" not in actions
     assert project.spec_review_selection_state.pending_goal == "implement auth"
 
 
@@ -502,7 +501,7 @@ def test_delete_spec_run_cache_blocks_running_engine(monkeypatch):
     assert "仍在运行" in reply_text.call_args.args[1]
 
 
-def test_spec_review_selection_card_does_not_render_worktree_journey_copy():
+def test_spec_review_selection_card_renders_spec_review_copy():
     handler = _make_spec_handler()
     project = ProjectContext(project_id="p-render", project_name="Spec", root_path="/tmp/spec-render")
     fake_tools = [
@@ -525,7 +524,6 @@ def test_spec_review_selection_card_does_not_render_worktree_journey_copy():
 
     assert "步骤 1/4" not in text
     assert "(1/4)" not in text
-    assert "Worktree" not in text
     assert "等待目标" not in text
     assert "cycle" not in text
     assert "Spec Review" in title
@@ -548,7 +546,6 @@ def test_spec_review_model_grid_keeps_spec_review_actions():
     actions = [button["value"].get("action") for button in buttons]
 
     assert SPEC_REVIEW_SELECT_MODEL in actions
-    assert "worktree_select_model" not in actions
     model_buttons = [button for button in buttons if button["value"].get("model_name") == "gpt-5.5"]
     assert model_buttons[0]["value"]["thread_root_id"] == "root-spec-msg"
 
@@ -786,4 +783,4 @@ def test_spec_review_select_model_patches_current_selection_card():
     get_session.assert_not_called()
     rendered = json.loads(update_card.call_args.args[1])
     buttons = _collect_buttons(rendered)
-    assert all(button["value"].get("action") != "worktree_select_model" for button in buttons)
+    assert any(button["value"].get("action") == SPEC_REVIEW_SELECT_TOOL for button in buttons)
