@@ -19,7 +19,7 @@ def test_workflow_model_lookup_uses_short_ttl_cache(monkeypatch):
             return [{"name": "openrouter-3o/low", "display_name": "openrouter-3o/low"}]
 
     monkeypatch.setattr(
-        "src.worktree_engine.tool_discovery.WorktreeToolDiscovery",
+        "src.acp.tool_discovery.AgentToolDiscovery",
         FakeDiscovery,
     )
 
@@ -54,7 +54,7 @@ def test_workflow_model_lookup_does_not_rescan_all_tools(monkeypatch):
             return [{"name": "openrouter-3o/low", "display_name": "openrouter-3o/low"}]
 
     monkeypatch.setattr(
-        "src.worktree_engine.tool_discovery.WorktreeToolDiscovery",
+        "src.acp.tool_discovery.AgentToolDiscovery",
         FakeDiscovery,
     )
 
@@ -84,7 +84,7 @@ def test_workflow_ttdak_model_selection_does_not_force_refresh(monkeypatch):
             return [{"name": "doubao-seed", "display_name": "doubao-seed"}]
 
     monkeypatch.setattr(
-        "src.worktree_engine.tool_discovery.WorktreeToolDiscovery",
+        "src.acp.tool_discovery.AgentToolDiscovery",
         FakeDiscovery,
     )
 
@@ -121,7 +121,7 @@ def test_workflow_codex_model_lookup_preserves_effort_capabilities_and_cache(
             ]
 
     monkeypatch.setattr(
-        "src.worktree_engine.tool_discovery.WorktreeToolDiscovery",
+        "src.acp.tool_discovery.AgentToolDiscovery",
         FakeDiscovery,
     )
 
@@ -169,7 +169,7 @@ def test_workflow_model_lookup_preserves_explicit_variants_and_copy_isolation(
             ]
 
     monkeypatch.setattr(
-        "src.worktree_engine.tool_discovery.WorktreeToolDiscovery",
+        "src.acp.tool_discovery.AgentToolDiscovery",
         FakeDiscovery,
     )
     handler = WorkflowHandler.__new__(WorkflowHandler)
@@ -195,7 +195,7 @@ def test_workflow_model_cache_reloads_after_shared_generation_changes(monkeypatc
             return [{"name": f"traex-model-{calls}"}]
 
     monkeypatch.setattr(
-        "src.worktree_engine.tool_discovery.WorktreeToolDiscovery",
+        "src.acp.tool_discovery.AgentToolDiscovery",
         FakeDiscovery,
     )
     handler = WorkflowHandler.__new__(WorkflowHandler)

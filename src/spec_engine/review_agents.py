@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable, Protocol
 
 from src.spec_engine.review_roles import ReviewRoleSpec
-from src.worktree_engine.models import WorktreeSelectionItem
+from src.spec_engine.review_selection import SpecReviewSelectionItem
 
 
 class _RandomLike(Protocol):
@@ -32,7 +32,7 @@ class ReviewAgentBinding:
         return f"{self.display_name or self.tool_name} / {model}"
 
     @classmethod
-    def from_selection_item(cls, item: WorktreeSelectionItem) -> "ReviewAgentBinding":
+    def from_selection_item(cls, item: SpecReviewSelectionItem) -> "ReviewAgentBinding":
         provider = str(item.provider or "").strip().lower()
         tool_name = str(item.tool_name or "").strip().lower()
         if provider == "ttadk":
@@ -89,7 +89,7 @@ def normalize_review_agents(items: Iterable[object] | None) -> list[ReviewAgentB
     for item in items or []:
         if isinstance(item, ReviewAgentBinding):
             agent = item
-        elif isinstance(item, WorktreeSelectionItem):
+        elif isinstance(item, SpecReviewSelectionItem):
             agent = ReviewAgentBinding.from_selection_item(item)
         else:
             agent = ReviewAgentBinding.from_dict(item)

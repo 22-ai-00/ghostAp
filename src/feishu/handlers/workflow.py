@@ -3862,10 +3862,10 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         self._workflow_model_cache = cache
 
         try:
-            from ...worktree_engine.tool_discovery import WorktreeToolDiscovery
+            from ...acp.tool_discovery import AgentToolDiscovery
 
             started = time.monotonic()
-            discovery = WorktreeToolDiscovery()
+            discovery = AgentToolDiscovery()
             models = discovery.get_models_for_tool(
                 tool_name,
                 provider=provider,

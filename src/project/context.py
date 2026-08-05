@@ -142,8 +142,8 @@ class ProjectContext:
             from ..worktree_engine.models import WorktreeRuntimeState
             self.worktree_state = WorktreeRuntimeState()
         if self.spec_review_selection_state is None:
-            from ..worktree_engine.models import WorktreeRuntimeState
-            self.spec_review_selection_state = WorktreeRuntimeState()
+            from ..spec_engine.review_selection import SpecReviewSelectionState
+            self.spec_review_selection_state = SpecReviewSelectionState()
         if not self.working_dir:
             self.working_dir = self.root_path
         self.root_path = os.path.expanduser(self.root_path)

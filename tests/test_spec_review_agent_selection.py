@@ -4,6 +4,7 @@ from random import Random
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from src.acp.tool_discovery import AgentToolOption
 from src.card import CardBuilder
 from src.card.actions.dispatch import (
     SPEC_REVIEW_SELECT_MODEL,
@@ -18,10 +19,9 @@ from src.spec_engine.review import ReviewCircuitState
 from src.spec_engine.review_agents import ReviewAgentBinding, assign_review_agents
 from src.spec_engine.review_artifacts import ReviewArtifacts
 from src.spec_engine.review_roles import ReviewRoleSpec
+from src.spec_engine.review_selection import SpecReviewSelectionItem
 from src.spec_engine.review_strategy import AdaptiveRoleReviewStrategy, ReviewContext
 from src.spec_engine.storage import SpecRunSummary
-from src.worktree_engine.models import WorktreeSelectionItem
-from src.worktree_engine.selection import WorktreeToolOption
 
 
 def _role(role_id: str) -> ReviewRoleSpec:
@@ -37,14 +37,33 @@ def _role(role_id: str) -> ReviewRoleSpec:
     )
 
 
-def _item(tool: str, model: str | None = None) -> WorktreeSelectionItem:
-    return WorktreeSelectionItem(
+def _item(tool: str, model: str | None = None) -> SpecReviewSelectionItem:
+    return SpecReviewSelectionItem(
         provider="acp",
         tool_name=tool,
         display_name=tool.title(),
         model_name=model,
         model_display_name=model,
     )
+
+
+def test_spec_review_selection_is_owned_without_worktree_runtime():
+    from src.acp.tool_discovery import AgentToolOption
+    from src.spec_engine.review_selection import SpecReviewSelectionController
+
+    project = ProjectContext(project_id="p", project_name="Spec", root_path="/tmp/spec")
+    controller = SpecReviewSelectionController()
+    state = controller.start_selection(project, goal="review auth")
+    controller.select_tool(
+        project,
+        AgentToolOption(provider="acp", tool_name="codex", display_name="Codex"),
+    )
+    controller.add_pending_item(project, model_name="gpt-5.6-sol")
+
+    assert state.pending_goal == "review auth"
+    assert [item.selection_key for item in state.selected_items] == [
+        "acp:codex:gpt-5.6-sol"
+    ]
 
 
 def test_assign_review_agents_covers_selected_pool_when_roles_cover_pool():
@@ -266,7 +285,7 @@ def test_spec_start_shows_review_agent_selection_before_submitting_task():
     assert SPEC_REVIEW_SELECT_TOOL in actions
     assert SPEC_REVIEW_USE_AUTO in actions
     assert "worktree_select_tool" not in actions
-    assert project.spec_review_selection_state.selection.pending_goal == "implement auth"
+    assert project.spec_review_selection_state.pending_goal == "implement auth"
 
 
 def test_spec_status_lists_cached_runs_with_restore_and_delete_buttons(monkeypatch):
@@ -639,7 +658,7 @@ def test_spec_review_finish_starts_with_selected_review_agent_pool():
     ctrl.start_selection(project, goal="build review")
     ctrl.select_tool(
         project,
-        WorktreeToolOption(
+        AgentToolOption(
             provider="acp",
             tool_name="codex",
             display_name="Codex",
@@ -742,7 +761,7 @@ def test_spec_review_select_model_patches_current_selection_card():
     ctrl.start_selection(project, goal="build review")
     ctrl.select_tool(
         project,
-        WorktreeToolOption(
+        AgentToolOption(
             provider="acp",
             tool_name="codex",
             display_name="Codex",

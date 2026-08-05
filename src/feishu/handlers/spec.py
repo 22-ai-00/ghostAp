@@ -9,6 +9,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Optional
 
+from ...acp.tool_discovery import AgentToolDiscovery, AgentToolOption
 from ...card import CardBuilder
 from ...card.actions.dispatch import (
     SPEC_REVIEW_SELECT_MODEL,
@@ -20,6 +21,7 @@ from ...card.ui_text import UI_TEXT
 from ...model_selection import DEFAULT_MODEL_OPTION_VALUE, is_default_model_option
 from ...spec_engine.models import SpecProjectStatus
 from ...spec_engine.review_agents import ReviewAgentBinding
+from ...spec_engine.review_selection import SpecReviewSelectionController
 from ...spec_engine.storage import SpecRunSummary, delete_spec_run, list_spec_runs, state_path_for_run
 from ...spec_engine.task_persistence import list_pending_tasks, load_task_state
 from ...tasking import TaskPriority, TaskSpec
@@ -84,42 +86,25 @@ class SpecHandler(BaseEngineHandler):
         """Return the progress reporter used by _safe_execute_engine."""
         return self.ctx.progress_reporter
 
-    def _worktree_manager(self):
-        """Reuse Worktree tool/model discovery for Spec review selection."""
-        mgr = getattr(self, "_spec_review_wt_manager", None)
-        if mgr is None:
-            from ...worktree_engine.manager import WorktreeManager
-
-            mgr = WorktreeManager(self.project_manager)
-            self._spec_review_wt_manager = mgr
-        return mgr
+    def _agent_tool_discovery(self):
+        discovery = getattr(self, "_spec_review_tool_discovery", None)
+        if discovery is None:
+            discovery = AgentToolDiscovery()
+            self._spec_review_tool_discovery = discovery
+        return discovery
 
     def _spec_review_selection_controller(self):
         ctrl = getattr(self, "_spec_review_selection_ctrl", None)
         if ctrl is None:
-            from ...worktree_engine.models import WorktreeRuntimeState
-            from ...worktree_engine.selection_controller import WorktreeSelectionController
-
-            def _get_state(project: "ProjectContext") -> WorktreeRuntimeState:
-                state = getattr(project, "spec_review_selection_state", None)
-                if state is None:
-                    state = WorktreeRuntimeState()
-                    project.spec_review_selection_state = state
-                return state
-
-            def _reset_state(project: "ProjectContext") -> WorktreeRuntimeState:
-                project.spec_review_selection_state = WorktreeRuntimeState()
-                return project.spec_review_selection_state
-
-            ctrl = WorktreeSelectionController(state_getter=_get_state, state_resetter=_reset_state)
+            ctrl = SpecReviewSelectionController()
             self._spec_review_selection_ctrl = ctrl
         return ctrl
 
     def _get_available_spec_review_tools(self) -> list[dict]:
-        return self._worktree_manager().get_available_tools()
+        return self._agent_tool_discovery().get_available_tools()
 
     def _get_ttadk_spec_review_tools(self) -> list[dict]:
-        return self._worktree_manager().get_ttadk_tools()
+        return self._agent_tool_discovery().get_ttadk_tools()
 
     def _get_spec_review_models_for_tool(
         self,
@@ -128,7 +113,7 @@ class SpecHandler(BaseEngineHandler):
         cwd: Optional[str] = None,
         current_model: Optional[str] = None,
     ) -> list[dict]:
-        models = self._worktree_manager().get_models_for_tool(
+        models = self._agent_tool_discovery().get_models_for_tool(
             tool_name, provider=provider, cwd=cwd, current_model=current_model
         )
         from ...acp.traex_selection import expand_model_option_dicts
@@ -228,7 +213,7 @@ class SpecHandler(BaseEngineHandler):
                 chat_id=chat_id,
                 project=project,
                 tools=tools,
-                selected=[item.to_dict() for item in state.selection.selected_items],
+                selected=[item.to_dict() for item in state.selected_items],
                 message=UI_TEXT["spec_review_select_message"],
                 patch_existing=False,
             )
@@ -425,7 +410,7 @@ class SpecHandler(BaseEngineHandler):
 
     def _spec_review_pending_requirement(self, project: "ProjectContext") -> str:
         state = getattr(project, "spec_review_selection_state", None)
-        return str(getattr(getattr(state, "selection", None), "pending_goal", "") or "").strip()
+        return str(getattr(state, "pending_goal", "") or "").strip()
 
     def handle_spec_review_use_auto(
         self,
@@ -481,7 +466,7 @@ class SpecHandler(BaseEngineHandler):
 
         ctrl = self._spec_review_selection_controller()
         state = ctrl._get_state(project)
-        selected_dicts = [item.to_dict() for item in state.selection.selected_items]
+        selected_dicts = [item.to_dict() for item in state.selected_items]
 
         if provider == "ttadk" and tool_name == "ttadk":
             tools = [self._normalize_ttadk_tool_option(t) for t in self._get_ttadk_spec_review_tools()]
@@ -496,9 +481,7 @@ class SpecHandler(BaseEngineHandler):
             )
             return
 
-        from ...worktree_engine.selection import WorktreeToolOption
-
-        option = WorktreeToolOption(
+        option = AgentToolOption(
             provider=provider,
             tool_name=tool_name,
             display_name=value.get("display_name") or tool_name,
@@ -547,7 +530,7 @@ class SpecHandler(BaseEngineHandler):
                 chat_id=chat_id,
                 project=project,
                 tools=model_tools,
-                selected=[item.to_dict() for item in ctrl._get_state(project).selection.selected_items],
+                selected=[item.to_dict() for item in ctrl._get_state(project).selected_items],
                 message=UI_TEXT["system_worktree_select_model_prompt"].format(tool=option.display_name),
                 select_action=SPEC_REVIEW_SELECT_MODEL,
                 pending_tool=option.display_name,
@@ -571,7 +554,7 @@ class SpecHandler(BaseEngineHandler):
             chat_id=chat_id,
             project=project,
             tools=self._get_available_spec_review_tools(),
-            selected=[item.to_dict() for item in ctrl._get_state(project).selection.selected_items],
+            selected=[item.to_dict() for item in ctrl._get_state(project).selected_items],
             message=msg,
             thread_root_id=thread_root_id,
         )
@@ -613,7 +596,7 @@ class SpecHandler(BaseEngineHandler):
             chat_id=chat_id,
             project=project,
             tools=self._get_available_spec_review_tools(),
-            selected=[item.to_dict() for item in ctrl._get_state(project).selection.selected_items],
+            selected=[item.to_dict() for item in ctrl._get_state(project).selected_items],
             message=msg,
             thread_root_id=thread_root_id,
         )
@@ -641,7 +624,7 @@ class SpecHandler(BaseEngineHandler):
             chat_id=chat_id,
             project=project,
             tools=self._get_available_spec_review_tools(),
-            selected=[item.to_dict() for item in ctrl._get_state(project).selection.selected_items],
+            selected=[item.to_dict() for item in ctrl._get_state(project).selected_items],
             message=msg,
             thread_root_id=thread_root_id,
         )
@@ -668,7 +651,7 @@ class SpecHandler(BaseEngineHandler):
             chat_id=chat_id,
             project=project,
             tools=self._get_available_spec_review_tools(),
-            selected=[item.to_dict() for item in ctrl._get_state(project).selection.selected_items],
+            selected=[item.to_dict() for item in ctrl._get_state(project).selected_items],
             message=msg,
             thread_root_id=thread_root_id,
         )
@@ -695,7 +678,7 @@ class SpecHandler(BaseEngineHandler):
             chat_id=chat_id,
             project=project,
             tools=self._get_available_spec_review_tools(),
-            selected=[item.to_dict() for item in ctrl._get_state(project).selection.selected_items],
+            selected=[item.to_dict() for item in ctrl._get_state(project).selected_items],
             message=UI_TEXT["spec_review_select_message"],
             thread_root_id=thread_root_id,
         )
@@ -722,16 +705,16 @@ class SpecHandler(BaseEngineHandler):
             self.reply_error(message_id, UI_TEXT["spec_cmd_help_usage"])
             return
         state = ctrl.finalize_selection(project)
-        if not state.selection.selected_items:
+        if not state.selected_items:
             self.reply_error(message_id, UI_TEXT["system_worktree_no_selection_error"])
             return
         review_agents = [
             ReviewAgentBinding.from_selection_item(item)
-            for item in state.selection.selected_items
+            for item in state.selected_items
         ]
         self._patch_spec_review_starting_card(
             message_id=message_id,
-            selected=[item.to_dict() for item in state.selection.selected_items],
+            selected=[item.to_dict() for item in state.selected_items],
         )
         self._start_spec_engine_now(start_message_id, chat_id, requirement, project, review_agents=review_agents)
 
