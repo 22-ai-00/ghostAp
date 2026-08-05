@@ -200,6 +200,23 @@ def test_team_recovery_waits_for_shared_dispatch_projections() -> None:
     assert calls[-1] == "admission_open"
 
 
+def test_background_recovery_failure_closes_employee_admission_only() -> None:
+    from unittest.mock import MagicMock
+
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    runtime = EmployeeDepartmentRuntime()
+    service = SimpleNamespace(stop_admission=MagicMock())
+    runtime._service = service  # type: ignore[assignment]  # noqa: SLF001
+    runtime._core_recovered = True  # noqa: SLF001
+
+    runtime.fail_recovery("membership_recovery")
+
+    assert runtime._core_recovered is False  # noqa: SLF001
+    assert runtime._execution_blockers == ("membership_recovery",)  # noqa: SLF001
+    service.stop_admission.assert_called_once_with()
+
+
 def test_production_dispatch_tick_reaps_idle_employee_sessions() -> None:
     calls: list[str] = []
     empty_state = SimpleNamespace(by_acceptance_id={})

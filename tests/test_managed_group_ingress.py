@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import threading
 from contextlib import nullcontext
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -907,10 +908,19 @@ def test_startup_restores_registry_slock_employee_and_membership_in_order() -> N
         recover=lambda: order.append("employee"),
         membership_service=membership,
     )
+    client._employee_runtime_recovery_lock = threading.Lock()
+    client._employee_runtime_recovery_thread = None
+    client._employee_runtime_recovery_started = False
+    client._employee_runtime_recovery_error = None
+    client._employee_runtime_init_cleanup_done = False
+    client._closed = False
     client._reply_text = MagicMock()
 
     client._restore_trusted_ingress_dependencies("/srv/project")
+    assert order == ["registry", "slock"]
 
+    client._start_employee_runtime_recovery()
+    client._employee_runtime_recovery_thread.join(1.0)
     assert order == ["registry", "slock", "employee", "membership"]
 
 

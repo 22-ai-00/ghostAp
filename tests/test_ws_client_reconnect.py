@@ -94,6 +94,7 @@ def test_connected_activity_marks_the_participating_instance_ready() -> None:
     client = object.__new__(ws.FeishuWSClient)
     client._ws_health_monitor = FakeHealthMonitor()
     client._restart_gate = FakeGate()
+    client._employee_department_runtime = None
 
     client._record_ws_activity("pong")
     client._record_ws_activity("connected")
@@ -103,6 +104,137 @@ def test_connected_activity_marks_the_participating_instance_ready() -> None:
         ("activity", "connected"),
         ("ready", os.getpid()),
     ]
+
+
+def test_connected_readiness_does_not_wait_for_employee_recovery() -> None:
+    from src.feishu import ws_client as ws
+
+    recovery_started = threading.Event()
+    release_recovery = threading.Event()
+
+    class FakeHealthMonitor:
+        def record_activity(self, _kind):
+            return None
+
+    class FakeGate:
+        def __init__(self) -> None:
+            self.ready = threading.Event()
+
+        def mark_ready(self, *, service_pid):
+            assert service_pid == os.getpid()
+            self.ready.set()
+            return "G" * 24
+
+    def recover() -> None:
+        recovery_started.set()
+        release_recovery.wait(1.0)
+
+    client = object.__new__(ws.FeishuWSClient)
+    client._ws_health_monitor = FakeHealthMonitor()
+    client._restart_gate = FakeGate()
+    client._employee_department_runtime = SimpleNamespace(recover=recover)
+    client._employee_runtime_recovery_lock = threading.Lock()
+    client._employee_runtime_recovery_thread = None
+    client._employee_runtime_recovery_started = False
+    client._employee_runtime_recovery_error = None
+    client._employee_runtime_init_cleanup_done = False
+    client._closed = False
+    client._reply_text = lambda *_args, **_kwargs: None
+
+    client._record_ws_activity("connected")
+
+    assert client._restart_gate.ready.is_set()
+    assert recovery_started.wait(0.2)
+    release_recovery.set()
+
+
+def _make_connected_recovery_client(*, recover=None):
+    from unittest.mock import MagicMock
+
+    from src.feishu import ws_client as ws
+
+    runtime = SimpleNamespace(
+        recover=recover or MagicMock(),
+        close=MagicMock(),
+        fail_recovery=MagicMock(),
+        membership_service=SimpleNamespace(
+            reconcile_projected_memberships=MagicMock(
+                return_value=SimpleNamespace(removed=0, degraded=0)
+            )
+        ),
+    )
+    client = object.__new__(ws.FeishuWSClient)
+    client._ws_health_monitor = SimpleNamespace(record_activity=MagicMock())
+    client._restart_gate = SimpleNamespace(mark_ready=MagicMock(return_value="G" * 24))
+    client._employee_department_runtime = runtime
+    client._employee_runtime_recovery_lock = threading.Lock()
+    client._employee_runtime_recovery_thread = None
+    client._employee_runtime_recovery_started = False
+    client._employee_runtime_recovery_error = None
+    client._employee_runtime_init_cleanup_done = False
+    client._closed = False
+    client._reply_text = MagicMock()
+    return client
+
+
+def test_employee_recovery_worker_starts_once_across_reconnects() -> None:
+    client = _make_connected_recovery_client()
+
+    client._record_ws_activity("connected")
+    client._record_ws_activity("connected")
+    client._employee_runtime_recovery_thread.join(1.0)
+
+    client._employee_department_runtime.recover.assert_called_once_with()
+    reconcile = (
+        client._employee_department_runtime.membership_service
+        .reconcile_projected_memberships
+    )
+    reconcile.assert_called_once_with()
+
+
+def test_employee_recovery_failure_keeps_main_ws_ready() -> None:
+    from unittest.mock import MagicMock
+
+    failure = RuntimeError("journal replay failed")
+    client = _make_connected_recovery_client(
+        recover=MagicMock(side_effect=failure)
+    )
+
+    client._record_ws_activity("connected")
+    client._employee_runtime_recovery_thread.join(1.0)
+
+    client._restart_gate.mark_ready.assert_called_once_with(service_pid=os.getpid())
+    assert client._employee_runtime_recovery_error is failure
+    client._employee_department_runtime.fail_recovery.assert_called_once_with(
+        "background_recovery"
+    )
+    client._employee_department_runtime.close.assert_not_called()
+
+
+def test_connected_activity_after_close_does_not_start_employee_recovery() -> None:
+    client = _make_connected_recovery_client()
+    client._closed = True
+
+    client._record_ws_activity("connected")
+
+    assert client._employee_runtime_recovery_thread is None
+    client._employee_department_runtime.recover.assert_not_called()
+
+
+def test_employee_recovery_drain_reports_live_worker_after_timeout() -> None:
+    from unittest.mock import MagicMock
+
+    from src.feishu import ws_client as ws
+
+    worker = SimpleNamespace(
+        join=MagicMock(),
+        is_alive=MagicMock(return_value=True),
+    )
+    client = object.__new__(ws.FeishuWSClient)
+    client._employee_runtime_recovery_thread = worker
+
+    assert client._wait_for_employee_runtime_recovery(0.01) is False
+    worker.join.assert_called_once_with(timeout=0.01)
 
 
 def test_pending_employee_notification_does_not_claim_ready() -> None:
@@ -204,6 +336,7 @@ def test_ws_client_start_reconnects_if_underlying_start_returns(monkeypatch):
             created.append(kwargs)
 
         def start(self):
+            created[-1]["on_activity"]("connected")
             # Simulate immediate exit (disconnect / internal error).
             time.sleep(0.01)
 

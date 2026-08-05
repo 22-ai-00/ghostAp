@@ -950,6 +950,22 @@ class TestCardActionHandler(unittest.TestCase):
         assert events.index("scheduler-stop") < events.index("chat-lock-close")
         assert events.index("scheduler-stop") < events.index("repo-lock-close")
 
+    def test_close_preserves_employee_runtime_while_recovery_is_alive(self):
+        client = _make_ws_client()
+        runtime = MagicMock()
+        worker = SimpleNamespace(
+            join=MagicMock(),
+            is_alive=MagicMock(return_value=True),
+        )
+        client._employee_department_runtime = runtime
+        client._employee_runtime_recovery_thread = worker
+
+        with patch("src.feishu.ws_client._SHUTDOWN_DELEGATED_DRAIN_S", 0.01):
+            assert client.close() is False
+
+        worker.join.assert_called_once_with(timeout=0.01)
+        runtime.close.assert_not_called()
+
     def test_close_does_not_destroy_dependencies_when_scheduler_cannot_drain(self):
         events: list[str] = []
         client = object.__new__(FeishuWSClient)

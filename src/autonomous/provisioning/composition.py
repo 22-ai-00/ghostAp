@@ -1670,6 +1670,16 @@ class EmployeeDepartmentRuntime:
             if execution_recovered:
                 self._start_dispatch_worker()
 
+    def fail_recovery(self, blocker: str) -> None:
+        """Keep Employee admission closed without tearing down main-Bot audit."""
+
+        if not isinstance(blocker, str) or not blocker.strip():
+            raise ValueError("recovery blocker is required")
+        self._execution_blockers = (blocker,)
+        self._core_recovered = False
+        if self._service is not None:
+            self._service.stop_admission()
+
     def journal_frames(self) -> tuple[Any, ...]:
         return tuple(self._writer.replay()) if self._writer is not None else ()
 

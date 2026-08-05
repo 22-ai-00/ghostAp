@@ -336,6 +336,10 @@ class FeishuWSClient:
         self._api_client: Optional[lark.Client] = None
         self._channel_client: Optional[FeishuChannel] = None
         self._slash_command_sync_thread: Optional[threading.Thread] = None
+        self._employee_runtime_recovery_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._employee_runtime_recovery_thread: Optional[threading.Thread] = None
+        self._employee_runtime_recovery_started = False
+        self._employee_runtime_recovery_error: Exception | None = None
         self._channel_client_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
         # ACPSessionManager: IdleHealth 相关协作者统一通过 IdleHealthConfig 注入，
@@ -807,7 +811,11 @@ class FeishuWSClient:
         # Configure trace logging
         configure_logging_with_trace()
 
-    def _recover_employee_runtime_after_handler_binding(self) -> None:
+    def _recover_employee_runtime_after_handler_binding(
+        self,
+        *,
+        close_on_failure: bool = True,
+    ) -> None:
         """Start durable recovery only after the main-Bot reply path exists."""
 
         runtime = self._employee_department_runtime
@@ -818,8 +826,89 @@ class FeishuWSClient:
                 raise RuntimeError("main Bot reply transport is not bound")
             runtime.recover()
         except Exception:
-            self._close_employee_runtime_after_initialization_failure()
+            if close_on_failure:
+                self._close_employee_runtime_after_initialization_failure()
             raise
+
+    def _run_employee_runtime_recovery(self) -> None:
+        """Recover Employee state after main WS readiness without weakening admission."""
+
+        try:
+            self._recover_employee_runtime_after_handler_binding(
+                close_on_failure=False
+            )
+            runtime = self._employee_department_runtime
+            membership = (
+                getattr(runtime, "membership_service", None)
+                if runtime is not None
+                else None
+            )
+            reconcile_memberships = getattr(
+                membership,
+                "reconcile_projected_memberships",
+                None,
+            )
+            if callable(reconcile_memberships):
+                summary = reconcile_memberships()
+                removed = int(getattr(summary, "removed", 0) or 0)
+                degraded = int(getattr(summary, "degraded", 0) or 0)
+                if removed or degraded:
+                    logger.warning(
+                        "Employee membership startup audit reconciled "
+                        "removed=%d degraded=%d",
+                        removed,
+                        degraded,
+                    )
+        except Exception as exc:
+            self._employee_runtime_recovery_error = exc
+            runtime = self._employee_department_runtime
+            fail_recovery = getattr(runtime, "fail_recovery", None)
+            if callable(fail_recovery):
+                try:
+                    fail_recovery("background_recovery")
+                except Exception:
+                    logger.exception(
+                        "Employee runtime failed to close admission after recovery error"
+                    )
+            logger.exception(
+                "Employee runtime background recovery failed; "
+                "main Bot remains available and Employee admission stays closed"
+            )
+            return
+        logger.info("Employee runtime background recovery complete")
+
+    def _start_employee_runtime_recovery(self) -> None:
+        """Start at most one post-connection Employee recovery worker."""
+
+        if self._employee_department_runtime is None:
+            return
+        with self._employee_runtime_recovery_lock:
+            if self._closed or self._employee_runtime_recovery_started:
+                return
+            self._employee_runtime_recovery_started = True
+            thread = threading.Thread(
+                target=self._run_employee_runtime_recovery,
+                name="employee-runtime-recovery",
+                daemon=True,
+            )
+            self._employee_runtime_recovery_thread = thread
+            thread.start()
+
+    def _wait_for_employee_runtime_recovery(self, timeout: float) -> bool:
+        """Wait for background recovery before closing its durable resources."""
+
+        lock = getattr(self, "_employee_runtime_recovery_lock", None)
+        if lock is None:
+            thread = getattr(self, "_employee_runtime_recovery_thread", None)
+        else:
+            with lock:
+                thread = getattr(self, "_employee_runtime_recovery_thread", None)
+        if thread is None or thread is threading.current_thread():
+            return True
+        if not thread.is_alive():
+            return True
+        thread.join(timeout=timeout)
+        return not thread.is_alive()
 
     def _close_employee_runtime_after_initialization_failure(self) -> None:
         """Close a composed runtime once without masking the init failure."""
@@ -916,6 +1005,18 @@ class FeishuWSClient:
         spec_engines = spec_resources.stop_running_engines()
         workflow_engines = workflow_resources.stop_running_engines()
         slock_engines = self._quiesce_slock_activities()
+
+        if not self._wait_for_employee_runtime_recovery(
+            _SHUTDOWN_DELEGATED_DRAIN_S
+        ):
+            logger.error(
+                "Employee recovery worker did not drain; preserving durable resources"
+            )
+            try:
+                self._scheduler.stop(wait=True, shutdown_executor=False)
+            except Exception:
+                logger.debug("failed to stop scheduler dispatcher", exc_info=True)
+            return False
 
         delegated_idle = True
         try:
@@ -4192,6 +4293,7 @@ class FeishuWSClient:
             "GhostAP restart readiness published generation=%s",
             self._restart_generation,
         )
+        self._start_employee_runtime_recovery()
 
     def _publish_restart_participation(self) -> str:
         """Bind restart identity only when the real service starts intake."""
@@ -4255,31 +4357,6 @@ class FeishuWSClient:
                 logger.info("Restored %d slock engine(s) from disk", restored)
         except (OSError, ValueError, KeyError):
             logger.warning("Failed to restore slock engines from disk", exc_info=True)
-
-        self._recover_employee_runtime_after_handler_binding()
-
-        runtime = self._employee_department_runtime
-        membership = (
-            getattr(runtime, "membership_service", None)
-            if runtime is not None
-            else None
-        )
-        reconcile_memberships = getattr(
-            membership,
-            "reconcile_projected_memberships",
-            None,
-        )
-        if callable(reconcile_memberships):
-            summary = reconcile_memberships()
-            removed = int(getattr(summary, "removed", 0) or 0)
-            degraded = int(getattr(summary, "degraded", 0) or 0)
-            if removed or degraded:
-                logger.warning(
-                    "Employee membership startup audit reconciled "
-                    "removed=%d degraded=%d",
-                    removed,
-                    degraded,
-                )
 
     def start(self):
         """启动 WS 长连接并进入重连循环。
