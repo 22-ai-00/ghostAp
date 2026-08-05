@@ -125,6 +125,20 @@ class TestAGENTSMDScopeStatement(unittest.TestCase):
         with open(self.AGENTS_PATH, "r", encoding="utf-8") as f:
             return f.read()
 
+    def test_agents_md_includes_workflow_in_scope(self):
+        """Verify Workflow is documented as a topic/root-thread strategy."""
+        content = self._read_agents_md()
+        workflow_scope_lines = [
+            line
+            for line in content.splitlines()
+            if "Workflow" in line and "作用于飞书话题/根线程的引擎策略" in line
+        ]
+
+        self.assertTrue(
+            workflow_scope_lines,
+            "AGENTS.md must scope Workflow execution to a Feishu topic/root thread",
+        )
+
     def test_agents_md_states_no_state_replacement(self):
         """Verify AGENTS.md explicitly forbids replacing chat+project state.
 
