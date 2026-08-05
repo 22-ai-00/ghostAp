@@ -68,36 +68,13 @@ _WORKTREE_ACTION_IDS = [
 class TestBuildWorktreeActionRegistry:
     """Validate build_worktree_action_registry() coverage and correctness."""
 
-    def test_all_worktree_ids_present(self):
-        """Every expected worktree action_id has an entry in the registry."""
+    def test_registry_exactly_maps_every_action_to_a_card_event(self):
         registry = build_worktree_action_registry()
-        for aid in _WORKTREE_ACTION_IDS:
-            assert aid in registry, f"action_id {aid!r} missing from worktree registry"
-
-    def test_no_extra_keys(self):
-        """Registry contains only known worktree action_ids (no stale entries)."""
-        registry = build_worktree_action_registry()
-        expected = set(_WORKTREE_ACTION_IDS)
-        extra = set(registry.keys()) - expected
-        assert not extra, f"Unexpected keys in worktree registry: {extra}"
-
-    @pytest.mark.parametrize("action_id", _WORKTREE_ACTION_IDS)
-    def test_factory_returns_card_event(self, action_id: str):
-        """Each factory in the registry returns a CardEvent when called with a dict payload."""
-        registry = build_worktree_action_registry()
-        factory = registry[action_id]
-        event = factory({"test": True})
-        assert isinstance(event, CardEvent), (
-            f"factory for {action_id!r} returned {type(event).__name__}, expected CardEvent"
-        )
-
-    @pytest.mark.parametrize("action_id", _WORKTREE_ACTION_IDS)
-    def test_factory_returns_card_event_with_empty_payload(self, action_id: str):
-        """Factories handle empty payload without error."""
-        registry = build_worktree_action_registry()
-        factory = registry[action_id]
-        event = factory({})
-        assert isinstance(event, CardEvent)
+        assert set(registry) == set(_WORKTREE_ACTION_IDS)
+        for action_id in _WORKTREE_ACTION_IDS:
+            for payload in ({}, {"test": True}):
+                event = registry[action_id](payload)
+                assert isinstance(event, CardEvent), (action_id, payload)
 
     def test_cancel_factory_ignores_payload(self):
         """WORKTREE_CANCEL factory produces fixed payload regardless of input."""

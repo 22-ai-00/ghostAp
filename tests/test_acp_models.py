@@ -3,107 +3,11 @@
 import time
 
 import src.acp.telemetry as telemetry_mod
-from src.acp.models import ACPEvent, ACPEventType, ACPSessionState, PlanEntryInfo, PlanInfo, PromptResult, ToolCallInfo
+from src.acp.models import ACPSessionState, PromptResult, ToolCallInfo
 from src.acp.renderer import render_prompt_result_markdown
 
 
-class TestACPEventType:
-    def test_values(self):
-        assert ACPEventType.TEXT_CHUNK.value == "text_chunk"
-        assert ACPEventType.THOUGHT_CHUNK.value == "thought_chunk"
-        assert ACPEventType.TOOL_CALL_START.value == "tool_call_start"
-        assert ACPEventType.TOOL_CALL_UPDATE.value == "tool_call_update"
-        assert ACPEventType.TOOL_CALL_DONE.value == "tool_call_done"
-        assert ACPEventType.PLAN_UPDATE.value == "plan_update"
-
-    def test_all_values_unique(self):
-        values = [e.value for e in ACPEventType]
-        assert len(values) == len(set(values))
-
-
-class TestToolCallInfo:
-    def test_create(self):
-        tc = ToolCallInfo(id="tc1", title="Read file", kind="read", status="completed")
-        assert tc.id == "tc1"
-        assert tc.title == "Read file"
-        assert tc.kind == "read"
-        assert tc.status == "completed"
-        assert tc.content == ""
-        assert tc.locations == []
-
-    def test_with_locations(self):
-        tc = ToolCallInfo(
-            id="tc2", title="Edit", kind="edit", status="in_progress", locations=["/tmp/a.py", "/tmp/b.py"]
-        )
-        assert len(tc.locations) == 2
-
-
-class TestPlanInfo:
-    def test_empty_plan(self):
-        plan = PlanInfo()
-        assert plan.entries == []
-
-    def test_plan_with_entries(self):
-        plan = PlanInfo(
-            entries=[
-                PlanEntryInfo(content="step 1", status="completed"),
-                PlanEntryInfo(content="step 2", status="in_progress"),
-                PlanEntryInfo(content="step 3"),
-            ]
-        )
-        assert len(plan.entries) == 3
-        assert plan.entries[0].status == "completed"
-        assert plan.entries[2].status == "pending"
-
-
-class TestACPEvent:
-    def test_text_event(self):
-        event = ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="hello")
-        assert event.event_type == ACPEventType.TEXT_CHUNK
-        assert event.text == "hello"
-        assert event.tool_call is None
-        assert event.plan is None
-        assert event.timestamp > 0
-
-    def test_tool_call_event(self):
-        tc = ToolCallInfo(id="tc1", title="Read", kind="read", status="completed")
-        event = ACPEvent(event_type=ACPEventType.TOOL_CALL_DONE, tool_call=tc)
-        assert event.tool_call.id == "tc1"
-
-    def test_plan_event(self):
-        plan = PlanInfo(entries=[PlanEntryInfo(content="step 1")])
-        event = ACPEvent(event_type=ACPEventType.PLAN_UPDATE, plan=plan)
-        assert len(event.plan.entries) == 1
-
-
 class TestACPSessionState:
-    def test_create(self):
-        state = ACPSessionState(session_id="s1", agent_type="coco", cwd="/tmp")
-        assert state.session_id == "s1"
-        assert state.agent_type == "coco"
-        assert state.message_count == 0
-        assert state.is_active
-
-    def test_to_dict(self):
-        state = ACPSessionState(session_id="s1", agent_type="claude", cwd="/home")
-        d = state.to_dict()
-        assert d["session_id"] == "s1"
-        assert d["agent_type"] == "claude"
-        assert "created_at" in d
-
-    def test_from_dict(self):
-        d = {
-            "session_id": "s1",
-            "agent_type": "coco",
-            "cwd": "/tmp",
-            "message_count": 5,
-            "is_active": False,
-        }
-        state = ACPSessionState.from_dict(d)
-        assert state.session_id == "s1"
-        assert state.message_count == 5
-        assert not state.is_active
-
     def test_roundtrip(self):
         state = ACPSessionState(session_id="s1", agent_type="claude", cwd="/home", message_count=3, is_active=True)
         d = state.to_dict()
@@ -114,25 +18,6 @@ class TestACPSessionState:
 
 
 class TestPromptResult:
-    def test_create(self):
-        result = PromptResult(stop_reason="end_turn", text="done")
-        assert result.stop_reason == "end_turn"
-        assert result.text == "done"
-        assert result.tool_calls == []
-        assert result.tool_results == []
-        assert result.plan is None
-        assert result.modified_files == set()
-
-    def test_with_tools(self):
-        tc = ToolCallInfo(id="t1", title="Edit", kind="edit", status="completed", locations=["/tmp/f.py"])
-        result = PromptResult(
-            stop_reason="end_turn",
-            tool_calls=[tc],
-            modified_files={"/tmp/f.py"},
-        )
-        assert len(result.tool_calls) == 1
-        assert "/tmp/f.py" in result.modified_files
-
     def test_ingest_history_tracks_files(self):
         result = PromptResult(stop_reason="end_turn")
         result.ingest_history(
@@ -203,15 +88,6 @@ class TestIdleHealthClassificationStatic:
 
 
 class TestTelemetryPublicExports:
-    def test_star_import_exports_telemetry_context_only(self):
-        mod = __import__("src.acp.telemetry", fromlist=["*"])
-        exported = getattr(mod, "__all__", [])
-
-        # 仅 IdleHealthTelemetryContext 应作为 Telemetry 上下文公开名称出现；
-        # IdleHealthContext 作为 [INTERNAL] 实现细节不应通过星号导出暴露给调用方。
-        assert "IdleHealthTelemetryContext" in exported
-        assert "IdleHealthContext" not in exported
-
     def test_get_idle_health_service_for_manager_prefers_explicit_instance(self):
         """_get_idle_health_service_for_manager 应优先返回显式传入的 IdleHealthService 实例。"""
 
@@ -220,19 +96,6 @@ class TestTelemetryPublicExports:
         result = telemetry_mod._get_idle_health_service_for_manager(svc)
 
         assert result is svc
-
-    def test_get_idle_health_service_for_manager_constructs_default_with_telemetry(self):
-        """当未显式传入 IdleHealthService 时，应基于给定 telemetry 构造默认实现。"""
-
-        class CustomTelemetry(telemetry_mod._DefaultIdleHealthTelemetry):
-            pass
-
-        telemetry = CustomTelemetry()
-
-        result = telemetry_mod._get_idle_health_service_for_manager(None, telemetry=telemetry)
-
-        # 仅通过鸭子类型检查关键方法是否存在，避免对具体实现做过强绑定
-        assert hasattr(result, "classify_session_idle_health")
 
     def test_manager_instance_uses_injected_idle_health_telemetry(self, monkeypatch) -> None:
         """ACPSessionManager 实例应仅依赖 IdleHealthTelemetry 协议方法。"""

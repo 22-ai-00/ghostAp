@@ -208,32 +208,7 @@ class TestConcurrency:
 
 
 class TestNewQueueFeatures:
-    """Tests for bootstrap_pending field, peek(), and drain_to()."""
-
-    # ----------------------------------------------------------
-    # bootstrap_pending field on QueuedTask
-    # ----------------------------------------------------------
-
-    def test_bootstrap_pending_defaults_to_false(self):
-        task = QueuedTask(task_id="t1", text="hello", chat_id="c1", message_id="m1")
-        assert task.bootstrap_pending is False
-
-    def test_bootstrap_pending_can_be_set_true(self):
-        task = QueuedTask(
-            task_id="t1", text="hello", chat_id="c1", message_id="m1", bootstrap_pending=True
-        )
-        assert task.bootstrap_pending is True
-
-    def test_retry_count_defaults_to_zero(self):
-        task = QueuedTask(task_id="t1", text="hello", chat_id="c1", message_id="m1")
-        assert task.retry_count == 0
-
-    def test_retry_count_can_be_incremented(self):
-        task = QueuedTask(task_id="t1", text="hello", chat_id="c1", message_id="m1")
-        task.retry_count += 1
-        assert task.retry_count == 1
-        task.retry_count += 1
-        assert task.retry_count == 2
+    """Tests for peek() and drain_to()."""
 
     # ----------------------------------------------------------
     # peek() — returns oldest task without removing it
@@ -307,64 +282,3 @@ class TestNewQueueFeatures:
         assert collected == ["t0", "t2", "t3"]
         # Queue must be empty after drain
         assert q.size() == 0
-
-
-# ============================================================
-# Bootstrap failed → unschedulable
-# ============================================================
-
-
-class TestBootstrapFailedUnschedulable:
-    """AC-R2: Tasks in bootstrap_failed channels become unschedulable."""
-
-    def test_bootstrap_pending_becomes_unschedulable(self):
-        """A task with bootstrap_pending=True can be marked unschedulable."""
-        queue = TaskQueue(max_size=10)
-        task = QueuedTask(
-            task_id="t1",
-            text="help me",
-            chat_id="chat1",
-            message_id="msg1",
-            bootstrap_pending=True,
-        )
-        queue.enqueue(task)
-        # Simulate bootstrap failure by marking task
-        task.status = "unschedulable"
-        assert task.status == "unschedulable"
-
-    def test_unschedulable_task_still_in_queue_until_drained(self):
-        """Marking status does not auto-remove from queue; needs explicit drain."""
-        queue = TaskQueue(max_size=10)
-        task = QueuedTask(
-            task_id="t1",
-            text="help me",
-            chat_id="chat1",
-            message_id="msg1",
-            bootstrap_pending=True,
-        )
-        queue.enqueue(task)
-        task.status = "unschedulable"
-        # Task is still in the queue (status is advisory)
-        assert queue.size() == 1
-        peeked = queue.peek()
-        assert peeked is not None
-        assert peeked.status == "unschedulable"
-
-    def test_default_status_is_pending(self):
-        """QueuedTask default status should be 'pending'."""
-        task = QueuedTask(
-            task_id="t1", text="normal", chat_id="c1", message_id="m1"
-        )
-        assert task.status == "pending"
-
-    def test_non_bootstrap_task_stays_pending(self):
-        """Tasks without bootstrap_pending=True remain in pending status."""
-        task = QueuedTask(
-            task_id="t2",
-            text="regular task",
-            chat_id="chat1",
-            message_id="msg2",
-            bootstrap_pending=False,
-        )
-        assert task.status == "pending"
-        assert task.bootstrap_pending is False

@@ -77,7 +77,7 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         self._PENDING_PROMPTS_MAX_SIZE = 256
         # ACP model cards can be answered out of order.  Ownership is scoped
         # to this handler request, never inferred from mutable project choice.
-        self._acp_activation_lock = threading.RLock()
+        self._acp_activation_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._acp_activation_tokens: dict[str, object] = {}
         self.help_commands = _SystemSubcommands(self, ("show_help", "show_full_help", "handle_help_category", "handle_menu_command"))
         self.shell_commands = _SystemSubcommands(self, ("submit_shell_command", "execute_shell_and_reply", "change_directory"))

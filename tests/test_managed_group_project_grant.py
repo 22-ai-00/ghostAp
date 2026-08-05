@@ -1122,7 +1122,7 @@ def test_startup_rejected_delete_cancels_only_after_durable_marker_restore(
     assert registry.active_record("oc_crash_after_archive") is not None
 
 
-def test_restore_from_disk_skips_and_archives_untrusted_markers(tmp_path):
+def test_restore_from_disk_leaves_untrusted_marker_inactive_for_migration(tmp_path):
     from src.slock_engine.manager import SlockEngineManager
 
     manager = SlockEngineManager(storage_base_path=str(tmp_path / "slock"))
@@ -1134,7 +1134,8 @@ def test_restore_from_disk_skips_and_archives_untrusted_markers(tmp_path):
     )
 
     assert restored == 0
-    assert not os.path.exists(marker)
+    assert os.path.isfile(marker)
+    assert manager.is_managed_chat("oc_tombstoned") is False
 
 
 def _adoption_handler(project_manager, registry):

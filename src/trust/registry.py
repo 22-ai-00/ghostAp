@@ -289,7 +289,7 @@ class ManagedGroupRegistry:
         self._uncertain_path = self._path.with_name(
             f".{self._path.name}.commit-uncertain"
         )
-        self._lock = threading.RLock()  # leaf lock: no external calls while held
+        self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._revision = 0
         self._intents: dict[str, dict[str, Any]] = {}
         self._records: dict[str, ManagedGroupRecord] = {}

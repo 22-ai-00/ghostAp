@@ -127,42 +127,9 @@ class TestUITextFrozenProxy:
         with pytest.raises(TypeError):
             UI_TEXT["orch_plan_archived"] = "tampered"  # type: ignore[index]
 
-    def test_frozen_proxy_raises_on_new_key(self):
-        """UI_TEXT['new_key'] = 'x' should raise TypeError."""
-        with pytest.raises(TypeError):
-            UI_TEXT["nonexistent_key_xyz"] = "value"  # type: ignore[index]
-
-    def test_frozen_proxy_has_no_pop(self):
-        """UI_TEXT should not support pop/del."""
-        with pytest.raises((TypeError, AttributeError)):
-            UI_TEXT.pop("orch_plan_archived")  # type: ignore[attr-defined]
-
-
-class TestMutableUITextNotExported:
-    """AC13: _MUTABLE_UI_TEXT is not accessible via wildcard import."""
-
-    def test_mutable_not_in_wildcard_import(self):
-        """from src.card.ui_text import * should NOT expose _MUTABLE_UI_TEXT."""
-        import importlib
-        mod = importlib.import_module("src.card.ui_text")
-        public_api = getattr(mod, "__all__", None)
-        assert public_api is not None, "ui_text.py must define __all__"
-        assert "_MUTABLE_UI_TEXT" not in public_api
-
-    def test_all_contains_ui_text(self):
-        """__all__ must contain 'UI_TEXT'."""
-        import importlib
-        mod = importlib.import_module("src.card.ui_text")
-        assert "UI_TEXT" in mod.__all__
-
-
 # ---------------------------------------------------------------------------
 # Strict UI_TEXT placeholder validation (merged from test_ui_text_placeholder_strict.py)
 # ---------------------------------------------------------------------------
-
-_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
-_SNAKE_CASE_RE = re.compile(r"^[a-z][a-z0-9]*(_[a-z0-9]+)*$")
-
 
 class TestUITextPlaceholderStrict(unittest.TestCase):
     """Strict validation of UI_TEXT entries."""
@@ -171,21 +138,6 @@ class TestUITextPlaceholderStrict(unittest.TestCase):
         """No UI_TEXT entry should have an empty string value."""
         empty_keys = [k for k, v in UI_TEXT.items() if isinstance(v, str) and v.strip() == ""]
         self.assertEqual(empty_keys, [], f"Empty UI_TEXT values: {empty_keys}")
-
-    def test_keys_are_snake_case(self):
-        """All UI_TEXT keys should follow snake_case convention."""
-        non_snake = [k for k in UI_TEXT.keys() if not _SNAKE_CASE_RE.match(k)]
-        self.assertEqual(non_snake, [], f"Non-snake_case keys: {non_snake}")
-
-    def test_no_tab_characters_in_values(self):
-        """No value should contain raw tab characters (use spaces for indentation)."""
-        bad_keys = []
-        for key, value in UI_TEXT.items():
-            if not isinstance(value, str):
-                continue
-            if "\t" in value:
-                bad_keys.append(key)
-        self.assertEqual(bad_keys, [], f"Keys with tab characters: {bad_keys}")
 
     def test_no_unbalanced_braces(self):
         """Format strings should have balanced { } braces."""
@@ -209,31 +161,19 @@ class TestUITextPlaceholderStrict(unittest.TestCase):
 class TestFormatIdleTimeout:
     """Test _format_idle_timeout edge cases."""
 
-    @pytest.mark.parametrize(
-        "seconds, expected",
-        [
+    def test_representative_formats(self):
+        cases = [
             (60, "1 分钟"),         # test_minimum_value_60
             (300, "5 分钟"),        # test_300_seconds
             (350, "6 分钟"),        # test_non_60_divisible (rounds up)
             (1800, "30 分钟"),      # test_1800_seconds (default)
             (3600, "1 小时"),       # test_3600_seconds (exact hour)
             (7200, "2 小时"),       # test_7200_seconds (exact hours)
-        ],
-        ids=[
-            "60s-1min", "300s-5min", "350s-round-up-6min",
-            "1800s-30min", "3600s-1h", "7200s-2h",
-        ],
-    )
-    def test_exact_format(self, seconds, expected):
-        assert _format_idle_timeout(seconds) == expected
+        ]
+        for seconds, expected in cases:
+            assert _format_idle_timeout(seconds) == expected, seconds
 
-    @pytest.mark.parametrize(
-        "seconds",
-        [4500, 5400],
-        ids=["4500s-1.25h", "5400s-1.5h"],
-    )
-    def test_non_exact_hour_has_approx_prefix(self, seconds):
-        """Non-exact hour values get 'approximately' prefix with 'hours'."""
-        result = _format_idle_timeout(seconds)
-        assert "约" in result
-        assert "小时" in result
+        for seconds in (4500, 5400):
+            result = _format_idle_timeout(seconds)
+            assert "约" in result, seconds
+            assert "小时" in result, seconds

@@ -69,7 +69,7 @@ class CardDelivery:
         self._mutator = PageMutator(client, self._bindings, self._sequences)
         self._payload_transform = payload_transform
         self._trust_revision_provider = trust_revision_provider
-        self._trust_lock = threading.Lock()
+        self._trust_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._expected_trust_revisions: dict[str, tuple[int, int] | None] = {}
         self._trust_snapshot_failed: set[str] = set()
 

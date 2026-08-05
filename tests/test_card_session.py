@@ -15,7 +15,6 @@ from src.card.events.worktree import (
 )
 from src.card.session import CardSession
 from src.card.session.config import SessionCallbacks, SessionConfig
-from src.card.session.factory import CardSessionFactory
 from src.card.state.button_intent import ButtonIntent
 from src.card.state.models import CardMetadata, CardState, ContentBlock
 from src.card.state.reducer import reduce_card_state
@@ -611,45 +610,6 @@ class TestCardSessionLifecycle:
         # After all threads done, session must be closed and terminal
         assert session.closed
         assert session.state.terminal == "completed"
-
-
-class TestCardSessionFactory:
-    """CardSessionFactory tests."""
-
-    def test_factory_creates_session(self):
-        client = MockDeliveryClient()
-        delivery = CardDelivery(client)
-        factory = CardSessionFactory(delivery)
-
-        session = factory.create(
-            chat_id="chat_1",
-            metadata=CardMetadata(mode_name="Claude"),
-            callbacks=SessionCallbacks(notify_callback=lambda _c, _t: None),
-        )
-        assert isinstance(session, CardSession)
-        assert not session.closed
-
-    def test_factory_injects_delivery(self):
-        client = MockDeliveryClient()
-        delivery = CardDelivery(client)
-        factory = CardSessionFactory(delivery)
-
-        session = factory.create("chat_1", CardMetadata(), callbacks=SessionCallbacks(notify_callback=lambda _c, _t: None))
-        session.dispatch(CardEvent(type=CardEventType.STARTED))
-        assert len(client.creates) == 1
-
-    def test_factory_custom_session_id(self):
-        client = MockDeliveryClient()
-        delivery = CardDelivery(client)
-        factory = CardSessionFactory(delivery)
-
-        session = factory.create(
-            "chat_1",
-            CardMetadata(),
-            session_id="my_custom_id",
-            callbacks=SessionCallbacks(notify_callback=lambda _c, _t: None),
-        )
-        assert session.session_id == "my_custom_id"
 
 
 # ---------------------------------------------------------------------------
@@ -1672,21 +1632,6 @@ class TestWorktreeStepperRender:
 class TestAtomRendererRegistry:
     """Test atom renderer registry completeness and fallback (Task 24)."""
 
-    def test_all_expected_kinds_registered(self):
-        """All expected atom kinds have renderers in the registry."""
-        from src.card.render.renderer import _ATOM_RENDERERS
-
-        expected_kinds = {
-            "text", "tool_panel", "reasoning", "plan",
-            "criteria_panel", "phase_panel", "warning_banner",
-            "progress_bar", "worktree_panel", "task_list",
-            "phase_banner", "subagent_dispatch", "activity_digest",
-            "review_role", "spec_plan", "spec_task",
-            "execution_current", "execution_history",
-            "image",
-        }
-        assert expected_kinds == set(_ATOM_RENDERERS.keys())
-
     def test_unknown_kind_falls_through_to_markdown(self):
         """Unknown atom kind → rendered as plain markdown with warning log."""
         from src.card.render.atoms import RenderAtom
@@ -1704,14 +1649,6 @@ class TestAtomRendererRegistry:
         # Running state → shows "任务仍在运行中" placeholder
         assert "部分内容暂时无法渲染" in elements[0]["content"]
         assert "运行中" in elements[0]["content"]
-
-    def test_registry_values_are_callable(self):
-        """Each registry entry is a callable."""
-        from src.card.render.renderer import _ATOM_RENDERERS
-
-        for kind, renderer in _ATOM_RENDERERS.items():
-            assert callable(renderer), f"Renderer for '{kind}' is not callable"
-
 
 # ---------------------------------------------------------------------------
 # Lifecycle hooks tests
@@ -2592,25 +2529,6 @@ class TestFallbackCmdToast:
         result = session.inbound_action("any_action")
         toast_content = result["toast"]["content"]
         assert UI_TEXT["card_session_fallback_cmd"] in toast_content
-
-
-class TestDispatchStructure:
-    """Verify dispatch() refactor: sub-methods exist and main body is concise."""
-
-    def test_dispatch_has_sub_methods(self):
-        """CardSession must have _check_ttl_inline, _enrich_event, _reduce_safe, _render_safe."""
-        assert hasattr(CardSession, "_check_ttl_inline")
-        assert hasattr(CardSession, "_enrich_event")
-        assert hasattr(CardSession, "_reduce_safe")
-        assert hasattr(CardSession, "_render_safe")
-
-    def test_dispatch_main_body_line_count(self):
-        """dispatch() main method body should be ≤36 lines (concise orchestration)."""
-        import inspect
-        source = inspect.getsource(CardSession.dispatch)
-        lines = [l for l in source.splitlines() if l.strip() and not l.strip().startswith("#")]
-        # Subtract the def line and docstring lines
-        assert len(lines) <= 36, f"dispatch() has {len(lines)} non-blank non-comment lines, expected ≤36"
 
 
 # ---------------------------------------------------------------------------

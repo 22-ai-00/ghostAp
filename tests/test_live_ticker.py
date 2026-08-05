@@ -40,20 +40,11 @@ def test_frame_for_tick_cycles_frames():
     assert frame_for_tick(2, ("a", "b")) == "a"
 
 
-def test_default_ticker_frames_match_v2_live_dot_spec():
+def test_default_ticker_contract():
     assert DEFAULT_TICKER_FRAMES == ("🟢", "⚪")
-
-
-def test_default_interval_is_1_2():
-    """Default LiveTicker interval should be 1.2s (v2 design)."""
-    ticker = LiveTicker(session_id="test", on_frame=lambda f: None)
-    assert ticker.interval == 1.2
     assert DEFAULT_TICKER_INTERVAL == 1.2
-
-
-def test_frozen_frame_constant():
-    """FROZEN_FRAME should be ⏸ (pause marker for archived cards)."""
     assert FROZEN_FRAME == "⏸"
+    assert LiveTicker(session_id="test", on_frame=lambda f: None).interval == 1.2
 
 
 def test_live_ticker_emits_now_and_reschedules_frames():

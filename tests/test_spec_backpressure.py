@@ -22,6 +22,9 @@ def test_spec_backpressure(mock_scheduler_cls):
 
     client = FeishuWSClient(message_callback=lambda x: None)
     client._reply_text = MagicMock()
+    # This unit test exercises scheduler backpressure after trust admission.
+    # Registry-first ingress behavior has its own managed/external group suite.
+    client._managed_group_registry = None
     client._ingress_access_policy_provider = IngressAccessPolicyProvider(
         IngressAccessPolicy(
             admin_ids=frozenset(),

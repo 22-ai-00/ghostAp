@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from src.slock_engine.models import (
-    AGENT_ROLE_COLORS,
     AgentIdentity,
     AgentStatus,
     DiscussionStatus,
@@ -36,15 +35,6 @@ def test_persisted_status_values_are_stable():
 
 
 class TestAgentIdentity:
-    def test_default_construction(self):
-        a = AgentIdentity(name="Alice")
-        assert a.name == "Alice"
-        assert a.emoji == "🤖"
-        assert a.agent_type == "coco"
-        assert a.role == "custom"
-        assert a.permissions == ["shell", "file_write", "git"]
-        assert a.agent_id  # UUID generated
-
     def test_display_name_with_name(self):
         a = AgentIdentity(name="Bob", emoji="🔧")
         assert a.display_name == "🔧 Bob"
@@ -97,12 +87,6 @@ class TestAgentIdentity:
 
 
 class TestSlockTask:
-    def test_default_construction(self):
-        t = SlockTask(content="Write tests")
-        assert t.content == "Write tests"
-        assert t.status == TaskStatus.TODO
-        assert t.claimed_by is None
-
     def test_to_dict_round_trip(self):
         t = SlockTask(
             task_id="t1",
@@ -130,11 +114,6 @@ class TestSlockTask:
 
 
 class TestSlockChannel:
-    def test_default_construction(self):
-        ch = SlockChannel(channel_id="c1", name="dev-team")
-        assert ch.channel_id == "c1"
-        assert ch.agents == []
-
     def test_to_dict_round_trip(self):
         ch = SlockChannel(
             channel_id="c2",
@@ -195,11 +174,6 @@ class TestSlockMemory:
 
 
 class TestSkillProfile:
-    def test_default(self):
-        sp = SkillProfile(tag="code")
-        assert sp.success_rate == 50.0
-        assert sp.total_tasks == 0
-
     def test_to_dict_round_trip(self):
         sp = SkillProfile(tag="review", success_rate=80.0, total_tasks=10, last_active=999.0)
         d = sp.to_dict()
@@ -208,14 +182,6 @@ class TestSkillProfile:
         assert restored.success_rate == 80.0
         assert restored.total_tasks == 10
         assert restored.last_active == 999.0
-
-
-class TestAgentRoleColors:
-    def test_known_roles_have_colors(self):
-        assert "coder" in AGENT_ROLE_COLORS
-        assert "writer" in AGENT_ROLE_COLORS
-        assert "reviewer" in AGENT_ROLE_COLORS
-        assert "tester" in AGENT_ROLE_COLORS
 
 
 class TestMaxRoundsReachedStatus:

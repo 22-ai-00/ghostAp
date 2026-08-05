@@ -424,7 +424,10 @@ def test_programming_handle_response_builds_channel_card_client():
     channel_client_cls.assert_called_once()
     assert channel_client_cls.call_args.args == (channel,)
     assert channel_client_cls.call_args.kwargs["preallocate_cards"] is True
-    delivery_factory.assert_called_once_with(channel_adapter)
+    delivery_factory.assert_called_once()
+    assert delivery_factory.call_args.args == (channel_adapter,)
+    assert callable(delivery_factory.call_args.kwargs["payload_transform"])
+    assert callable(delivery_factory.call_args.kwargs["trust_revision_provider"])
 
 
 def test_programming_handle_response_falls_back_when_channel_is_unavailable():

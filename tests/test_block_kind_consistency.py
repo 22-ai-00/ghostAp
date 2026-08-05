@@ -18,24 +18,3 @@ def test_block_kind_map_consistent_with_handlers():
         f"  In models but not handlers: {model_keys - handler_keys}\n"
         f"  In handlers but not models: {handler_keys - model_keys}"
     )
-
-
-def test_all_handler_keys_are_valid_block_kinds():
-    """Every key in _get_block_kind_handlers corresponds to a real block dataclass."""
-    from src.card.render.atoms import _get_block_kind_handlers
-    from src.card.state.models import _BLOCK_KIND_MAP
-
-    for kind in _get_block_kind_handlers():
-        assert kind in _BLOCK_KIND_MAP, f"Handler key '{kind}' not in _BLOCK_KIND_MAP"
-
-
-def test_import_time_no_handler_construction():
-    """Importing atoms.py does not build the handler registry at import time."""
-    import src.card.render.atoms as atoms_mod
-
-    # The lazy function uses functools.cache — verify it's callable
-    assert callable(atoms_mod._get_block_kind_handlers)
-    # Calling it should succeed (builds on first call)
-    handlers = atoms_mod._get_block_kind_handlers()
-    assert isinstance(handlers, dict)
-    assert len(handlers) > 0

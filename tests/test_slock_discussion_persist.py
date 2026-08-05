@@ -84,12 +84,6 @@ class TestStopDiscussionPersistence:
 class TestFinalArbiter:
     """AC-R06: max_rounds 耗尽时 Final Arbiter 强制收敛。"""
 
-    def test_arbiter_method_exists(self):
-        """DiscussionManager has _run_final_arbiter method."""
-        mgr = _make_manager()
-        assert hasattr(mgr, "_run_final_arbiter")
-        assert callable(getattr(mgr, "_run_final_arbiter"))
-
     def test_arbiter_fallback_on_low_budget(self):
         """When budget is insufficient, arbiter uses last message as conclusion."""
         mgr = _make_manager()

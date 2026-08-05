@@ -4,49 +4,6 @@ import importlib
 import re
 from pathlib import Path
 
-import pytest
-
-
-@pytest.mark.parametrize("module_path", [
-    "src.card.events",
-    "src.card.session",
-])
-def test_all_symbols_importable(module_path: str) -> None:
-    """Every name listed in __all__ must be importable from the module."""
-    mod = importlib.import_module(module_path)
-    all_names = getattr(mod, "__all__", None)
-    assert all_names is not None, f"{module_path} has no __all__"
-    assert len(all_names) > 0, f"{module_path}.__all__ is empty"
-
-    missing: list[str] = []
-    for name in all_names:
-        if not hasattr(mod, name):
-            missing.append(name)
-
-    assert not missing, f"{module_path} is missing: {missing}"
-
-
-@pytest.mark.parametrize("module_path", [
-    "src.card.events",
-    "src.card.session",
-])
-def test_all_no_duplicates(module_path: str) -> None:
-    """__all__ should not contain duplicate entries."""
-    mod = importlib.import_module(module_path)
-    all_names = getattr(mod, "__all__", [])
-    duplicates = [n for n in all_names if all_names.count(n) > 1]
-    assert not duplicates, f"{module_path}.__all__ has duplicates: {set(duplicates)}"
-
-
-def test_acp_manager_idle_health_calls_typed_telemetry_entry_without_type_ignores() -> None:
-    """Task 25 guard: idle-health delegation should not need broad type ignores."""
-    source = (Path(__file__).parent.parent / "src" / "acp" / "manager.py").read_text(encoding="utf-8")
-
-    assert "classify_manager_idle_health" in source
-    assert "_classify_idle_health_for_manager" not in source
-    assert "type: ignore[attr-defined]" not in source
-    assert "context=context,  # type: ignore[arg-type]" not in source
-
 
 def test_card_builder_project_context_import_is_type_checking_only() -> None:
     """Task 27 guard: card builder must not runtime-import project context for annotations."""

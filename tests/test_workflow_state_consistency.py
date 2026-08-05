@@ -211,6 +211,7 @@ def test_first_workflow_selection_card_links_to_original_inbound_message(tmp_pat
 
     handler = WorkflowHandler.__new__(WorkflowHandler)
     handler.ctx = MagicMock()
+    handler.ctx.managed_group_registry = None
     handler.ctx.message_linker = linker
     handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
     handler.im_client = MagicMock()

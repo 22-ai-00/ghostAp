@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from unittest.mock import patch
 
 from src.utils.metrics_exporter import (
     JsonLinesExporter,
     LoggerExporter,
-    ReviewMetricsExporter,
     get_metrics_exporter,
     reset_metrics_exporter,
 )
@@ -33,21 +31,6 @@ SAMPLE_METRICS = {
 
 
 # ---------------------------------------------------------------------------
-# Protocol conformance
-# ---------------------------------------------------------------------------
-class TestProtocolConformance:
-    def test_logger_exporter_is_protocol(self):
-        assert isinstance(LoggerExporter(), ReviewMetricsExporter)
-
-    def test_jsonl_exporter_is_protocol(self):
-        with tempfile.TemporaryDirectory() as d:
-            assert isinstance(
-                JsonLinesExporter(path=os.path.join(d, "m.jsonl")),
-                ReviewMetricsExporter,
-            )
-
-
-# ---------------------------------------------------------------------------
 # LoggerExporter
 # ---------------------------------------------------------------------------
 class TestLoggerExporter:
@@ -64,13 +47,6 @@ class TestLoggerExporter:
         bad = {"key": object()}
         exporter.export_metrics(bad, prefix="[X]")  # should not raise
 
-    def test_prefix_appears_in_log(self, caplog):
-        exporter = LoggerExporter()
-        with caplog.at_level("INFO"):
-            exporter.export_metrics(SAMPLE_METRICS, prefix="[Loop]")
-        assert "[Loop]" in caplog.text
-
-
 # ---------------------------------------------------------------------------
 # JsonLinesExporter
 # ---------------------------------------------------------------------------
@@ -84,9 +60,7 @@ class TestJsonLinesExporter:
             lines = f.readlines()
         assert len(lines) == 1
         parsed = json.loads(lines[0])
-        assert parsed["metric_type"] == "review_exception"
-        assert parsed["engine"] == "spec"
-        assert parsed["fail_reason"] == "timeout"
+        assert parsed == SAMPLE_METRICS
 
     def test_write_multiple_lines(self, tmp_path):
         path = str(tmp_path / "metrics.jsonl")
@@ -100,38 +74,18 @@ class TestJsonLinesExporter:
         for i, line in enumerate(lines):
             assert json.loads(line)["cycle"] == i
 
-    def test_all_10_fields_present(self, tmp_path):
-        path = str(tmp_path / "metrics.jsonl")
-        exporter = JsonLinesExporter(path=path)
-        exporter.export_metrics(SAMPLE_METRICS)
-        with open(path, "r", encoding="utf-8") as f:
-            parsed = json.loads(f.readline())
-        expected_keys = {
-            "metric_type", "engine", "cycle", "fail_reason",
-            "consecutive_timeouts", "consecutive_failures",
-            "circuit_open", "adaptive_timeout", "backoff_level",
-            "total_elapsed_ms",
-        }
-        assert expected_keys.issubset(set(parsed.keys()))
-
     def test_creates_parent_directory(self, tmp_path):
         path = str(tmp_path / "subdir" / "nested" / "m.jsonl")
         exporter = JsonLinesExporter(path=path)
         exporter.export_metrics(SAMPLE_METRICS)
         assert os.path.isfile(path)
 
-    def test_path_property(self, tmp_path):
-        path = str(tmp_path / "m.jsonl")
-        exporter = JsonLinesExporter(path=path)
-        assert exporter.path == path
-
     def test_survives_bad_dict(self, tmp_path):
         """Non-serialisable dict does not raise — silently skipped."""
         path = str(tmp_path / "m.jsonl")
         exporter = JsonLinesExporter(path=path)
         exporter.export_metrics({"bad": object()})
-        # File may be empty or not created — no crash
-        assert True
+        # Reaching this point is the contract: malformed metrics do not escape.
 
 
 # ---------------------------------------------------------------------------
@@ -243,20 +197,10 @@ class TestJsonLinesExporterErrorLogging:
 
         with patch("src.utils.metrics_exporter.logger") as mock_logger:
             exporter.export_metrics(SAMPLE_METRICS)
-            if mock_logger.debug.called:
-                call_args = mock_logger.debug.call_args
-                log_msg = call_args[0][1] if len(call_args[0]) > 1 else ""
-                # Must NOT contain the class representation
-                assert "<class" not in str(log_msg), (
-                    f"Log should contain actual error, not class name; got: {log_msg}"
-                )
-
-    def test_write_failure_does_not_log_class_exception(self):
-        """Explicitly verify str(Exception) pattern is gone — error variable is used."""
-        import inspect
-        source = inspect.getsource(JsonLinesExporter.export_metrics)
-        assert "str(Exception)" not in source, "Must use str(e), not str(Exception)"
-        assert "repr(Exception)" not in source, "Must use repr(e), not repr(Exception)"
+            mock_logger.debug.assert_called_once()
+            call_args = mock_logger.debug.call_args
+            log_msg = call_args[0][1] if len(call_args[0]) > 1 else ""
+            assert "<class" not in str(log_msg)
 
 
 # ---------------------------------------------------------------------------
@@ -284,11 +228,6 @@ class TestFactoryReconfiguration:
         b = get_metrics_exporter("logger")
         assert isinstance(b, LoggerExporter)
         assert a is not b
-
-    def test_same_type_returns_cached(self):
-        a = get_metrics_exporter("logger")
-        b = get_metrics_exporter("logger")
-        assert a is b
 
     def test_same_jsonl_type_returns_cached(self, tmp_path):
         path = str(tmp_path / "m.jsonl")

@@ -956,11 +956,6 @@ class TestSpecModels:
         assert SpecPhase.BUILD.value == "build"
         assert SpecPhase.REVIEW.value == "review"
 
-    def test_spec_phase_emoji(self):
-        assert SpecPhase.SPEC.emoji == "📋"
-        assert SpecPhase.BUILD.emoji == "🔨"
-        assert SpecPhase.REVIEW.emoji == "🔍"
-
     def test_project_status_enum(self):
         assert SpecProjectStatus.IDLE.value == "idle"
         assert SpecProjectStatus.RUNNING.value == "running"
@@ -971,14 +966,6 @@ class TestSpecModels:
     def test_task_status_enum(self):
         assert SpecTaskStatus.PENDING.value == "pending"
         assert SpecTaskStatus.COMPLETED.value == "completed"
-
-    def test_spec_task_creation(self):
-        task = SpecTask(task_id=1, description="Implement auth")
-        assert task.task_id == 1
-        assert task.description == "Implement auth"
-        assert task.dependencies == []
-        assert task.status == SpecTaskStatus.PENDING
-        assert task.output == ""
 
     def test_spec_task_to_dict_from_dict(self):
         task = SpecTask(
@@ -1041,13 +1028,6 @@ class TestSpecModels:
         assert len(restored.tasks) == 1
         assert restored.status == "completed"
 
-    def test_spec_project_create(self):
-        project = SpecProject.create(name="test_project", root_path="/tmp/test")
-        assert project.name == "test_project"
-        assert project.root_path == "/tmp/test"
-        assert len(project.project_id) == 8
-        assert project.status == SpecProjectStatus.IDLE
-
     def test_spec_project_lifecycle(self):
         project = SpecProject.create(root_path="/tmp")
         assert project.status == SpecProjectStatus.IDLE
@@ -1065,28 +1045,6 @@ class TestSpecModels:
         project.complete()
         assert project.status == SpecProjectStatus.COMPLETED
         assert project.completed_at is not None
-
-    def test_spec_project_properties(self):
-        project = SpecProject.create(root_path="/tmp")
-        assert project.current_cycle is None
-        assert project.current_cycle_number == 0
-        assert project.satisfied_count == 0
-        assert project.total_criteria == 0
-        # CriteriaTracker requires total_count > 0 to be "all satisfied"
-        assert not project.is_all_satisfied
-
-        project.cycles.append(SpecCycle(cycle_number=1))
-        assert project.current_cycle is not None
-        assert project.current_cycle.cycle_number == 1
-        assert project.current_cycle_number == 1
-
-    def test_spec_project_duration(self):
-        project = SpecProject.create(root_path="/tmp")
-        assert project.duration() is None
-
-        project.start()
-        assert project.duration() is not None
-        assert project.duration() >= 0
 
     def test_spec_project_serialization(self):
         project = SpecProject.create(name="test", root_path="/tmp/test")

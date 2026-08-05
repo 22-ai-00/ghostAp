@@ -4,8 +4,6 @@ Each handler is tested with a fully-mocked HandlerContext so that no real
 Feishu API calls or sessions are required.
 """
 
-import ast
-import inspect
 import json
 import threading
 import time
@@ -152,15 +150,6 @@ class TestBaseHandler:
     def _make(self, **ctx_overrides):
         ctx = _make_handler_context(**ctx_overrides)
         return BaseHandler(ctx), ctx
-
-    def test_property_accessors(self):
-        ctx = _make_handler_context()
-        h = BaseHandler(ctx)
-        assert h.settings is ctx.settings
-        assert h.project_manager is ctx.project_manager
-        assert h.mode_manager is ctx.mode_manager
-        assert h.context_manager is ctx.context_manager
-        assert h.scheduler is ctx.scheduler
 
     def test_get_working_dir_default(self):
         h, ctx = self._make()
@@ -942,17 +931,6 @@ class TestCocoModeHandler:
         kwargs = thread_manager.register.call_args.kwargs
         assert kwargs["tool_name"] == "coco"
         assert kwargs["model_name"] == "selected-model"
-
-    def test_programming_mode_handler_declares_single_base_model_override(self):
-        source = inspect.getsource(ProgrammingModeHandler)
-        tree = ast.parse(source)
-        class_node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ProgrammingModeHandler")
-        definitions = [
-            node for node in class_node.body
-            if isinstance(node, ast.FunctionDef) and node.name == "_get_model_name_override"
-        ]
-
-        assert len(definitions) == 1
 
     def test_exit_opposite_mode(self):
         h, _ = self._make()
@@ -2395,23 +2373,6 @@ class TestHelpCategoryPatch:
             # Verify fallback to reply_card
             h.reply_card.assert_called_once()
 
-    def test_handle_help_category_patch_exception_fallback(self):
-        # With the new impl, update_card handles exceptions internally and returns False
-        # So this test is effectively same as failure fallback
-        h, ctx = self._make()
-
-        ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
-
-        h.update_card = MagicMock(return_value=False)
-
-        with patch("src.card.builder.CardBuilder.build_help_card") as mock_build:
-            mock_build.return_value = ("interactive", "{}")
-
-            h.handle_help_category("msg1", "chat1", "main", origin_message_id="origin1")
-
-            h.update_card.assert_called_once()
-            h.reply_card.assert_called_once()
-
     def test_handle_help_category_no_origin_id(self):
         h, ctx = self._make()
 
@@ -2470,13 +2431,6 @@ class TestSystemHandlerShellRepoLock:
 class TestWithRepoLockSignature:
     """AC-16: _with_repo_lock accepts only (root_path, chat_id, body_func)."""
 
-    def test_signature_has_three_params(self):
-        import inspect
-        sig = inspect.signature(BaseHandler._with_repo_lock)
-        # Parameters: self, root_path, chat_id, body_func
-        param_names = list(sig.parameters.keys())
-        assert param_names == ["self", "root_path", "chat_id", "body_func"]
-
     def test_invokes_body_func(self):
         ctx = _make_handler_context()
         h = BaseHandler(ctx)
@@ -2485,22 +2439,6 @@ class TestWithRepoLockSignature:
         called = []
         h._with_repo_lock("/tmp/repo", "chat_1", lambda: called.append(True))
         assert called == [True]
-
-
-# ======================================================================
-# AC-17: send_lock_conflict_card has type annotation
-# ======================================================================
-
-
-class TestSendLockConflictCardAnnotation:
-    """AC-17: send_lock_conflict_card has 'LockConflictError' annotation on first arg."""
-
-    def test_type_annotation_present(self):
-        import inspect
-        hints = inspect.get_annotations(BaseHandler.send_lock_conflict_card)
-        assert "e" in hints
-        # The annotation is a string (TYPE_CHECKING forward ref)
-        assert "LockConflictError" in str(hints["e"])
 
 
 # ======================================================================

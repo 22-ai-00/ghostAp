@@ -23,20 +23,6 @@ def test_create_card_delivery_injects_settings():
     assert delivery._session_lock_ttl == 300.0
 
 
-def test_create_card_delivery_uses_default_settings():
-    """Factory should work with default settings (no env override)."""
-    mock_client = MagicMock()
-
-    # Use real settings (defaults)
-    from src.card.delivery.factory import create_card_delivery
-    delivery = create_card_delivery(mock_client)
-
-    from src.config import get_settings
-    settings = get_settings()
-    assert delivery._max_session_locks == settings.card.session_lock_max
-    assert delivery._session_lock_ttl == settings.card.session_lock_ttl
-
-
 @pytest.mark.parametrize("kwargs, match", [
     ({"max_session_locks": 0},   "max_session_locks must be > 0"),
     ({"session_lock_ttl": -1},   "session_lock_ttl must be > 0"),

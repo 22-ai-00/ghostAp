@@ -35,24 +35,15 @@ def _make_ctx(**overrides):
     return ReviewContext(**base)
 
 
-def test_select_default():
-    s = select_review_strategy(types.SimpleNamespace())
-    assert isinstance(s, AdaptiveRoleReviewStrategy)
-
-
-def test_select_multi_perspective():
-    s = select_review_strategy(types.SimpleNamespace(spec_review_strategy="multi_perspective"))
-    assert isinstance(s, MultiPerspectiveStrategy)
-
-
-def test_select_none():
-    s = select_review_strategy(types.SimpleNamespace(spec_review_strategy="none"))
-    assert isinstance(s, NoReviewStrategy)
-
-
-def test_select_unknown_fallback():
-    s = select_review_strategy(types.SimpleNamespace(spec_review_strategy="xxx"))
-    assert isinstance(s, MultiPerspectiveStrategy)
+def test_strategy_selection_contract():
+    cases = (
+        (types.SimpleNamespace(), AdaptiveRoleReviewStrategy),
+        (types.SimpleNamespace(spec_review_strategy="multi_perspective"), MultiPerspectiveStrategy),
+        (types.SimpleNamespace(spec_review_strategy="none"), NoReviewStrategy),
+        (types.SimpleNamespace(spec_review_strategy="xxx"), MultiPerspectiveStrategy),
+    )
+    for settings, expected_type in cases:
+        assert isinstance(select_review_strategy(settings), expected_type), settings
 
 
 def test_no_review_returns_empty():
