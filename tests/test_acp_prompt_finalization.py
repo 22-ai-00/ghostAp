@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
@@ -502,6 +503,115 @@ def test_real_goal_pause_transport_and_retirement_failures_preserve_both_causes(
     }
     assert prompt_calls == ["original task"]
     assert session._force_dead is True
+
+
+def test_sync_prompt_timeout_dual_cancel_failure_reaches_exact_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    backend = ACPSession(agent_cmd="npx", agent_args=[], cwd=str(tmp_path))
+    backend._session_id = "session-goal"
+    backend._on_session_info(
+        "session-goal",
+        ACPSessionInfo(
+            goal_known=True,
+            goal=ACPGoalInfo(
+                "finish",
+                "active",
+                control_method="_codex/session/goal_control",
+            ),
+            thread_status_known=True,
+            thread_status="active",
+        ),
+    )
+
+    async def stuck_prompt(*_args, **_kwargs) -> PromptResult:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    class Connection:
+        async def ext_method(self, *_args, **_kwargs):
+            raise ConnectionError("pause transport lost")
+
+        async def cancel(self, **_kwargs):
+            raise RuntimeError("turn cancel lost")
+
+    backend.prompt = stuck_prompt  # type: ignore[method-assign]
+    backend._conn = Connection()
+
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+
+    def run_loop() -> None:
+        asyncio.set_event_loop(loop)
+        loop_ready.set()
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=run_loop)
+    loop_thread.start()
+    assert loop_ready.wait(timeout=1)
+
+    session = SyncACPSession.__new__(SyncACPSession)
+    session._agent_type = "codex"
+    session._acp_session = backend
+    session._loop = loop
+    session._log_failures = False
+    session._force_dead = False
+    session._active_future = None
+    session._start_watchdog = lambda: None
+    session.last_active = 0.0
+    session.message_count = 0
+    session.last_query = ""
+    retired: list[object] = []
+    transitions: list[str] = []
+    monkeypatch.setattr(
+        "src.acp.sync_adapter._PROMPT_CANCEL_DRAIN_TIMEOUT_S",
+        0.01,
+    )
+
+    try:
+        with (
+            caplog.at_level("WARNING", logger="src.acp.sync_adapter"),
+            pytest.raises(TimeoutError) as exc_info,
+        ):
+            _runner()(
+                session,
+                "original task",
+                timeout_s=0.02,
+                finalization_reserve_s=0,
+                on_finalization_start=lambda: transitions.append("finalizing"),
+                retire_finalization_session=lambda active, _budget: retired.append(
+                    active
+                ),
+            )
+    finally:
+        async def cancel_pending_tasks() -> None:
+            current = asyncio.current_task()
+            pending = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not current and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        asyncio.run_coroutine_threadsafe(
+            cancel_pending_tasks(),
+            loop,
+        ).result(timeout=1)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=1)
+        loop.close()
+
+    assert not isinstance(exc_info.value, ExceptionGroup)
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert transitions == ["finalizing"]
+    assert retired == [session]
+    assert session._force_dead is True
+    assert "pause transport lost" in caplog.text
+    assert "turn cancel lost" in caplog.text
 
 
 def test_real_parser_unknown_goal_retires_before_finalization_prompt(

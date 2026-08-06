@@ -1915,7 +1915,17 @@ class SyncACPSession:
                     agent_type_str,
                     effective_timeout,
                 )
-            self.cancel(wait=True, timeout=2.0)
+            try:
+                self.cancel(wait=True, timeout=2.0)
+            except Exception as cancel_error:
+                future.cancel()
+                self._force_dead = True
+                logger.warning(
+                    "[ACP:%s] prompt timeout cleanup failed; session marked dead: %s",
+                    agent_type_str,
+                    get_error_detail(cancel_error),
+                    exc_info=True,
+                )
             try:
                 future.result(timeout=_PROMPT_CANCEL_DRAIN_TIMEOUT_S)
             except (
@@ -2059,7 +2069,12 @@ class SyncACPSession:
         try:
             fut.result(timeout=timeout)
             return True
-        except (TimeoutError, OSError, RuntimeError) as e:
+        except TimeoutError as e:
+            fut.cancel()
+            self._force_dead = True
+            logger.debug("[ACP] cancel wait timed out: %s", get_error_detail(e))
+            return False
+        except (OSError, RuntimeError) as e:
             logger.debug("[ACP] cancel wait skipped: %s", get_error_detail(e))
             return False
 

@@ -14,8 +14,10 @@ from unittest.mock import AsyncMock, call
 import pytest
 
 from src.acp import diagnostics as diag
+from src.acp import session as acp_session_module
 from src.acp import sync_adapter as sa
-from src.acp.models import PromptResult
+from src.acp.models import ACPGoalInfo, ACPSessionInfo, PromptResult
+from src.acp.session import ACPSession
 
 
 def _cancel_test_session() -> sa.SyncACPSession:
@@ -53,6 +55,112 @@ def test_cancel_wait_timeout_returns_not_acknowledged(monkeypatch):
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
 
     assert session.cancel(wait=True, timeout=0.1) is False
+
+
+def test_cancel_wait_timeout_cancels_pending_future_and_marks_session_dead(
+    monkeypatch,
+):
+    session = _cancel_test_session()
+    session._force_dead = False
+    pending: concurrent.futures.Future[None] = concurrent.futures.Future()
+
+    def submit(coro, _loop):
+        coro.close()
+        return pending
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
+
+    assert session.cancel(wait=True, timeout=0.01) is False
+    assert pending.cancelled() is True
+    assert session._force_dead is True
+
+
+def test_cancel_wait_timeout_does_not_send_turn_cancel_after_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ACPSession(agent_cmd="npx", agent_args=[], cwd=str(tmp_path))
+    backend._session_id = "session-goal"
+    backend._on_session_info(
+        "session-goal",
+        ACPSessionInfo(
+            goal_known=True,
+            goal=ACPGoalInfo(
+                "finish",
+                "active",
+                control_method="_codex/session/goal_control",
+            ),
+            thread_status_known=True,
+            thread_status="active",
+        ),
+    )
+    pause_entered = threading.Event()
+    pause_cancelled = threading.Event()
+    turn_cancel_called = threading.Event()
+
+    class Connection:
+        async def ext_method(self, *_args, **_kwargs):
+            pause_entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                pause_cancelled.set()
+
+        async def cancel(self, **_kwargs):
+            turn_cancel_called.set()
+
+    async def wait_for_external_cancel(awaitable, **_kwargs):
+        return await awaitable
+
+    backend._conn = Connection()
+    monkeypatch.setattr(
+        acp_session_module,
+        "safe_wait_for",
+        wait_for_external_cancel,
+    )
+
+    loop = asyncio.new_event_loop()
+    loop_ready = threading.Event()
+
+    def run_loop() -> None:
+        asyncio.set_event_loop(loop)
+        loop_ready.set()
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=run_loop)
+    loop_thread.start()
+    assert loop_ready.wait(timeout=1)
+
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._acp_session = backend
+    session._loop = loop
+    session._force_dead = False
+
+    try:
+        assert session.cancel(wait=True, timeout=0.02) is False
+        assert pause_entered.is_set()
+        assert pause_cancelled.wait(timeout=1)
+        assert turn_cancel_called.wait(timeout=0.05) is False
+        assert session._force_dead is True
+    finally:
+        async def cancel_pending_tasks() -> None:
+            current = asyncio.current_task()
+            pending = [
+                task
+                for task in asyncio.all_tasks()
+                if task is not current and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        asyncio.run_coroutine_threadsafe(
+            cancel_pending_tasks(),
+            loop,
+        ).result(timeout=1)
+        loop.call_soon_threadsafe(loop.stop)
+        loop_thread.join(timeout=1)
+        loop.close()
 
 
 def test_goal_control_methods_use_caller_bounded_background_loop() -> None:

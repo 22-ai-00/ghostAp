@@ -973,6 +973,8 @@ class ACPSession:
                     )
                 if await self.has_active_goal() and not paused:
                     raise RuntimeError("ACP active goal pause was not confirmed")
+            except asyncio.CancelledError:
+                raise
             except BaseException as exc:
                 pause_error = exc
 
