@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import hashlib
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -895,6 +896,72 @@ def test_request_rejection_after_forced_snapshot_marks_resume_transport_dead(
         assert session._session_id == "observed-target"
 
     asyncio.run(exercise())
+
+
+def test_target_snapshot_between_rejection_check_and_rollback_marks_dead(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._session_id = "new-session"
+    session._reset_lifecycle(goal_known=True)
+    request_failed = threading.Event()
+    deliver_snapshot = threading.Event()
+    snapshot_delivered = threading.Event()
+    interleaved = False
+    base_lock = threading.Lock()
+
+    class InterleavingLock:
+        def __enter__(self):
+            base_lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            nonlocal interleaved
+            should_interleave = request_failed.is_set() and not interleaved
+            if should_interleave:
+                interleaved = True
+            base_lock.release()
+            if should_interleave:
+                deliver_snapshot.set()
+                assert snapshot_delivered.wait(timeout=1)
+
+    session._handler_lock = InterleavingLock()
+
+    def send_snapshot() -> None:
+        assert deliver_snapshot.wait(timeout=1)
+        session._on_session_info("racing-target", _active_goal_info())
+        snapshot_delivered.set()
+
+    snapshot_thread = threading.Thread(target=send_snapshot)
+    snapshot_thread.start()
+
+    async def exercise() -> None:
+        error = RequestError(-32602, "resume rejected")
+
+        class Connection:
+            async def load_session(self, **_kwargs):
+                request_failed.set()
+                raise error
+
+        session._conn = Connection()
+        with pytest.raises(RequestError) as exc_info:
+            await session.load_session("racing-target")
+        assert exc_info.value is error
+        assert snapshot_delivered.is_set()
+        assert session._force_dead is True
+        assert session._session_id == "racing-target"
+        assert session._state.session_id == "racing-target"
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        deliver_snapshot.set()
+        snapshot_thread.join(timeout=1)
+    assert snapshot_thread.is_alive() is False
 
 
 def test_same_target_cannot_reuse_delayed_snapshot_after_rejected_load(

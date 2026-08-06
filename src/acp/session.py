@@ -613,8 +613,13 @@ class ACPSession:
                         revision = self._lifecycle_revision
                     await self._wait_for_lifecycle_change(revision)
         except BaseException as exc:
+            ambiguous_rejection: RequestError | None = None
             with self._handler_lock:
-                if isinstance(exc, ACPResumeRejected):
+                clean_rejection = (
+                    isinstance(exc, ACPResumeRejected)
+                    and not self._load_snapshot_observed
+                )
+                if clean_rejection:
                     self._session_id = previous_session_id
                     self._state.session_id = previous_session_id or ""
                     (
@@ -632,11 +637,18 @@ class ACPSession:
                     self._session_id = target_session_id
                     self._state.session_id = target_session_id
                     self._force_dead = True
+                    if (
+                        isinstance(exc, ACPResumeRejected)
+                        and isinstance(exc.__cause__, RequestError)
+                    ):
+                        ambiguous_rejection = exc.__cause__
                 self._lifecycle_revision += 1
                 self._loading_session_id = None
                 self._load_epoch += 1
             self._bind_session_info_callback()
             self._wake_lifecycle_waiter()
+            if ambiguous_rejection is not None:
+                raise ambiguous_rejection from None
             raise
         with self._handler_lock:
             self._loading_session_id = None
