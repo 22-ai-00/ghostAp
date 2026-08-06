@@ -782,7 +782,8 @@ def test_ttadk_startup_model_log_uses_real_or_auto(caplog):
             def start(self, startup_timeout: float = 60, **kwargs):
                 return "sid"
 
-            def load_session(self, session_id: str):
+            def load_session(self, session_id: str, timeout: float = 60):
+                del timeout
                 return None
 
             def load_local_history(self, session_id=None, limit: int = 200):
@@ -875,7 +876,8 @@ def test_ttadk_resume_model_log_uses_real_or_auto(caplog):
             def start(self, startup_timeout: float = 60, **kwargs):
                 return "sid"
 
-            def load_session(self, session_id: str):
+            def load_session(self, session_id: str, timeout: float = 60):
+                del timeout
                 return None
 
             def load_local_history(self, session_id=None, limit: int = 200):

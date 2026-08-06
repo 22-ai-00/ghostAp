@@ -71,7 +71,8 @@ class RecordedSession:
     def start(self, startup_timeout: float = 60) -> str:
         return self.session_id
 
-    def load_session(self, session_id: str) -> None:
+    def load_session(self, session_id: str, timeout: float = 60) -> None:
+        del timeout
         self.session_id = session_id
         self.is_resumed = True
 

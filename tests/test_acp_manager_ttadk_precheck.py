@@ -36,7 +36,8 @@ def test_acp_session_manager_ttadk_uses_precheck_fn(monkeypatch, caplog):
         def start(self, startup_timeout: float = 60) -> str:
             return "sid"
 
-        def load_session(self, session_id: str) -> None:
+        def load_session(self, session_id: str, timeout: float = 60) -> None:
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
@@ -146,7 +147,8 @@ def test_acp_session_manager_ttadk_startup_fail_log_has_non_empty_error_blob(mon
         def start(self, startup_timeout: float = 60) -> str:
             raise _EmptyStrErr()
 
-        def load_session(self, session_id: str) -> None:
+        def load_session(self, session_id: str, timeout: float = 60) -> None:
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
@@ -297,7 +299,8 @@ def test_acp_session_manager_ttadk_startup_fail_diagnostics_summary_is_redacted(
             e.stderr = "token=abc123 api_key=sk-secret-1234567890 " + "x" * 1000
             raise e
 
-        def load_session(self, session_id: str) -> None:
+        def load_session(self, session_id: str, timeout: float = 60) -> None:
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):

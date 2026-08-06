@@ -206,7 +206,7 @@ def test_executor_cancel_during_session_creation(tmp_path):
 
         def describe_agent(self): return "fake"
         def start(self, timeout=60): return self.session_id
-        def load_session(self, sid): self.session_id = sid
+        def load_session(self, sid, timeout=60): self.session_id = sid
         def load_local_history(self, *a, **kw): return []
         def to_snapshot(self): return {"session_id": self.session_id}
         def get_session_info(self): return "SlowCreateSession"

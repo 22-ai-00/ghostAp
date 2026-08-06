@@ -48,7 +48,8 @@ def test_e2e_model_failure_need_compaction_then_loop_then_failover(monkeypatch, 
         def start(self, startup_timeout: float = 60):
             return self.session_id
 
-        def load_session(self, session_id: str):
+        def load_session(self, session_id: str, timeout: float = 60):
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):

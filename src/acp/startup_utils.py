@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Optional, Protocol
 
@@ -104,6 +105,7 @@ class SessionStartupRequest:
     effective_agent_type: str
     model_name: Optional[str]
     retries: int
+    deadline_monotonic: float | None = None
 
 
 @dataclass(frozen=True)
@@ -177,6 +179,8 @@ class TtadkCliStarter:
         agent_session_cls: Any,
         original_session_cls: Any,
         start_operation: Callable[..., Any],
+        deadline_monotonic: float,
+        monotonic_fn: Callable[[], float],
     ) -> TtadkCliStartResult:
         session_cls = self._resolve_session_class(
             manager_session_cls=manager_session_cls,
@@ -191,8 +195,14 @@ class TtadkCliStarter:
             precheck_fn=precheck_fn,
         )
         resolved_model = precheck.get("model")
+        remaining = deadline_monotonic - monotonic_fn()
+        if remaining <= 0:
+            raise TimeoutError("ACP startup deadline exhausted during TTADK precheck")
         session = session_cls(agent_type=agent_type, cwd=cwd or ".", model_name=resolved_model)
-        actual_id = start_operation(session.start)
+        actual_id = start_operation(session.start, startup_timeout=remaining)
+        if monotonic_fn() >= deadline_monotonic:
+            AcpRetryStarter._close_session(session)
+            raise TimeoutError("ACP startup deadline exhausted during TTADK startup")
         return TtadkCliStartResult(session=session, actual_id=actual_id, resolved_model=resolved_model)
 
     @staticmethod
@@ -229,12 +239,22 @@ class AcpRetryStarter:
         format_log_line_fn: Callable[..., str],
         get_settings_fn: Callable[[], Any],
         sleep_fn: Callable[[float], None],
+        deadline_monotonic: float | None = None,
+        monotonic_fn: Callable[[], float] | None = None,
     ) -> AcpRetryStartResult:
         last_err: Exception | None = None
         last_spec = ""
         effective_timeout = float(retry_plan.startup_timeout or 60)
+        clock = monotonic_fn or time.monotonic
 
         for attempt in range(1, int(retry_plan.attempts) + 1):
+            if deadline_monotonic is not None:
+                remaining = deadline_monotonic - clock()
+                if remaining <= 0:
+                    last_err = TimeoutError("ACP startup deadline exhausted")
+                    break
+            else:
+                remaining = float("inf")
             session = self._build_session(
                 backend=backend,
                 agent_type=agent_type,
@@ -245,8 +265,18 @@ class AcpRetryStarter:
             )
             try:
                 last_spec = self._describe_session(session)
-                effective_timeout = retry_plan.timeout_for_attempt(attempt)
+                effective_timeout = min(
+                    retry_plan.timeout_for_attempt(attempt),
+                    remaining,
+                )
                 actual_id = start_operation(session.start, startup_timeout=effective_timeout)
+                if (
+                    deadline_monotonic is not None
+                    and clock() >= deadline_monotonic
+                ):
+                    last_err = TimeoutError("ACP startup deadline exhausted")
+                    self._close_session(session)
+                    break
                 return AcpRetryStartResult(
                     session=session,
                     actual_id=actual_id,
@@ -290,7 +320,14 @@ class AcpRetryStarter:
                 )
                 self._close_session(session)
                 if classification.action == StartupErrorAction.RETRY and attempt < int(retry_plan.attempts):
-                    sleep_fn(min(2.0, 0.3 * attempt))
+                    retry_delay = min(2.0, 0.3 * attempt)
+                    if deadline_monotonic is not None:
+                        retry_delay = min(
+                            retry_delay,
+                            max(0.0, deadline_monotonic - clock()),
+                        )
+                    if retry_delay > 0:
+                        sleep_fn(retry_delay)
                 continue
 
         return AcpRetryStartResult(
@@ -417,6 +454,7 @@ class AcpStartupBackendStrategy:
         sync_claude_cli_session_cls: Any | None,
         get_settings_fn: Callable[[], Any],
         sleep_fn: Callable[[float], None],
+        monotonic_fn: Callable[[], float],
     ) -> None:
         self._retry_starter = retry_starter
         self._failure_reporter = failure_reporter
@@ -424,6 +462,7 @@ class AcpStartupBackendStrategy:
         self._sync_claude_cli_session_cls = sync_claude_cli_session_cls
         self._get_settings = get_settings_fn
         self._sleep = sleep_fn
+        self._monotonic = monotonic_fn
 
     def start(
         self,
@@ -483,6 +522,8 @@ class AcpStartupBackendStrategy:
             format_log_line_fn=format_startup_failure_log_line,
             get_settings_fn=self._get_settings,
             sleep_fn=self._sleep,
+            deadline_monotonic=request.deadline_monotonic,
+            monotonic_fn=self._monotonic,
         )
 
     def _raise_startup_failure(
@@ -552,6 +593,7 @@ class TtadkCliStartupBackendStrategy:
         agent_session_module: Any | None,
         original_ttadk_cli_session_cls: Any | None,
         get_settings_fn: Callable[[], Any],
+        monotonic_fn: Callable[[], float],
     ) -> None:
         self._ttadk_cli_starter = ttadk_cli_starter
         self._failure_reporter = failure_reporter
@@ -559,6 +601,7 @@ class TtadkCliStartupBackendStrategy:
         self._agent_session_module = agent_session_module
         self._original_ttadk_cli_session_cls = original_ttadk_cli_session_cls
         self._get_settings = get_settings_fn
+        self._monotonic = monotonic_fn
 
     def start(
         self,
@@ -589,6 +632,8 @@ class TtadkCliStartupBackendStrategy:
                 agent_session_cls=agent_cls,
                 original_session_cls=self._original_ttadk_cli_session_cls,
                 start_operation=run_startup_operation,
+                deadline_monotonic=float(request.deadline_monotonic or 0),
+                monotonic_fn=self._monotonic,
             )
             logger.info(
                 "[ACP:%s] TTADK CLI Session started: key=%s, session=%s, model=%s",
@@ -724,6 +769,7 @@ class SessionStartupCoordinator:
         original_ttadk_cli_session_cls: Any | None = None,
         get_settings_fn: Callable[[], Any] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
+        monotonic_fn: Callable[[], float] | None = None,
     ) -> None:
         self._manager_agent_type = manager_agent_type
         self._session_starter = session_starter
@@ -743,6 +789,7 @@ class SessionStartupCoordinator:
         self._original_ttadk_cli_session_cls = original_ttadk_cli_session_cls
         self._get_settings = get_settings_fn or self._default_get_settings
         self._sleep = sleep_fn or self._default_sleep
+        self._monotonic = monotonic_fn or time.monotonic
         self._backend_strategies: dict[StartupBackend, StartupBackendStrategy] = {
             StartupBackend.ACP: AcpStartupBackendStrategy(
                 retry_starter=self._acp_retry_starter,
@@ -751,6 +798,7 @@ class SessionStartupCoordinator:
                 sync_claude_cli_session_cls=self._sync_claude_cli_session_cls,
                 get_settings_fn=self._get_settings,
                 sleep_fn=self._sleep,
+                monotonic_fn=self._monotonic,
             ),
             StartupBackend.CLI: CliStartupBackendStrategy(
                 retry_starter=self._acp_retry_starter,
@@ -759,6 +807,7 @@ class SessionStartupCoordinator:
                 sync_claude_cli_session_cls=self._sync_claude_cli_session_cls,
                 get_settings_fn=self._get_settings,
                 sleep_fn=self._sleep,
+                monotonic_fn=self._monotonic,
             ),
             StartupBackend.TTADK_CLI: TtadkCliStartupBackendStrategy(
                 ttadk_cli_starter=self._ttadk_cli_starter,
@@ -767,6 +816,7 @@ class SessionStartupCoordinator:
                 agent_session_module=self._agent_session_module,
                 original_ttadk_cli_session_cls=self._original_ttadk_cli_session_cls,
                 get_settings_fn=self._get_settings,
+                monotonic_fn=self._monotonic,
             ),
         }
 
@@ -822,6 +872,13 @@ class SessionStartupCoordinator:
         )
 
     def start(self, request: SessionStartupRequest) -> SessionStartupResult:
+        deadline = request.deadline_monotonic
+        if deadline is None:
+            deadline = self._monotonic() + float(request.startup_timeout or 60)
+            request = replace(request, deadline_monotonic=deadline)
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise TimeoutError("ACP startup deadline exhausted")
         effective_agent_type = request.effective_agent_type
         backend = select_startup_backend(effective_agent_type)
         retry_plan = build_retry_plan(
@@ -837,7 +894,7 @@ class SessionStartupCoordinator:
             agent_type=effective_agent_type,
             retries=retries,
             cwd=cwd or ".",
-            startup_timeout=float(request.startup_timeout or 60),
+            startup_timeout=remaining,
             model_name=model_name,
             session_id=request.session_id,
             project_id=request.project_id,
@@ -845,6 +902,9 @@ class SessionStartupCoordinator:
         if injected_result is not None:
             session, actual_id, _diag = injected_result
             if session and actual_id:
+                if self._monotonic() >= deadline:
+                    AcpRetryStarter._close_session(session)
+                    raise TimeoutError("ACP startup deadline exhausted")
                 try:
                     session.describe_agent()
                 except (AttributeError, TypeError):
@@ -862,7 +922,11 @@ class SessionStartupCoordinator:
                     model_name=model_name,
                 )
 
+        if self._monotonic() >= deadline:
+            raise TimeoutError("ACP startup deadline exhausted")
         cwd = self._normalize_cwd(cwd)
+        if self._monotonic() >= deadline:
+            raise TimeoutError("ACP startup deadline exhausted")
         return self._backend_strategies[backend].start(
             request=request,
             cwd=cwd,

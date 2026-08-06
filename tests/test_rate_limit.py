@@ -202,7 +202,8 @@ def test_model_failure_aware_session_need_compaction_compacts_then_retries(monke
         def start(self, startup_timeout: float = 60):
             return "sid"
 
-        def load_session(self, session_id: str):
+        def load_session(self, session_id: str, timeout: float = 60):
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
@@ -270,7 +271,8 @@ def test_model_failure_aware_session_compaction_loop_suppresses_compaction(monke
         def start(self, startup_timeout: float = 60):
             return "sid"
 
-        def load_session(self, session_id: str):
+        def load_session(self, session_id: str, timeout: float = 60):
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
@@ -346,7 +348,8 @@ def test_model_failure_aware_session_loop_detected_triggers_failover(monkeypatch
         def start(self, startup_timeout: float = 60):
             return "sid"
 
-        def load_session(self, session_id: str):
+        def load_session(self, session_id: str, timeout: float = 60):
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
@@ -396,7 +399,8 @@ def test_model_failure_aware_session_loop_detected_triggers_failover(monkeypatch
         def describe_agent(self):
             return "dummy"
 
-        def load_session(self, session_id: str):
+        def load_session(self, session_id: str, timeout: float = 60):
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
@@ -467,6 +471,21 @@ class TestRateLimitAwareSession:
         wrapped = RateLimitAwareSession(inner)
         assert wrapped.start(startup_timeout=30) == "sid"
         inner.start.assert_called_once_with(startup_timeout=30)
+
+    @pytest.mark.parametrize(
+        "wrapper_cls",
+        [RateLimitAwareSession, ModelFailureAwareSession],
+    )
+    def test_delegates_resume_timeout_exactly(self, wrapper_cls):
+        inner = _make_mock_session()
+        wrapped = wrapper_cls(inner)
+
+        wrapped.load_session("resume-target", timeout=0.625)
+
+        inner.load_session.assert_called_once_with(
+            "resume-target",
+            timeout=0.625,
+        )
 
     def test_delegates_close(self):
         inner = _make_mock_session()
@@ -787,7 +806,8 @@ def test_model_failure_aware_session_send_prompt_with_retry_success_after_retry(
         def start(self, startup_timeout: float = 60):
             return "sid"
 
-        def load_session(self, session_id: str):
+        def load_session(self, session_id: str, timeout: float = 60):
+            del timeout
             return None
 
         def load_local_history(self, session_id=None, limit: int = 200):

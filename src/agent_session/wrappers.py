@@ -93,8 +93,8 @@ class RateLimitAwareSession:
     def start(self, startup_timeout: float = 60) -> str:
         return self._inner.start(startup_timeout=startup_timeout)
 
-    def load_session(self, session_id: str) -> None:
-        self._inner.load_session(session_id)
+    def load_session(self, session_id: str, timeout: float) -> None:
+        self._inner.load_session(session_id, timeout=timeout)
 
     def load_local_history(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict]:
         return self._inner.load_local_history(session_id=session_id, limit=limit)
@@ -302,8 +302,8 @@ class ModelFailureAwareSession:
     def start(self, startup_timeout: float = 60) -> str:
         return self._inner.start(startup_timeout=startup_timeout)
 
-    def load_session(self, session_id: str) -> None:
-        self._inner.load_session(session_id)
+    def load_session(self, session_id: str, timeout: float) -> None:
+        self._inner.load_session(session_id, timeout=timeout)
 
     def load_local_history(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict]:
         return self._inner.load_local_history(session_id=session_id, limit=limit)

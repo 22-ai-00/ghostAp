@@ -21,7 +21,7 @@ from .models import (
     ToolCallInfo,
 )
 from .renderer import ACPEventRenderer
-from .session import ACPSession
+from .session import ACPResumeRejected, ACPSession
 from .sync_adapter import SyncACPSession, start_session_with_retry
 
 # NOTE: .manager import is deferred via __getattr__ (PEP 562) to break a
@@ -52,6 +52,7 @@ __all__ = [
     "ToolCallInfo",
     "GhostAPClient",
     "ACPSession",
+    "ACPResumeRejected",
     "SyncACPSession",
     "start_session_with_retry",
     "PromptContinuationResult",

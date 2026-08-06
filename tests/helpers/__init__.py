@@ -22,7 +22,8 @@ class FakeSessionBase:
         self.session_id = "s_fake"
         return self.session_id
 
-    def load_session(self, session_id: str):
+    def load_session(self, session_id: str, timeout: float = 60):
+        del timeout
         self.session_id = session_id
 
     def load_local_history(self, *a, **kw):

@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import unquote, urlparse
@@ -140,6 +140,17 @@ class LocalImageArtifactSnapshot:
     complete: bool = True
     conflicted: bool = False
     active: bool = True
+
+
+@dataclass
+class LocalImageEmissionBudget:
+    """Prompt-wide limits and deduplication for changed local images."""
+
+    max_images: int = _MAX_DISCOVERED_IMAGES_PER_PROMPT
+    max_bytes: int = _MAX_DISCOVERED_IMAGE_BYTES_PER_PROMPT
+    seen_image_ids: set[str] = field(default_factory=set)
+    emitted_count: int = 0
+    emitted_bytes: int = 0
 
 
 _IMAGE_SNAPSHOT_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
@@ -729,15 +740,17 @@ def emit_referenced_changed_local_image_events(
     before: LocalImageArtifactSnapshot | Mapping[str, _ImageArtifactSignature],
     references: Any,
     on_event: Callable[[ACPEvent], None],
+    *,
+    budget: LocalImageEmissionBudget | None = None,
+    release_snapshot: bool = True,
 ) -> int:
     """Publish only explicitly referenced local images changed since baseline."""
     snapshot = before if isinstance(before, LocalImageArtifactSnapshot) else None
+    active_budget = budget or LocalImageEmissionBudget()
     emitted = 0
-    seen_ids: set[str] = set()
-    total_bytes = 0
     try:
         for path in _local_image_candidates(references):
-            if emitted >= _MAX_DISCOVERED_IMAGES_PER_PROMPT:
+            if active_budget.emitted_count >= active_budget.max_images:
                 break
             image = _read_local_image_resource(
                 root_dir=root_dir,
@@ -747,13 +760,14 @@ def emit_referenced_changed_local_image_events(
                 image_snapshot=snapshot,
                 require_changed=True,
             )
-            if image is None or image.image_id in seen_ids:
+            if image is None or image.image_id in active_budget.seen_image_ids:
                 continue
             image_bytes = (len(image.data) * 3) // 4
-            if total_bytes + image_bytes > _MAX_DISCOVERED_IMAGE_BYTES_PER_PROMPT:
+            if active_budget.emitted_bytes + image_bytes > active_budget.max_bytes:
                 break
-            seen_ids.add(image.image_id)
-            total_bytes += image_bytes
+            active_budget.seen_image_ids.add(image.image_id)
+            active_budget.emitted_count += 1
+            active_budget.emitted_bytes += image_bytes
             on_event(
                 ACPEvent(
                     event_type=ACPEventType.IMAGE_CHUNK,
@@ -762,7 +776,8 @@ def emit_referenced_changed_local_image_events(
             )
             emitted += 1
     finally:
-        release_local_image_artifact_snapshot(before)
+        if release_snapshot:
+            release_local_image_artifact_snapshot(before)
     return emitted
 
 
@@ -1250,10 +1265,10 @@ def _parse_codex_goal(value: object) -> ACPGoalInfo | None:
         time_used_seconds = time_number
 
     control_method = value.get("controlMethod", "")
-    created_at: str | float = value.get("createdAt", "")
+    created_at: str | float | None = value.get("createdAt")
     if not isinstance(control_method, str):
         return None
-    if not isinstance(created_at, str):
+    if created_at is not None and not isinstance(created_at, str):
         created_number = _finite_number(created_at)
         if created_number is None or created_number < 0:
             return None
@@ -1286,18 +1301,20 @@ def _parse_session_info_update(update: SessionInfoUpdate) -> ACPSessionInfo:
             goal = _parse_codex_goal(raw_goal)
             goal_known = goal is not None
 
+    thread_status_observed = "threadStatus" in codex
     thread_status_known = False
     thread_status = ""
     raw_thread_status = codex.get("threadStatus")
     if isinstance(raw_thread_status, Mapping):
         raw_type = raw_thread_status.get("type")
-        if isinstance(raw_type, str) and raw_type.strip():
+        if isinstance(raw_type, str) and raw_type.strip() in {"active", "idle"}:
             thread_status_known = True
             thread_status = raw_type.strip()
 
     return ACPSessionInfo(
         goal_known=goal_known,
         goal=goal,
+        thread_status_observed=thread_status_observed,
         thread_status_known=thread_status_known,
         thread_status=thread_status,
     )
@@ -1391,7 +1408,10 @@ class GhostAPClient(Client):
                 info = _parse_session_info_update(update)
                 if (
                     self._on_session_info is not None
-                    and (info.goal_known or info.thread_status_known)
+                    and (
+                        info.goal_known
+                        or info.thread_status_observed
+                    )
                 ):
                     self._on_session_info(session_id, info)
             elif isinstance(update, AgentMessageChunk):

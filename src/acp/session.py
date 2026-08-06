@@ -13,6 +13,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
+from acp.exceptions import RequestError
 from acp.helpers import text_block
 from acp.schema import PromptResponse
 from acp.stdio import spawn_agent_process
@@ -23,6 +24,7 @@ from ..utils.errors import get_error_detail
 from .client import (
     ACPHistoryStore,
     GhostAPClient,
+    LocalImageEmissionBudget,
     emit_referenced_changed_local_image_events,
 )
 from .models import (
@@ -76,6 +78,10 @@ class ACPStartupError(RuntimeError):
         self.stderr_snippet = stderr_snippet or ""
         self.fail_phase = str(fail_phase or "")
         self.__cause__ = cause
+
+
+class ACPResumeRejected(RuntimeError):
+    """The provider explicitly rejected a resume target without ambiguity."""
 
 
 async def _read_stream_snippet(stream: object, *, max_bytes: int = 8192, timeout: float = 0.2) -> str:
@@ -226,6 +232,7 @@ class ACPSession:
         self._closing = False
         self._goal_known = not self._uses_official_codex_acp()
         self._goal: ACPGoalInfo | None = None
+        self._thread_status_observed = False
         self._thread_status_known = False
         self._thread_status = ""
         self._lifecycle_revision = 0
@@ -235,6 +242,7 @@ class ACPSession:
         self._force_dead = False
         self._transport_epoch = 0
         self._load_epoch = 0
+        self._attempted_load_targets: set[str] = set()
 
     def _uses_official_codex_acp(self) -> bool:
         return any(
@@ -261,6 +269,7 @@ class ACPSession:
         with self._handler_lock:
             self._goal_known = goal_known
             self._goal = None
+            self._thread_status_observed = False
             self._thread_status_known = False
             self._thread_status = ""
             self._lifecycle_revision += 1
@@ -276,15 +285,20 @@ class ACPSession:
     ) -> None:
         """Apply a trusted control-plane update for the current/load target only."""
         with self._handler_lock:
-            expected_ids = {self._session_id, self._loading_session_id}
+            expected_session_id = (
+                self._loading_session_id
+                if self._loading_session_id is not None
+                else self._session_id
+            )
             if (
                 self._closing
+                or self._force_dead
                 or (
                     transport_epoch is not None
                     and transport_epoch != self._transport_epoch
                 )
                 or (load_epoch is not None and load_epoch != self._load_epoch)
-                or session_id not in expected_ids
+                or session_id != expected_session_id
                 or not isinstance(info, ACPSessionInfo)
             ):
                 return
@@ -293,9 +307,12 @@ class ACPSession:
                 self._goal_known = True
                 self._goal = info.goal
                 changed = True
-            if info.thread_status_known:
-                self._thread_status_known = True
-                self._thread_status = info.thread_status
+            if info.thread_status_observed or info.thread_status_known:
+                self._thread_status_observed = True
+                self._thread_status_known = info.thread_status_known
+                self._thread_status = (
+                    info.thread_status if info.thread_status_known else ""
+                )
                 changed = True
             if not changed:
                 return
@@ -333,39 +350,66 @@ class ACPSession:
             if self._closing:
                 raise RuntimeError("ACP session is closing")
 
+    def _goal_requires_prompt_wait_locked(self) -> bool:
+        """Keep collection attached until the provider proves quiescence."""
+        if self._closing:
+            raise RuntimeError("ACP session is closing")
+        if self._uses_official_codex_acp() and not self._goal_known:
+            return True
+        if not self._goal_known:
+            return False
+        if self._goal is None:
+            return False
+        activity_state = self._goal.activity_state
+        if activity_state is None:
+            return True
+        if activity_state:
+            return True
+        if not self._thread_status_known:
+            return True
+        if self._thread_status == "active":
+            return True
+        if self._thread_status != "idle":
+            return True
+        return False
+
     def _goal_requires_prompt_wait(self) -> tuple[bool, int]:
         with self._handler_lock:
-            if self._closing:
-                raise RuntimeError("ACP session is closing")
-            active = bool(
-                self._goal_known
-                and self._goal is not None
-                and self._goal.is_active
+            return (
+                self._goal_requires_prompt_wait_locked(),
+                self._lifecycle_revision,
             )
-            terminal_thread_active = bool(
-                self._goal_known
-                and self._goal is not None
-                and not self._goal.is_active
-                and self._thread_status_known
-                and self._thread_status == "active"
-            )
-            return active or terminal_thread_active, self._lifecycle_revision
 
     async def has_active_goal(self) -> bool:
         with self._handler_lock:
             if self._uses_official_codex_acp() and not self._goal_known:
                 raise RuntimeError("ACP goal state is unknown")
-            return bool(self._goal is not None and self._goal.is_active)
+            if self._goal is None:
+                return False
+            activity_state = self._goal.activity_state
+            if activity_state is None:
+                raise RuntimeError(
+                    f"ACP goal status is unknown: {self._goal.status}"
+                )
+            return activity_state
 
     async def _pause_active_goal(self, *, propagate_errors: bool) -> bool:
         try:
             with self._handler_lock:
+                goal_known = self._goal_known
                 goal = self._goal if self._goal_known else None
-                revision = self._lifecycle_revision
                 session_id = self._session_id
                 closing = self._closing
-            if closing or goal is None or not goal.is_active:
-                return not closing
+            if closing:
+                raise RuntimeError("ACP session is closing")
+            if self._uses_official_codex_acp() and not goal_known:
+                raise RuntimeError("ACP goal state is unknown")
+            if goal is None:
+                return True
+            if goal.activity_state is None:
+                raise RuntimeError(f"ACP goal status is unknown: {goal.status}")
+            if not goal.is_active:
+                return True
             if goal.control_method != _CODEX_GOAL_CONTROL_METHOD:
                 return False
             if not self._conn or not session_id:
@@ -379,11 +423,18 @@ class ACPSession:
             while True:
                 with self._handler_lock:
                     if self._closing:
-                        return False
+                        raise RuntimeError("ACP session is closing")
                     if (
-                        self._goal_known
-                        and (self._goal is None or not self._goal.is_active)
+                        self._uses_official_codex_acp()
+                        and not self._goal_known
                     ):
+                        raise RuntimeError("ACP goal state is unknown")
+                    current_goal = self._goal if self._goal_known else None
+                    if current_goal is not None and current_goal.activity_state is None:
+                        raise RuntimeError(
+                            f"ACP goal status is unknown: {current_goal.status}"
+                        )
+                    if current_goal is None or not current_goal.is_active:
                         return True
                     revision = self._lifecycle_revision
                 await self._wait_for_lifecycle_change(revision)
@@ -393,7 +444,7 @@ class ACPSession:
             return False
 
     async def pause_active_goal(self) -> bool:
-        return await self._pause_active_goal(propagate_errors=False)
+        return await self._pause_active_goal(propagate_errors=True)
 
     @property
     def session_id(self) -> Optional[str]:
@@ -447,6 +498,9 @@ class ACPSession:
         try:
             phase = "spawn"
             self._conn, self._proc = await self._ctx_manager.__aenter__()
+            with self._handler_lock:
+                self._force_dead = False
+                self._attempted_load_targets.clear()
 
             # Initialize protocol
             phase = "initialize"
@@ -512,24 +566,42 @@ class ACPSession:
         """Load an existing session by ID (for resume)."""
         if not self._conn:
             raise RuntimeError("Connection not established. Call start() first.")
+        target_session_id = str(session_id or "").strip()
+        if not target_session_id:
+            raise ValueError("ACP resume session_id is required")
         previous_session_id = self._session_id
         previous_goal_state = (
             self._goal_known,
             self._goal,
+            self._thread_status_observed,
             self._thread_status_known,
             self._thread_status,
         )
-        rpc_completed = False
         with self._handler_lock:
-            self._loading_session_id = session_id
+            if self._loading_session_id is not None:
+                raise RuntimeError("ACP resume load is already in progress")
+            if target_session_id in self._attempted_load_targets:
+                self._force_dead = True
+                raise RuntimeError(
+                    "ACP resume target requires a new transport before retry"
+                )
+            self._attempted_load_targets.add(target_session_id)
+            self._loading_session_id = target_session_id
             self._load_epoch += 1
         self._bind_session_info_callback()
         self._reset_lifecycle(goal_known=not self._uses_official_codex_acp())
         try:
-            await self._conn.load_session(cwd=self._cwd, session_id=session_id)
-            rpc_completed = True
-            self._session_id = session_id
-            self._state.session_id = session_id
+            try:
+                await self._conn.load_session(
+                    cwd=self._cwd,
+                    session_id=target_session_id,
+                )
+            except RequestError as exc:
+                raise ACPResumeRejected(
+                    f"ACP resume explicitly rejected: {target_session_id}"
+                ) from exc
+            self._session_id = target_session_id
+            self._state.session_id = target_session_id
             if self._uses_official_codex_acp():
                 while True:
                     with self._handler_lock:
@@ -537,27 +609,39 @@ class ACPSession:
                             break
                         revision = self._lifecycle_revision
                     await self._wait_for_lifecycle_change(revision)
-        except BaseException:
+        except BaseException as exc:
             with self._handler_lock:
-                self._session_id = previous_session_id
-                self._state.session_id = previous_session_id or ""
-                (
-                    self._goal_known,
-                    self._goal,
-                    self._thread_status_known,
-                    self._thread_status,
-                ) = previous_goal_state
+                if isinstance(exc, ACPResumeRejected):
+                    self._session_id = previous_session_id
+                    self._state.session_id = previous_session_id or ""
+                    (
+                        self._goal_known,
+                        self._goal,
+                        self._thread_status_observed,
+                        self._thread_status_known,
+                        self._thread_status,
+                    ) = previous_goal_state
+                else:
+                    # The load RPC may already have committed.  Keep the only
+                    # identity that could now own this transport until the
+                    # manager retires it; restoring the temporary new-session
+                    # identity would create a split-brain session object.
+                    self._session_id = target_session_id
+                    self._state.session_id = target_session_id
+                    self._force_dead = True
                 self._lifecycle_revision += 1
                 self._loading_session_id = None
                 self._load_epoch += 1
-                if rpc_completed:
-                    self._force_dead = True
             self._bind_session_info_callback()
             self._wake_lifecycle_waiter()
             raise
         with self._handler_lock:
             self._loading_session_id = None
-        logger.info("[ACP:%s] Session loaded: %s", self._agent_cmd, session_id[:8])
+        logger.info(
+            "[ACP:%s] Session loaded: %s",
+            self._agent_cmd,
+            target_session_id[:8],
+        )
 
     async def health_check(self, timeout: float = 2.0) -> bool:
         """Best-effort health check of ACP connection.
@@ -612,6 +696,7 @@ class ACPSession:
         # Collector aggregates text/tool calls/plan/modified_files.
         collected_tool_calls: dict[str, Any] = {}
         emitted_image_ids: set[str] = set()
+        image_budget = LocalImageEmissionBudget()
         result = PromptResult(stop_reason="")
         last_event_monotonic = [time.monotonic()]
         image_snapshot: object = {}
@@ -630,35 +715,40 @@ class ACPSession:
                 await asyncio.sleep(min(0.005, quiet_s - quiet_for))
 
         def _collector(ev: ACPEvent):
+            accepted = False
             with self._handler_lock:
                 is_current_generation = (
                     self._event_generation == event_generation
                     and self._event_handler is _collector
                 )
-            if not is_current_generation:
+                if is_current_generation:
+                    accepted = True
+                    last_event_monotonic[0] = time.monotonic()
+                    try:
+                        if ev.event_type == ACPEventType.TEXT_CHUNK:
+                            result.add_text(ev.text or "")
+                        elif ev.event_type in (
+                            ACPEventType.TOOL_CALL_START,
+                            ACPEventType.TOOL_CALL_UPDATE,
+                            ACPEventType.TOOL_CALL_DONE,
+                        ):
+                            if ev.tool_call:
+                                # Keep the latest state per tool_call_id
+                                collected_tool_calls[ev.tool_call.id] = ev.tool_call
+                                for p in ev.tool_call.locations or []:
+                                    if p:
+                                        result.add_modified_file(p)
+                        elif ev.event_type == ACPEventType.IMAGE_CHUNK and ev.image:
+                            emitted_image_ids.add(ev.image.image_id)
+                        elif ev.event_type == ACPEventType.PLAN_UPDATE:
+                            result.set_plan(ev.plan)
+                    except Exception:
+                        logger.debug(
+                            "plan_update event processing failed",
+                            exc_info=True,
+                        )
+            if not accepted:
                 return
-
-            last_event_monotonic[0] = time.monotonic()
-            try:
-                if ev.event_type == ACPEventType.TEXT_CHUNK:
-                    result.add_text(ev.text or "")
-                elif ev.event_type in (
-                    ACPEventType.TOOL_CALL_START,
-                    ACPEventType.TOOL_CALL_UPDATE,
-                    ACPEventType.TOOL_CALL_DONE,
-                ):
-                    if ev.tool_call:
-                        # Keep the latest state per tool_call_id
-                        collected_tool_calls[ev.tool_call.id] = ev.tool_call
-                        for p in ev.tool_call.locations or []:
-                            if p:
-                                result.add_modified_file(p)
-                elif ev.event_type == ACPEventType.IMAGE_CHUNK and ev.image:
-                    emitted_image_ids.add(ev.image.image_id)
-                elif ev.event_type == ACPEventType.PLAN_UPDATE:
-                    result.set_plan(ev.plan)
-            except Exception:
-                logger.debug("plan_update event processing failed", exc_info=True)
             if on_event:
                 try:
                     on_event(ev)
@@ -669,6 +759,38 @@ class ACPSession:
             self._event_generation += 1
             event_generation = self._event_generation
             self._event_handler = _collector
+        collector_detached = False
+
+        def _discover_changed_images() -> None:
+            if self._client is None:
+                return
+            try:
+                with self._handler_lock:
+                    image_budget.seen_image_ids.update(emitted_image_ids)
+
+                def _emit_new_image(event: ACPEvent) -> None:
+                    if (
+                        event.image is not None
+                        and event.image.image_id in emitted_image_ids
+                    ):
+                        return
+                    _collector(event)
+
+                emit_referenced_changed_local_image_events(
+                    self._cwd,
+                    image_snapshot,
+                    result.text,
+                    _emit_new_image,
+                    budget=image_budget,
+                    release_snapshot=False,
+                )
+            except Exception:
+                logger.debug(
+                    "[ACP:%s] changed image discovery failed",
+                    self._agent_cmd,
+                    exc_info=True,
+                )
+
         try:
             self._state.message_count += 1
 
@@ -684,59 +806,42 @@ class ACPSession:
                 prompt=[text_block(text)],
             )
 
-            # Race guard: some ACP agents (or stdio scheduling) may deliver the final
-            # PromptResponse slightly before their last `session/update`. Drain until
-            # the stream has been quiet for a short window so late text *and media*
-            # arrive before the handler is cleared and the card becomes terminal.
-            try:
+            while True:
+                # A continuation can produce text and referenced images after
+                # PromptResponse.  Drain and rescan on every lifecycle revision
+                # before making the final atomic quiescence decision.
                 await _drain_prompt_tail()
-                while True:
-                    should_wait, lifecycle_revision = (
-                        self._goal_requires_prompt_wait()
-                    )
-                    if not should_wait:
-                        break
-                    await self._wait_for_lifecycle_change(lifecycle_revision)
-                    await _drain_prompt_tail()
-            except Exception:
+                _discover_changed_images()
                 with self._handler_lock:
-                    if self._closing:
-                        raise RuntimeError("ACP session is closing")
-                logger.debug("grace window wait failed", exc_info=True)
-
-            if self._client is not None:
-                try:
-                    def _emit_new_image(event: ACPEvent) -> None:
+                    should_wait = self._goal_requires_prompt_wait_locked()
+                    lifecycle_revision = self._lifecycle_revision
+                    if not should_wait:
                         if (
-                            event.image is not None
-                            and event.image.image_id in emitted_image_ids
+                            self._event_generation != event_generation
+                            or self._event_handler is not _collector
                         ):
-                            return
-                        _collector(event)
-
-                    emit_referenced_changed_local_image_events(
-                        self._cwd,
-                        image_snapshot,
-                        result.text,
-                        _emit_new_image,
-                    )
-                except Exception:
-                    logger.debug(
-                        "[ACP:%s] changed image discovery failed",
-                        self._agent_cmd,
-                        exc_info=True,
-                    )
+                            raise RuntimeError(
+                                "ACP prompt collector ownership changed"
+                            )
+                        result.goal = self._goal if self._goal_known else None
+                        self._event_handler = None
+                        self._event_generation += 1
+                        collector_detached = True
+                        break
+                await self._wait_for_lifecycle_change(lifecycle_revision)
+                await _drain_prompt_tail()
 
         finally:
             if self._client is not None:
                 self._client.release_local_image_snapshot(image_snapshot)
-            with self._handler_lock:
-                if (
-                    self._event_generation == event_generation
-                    and self._event_handler is _collector
-                ):
-                    self._event_handler = None
-                    self._event_generation += 1
+            if not collector_detached:
+                with self._handler_lock:
+                    if (
+                        self._event_generation == event_generation
+                        and self._event_handler is _collector
+                    ):
+                        self._event_handler = None
+                        self._event_generation += 1
 
         # Finalize aggregated tool call list (preserve insertion order by first-seen)
         try:
@@ -746,10 +851,6 @@ class ACPSession:
             logger.debug("[ACP:%s] tool_calls finalization failed", self._agent_cmd, exc_info=True)
 
         result.stop_reason = str(getattr(response, "stop_reason", "") or "")
-        with self._handler_lock:
-            if self._goal_known:
-                result.goal = self._goal
-
         # Best-effort: attach local tool results (execute/read/write/permission) produced during this prompt.
         try:
             store = ACPHistoryStore()

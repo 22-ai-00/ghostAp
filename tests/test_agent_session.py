@@ -53,8 +53,14 @@ class TestSyncClaudeCLISession:
 
     def test_load_session_sets_resumed(self):
         sess = SyncClaudeCLISession(cwd="/tmp")
-        sess.load_session("test-session-123")
+        sess.load_session("test-session-123", timeout=0.25)
         assert sess.session_id == "test-session-123"
+        assert sess.is_resumed is True
+
+    def test_ttadk_load_session_accepts_shared_resume_timeout(self):
+        sess = SyncTTADKCLISession(agent_type="ttadk_codex", cwd="/tmp")
+        sess.load_session("test-session-ttadk", timeout=0.5)
+        assert sess.session_id == "test-session-ttadk"
         assert sess.is_resumed is True
 
     def test_load_local_history_returns_empty(self):

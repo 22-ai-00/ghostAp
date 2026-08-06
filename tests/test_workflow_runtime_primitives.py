@@ -733,7 +733,7 @@ def test_race_abort_session_cancel_and_close_within_5s(tmp_path):
         def start(self, timeout=60):
             return self.session_id
 
-        def load_session(self, sid):
+        def load_session(self, sid, timeout=60):
             self.session_id = sid
 
         def load_local_history(self, *a, **kw):

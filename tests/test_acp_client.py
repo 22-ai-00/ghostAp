@@ -25,7 +25,7 @@ from acp.schema import (
 
 import src.acp.client as acp_client
 from src.acp.client import ACPHistoryStore, GhostAPClient, _parse_plan, _parse_tool_call
-from src.acp.models import ACPEvent, ACPSessionInfo
+from src.acp.models import ACPEvent, ACPGoalInfo, ACPSessionInfo
 from src.acp.sync_adapter import resolve_agent_spec
 from src.sandbox.executor import SandboxExecutor
 
@@ -154,6 +154,98 @@ def test_codex_goal_session_info_accepts_finite_unix_created_at(
 
     assert controls[0][1].goal is not None
     assert controls[0][1].goal.created_at == 1785975561.25
+
+
+def test_codex_goal_session_info_missing_created_at_is_explicitly_absent(
+    tmp_path: Path,
+) -> None:
+    controls: list[tuple[str, ACPSessionInfo]] = []
+    client = GhostAPClient(
+        on_event=lambda _event: None,
+        on_session_info=lambda sid, info: controls.append((sid, info)),
+        root_dir=str(tmp_path),
+    )
+
+    asyncio.run(
+        client.session_update(
+            "session-goal",
+            _session_info_update(
+                {"goal": {"objective": "finish", "status": "active"}}
+            ),
+        )
+    )
+
+    assert controls[0][1].goal is not None
+    assert controls[0][1].goal.created_at is None
+
+
+def test_unknown_goal_status_remains_visible_to_fail_closed_tracker(
+    tmp_path: Path,
+) -> None:
+    controls: list[tuple[str, ACPSessionInfo]] = []
+    client = GhostAPClient(
+        on_event=lambda _event: None,
+        on_session_info=lambda sid, info: controls.append((sid, info)),
+        root_dir=str(tmp_path),
+    )
+
+    asyncio.run(
+        client.session_update(
+            "session-goal",
+            _session_info_update(
+                {
+                    "goal": {"objective": "finish", "status": "running"},
+                    "threadStatus": {"type": "idle"},
+                }
+            ),
+        )
+    )
+
+    assert controls[0][1].goal is not None
+    assert controls[0][1].goal.status == "running"
+    assert controls[0][1].goal.activity_state is None
+
+
+@pytest.mark.parametrize(
+    ("status", "activity_state"),
+    [
+        ("active", True),
+        ("paused", False),
+        ("blocked", False),
+        ("completed", False),
+        ("running", None),
+    ],
+)
+def test_goal_status_classification_is_explicitly_tristate(
+    status: str,
+    activity_state: bool | None,
+) -> None:
+    goal = ACPGoalInfo(objective="finish", status=status)
+
+    assert goal.activity_state is activity_state
+    assert goal.is_active is (activity_state is True)
+
+
+def test_unknown_thread_status_is_observed_but_not_trusted(
+    tmp_path: Path,
+) -> None:
+    controls: list[tuple[str, ACPSessionInfo]] = []
+    client = GhostAPClient(
+        on_event=lambda _event: None,
+        on_session_info=lambda sid, info: controls.append((sid, info)),
+        root_dir=str(tmp_path),
+    )
+
+    asyncio.run(
+        client.session_update(
+            "session-goal",
+            _session_info_update({"threadStatus": {"type": "busy"}}),
+        )
+    )
+
+    assert controls[0][1].thread_status_observed is True
+    assert controls[0][1].thread_status_known is False
+    assert controls[0][1].thread_status == ""
 
 
 @pytest.mark.parametrize(
@@ -672,6 +764,47 @@ def test_image_scan_stops_iterating_at_entry_budget(
     assert inspected <= acp_client._MAX_IMAGE_SCAN_ENTRIES + 1
 
 
+def test_repeated_changed_image_scans_share_one_prompt_budget(
+    tmp_path: Path,
+) -> None:
+    snapshot = acp_client.snapshot_local_image_artifacts(str(tmp_path))
+    paths = [tmp_path / f"continuation-{index}.png" for index in range(3)]
+    for index, path in enumerate(paths):
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([index]))
+
+    events: list[ACPEvent] = []
+    budget = acp_client.LocalImageEmissionBudget(
+        max_images=2,
+        max_bytes=1024,
+    )
+    try:
+        acp_client.emit_referenced_changed_local_image_events(
+            str(tmp_path),
+            snapshot,
+            str(paths[0]),
+            events.append,
+            budget=budget,
+            release_snapshot=False,
+        )
+        acp_client.emit_referenced_changed_local_image_events(
+            str(tmp_path),
+            snapshot,
+            " ".join(str(path) for path in paths),
+            events.append,
+            budget=budget,
+            release_snapshot=False,
+        )
+    finally:
+        acp_client.release_local_image_artifact_snapshot(snapshot)
+
+    assert [event.image.source_uri for event in events if event.image] == [
+        str(paths[0]),
+        str(paths[1]),
+    ]
+    assert budget.emitted_count == 2
+    assert budget.emitted_bytes > 0
+
+
 def test_overlapping_prompt_scans_do_not_cross_publish_images(
     tmp_path: Path,
 ):
@@ -909,7 +1042,9 @@ def test_acp_manager_retries_start_failure(monkeypatch, caplog):
     caplog.set_level(logging.WARNING)
     # 默认路径仍然支持「少参数」构造
     m = mgr.ACPSessionManager("coco", session_timeout=999999)
-    s = m.start_session("chat1", cwd=".", startup_timeout=0.01)
+    # The startup timeout is one absolute budget shared by all retries.  Give
+    # this retry-behaviour test enough budget for its two intentional backoffs.
+    s = m.start_session("chat1", cwd=".", startup_timeout=3.0)
     assert s.session_id == "s_ok"
     assert calls["start"] == 3
 
@@ -1159,7 +1294,8 @@ def test_acp_manager_session_starter_success_is_not_overwritten(monkeypatch):
         def describe_agent(self):
             return "starter"
 
-        def load_session(self, session_id: str):
+        def load_session(self, session_id: str, timeout: float = 60):
+            del timeout
             self.session_id = session_id
 
         def load_local_history(self, *args, **kwargs):

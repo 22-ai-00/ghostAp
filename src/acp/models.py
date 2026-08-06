@@ -32,11 +32,20 @@ class ACPGoalInfo:
     control_method: str = ""
     token_budget: int | None = None
     time_used_seconds: float | None = None
-    created_at: str | float = ""
+    created_at: str | float | None = None
+
+    @property
+    def activity_state(self) -> bool | None:
+        """Classify only the provider lifecycle states GhostAP understands."""
+        if self.status == "active":
+            return True
+        if self.status in {"paused", "blocked", "completed"}:
+            return False
+        return None
 
     @property
     def is_active(self) -> bool:
-        return self.status == "active"
+        return self.activity_state is True
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,7 @@ class ACPSessionInfo:
 
     goal_known: bool = False
     goal: ACPGoalInfo | None = None
+    thread_status_observed: bool = False
     thread_status_known: bool = False
     thread_status: str = ""
 

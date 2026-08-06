@@ -7,8 +7,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from acp.exceptions import RequestError
 from acp.schema import SessionInfoUpdate
 
+from src.acp import session as session_mod
 from src.acp.client import GhostAPClient
 from src.acp.models import (
     ACPEvent,
@@ -128,6 +130,211 @@ def test_terminal_goal_waits_for_idle_thread_status(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
+def test_unknown_goal_status_keeps_prompt_attached_until_trusted_update(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+
+    async def exercise() -> None:
+        class Connection:
+            async def prompt(self, **_kwargs):
+                session._on_session_info(
+                    "session-goal",
+                    ACPSessionInfo(
+                        goal_known=True,
+                        goal=ACPGoalInfo("finish", "running"),
+                        thread_status_known=True,
+                        thread_status="idle",
+                    ),
+                )
+                return SimpleNamespace(stop_reason="end_turn")
+
+        session._conn = Connection()
+        session._session_id = "session-goal"
+        prompt = asyncio.create_task(session.prompt("work"))
+        await asyncio.sleep(0.15)
+        assert prompt.done() is False
+        assert session._event_handler is not None
+        with pytest.raises(RuntimeError, match="goal status is unknown"):
+            await session.has_active_goal()
+        session._on_session_info("session-goal", _completed_idle_goal_info())
+        result = await asyncio.wait_for(prompt, timeout=1)
+        assert result.goal is not None
+        assert result.goal.status == "completed"
+        assert session._event_handler is None
+
+    asyncio.run(exercise())
+
+
+def test_unknown_thread_status_keeps_prompt_attached_until_trusted_update(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    client = GhostAPClient(
+        on_event=session._dispatch_event,
+        on_session_info=session._on_session_info,
+        root_dir=str(tmp_path),
+    )
+    session._client = client
+
+    async def exercise() -> None:
+        class Connection:
+            async def prompt(self, **_kwargs):
+                await client.session_update(
+                    "session-goal",
+                    SessionInfoUpdate.model_validate(
+                        {
+                            "sessionUpdate": "session_info_update",
+                            "_meta": {
+                                "codex": {
+                                    "goal": {
+                                        "objective": "finish",
+                                        "status": "completed",
+                                    },
+                                    "threadStatus": {"type": "busy"},
+                                }
+                            },
+                        }
+                    ),
+                )
+                return SimpleNamespace(stop_reason="end_turn")
+
+        session._conn = Connection()
+        session._session_id = "session-goal"
+        prompt = asyncio.create_task(session.prompt("work"))
+        await asyncio.sleep(0.15)
+        assert prompt.done() is False
+        assert session._event_handler is not None
+        session._on_session_info(
+            "session-goal",
+            ACPSessionInfo(
+                thread_status_observed=True,
+                thread_status_known=True,
+                thread_status="idle",
+            ),
+        )
+        result = await asyncio.wait_for(prompt, timeout=1)
+        assert result.goal is not None
+        assert result.goal.status == "completed"
+        assert session._event_handler is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("thread_status", ["active", "busy"])
+def test_known_null_goal_does_not_infer_goal_from_thread_status(
+    tmp_path: Path,
+    thread_status: str,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    client = GhostAPClient(
+        on_event=session._dispatch_event,
+        on_session_info=session._on_session_info,
+        root_dir=str(tmp_path),
+    )
+    session._client = client
+
+    async def exercise() -> None:
+        class Connection:
+            async def prompt(self, **_kwargs):
+                await client.session_update(
+                    "session-goal",
+                    SessionInfoUpdate.model_validate(
+                        {
+                            "sessionUpdate": "session_info_update",
+                            "_meta": {
+                                "codex": {
+                                    "goal": None,
+                                    "threadStatus": {"type": thread_status},
+                                }
+                            },
+                        }
+                    ),
+                )
+                return SimpleNamespace(stop_reason="end_turn")
+
+        session._conn = Connection()
+        session._session_id = "session-goal"
+        result = await asyncio.wait_for(session.prompt("work"), timeout=1)
+        assert result.goal is None
+        assert session._event_handler is None
+
+    asyncio.run(exercise())
+
+
+def test_prompt_rechecks_quiescence_before_atomically_detaching_collector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal-to-active transition in the old image window must be observed."""
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    client = GhostAPClient(
+        on_event=session._dispatch_event,
+        on_session_info=session._on_session_info,
+        root_dir=str(tmp_path),
+    )
+    session._client = client
+    continuation_injected = False
+
+    def inject_continuation(*_args, **_kwargs) -> None:
+        nonlocal continuation_injected
+        if continuation_injected:
+            return
+        continuation_injected = True
+        session._on_session_info("session-goal", _active_goal_info())
+        loop = asyncio.get_running_loop()
+        loop.call_soon(
+            session._dispatch_event,
+            _text_event("continuation from image window"),
+        )
+        loop.call_soon(
+            session._on_session_info,
+            "session-goal",
+            _completed_idle_goal_info(),
+        )
+
+    monkeypatch.setattr(
+        session_mod,
+        "emit_referenced_changed_local_image_events",
+        inject_continuation,
+    )
+
+    async def exercise() -> None:
+        class Connection:
+            async def prompt(self, **_kwargs):
+                session._on_session_info(
+                    "session-goal",
+                    _completed_idle_goal_info(),
+                )
+                return SimpleNamespace(stop_reason="end_turn")
+
+        session._conn = Connection()
+        session._session_id = "session-goal"
+        result = await asyncio.wait_for(session.prompt("work"), timeout=1)
+        assert result.text == "continuation from image window"
+        assert result.goal is not None
+        assert result.goal.status == "completed"
+        assert session._event_handler is None
+
+    asyncio.run(exercise())
+
+
 def test_unrelated_session_info_cannot_release_active_goal_waiter(
     tmp_path: Path,
 ) -> None:
@@ -232,6 +439,102 @@ def test_load_accepts_forced_snapshot_before_rpc_returns(tmp_path: Path) -> None
     asyncio.run(exercise())
 
 
+def test_load_target_cannot_be_satisfied_by_late_current_session_snapshot(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._session_id = "current-session"
+
+    async def exercise() -> None:
+        client = GhostAPClient(
+            on_event=session._dispatch_event,
+            root_dir=str(tmp_path),
+        )
+        session._client = client
+        session._bind_session_info_callback()
+
+        class Connection:
+            async def load_session(self, **_kwargs):
+                await client.session_update(
+                    "current-session",
+                    SessionInfoUpdate.model_validate(
+                        {
+                            "sessionUpdate": "session_info_update",
+                            "_meta": {
+                                "codex": {
+                                    "goal": {
+                                        "objective": "old current state",
+                                        "status": "active",
+                                    },
+                                    "threadStatus": {"type": "active"},
+                                }
+                            },
+                        }
+                    ),
+                )
+
+        session._conn = Connection()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                session.load_session("target-session"),
+                timeout=0.03,
+            )
+        assert session._session_id == "target-session"
+        assert session._state.session_id == "target-session"
+        assert session._force_dead is True
+        with pytest.raises(RuntimeError, match="goal state is unknown"):
+            await session.has_active_goal()
+
+    asyncio.run(exercise())
+
+
+def test_concurrent_different_target_load_is_rejected_before_transport_call(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._session_id = "current-session"
+
+    async def exercise() -> None:
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        transport_calls: list[str] = []
+
+        class Connection:
+            async def load_session(self, *, session_id: str, **_kwargs):
+                transport_calls.append(session_id)
+                if session_id == "target-a":
+                    first_entered.set()
+                    await release_first.wait()
+                session._on_session_info(
+                    session_id,
+                    _completed_idle_goal_info(),
+                )
+
+        session._conn = Connection()
+        first = asyncio.create_task(session.load_session("target-a"))
+        await first_entered.wait()
+        try:
+            with pytest.raises(RuntimeError, match="already in progress"):
+                await session.load_session("target-b")
+        finally:
+            release_first.set()
+            await asyncio.wait_for(first, timeout=1)
+
+        assert transport_calls == ["target-a"]
+        assert session._session_id == "target-a"
+        assert session._force_dead is False
+
+    asyncio.run(exercise())
+
+
 def test_cancel_pauses_active_goal_before_cancelling_turn(tmp_path: Path) -> None:
     session = ACPSession(agent_cmd="npx", agent_args=[], cwd=str(tmp_path))
     order: list[str] = []
@@ -300,6 +603,63 @@ def test_untrusted_goal_control_method_is_never_called(tmp_path: Path) -> None:
             _active_goal_info(control_method="_evil/delete_everything"),
         )
         assert await session.pause_active_goal() is False
+
+    asyncio.run(exercise())
+
+
+def test_public_goal_pause_propagates_transport_failure(tmp_path: Path) -> None:
+    session = ACPSession(agent_cmd="npx", agent_args=[], cwd=str(tmp_path))
+
+    async def exercise() -> None:
+        class Connection:
+            async def ext_method(self, *_args, **_kwargs):
+                raise ConnectionError("goal control transport lost")
+
+        session._conn = Connection()
+        session._session_id = "session-goal"
+        session._on_session_info("session-goal", _active_goal_info())
+
+        with pytest.raises(ConnectionError, match="transport lost"):
+            await session.pause_active_goal()
+
+    asyncio.run(exercise())
+
+
+def test_public_goal_pause_rejects_unknown_official_goal_state(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._session_id = "session-goal"
+    session._conn = object()
+
+    with pytest.raises(RuntimeError, match="goal state is unknown"):
+        asyncio.run(session.pause_active_goal())
+
+
+def test_public_goal_pause_rejects_state_reset_to_unknown_during_rpc(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+
+    async def exercise() -> None:
+        class Connection:
+            async def ext_method(self, *_args, **_kwargs):
+                session._reset_lifecycle(goal_known=False)
+                return {}
+
+        session._conn = Connection()
+        session._session_id = "session-goal"
+        session._on_session_info("session-goal", _active_goal_info())
+        with pytest.raises(RuntimeError, match="goal state is unknown"):
+            await session.pause_active_goal()
 
     asyncio.run(exercise())
 
@@ -380,12 +740,17 @@ def test_load_without_forced_snapshot_marks_session_dead(tmp_path: Path) -> None
                 timeout=0.02,
             )
         assert session._force_dead is True
-        assert session._session_id == "new-session"
+        assert session._session_id == "loaded-session"
+        assert session._state.session_id == "loaded-session"
+        with pytest.raises(RuntimeError, match="goal state is unknown"):
+            await session.has_active_goal()
 
     asyncio.run(exercise())
 
 
-def test_failed_load_rejects_late_target_snapshot(tmp_path: Path) -> None:
+def test_ambiguous_failed_load_rejects_late_target_snapshot_and_marks_dead(
+    tmp_path: Path,
+) -> None:
     session = ACPSession(
         agent_cmd="npx",
         agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
@@ -403,10 +768,180 @@ def test_failed_load_rejects_late_target_snapshot(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="load rejected"):
             await session.load_session("failed-target")
         session._on_session_info("failed-target", _active_goal_info())
-        assert await session.has_active_goal() is False
-        assert session._force_dead is False
+        assert session._force_dead is True
+        assert session._session_id == "failed-target"
+        assert session._state.session_id == "failed-target"
+        with pytest.raises(RuntimeError, match="goal state is unknown"):
+            await session.has_active_goal()
 
     asyncio.run(exercise())
+
+
+def test_explicit_request_rejection_is_typed_and_does_not_poison_transport(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._session_id = "new-session"
+    session._reset_lifecycle(goal_known=True)
+
+    async def exercise() -> None:
+        class Connection:
+            async def load_session(self, **_kwargs):
+                raise RequestError(-32602, "resume rejected")
+
+        session._conn = Connection()
+        with pytest.raises(Exception) as exc_info:
+            await session.load_session("rejected-target")
+        assert type(exc_info.value).__name__ == "ACPResumeRejected"
+        assert session._force_dead is False
+        assert session._session_id == "new-session"
+
+    asyncio.run(exercise())
+
+
+def test_same_target_cannot_reuse_delayed_snapshot_after_rejected_load(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._session_id = "new-session"
+    session._reset_lifecycle(goal_known=True)
+    delayed_update_finished: asyncio.Event | None = None
+
+    async def exercise() -> None:
+        nonlocal delayed_update_finished
+        delayed_update_finished = asyncio.Event()
+        client = GhostAPClient(
+            on_event=session._dispatch_event,
+            root_dir=str(tmp_path),
+        )
+        session._client = client
+        session._bind_session_info_callback()
+
+        class Connection:
+            calls = 0
+
+            async def load_session(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    async def delayed_old_snapshot() -> None:
+                        await asyncio.sleep(0)
+                        await client.session_update(
+                            "rejected-target",
+                            SessionInfoUpdate.model_validate(
+                                {
+                                    "sessionUpdate": "session_info_update",
+                                    "_meta": {
+                                        "codex": {
+                                            "goal": {
+                                                "objective": "stale",
+                                                "status": "active",
+                                            },
+                                            "threadStatus": {"type": "active"},
+                                        }
+                                    },
+                                }
+                            ),
+                        )
+                        delayed_update_finished.set()
+
+                    asyncio.create_task(delayed_old_snapshot())
+                    raise RequestError(-32602, "resume rejected")
+                return None
+
+        connection = Connection()
+        session._conn = connection
+        with pytest.raises(Exception):
+            await session.load_session("rejected-target")
+        with pytest.raises(RuntimeError, match="new transport"):
+            await asyncio.wait_for(
+                session.load_session("rejected-target"),
+                timeout=0.2,
+            )
+        await delayed_update_finished.wait()
+        assert connection.calls == 1
+        assert session._session_id == "new-session"
+        assert await session.has_active_goal() is False
+
+    asyncio.run(exercise())
+
+
+def test_new_transport_clears_resume_target_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._attempted_load_targets = {"previous-target"}
+
+    class Connection:
+        async def initialize(self, **_kwargs):
+            return None
+
+        async def new_session(self, **_kwargs):
+            return SimpleNamespace(session_id="new-transport-session")
+
+    class Context:
+        async def __aenter__(self):
+            return Connection(), SimpleNamespace(returncode=None)
+
+        async def __aexit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        session_mod,
+        "spawn_agent_process",
+        lambda *_args, **_kwargs: Context(),
+    )
+
+    async def exercise() -> None:
+        await session.start()
+        assert session._attempted_load_targets == set()
+        await session.close()
+
+    asyncio.run(exercise())
+
+
+def test_failed_transport_start_preserves_existing_resume_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    old_connection = object()
+    session._conn = old_connection
+    session._force_dead = True
+    session._attempted_load_targets = {"previous-target"}
+
+    class FailingContext:
+        async def __aenter__(self):
+            raise OSError("new transport failed")
+
+    monkeypatch.setattr(
+        session_mod,
+        "spawn_agent_process",
+        lambda *_args, **_kwargs: FailingContext(),
+    )
+
+    with pytest.raises(Exception, match="ACP 启动失败"):
+        asyncio.run(session.start())
+
+    assert session._conn is old_connection
+    assert session._force_dead is True
+    assert session._attempted_load_targets == {"previous-target"}
 
 
 def test_stale_transport_epoch_cannot_mutate_goal_tracker(tmp_path: Path) -> None:
@@ -593,6 +1128,59 @@ def test_prompt_emits_changed_referenced_image_before_snapshot_release(
     assert result.stop_reason == "end_turn"
     assert image_events == [True]
     assert client._current_image_snapshot() is None
+
+
+def test_prompt_rescans_referenced_image_created_by_goal_continuation(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "continuation-evidence.png"
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    client = GhostAPClient(
+        on_event=session._dispatch_event,
+        root_dir=str(tmp_path),
+    )
+    session._client = client
+
+    async def exercise() -> None:
+        def finish_continuation() -> None:
+            image_path.write_bytes(b"\x89PNG\r\n\x1a\ncontinuation-image")
+            session._dispatch_event(
+                _text_event(f"最终证据 ![result]({image_path})")
+            )
+            session._on_session_info(
+                "session-goal",
+                _completed_idle_goal_info(),
+            )
+
+        class Connection:
+            async def prompt(self, **_kwargs):
+                session._on_session_info("session-goal", _active_goal_info())
+                asyncio.get_running_loop().call_later(0.12, finish_continuation)
+                return SimpleNamespace(stop_reason="end_turn")
+
+        session._conn = Connection()
+        session._session_id = "session-goal"
+        images: list[str] = []
+        result = await asyncio.wait_for(
+            session.prompt(
+                "work",
+                on_event=lambda event: (
+                    images.append(event.image.image_id)
+                    if event.image is not None
+                    else None
+                ),
+            ),
+            timeout=1,
+        )
+        assert result.goal is not None
+        assert result.goal.status == "completed"
+        assert len(images) == 1
+
+    asyncio.run(exercise())
 
 
 def test_prompt_does_not_repeat_image_already_emitted_by_tool_update(

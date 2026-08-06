@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import re
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
@@ -87,15 +88,108 @@ def test_load_snapshot_timeout_marks_session_force_dead() -> None:
     session = sa.SyncACPSession.__new__(sa.SyncACPSession)
     session._acp_session = FakeACPSession()
     session._force_dead = False
-    def timeout(coro):
+    observed_timeouts: list[float] = []
+
+    def timeout(coro, timeout: float):
+        observed_timeouts.append(timeout)
         coro.close()
         raise TimeoutError("forced snapshot missing")
 
     session._run_async = timeout
 
     with pytest.raises(TimeoutError, match="forced snapshot missing"):
-        session.load_session("session-resume")
+        session.load_session("session-resume", timeout=0.25)
 
+    assert session._force_dead is True
+    assert observed_timeouts == [0.25]
+
+
+def test_load_session_forwards_exact_caller_timeout_to_background_loop() -> None:
+    class FakeACPSession:
+        _force_dead = False
+
+        async def load_session(self, session_id: str) -> None:
+            assert session_id == "session-resume"
+
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._acp_session = FakeACPSession()
+    session._force_dead = False
+    session.session_id = "new-session"
+    session.is_resumed = False
+    loaded_history: list[str] = []
+    session.load_local_history = lambda session_id: loaded_history.append(session_id) or []
+    observed_timeouts: list[float] = []
+
+    def run(coro, timeout: float):
+        observed_timeouts.append(timeout)
+        return asyncio.run(coro)
+
+    session._run_async = run
+
+    session.load_session("session-resume", timeout=0.375)
+
+    assert observed_timeouts == [0.375]
+    assert session.session_id == "session-resume"
+    assert session.is_resumed is True
+    assert loaded_history == ["session-resume"]
+
+
+def test_ambiguous_backend_load_error_marks_sync_session_dead() -> None:
+    class FakeACPSession:
+        _force_dead = False
+
+        async def load_session(self, _session_id: str) -> None:
+            raise OSError("resume transport lost")
+
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._acp_session = FakeACPSession()
+    session._force_dead = False
+    session._run_async = lambda coro, timeout: asyncio.run(coro)
+
+    with pytest.raises(OSError, match="transport lost"):
+        session.load_session("session-resume", timeout=0.25)
+
+    assert session._force_dead is True
+
+
+def test_load_session_timeout_is_wall_bounded_without_default_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SlowACPSession:
+        _force_dead = False
+
+        async def load_session(self, _session_id: str) -> None:
+            await asyncio.Event().wait()
+
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._agent_type = "codex"
+    session._log_failures = False
+    session._loop = object()
+    session._acp_session = SlowACPSession()
+    session._force_dead = False
+
+    class BlockingFuture:
+        def __init__(self, coro) -> None:
+            self._coro = coro
+
+        def result(self, timeout: float):
+            threading.Event().wait(timeout=timeout)
+            raise TimeoutError("resume deadline")
+
+        def cancel(self) -> None:
+            self._coro.close()
+
+    monkeypatch.setattr(
+        asyncio,
+        "run_coroutine_threadsafe",
+        lambda coro, _loop: BlockingFuture(coro),
+    )
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        session.load_session("session-resume", timeout=0.03)
+    elapsed = time.monotonic() - started
+
+    assert 0.02 <= elapsed < 0.5
     assert session._force_dead is True
 
 

@@ -107,8 +107,9 @@ class SyncClaudeCLISession:
             self.session_id = str(uuid.uuid4())
         return self.session_id
 
-    def load_session(self, session_id: str) -> None:
+    def load_session(self, session_id: str, timeout: float) -> None:
         # Claude CLI uses local persistence; we just switch to target session id.
+        del timeout
         self.session_id = session_id
         self.is_resumed = True
 

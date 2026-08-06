@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import src.acp.session as acp_session_mod
 import src.acp.telemetry as telemetry_mod
 from src.acp.manager import ACPSessionManager
 from src.acp.telemetry import (
@@ -31,8 +32,13 @@ def _make_mock_session(*, last_active: float = 0.0, server_running: bool = True)
     return session
 
 
-def test_resume_snapshot_timeout_is_closed_and_never_installed() -> None:
+def test_ambiguous_resume_uses_remaining_deadline_and_is_closed_before_rethrow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     closed: list[str] = []
+    resume_timeouts: list[float] = []
+    close_deadlines: list[float] = []
+    clock = {"now": 100.0}
 
     class UncertainResumeSession:
         def __init__(self) -> None:
@@ -44,32 +50,156 @@ def test_resume_snapshot_timeout_is_closed_and_never_installed() -> None:
         def describe_agent(self) -> str:
             return "codex-acp"
 
-        def load_session(self, _session_id: str) -> None:
-            self._force_dead = True
-            raise TimeoutError("forced goal snapshot missing")
+        def load_session(self, _session_id: str, *, timeout: float) -> None:
+            resume_timeouts.append(timeout)
+            clock["now"] += 1.0
+            raise ConnectionError("resume transport lost")
 
         def close(self) -> None:
             closed.append(self.session_id)
 
     created = UncertainResumeSession()
+    def start_backend(**_kwargs):
+        clock["now"] += 4.0
+        return created, created.session_id, {}
+
+    monkeypatch.setattr(
+        "src.acp.manager.time.monotonic",
+        lambda: clock["now"],
+    )
     manager = ACPSessionManager(
         "codex",
         keepalive_interval=0,
-        session_starter=lambda **_kwargs: (
-            created,
-            created.session_id,
-            {},
-        ),
+        session_starter=start_backend,
     )
+    original_close = manager._close_session_before
+
+    def record_close(session, *, key: str, deadline: float) -> None:
+        close_deadlines.append(deadline)
+        session.close()
+
+    manager._close_session_before = record_close  # type: ignore[method-assign]
     try:
-        with pytest.raises(TimeoutError, match="forced goal snapshot missing"):
+        with pytest.raises(ConnectionError, match="resume transport lost"):
             manager.start_session(
                 "chat-resume",
                 cwd=".",
                 session_id="target-session",
+                startup_timeout=10,
             )
         assert manager.get_session("chat-resume") is None
         assert closed == ["new-session"]
+        assert resume_timeouts == [pytest.approx(3.0)]
+        assert close_deadlines == [pytest.approx(110.0)]
+    finally:
+        manager._close_session_before = original_close  # type: ignore[method-assign]
+        manager.cleanup_all()
+
+
+def test_resume_timeout_preserves_close_reserve_inside_original_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 200.0}
+    resume_timeouts: list[float] = []
+    close_remaining: list[float] = []
+    closed: list[str] = []
+
+    class TimedOutResumeSession:
+        def __init__(self) -> None:
+            self.session_id = "new-session"
+            self.message_count = 0
+            self.last_active = time.time()
+            self._force_dead = False
+
+        def describe_agent(self) -> str:
+            return "codex-acp"
+
+        def load_session(self, _session_id: str, *, timeout: float) -> None:
+            resume_timeouts.append(timeout)
+            clock["now"] += timeout
+            raise TimeoutError("resume load deadline")
+
+        def close(self) -> None:
+            closed.append(self.session_id)
+
+    created = TimedOutResumeSession()
+    monkeypatch.setattr(
+        "src.acp.manager.time.monotonic",
+        lambda: clock["now"],
+    )
+    manager = ACPSessionManager(
+        "codex",
+        keepalive_interval=0,
+        session_starter=lambda **_kwargs: (created, created.session_id, {}),
+    )
+    original_close = manager._close_session_before
+
+    def record_close(session, *, key: str, deadline: float) -> None:
+        del key
+        close_remaining.append(deadline - clock["now"])
+        if deadline <= clock["now"]:
+            raise TimeoutError("close registration budget exhausted")
+        session.close()
+
+    manager._close_session_before = record_close  # type: ignore[method-assign]
+    try:
+        with pytest.raises(TimeoutError, match="resume load deadline"):
+            manager.start_session(
+                "chat-timeout-resume",
+                cwd=".",
+                session_id="target-session",
+                startup_timeout=10,
+            )
+        assert resume_timeouts == [pytest.approx(5.0)]
+        assert close_remaining == [pytest.approx(5.0)]
+        assert closed == ["new-session"]
+        assert manager.get_session("chat-timeout-resume") is None
+    finally:
+        manager._close_session_before = original_close  # type: ignore[method-assign]
+        manager.cleanup_all()
+
+
+def test_explicit_resume_rejection_is_the_only_new_session_fallback() -> None:
+    rejection_type = getattr(acp_session_mod, "ACPResumeRejected", None)
+    assert rejection_type is not None
+    closed: list[str] = []
+
+    class ExplicitlyRejectedSession:
+        def __init__(self) -> None:
+            self.session_id = "new-session"
+            self.message_count = 0
+            self.last_active = time.time()
+            self._force_dead = False
+
+        def describe_agent(self) -> str:
+            return "codex-acp"
+
+        def load_session(self, _session_id: str, *, timeout: float) -> None:
+            assert timeout > 0
+            raise rejection_type("resume explicitly rejected")
+
+        def load_local_history(self, _session_id: str) -> list[dict]:
+            return []
+
+        def close(self) -> None:
+            closed.append(self.session_id)
+
+    created = ExplicitlyRejectedSession()
+    manager = ACPSessionManager(
+        "codex",
+        keepalive_interval=0,
+        session_starter=lambda **_kwargs: (created, created.session_id, {}),
+    )
+    try:
+        session = manager.start_session(
+            "chat-explicit-reject",
+            cwd=".",
+            session_id="missing-target",
+        )
+        assert session is created
+        assert session.session_id == "new-session"
+        assert session._force_dead is False
+        assert closed == []
     finally:
         manager.cleanup_all()
 
@@ -680,7 +810,8 @@ class TestSessionTelemetryAdapterIntegration:
                 def describe_agent(self) -> str:
                     return "dummy-agent"
 
-                def load_session(self, _sid: str) -> None:
+                def load_session(self, _sid: str, timeout: float = 60) -> None:
+                    del timeout
                     return None
 
                 def load_local_history(self, _sid: str) -> None:

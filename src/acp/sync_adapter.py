@@ -34,7 +34,7 @@ from .diagnostics import (
     truncate_text,
 )
 from .models import ACPEvent, PromptResult
-from .session import ACPSession, ACPStartupError
+from .session import ACPResumeRejected, ACPSession, ACPStartupError
 from .startup_utils import initial_startup_diagnostics, safe_float_or_none
 
 logger = logging.getLogger(__name__)
@@ -1741,18 +1741,20 @@ class SyncACPSession:
                 )
         return session_id
 
-    def load_session(self, session_id: str) -> None:
+    def load_session(self, session_id: str, timeout: float) -> None:
         """Load an existing session (for resume)."""
         if not self._acp_session:
             raise RuntimeError("Session not started")
+        bounded_timeout = float(timeout)
+        if bounded_timeout <= 0:
+            raise TimeoutError("ACP resume load budget exhausted")
         try:
-            self._run_async(self._acp_session.load_session(session_id))
+            self._run_async(
+                self._acp_session.load_session(session_id),
+                timeout=bounded_timeout,
+            )
         except BaseException as exc:
-            if isinstance(exc, TimeoutError) or getattr(
-                self._acp_session,
-                "_force_dead",
-                False,
-            ):
+            if not isinstance(exc, ACPResumeRejected):
                 self._force_dead = True
             raise
         self.session_id = session_id

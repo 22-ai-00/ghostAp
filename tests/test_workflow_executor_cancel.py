@@ -43,7 +43,8 @@ class _SlowCancelableSession:
     def start(self, startup_timeout: float = 60) -> str:
         return self.session_id
 
-    def load_session(self, session_id: str) -> None:
+    def load_session(self, session_id: str, timeout: float = 60) -> None:
+        del timeout
         self.session_id = session_id
 
     def load_local_history(self, *a, **kw):
@@ -314,7 +315,7 @@ def test_prompt_timeout_not_retried(tmp_path, make_executor):
 
         def describe_agent(self): return "fake"
         def start(self, timeout=60): return self.session_id
-        def load_session(self, sid): pass
+        def load_session(self, sid, timeout=60): pass
         def load_local_history(self, *a, **kw): return []
         def cancel(self): pass
         def close(self): pass
@@ -357,7 +358,7 @@ def test_transient_network_error_is_retried(tmp_path, make_executor):
 
         def describe_agent(self): return "fake"
         def start(self, timeout=60): return self.session_id
-        def load_session(self, sid): pass
+        def load_session(self, sid, timeout=60): pass
         def load_local_history(self, *a, **kw): return []
         def cancel(self): pass
         def close(self): pass
@@ -573,7 +574,7 @@ class _RecordingSession:
 
     def describe_agent(self): return "fake"
     def start(self, startup_timeout: float = 60): return self.session_id
-    def load_session(self, sid): pass
+    def load_session(self, sid, timeout=60): pass
     def load_local_history(self, *a, **kw): return []
     def cancel(self): pass
     def close(self): pass

@@ -262,7 +262,8 @@ def test_ttdak_cli_starter_resolves_session_class_and_prechecks_model():
             self.cwd = cwd
             self.model_name = model_name
 
-        def start(self) -> str:
+        def start(self, startup_timeout: float) -> str:
+            assert startup_timeout == pytest.approx(10.0)
             return "sid-ttadk"
 
     manager = object()
@@ -282,6 +283,8 @@ def test_ttdak_cli_starter_resolves_session_class_and_prechecks_model():
         agent_session_cls=PatchedSession,
         original_session_cls=OriginalSession,
         start_operation=lambda fn, **kwargs: fn(**kwargs),
+        deadline_monotonic=110.0,
+        monotonic_fn=lambda: 100.0,
     )
 
     assert isinstance(result.session, PatchedSession)
@@ -355,6 +358,100 @@ def test_acp_retry_starter_retries_and_builds_diagnostics_without_success_side_e
     assert isinstance(result.last_err, TimeoutError)
     assert FlakySession.starts == 2
     assert [item["attempt"] for item in diagnostics] == [1, 2]
+
+
+def test_acp_retry_starter_shares_one_absolute_deadline_across_retries():
+    from src.acp.startup_utils import AcpRetryStarter, RetryPlan, StartupBackend
+
+    clock = {"now": 100.0}
+    attempt_timeouts: list[float] = []
+    sleeps: list[float] = []
+
+    class TimedSession:
+        def __init__(self, **_kwargs):
+            self.closed = False
+
+        def describe_agent(self) -> str:
+            return "timed spec"
+
+        def start(self, *, startup_timeout: float) -> str:
+            attempt_timeouts.append(startup_timeout)
+            clock["now"] += 4.0 if len(attempt_timeouts) == 1 else startup_timeout
+            raise TimeoutError("attempt failed")
+
+        def close(self) -> None:
+            self.closed = True
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    result = AcpRetryStarter().start(
+        backend=StartupBackend.ACP,
+        agent_type="coco",
+        cwd="/repo",
+        model_name=None,
+        retry_plan=RetryPlan(attempts=3, startup_timeout=10),
+        request_key="chat/project",
+        acp_session_cls=TimedSession,
+        cli_session_cls=None,
+        start_operation=lambda fn, **kwargs: fn(**kwargs),
+        diagnostics_fn=lambda **_kwargs: {},
+        format_log_line_fn=lambda **_kwargs: "failed",
+        get_settings_fn=lambda: object(),
+        sleep_fn=sleep,
+        deadline_monotonic=110.0,
+        monotonic_fn=lambda: clock["now"],
+    )
+
+    assert result.session is None
+    assert isinstance(result.last_err, TimeoutError)
+    assert attempt_timeouts == pytest.approx([10.0, 5.7])
+    assert sleeps == pytest.approx([0.3])
+    assert clock["now"] == pytest.approx(110.0)
+
+
+def test_session_startup_coordinator_retires_injected_late_success():
+    from src.acp.startup_utils import SessionStartupCoordinator, SessionStartupRequest
+
+    clock = {"now": 100.0}
+
+    class LateSession:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    late_session = LateSession()
+
+    def starter(**_kwargs):
+        clock["now"] = 111.0
+        return late_session, "late-session", {}
+
+    coordinator = SessionStartupCoordinator(
+        manager_agent_type="coco",
+        session_starter=starter,
+        session_telemetry=MagicMock(),
+        monotonic_fn=lambda: clock["now"],
+    )
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        coordinator.start(
+            SessionStartupRequest(
+                key="chat",
+                cwd="/repo",
+                startup_timeout=10,
+                project_id=None,
+                session_id=None,
+                effective_agent_type="coco",
+                model_name=None,
+                retries=2,
+                deadline_monotonic=110.0,
+            )
+        )
+
+    assert late_session.closed is True
 
 
 def test_session_startup_coordinator_has_no_uncategorized_broad_catches():

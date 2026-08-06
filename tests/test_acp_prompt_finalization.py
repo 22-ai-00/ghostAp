@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from acp.schema import SessionInfoUpdate
 
 import src.acp as acp
-from src.acp.models import PromptResult
+from src.acp.client import GhostAPClient
+from src.acp.models import ACPGoalInfo, ACPSessionInfo, PromptResult
+from src.acp.session import ACPSession
+from src.acp.sync_adapter import SyncACPSession
 
 
 class _TimeoutThenCompleteSession:
@@ -436,3 +442,124 @@ def test_goal_inspection_and_retirement_failures_preserve_both_causes() -> None:
         "goal inspection failed",
         "retirement failed",
     }
+
+
+def _sync_wrapper_for_backend(backend: ACPSession) -> SyncACPSession:
+    session = SyncACPSession.__new__(SyncACPSession)
+    session._acp_session = backend
+    session._force_dead = False
+    session._run_async = lambda coro, timeout: asyncio.run(coro)
+    return session
+
+
+def test_real_goal_pause_transport_and_retirement_failures_preserve_both_causes(
+    tmp_path: Path,
+) -> None:
+    backend = ACPSession(agent_cmd="npx", agent_args=[], cwd=str(tmp_path))
+    backend._session_id = "session-goal"
+    backend._on_session_info(
+        "session-goal",
+        ACPSessionInfo(
+            goal_known=True,
+            goal=ACPGoalInfo(
+                "finish",
+                "active",
+                control_method="_codex/session/goal_control",
+            ),
+            thread_status_known=True,
+            thread_status="active",
+        ),
+    )
+
+    class Connection:
+        async def ext_method(self, *_args, **_kwargs):
+            raise ConnectionError("pause transport lost")
+
+    backend._conn = Connection()
+    session = _sync_wrapper_for_backend(backend)
+    prompt_calls: list[str] = []
+
+    def timeout_primary(text: str, **_kwargs) -> PromptResult:
+        prompt_calls.append(text)
+        raise TimeoutError("primary deadline")
+
+    session.send_prompt = timeout_primary  # type: ignore[method-assign]
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        _runner()(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+            retire_finalization_session=lambda _active, _budget: (_ for _ in ()).throw(
+                RuntimeError("retirement failed")
+            ),
+        )
+
+    assert {str(exc) for exc in exc_info.value.exceptions} == {
+        "pause transport lost",
+        "retirement failed",
+    }
+    assert prompt_calls == ["original task"]
+    assert session._force_dead is True
+
+
+def test_real_parser_unknown_goal_retires_before_finalization_prompt(
+    tmp_path: Path,
+) -> None:
+    backend = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    backend._session_id = "session-goal"
+    client = GhostAPClient(
+        on_event=backend._dispatch_event,
+        on_session_info=backend._on_session_info,
+        root_dir=str(tmp_path),
+    )
+    asyncio.run(
+        client.session_update(
+            "session-goal",
+            SessionInfoUpdate.model_validate(
+                {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "codex": {
+                            "goal": {
+                                "objective": "finish",
+                                "status": "running",
+                            },
+                            "threadStatus": {"type": "idle"},
+                        }
+                    },
+                }
+            ),
+        )
+    )
+    session = _sync_wrapper_for_backend(backend)
+    retired: list[object] = []
+    prompt_calls: list[str] = []
+
+    def primary_only(text: str, **_kwargs) -> PromptResult:
+        prompt_calls.append(text)
+        if len(prompt_calls) == 1:
+            raise TimeoutError("primary deadline")
+        raise AssertionError("unknown goal must prevent finalization prompt")
+
+    session.send_prompt = primary_only  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="goal status is unknown"):
+        _runner()(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+            retire_finalization_session=lambda active, _budget: retired.append(
+                active
+            ),
+        )
+
+    assert prompt_calls == ["original task"]
+    assert retired == [session]
+    assert session._force_dead is True

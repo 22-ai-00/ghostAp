@@ -94,7 +94,8 @@ class SyncTTADKCLISession:
             self.session_id = str(uuid.uuid4())
         return self.session_id
 
-    def load_session(self, session_id: str) -> None:
+    def load_session(self, session_id: str, timeout: float) -> None:
+        del timeout
         self.session_id = session_id
         self.is_resumed = True
 

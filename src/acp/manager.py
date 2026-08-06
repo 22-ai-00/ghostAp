@@ -25,6 +25,7 @@ from .diagnostics import (
     truncate_text,
 )
 from .helper import SessionKeyCodec
+from .session import ACPResumeRejected
 from .sync_adapter import SyncACPSession, build_startup_diagnostics
 from .telemetry import (
     IdleHealthConfig,
@@ -187,6 +188,7 @@ def _build_startup_diagnostics(
 # `SessionKeyCodec` 的默认 project 占位符应作为 session_key 协议的 SSOT；
 # 为保持历史常量名稳定，这里仅作为引用别名保留。
 _DEFAULT_PROJECT = SessionKeyCodec.DEFAULT_PROJECT_PLACEHOLDER
+_RESUME_CLOSE_HEADROOM_S = 17.0
 
 # 标准化后的 session_key 解析结果类型：
 # (chat_id, project_id, thread_id)
@@ -667,6 +669,7 @@ class ACPSessionManager:
                 effective_agent_type=effective_agent_type,
                 model_name=model_name,
                 retries=retries,
+                deadline_monotonic=startup_deadline,
             )
         )
         session = startup_result.session
@@ -677,26 +680,39 @@ class ACPSessionManager:
         # If caller wants a specific session_id (resume), load it
         if session_id:
             try:
-                session.load_session(session_id)
+                resume_remaining = self._remaining_before(
+                    startup_deadline,
+                    "resume load",
+                )
+                resume_close_reserve = min(
+                    _RESUME_CLOSE_HEADROOM_S,
+                    resume_remaining / 2.0,
+                )
+                resume_load_timeout = resume_remaining - resume_close_reserve
+                session.load_session(
+                    session_id,
+                    timeout=resume_load_timeout,
+                )
                 session.session_id = session_id
                 session.is_resumed = True
-            except Exception as e:
-                if getattr(session, "_force_dead", False) is True:
-                    try:
-                        self._close_session_before(
-                            session,
-                            key=key,
-                            deadline=startup_deadline,
-                        )
-                    except Exception as close_error:
-                        raise ExceptionGroup(
-                            "ACP resume and uncertain session retirement both failed",
-                            [e, close_error],
-                        ) from None
-                    raise
+            except ACPResumeRejected as e:
                 logger.warning(
                     "[ACP:%s] Failed to load session %s, using new: %s", effective_agent_type.upper(), session_id[:8], e
                 )
+            except BaseException as e:
+                setattr(session, "_force_dead", True)
+                try:
+                    self._close_session_before(
+                        session,
+                        key=key,
+                        deadline=startup_deadline,
+                    )
+                except BaseException as close_error:
+                    raise BaseExceptionGroup(
+                        "ACP resume and uncertain session retirement both failed",
+                        [e, close_error],
+                    ) from None
+                raise
 
         # Load local persisted history (best-effort)
         try:
