@@ -966,9 +966,10 @@ class ACPSession:
                     paused = await pause_operation
                 else:
                     pause_budget = max(0.001, float(timeout) / 2.0)
-                    paused = await asyncio.wait_for(
+                    paused = await safe_wait_for(
                         pause_operation,
                         timeout=pause_budget,
+                        action="ACP Goal 暂停",
                     )
                 if await self.has_active_goal() and not paused:
                     raise RuntimeError("ACP active goal pause was not confirmed")
