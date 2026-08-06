@@ -23,6 +23,32 @@ class ACPImageInfo:
     source_uri: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ACPGoalInfo:
+    """Trusted provider-owned goal state advertised through ACP metadata."""
+
+    objective: str
+    status: str
+    control_method: str = ""
+    token_budget: int | None = None
+    time_used_seconds: float | None = None
+    created_at: str | float = ""
+
+    @property
+    def is_active(self) -> bool:
+        return self.status == "active"
+
+
+@dataclass(frozen=True)
+class ACPSessionInfo:
+    """Normalized control-plane state from an ACP session-info update."""
+
+    goal_known: bool = False
+    goal: ACPGoalInfo | None = None
+    thread_status_known: bool = False
+    thread_status: str = ""
+
+
 class ACPEventType(Enum):
     """Event types produced from ACP session_update notifications."""
 
@@ -138,6 +164,7 @@ class PromptResult:
     plan: Optional[PlanInfo] = None
     modified_files: set[str] = field(default_factory=set)
     output_tokens: Optional[int] = None  # Output token count for discussion budget tracking
+    goal: ACPGoalInfo | None = None
 
     # ---- aggregation helpers ----
     def add_text(self, chunk: str) -> None:

@@ -1745,7 +1745,16 @@ class SyncACPSession:
         """Load an existing session (for resume)."""
         if not self._acp_session:
             raise RuntimeError("Session not started")
-        self._run_async(self._acp_session.load_session(session_id))
+        try:
+            self._run_async(self._acp_session.load_session(session_id))
+        except BaseException as exc:
+            if isinstance(exc, TimeoutError) or getattr(
+                self._acp_session,
+                "_force_dead",
+                False,
+            ):
+                self._force_dead = True
+            raise
         self.session_id = session_id
         self.is_resumed = True
         self.load_local_history(session_id)
@@ -2001,6 +2010,34 @@ class SyncACPSession:
         """Return the currently installed tool filter, or None."""
         return getattr(self, "_tool_filter", None)
 
+    def has_active_goal(self, timeout: float = 1.0) -> bool:
+        """Inspect provider-owned goal state on the session event loop."""
+        if not self._acp_session:
+            return False
+        bounded_timeout = float(timeout)
+        if bounded_timeout <= 0:
+            raise TimeoutError("ACP goal inspection budget exhausted")
+        return bool(
+            self._run_async(
+                self._acp_session.has_active_goal(),
+                timeout=bounded_timeout,
+            )
+        )
+
+    def pause_active_goal(self, timeout: float) -> bool:
+        """Pause a provider-owned goal within the caller's absolute budget."""
+        if not self._acp_session:
+            return False
+        bounded_timeout = float(timeout)
+        if bounded_timeout <= 0:
+            raise TimeoutError("ACP goal pause budget exhausted")
+        return bool(
+            self._run_async(
+                self._acp_session.pause_active_goal(),
+                timeout=bounded_timeout,
+            )
+        )
+
     def cancel(self, wait: bool = False, timeout: float = 2.0) -> bool | None:
         """Cancel current prompt.
 
@@ -2012,7 +2049,7 @@ class SyncACPSession:
         if not (self._acp_session and self._loop):
             return False
         fut = asyncio.run_coroutine_threadsafe(
-            self._acp_session.cancel(),
+            self._acp_session.cancel(timeout=timeout),
             self._loop,
         )
         if not wait:

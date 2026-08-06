@@ -10,6 +10,7 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
 from acp.helpers import text_block
@@ -24,9 +25,18 @@ from .client import (
     GhostAPClient,
     emit_referenced_changed_local_image_events,
 )
-from .models import ACPEvent, ACPEventType, ACPSessionState, PromptResult
+from .models import (
+    ACPEvent,
+    ACPEventType,
+    ACPGoalInfo,
+    ACPSessionInfo,
+    ACPSessionState,
+    PromptResult,
+)
 
 logger = logging.getLogger(__name__)
+
+_CODEX_GOAL_CONTROL_METHOD = "_codex/session/goal_control"
 
 
 class ACPStartupError(RuntimeError):
@@ -214,6 +224,176 @@ class ACPSession:
         self._handler_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._prompt_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._closing = False
+        self._goal_known = not self._uses_official_codex_acp()
+        self._goal: ACPGoalInfo | None = None
+        self._thread_status_known = False
+        self._thread_status = ""
+        self._lifecycle_revision = 0
+        self._lifecycle_event: asyncio.Event | None = None
+        self._lifecycle_event_loop: asyncio.AbstractEventLoop | None = None
+        self._loading_session_id: str | None = None
+        self._force_dead = False
+        self._transport_epoch = 0
+        self._load_epoch = 0
+
+    def _uses_official_codex_acp(self) -> bool:
+        return any(
+            "@agentclientprotocol/codex-acp" in str(arg)
+            for arg in self._agent_args
+        )
+
+    def _wake_lifecycle_waiter(self) -> None:
+        event = self._lifecycle_event
+        owner_loop = self._lifecycle_event_loop
+        if event is None or owner_loop is None:
+            return
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        if running_loop is owner_loop:
+            event.set()
+            return
+        if not owner_loop.is_closed():
+            owner_loop.call_soon_threadsafe(event.set)
+
+    def _reset_lifecycle(self, *, goal_known: bool) -> None:
+        with self._handler_lock:
+            self._goal_known = goal_known
+            self._goal = None
+            self._thread_status_known = False
+            self._thread_status = ""
+            self._lifecycle_revision += 1
+        self._wake_lifecycle_waiter()
+
+    def _on_session_info(
+        self,
+        session_id: str,
+        info: ACPSessionInfo,
+        *,
+        transport_epoch: int | None = None,
+        load_epoch: int | None = None,
+    ) -> None:
+        """Apply a trusted control-plane update for the current/load target only."""
+        with self._handler_lock:
+            expected_ids = {self._session_id, self._loading_session_id}
+            if (
+                self._closing
+                or (
+                    transport_epoch is not None
+                    and transport_epoch != self._transport_epoch
+                )
+                or (load_epoch is not None and load_epoch != self._load_epoch)
+                or session_id not in expected_ids
+                or not isinstance(info, ACPSessionInfo)
+            ):
+                return
+            changed = False
+            if info.goal_known:
+                self._goal_known = True
+                self._goal = info.goal
+                changed = True
+            if info.thread_status_known:
+                self._thread_status_known = True
+                self._thread_status = info.thread_status
+                changed = True
+            if not changed:
+                return
+            self._lifecycle_revision += 1
+        self._wake_lifecycle_waiter()
+
+    def _bind_session_info_callback(self) -> None:
+        client = self._client
+        if client is None:
+            return
+        with self._handler_lock:
+            transport_epoch = self._transport_epoch
+            load_epoch = self._load_epoch
+        client._on_session_info = lambda session_id, info: self._on_session_info(
+            session_id,
+            info,
+            transport_epoch=transport_epoch,
+            load_epoch=load_epoch,
+        )
+
+    async def _wait_for_lifecycle_change(self, revision: int) -> None:
+        loop = asyncio.get_running_loop()
+        with self._handler_lock:
+            if self._closing:
+                raise RuntimeError("ACP session is closing")
+            if revision != self._lifecycle_revision:
+                return
+            if self._lifecycle_event_loop is not loop:
+                self._lifecycle_event = asyncio.Event()
+                self._lifecycle_event_loop = loop
+            event = self._lifecycle_event
+            event.clear()
+        await event.wait()
+        with self._handler_lock:
+            if self._closing:
+                raise RuntimeError("ACP session is closing")
+
+    def _goal_requires_prompt_wait(self) -> tuple[bool, int]:
+        with self._handler_lock:
+            if self._closing:
+                raise RuntimeError("ACP session is closing")
+            active = bool(
+                self._goal_known
+                and self._goal is not None
+                and self._goal.is_active
+            )
+            terminal_thread_active = bool(
+                self._goal_known
+                and self._goal is not None
+                and not self._goal.is_active
+                and self._thread_status_known
+                and self._thread_status == "active"
+            )
+            return active or terminal_thread_active, self._lifecycle_revision
+
+    async def has_active_goal(self) -> bool:
+        with self._handler_lock:
+            if self._uses_official_codex_acp() and not self._goal_known:
+                raise RuntimeError("ACP goal state is unknown")
+            return bool(self._goal is not None and self._goal.is_active)
+
+    async def _pause_active_goal(self, *, propagate_errors: bool) -> bool:
+        try:
+            with self._handler_lock:
+                goal = self._goal if self._goal_known else None
+                revision = self._lifecycle_revision
+                session_id = self._session_id
+                closing = self._closing
+            if closing or goal is None or not goal.is_active:
+                return not closing
+            if goal.control_method != _CODEX_GOAL_CONTROL_METHOD:
+                return False
+            if not self._conn or not session_id:
+                return False
+            response = await self._conn.ext_method(
+                goal.control_method[1:],
+                {"sessionId": session_id, "action": "pause"},
+            )
+            if not isinstance(response, Mapping):
+                return False
+            while True:
+                with self._handler_lock:
+                    if self._closing:
+                        return False
+                    if (
+                        self._goal_known
+                        and (self._goal is None or not self._goal.is_active)
+                    ):
+                        return True
+                    revision = self._lifecycle_revision
+                await self._wait_for_lifecycle_change(revision)
+        except Exception:
+            if propagate_errors:
+                raise
+            return False
+
+    async def pause_active_goal(self) -> bool:
+        return await self._pause_active_goal(propagate_errors=False)
 
     @property
     def session_id(self) -> Optional[str]:
@@ -227,6 +407,8 @@ class ACPSession:
         """Start agent process and establish ACP connection. Returns session_id."""
         with self._handler_lock:
             self._closing = False
+            self._transport_epoch += 1
+            self._load_epoch += 1
         settings = get_settings()
         client = GhostAPClient(
             on_event=self._dispatch_event,
@@ -234,6 +416,7 @@ class ACPSession:
             root_dir=self._cwd,
         )
         self._client = client
+        self._bind_session_info_callback()
         if self._tool_filter is not None:
             client.set_tool_filter(self._tool_filter)
         # Raise the stdio stream buffer limit to handle large agent responses.
@@ -275,6 +458,8 @@ class ACPSession:
             self._session_id = session_resp.session_id
             self._state.session_id = self._session_id
             self._state.is_active = True
+            if self._uses_official_codex_acp():
+                self._reset_lifecycle(goal_known=True)
 
             logger.info("[ACP:%s] Session started: %s", self._agent_cmd, self._session_id[:8])
             return self._session_id
@@ -327,9 +512,51 @@ class ACPSession:
         """Load an existing session by ID (for resume)."""
         if not self._conn:
             raise RuntimeError("Connection not established. Call start() first.")
-        await self._conn.load_session(cwd=self._cwd, session_id=session_id)
-        self._session_id = session_id
-        self._state.session_id = session_id
+        previous_session_id = self._session_id
+        previous_goal_state = (
+            self._goal_known,
+            self._goal,
+            self._thread_status_known,
+            self._thread_status,
+        )
+        rpc_completed = False
+        with self._handler_lock:
+            self._loading_session_id = session_id
+            self._load_epoch += 1
+        self._bind_session_info_callback()
+        self._reset_lifecycle(goal_known=not self._uses_official_codex_acp())
+        try:
+            await self._conn.load_session(cwd=self._cwd, session_id=session_id)
+            rpc_completed = True
+            self._session_id = session_id
+            self._state.session_id = session_id
+            if self._uses_official_codex_acp():
+                while True:
+                    with self._handler_lock:
+                        if self._goal_known:
+                            break
+                        revision = self._lifecycle_revision
+                    await self._wait_for_lifecycle_change(revision)
+        except BaseException:
+            with self._handler_lock:
+                self._session_id = previous_session_id
+                self._state.session_id = previous_session_id or ""
+                (
+                    self._goal_known,
+                    self._goal,
+                    self._thread_status_known,
+                    self._thread_status,
+                ) = previous_goal_state
+                self._lifecycle_revision += 1
+                self._loading_session_id = None
+                self._load_epoch += 1
+                if rpc_completed:
+                    self._force_dead = True
+            self._bind_session_info_callback()
+            self._wake_lifecycle_waiter()
+            raise
+        with self._handler_lock:
+            self._loading_session_id = None
         logger.info("[ACP:%s] Session loaded: %s", self._agent_cmd, session_id[:8])
 
     async def health_check(self, timeout: float = 2.0) -> bool:
@@ -388,6 +615,19 @@ class ACPSession:
         result = PromptResult(stop_reason="")
         last_event_monotonic = [time.monotonic()]
         image_snapshot: object = {}
+
+        async def _drain_prompt_tail() -> None:
+            quiet_s = 0.2 if "tui2acp" in self._agent_cmd else 0.05
+            max_drain_s = 0.6 if "tui2acp" in self._agent_cmd else 0.15
+            drain_started = time.monotonic()
+            while time.monotonic() - drain_started < max_drain_s:
+                quiet_for = time.monotonic() - max(
+                    last_event_monotonic[0],
+                    drain_started,
+                )
+                if quiet_for >= quiet_s:
+                    break
+                await asyncio.sleep(min(0.005, quiet_s - quiet_for))
 
         def _collector(ev: ACPEvent):
             with self._handler_lock:
@@ -449,18 +689,19 @@ class ACPSession:
             # the stream has been quiet for a short window so late text *and media*
             # arrive before the handler is cleared and the card becomes terminal.
             try:
-                quiet_s = 0.2 if "tui2acp" in self._agent_cmd else 0.05
-                max_drain_s = 0.6 if "tui2acp" in self._agent_cmd else 0.15
-                drain_started = time.monotonic()
-                while time.monotonic() - drain_started < max_drain_s:
-                    quiet_for = time.monotonic() - max(
-                        last_event_monotonic[0],
-                        drain_started,
+                await _drain_prompt_tail()
+                while True:
+                    should_wait, lifecycle_revision = (
+                        self._goal_requires_prompt_wait()
                     )
-                    if quiet_for >= quiet_s:
+                    if not should_wait:
                         break
-                    await asyncio.sleep(min(0.005, quiet_s - quiet_for))
+                    await self._wait_for_lifecycle_change(lifecycle_revision)
+                    await _drain_prompt_tail()
             except Exception:
+                with self._handler_lock:
+                    if self._closing:
+                        raise RuntimeError("ACP session is closing")
                 logger.debug("grace window wait failed", exc_info=True)
 
             if self._client is not None:
@@ -505,6 +746,9 @@ class ACPSession:
             logger.debug("[ACP:%s] tool_calls finalization failed", self._agent_cmd, exc_info=True)
 
         result.stop_reason = str(getattr(response, "stop_reason", "") or "")
+        with self._handler_lock:
+            if self._goal_known:
+                result.goal = self._goal
 
         # Best-effort: attach local tool results (execute/read/write/permission) produced during this prompt.
         try:
@@ -596,10 +840,40 @@ class ACPSession:
             logger.warning("[ACP:%s] set_model failed (agent may not support it): %s", self._agent_cmd, get_error_detail(e))
             return False
 
-    async def cancel(self) -> None:
+    async def cancel(self, timeout: float | None = None) -> None:
         """Cancel the current prompt execution."""
         if self._conn and self._session_id:
-            await self._conn.cancel(session_id=self._session_id)
+            pause_error: BaseException | None = None
+            try:
+                pause_operation = self._pause_active_goal(propagate_errors=True)
+                if timeout is None:
+                    paused = await pause_operation
+                else:
+                    pause_budget = max(0.001, float(timeout) / 2.0)
+                    paused = await asyncio.wait_for(
+                        pause_operation,
+                        timeout=pause_budget,
+                    )
+                if await self.has_active_goal() and not paused:
+                    raise RuntimeError("ACP active goal pause was not confirmed")
+            except BaseException as exc:
+                pause_error = exc
+
+            cancel_error: BaseException | None = None
+            try:
+                await self._conn.cancel(session_id=self._session_id)
+            except BaseException as exc:
+                cancel_error = exc
+
+            if pause_error is not None and cancel_error is not None:
+                raise BaseExceptionGroup(
+                    "ACP goal pause and turn cancellation both failed",
+                    [pause_error, cancel_error],
+                )
+            if pause_error is not None:
+                raise pause_error
+            if cancel_error is not None:
+                raise cancel_error
 
     async def close(self) -> None:
         """Close session and terminate agent process."""
@@ -608,6 +882,10 @@ class ACPSession:
             self._closing = True
             self._event_handler = None
             self._event_generation += 1
+            self._lifecycle_revision += 1
+            self._transport_epoch += 1
+            self._load_epoch += 1
+        self._wake_lifecycle_waiter()
         if self._client is not None:
             self._client.release_active_local_image_snapshot()
         if self._ctx_manager:

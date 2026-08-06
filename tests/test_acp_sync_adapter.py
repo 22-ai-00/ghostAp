@@ -19,7 +19,9 @@ from src.acp.models import PromptResult
 
 def _cancel_test_session() -> sa.SyncACPSession:
     session = sa.SyncACPSession.__new__(sa.SyncACPSession)
-    session._acp_session = SimpleNamespace(cancel=lambda: asyncio.sleep(0))
+    session._acp_session = SimpleNamespace(
+        cancel=lambda **_kwargs: asyncio.sleep(0)
+    )
     session._loop = object()
     return session
 
@@ -50,6 +52,51 @@ def test_cancel_wait_timeout_returns_not_acknowledged(monkeypatch):
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submit)
 
     assert session.cancel(wait=True, timeout=0.1) is False
+
+
+def test_goal_control_methods_use_caller_bounded_background_loop() -> None:
+    class FakeACPSession:
+        async def has_active_goal(self) -> bool:
+            return True
+
+        async def pause_active_goal(self) -> bool:
+            return True
+
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._acp_session = FakeACPSession()
+    observed_timeouts: list[float] = []
+
+    def run(coro, timeout: float):
+        observed_timeouts.append(timeout)
+        return asyncio.run(coro)
+
+    session._run_async = run
+
+    assert session.has_active_goal(timeout=0.25) is True
+    assert session.pause_active_goal(timeout=0.5) is True
+    assert observed_timeouts == [0.25, 0.5]
+
+
+def test_load_snapshot_timeout_marks_session_force_dead() -> None:
+    class FakeACPSession:
+        _force_dead = False
+
+        async def load_session(self, _session_id: str) -> None:
+            return None
+
+    session = sa.SyncACPSession.__new__(sa.SyncACPSession)
+    session._acp_session = FakeACPSession()
+    session._force_dead = False
+    def timeout(coro):
+        coro.close()
+        raise TimeoutError("forced snapshot missing")
+
+    session._run_async = timeout
+
+    with pytest.raises(TimeoutError, match="forced snapshot missing"):
+        session.load_session("session-resume")
+
+    assert session._force_dead is True
 
 
 def test_send_prompt_rejects_concurrent_threads_before_replacing_active_future(

@@ -681,6 +681,19 @@ class ACPSessionManager:
                 session.session_id = session_id
                 session.is_resumed = True
             except Exception as e:
+                if getattr(session, "_force_dead", False) is True:
+                    try:
+                        self._close_session_before(
+                            session,
+                            key=key,
+                            deadline=startup_deadline,
+                        )
+                    except Exception as close_error:
+                        raise ExceptionGroup(
+                            "ACP resume and uncertain session retirement both failed",
+                            [e, close_error],
+                        ) from None
+                    raise
                 logger.warning(
                     "[ACP:%s] Failed to load session %s, using new: %s", effective_agent_type.upper(), session_id[:8], e
                 )

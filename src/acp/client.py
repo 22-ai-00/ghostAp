@@ -10,6 +10,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -40,6 +41,7 @@ from acp.schema import (
     ReleaseTerminalResponse,
     RequestPermissionResponse,
     ResourceContentBlock,
+    SessionInfoUpdate,
     TerminalExitStatus,
     TerminalOutputResponse,
     TextContentBlock,
@@ -60,7 +62,9 @@ from ..utils.text import sanitize_single_line_label
 from .models import (
     ACPEvent,
     ACPEventType,
+    ACPGoalInfo,
     ACPImageInfo,
+    ACPSessionInfo,
     PlanEntryInfo,
     PlanInfo,
     ToolCallInfo,
@@ -1214,18 +1218,105 @@ def _extract_update_source_id(update: Any) -> str | None:
     return _from_obj(update) or _from_obj(getattr(update, "content", None))
 
 
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _parse_codex_goal(value: object) -> ACPGoalInfo | None:
+    if not isinstance(value, Mapping):
+        return None
+    objective = value.get("objective")
+    status = value.get("status")
+    if not isinstance(objective, str) or not objective.strip():
+        return None
+    if not isinstance(status, str) or not status.strip():
+        return None
+
+    token_budget = None
+    if "tokenBudget" in value and value.get("tokenBudget") is not None:
+        token_number = _finite_number(value.get("tokenBudget"))
+        if token_number is None or not token_number.is_integer():
+            return None
+        token_budget = int(token_number)
+
+    time_used_seconds = None
+    if "timeUsedSeconds" in value and value.get("timeUsedSeconds") is not None:
+        time_number = _finite_number(value.get("timeUsedSeconds"))
+        if time_number is None:
+            return None
+        time_used_seconds = time_number
+
+    control_method = value.get("controlMethod", "")
+    created_at: str | float = value.get("createdAt", "")
+    if not isinstance(control_method, str):
+        return None
+    if not isinstance(created_at, str):
+        created_number = _finite_number(created_at)
+        if created_number is None or created_number < 0:
+            return None
+        created_at = created_number
+    return ACPGoalInfo(
+        objective=objective.strip(),
+        status=status.strip(),
+        control_method=control_method,
+        token_budget=token_budget,
+        time_used_seconds=time_used_seconds,
+        created_at=created_at,
+    )
+
+
+def _parse_session_info_update(update: SessionInfoUpdate) -> ACPSessionInfo:
+    meta = update.field_meta
+    if not isinstance(meta, Mapping):
+        return ACPSessionInfo()
+    codex = meta.get("codex")
+    if not isinstance(codex, Mapping):
+        return ACPSessionInfo()
+
+    goal_known = False
+    goal = None
+    if "goal" in codex:
+        raw_goal = codex.get("goal")
+        if raw_goal is None:
+            goal_known = True
+        else:
+            goal = _parse_codex_goal(raw_goal)
+            goal_known = goal is not None
+
+    thread_status_known = False
+    thread_status = ""
+    raw_thread_status = codex.get("threadStatus")
+    if isinstance(raw_thread_status, Mapping):
+        raw_type = raw_thread_status.get("type")
+        if isinstance(raw_type, str) and raw_type.strip():
+            thread_status_known = True
+            thread_status = raw_type.strip()
+
+    return ACPSessionInfo(
+        goal_known=goal_known,
+        goal=goal,
+        thread_status_known=thread_status_known,
+        thread_status=thread_status,
+    )
+
+
 class GhostAPClient(Client):
     """ACP Client implementation — processes agent session updates."""
 
     def __init__(
         self,
         on_event: Callable[[ACPEvent], None],
+        on_session_info: Callable[[str, ACPSessionInfo], None] | None = None,
         auto_approve: bool = True,
         root_dir: str = ".",
         sandbox: Optional[SandboxExecutor] = None,
         history_store: Optional[ACPHistoryStore] = None,
     ):
         self._on_event = on_event
+        self._on_session_info = on_session_info
         self._auto_approve = auto_approve
         self._root_dir = os.path.abspath(os.path.expanduser(root_dir or "."))
         self._sandbox = sandbox or SandboxExecutor()
@@ -1296,7 +1387,14 @@ class GhostAPClient(Client):
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Receive agent's streaming updates — the core event handler."""
         try:
-            if isinstance(update, AgentMessageChunk):
+            if isinstance(update, SessionInfoUpdate):
+                info = _parse_session_info_update(update)
+                if (
+                    self._on_session_info is not None
+                    and (info.goal_known or info.thread_status_known)
+                ):
+                    self._on_session_info(session_id, info)
+            elif isinstance(update, AgentMessageChunk):
                 self._handle_message_chunk(update)
             elif isinstance(update, AgentThoughtChunk):
                 self._handle_thought_chunk(update)

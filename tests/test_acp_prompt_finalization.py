@@ -31,6 +31,28 @@ class _TimeoutThenCompleteSession:
         return PromptResult(stop_reason="end_turn", text="finalized")
 
 
+class _ActiveGoalTimeoutThenCompleteSession(_TimeoutThenCompleteSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.order: list[str] = []
+        self.goal_active = True
+        self.pause_timeouts: list[float] = []
+
+    def has_active_goal(self, timeout: float = 1.0) -> bool:
+        self.order.append("inspect_goal")
+        return self.goal_active
+
+    def pause_active_goal(self, timeout: float) -> bool:
+        self.order.append("pause_goal")
+        self.pause_timeouts.append(timeout)
+        self.goal_active = False
+        return True
+
+    def send_prompt(self, *args, **kwargs):
+        self.order.append("primary" if not self.calls else "finalize")
+        return super().send_prompt(*args, **kwargs)
+
+
 def _runner():
     runner = getattr(acp, "run_prompt_with_finalization", None)
     assert callable(runner), "deadline-aware prompt finalization is not implemented"
@@ -252,3 +274,165 @@ def test_retirement_receives_only_remaining_total_budget() -> None:
 
     assert retirement_budgets
     assert retirement_budgets[0] == pytest.approx(2.0)
+
+
+def test_active_goal_is_paused_before_finalization_and_retired_afterward() -> None:
+    session = _ActiveGoalTimeoutThenCompleteSession()
+    retired: list[object] = []
+
+    result = _runner()(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+        retire_finalization_session=lambda active, _budget: (
+            session.order.append("retire"),
+            retired.append(active),
+        ),
+    )
+
+    assert result.text == "finalized"
+    assert session.order == [
+        "primary",
+        "inspect_goal",
+        "pause_goal",
+        "finalize",
+        "retire",
+    ]
+    assert session.pause_timeouts[0] > 0
+    assert session.pause_timeouts[0] <= 63
+    assert retired == [session]
+
+
+@pytest.mark.parametrize("failure", ["false", "raise"])
+def test_failed_active_goal_pause_retires_without_finalization(
+    failure: str,
+) -> None:
+    session = _ActiveGoalTimeoutThenCompleteSession()
+    retired: list[object] = []
+
+    def fail_pause(timeout: float) -> bool:
+        session.order.append("pause_goal")
+        if failure == "raise":
+            raise RuntimeError("pause transport failed")
+        return False
+
+    session.pause_active_goal = fail_pause  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="pause"):
+        _runner()(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+            retire_finalization_session=lambda active, _budget: retired.append(
+                active
+            ),
+        )
+
+    assert session.order == ["primary", "inspect_goal", "pause_goal"]
+    assert retired == [session]
+    assert session._force_dead is True
+    assert len(session.calls) == 1
+
+
+def test_exhausted_goal_pause_budget_retires_without_finalization() -> None:
+    session = _ActiveGoalTimeoutThenCompleteSession()
+    retired: list[object] = []
+    clock = iter((100.0, 164.0, 164.0))
+
+    with (
+        patch("src.acp.finalization._monotonic", side_effect=lambda: next(clock)),
+        pytest.raises(TimeoutError, match="pause budget exhausted"),
+    ):
+        _runner()(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+            retire_finalization_session=lambda active, _budget: retired.append(
+                active
+            ),
+        )
+
+    assert retired == [session]
+    assert session.order == ["primary"]
+    assert len(session.calls) == 1
+
+
+def test_replacement_without_active_goal_is_inspected_before_finalization() -> None:
+    dead = _TimeoutThenCompleteSession()
+    replacement = _ActiveGoalTimeoutThenCompleteSession()
+    replacement.goal_active = False
+    replacement.calls.append(("already consumed primary slot", None))
+
+    original_send = dead.send_prompt
+
+    def timeout_and_mark_dead(*args, **kwargs):
+        try:
+            return original_send(*args, **kwargs)
+        finally:
+            dead._force_dead = True
+
+    dead.send_prompt = timeout_and_mark_dead  # type: ignore[method-assign]
+
+    result = _runner()(
+        dead,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+        replace_dead_session=lambda _budget: replacement,
+    )
+
+    assert result.text == "finalized"
+    assert replacement.order == ["inspect_goal", "finalize"]
+
+
+def test_unknown_goal_state_retires_without_finalization_prompt() -> None:
+    session = _ActiveGoalTimeoutThenCompleteSession()
+    retired: list[object] = []
+
+    def unknown_goal(*, timeout: float = 1.0) -> bool:
+        session.order.append("inspect_goal")
+        raise RuntimeError("ACP goal state is unknown")
+
+    session.has_active_goal = unknown_goal  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="goal state is unknown"):
+        _runner()(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+            retire_finalization_session=lambda active, _budget: retired.append(
+                active
+            ),
+        )
+
+    assert retired == [session]
+    assert len(session.calls) == 1
+
+
+def test_goal_inspection_and_retirement_failures_preserve_both_causes() -> None:
+    session = _ActiveGoalTimeoutThenCompleteSession()
+
+    def fail_inspection(*, timeout: float = 1.0) -> bool:
+        raise RuntimeError("goal inspection failed")
+
+    session.has_active_goal = fail_inspection  # type: ignore[method-assign]
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        _runner()(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+            retire_finalization_session=lambda _active, _budget: (_ for _ in ()).throw(
+                RuntimeError("retirement failed")
+            ),
+        )
+
+    assert {str(exc) for exc in exc_info.value.exceptions} == {
+        "goal inspection failed",
+        "retirement failed",
+    }

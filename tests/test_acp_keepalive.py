@@ -31,6 +31,49 @@ def _make_mock_session(*, last_active: float = 0.0, server_running: bool = True)
     return session
 
 
+def test_resume_snapshot_timeout_is_closed_and_never_installed() -> None:
+    closed: list[str] = []
+
+    class UncertainResumeSession:
+        def __init__(self) -> None:
+            self.session_id = "new-session"
+            self.message_count = 0
+            self.last_active = time.time()
+            self._force_dead = False
+
+        def describe_agent(self) -> str:
+            return "codex-acp"
+
+        def load_session(self, _session_id: str) -> None:
+            self._force_dead = True
+            raise TimeoutError("forced goal snapshot missing")
+
+        def close(self) -> None:
+            closed.append(self.session_id)
+
+    created = UncertainResumeSession()
+    manager = ACPSessionManager(
+        "codex",
+        keepalive_interval=0,
+        session_starter=lambda **_kwargs: (
+            created,
+            created.session_id,
+            {},
+        ),
+    )
+    try:
+        with pytest.raises(TimeoutError, match="forced goal snapshot missing"):
+            manager.start_session(
+                "chat-resume",
+                cwd=".",
+                session_id="target-session",
+            )
+        assert manager.get_session("chat-resume") is None
+        assert closed == ["new-session"]
+    finally:
+        manager.cleanup_all()
+
+
 class TestKeepaliveThreadLifecycle:
     def test_keepalive_thread_starts_when_interval_positive(self):
         mgr = ACPSessionManager("coco", keepalive_interval=1)

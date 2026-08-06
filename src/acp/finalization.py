@@ -120,6 +120,46 @@ def _retire_after_timeout(
         raise
 
 
+def _pause_active_goal_before_finalization(
+    session: SessionT,
+    *,
+    deadline: float,
+    retire_finalization_session: Callable[[SessionT, float], None] | None,
+) -> None:
+    """Fence a provider-owned continuation before sending the final turn."""
+    has_goal = getattr(session, "has_active_goal", None)
+    if not callable(has_goal):
+        return
+    try:
+        remaining = deadline - _monotonic() - _FINALIZATION_CLEANUP_HEADROOM_S
+        if remaining <= 0:
+            raise TimeoutError("ACP active goal pause budget exhausted")
+        active = bool(has_goal(timeout=min(1.0, remaining)))
+        if not active:
+            return
+        pause_goal = getattr(session, "pause_active_goal", None)
+        if not callable(pause_goal):
+            raise RuntimeError("ACP active goal cannot be paused safely")
+        remaining = deadline - _monotonic() - _FINALIZATION_CLEANUP_HEADROOM_S
+        if remaining <= 0:
+            raise TimeoutError("ACP active goal pause budget exhausted")
+        if not pause_goal(timeout=remaining):
+            raise RuntimeError("ACP active goal pause was not confirmed")
+    except Exception as control_error:
+        try:
+            _poison_and_retire(
+                session,
+                retire_finalization_session,
+                deadline=deadline,
+            )
+        except Exception as retirement_error:
+            raise ExceptionGroup(
+                "ACP goal control and session retirement both failed",
+                [control_error, retirement_error],
+            ) from None
+        raise
+
+
 def _build_finalization_prompt(original_task: str, reserve_s: float | int) -> str:
     task = str(original_task or "").strip()
     if len(task) > _TASK_EXCERPT_CHARS:
@@ -225,6 +265,12 @@ def run_prompt_with_finalization(
                 deadline=deadline,
             )
             raise
+
+    _pause_active_goal_before_finalization(
+        finalization_session,
+        deadline=deadline,
+        retire_finalization_session=retire_finalization_session,
+    )
 
     remaining_budget = deadline - _monotonic()
     final_timeout = min(

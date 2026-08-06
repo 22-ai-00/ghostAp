@@ -17,6 +17,7 @@ from acp.schema import (
     ImageContentBlock,
     PermissionOption,
     ResourceContentBlock,
+    SessionInfoUpdate,
     TextContentBlock,
     ToolCallLocation,
     ToolCallProgress,
@@ -24,13 +25,194 @@ from acp.schema import (
 
 import src.acp.client as acp_client
 from src.acp.client import ACPHistoryStore, GhostAPClient, _parse_plan, _parse_tool_call
-from src.acp.models import ACPEvent
+from src.acp.models import ACPEvent, ACPSessionInfo
 from src.acp.sync_adapter import resolve_agent_spec
 from src.sandbox.executor import SandboxExecutor
 
 _ONE_PIXEL_PNG = base64.b64encode(
     b"\x89PNG\r\n\x1a\n" + b"ghostap-image"
 ).decode("ascii")
+
+
+def _session_info_update(codex: dict) -> SessionInfoUpdate:
+    return SessionInfoUpdate.model_validate(
+        {
+            "sessionUpdate": "session_info_update",
+            "_meta": {"codex": codex},
+        }
+    )
+
+
+def test_codex_goal_session_info_is_control_plane_not_render_event(
+    tmp_path: Path,
+) -> None:
+    events: list[ACPEvent] = []
+    controls: list[tuple[str, ACPSessionInfo]] = []
+    client = GhostAPClient(
+        on_event=events.append,
+        on_session_info=lambda sid, info: controls.append((sid, info)),
+        root_dir=str(tmp_path),
+    )
+    update = _session_info_update(
+        {
+            "goal": {
+                "objective": "finish the repository task",
+                "status": "active",
+                "tokenBudget": 12000,
+                "timeUsedSeconds": 15,
+                "createdAt": "2026-08-06T00:19:21Z",
+                "controlMethod": "_codex/session/goal_control",
+            },
+            "threadStatus": {"type": "active"},
+        }
+    )
+
+    asyncio.run(client.session_update("session-goal", update))
+
+    assert events == []
+    assert controls[0][0] == "session-goal"
+    info = controls[0][1]
+    assert info.goal_known is True
+    assert info.goal is not None
+    assert info.goal.status == "active"
+    assert info.goal.token_budget == 12000
+    assert info.goal.time_used_seconds == 15
+    assert info.goal.control_method == "_codex/session/goal_control"
+    assert info.thread_status_known is True
+    assert info.thread_status == "active"
+
+
+@pytest.mark.parametrize("status", ["paused", "completed"])
+def test_codex_goal_session_info_accepts_terminal_status(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    controls: list[tuple[str, ACPSessionInfo]] = []
+    client = GhostAPClient(
+        on_event=lambda _event: None,
+        on_session_info=lambda sid, info: controls.append((sid, info)),
+        root_dir=str(tmp_path),
+    )
+
+    asyncio.run(
+        client.session_update(
+            "session-goal",
+            _session_info_update(
+                {"goal": {"objective": "finish", "status": status}}
+            ),
+        )
+    )
+
+    assert controls[0][1].goal_known is True
+    assert controls[0][1].goal is not None
+    assert controls[0][1].goal.status == status
+
+
+def test_codex_goal_session_info_null_is_known_clear(tmp_path: Path) -> None:
+    controls: list[tuple[str, ACPSessionInfo]] = []
+    client = GhostAPClient(
+        on_event=lambda _event: None,
+        on_session_info=lambda sid, info: controls.append((sid, info)),
+        root_dir=str(tmp_path),
+    )
+
+    asyncio.run(
+        client.session_update(
+            "session-goal",
+            _session_info_update({"goal": None}),
+        )
+    )
+
+    assert controls[0][1].goal_known is True
+    assert controls[0][1].goal is None
+
+
+def test_codex_goal_session_info_accepts_finite_unix_created_at(
+    tmp_path: Path,
+) -> None:
+    controls: list[tuple[str, ACPSessionInfo]] = []
+    client = GhostAPClient(
+        on_event=lambda _event: None,
+        on_session_info=lambda sid, info: controls.append((sid, info)),
+        root_dir=str(tmp_path),
+    )
+
+    asyncio.run(
+        client.session_update(
+            "session-goal",
+            _session_info_update(
+                {
+                    "goal": {
+                        "objective": "finish",
+                        "status": "active",
+                        "createdAt": 1785975561.25,
+                    }
+                }
+            ),
+        )
+    )
+
+    assert controls[0][1].goal is not None
+    assert controls[0][1].goal.created_at == 1785975561.25
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"title": "renamed session", "sessionUpdate": "session_info_update"},
+        {
+            "sessionUpdate": "session_info_update",
+            "_meta": {"codex": {"goal": {"objective": "missing status"}}},
+        },
+        {
+            "sessionUpdate": "session_info_update",
+            "_meta": {
+                "codex": {
+                    "goal": {
+                        "objective": "finish",
+                        "status": "active",
+                        "tokenBudget": True,
+                    }
+                }
+            },
+        },
+        {
+            "sessionUpdate": "session_info_update",
+            "_meta": {
+                "codex": {
+                    "goal": {
+                        "objective": "finish",
+                        "status": "active",
+                        "timeUsedSeconds": float("inf"),
+                    }
+                }
+            },
+        },
+        {
+            "sessionUpdate": "session_info_update",
+            "_meta": {"vendor": {"goal": None}},
+        },
+    ],
+)
+def test_untrustworthy_goal_session_info_cannot_clear_stored_state(
+    tmp_path: Path,
+    payload: dict,
+) -> None:
+    controls: list[tuple[str, ACPSessionInfo]] = []
+    client = GhostAPClient(
+        on_event=lambda _event: None,
+        on_session_info=lambda sid, info: controls.append((sid, info)),
+        root_dir=str(tmp_path),
+    )
+
+    asyncio.run(
+        client.session_update(
+            "session-goal",
+            SessionInfoUpdate.model_validate(payload),
+        )
+    )
+
+    assert controls == [] or controls[0][1].goal_known is False
 
 
 def test_agent_image_chunk_emits_typed_acp_image_event(tmp_path: Path):
