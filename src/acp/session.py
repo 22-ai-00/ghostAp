@@ -239,6 +239,7 @@ class ACPSession:
         self._lifecycle_event: asyncio.Event | None = None
         self._lifecycle_event_loop: asyncio.AbstractEventLoop | None = None
         self._loading_session_id: str | None = None
+        self._load_snapshot_observed = False
         self._force_dead = False
         self._transport_epoch = 0
         self._load_epoch = 0
@@ -307,15 +308,15 @@ class ACPSession:
                 self._goal_known = True
                 self._goal = info.goal
                 changed = True
-            if info.thread_status_observed or info.thread_status_known:
+            if info.thread_status_known:
                 self._thread_status_observed = True
-                self._thread_status_known = info.thread_status_known
-                self._thread_status = (
-                    info.thread_status if info.thread_status_known else ""
-                )
+                self._thread_status_known = True
+                self._thread_status = info.thread_status
                 changed = True
             if not changed:
                 return
+            if self._loading_session_id is not None:
+                self._load_snapshot_observed = True
             self._lifecycle_revision += 1
         self._wake_lifecycle_waiter()
 
@@ -365,13 +366,7 @@ class ACPSession:
             return True
         if activity_state:
             return True
-        if not self._thread_status_known:
-            return True
-        if self._thread_status == "active":
-            return True
-        if self._thread_status != "idle":
-            return True
-        return False
+        return self._thread_status_known and self._thread_status == "active"
 
     def _goal_requires_prompt_wait(self) -> tuple[bool, int]:
         with self._handler_lock:
@@ -587,6 +582,7 @@ class ACPSession:
                 )
             self._attempted_load_targets.add(target_session_id)
             self._loading_session_id = target_session_id
+            self._load_snapshot_observed = False
             self._load_epoch += 1
         self._bind_session_info_callback()
         self._reset_lifecycle(goal_known=not self._uses_official_codex_acp())
@@ -597,9 +593,16 @@ class ACPSession:
                     session_id=target_session_id,
                 )
             except RequestError as exc:
-                raise ACPResumeRejected(
-                    f"ACP resume explicitly rejected: {target_session_id}"
-                ) from exc
+                with self._handler_lock:
+                    clean_rejection = (
+                        exc.code == -32602
+                        and not self._load_snapshot_observed
+                    )
+                if clean_rejection:
+                    raise ACPResumeRejected(
+                        f"ACP resume explicitly rejected: {target_session_id}"
+                    ) from exc
+                raise
             self._session_id = target_session_id
             self._state.session_id = target_session_id
             if self._uses_official_codex_acp():

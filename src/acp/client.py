@@ -1410,7 +1410,7 @@ class GhostAPClient(Client):
                     self._on_session_info is not None
                     and (
                         info.goal_known
-                        or info.thread_status_observed
+                        or info.thread_status_known
                     )
                 ):
                     self._on_session_info(session_id, info)

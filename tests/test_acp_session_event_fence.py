@@ -170,7 +170,7 @@ def test_unknown_goal_status_keeps_prompt_attached_until_trusted_update(
     asyncio.run(exercise())
 
 
-def test_unknown_thread_status_keeps_prompt_attached_until_trusted_update(
+def test_terminal_goal_without_known_thread_status_is_quiescent(
     tmp_path: Path,
 ) -> None:
     session = ACPSession(
@@ -209,22 +209,59 @@ def test_unknown_thread_status_keeps_prompt_attached_until_trusted_update(
 
         session._conn = Connection()
         session._session_id = "session-goal"
-        prompt = asyncio.create_task(session.prompt("work"))
-        await asyncio.sleep(0.15)
-        assert prompt.done() is False
-        assert session._event_handler is not None
-        session._on_session_info(
-            "session-goal",
-            ACPSessionInfo(
-                thread_status_observed=True,
-                thread_status_known=True,
-                thread_status="idle",
-            ),
-        )
-        result = await asyncio.wait_for(prompt, timeout=1)
+        result = await asyncio.wait_for(session.prompt("work"), timeout=0.2)
         assert result.goal is not None
         assert result.goal.status == "completed"
         assert session._event_handler is None
+
+    asyncio.run(exercise())
+
+
+def test_malformed_thread_status_cannot_clear_known_active_state(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(agent_cmd="npx", agent_args=[], cwd=str(tmp_path))
+    session._session_id = "session-goal"
+    session._on_session_info(
+        "session-goal",
+        ACPSessionInfo(thread_status_known=True, thread_status="active"),
+    )
+    session._on_session_info(
+        "session-goal",
+        ACPSessionInfo(thread_status_observed=True),
+    )
+
+    assert session._thread_status_known is True
+    assert session._thread_status == "active"
+
+    async def exercise() -> None:
+        class Connection:
+            async def prompt(self, **_kwargs):
+                session._on_session_info(
+                    "session-goal",
+                    ACPSessionInfo(
+                        goal_known=True,
+                        goal=ACPGoalInfo("finish", "completed"),
+                        thread_status_known=True,
+                        thread_status="active",
+                    ),
+                )
+                session._on_session_info(
+                    "session-goal",
+                    ACPSessionInfo(thread_status_observed=True),
+                )
+                return SimpleNamespace(stop_reason="end_turn")
+
+        session._conn = Connection()
+        session._session_id = "session-goal"
+        prompt = asyncio.create_task(session.prompt("work"))
+        await asyncio.sleep(0.06)
+        assert prompt.done() is False
+        session._on_session_info(
+            "session-goal",
+            ACPSessionInfo(thread_status_known=True, thread_status="idle"),
+        )
+        await asyncio.wait_for(prompt, timeout=1)
 
     asyncio.run(exercise())
 
@@ -799,6 +836,63 @@ def test_explicit_request_rejection_is_typed_and_does_not_poison_transport(
         assert type(exc_info.value).__name__ == "ACPResumeRejected"
         assert session._force_dead is False
         assert session._session_id == "new-session"
+
+    asyncio.run(exercise())
+
+
+def test_internal_request_error_marks_resume_transport_dead(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._session_id = "new-session"
+    session._reset_lifecycle(goal_known=True)
+
+    async def exercise() -> None:
+        error = RequestError(-32603, "internal error")
+
+        class Connection:
+            async def load_session(self, **_kwargs):
+                raise error
+
+        session._conn = Connection()
+        with pytest.raises(RequestError) as exc_info:
+            await session.load_session("ambiguous-target")
+        assert exc_info.value is error
+        assert session._force_dead is True
+        assert session._session_id == "ambiguous-target"
+
+    asyncio.run(exercise())
+
+
+def test_request_rejection_after_forced_snapshot_marks_resume_transport_dead(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["-y", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(tmp_path),
+    )
+    session._session_id = "new-session"
+    session._reset_lifecycle(goal_known=True)
+
+    async def exercise() -> None:
+        error = RequestError(-32602, "resume rejected")
+
+        class Connection:
+            async def load_session(self, *, session_id: str, **_kwargs):
+                session._on_session_info(session_id, _active_goal_info())
+                raise error
+
+        session._conn = Connection()
+        with pytest.raises(RequestError) as exc_info:
+            await session.load_session("observed-target")
+        assert exc_info.value is error
+        assert session._force_dead is True
+        assert session._session_id == "observed-target"
 
     asyncio.run(exercise())
 

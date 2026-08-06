@@ -226,7 +226,7 @@ def test_goal_status_classification_is_explicitly_tristate(
     assert goal.is_active is (activity_state is True)
 
 
-def test_unknown_thread_status_is_observed_but_not_trusted(
+def test_unknown_thread_status_does_not_emit_control_update(
     tmp_path: Path,
 ) -> None:
     controls: list[tuple[str, ACPSessionInfo]] = []
@@ -243,9 +243,7 @@ def test_unknown_thread_status_is_observed_but_not_trusted(
         )
     )
 
-    assert controls[0][1].thread_status_observed is True
-    assert controls[0][1].thread_status_known is False
-    assert controls[0][1].thread_status == ""
+    assert controls == []
 
 
 @pytest.mark.parametrize(
