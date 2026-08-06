@@ -600,6 +600,15 @@ UI_TEXT = {
     "mode_exec_cancelled_msg": "⏹️ 任务已取消：{reason}",
     "mode_exec_incomplete_title": "执行未完成",
     "mode_exec_incomplete_msg": "⚠️ 任务未完成：{reason}",
+    "mode_exec_finalization_incomplete_msg": (
+        "执行窗口已耗尽；安全收尾后{reason}\n"
+        "可查看脱敏诊断后重新发起任务。"
+    ),
+    "mode_exec_finalization_paused_goal_msg": (
+        "执行窗口已耗尽；安全收尾后{reason}\n"
+        "Codex Goal 已确认暂停，未在收尾阶段继续扩张；"
+        "可查看脱敏诊断后重新发起或从会话历史恢复任务。"
+    ),
     "mode_exec_waiting_title": "等待用户确认",
     "mode_exec_waiting_msg": "⏸️ 自动续做已完成，仍需你的确认后才能继续：{reason}",
     "mode_exec_timeout_title": "执行超时",

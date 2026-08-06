@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Protocol, TypeVar
 
@@ -44,6 +44,7 @@ class PromptContinuationResult:
     assessment: PromptAssessment
     automatic_continuations: int
     awaiting_user_input: bool
+    entered_finalization: bool
 
 
 def _build_continuation_prompt(pending_plan_entries: int) -> str:
@@ -82,7 +83,55 @@ def _merge_tool_calls(
     anonymous: list[ToolCallInfo] = []
     for tool_call in [*previous, *current]:
         if tool_call.id:
-            merged[tool_call.id] = tool_call
+            prior = merged.get(tool_call.id)
+            if prior is None or not prior.subagent_states:
+                merged[tool_call.id] = tool_call
+                continue
+            if not tool_call.subagent_states:
+                merged[tool_call.id] = replace(
+                    tool_call,
+                    subagent_states=prior.subagent_states,
+                )
+                continue
+            children: dict[str, dict] = {}
+            anonymous_children: list[dict] = []
+            for child in prior.subagent_states:
+                if not isinstance(child, Mapping):
+                    anonymous_children.append(child)
+                    continue
+                source_id = str(child.get("source_id") or "").strip()
+                if source_id:
+                    children[source_id] = child
+                else:
+                    anonymous_children.append(child)
+            for child in tool_call.subagent_states:
+                if not isinstance(child, Mapping):
+                    anonymous_children.append(child)
+                    continue
+                source_id = str(child.get("source_id") or "").strip()
+                if not source_id:
+                    anonymous_children.append(child)
+                    continue
+                prior_child = children.get(source_id)
+                prior_status = str(
+                    (prior_child or {}).get("status") or ""
+                ).strip().casefold()
+                current_status = str(
+                    child.get("status") or ""
+                ).strip().casefold()
+                if (
+                    prior_status in {"running", "pending"}
+                    and current_status
+                    not in {"completed", "failed", "cancelled"}
+                ):
+                    continue
+                children[source_id] = child
+            merged[tool_call.id] = replace(
+                tool_call,
+                subagent_states=tuple(
+                    [*children.values(), *anonymous_children]
+                ),
+            )
         else:
             anonymous.append(tool_call)
     return [*merged.values(), *anonymous]
@@ -115,12 +164,14 @@ def _merge_prompt_results(
 
 
 def _eligible_for_ordinary_continuation(
+    result: PromptResult,
     assessment: PromptAssessment,
     *,
     entered_finalization: bool,
 ) -> bool:
     return (
         not entered_finalization
+        and result.goal is None
         and assessment.outcome is PromptOutcome.INCOMPLETE
         and assessment.stop_reason == "end_turn"
         and assessment.pending_plan_entries > 0
@@ -181,12 +232,14 @@ def run_prompt_with_continuation(
 
     first_turn_budget = deadline - _monotonic()
     result, entered_finalization = run_turn(text, first_turn_budget)
+    ever_entered_finalization = entered_finalization
     assessment = classify_prompt_result(result)
     automatic_continuations = 0
 
     while (
         automatic_continuations < MAX_ORDINARY_CONTINUATIONS
         and _eligible_for_ordinary_continuation(
+            result,
             assessment,
             entered_finalization=entered_finalization,
         )
@@ -205,15 +258,30 @@ def run_prompt_with_continuation(
             continuation_prompt,
             remaining_budget,
         )
+        ever_entered_finalization = (
+            ever_entered_finalization or entered_finalization
+        )
         automatic_continuations += 1
         result = _merge_prompt_results(result, next_result)
         assessment = classify_prompt_result(result)
 
+    goal = result.goal
+    goal_status = (
+        str(goal.status or "").strip().casefold()
+        if goal is not None
+        else ""
+    )
     awaiting_user_input = (
-        automatic_continuations == MAX_ORDINARY_CONTINUATIONS
+        goal is not None
+        and not ever_entered_finalization
+        and goal_status in {"paused", "blocked"}
+    ) or (
+        goal is None
+        and automatic_continuations == MAX_ORDINARY_CONTINUATIONS
         and _eligible_for_ordinary_continuation(
+            result,
             assessment,
-            entered_finalization=entered_finalization,
+            entered_finalization=ever_entered_finalization,
         )
     )
     return PromptContinuationResult(
@@ -221,6 +289,7 @@ def run_prompt_with_continuation(
         assessment=assessment,
         automatic_continuations=automatic_continuations,
         awaiting_user_input=awaiting_user_input,
+        entered_finalization=ever_entered_finalization,
     )
 
 

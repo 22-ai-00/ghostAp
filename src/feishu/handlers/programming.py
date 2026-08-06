@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Optional
 
 from ...acp import ACPEventRenderer, run_prompt_with_continuation
 from ...acp.manager import ACPSessionManager
-from ...acp.outcome import PromptOutcome
+from ...acp.outcome import PromptAssessment, PromptOutcome
 from ...acp.providers import normalize_acp_model_name
 from ...agent_session import SyncSession
 from ...card import CardBuilder
@@ -50,6 +50,51 @@ def _configured_finalization_reserve(settings: object) -> int:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return 0
     return max(0, int(raw))
+
+
+def _finalization_incomplete_reason(
+    assessment: PromptAssessment,
+) -> str:
+    if assessment.pending_plan_entries > 0:
+        return f"仍有 {assessment.pending_plan_entries} 个计划项未完成"
+    if assessment.incomplete_tool_calls > 0:
+        return (
+            f"仍有 {assessment.incomplete_tool_calls} 个工具调用未进入终态"
+        )
+    return assessment.detail
+
+
+def _incomplete_notice(execution: object) -> str:
+    assessment = execution.assessment
+    if not execution.entered_finalization:
+        return UI_TEXT["mode_exec_incomplete_msg"].format(
+            reason=assessment.detail,
+        )
+    goal = getattr(execution.result, "goal", None)
+    key = (
+        "mode_exec_finalization_paused_goal_msg"
+        if goal is not None and goal.status == "paused"
+        else "mode_exec_finalization_incomplete_msg"
+    )
+    return UI_TEXT[key].format(
+        reason=_finalization_incomplete_reason(assessment),
+    )
+
+
+def _log_prompt_execution(mode_name: str, execution: object) -> None:
+    assessment = execution.assessment
+    goal = getattr(execution.result, "goal", None)
+    logger.info(
+        "%s ACP执行判定: entered_finalization=%s goal_status=%s "
+        "automatic_continuations=%s pending_plan_entries=%s "
+        "incomplete_tool_calls=%s",
+        mode_name,
+        execution.entered_finalization,
+        getattr(goal, "status", None),
+        execution.automatic_continuations,
+        assessment.pending_plan_entries,
+        assessment.incomplete_tool_calls,
+    )
 
 
 def build_programming_session_callbacks(
@@ -1321,6 +1366,7 @@ class ProgrammingModeHandler(BaseHandler):
             )
             result = execution.result
             assessment = execution.assessment
+            _log_prompt_execution(self.mode_name, execution)
             prompt_outcome = assessment.outcome
             prompt_stop_reason = assessment.stop_reason
             streamed_response = prog_session.get_final_text()
@@ -1349,14 +1395,14 @@ class ProgrammingModeHandler(BaseHandler):
                 final_response = _append_execution_notice(response_text, notice)
                 prog_session.wait_for_user_confirmation(notice)
             else:
-                notice = UI_TEXT["mode_exec_incomplete_msg"].format(
-                    reason=assessment.detail,
-                )
+                notice = _incomplete_notice(execution)
                 final_response = _append_execution_notice(response_text, notice)
                 prog_session.fail(
                     notice,
                     unfinished_subagent_status=(
-                        "cancelled" if entered_finalization[0] else "failed"
+                        "cancelled"
+                        if execution.entered_finalization
+                        else "failed"
                     ),
                 )
         except TimeoutError as e:
@@ -1599,6 +1645,7 @@ class ProgrammingModeHandler(BaseHandler):
             )
             result = execution.result
             assessment = execution.assessment
+            _log_prompt_execution(self.mode_name, execution)
             final_response = (
                 (getattr(result, "text", None) or "").strip()
                 or renderer.get_final_content()
@@ -1629,9 +1676,7 @@ class ProgrammingModeHandler(BaseHandler):
             else:
                 final_response = _append_execution_notice(
                     final_response,
-                    UI_TEXT["mode_exec_incomplete_msg"].format(
-                        reason=assessment.detail,
-                    ),
+                    _incomplete_notice(execution),
                 )
                 response_title = (
                     f"{self.mode_name} · {UI_TEXT['mode_exec_incomplete_title']}"

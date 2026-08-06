@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -28,10 +29,21 @@ class PromptAssessment:
 
 _CANCELLED_REASONS = frozenset({"cancelled", "canceled"})
 _TERMINAL_TOOL_STATUSES = frozenset({"completed", "failed"})
+_TERMINAL_CHILD_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
 def _status(value: Any) -> str:
     return str(getattr(value, "status", "") or "").strip().casefold()
+
+
+def _has_unresolved_child(tool_call: object) -> bool:
+    for child in getattr(tool_call, "subagent_states", None) or ():
+        if not isinstance(child, Mapping):
+            return True
+        status = str(child.get("status") or "").strip().casefold()
+        if status not in _TERMINAL_CHILD_STATUSES:
+            return True
+    return False
 
 
 def classify_prompt_result(result: object) -> PromptAssessment:
@@ -54,7 +66,10 @@ def classify_prompt_result(result: object) -> PromptAssessment:
     incomplete_tools = [
         tool
         for tool in (getattr(result, "tool_calls", None) or ())
-        if _status(tool) not in _TERMINAL_TOOL_STATUSES
+        if (
+            _status(tool) not in _TERMINAL_TOOL_STATUSES
+            or _has_unresolved_child(tool)
+        )
     ]
     counts = {
         "pending_plan_entries": len(pending_plan),
@@ -74,6 +89,24 @@ def classify_prompt_result(result: object) -> PromptAssessment:
             outcome=PromptOutcome.INCOMPLETE,
             stop_reason=reason,
             detail=f"ACP 停止原因：{reason}",
+            **counts,
+        )
+
+    goal = getattr(result, "goal", None)
+    goal_status = _status(goal)
+    if goal is not None and goal_status != "completed":
+        detail = {
+            "active": "Codex Goal 仍在执行",
+            "paused": "Codex Goal 已暂停",
+            "blocked": "Codex Goal 已阻塞",
+        }.get(
+            goal_status,
+            f"Codex Goal 状态未知：{goal_status or 'missing'}",
+        )
+        return PromptAssessment(
+            PromptOutcome.INCOMPLETE,
+            stop_reason,
+            detail,
             **counts,
         )
 

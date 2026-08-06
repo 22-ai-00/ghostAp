@@ -11,6 +11,7 @@ import pytest
 import src.acp as acp
 from src.acp.models import (
     ACPEvent,
+    ACPGoalInfo,
     PlanEntryInfo,
     PlanInfo,
     PromptResult,
@@ -347,6 +348,155 @@ def test_timeout_finalization_result_is_not_ordinary_continuation() -> None:
     assert transitions == ["finalizing"]
     assert execution.automatic_continuations == 0
     assert execution.awaiting_user_input is False
+
+
+@pytest.mark.parametrize(
+    ("status", "awaiting_user_input"),
+    [
+        ("active", False),
+        ("paused", True),
+        ("blocked", True),
+        ("completed", False),
+        ("future-provider-state", False),
+    ],
+)
+def test_provider_goal_disables_ordinary_continuation(
+    status: str,
+    awaiting_user_input: bool,
+) -> None:
+    runner = _runner()
+    result = _pending_result()
+    result.goal = ACPGoalInfo(objective="finish", status=status)
+    session = _FakeSession(result)
+
+    with patch(
+        "src.acp.continuation._build_continuation_prompt"
+    ) as build_continuation:
+        execution = runner(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+        )
+
+    assert len(session.calls) == 1
+    build_continuation.assert_not_called()
+    assert execution.automatic_continuations == 0
+    assert execution.awaiting_user_input is awaiting_user_input
+    assert execution.entered_finalization is False
+
+
+@pytest.mark.parametrize("status", ["paused", "blocked"])
+def test_provider_goal_after_finalization_does_not_await_retired_session(
+    status: str,
+) -> None:
+    runner = _runner()
+    final_result = _pending_result()
+    final_result.goal = ACPGoalInfo(objective="finish", status=status)
+    session = _FakeSession(
+        PromptResult(stop_reason="timeout", text="partial"),
+        final_result,
+    )
+
+    with patch(
+        "src.acp.continuation._build_continuation_prompt"
+    ) as build_continuation:
+        execution = runner(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+        )
+
+    assert len(session.calls) == 2
+    build_continuation.assert_not_called()
+    assert execution.awaiting_user_input is False
+    assert execution.entered_finalization is True
+
+
+def test_running_child_snapshot_survives_outer_update_without_children() -> None:
+    from src.acp.continuation import _merge_tool_calls
+
+    previous = ToolCallInfo(
+        id="wait-1",
+        title="wait_agent",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+    current = ToolCallInfo(
+        id="wait-1",
+        title="wait_agent",
+        kind="other",
+        status="completed",
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+
+    assert merged[0].subagent_states == previous.subagent_states
+
+
+def test_running_child_snapshot_is_replaced_by_authoritative_terminal_update() -> None:
+    from src.acp.continuation import _merge_tool_calls
+
+    previous = ToolCallInfo(
+        id="wait-1",
+        title="wait_agent",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+            {"source_id": "child-b", "status": "pending"},
+        ),
+    )
+    current = ToolCallInfo(
+        id="wait-1",
+        title="wait_agent",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+
+    assert merged[0].subagent_states == (
+        {"source_id": "child-a", "status": "completed"},
+        {"source_id": "child-b", "status": "pending"},
+    )
+
+
+def test_running_child_snapshot_ignores_nonauthoritative_unknown_update() -> None:
+    from src.acp.continuation import _merge_tool_calls
+
+    previous_child = {
+        "source_id": "child-a",
+        "status": "running",
+        "message": "still working",
+    }
+    previous = ToolCallInfo(
+        id="wait-1",
+        title="wait_agent",
+        kind="other",
+        status="completed",
+        subagent_states=(previous_child,),
+    )
+    current = ToolCallInfo(
+        id="wait-1",
+        title="wait_agent",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "future-state"},
+        ),
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+
+    assert merged[0].subagent_states == (previous_child,)
 
 
 def test_timeout_exception_does_not_start_ordinary_continuation() -> None:

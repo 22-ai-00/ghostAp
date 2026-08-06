@@ -9,6 +9,7 @@ import pytest
 from src.acp.models import (
     ACPEvent,
     ACPEventType,
+    ACPGoalInfo,
     ACPImageInfo,
     PlanEntryInfo,
     PlanInfo,
@@ -784,6 +785,158 @@ def test_end_turn_with_active_tool_is_incomplete() -> None:
     assert assessment.pending_plan_entries == 0
     assert assessment.incomplete_tool_calls == 1
     assert "工具" in assessment.detail
+
+
+def test_active_provider_goal_is_incomplete_even_with_end_turn() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        goal=ACPGoalInfo(objective="finish", status="active"),
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert "Goal" in assessment.detail
+
+
+@pytest.mark.parametrize(
+    ("status", "expected", "detail_fragment"),
+    [
+        ("active", PromptOutcome.INCOMPLETE, "仍在执行"),
+        ("paused", PromptOutcome.INCOMPLETE, "已暂停"),
+        ("blocked", PromptOutcome.INCOMPLETE, "已阻塞"),
+        ("completed", PromptOutcome.COMPLETED, "正常结束"),
+        ("future-provider-state", PromptOutcome.INCOMPLETE, "状态未知"),
+    ],
+)
+def test_provider_goal_status_is_fail_closed(
+    status: str,
+    expected: PromptOutcome,
+    detail_fragment: str,
+) -> None:
+    assessment = classify_prompt_result(
+        PromptResult(
+            stop_reason="end_turn",
+            goal=ACPGoalInfo(objective="finish", status=status),
+        )
+    )
+
+    assert assessment.outcome is expected
+    assert detail_fragment in assessment.detail
+
+
+def test_no_provider_goal_uses_ordinary_completion_checks() -> None:
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", goal=None)
+    )
+
+    assert assessment.outcome is PromptOutcome.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "expected"),
+    [
+        ("cancelled", PromptOutcome.CANCELLED),
+        ("max_tokens", PromptOutcome.INCOMPLETE),
+    ],
+)
+def test_provider_goal_preserves_stop_reason_priority(
+    stop_reason: str,
+    expected: PromptOutcome,
+) -> None:
+    assessment = classify_prompt_result(
+        PromptResult(
+            stop_reason=stop_reason,
+            goal=ACPGoalInfo(objective="finish", status="active"),
+        )
+    )
+
+    assert assessment.outcome is expected
+    assert "ACP 停止原因" in assessment.detail
+
+
+def test_completed_outer_wait_with_running_child_is_incomplete() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="wait-1",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {
+                        "source_id": "child-a",
+                        "status": "running",
+                        "message": "still working",
+                    },
+                ),
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.incomplete_tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("child", "expected"),
+    [
+        ({"source_id": "child", "status": "completed"}, PromptOutcome.COMPLETED),
+        ({"source_id": "child", "status": "failed"}, PromptOutcome.COMPLETED),
+        ({"source_id": "child", "status": "cancelled"}, PromptOutcome.COMPLETED),
+        ({"source_id": "child", "status": "running"}, PromptOutcome.INCOMPLETE),
+        ({"source_id": "child", "status": "pending"}, PromptOutcome.INCOMPLETE),
+        ({"source_id": "child", "status": "future"}, PromptOutcome.INCOMPLETE),
+        ({"source_id": "child"}, PromptOutcome.INCOMPLETE),
+        ("not-a-mapping", PromptOutcome.INCOMPLETE),
+    ],
+)
+def test_running_child_statuses_fail_closed(
+    child: object,
+    expected: PromptOutcome,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="wait-child-status",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                subagent_states=(child,),  # type: ignore[arg-type]
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is expected
+
+
+def test_multiple_running_children_count_as_one_outer_tool() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="wait-many",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "running"},
+                    {"source_id": "child-b", "status": "pending"},
+                ),
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.incomplete_tool_calls == 1
 
 
 def test_assessment_counts_plan_and_tool_incompleteness_before_diagnostic() -> None:

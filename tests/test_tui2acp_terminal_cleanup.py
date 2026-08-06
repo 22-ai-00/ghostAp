@@ -4,14 +4,19 @@ import json
 from contextlib import ExitStack, contextmanager, nullcontext
 from unittest.mock import MagicMock, PropertyMock, patch
 
+import pytest
+
+from src.acp.continuation import PromptContinuationResult
 from src.acp.models import (
     ACPEvent,
     ACPEventType,
+    ACPGoalInfo,
     ACPImageInfo,
     PlanEntryInfo,
     PlanInfo,
     PromptResult,
 )
+from src.acp.outcome import PromptAssessment, PromptOutcome
 from src.feishu.handlers.programming import ClaudeModeHandler, Tui2acpModeHandler
 
 
@@ -110,6 +115,39 @@ def _completed_result(text: str = "done") -> PromptResult:
                 PlanEntryInfo(content="verification", status="completed"),
             ]
         ),
+    )
+
+
+def _incomplete_execution(
+    *,
+    entered_finalization: bool,
+    goal_status: str | None = None,
+) -> PromptContinuationResult:
+    goal = (
+        ACPGoalInfo(objective="finish", status=goal_status)
+        if goal_status is not None
+        else None
+    )
+    result = PromptResult(
+        stop_reason="end_turn",
+        text="partial result",
+        goal=goal,
+    )
+    assessment = PromptAssessment(
+        outcome=PromptOutcome.INCOMPLETE,
+        stop_reason="end_turn",
+        detail="仍有 3 个计划项未完成",
+        pending_plan_entries=3,
+    )
+    return PromptContinuationResult(
+        result=result,
+        assessment=assessment,
+        automatic_continuations=0,
+        awaiting_user_input=(
+            not entered_finalization
+            and goal_status in {"paused", "blocked"}
+        ),
+        entered_finalization=entered_finalization,
     )
 
 
@@ -313,6 +351,148 @@ def test_non_streaming_second_pending_plan_renders_waiting_without_success():
     assert "自动续做已完成，仍需你的确认后才能继续" in markdown
     assert "仍有 1 个计划项未完成" in markdown
     handler.add_reaction.assert_not_called()
+
+
+@pytest.mark.parametrize("entered_finalization", [True, False])
+def test_streaming_finalization_provenance_controls_incomplete_copy(
+    entered_finalization: bool,
+) -> None:
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = MagicMock()
+    session.session_id = "streaming-provenance"
+    session.message_count = 1
+
+    with (
+        _streaming_environment(),
+        patch(
+            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            return_value=_incomplete_execution(
+                entered_finalization=entered_finalization
+            ),
+        ),
+    ):
+        handler.handle_response(
+            "msg-finalization",
+            "chat-1",
+            "finish the task",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    failed_text = _FakeProgrammingCardSession.last.failed_text
+    assert "仍有 3 个计划项未完成" in failed_text
+    assert ("执行窗口已耗尽" in failed_text) is entered_finalization
+
+
+@pytest.mark.parametrize("entered_finalization", [True, False])
+def test_non_streaming_finalization_provenance_controls_incomplete_copy(
+    entered_finalization: bool,
+) -> None:
+    handler = _make_handler()
+    handler.reply_card = MagicMock()
+    handler.upload_acp_image = MagicMock()
+    session = MagicMock()
+
+    with patch(
+        "src.feishu.handlers.programming.run_prompt_with_continuation",
+        return_value=_incomplete_execution(
+            entered_finalization=entered_finalization
+        ),
+    ):
+        handler._handle_response_non_streaming(
+            "msg-finalization",
+            "chat-1",
+            "finish the task",
+            session,
+            None,
+            "/tmp",
+        )
+
+    response = handler.reply_text.call_args.args[1]
+    assert "仍有 3 个计划项未完成" in response
+    assert ("执行窗口已耗尽" in response) is entered_finalization
+
+
+@pytest.mark.parametrize("goal_status", ["paused", "blocked"])
+def test_provider_goal_waits_only_outside_finalization(
+    goal_status: str,
+) -> None:
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = MagicMock()
+    session.session_id = f"provider-goal-{goal_status}"
+    session.message_count = 1
+
+    with (
+        _streaming_environment(),
+        patch(
+            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            return_value=_incomplete_execution(
+                entered_finalization=False,
+                goal_status=goal_status,
+            ),
+        ),
+    ):
+        handler.handle_response(
+            "msg-provider-goal",
+            "chat-1",
+            "finish the task",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    adapter = _FakeProgrammingCardSession.last
+    assert adapter.waiting_reason is not None
+    assert adapter.finished is False
+    assert adapter.failed_text is None
+    assert adapter.continuation_boundaries == 0
+
+
+@pytest.mark.parametrize("goal_status", ["paused", "blocked"])
+def test_provider_goal_after_finalization_fails_with_timeout_truth(
+    goal_status: str,
+) -> None:
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = MagicMock()
+    session.session_id = f"retired-provider-goal-{goal_status}"
+    session.message_count = 1
+
+    with (
+        _streaming_environment(),
+        patch(
+            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            return_value=_incomplete_execution(
+                entered_finalization=True,
+                goal_status=goal_status,
+            ),
+        ),
+    ):
+        handler.handle_response(
+            "msg-provider-goal-finalization",
+            "chat-1",
+            "finish the task",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    adapter = _FakeProgrammingCardSession.last
+    assert adapter.waiting_reason is None
+    assert adapter.finished is False
+    assert adapter.continuation_boundaries == 0
+    assert "执行窗口已耗尽" in adapter.failed_text
+    assert "仍有 3 个计划项未完成" in adapter.failed_text
+    if goal_status == "paused":
+        assert "Codex Goal 已确认暂停" in adapter.failed_text
+    else:
+        assert "Codex Goal 已确认暂停" not in adapter.failed_text
 
 
 def test_tui2acp_terminal_state_prompt_error_ends_manager_session():

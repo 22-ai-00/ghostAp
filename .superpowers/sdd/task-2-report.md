@@ -1,4 +1,4 @@
-# Phase 3 Task 2 Implementation Report
+# Task 2 Implementation Report
 
 ## Status
 
@@ -6,149 +6,145 @@ DONE
 
 ## Scope
 
-- Implemented Journal-backed employee Ingress projection and service.
-- Added a dedicated encrypted Ingress BlobStore owner using the employee data
-  keyring provider without sharing the Data BlobStore.
-- Did not implement Channel bridge, Router, or ACP integration.
-- Did not create FI-29 or claim production readiness.
+- Added fail-closed completion classification for provider Goal lifecycle states
+  and nested child-agent snapshots.
+- Preserved finalization provenance across all prompt turns without changing the
+  absolute deadline or one-continuation limit.
+- Preserved unresolved child snapshots across repeated outer tool updates until
+  an authoritative terminal update arrives for the same `source_id`.
+- Added finalization-specific programming failure copy for streaming and
+  non-streaming paths, with the paused-Goal claim gated on an exact trusted
+  `goal.status == "paused"` snapshot.
+- Added the required desktop and 360px red error-card preview before changing
+  production copy.
 
 ## RED Evidence
 
-Initial required files and true RED:
+Outcome and continuation RED:
 
 ```bash
-uv --cache-dir /tmp/ghostap-uv-cache run python -m pytest \
-  tests/autonomous/unit/test_employee_durable_inbox.py \
-  tests/autonomous/chaos/test_employee_ingress_recovery.py -q
+UV_CACHE_DIR=/tmp/ghostap-uv-cache uv run python -m pytest \
+  tests/test_programming_completion_guards.py \
+  tests/test_acp_prompt_continuation.py -q \
+  -k "provider_goal or running_child"
 ```
 
 ```text
-2 failed in 0.77s
-projection/service module specs were absent
+21 failed, 7 passed, 58 deselected
+
+- active/paused/blocked/unknown Goals were classified as completed or entered
+  the ordinary synthesized continuation path;
+- completed outer waits erased or ignored unresolved child snapshots;
+- PromptContinuationResult did not expose entered_finalization.
 ```
 
-Behavior RED after the empty module existence cycle:
+Handler provenance RED:
 
-```text
-2 collection errors: IngressProjectionState was absent
+```bash
+UV_CACHE_DIR=/tmp/ghostap-uv-cache uv run python -m pytest \
+  tests/test_tui2acp_terminal_cleanup.py \
+  tests/contracts/test_direct_programming_lane.py -q \
+  -k "finalization or provider_goal"
 ```
 
-Review regression RED:
+```text
+4 failed, 4 passed, 42 deselected
+
+- both streaming and non-streaming finalization results rendered the ordinary
+  incomplete text and omitted the execution-window exhaustion cause;
+- paused/blocked post-finalization results did not carry truthful timeout copy.
+```
+
+Self-review child-merge RED:
 
 ```text
-test_blob_readback_mismatch_quarantines_publish_before_journal failed:
-published Blob remained live after authenticated readback mismatch
+1 failed, 32 deselected
+
+- an unknown partial update for the same source_id replaced the previously
+  observed running child snapshot before an authoritative terminal update.
 ```
 
 ## GREEN Evidence
 
-Ingress implementation and existing contract:
+First Goal/child/continuation selector after implementation:
 
 ```text
-84 passed in 2.33s
+28 passed, 58 deselected
 ```
 
-Ingress plus adjacent Journal/Data regression:
+Handler provenance selector after copy alignment:
 
 ```text
-185 passed in 4.43s
+8 passed, 42 deselected
 ```
 
-EI-IPC-01 exact selector:
+Final required focused suite:
 
 ```bash
-uv --cache-dir /tmp/ghostap-uv-cache run python -m pytest -s \
-  tests/autonomous/chaos/test_employee_ingress_recovery.py::\
-test_ipc_ack_only_after_anchored_acceptance -q
+UV_CACHE_DIR=/tmp/ghostap-uv-cache uv run python -m pytest \
+  tests/test_programming_completion_guards.py \
+  tests/test_acp_prompt_continuation.py \
+  tests/test_tui2acp_terminal_cleanup.py \
+  tests/contracts/test_direct_programming_lane.py -q
 ```
 
 ```text
-EI-IPC-01 elapsed_seconds=0.014952 bound_seconds=1.5 anchored_sequence=1
-1 passed in 1.02s
+137 passed, 2 warnings in 9.41s
 ```
 
-Quality gates:
+Changed-file quality gate:
+
+```bash
+UV_CACHE_DIR=/tmp/ghostap-uv-cache uv run ruff check \
+  src/acp/outcome.py src/acp/continuation.py \
+  src/feishu/handlers/programming.py src/card/ui_text.py \
+  tests/test_programming_completion_guards.py \
+  tests/test_acp_prompt_continuation.py \
+  tests/test_tui2acp_terminal_cleanup.py \
+  tests/contracts/test_direct_programming_lane.py
+```
 
 ```text
-ruff: All checks passed!
+All checks passed!
 git diff --check: passed
 ```
 
-## Coverage
+## Contract Coverage
 
-- True concurrent duplicate admission: 32 callers, one acceptance/Blob/frame.
-- Stable restart replay across a new channel generation and connection.
-- Trusted fallback action correlation; missing or mismatched correlation rejects.
-- Semantic and sender/chat/action provenance conflicts reject without new frame.
-- AES-GCM labels/AAD bind schema, tenant, employee, envelope, dedup identity,
-  and semantic digest; Journal contains no normalized payload or key material.
-- Missing/corrupt nonterminal Blob closes employee admission on restart.
-- Blob publish/readback failure creates no acceptance; readback orphan is quarantined.
-- Journal fsync and anchor failures create no applied acceptance and quarantine Blob.
-- Live-set orphan quarantine preserves accepted records and isolates unreferenced Blob.
-- Terminal disposition durably tombstones before GC while acceptance metadata remains.
-- Ingress service is the sole idempotent close owner of its dedicated BlobStore.
-- EI-IPC-01 uses a spawned process, Pipe, FileAnchor, real Journal fsync, and an
-  exact 1.5-second ACK bound.
+- Cancellation and non-`end_turn` stop reasons retain priority over Goal state.
+- `active`, `paused`, `blocked`, missing status, and unknown Goal statuses fail
+  closed; only completed/no Goal reaches ordinary end-turn checks.
+- Every observed Goal, including completed, disables GhostAP's synthesized
+  continuation prompt.
+- Paused/blocked Goals await user input only before finalization; finalization
+  results never advertise continuation on a retired session.
+- Nested child statuses `completed`, `failed`, and `cancelled` are terminal;
+  missing, malformed, unknown, running, and pending snapshots stay unresolved.
+- Multiple unresolved children count as one unresolved outer tool call.
+- `entered_finalization` is accumulated with logical OR across turns.
+- Finalization copy reports pending plan/tool truth and logs finalization, Goal,
+  continuation, plan, and unresolved-tool fields for incident diagnosis.
+- The paused copy appears only with an exact trusted paused Goal snapshot.
 
 ## Self-Review
 
-- Round 1 found the Blob readback mismatch orphan gap; regression was written
-  first, observed failing, then fixed by the common quarantine boundary.
-- Round 2 re-read only the current goal and implementation and found no material
-  correctness, architecture, engineering, or QA issue.
+- Re-read the Task 2 brief against the final diff and confirmed no new card
+  state, renderer dependency, button, color, deadline, or continuation count.
+- Found one merge subtlety during review: a non-terminal unknown child update
+  could replace a previously known running snapshot. Added a failing regression
+  first, then retained running/pending truth until terminal proof arrives.
+- Confirmed the preview contains both exact copy contracts at desktop and 360px.
+- Confirmed `.Memory/2026-08-05.md` and `docs/superpowers/` remain untouched by
+  this task and are excluded from staging.
 
 ## Commit
 
-- Baseline: `0b022e6fd92784040351208b4029c4c125183072`
-- Subject: `feat(autonomous): persist employee ingress before ack`
-- Exact resulting SHA is reported by Git after this report-containing commit.
+- Baseline: `84f84c8d`
+- Subject: `fix(programming): report goal timeout truthfully`
+- Exact resulting SHA is reported after the report-containing commit.
 
 ## Concerns
 
-- EI-IPC-01 is local implementation evidence only. Its collectability and bound
-  result do not satisfy FI-29, real-tenant acceptance, or production readiness.
-- Per parent instruction, Task 2 ran focused and adjacent Journal/Data suites,
-  not the full repository suite; the main thread owns full-suite aggregation.
-- Pytest conftest reported 18 already-running Node processes after selectors;
-  no Task 2 test spawned Node, and the warning did not affect test results.
-
-## Review Block Resolution
-
-The Task 2 review identified two Important crash-consistency defects after the
-initial commit `1703b1e`.
-
-RED evidence:
-
-```bash
-uv --cache-dir /tmp/ghostap-uv-cache run python -m pytest \
-  tests/autonomous/chaos/test_employee_ingress_recovery.py \
-  -k 'restart_quarantines_blob_left or restart_retries_gc or invalid_disposition' -q
-```
-
-```text
-4 failed, 10 deselected
-- pre-commit process exit left an unreferenced Blob live across restart
-- post-tombstone process exit left the physical Blob live across restart
-- invalid disposition state and reason were anchored before reducer validation
-```
-
-Fixes:
-
-- The sole Ingress owner now reconciles its complete BlobStore live-set during
-  every projection rebuild/startup and strictly quarantines every unreferenced
-  Blob. Tombstoned records are not live Blob references.
-- Terminal GC now retries physical quarantine for already-tombstoned records
-  when the Blob is still present; it does not emit a second tombstone frame.
-- `record_disposition()` constructs a complete validated `IngressDisposition`
-  draft before creating or committing the Journal event. Invalid state/reason
-  leaves Journal bytes, anchor, writer health, and replay unchanged.
-
-GREEN evidence:
-
-```text
-review regressions: 4 passed, 10 deselected in 0.85s
-Task 2 plus adjacent Journal/Data: 189 passed in 4.39s
-ruff: All checks passed!
-git diff --check: passed
-```
+- The focused tests emit two existing dependency deprecation warnings from
+  `lark_channel`; they do not affect the selected Task 2 results.
+- No Task 2 correctness or security concern remains open.
