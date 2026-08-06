@@ -304,10 +304,7 @@ class SpecEngine(BaseEngine):
 
     @staticmethod
     def _infer_engine_name(agent_type: Optional[str]) -> str:
-        from ..agent_session.backend_resolver import is_ttadk_type
         normalized = str(agent_type or "").strip().lower()
-        if is_ttadk_type(normalized):
-            return "TTADK"
         if normalized == "claude":
             return "Claude"
         if normalized == "traex":
@@ -1729,7 +1726,6 @@ class SpecEngine(BaseEngine):
         try:
             self._close_session_safely()
 
-            # Resolve TTADK startup model (resume)
             self._session = self._create_session_fn(
                 agent_type=self._agent_type,
                 cwd=self.root_path,

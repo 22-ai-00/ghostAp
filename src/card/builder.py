@@ -181,10 +181,6 @@ class CardBuilder:
         return ProjectBuilder.build_claude_resume_card(project)
 
     @staticmethod
-    def build_ttadk_resume_card(project: ProjectContext) -> tuple[str, str]:
-        return ProjectBuilder.build_ttadk_resume_card(project)
-
-    @staticmethod
     def build_current_project_card(project: ProjectContext, global_working_dir: str) -> tuple[str, str]:
         return ProjectBuilder.build_current_project_card(project, global_working_dir)
 
@@ -238,21 +234,8 @@ class CardBuilder:
         return SystemBuilder.build_directory_change_card(project, path, success)
 
     @staticmethod
-    def build_ttadk_refresh_result_card(tool: str, result: any) -> tuple[str, str]:
-        return SystemBuilder.build_ttadk_refresh_result_card(tool, result)
-
-    @staticmethod
     def build_switching_status_card(tool: str, model: str) -> tuple[str, str]:
         return SystemBuilder.build_switching_status_card(tool, model)
-
-    @staticmethod
-    def build_ttadk_info_content(
-        current_tool: Optional[str],
-        current_model: Optional[str],
-        tool_desc: dict[str, str],
-        model_desc: dict[str, str],
-    ) -> str:
-        return SystemBuilder.build_ttadk_info_content(current_tool, current_model, tool_desc, model_desc)
 
     @staticmethod
     def build_coco_status_content(
@@ -341,59 +324,6 @@ class CardBuilder:
         project: Optional[ProjectContext] = None,
     ) -> tuple[str, str]:
         return SystemBuilder.build_shell_result_card(cmd, result, working_dir, project)
-
-    @staticmethod
-    def build_ttadk_tool_select_card(
-        tools: list, project_id: Optional[str] = None, yolo_enabled: bool = False, current_tool: Optional[str] = None
-    ) -> tuple[str, str]:
-        return SystemBuilder.build_ttadk_tool_select_card(tools, project_id, yolo_enabled=yolo_enabled, current_tool=current_tool)
-
-    @staticmethod
-    def build_ttadk_model_select_card(
-        models: list, tool_name: str, project_id: Optional[str] = None, yolo_enabled: bool = False, current_model: Optional[str] = None
-    ) -> tuple[str, str]:
-        return SystemBuilder.build_ttadk_model_select_card(models, tool_name, project_id, yolo_enabled=yolo_enabled, current_model=current_model)
-
-    @staticmethod
-    def build_ttadk_combined_select_card(
-        tools: list,
-        models_by_tool: dict,
-        project_id: Optional[str] = None,
-        yolo_enabled: bool = False,
-        current_tool: Optional[str] = None,
-        current_model: Optional[str] = None,
-    ) -> tuple[str, str]:
-        return SystemBuilder.build_ttadk_combined_select_card(tools, models_by_tool, project_id, yolo_enabled=yolo_enabled, current_tool=current_tool, current_model=current_model)
-
-    @staticmethod
-    def build_ttadk_soft_failure_card(
-        message: str,
-        project_id: Optional[str] = None,
-        *,
-        action: str = "show_ttadk_menu",
-        button_text: str = "🔄 重新进入TTADK",
-    ) -> tuple[str, str]:
-        return SystemBuilder.build_ttadk_soft_failure_card(
-            message,
-            project_id,
-            action=action,
-            button_text=button_text,
-        )
-
-    @staticmethod
-    def build_ttadk_soft_failure_card_for(
-        reason: str,
-        project_id: Optional[str] = None,
-        *,
-        action: str = "show_ttadk_menu",
-        button_text: str = "继续进入TTADK",
-    ) -> tuple[str, str]:
-        return SystemBuilder.build_ttadk_soft_failure_card_for(
-            reason,
-            project_id,
-            action=action,
-            button_text=button_text,
-        )
 
     @staticmethod
     def build_acp_tool_select_card(tools: list, project_id: Optional[str] = None, current_tool: Optional[str] = None) -> tuple[str, str]:

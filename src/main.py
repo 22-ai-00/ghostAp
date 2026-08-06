@@ -237,17 +237,6 @@ class Application:
         else:
             logger.info("默认模式: 纯 Shell")
 
-        # TTADK 常用工具模型预热（后台 best-effort）
-        try:
-            if getattr(self.settings, "ttadk_preheat_enabled", True) and getattr(
-                self.settings, "ttadk_preheat_on_startup", True
-            ):
-                from ttadk import get_ttadk_manager
-
-                get_ttadk_manager().kickoff_preheat_common_models(cwd=os.getcwd())
-        except Exception:
-            logger.debug("Application.run: TTADK preheat failed", exc_info=True)
-
         # ACP model list preheat (background best-effort).
         try:
             if getattr(self.settings, "acp_model_preheat_on_startup", True):

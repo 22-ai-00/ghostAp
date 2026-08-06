@@ -1,6 +1,6 @@
 """ACP Session Factory — abstracts the creation of different session types.
 
-Decouples the manager from concrete session implementations (ACP, CLI, TTADK).
+Decouples the manager from concrete session implementations (ACP and CLI).
 """
 
 from __future__ import annotations
@@ -44,44 +44,20 @@ class DefaultACPSessionFactory:
         """Create a session by agent_type.
 
         - claude: SyncClaudeCLISession (CLI)
-        - ttadk_*: SyncTTADKCLISession (CLI bridge)
         - others: SyncACPSession (ACP)
         """
         from ..agent_session import (
             SyncClaudeCLISession,
-            SyncTTADKCLISession,
         )
         from ..coco_model import get_coco_model_manager
-        from ..utils.path import normalize_ttadk_cwd
+        from ..utils.path import normalize_session_cwd
         from .sync_adapter import SyncACPSession
 
         agent_type = (agent_type or "").lower()
-        raw_cwd = cwd
-        norm_cwd = normalize_ttadk_cwd(raw_cwd)
-        cwd = norm_cwd or raw_cwd
+        cwd = normalize_session_cwd(cwd) or cwd
 
         if agent_type == "claude":
             return SyncClaudeCLISession(cwd=cwd, model_name=model_name)
-
-        if agent_type.startswith("ttadk_"):
-            try:
-                from ..ttadk.startup_common import precheck_ttadk_startup_model
-
-                info = precheck_ttadk_startup_model(
-                    agent_type=agent_type, cwd=cwd, model_intent=model_name
-                )
-                model_name = info.get("model")
-                logger.info(
-                    "[SessionFactory] ttadk precheck: tool=%s model=%s validated=%s",
-                    info.get("tool") or "",
-                    (model_name or "(auto)"),
-                    bool(info.get("validated")),
-                )
-            except Exception as e:
-                from ..utils.errors import get_error_detail
-                logger.debug("TTADK precheck failed: %s", get_error_detail(e))
-                model_name = None
-            return SyncTTADKCLISession(agent_type=agent_type, cwd=cwd, model_name=model_name)
 
         # Default to ACP session
         effective_model = model_name

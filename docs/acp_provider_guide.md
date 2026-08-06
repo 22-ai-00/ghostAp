@@ -11,7 +11,7 @@
 1. **ACPProvider Protocol** - 统一工具接入接口
 2. **ToolRegistry** - 工具注册/发现机制
 3. **SyncACPSession** - ACP 会话管理
-4. **TTADK 隔离** - TTADK 模式下强制使用 CLI，与 ACP 模式完全隔离
+4. **传输边界** - ACP Provider 与 shell CLI 后端保持独立
 
 ## 接入步骤
 
@@ -121,18 +121,11 @@ class MyToolModeHandler(ProgrammingModeHandler):
 
 ## 关键设计原则
 
-### ACP vs TTADK 隔离
+### ACP 与 CLI 隔离
 
 - **ACP 模式**：直接通过 ACP 协议与工具通信，使用 `SyncACPSession`
-- **TTADK 模式**：通过 CLI 调用工具，使用 `SyncTTADKCLISession`
-- **隔离机制**：`agent_type` 以 `ttadk_` 前缀强制走 CLI 路径
-- **强约束**：`ttadk_*` 下不得直接启动 ACP server（即使该工具支持 `acp serve`）
-
-示例：
-
-- `agent_type="codex"` → 允许走 ACP provider，尝试 `codex acp serve`
-- `agent_type="ttadk_codex"` → 必须走 CLI bridge，不允许启动 `codex acp serve`
-- `agent_type="ttadk_claude"` → 必须走 CLI bridge，不允许启动 `claude acp serve`
+- **CLI 模式**：由专用 CLI 会话后端启动，不伪装成 ACP Provider
+- **强约束**：只有声明 ACP 能力的 Provider 才能启动 ACP server
 
 ### 性能优化
 

@@ -14,16 +14,10 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
-from .. import agent_session as _agent_session_mod
-from ..agent_session import SyncClaudeCLISession, SyncSession, SyncTTADKCLISession
+from ..agent_session import SyncClaudeCLISession, SyncSession
 from ..config import get_settings
 from ..utils.errors import get_error_detail
 from . import startup_utils as _startup_utils
-from .diagnostics import (
-    get_diagnostics_config,
-    redact_text,
-    truncate_text,
-)
 from .helper import SessionKeyCodec
 from .session import ACPResumeRejected
 from .sync_adapter import SyncACPSession, build_startup_diagnostics
@@ -71,11 +65,7 @@ def _session_matches_requested_model(
 
 def _normalize_manager_acp_model(agent_type: str, model_name: Optional[str]) -> Optional[str]:
     agent = (agent_type or "").strip().lower()
-    if (
-        not model_name
-        or agent in {"claude", "traex"}
-        or agent.startswith("ttadk_")
-    ):
+    if not model_name or agent in {"claude", "traex"}:
         return model_name
     try:
         from .providers import normalize_acp_model_name
@@ -99,54 +89,6 @@ if TYPE_CHECKING:
     from ..utils.time_ago import IdleHealth, TimeAgoBucket
     from .telemetry import _IdleHealthServiceProtocol as IdleHealthServiceProtocol
     from .telemetry import _IdleHealthTelemetry as IdleHealthTelemetry
-
-
-# Preserve the original TTADK CLI session class so that we can
-# distinguish between tests patching src.acp.manager.SyncTTADKCLISession
-# and those patching src.agent_session.SyncTTADKCLISession.
-try:  # best-effort, never raise during import
-    _ORIG_TTADK_CLI_SESSION = _agent_session_mod.SyncTTADKCLISession
-except Exception:  # pragma: no cover - extremely unlikely
-    _ORIG_TTADK_CLI_SESSION = None
-
-
-def _format_ttadk_startup_attempts(diagnostics: object, *, per_item_limit: int = 300, total_limit: int = 1600) -> str:
-    """TTADK 启动 attempts 摘要（compat wrapper）。
-
-    说明：脱敏/截断/配置读取的 SSOT 在 `src.acp.diagnostics`，本函数仅做 best-effort 薄封装，
-    以保持现有日志调用点与函数名稳定。
-    """
-    try:
-        from .diagnostics import format_attempts_summary
-
-        diag = diagnostics if isinstance(diagnostics, dict) else {}
-        attempts = (diag.get("attempts") or []) if isinstance(diag, dict) else []
-        return format_attempts_summary(
-            attempts, per_item_limit=per_item_limit, total_limit=total_limit, get_settings_fn=get_settings
-        )
-    except Exception:
-        logger.warning("Error while formatting TTADK startup attempts", exc_info=True)
-        return ""
-
-
-def _sanitize_startup_detail(text: str) -> str:
-    """Redact and truncate startup detail for safe logging/user-facing errors."""
-    s = str(text or "")
-    if not s:
-        return ""
-    try:
-        cfg = get_diagnostics_config(get_settings_fn=get_settings)
-        if bool(getattr(cfg, "redact_enabled", True)):
-            s = redact_text(
-                s,
-                list(getattr(cfg, "redact_patterns", []) or []),
-                str(getattr(cfg, "redact_replacement", "***REDACTED***") or "***REDACTED***"),
-            )
-        lim = int(getattr(cfg, "snippet_limit", 240) or 240)
-        s = truncate_text(s, max(1, lim))
-    except (AttributeError, TypeError, ValueError):
-        logger.warning("Error while sanitizing startup detail", exc_info=True)
-    return s
 
 
 def _build_startup_diagnostics(
@@ -437,9 +379,6 @@ class ACPSessionManager:
             session_telemetry=self._session_telemetry,
             sync_acp_session_cls=SyncACPSession,
             sync_claude_cli_session_cls=SyncClaudeCLISession,
-            sync_ttadk_cli_session_cls=SyncTTADKCLISession,
-            agent_session_module=_agent_session_mod,
-            original_ttadk_cli_session_cls=_ORIG_TTADK_CLI_SESSION,
             get_settings_fn=get_settings,
         )
 
@@ -794,7 +733,7 @@ class ACPSessionManager:
                 _safe_end_session(lambda _: True)
                 existing = None
 
-        # Agent type / model mismatch for dynamic backends (e.g., TTADK)
+        # Agent type / model mismatch for dynamic backends.
         if existing and agent_type_override:
             existing_agent = getattr(existing, "_agent_type", "")
             if existing_agent and existing_agent.lower() != agent_type_override.lower():
@@ -807,46 +746,15 @@ class ACPSessionManager:
                 )
                 _safe_end_session(lambda _: True)
                 existing = None
-            elif model_name:
-                # TTADK: model_name 可能是"意图/友好名"，未必会透传 -m；仅当能解析出 validated 的真实模型名时才做一致性重启。
-                from ..agent_session.backend_resolver import is_ttadk_type
-                if is_ttadk_type(agent_type_override):
-                    # 若该 session 已因 TTADK 启动失败降级（例如降级到 coco ACP），则不要再因 model mismatch 触发重启，
-                    # 否则在 TTADK 不可用时会产生"每次 ensure 都重启→再失败→再降级"的抖动。
-                    target_model: Optional[str] = None
-                    if not getattr(existing, "_degraded_to", ""):
-                        try:
-                            target_model = self._build_startup_coordinator().resolve_ttadk_target_model_for_existing_session(
-                                agent_type=agent_type_override,
-                                cwd=cwd or ".",
-                                model_name=model_name,
-                            )
-                        except Exception:
-                            logger.warning("Error while prechecking TTADK startup model", exc_info=True)
-                            target_model = None
-
-                    if target_model:
-                        existing_args = getattr(existing, "_agent_args", None)
-                        args_text = " ".join(existing_args or [])
-                        if target_model not in args_text:
-                            logger.info(
-                                "[ACP:%s] TTADK model changed (missing %s), restarting: key=%s",
-                                self._agent_type.upper(),
-                                target_model,
-                                key[-16:],
-                            )
-                            _safe_end_session(lambda _: True)
-                            existing = None
-                else:
-                    if not _session_matches_requested_model(existing, model_name):
-                        logger.info(
-                            "[ACP:%s] Model changed (%s), restarting: key=%s",
-                            self._agent_type.upper(),
-                            model_name,
-                            key[-16:],
-                        )
-                        _safe_end_session(lambda _: True)
-                        existing = None
+            elif model_name and not _session_matches_requested_model(existing, model_name):
+                logger.info(
+                    "[ACP:%s] Model changed (%s), restarting: key=%s",
+                    self._agent_type.upper(),
+                    model_name,
+                    key[-16:],
+                )
+                _safe_end_session(lambda _: True)
+                existing = None
 
         if existing:
             idle = time.time() - existing.last_active
@@ -872,7 +780,7 @@ class ACPSessionManager:
                     _safe_end_session(lambda s: s is existing)
                     existing = None
 
-        # Model mismatch check for non-TTADK sessions (when no agent_type_override).
+        # Model mismatch check when no agent_type_override is provided.
         # Ensures that calling ensure_session() with a different model_name triggers a restart.
         if existing and not agent_type_override and model_name:
             if not _session_matches_requested_model(existing, model_name):

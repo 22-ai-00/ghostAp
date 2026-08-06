@@ -22,7 +22,6 @@ def _display_mode_label(mode: str) -> str:
         "codex": "Codex",
         "gemini": "Gemini",
         "traex": "Traex",
-        "ttadk": "TTADK",
     }
     raw = str(mode or "").strip()
     return labels.get(raw.lower(), raw)
@@ -171,28 +170,9 @@ def init_action_registry(client: 'FeishuWSClient') -> None:
         exact=action_ids.NEW_PROJECT_PROMPT,
     )
 
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_select_ttadk_tool(
-            mid, cid, val.get("_option") or val.get("tool_name", ""), pid
-        ),
-        exact=action_ids.SELECT_TTADK_TOOL,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_toggle_ttadk_yolo(
-            mid,
-            cid,
-            bool(val.get("enabled")),
-            val.get("view", "tool_select"),
-            val.get("tool_name", ""),
-            pid,
-        ),
-        exact=action_ids.TOGGLE_TTADK_YOLO,
-    )
-
-
 def register_programming_mode_actions(client: 'FeishuWSClient') -> None:
     """Register enter/exit/resume/new actions for all programming modes."""
-    mode_names = ("coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk", "tui2acp")
+    mode_names = ("coco", "claude", "aiden", "codex", "gemini", "traex", "tui2acp")
     for mode in mode_names:
         enter = getattr(client, f"_handle_card_enter_{mode}")
         exit_ = getattr(client, f"_handle_card_exit_{mode}")
@@ -206,43 +186,6 @@ def register_programming_mode_actions(client: 'FeishuWSClient') -> None:
             exact=f"resume_{mode}",
         )
         client._register_action(new, exact=f"new_{mode}")
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_select_ttadk_model(
-            mid,
-            cid,
-            val.get("tool_name", ""),
-            val.get("_option") or val.get("model_name", ""),
-            _resolve_project(client, pid, cid),
-        ),
-        exact=action_ids.SELECT_TTADK_MODEL,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_refresh_ttadk_models(mid, cid, val.get("tool_name", ""), pid),
-        exact=action_ids.REFRESH_TTADK_MODELS,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_select_ttadk_combined(
-            mid,
-            cid,
-            val.get("tool_name", ""),
-            val.get("_option") or val.get("model_name", ""),
-            _resolve_project(client, pid, cid),
-        ),
-        exact=action_ids.SELECT_TTADK_COMBINED,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_select_ttadk_combined_tool(
-            mid, cid, val.get("_option", ""), _resolve_project(client, pid, cid),
-        ),
-        exact=action_ids.SELECT_TTADK_COMBINED_TOOL,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_ttadk_command(
-            mid, cid, _resolve_project(client, pid, cid), True
-        ),
-        exact=action_ids.SHOW_TTADK_MENU,
-    )
-
     # Tui2ACP
     client._register_action(
         lambda mid, cid, pid, val: client._handle_select_tui2acp_adapter(

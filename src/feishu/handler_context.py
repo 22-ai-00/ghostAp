@@ -66,7 +66,6 @@ class HandlerContext:
     codex_manager: "ACPSessionManager"
     gemini_manager: "ACPSessionManager"
     traex_manager: "ACPSessionManager"
-    ttadk_manager: "ACPSessionManager"
     tui2acp_manager: "ACPSessionManager"
 
     # Core services

@@ -6,7 +6,7 @@ Covers:
 - switch_model() no existing session (direct ensure_session)
 - _enter_mode_with_acp_model() routes to switch_model() when mode is active
 - _enter_mode_with_acp_model() routes to enter_mode() when not in mode
-- ensure_session() restarts on model mismatch (non-TTADK)
+- ensure_session() restarts on model mismatch
 - ACPSession.set_model() / SyncACPSession.set_model() delegation
 """
 
@@ -267,7 +267,7 @@ class TestSyncACPSessionSetModel(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# ACPSessionManager.ensure_session() — model mismatch restart for non-TTADK
+# ACPSessionManager.ensure_session() — model mismatch restart
 # ---------------------------------------------------------------------------
 class TestEnsureSessionModelMismatch(unittest.TestCase):
     def _make_manager(self):
@@ -284,7 +284,7 @@ class TestEnsureSessionModelMismatch(unittest.TestCase):
         return mgr
 
     def test_model_mismatch_triggers_restart(self):
-        """ensure_session with a new model_name restarts non-TTADK sessions."""
+        """ensure_session with a new model_name restarts sessions."""
         import time
 
         from src.acp.manager import ACPSessionManager
@@ -416,7 +416,6 @@ class TestSwitchModelACPPath(unittest.TestCase):
         project.project_id = "p1"
         project.coco_mode = True
         project.claude_mode = False
-        project.ttadk_mode = False
         project.theme_color = "blue"
         project.root_path = "/tmp/p1"
         project.project_name = "P1"
@@ -453,7 +452,6 @@ class TestSwitchModelFallbackPath(unittest.TestCase):
         project.project_id = "p1"
         project.coco_mode = True
         project.claude_mode = False
-        project.ttadk_mode = False
         project.theme_color = "blue"
         project.root_path = "/tmp/p1"
         project.project_name = "P1"

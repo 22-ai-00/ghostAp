@@ -25,13 +25,10 @@ BUTTON_CONFIG = {
     "exit_coco": {"text": "🚪 退出 Coco 模式", "type": "default"},
     "exit_gemini": {"text": "🚪 退出 Gemini 模式", "type": "default"},
     "exit_traex": {"text": "🚪 退出 Traex 模式", "type": "default"},
-    "exit_ttadk": {"text": "🚪 退出 TTADK 模式", "type": "default"},
     "enter_coco": {"text": "🤖 进入 Coco 模式", "type": "default"},
     "enter_claude": {"text": "🔮 进入 Claude 模式", "type": "default"},
     "enter_gemini": {"text": "✨ 进入 Gemini 模式", "type": "default"},
     "enter_traex": {"text": "🚀 进入 Traex 模式", "type": "default"},
-    "enter_ttadk": {"text": "🎮 进入 TTADK 模式", "type": "default"},
-    "switch_ttadk_tool": {"text": "🔧 切换 TTADK 工具", "type": "primary"},
     "switch_project": {"text": "🔄 切换项目", "type": "default"},
     # Reducer escalation button — rendered to user by DeepBuilder in escalation scenarios.
     # Also used in confirm dialogs when user initiates force-stop.

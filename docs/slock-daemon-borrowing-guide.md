@@ -22,7 +22,7 @@ GhostAp Slock Engine 与 @slock-ai/daemon 代表了两种不同的 AI Agent 管�
 │       │             │            │                 │             │
 │  ┌────▼─────────────▼────────────▼─────────────────▼─────────┐  │
 │  │              BoundedExecutor (线程池)                       │  │
-│  │         ACPSession / SyncClaudeCLI / TTADK                 │  │
+│  │              ACPSession / SyncClaudeCLI                    │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │  定位：应用层编排器，Agent = 无状态函数调用                        │
 └─────────────────────────────────────────────────────────────────┘
@@ -76,7 +76,7 @@ GhostAp Slock Engine 与 @slock-ai/daemon 代表了两种不同的 AI Agent 管�
 
 - 当前 GhostAp 添加新运行时需修改 `ACPProvider` 注册代码、新增 Session 子类、在 Manager 中添加分支逻辑——改动分散在 3+ 个文件中
 - `agent_type` 字符串在代码中散落为隐式耦合点，IDE 无法追踪所有引用
-- 不同 Session 类（`SyncACPSession`, `SyncClaudeCLISession`, `SyncTTADKCLISession`）的接口不一致，上层需要知道具体类型
+- 不同 Session 类（`SyncACPSession`, `SyncClaudeCLISession`）的实现不同，上层应只依赖统一协议
 
 **How - 怎么做：**
 

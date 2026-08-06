@@ -109,9 +109,7 @@ class SpecTaskState:
         agent_type = str(ctx.get("agent_type") or self.agent_type or "coco").strip().lower() or "coco"
         engine_name = str(ctx.get("engine_name") or "").strip()
         if not engine_name:
-            if agent_type.startswith("ttadk_"):
-                engine_name = "TTADK"
-            elif agent_type == "claude":
+            if agent_type == "claude":
                 engine_name = "Claude"
             else:
                 engine_name = "Coco"

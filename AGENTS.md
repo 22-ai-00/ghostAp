@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-GhostAP 是一个飞书/Lark 机器人服务，用于通过出站 WebSocket 连接进行安全的远程 shell 执行和 AI 辅助开发。用户可以通过聊天运行 shell 命令、管理项目，并驱动 Coco、Claude、Aiden、Codex、Gemini 和 TTADK 等编程工具。
+GhostAP 是一个飞书/Lark 机器人服务，用于通过出站 WebSocket 连接进行安全的远程 shell 执行和 AI 辅助开发。用户可以通过聊天运行 shell 命令、管理项目，并驱动 Coco、Claude、Aiden、Codex、Gemini 和 Traex 等编程工具。
 
 ## 命令
 
@@ -44,7 +44,7 @@ uv run python scripts/test_inventory.py tests/
 - 优先选择特定的失败衍生规则而非通用建议。
 - 如果规则可以通过测试、钩子或类型化 API 强制执行，就在那里强制执行，并在此处只保留简短指针。
 - 当代码库或工具不再需要时，删除过时规则。
-- 将 Coco/Claude/Aiden/Codex/Gemini/TTADK 视为 GhostAP 编程抽象背后的工具后端。除非传输或功能确实不同，否则避免添加后端特定分支。
+- 将 Coco/Claude/Aiden/Codex/Gemini/Traex 视为 GhostAP 编程抽象背后的工具后端。除非传输或功能确实不同，否则避免添加后端特定分支。
 - 机器人管理员引导是单向的：仅当 `ADMIN_USER_IDS` 为空时，才接受任意用户在主 Bot 私聊中发送 `/setadmin`；群聊中的首次设置一律拒绝。之后只有配置的管理员可以替换 `.env` 中的单个管理员。
 
 ## 架构指针
@@ -55,7 +55,6 @@ uv run python scripts/test_inventory.py tests/
 - `src/feishu/handlers/`：命令处理器。使用 `BaseHandler` 消息辅助函数：`reply_text`、`reply_card`、`update_card`、`send_card_to_chat`、`send_text_to_chat`。
 - `src/mode/`：`InteractionMode` 和每聊天/项目模式状态。
 - `src/acp/`：ACP 会话、提供者、诊断和支持 ACP 的编程工具的模型/工具发现。
-- `src/ttadk/`：TTADK 工具/模型选择和启动策略。`ttadk_*` 代理类型仅支持 CLI 桥接；不要直接为它们启动 ACP。
 - `src/deep_engine/`、`src/spec_engine/`、`src/workflow_engine/`：长时间运行的执行策略。
   - `src/workflow_engine/`：JS 编排的多代理并行执行。关键模块：`commands.py`（SSOT 命令集）、`engine.py`（桥接 + 运行时）、`executor.py`（每代理调用会话）、`tool_registry.py`（动态发现）、`script_gen.py`（提示模板 + 验证）、`renderer.py`（飞书卡片）。需要 Node.js >= `NODE_MIN_VERSION`（在 `src/workflow_engine/constants.py` 中定义）；所有面向用户的"Node 版本过旧"消息都源自此常量。
 - `src/card/`：飞书卡片构建器、渲染管道、会话编排和交付。
@@ -107,14 +106,14 @@ uv run ruff check src/autonomous/           # 0 错误
 GhostAP 有两个独立的维度：
 
 - 执行策略：普通编程、Deep、Spec、Workflow 和 Autonomous。
-- 工具传输：ACP 直接模式、shell CLI 桥接模式和 TTADK CLI 桥接。
+- 工具传输：ACP 直接模式和 shell CLI 桥接模式。
 
-保持这些维度分离。新的编程功能通常应在 Coco、Claude、Aiden、Codex、Gemini 和 TTADK 上工作，除非用户明确限定范围或后端不支持。
+保持这些维度分离。新的编程功能通常应在 Coco、Claude、Aiden、Codex、Gemini 和 Traex 上工作，除非用户明确限定范围或后端不支持。
 
 状态范围也是产品合约：
 
 - SMART 是默认聊天/项目状态，可直接路由简单意图或类 shell 命令。
-- 普通工具入口如 `/coco`、`/codex`、`/aiden`、`/claude`、`/gemini` 和 `/ttadk` 设置持久聊天+项目编程状态，直到 `/exit`。
+- 普通工具入口如 `/coco`、`/codex`、`/aiden`、`/claude`、`/gemini` 和 `/traex` 设置持久聊天+项目编程状态，直到 `/exit`。
 - Deep、Spec 和 Workflow 是作用于飞书话题/根线程的引擎策略；它们不得替换聊天+项目编程状态。Autonomous 同理。
 - SMART 中的类 shell 文本必须保持 shell 执行，包括 `./restart.sh rr` 等命令，而不是被项目聊天自由文本编程路由窃取。
 

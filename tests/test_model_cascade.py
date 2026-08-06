@@ -427,7 +427,7 @@ def test_explicit_traex_variants_render_three_level_dropdowns():
 
 
 def test_button_model_card_expands_explicit_traex_variants():
-    from src.ttadk.models import ACPModelOption, ACPModelVariantOption
+    from src.acp.options import ACPModelOption, ACPModelVariantOption
 
     model = ACPModelOption(
         name="c_o_new_thinking",

@@ -225,26 +225,6 @@ class Settings(BaseSettings):
     claude_acp_cmd: str = ""
     claude_acp_args: str = ""
 
-    ttadk_auto_update: bool = True
-    ttadk_update_timeout: int = 120
-
-    ttadk_default_tool: str = "coco"
-    ttadk_default_model: str = ""
-    ttadk_yolo_default_enabled: bool = False
-    # Max models to probe in interactive PTY discovery (clamped to [1, 50])
-    ttadk_interactive_max_models: int = 12
-
-    # TTADK common tool model preheating (probe-based, best-effort)
-    # - enabled: master switch
-    # - on_startup: trigger once on application startup
-    # - on_first_use: trigger once when first accessing a tool's models
-    # - tools: comma/space separated tool names
-    # - timeout: probe subprocess timeout (seconds)
-    ttadk_preheat_enabled: bool = True
-    ttadk_preheat_on_startup: bool = True
-    ttadk_preheat_on_first_use: bool = True
-    ttadk_preheat_tools: str = "claude,coco,trae,opencode,codex"
-
     # ------------------------------------------------------------------
     # Workflow Engine
     # ------------------------------------------------------------------
@@ -295,84 +275,6 @@ class Settings(BaseSettings):
         description="Agent session creation timeout inside a workflow (seconds).",
     )
 
-    ttadk_preheat_timeout: float = 2.5
-
-    # TTADK model list fetch strategy knobs
-    # Interactive strategy is risky in multi-threaded service (pty + fork), so it is disabled by default.
-    ttadk_interactive_enabled: bool = False
-    ttadk_probe_timeout: float = 10.0
-    ttadk_structured_timeout: float = 8.0
-
-    # TTADK official CLI models strategy (non-PTY, preferred when available)
-    # - enabled: master switch for official_cli strategy
-    # - timeout: subprocess timeout (seconds)
-    ttadk_official_cli_enabled: bool = True
-    ttadk_official_timeout: float = 4.0
-
-    # TTADK CLI capabilities probe (`ttadk --help`)
-    # - ttl_s: cache TTL for parsed Commands list
-    # - timeout_s: subprocess timeout for `ttadk --help`
-    ttadk_cli_capabilities_ttl_s: float = 300.0
-    ttadk_cli_capabilities_timeout_s: float = 2.0
-
-    # TTADK model fetch strategy order (comma/space separated strategy names)
-    # Supported names: official_cli, structured_sync, file_cache, local_config, probe, interactive
-    # Empty means "use built-in conservative defaults".
-    ttadk_models_strategy_order: str = ""
-
-    # ------------------------------------------------------------------
-    # TTADK model cache (service-side disk cache, project-scoped)
-    # ------------------------------------------------------------------
-    # Cache file path template. If empty, defaults to "{cwd}/.ghostap/ttadk/models_cache.json".
-    # Supports "{cwd}" placeholder. If cwd is empty/None, disk cache is disabled.
-    ttadk_models_cache_path: str = ""
-    # Backward-compat: read legacy "~/.ttadk/models_cache.json" when project cache missing.
-    ttadk_models_cache_read_legacy_home: bool = True
-    # Whether to auto-migrate legacy cache content into project cache on first load.
-    ttadk_models_cache_migrate_from_legacy_home: bool = True
-
-    # TTADK cwd normalization diagnostics
-    # - enabled: emit debug logs for raw/normalized cwd at key call sites
-    ttadk_cwd_debug_enabled: bool = False
-
-    # ------------------------------------------------------------------
-    # TTADK subprocess env sandbox (avoid writing to real ~/.ttadk)
-    # ------------------------------------------------------------------
-    # Enable sandboxed HOME/XDG_* for all ttadk-related subprocess/PTY calls.
-    # Default: enabled to avoid test/runtime polluting user's real HOME.
-    ttadk_sandbox_home_enabled: bool = True
-    # Sandbox root directory. If empty, defaults to "<cwd>/.ttadk_sandbox".
-    # Supports "{cwd}" placeholder.
-    ttadk_sandbox_home_root: str = ""
-    # Whether to also override XDG_CACHE_HOME under the sandbox root.
-    ttadk_sandbox_cover_cache_home: bool = False
-
-    # TTADK runtime invalid-model self-healing (execution-time)
-    # - enabled: master switch
-    # - allow_autoswitch: when available models are known, allow selecting a best-match real model for one retry
-    # - cooldown: per-tool cooldown to avoid repeated retries (seconds)
-    # - max_retries: hard cap (kept as 1 for safety)
-    ttadk_runtime_retry_enabled: bool = True
-    ttadk_runtime_retry_allow_autoswitch: bool = True
-    ttadk_runtime_retry_cooldown_s: float = 120.0
-    ttadk_runtime_max_retries: int = 1
-
-    # TTADK runtime invalid-model stub cooldown store limits (service-side)
-    # Used only for non-TTADKManager manager stubs (tests/legacy path).
-    # - ttl_s: cleanup entries older than ttl seconds; 0 disables TTL cleanup
-    # - max_keys: hard cap for number of keys kept; 0 disables cap
-    # - gc_interval_s: minimum seconds between GC runs; 0 runs GC on every write
-    ttadk_runtime_stub_cooldown_ttl_s: float = 3600.0
-    ttadk_runtime_stub_cooldown_max_keys: int = 1024
-    ttadk_runtime_stub_cooldown_gc_interval_s: float = 60.0
-
-    # TTADK startup: auto PTY retry when downstream requires a real TTY
-    # - enabled: master switch
-    # - retry_once: whether to retry exactly once with PTY on stdin-not-tty errors
-    ttadk_pty_enabled: bool = True
-    ttadk_pty_retry_once: bool = True
-    # Cooldown for repeated PTY retries per tool (seconds)
-    ttadk_pty_retry_cooldown_s: float = 60.0
 
     # Spec Engine settings
     spec_max_cycles: int = 1000
@@ -1127,7 +1029,7 @@ class Settings(BaseSettings):
         default="",
         description=(
             "新建 slock 群时自动创建的预置角色（格式: role:tool_type,role:tool_type）；留空则不自动创建。"
-            " 合法 tool_type: codex, claude, coco, aiden, gemini, ttadk"
+            " 合法 tool_type: codex, claude, coco, aiden, gemini"
         ),
     )
 
@@ -1166,7 +1068,7 @@ class Settings(BaseSettings):
     def _validate_default_roles(cls, v: str) -> str:
         if not v:
             return v
-        valid_tool_types = {"codex", "claude", "coco", "aiden", "gemini", "ttadk"}
+        valid_tool_types = {"codex", "claude", "coco", "aiden", "gemini"}
         for pair in v.split(","):
             pair = pair.strip()
             if not pair:

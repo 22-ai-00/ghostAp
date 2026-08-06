@@ -106,7 +106,6 @@ class TestRefactorRobustness(unittest.TestCase):
             stack.enter_context(patch("src.feishu.ws_client.ActionDispatcher"))
             stack.enter_context(patch("src.feishu.ws_client.CocoModeHandler"))
             stack.enter_context(patch("src.feishu.ws_client.ClaudeModeHandler"))
-            stack.enter_context(patch("src.feishu.ws_client.TTADKModeHandler"))
             stack.enter_context(patch("src.feishu.ws_client.DeepHandler"))
             stack.enter_context(patch("src.feishu.ws_client.SpecHandler"))
             stack.enter_context(patch("src.feishu.ws_client.ProjectHandler"))

@@ -11,8 +11,8 @@ class ToolOptionView:
     """卡片层通用的“工具选择”选项模型。
 
     说明：
-    - 与具体后端实现（ACP/TTADK）解耦，只承载 UI 所需字段；
-    - name: 逻辑工具名称（如 coco/claude/ttadk 等）；
+    - 与具体后端实现解耦，只承载 UI 所需字段；
+    - name: 逻辑工具名称（如 coco/claude 等）；
     - description: 简要说明文案；
     - is_default: 是否作为默认高亮/推荐选项；
     - emoji: 可选图标，用于提高可读性；

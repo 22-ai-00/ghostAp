@@ -168,7 +168,6 @@ def test_help_card_omits_quick_action_buttons():
         in {
             "enter_deep_prompt",
             "show_acp_menu",
-            "show_ttadk_menu",
             "show_status",
             "switch_project",
         }
@@ -224,18 +223,6 @@ def test_project_board_includes_group_jump_for_bound_project():
     )
 
 
-def test_system_builder_soft_failure_banner():
-    """Verify that SystemBuilder.build_ttadk_soft_failure_card uses the banner."""
-    message = "TTADK Timeout"
-    msg_type, card_json = SystemBuilder.build_ttadk_soft_failure_card(message)
-
-    card = json.loads(card_json)
-    elements = card["body"]["elements"]
-    assert elements[0]["tag"] == "column_set"
-    assert elements[0]["background_style"] == "orange"  # soft failure 使用 warning 类型（Apple 风格优化：橙色）
-    assert message in elements[0]["columns"][0]["elements"][0]["content"]
-
-
 def test_system_error_card_action_buttons_have_callback_behaviors():
     """Error card detail/retry buttons must be clickable callback buttons in Feishu."""
     msg_type, card_json = SystemBuilder.build_error_card(
@@ -255,54 +242,6 @@ def test_system_error_card_action_buttons_have_callback_behaviors():
         assert button.get("behaviors") == [{"type": "callback", "value": button["value"]}]
 
 
-def test_ttadk_select_cards_keep_critical_fields_and_refresh_button():
-    """TTADK tool/model/combined cards must keep select value and refresh fields stable."""
-    tools = [ToolOptionView(name="coco", description="Coco agent")]
-    models = [ModelOptionView(name="gpt-5", description="Flagship", display_name="GPT 5")]
-
-    _, tool_json = SystemBuilder.build_ttadk_tool_select_card(
-        tools, project_id="p1", current_tool="coco"
-    )
-    tool_card = json.loads(tool_json)
-    tool_select = _collect_selects(tool_card)[0]
-    assert tool_select["initial_option"] == "coco"
-    assert tool_select["value"] == {"action": "select_ttadk_tool", "project_id": "p1"}
-    assert tool_select["options"][0]["value"] == "coco"
-    assert "Coco agent" in tool_select["options"][0]["text"]["content"]
-
-    _, model_json = SystemBuilder.build_ttadk_model_select_card(
-        models, tool_name="coco", project_id="p1", current_model="gpt-5"
-    )
-    model_card = json.loads(model_json)
-    model_select = _collect_selects(model_card)[0]
-    assert model_select["initial_option"] == "gpt-5"
-    assert model_select["value"] == {
-        "action": "select_ttadk_model",
-        "tool_name": "coco",
-        "project_id": "p1",
-    }
-    refresh_buttons = [b for b in _collect_buttons(model_card) if b["value"].get("action") == "refresh_ttadk_models"]
-    assert refresh_buttons[0]["value"] == {
-        "action": "refresh_ttadk_models",
-        "tool_name": "coco",
-        "project_id": "p1",
-    }
-
-    _, combined_json = SystemBuilder.build_ttadk_combined_select_card(
-        tools,
-        {"coco": models},
-        project_id="p1",
-        current_tool="coco",
-        current_model="gpt-5",
-    )
-    combined_card = json.loads(combined_json)
-    combined_selects = _collect_selects(combined_card)
-    assert combined_selects[0]["value"] == {"action": "select_ttadk_combined_tool", "project_id": "p1"}
-    assert combined_selects[1]["value"] == {
-        "action": "select_ttadk_combined",
-        "tool_name": "coco",
-        "project_id": "p1",
-    }
 
 
 def test_acp_select_cards_keep_project_tool_thread_and_refresh_fields():
@@ -548,8 +487,8 @@ def test_system_error_card_detail_action_payload_details_feed_diagnostic_store()
     from src.card.error_diagnostics import render_error_diagnostic
 
     _, card_json = SystemBuilder.build_error_card(
-        "TTADK 启动失败",
-        title="TTADK 暂不可用",
+        "Codex 启动失败",
+        title="Codex 暂不可用",
         severity="degraded",
         summary="系统已切换到备用路径",
         details="诊断详情已收起，点击“查看详情”可查看本次失败摘要。",
@@ -669,8 +608,8 @@ def test_degraded_error_card_with_quick_actions_keeps_single_decision_area():
         retry_action={
             "action": "retry_original",
             "request_id": "retry-quick",
-            "original_mode": "TTADK",
-            "retry_mode": "TTADK",
+            "original_mode": "Codex",
+            "retry_mode": "Codex",
             "degraded_to": "Aiden",
         },
     )
@@ -770,14 +709,14 @@ def test_degraded_error_card_does_not_infer_degraded_to_from_legacy_next_mode():
     """Builder 只能消费上游显式 degraded_to，不能从 next_mode 修补降级语义。"""
 
     _, card_json = SystemBuilder.build_error_card(
-        RuntimeError("ttadk failed"),
-        title="TTADK 启动失败",
+        RuntimeError("codex failed"),
+        title="Codex 启动失败",
         severity="degraded",
         continue_action={"action": "continue_degraded", "next_mode": "Coco", "request_id": "req-legacy"},
         retry_action={
             "action": "retry_original",
-            "original_mode": "TTADK",
-            "retry_mode": "TTADK",
+            "original_mode": "Codex",
+            "retry_mode": "Codex",
             "next_mode": "Coco",
             "request_id": "req-legacy",
         },
@@ -827,17 +766,6 @@ def test_mobile_preview_covers_degraded_error_card_visual_contract():
     assert "available_mode" not in degraded_section
 
 
-def test_select_option_long_name_and_description_are_mobile_safe():
-    """长名称 + 描述应被压缩，避免移动端下拉项过宽。"""
-    long_tool = ToolOptionView(name="tool-" + "x" * 80, description="desc-" + "y" * 120)
-
-    _, card_json = SystemBuilder.build_ttadk_tool_select_card([long_tool], project_id="p1")
-    select = _collect_selects(json.loads(card_json))[0]
-    label = select["options"][0]["text"]["content"]
-
-    assert len(label) <= 72
-    assert label.endswith("…")
-    assert select["options"][0]["value"] == long_tool.name
 
 
 def test_acp_tool_button_long_name_and_description_are_mobile_safe():
@@ -884,28 +812,10 @@ def test_acp_model_button_long_display_and_description_are_mobile_safe():
     }
 
 
-def test_ttadk_select_label_boundary_exact_limit_and_overflow():
-    """TTADK 下拉项 72 字符边界：等长不截断，超长追加省略号。"""
-    exact = "x" * 72
-    overflow = "y" * 73
-
-    _, exact_json = SystemBuilder.build_ttadk_tool_select_card([ToolOptionView(name=exact)], project_id="p1")
-    exact_label = _collect_selects(json.loads(exact_json))[0]["options"][0]["text"]["content"]
-
-    _, overflow_json = SystemBuilder.build_ttadk_tool_select_card([ToolOptionView(name=overflow)], project_id="p1")
-    overflow_label = _collect_selects(json.loads(overflow_json))[0]["options"][0]["text"]["content"]
-
-    assert exact_label == exact
-    assert len(overflow_label) == 72
-    assert overflow_label.endswith("…")
 
 
 def test_selector_cards_empty_options_still_render_operable_shells():
     """空工具/模型列表不得生成坏卡片；可操作辅助入口仍保留。"""
-    _, ttadk_tool_json = SystemBuilder.build_ttadk_tool_select_card([], project_id="p1")
-    ttadk_tool_select = _collect_selects(json.loads(ttadk_tool_json))[0]
-    assert ttadk_tool_select["options"] == []
-
     _, acp_tool_json = SystemBuilder.build_acp_tool_select_card([], project_id="p1")
     assert _collect_buttons(json.loads(acp_tool_json)) == []
 

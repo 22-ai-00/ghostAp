@@ -33,7 +33,6 @@ from ..product_catalog import retired_command_tokens
 from ..slash_command_parser import CommandMatch, SlashCommandParser
 from .base import BaseHandler
 from .lock_commands import LockCommandsMixin
-from .ttadk_commands import TTADKCommandsMixin
 
 if TYPE_CHECKING:
     from ...project import ProjectContext
@@ -54,7 +53,7 @@ class _SystemSubcommands:
         raise AttributeError(name)
 
 
-class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
+class SystemHandler(LockCommandsMixin, BaseHandler):
     """Help, exit, shell, directory, and intercepted-command handling."""
 
     # `/status` remains the established Deep/Spec diagnostics command. The
@@ -66,9 +65,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
     def __init__(self, ctx: "HandlerContext") -> None:
         super().__init__(ctx)
         self._init_command_registry()
-        self._ttadk_flow_start_times: dict[str, float] = {}
-        self._ttadk_flow_last_duration_ms: OrderedDict[str, int] = OrderedDict()
-        self._TTADK_FLOW_DURATION_MAX_SIZE = 200
         # Pending programming prompts stashed when showing the ACP model-select
         # card. After the user picks a model and enters the mode, the stashed
         # prompt is forwarded to the mode handler as the first requirement.
@@ -82,7 +78,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
         self.help_commands = _SystemSubcommands(self, ("show_help", "show_full_help", "handle_help_category", "handle_menu_command"))
         self.shell_commands = _SystemSubcommands(self, ("submit_shell_command", "execute_shell_and_reply", "change_directory"))
         self.acp_commands = _SystemSubcommands(self, ("handle_acp_command", "handle_select_acp_tool", "handle_select_acp_model", "handle_refresh_acp_models", "handle_model_command"))
-        self.ttadk_commands = _SystemSubcommands(self, ("handle_ttadk_command", "handle_select_ttadk_tool", "handle_select_ttadk_model", "handle_refresh_ttadk_models", "handle_toggle_ttadk_yolo", "handle_select_ttadk_combined", "handle_select_ttadk_combined_tool"))
         self.lock_commands = _SystemSubcommands(self, ("handle_force_release_repo_lock", "handle_confirm_lock", "handle_cancel_lock", "handle_confirm_force_release", "handle_cancel_force_release"))
 
     @staticmethod
@@ -186,8 +181,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/exit_gemini": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_traex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/exit_traex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_ttadk": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_ttadk": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/coco_status": lambda m, c, t, p: self.show_coco_status(m, c),
             "/coco_info": lambda m, c, t, p: self.get_handler("coco").show_info(m, c, p),
             "/claude_info": lambda m, c, t, p: self.get_handler("claude").show_info(m, c, p),
@@ -199,16 +192,12 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/project": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/switch": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/new-chat": lambda m, c, t, p: self._handle_new_chat_project_args(m, c, ""),
-            "/ttadk": lambda m, c, t, p: self.handle_ttadk_command(m, c, p),
-            "/enter_ttadk": lambda m, c, t, p: self.handle_ttadk_command(m, c, p),
             "/tui2acp": lambda m, c, t, p: self.handle_tui2acp_command(m, c, p),
             "/enter_tui2acp": lambda m, c, t, p: self.handle_tui2acp_command(m, c, p),
             "/exit_tui2acp": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_tui2acp": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/tui2acp_info": lambda m, c, t, p: self.get_handler("tui2acp").show_info(m, c, p),
             "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, p),
-            "/ttadk_info": lambda m, c, t, p: self.show_ttadk_info(m, c),
-            "/ttadk_refresh": lambda m, c, t, p: self.refresh_ttadk_models(m, c, p),
             "/menu": lambda m, c, t, p: self.handle_menu_command(m, c, p),
             "/tools": lambda m, c, t, p: self.show_tools_list(m, c, p),
             "/tools_status": lambda m, c, t, p: self.show_tools_status(m, c, p),
@@ -316,8 +305,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/exit_gemini",
             "/end_traex",
             "/exit_traex",
-            "/end_ttadk",
-            "/exit_ttadk",
         }
         exit_keywords = {
             "退出模式",
@@ -330,7 +317,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "退出codex",
             "退出gemini",
             "退出traex",
-            "退出ttadk",
         }
         if text_lower in exit_commands:
             return True
@@ -404,7 +390,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/enter_gemini",
             "/traex",
             "/enter_traex",
-            "/enter_ttadk",
             "/exit",
             "/quit",
             "/end_coco",
@@ -419,8 +404,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/exit_gemini",
             "/end_traex",
             "/exit_traex",
-            "/end_ttadk",
-            "/exit_ttadk",
             "/tui2acp",
             "/enter_tui2acp",
             "/exit_tui2acp",
@@ -433,7 +416,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/codex_info",
             "/gemini_info",
             "/traex_info",
-            "/ttadk_info",
             "/projects",
             "/status",
             "/project",
@@ -442,9 +424,7 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             "/tasks",
             "/diff",
             "/trace",
-            "/ttadk",
             "/acp",
-            "/ttadk_refresh",
             "/menu",
             "/tools",
             "/tools_status",
@@ -859,7 +839,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             InteractionMode.AIDEN,
             InteractionMode.CODEX,
             InteractionMode.GEMINI,
-            InteractionMode.TTADK,
             InteractionMode.TUI2ACP,
         }
         thread_id = get_current_thread_id()
@@ -1613,8 +1592,6 @@ class SystemHandler(LockCommandsMixin, TTADKCommandsMixin, BaseHandler):
             self.get_handler("codex").exit_mode(message_id, chat_id, project)
         elif current_mode == InteractionMode.GEMINI:
             self.get_handler("gemini").exit_mode(message_id, chat_id, project)
-        elif current_mode == InteractionMode.TTADK:
-            self.get_handler("ttadk").exit_mode(message_id, chat_id, project)
         elif current_mode == InteractionMode.TUI2ACP:
             self.get_handler("tui2acp").exit_mode(message_id, chat_id, project)
         else:

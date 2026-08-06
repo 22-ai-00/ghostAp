@@ -95,11 +95,6 @@ class TestBuildProgrammingMetadata:
         assert meta.tool_name == "claude"
         assert meta.model_name == "claude-4-sonnet"
 
-    def test_ttadk_metadata(self):
-        meta = build_programming_metadata("ttadk", tool_name="cursor", model_name="gpt-4o")
-        assert meta.mode_name == "TTADK"
-        assert meta.tool_name == "cursor"
-        assert meta.model_name == "gpt-4o"
 
     def test_with_project_name(self):
         meta = build_programming_metadata("coco", project_name="MyProject")
@@ -117,7 +112,6 @@ class TestBuildProgrammingMetadata:
             "codex",
             "gemini",
             "traex",
-            "ttadk",
             "tui2acp",
         ]
         for mode in modes:
@@ -2805,11 +2799,6 @@ class TestSessionMetadataPerMode:
         if state.header.subtitle:
             assert "claude" in state.header.subtitle.lower()
 
-    def test_ttadk_custom_tool_name(self):
-        pcs, _ = _make_programming_session("ttadk", tool_name="cursor", model_name="gpt-4o")
-        pcs.start()
-        state = pcs.session.state
-        assert state.metadata.tool_name == "cursor"
 
 
 class TestNonStreamingFallback:

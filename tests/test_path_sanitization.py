@@ -4,7 +4,6 @@ Covers:
 - MemoryManager._sanitize_path_component: regex-based sanitization and post-checks
 - MemoryManager._safe_path: traversal detection via realpath resolution
 - AgentIdentity.__post_init__: agent_id sanitization on construction
-- normalize_ttadk_cwd: TTADK current-working-directory normalization
 """
 
 import logging
@@ -20,6 +19,32 @@ from src.slock_engine.models import AgentIdentity
 from src.utils.path_security import is_path_blacklisted
 
 # ---------------------------------------------------------------------------
+
+
+class TestNormalizeSessionCwd:
+    """Session startup paths use a stable absolute working directory."""
+
+    def test_none_and_empty_return_none(self):
+        from src.utils.path import normalize_session_cwd
+
+        assert normalize_session_cwd(None) is None
+        assert normalize_session_cwd("") is None
+        assert normalize_session_cwd("   ") is None
+
+    def test_dot_is_absolute(self, tmp_path: Path, monkeypatch):
+        from src.utils.path import normalize_session_cwd
+
+        monkeypatch.chdir(tmp_path)
+        assert Path(normalize_session_cwd(".") or "") == tmp_path.resolve()
+
+    def test_relative_path_is_absolute(self, tmp_path: Path, monkeypatch):
+        from src.utils.path import normalize_session_cwd
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "project").mkdir()
+        assert Path(normalize_session_cwd("project") or "") == (
+            tmp_path / "project"
+        ).resolve()
 # MemoryManager._sanitize_path_component tests
 # ---------------------------------------------------------------------------
 
@@ -277,36 +302,3 @@ class TestFailClosedPathBlacklist:
 
 
 # ---------------------------------------------------------------------------
-# TTADK cwd normalization tests (merged from test_ttadk_cwd_normalize.py)
-# ---------------------------------------------------------------------------
-
-
-class TestNormalizeTtadkCwd:
-    """Tests for normalize_ttadk_cwd utility."""
-
-    def test_normalize_ttadk_cwd_none_and_empty(self):
-        from src.utils.path import normalize_ttadk_cwd
-
-        assert normalize_ttadk_cwd(None) is None
-        assert normalize_ttadk_cwd("") is None
-        assert normalize_ttadk_cwd("   ") is None
-
-    def test_normalize_ttadk_cwd_dot_is_absolute(self, tmp_path: Path, monkeypatch):
-        from src.utils.path import normalize_ttadk_cwd
-
-        # ensure '.' resolves to an absolute path (under current process cwd)
-        monkeypatch.chdir(tmp_path)
-        out = normalize_ttadk_cwd(".")
-        assert out is not None
-        assert Path(out).is_absolute()
-        assert Path(out) == tmp_path.resolve()
-
-    def test_normalize_ttadk_cwd_relative_is_absolute(self, tmp_path: Path, monkeypatch):
-        from src.utils.path import normalize_ttadk_cwd
-
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / "p").mkdir(parents=True, exist_ok=True)
-        out = normalize_ttadk_cwd("p")
-        assert out is not None
-        assert Path(out).is_absolute()
-        assert Path(out) == (tmp_path / "p").resolve()

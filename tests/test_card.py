@@ -7,7 +7,6 @@ from src.card.models import EngineCardState
 from src.card.shared import THEMES, get_theme
 from src.config import Settings
 from src.project.context import ProjectContext, SessionSnapshot
-from src.ttadk.models import TTADKModel, TTADKTool
 
 
 class TestProjectTheme:
@@ -85,38 +84,6 @@ class TestCardBuilder:
         assert all(e.get("tag") == "column_set" for e in result)
         assert all(e.get("flex_mode") == "none" for e in result)
 
-    def test_build_ttadk_model_select_card_includes_refresh_button(self):
-        models = [
-            TTADKModel(name="gpt-5.2-codex-ttadk", description="", is_default=True),
-            TTADKModel(name="gpt-5.2-ttadk", description="", is_default=False),
-        ]
-        msg_type, content = CardBuilder.build_ttadk_model_select_card(models, tool_name="codex", project_id="p1")
-        assert msg_type == "interactive"
-
-        card = json.loads(content)
-        elements = card["body"]["elements"]
-
-        buttons: list[dict] = []
-        for e in elements:
-            if e.get("tag") != "column_set":
-                continue
-            for col in e.get("columns", []) or []:
-                for el in col.get("elements", []) or []:
-                    if isinstance(el, dict) and el.get("tag") == "button":
-                        buttons.append(el)
-
-        refresh = next(
-            (b for b in buttons if (b.get("text") or {}).get("content") == "🔄 刷新模型列表"),
-            None,
-        )
-        assert refresh is not None
-        assert (refresh.get("value") or {}).get("action") == "refresh_ttadk_models"
-        assert (refresh.get("value") or {}).get("tool_name") == "codex"
-        assert (refresh.get("value") or {}).get("project_id") == "p1"
-
-        yolo_toggle = next((b for b in buttons if (b.get("value") or {}).get("action") == "toggle_ttadk_yolo"), None)
-        assert yolo_toggle is not None
-        assert (yolo_toggle.get("value") or {}).get("enabled") is True
 
     def test_build_info_card_progress_bar_not_duplicated_when_content_contains_bar(self):
         progress_bar = "[████░░░░░░] 40% (2/5)"
@@ -152,22 +119,6 @@ class TestCardBuilder:
         card = json.loads(content)
         assert emoji in card["header"]["title"]["content"]
 
-    def test_build_project_response_card_ttadk_status_bar(self, sample_project):
-        sample_project.ttadk_mode = True
-        sample_project.ttadk_tool_name = "codex"
-        sample_project.ttadk_model_name = "gpt-5.2"
-        sample_project.ttadk_yolo_enabled = True
-
-        msg_type, content = CardBuilder.build_project_response_card(
-            project=sample_project, title="TTADK", content="执行中",
-        )
-
-        assert msg_type == "interactive"
-        content_str = json.dumps(json.loads(content), ensure_ascii=False)
-        assert "TTADK 状态" in content_str
-        assert "工具: `codex`" in content_str
-        assert "模型: `gpt-5.2`" in content_str
-        assert "自动执行: `开启`" in content_str
 
     def test_build_project_response_card_no_buttons(self, sample_project):
         msg_type, content = CardBuilder.build_project_response_card(
@@ -210,7 +161,7 @@ class TestCardBuilder:
         assert any("建议下一步" in str(e) for e in card["body"]["elements"])
 
     def test_build_resume_cards(self, sample_project):
-        """Both coco and ttadk resume cards render session info."""
+        """Coco resume cards render session info."""
         sample_project.coco_session_snapshot = SessionSnapshot(
             session_id="session_123", query_count=10,
             last_query="帮我写一个函数", is_resumable=True,
@@ -220,18 +171,6 @@ class TestCardBuilder:
         assert "session_123" in content_str
         assert "恢复会话" in content_str
 
-        sample_project.ttadk_tool_name = "claude"
-        sample_project.ttadk_model_name = "gpt-5.2-ttadk"
-        sample_project.ttadk_yolo_enabled = False
-        sample_project.ttadk_session_snapshot = SessionSnapshot(
-            session_id="session_ttadk", query_count=3,
-            last_query="继续重构", is_resumable=True,
-        )
-        msg_type, content2 = CardBuilder.build_ttadk_resume_card(sample_project)
-        assert msg_type == "interactive"
-        content_str2 = json.dumps(json.loads(content2), ensure_ascii=False)
-        assert "TTADK 状态" in content_str2
-        assert "工具: `claude`" in content_str2
 
     def test_build_project_created_card(self, sample_project):
         msg_type, content = CardBuilder.build_project_created_card(sample_project)
@@ -275,19 +214,6 @@ class TestCardBuilder:
         assert len(img_elements) == 2
         assert img_elements[0]["img_key"] == "img_v2_abc"
 
-    def test_build_project_response_card_ttadk_entry_ui(self, sample_project):
-        sample_project.ttadk_mode = True
-        sample_project.ttadk_tool_name = "codex"
-        sample_project.ttadk_model_name = "gpt-5.2"
-        sample_project.ttadk_yolo_enabled = True
-
-        msg_type, content = CardBuilder.build_project_response_card(
-            project=sample_project, title="TTADK编程模式", content="已进入TTADK编程模式",
-        )
-        content_str = json.dumps(json.loads(content), ensure_ascii=False)
-        assert "TTADK编程模式" in content_str
-        assert "TTADK 状态" in content_str
-        assert "show_ttadk_menu" in content_str
 
     def test_build_image_elements(self):
         elements = CardBuilder._build_image_elements(["key1", "key2", "key3"])
@@ -828,47 +754,3 @@ class TestTerminalAndFooterMarkers:
     def test_default_is_read(self):
         state = EngineCardState()
         assert state.is_read is True
-
-
-class TestTTADKCards:
-    """测试 TTADK 工具和模型选择卡片"""
-
-    def test_build_ttadk_tool_select_card(self):
-        tools = [
-            TTADKTool(name="claude", description="Claude AI Assistant", is_default=True),
-            TTADKTool(name="coco", description="Coco AI Assistant"),
-            TTADKTool(name="gemini", description="Google Gemini AI"),
-        ]
-        msg_type, content = CardBuilder.build_ttadk_tool_select_card(tools, project_id="test_project")
-        assert msg_type == "interactive"
-        card = json.loads(content)
-        assert card["schema"] == "2.0"
-        assert "TTADK 工具选择" in card["header"]["title"]["content"]
-        content_str = json.dumps(card, ensure_ascii=False)
-        for expected in ["claude", "Claude AI Assistant", "coco", "gemini", "toggle_ttadk_yolo"]:
-            assert expected in content_str
-
-    def test_build_ttadk_soft_failure_card(self):
-        msg_type, content = CardBuilder.build_ttadk_soft_failure_card_for("TTADK 暂不可用", project_id="p1")
-        assert msg_type == "interactive"
-        content_str = json.dumps(json.loads(content), ensure_ascii=False)
-        assert "TTADK 暂不可用" in content_str
-        assert "show_ttadk_menu" in content_str
-
-    def test_build_ttadk_model_select_card(self):
-        models = [
-            TTADKModel(name="claude-3-opus", description="Claude 3 Opus", is_default=True),
-            TTADKModel(name="gpt-5.2", description="GPT-5.2"),
-        ]
-        msg_type, content = CardBuilder.build_ttadk_model_select_card(models, tool_name="claude", project_id="test_project")
-        assert msg_type == "interactive"
-        card = json.loads(content)
-        assert card["schema"] == "2.0"
-        assert "claude" in card["header"]["title"]["content"]
-        assert "模型选择" in card["header"]["title"]["content"]
-        content_str = json.dumps(card, ensure_ascii=False)
-        for expected in ["claude-3-opus", "Claude 3 Opus", "gpt-5.2", "select_ttadk_model"]:
-            assert expected in content_str
-        # All cards use schema 2.0
-        assert "body" in card
-        assert "elements" in card["body"]

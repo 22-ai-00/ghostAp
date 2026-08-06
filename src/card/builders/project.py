@@ -231,9 +231,7 @@ class ProjectBuilder:
     ) -> tuple[str, str]:
         effective_mode = None
         if project:
-            if getattr(project, "ttadk_mode", False):
-                effective_mode = InteractionMode.TTADK
-            elif getattr(project, "claude_mode", False):
+            if getattr(project, "claude_mode", False):
                 effective_mode = InteractionMode.CLAUDE
             elif getattr(project, "gemini_mode", False):
                 effective_mode = InteractionMode.GEMINI
@@ -304,9 +302,7 @@ class ProjectBuilder:
         # Determine actual mode from project if not provided directly
         effective_mode = mode
         if effective_mode is None and project:
-            if getattr(project, "ttadk_mode", False):
-                effective_mode = InteractionMode.TTADK
-            elif getattr(project, "claude_mode", False):
+            if getattr(project, "claude_mode", False):
                 effective_mode = InteractionMode.CLAUDE
             elif getattr(project, "gemini_mode", False):
                 effective_mode = InteractionMode.GEMINI
@@ -317,7 +313,7 @@ class ProjectBuilder:
 
         theme_color = getattr(project, "theme_color", None) if project else None
         if not theme_color:
-            theme_color = "orange" if effective_mode == InteractionMode.TTADK else "turquoise" if effective_mode == InteractionMode.GEMINI else "blue"
+            theme_color = "turquoise" if effective_mode == InteractionMode.GEMINI else "blue"
         theme = get_theme(theme_color)
 
         header_title = CoreBuilder._build_header_title(
@@ -333,12 +329,6 @@ class ProjectBuilder:
         if banner:
             elements.append(banner)
             elements.append({"tag": "hr"})
-
-        if effective_mode == InteractionMode.TTADK:
-            ttadk_status = CoreBuilder._build_ttadk_status_element(project)
-            if ttadk_status:
-                elements.append(ttadk_status)
-                elements.append({"tag": "hr"})
 
         if image_keys:
             elements.extend(CoreBuilder._build_image_elements(image_keys))
@@ -613,9 +603,7 @@ class ProjectBuilder:
         else:
             effective_mode = None
             if project:
-                if getattr(project, "ttadk_mode", False):
-                    effective_mode = InteractionMode.TTADK
-                elif getattr(project, "claude_mode", False):
+                if getattr(project, "claude_mode", False):
                     effective_mode = InteractionMode.CLAUDE
                 elif getattr(project, "gemini_mode", False):
                     effective_mode = InteractionMode.GEMINI
@@ -641,18 +629,17 @@ class ProjectBuilder:
         mode: str,
     ) -> tuple[str, str]:
         theme = get_theme(project.theme_color)
-        is_coco = mode == "coco"
-        is_claude = mode == "claude"
-        is_ttadk = mode == "ttadk"
-        if is_coco:
-            mode_name = "Coco"
-            snapshot = project.coco_session_snapshot
-        elif is_claude:
-            mode_name = "Claude"
-            snapshot = project.claude_session_snapshot
-        else:
-            mode_name = "TTADK"
-            snapshot = project.ttadk_session_snapshot
+        mode_names = {
+            "coco": "Coco",
+            "claude": "Claude",
+            "aiden": "Aiden",
+            "codex": "Codex",
+            "gemini": "Gemini",
+            "traex": "Traex",
+            "tui2acp": "Tui2ACP",
+        }
+        mode_name = mode_names.get(mode, mode.title())
+        snapshot = project.get_programming_snapshot(mode)
 
         if not snapshot:
             return ProjectBuilder.build_project_response_card(
@@ -695,13 +682,10 @@ class ProjectBuilder:
             ),
         ]
 
-        effective_mode = None
-        if is_ttadk:
-            effective_mode = InteractionMode.TTADK
-        elif is_claude:
-            effective_mode = InteractionMode.CLAUDE
-        elif is_coco:
-            effective_mode = InteractionMode.COCO
+        try:
+            effective_mode = InteractionMode(mode)
+        except ValueError:
+            effective_mode = None
 
         header_title = CoreBuilder._build_header_title(project, mode=effective_mode)
 
@@ -709,11 +693,6 @@ class ProjectBuilder:
             CoreBuilder._build_directory_element(project),
             {"tag": "hr"},
         ]
-        if is_ttadk:
-            ttadk_status = CoreBuilder._build_ttadk_status_element(project)
-            if ttadk_status:
-                elements.append(ttadk_status)
-                elements.append({"tag": "hr"})
         elements.append(CoreBuilder._build_content_element(content))
         elements.extend(build_responsive_layout(buttons))
 
@@ -727,10 +706,6 @@ class ProjectBuilder:
     @staticmethod
     def build_claude_resume_card(project: ProjectContext) -> tuple[str, str]:
         return ProjectBuilder._build_resume_card(project, "claude")
-
-    @staticmethod
-    def build_ttadk_resume_card(project: ProjectContext) -> tuple[str, str]:
-        return ProjectBuilder._build_resume_card(project, "ttadk")
 
     @staticmethod
     def build_project_created_card(

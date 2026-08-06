@@ -42,12 +42,10 @@ def test_startup_collaborators_are_independently_testable():
     )
 
     assert select_startup_backend("claude") == StartupBackend.CLI
-    assert select_startup_backend("ttadk_coco") == StartupBackend.TTADK_CLI
     assert select_startup_backend("coco") == StartupBackend.ACP
     def starter(**kwargs):
         return None
     assert should_try_injected_starter("coco", starter=starter) is True
-    assert should_try_injected_starter("ttadk_coco", starter=starter) is False
 
     assert normalize_startup_cwd(".", normalize_fn=lambda raw: "/repo") == "/repo"
     assert normalize_startup_cwd("/repo", normalize_fn=lambda raw: "") == "/repo"
@@ -78,7 +76,7 @@ def test_startup_error_classes_have_distinct_outcomes():
     assert exhausted.kind == StartupErrorKind.DEGRADED
     assert exhausted.action == StartupErrorAction.REQUIRES_USER_ACTION
 
-    fatal = classify_startup_error(RuntimeError("bad ttadk model"), phase="ttadk_cli", attempt=1, retries=1)
+    fatal = classify_startup_error(RuntimeError("bad backend"), phase="unsupported_backend", attempt=1, retries=1)
     assert fatal.kind == StartupErrorKind.FATAL
     assert fatal.action == StartupErrorAction.RAISE
 
@@ -163,12 +161,9 @@ def test_session_startup_coordinator_is_split_into_startup_collaborators():
     assert "def start(self, request: SessionStartupRequest)" in startup_source
     for helper_name in (
         "InjectedStarterFallback",
-        "CwdNormalizer",
-        "TtadkCliStarter",
         "AcpRetryStarter",
         "StartupFailureReporter",
         "select_startup_backend",
-        "precheck_ttadk_cli_startup",
         "build_retry_plan",
         "build_manager_startup_diagnostics",
     ):
@@ -188,13 +183,11 @@ def test_session_startup_coordinator_start_is_only_an_orchestrator():
     assert target is not None
 
     forbidden_call_names = {
-        "precheck_ttadk_cli_startup",
         "build_manager_startup_diagnostics",
         "build_startup_diagnostics",
         "run_startup_operation",
         "SyncACPSession",
         "SyncClaudeCLISession",
-        "SyncTTADKCLISession",
     }
     calls: list[str] = []
     for call in (node for node in ast.walk(target) if isinstance(node, ast.Call)):
@@ -219,7 +212,6 @@ def test_session_startup_coordinator_delegates_backend_specific_branches_to_stra
     assert "StartupBackendStrategy" in class_names
     assert "AcpStartupBackendStrategy" in class_names
     assert "CliStartupBackendStrategy" in class_names
-    assert "TtadkCliStartupBackendStrategy" in class_names
 
     coordinator = next(
         node for node in ast.walk(tree)
@@ -228,7 +220,6 @@ def test_session_startup_coordinator_delegates_backend_specific_branches_to_stra
     coordinator_method_names = {
         node.name for node in coordinator.body if isinstance(node, ast.FunctionDef)
     }
-    assert "_start_ttadk_cli_session" not in coordinator_method_names
     assert "_start_retry_backend_session" not in coordinator_method_names
 
     start_method = next(
@@ -244,71 +235,14 @@ def test_session_startup_coordinator_delegates_backend_specific_branches_to_stra
                 compared_names.append(item.id)
             elif isinstance(item, ast.Attribute):
                 compared_names.append(item.attr)
-        if "backend" in compared_names or any(name in {"ACP", "CLI", "TTADK_CLI"} for name in compared_names):
+        if "backend" in compared_names or any(name in {"ACP", "CLI"} for name in compared_names):
             backend_branch_lines.append(node.lineno)
 
     assert backend_branch_lines == [], f"coordinator.start 仍包含后端特定分支: {backend_branch_lines}"
 
 
-def test_ttdak_cli_starter_resolves_session_class_and_prechecks_model():
-    from src.acp.startup_utils import TtadkCliStarter
-
-    class OriginalSession:
-        pass
-
-    class PatchedSession:
-        def __init__(self, *, agent_type: str, cwd: str, model_name: str | None) -> None:
-            self.agent_type = agent_type
-            self.cwd = cwd
-            self.model_name = model_name
-
-        def start(self, startup_timeout: float) -> str:
-            assert startup_timeout == pytest.approx(10.0)
-            return "sid-ttadk"
-
-    manager = object()
-    precheck_calls: list[dict[str, object]] = []
-
-    def precheck_fn(**kwargs):
-        precheck_calls.append(kwargs)
-        return {"model": "resolved-model"}
-
-    result = TtadkCliStarter().start(
-        agent_type="ttadk_coco",
-        cwd="/repo",
-        model_name="wanted-model",
-        manager_factory=lambda: manager,
-        precheck_fn=precheck_fn,
-        manager_session_cls=OriginalSession,
-        agent_session_cls=PatchedSession,
-        original_session_cls=OriginalSession,
-        start_operation=lambda fn, **kwargs: fn(**kwargs),
-        deadline_monotonic=110.0,
-        monotonic_fn=lambda: 100.0,
-    )
-
-    assert isinstance(result.session, PatchedSession)
-    assert result.actual_id == "sid-ttadk"
-    assert result.resolved_model == "resolved-model"
-    assert precheck_calls == [
-        {
-            "agent_type": "ttadk_coco",
-            "cwd": "/repo",
-            "model_intent": "wanted-model",
-            "manager": manager,
-        }
-    ]
 
 
-def test_startup_utils_do_not_expose_ttadk_to_acp_direct_fallback():
-    from src.acp import startup_utils
-
-    exported_names = set(dir(startup_utils))
-
-    assert not any(
-        name.startswith("_degrade_ttadk") and "acp" in name
-        for name in exported_names
-    )
 
 
 def test_acp_retry_starter_retries_and_builds_diagnostics_without_success_side_effects():

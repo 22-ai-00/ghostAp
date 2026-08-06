@@ -4,7 +4,7 @@ This module is the SSOT for mapping interaction mode to:
 - UI engine display name
 - backend agent_type
 - optional model_name
-- transport kind (acp/cli/ttadk_cli)
+- transport kind (acp/cli)
 """
 
 from __future__ import annotations
@@ -26,8 +26,6 @@ class EngineIdentity:
 def resolve_engine_identity(
     *,
     mode: InteractionMode,
-    ttadk_tool_name: Optional[str] = None,
-    ttadk_model_name: Optional[str] = None,
     acp_tool_name: Optional[str] = None,
     acp_model_name: Optional[str] = None,
 ) -> EngineIdentity:
@@ -50,11 +48,6 @@ def resolve_engine_identity(
     if mode == InteractionMode.TRAEX:
         model = acp_model_name if (acp_tool_name or "").strip().lower() == "traex" else None
         return EngineIdentity(engine_name="Traex", agent_type="traex", model_name=model, transport="acp")
-
-    if mode == InteractionMode.TTADK:
-        tool = (ttadk_tool_name or "").strip().lower() or "coco"
-        model = (ttadk_model_name or "").strip() or None
-        return EngineIdentity(engine_name="TTADK", agent_type=f"ttadk_{tool}", model_name=model, transport="ttadk_cli")
 
     # SMART / COCO / SHELL default to Coco engine for orchestrators
     model = acp_model_name if (acp_tool_name or "").strip().lower() == "coco" else None

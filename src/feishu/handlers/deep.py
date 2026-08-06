@@ -59,8 +59,6 @@ class DeepHandler(BaseEngineHandler):
         current_mode = self.ctx.mode_manager.get_mode(chat_id, project_id=project_id)
         identity = resolve_engine_identity(
             mode=current_mode,
-            ttadk_tool_name=getattr(project, "ttadk_tool_name", None) if project else None,
-            ttadk_model_name=getattr(project, "ttadk_model_name", None) if project else None,
             acp_tool_name=getattr(project, "acp_tool_name", None) if project else None,
             acp_model_name=getattr(project, "acp_model_name", None) if project else None,
         )

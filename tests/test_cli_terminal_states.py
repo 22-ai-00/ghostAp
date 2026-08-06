@@ -16,7 +16,6 @@ import pytest
 
 from src.agent_session.claude_cli import ClaudeCLIConfig, SyncClaudeCLISession
 from src.agent_session.process_cleanup import terminate_and_reap_process_tree
-from src.agent_session.ttadk_cli import SyncTTADKCLISession
 
 
 class _CompletedProcess:
@@ -72,36 +71,6 @@ class _CancelOnOutputProcess(_DelayedOutputProcess):
         yield "partial output\n"
 
 
-class _SilentTTADKProcess:
-    def __init__(self, natural_exit_after: float = 0.5) -> None:
-        self.stderr = io.StringIO("")
-        self.returncode: int | None = None
-        self.terminate_calls = 0
-        self._closed = threading.Event()
-        self._natural_exit_after = natural_exit_after
-        self.stdout = self._stdout()
-
-    def _stdout(self):
-        if not self._closed.wait(self._natural_exit_after):
-            self.returncode = 0
-            self._closed.set()
-        if False:
-            yield ""
-
-    def poll(self) -> int | None:
-        return self.returncode
-
-    def wait(self, timeout: float = 0) -> int:
-        if self.returncode is None:
-            self._closed.wait(timeout)
-        if self.returncode is None:
-            raise TimeoutError("process did not stop")
-        return self.returncode
-
-    def terminate(self) -> None:
-        self.terminate_calls += 1
-        self.returncode = -15
-        self._closed.set()
 
 
 class _StubbornTimeoutProcess:
@@ -214,28 +183,6 @@ def test_claude_fresh_retry_propagates_second_terminal_state(
     assert result.stop_reason == terminal_state
 
 
-def test_ttadk_silent_process_is_terminated_at_timeout() -> None:
-    session = SyncTTADKCLISession(agent_type="ttadk_codex", cwd="/tmp")
-    session.session_id = "session-1"
-    process = _SilentTTADKProcess()
-
-    with (
-        patch(
-            "src.agent_session.ttadk_cli.build_ttadk_subprocess_env",
-            return_value=({}, None),
-        ),
-        patch(
-            "src.agent_session.ttadk_cli.subprocess.Popen",
-            return_value=process,
-        ),
-    ):
-        started_at = time.monotonic()
-        result = session.send_prompt("work", timeout=0.01)
-        elapsed = time.monotonic() - started_at
-
-    assert result.stop_reason == "timeout"
-    assert process.terminate_calls == 1
-    assert elapsed < process._natural_exit_after
 
 
 def test_claude_timeout_kills_stubborn_process_and_stays_timeout() -> None:
@@ -255,28 +202,6 @@ def test_claude_timeout_kills_stubborn_process_and_stays_timeout() -> None:
     assert session._proc is None
 
 
-def test_ttadk_timeout_kills_stubborn_process_and_stays_timeout() -> None:
-    session = SyncTTADKCLISession(agent_type="ttadk_codex", cwd="/tmp")
-    session.session_id = "session-1"
-    process = _StubbornTimeoutProcess()
-
-    with (
-        patch(
-            "src.agent_session.ttadk_cli.build_ttadk_subprocess_env",
-            return_value=({}, None),
-        ),
-        patch(
-            "src.agent_session.ttadk_cli.subprocess.Popen",
-            return_value=process,
-        ),
-    ):
-        result = session.send_prompt("work", timeout=0.01)
-
-    assert result.stop_reason == "timeout"
-    assert process.terminate_calls >= 1
-    assert process.kill_calls == 1
-    assert process.poll() == -9
-    assert session._proc is None
 
 
 def test_claude_watchdog_kills_term_ignoring_process_with_blocked_stdout() -> None:
@@ -309,45 +234,9 @@ def test_claude_watchdog_kills_term_ignoring_process_with_blocked_stdout() -> No
     assert session._proc is None
 
 
-def test_ttadk_watchdog_kills_term_ignoring_process_with_blocked_stdout() -> None:
-    session = SyncTTADKCLISession(agent_type="ttadk_codex", cwd="/tmp")
-    session.session_id = "session-1"
-    process = _TermIgnoringTimeoutProcess()
-    observed: list[object] = []
-
-    with (
-        patch(
-            "src.agent_session.ttadk_cli.build_ttadk_subprocess_env",
-            return_value=({}, None),
-        ),
-        patch(
-            "src.agent_session.ttadk_cli.subprocess.Popen",
-            return_value=process,
-        ),
-    ):
-        worker = threading.Thread(
-            target=lambda: observed.append(
-                session.send_prompt("work", timeout=0.01)
-            ),
-            daemon=True,
-        )
-        worker.start()
-        worker.join(timeout=1.5)
-        completed_without_external_kill = not worker.is_alive()
-        if worker.is_alive():
-            process.kill()
-            worker.join(timeout=1)
-
-    assert completed_without_external_kill
-    assert observed and observed[0].stop_reason == "timeout"
-    assert process.terminate_calls >= 1
-    assert process.kill_calls == 1
-    assert process.events[-2:] == ["kill", "wait"]
-    assert session._proc is None
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-@pytest.mark.parametrize("backend", ["claude", "ttadk"])
 @pytest.mark.parametrize(
     ("leader_tail", "expected_stop_reason"),
     [
@@ -357,7 +246,6 @@ def test_ttadk_watchdog_kills_term_ignoring_process_with_blocked_stdout() -> Non
     ids=["leader-running", "leader-exits"],
 )
 def test_cli_watchdog_kills_descendant_that_inherits_stdout(
-    backend: str,
     leader_tail: str,
     expected_stop_reason: str,
 ) -> None:
@@ -396,46 +284,21 @@ def test_cli_watchdog_kills_descendant_that_inherits_stdout(
         spawned.append(process)
         return process
 
-    if backend == "claude":
-        session = _claude_session()
-        patches = (
-            patch(
-                "src.agent_session.claude_cli.subprocess.Popen",
-                side_effect=spawn_descendant,
-            ),
-            patch(
-                "src.agent_session.claude_cli._CLI_TERMINATE_GRACE_S",
-                0.1,
-            ),
-            patch(
-                "src.agent_session.claude_cli._CLI_KILL_GRACE_S",
-                0.2,
-            ),
-        )
-    else:
-        session = SyncTTADKCLISession(
-            agent_type="ttadk_codex",
-            cwd="/tmp",
-        )
-        session.session_id = "session-1"
-        patches = (
-            patch(
-                "src.agent_session.ttadk_cli.build_ttadk_subprocess_env",
-                return_value=({}, None),
-            ),
-            patch(
-                "src.agent_session.ttadk_cli.subprocess.Popen",
-                side_effect=spawn_descendant,
-            ),
-            patch(
-                "src.agent_session.ttadk_cli._CLI_TERMINATE_GRACE_S",
-                0.1,
-            ),
-            patch(
-                "src.agent_session.ttadk_cli._CLI_KILL_GRACE_S",
-                0.2,
-            ),
-        )
+    session = _claude_session()
+    patches = (
+        patch(
+            "src.agent_session.claude_cli.subprocess.Popen",
+            side_effect=spawn_descendant,
+        ),
+        patch(
+            "src.agent_session.claude_cli._CLI_TERMINATE_GRACE_S",
+            0.1,
+        ),
+        patch(
+            "src.agent_session.claude_cli._CLI_KILL_GRACE_S",
+            0.2,
+        ),
+    )
 
     observed: list[object] = []
     completed_without_external_kill = False
@@ -503,16 +366,8 @@ def test_process_group_receives_full_term_grace_before_kill() -> None:
     assert signal.SIGKILL not in signals
 
 
-@pytest.mark.parametrize("backend", ["claude", "ttadk"])
-def test_cli_close_failure_keeps_process_handle_and_raises(backend: str) -> None:
-    if backend == "claude":
-        session = _claude_session()
-    else:
-        session = SyncTTADKCLISession(
-            agent_type="ttadk_codex",
-            cwd="/tmp",
-        )
-        session.session_id = "session-1"
+def test_cli_close_failure_keeps_process_handle_and_raises() -> None:
+    session = _claude_session()
     process = _UnkillableProcess()
     session._proc = process
 
@@ -525,24 +380,9 @@ def test_cli_close_failure_keeps_process_handle_and_raises(backend: str) -> None
     assert process.kill_calls >= 1
 
 
-@pytest.mark.parametrize("backend", ["claude", "ttadk"])
-def test_cli_close_failure_keeps_process_group_handle(
-    backend: str,
-) -> None:
-    if backend == "claude":
-        session = _claude_session()
-        cleanup_path = (
-            "src.agent_session.claude_cli._terminate_and_reap_process"
-        )
-    else:
-        session = SyncTTADKCLISession(
-            agent_type="ttadk_codex",
-            cwd="/tmp",
-        )
-        session.session_id = "session-1"
-        cleanup_path = (
-            "src.agent_session.ttadk_cli._terminate_and_reap_process"
-        )
+def test_cli_close_failure_keeps_process_group_handle() -> None:
+    session = _claude_session()
+    cleanup_path = "src.agent_session.claude_cli._terminate_and_reap_process"
 
     process = object()
     process_group_id = 987_654_321

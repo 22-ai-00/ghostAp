@@ -432,7 +432,7 @@ class MessageDispatcher:
             )
             return
 
-        # Programming mode (Coco / Claude / TTADK): exit or forward to active session
+        # Programming mode: exit or forward to active session
         if is_in_programming:
             if not current_dispatch_allowed():
                 return
@@ -612,7 +612,6 @@ class MessageDispatcher:
                 IntentType.ENTER_CODEX,
                 IntentType.ENTER_GEMINI,
                 IntentType.ENTER_TRAEX,
-                IntentType.TTADK_MESSAGE,
             }:
                 break
 
@@ -721,8 +720,6 @@ class MessageDispatcher:
         # Mode message
         elif intent in self._MODE_MESSAGE_MAP:
             self._handle_mode_message(self._MODE_MESSAGE_MAP[intent], data, message_id, chat_id, original_text, project)
-        elif intent == IntentType.TTADK_MESSAGE:
-            self._handle_ttadk_message(data, message_id, chat_id, original_text, project)
         # System commands
         elif intent == IntentType.CHANGE_DIR:
             self.client._change_directory(message_id, chat_id, data.get("path", ""), project)
@@ -851,19 +848,6 @@ class MessageDispatcher:
             getattr(self.client, f"_show_{mode}_info")(message_id, chat_id, project)
         else:
             getattr(self.client, f"_handle_{mode}_message")(message_id, chat_id, original_text, project)
-
-    def _handle_ttadk_message(self, data: dict, message_id: str, chat_id: str, original_text: str, project):
-        from ..mode import InteractionMode
-        if data.get("command") == "info":
-            self.client._show_ttadk_info(message_id, chat_id, project)
-        elif str(original_text or "").strip().lower() in {"/ttadk", "/enter_ttadk"}:
-            self.client._handle_ttadk_command(message_id, chat_id, project)
-        else:
-            _pid = project.project_id if project else None
-            mode = self.client._mode_manager.get_mode(chat_id, project_id=_pid)
-            if mode != InteractionMode.TTADK:
-                self.client._enter_ttadk_mode(message_id, chat_id, project=project)
-            self.client._ttadk_handler.handle_message(message_id, chat_id, original_text, project)
 
     def _dispatch_project(self, intent, data: dict, message_id: str, chat_id: str, project):
         if intent == IntentType.CREATE_PROJECT:
@@ -1010,11 +994,6 @@ class MessageDispatcher:
                     working_dir = self.client._get_working_dir(chat_id)
                     self.client._system_handler.execute_shell_and_reply(message_id, chat_id, cmd, working_dir, project)
                 return True
-            elif intent == IntentType.TTADK_MESSAGE:
-                self.client._enter_ttadk_mode(message_id, chat_id, silent=True, project=project)
-                self.client._reply_text(message_id, UI_TEXT["multi_task_step_success"].format(step=step_num, desc="已进入 TTADK 模式"))
-                return True
-
             else:
                 return False
 
@@ -1029,7 +1008,6 @@ class MessageDispatcher:
         IntentType.ENTER_AIDEN: "进入 Aiden 编程模式",
         IntentType.ENTER_CODEX: "进入 Codex 编程模式",
         IntentType.ENTER_GEMINI: "进入 Gemini 编程模式",
-        IntentType.TTADK_MESSAGE: "进入 TTADK 编程模式",
         IntentType.EXIT_COCO: "退出 Coco 模式",
         IntentType.EXIT_CLAUDE: "退出 Claude 模式",
         IntentType.EXIT_AIDEN: "退出 Aiden 模式",

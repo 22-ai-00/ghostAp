@@ -21,8 +21,6 @@ from src.feishu.handlers.programming import (
     ClaudeModeHandler,
     CocoModeHandler,
     ProgrammingModeHandler,
-    TTADKModeHandler,
-    build_programming_session_callbacks,
 )
 from src.feishu.handlers.project import ProjectHandler
 from src.feishu.handlers.spec import SpecHandler
@@ -31,7 +29,6 @@ from src.feishu.handlers.workflow import WorkflowHandler
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.mode.manager import InteractionMode
 from src.project.context import ProjectContext, SessionSnapshot
-from src.ttadk.models import TTADKModel, TTADKTool
 
 # ======================================================================
 # Shared fixture: mock HandlerContext
@@ -53,7 +50,6 @@ def _make_handler_context(**overrides) -> HandlerContext:
         codex_manager=MagicMock(),
         gemini_manager=MagicMock(),
         traex_manager=MagicMock(),
-        ttadk_manager=MagicMock(),
         tui2acp_manager=MagicMock(),
         intent_recognizer=MagicMock(),
         scheduler=MagicMock(),
@@ -88,7 +84,6 @@ def _set_all_programming_mode_flags(ctx, value: bool) -> None:
     ctx.mode_manager.is_aiden_mode.return_value = value
     ctx.mode_manager.is_codex_mode.return_value = value
     ctx.mode_manager.is_gemini_mode.return_value = value
-    ctx.mode_manager.is_ttadk_mode.return_value = value
 
 
 def _collect_buttons(card: dict) -> list[dict]:
@@ -339,7 +334,6 @@ class TestSystemHandlerPredicates:
         assert SystemHandler.is_interceptable_command_match(m("/帮助")) is True
         assert SystemHandler.is_interceptable_command_match(m("/codex")) is True
         assert SystemHandler.is_interceptable_command_match(m("/coco")) is True
-        assert SystemHandler.is_interceptable_command_match(m("/enter_ttadk")) is True
         assert SystemHandler.is_interceptable_command_match(m("/coco_status")) is True
         assert SystemHandler.is_interceptable_command_match(m("/tools")) is True
         assert SystemHandler.is_interceptable_command_match(m("/btw remember this")) is True
@@ -368,7 +362,6 @@ class TestSystemHandlerRouting:
             "project": MagicMock(),
             "deep": MagicMock(),
             "diagnostics": MagicMock(),
-            "ttadk": MagicMock(),
         })
         # Keep attributes for test assertions
         handler.coco_handler = ctx.handlers["coco"]
@@ -376,7 +369,6 @@ class TestSystemHandlerRouting:
         handler.project_handler = ctx.handlers["project"]
         handler.deep_handler = ctx.handlers["deep"]
         handler.diagnostics_handler = ctx.handlers["diagnostics"]
-        handler.ttadk_handler = ctx.handlers["ttadk"]
         return handler
 
     def test_route_help(self):
@@ -391,7 +383,6 @@ class TestSystemHandlerRouting:
         assert h.help_commands.show_full_help.__func__ is h.show_full_help.__func__
         assert h.shell_commands.submit_shell_command.__func__ is h.submit_shell_command.__func__
         assert h.acp_commands.handle_acp_command.__func__ is h.handle_acp_command.__func__
-        assert h.ttadk_commands.handle_ttadk_command.__func__ is h.handle_ttadk_command.__func__
         assert h.lock_commands.handle_force_release_repo_lock.__func__ is h.handle_force_release_repo_lock.__func__
 
     def test_route_coco_info(self):
@@ -570,198 +561,13 @@ class TestSystemHandlerRouting:
         h.exit_current_mode("m1", "c1", None)
         h.coco_handler.exit_mode.assert_called_once_with("m1", "c1", None)
 
-    def test_handle_ttadk_command_shows_tool_select_even_when_configured(self):
-        ctx = _make_handler_context()
-        h = SystemHandler(ctx)
-        h.ttadk_handler = MagicMock()
-        h.reply_error = MagicMock()
-        h.reply_text = MagicMock()
 
-        project = MagicMock()
-        project.project_id = "p1"
-        project.ttadk_tool_name = "codex"
-        project.ttadk_model_name = "gpt-5.2"
-        project.ttadk_yolo_enabled = False
-        project.root_path = "/tmp"
 
-        tools = [TTADKTool(name="codex", description="Codex")]
-        with (
-            patch("src.feishu.handlers.ttadk_commands.CardBuilder.build_ttadk_combined_select_card", return_value=("interactive", "{}")) as mock_build,
-            patch("src.feishu.handlers.ttadk_commands.get_ttadk_manager") as mock_manager,
-        ):
-            manager = MagicMock()
-            manager.get_tools.return_value = SimpleNamespace(tools=tools, error=None, warnings=[])
-            manager.get_models.return_value = SimpleNamespace(models=[], error=None)
-            manager.get_current_tool.return_value = "codex"
-            mock_manager.return_value = manager
 
-            h.handle_ttadk_command("m1", "c1", project, force_select=True)
 
-            h.ttadk_handler.enter_mode.assert_not_called()
-            mock_build.assert_called_once()
 
-    def test_handle_ttadk_command_always_shows_tool_card(self):
-        ctx = _make_handler_context()
-        h = SystemHandler(ctx)
-        h.reply_card = MagicMock()
 
-        project = MagicMock()
-        project.project_id = "p1"
-        project.ttadk_tool_name = "codex"
-        project.ttadk_model_name = "gpt-5.2"
-        project.ttadk_yolo_enabled = False
-        project.root_path = "/tmp"
 
-        tools = [
-            TTADKTool(name="codex", description=""),
-            TTADKTool(name="claude", description=""),
-        ]
-
-        manager = MagicMock()
-        manager.get_current_tool.return_value = ""
-        manager.get_current_model.return_value = ""
-        manager.get_tools.return_value = SimpleNamespace(tools=tools, error=None)
-
-        with patch("src.feishu.handlers.ttadk_commands.get_ttadk_manager", return_value=manager):
-            h.handle_ttadk_command("m1", "c1", project)
-
-        h.reply_card.assert_called_once()
-        call_args = h.reply_card.call_args
-        card_json = call_args[0][1]
-        assert "TTADK" in card_json
-
-    def test_handle_ttadk_command_no_defaults_shows_tool_card(self):
-        ctx = _make_handler_context()
-        h = SystemHandler(ctx)
-        h.reply_text = MagicMock()
-        h.reply_error = MagicMock()
-
-        project = MagicMock()
-        project.project_id = "p1"
-        project.ttadk_tool_name = ""
-        project.ttadk_model_name = ""
-        project.ttadk_yolo_enabled = False
-        project.root_path = "/tmp"
-
-        tools = [
-            TTADKTool(name="codex", description=""),
-            TTADKTool(name="claude", description=""),
-        ]
-
-        manager = MagicMock()
-        manager.get_current_tool.return_value = ""
-        manager.get_tools.return_value = SimpleNamespace(tools=tools, error=None)
-
-        with (
-            patch("src.feishu.handlers.ttadk_commands.get_ttadk_manager", return_value=manager),
-            patch("src.feishu.handlers.ttadk_commands.CardBuilder") as mock_builder,
-        ):
-            mock_builder.build_ttadk_combined_select_card.return_value = ("interactive", "{}")
-            h.handle_ttadk_command("m1", "c1", project)
-
-        mock_builder.build_ttadk_combined_select_card.assert_called_once()
-
-    def test_handle_select_ttadk_tool_no_default_model_shows_card(self):
-        ctx = _make_handler_context()
-        h = SystemHandler(ctx)
-        h.reply_text = MagicMock()
-        h.reply_error = MagicMock()
-        h.update_card = MagicMock(return_value=True)
-        h.handle_select_ttadk_model = MagicMock()
-
-        project = MagicMock()
-        project.project_id = "p1"
-        project.root_path = "/tmp"
-        project.ttadk_yolo_enabled = False
-        project.ttadk_model_name = ""
-        ctx.project_manager.get_project.return_value = project
-
-        manager = MagicMock()
-        manager.set_tool.return_value = True
-        manager.get_current_model.return_value = None
-        manager.get_models.return_value = SimpleNamespace(
-            models=[
-                TTADKModel(name="gpt-5.2", description="", is_default=False),
-                TTADKModel(name="gpt-4.1", description="", is_default=False),
-            ],
-            error=None,
-            warnings=[],
-        )
-
-        with (
-            patch("src.feishu.handlers.ttadk_commands.get_ttadk_manager", return_value=manager),
-            patch("src.feishu.handlers.ttadk_commands.CardBuilder") as mock_builder,
-        ):
-            mock_builder.build_ttadk_model_select_card.return_value = ("interactive", "{}")
-            h.handle_select_ttadk_tool("m1", "c1", "codex", "p1")
-
-        h.handle_select_ttadk_model.assert_not_called()
-        mock_builder.build_ttadk_model_select_card.assert_called_once()
-
-    def test_handle_ttadk_command_tool_list_error_returns_hint(self):
-        ctx = _make_handler_context()
-        h = SystemHandler(ctx)
-        h.reply_card = MagicMock()
-        ctx.project_manager.get_active_project.return_value = None
-
-        manager = MagicMock()
-        manager.get_tools.return_value = SimpleNamespace(tools=[], error="offline")
-
-        with patch("src.feishu.handlers.ttadk_commands.get_ttadk_manager", return_value=manager):
-            h.handle_ttadk_command("m1", "c1", None)
-
-        h.reply_card.assert_called_once()
-        assert "已为你保留选择" in str(h.reply_card.call_args)
-        assert "继续进入TTADK" in str(h.reply_card.call_args)
-
-    def test_handle_select_ttadk_tool_model_list_error_returns_hint(self):
-        ctx = _make_handler_context()
-        h = SystemHandler(ctx)
-        h.reply_card = MagicMock()
-
-        project = MagicMock()
-        project.project_id = "p1"
-        project.root_path = "/tmp"
-        ctx.project_manager.get_project.return_value = project
-
-        manager = MagicMock()
-        manager.set_tool.return_value = True
-        manager.get_models.return_value = SimpleNamespace(models=[], error="timeout", warnings=[])
-
-        with patch("src.feishu.handlers.ttadk_commands.get_ttadk_manager", return_value=manager):
-            h.handle_select_ttadk_tool("m1", "c1", "codex", "p1")
-
-        h.reply_card.assert_called_once()
-        assert "已为你保留选择" in str(h.reply_card.call_args)
-        assert "继续进入TTADK" in str(h.reply_card.call_args)
-
-    def test_handle_select_ttadk_model_set_failure_returns_hint(self):
-        ctx = _make_handler_context()
-        h = SystemHandler(ctx)
-        h.reply_card = MagicMock()
-        h.reply_error = MagicMock()
-
-        manager = MagicMock()
-        manager.set_model.return_value = False
-
-        with patch("src.feishu.handlers.ttadk_commands.get_ttadk_manager", return_value=manager):
-            h.handle_select_ttadk_model("m1", "c1", "codex", "gpt-5.2", project=None)
-
-        assert h.reply_card.call_count == 2
-        h.reply_error.assert_not_called()
-        assert "已为你保留选择" in str(h.reply_card.call_args_list[-1])
-        assert "继续进入TTADK" in str(h.reply_card.call_args_list[-1])
-
-    def test_ttadk_flow_duration_is_recorded(self):
-        ctx = _make_handler_context()
-        h = SystemHandler(ctx)
-
-        with patch("src.feishu.handlers.ttadk_commands.time.perf_counter", side_effect=[10.0, 10.45]):
-            h._mark_ttadk_flow_start("c1")
-            h._report_ttadk_flow_duration("c1", "p1", "enter_mode")
-
-        assert h._ttadk_flow_last_duration_ms["c1"] == 450  # rounded to nearest ms
-        assert "c1" not in h._ttadk_flow_start_times
 
     def test_show_tools_list_uses_cached_availability_api(self):
         h = self._make()
@@ -788,7 +594,6 @@ class TestCocoModeHandler:
             "aiden": MagicMock(),
             "codex": MagicMock(),
             "gemini": MagicMock(),
-            "ttadk": MagicMock(),
         })
         # Keep attributes for test assertions
         h._opposite_handler = ctx.handlers["claude"]
@@ -796,7 +601,6 @@ class TestCocoModeHandler:
         h._aiden_handler = ctx.handlers["aiden"]
         h._codex_handler = ctx.handlers["codex"]
         h._gemini_handler = ctx.handlers["gemini"]
-        h._ttadk_handler = ctx.handlers["ttadk"]
         return h, ctx
 
     def test_mode_attributes(self):
@@ -888,8 +692,6 @@ class TestCocoModeHandler:
         h, _ = self._make()
         project = SimpleNamespace(
             project_id="p1",
-            ttadk_tool_name=None,
-            ttadk_model_name=None,
             acp_tool_name="coco",
             acp_model_name="selected-model",
         )
@@ -910,13 +712,11 @@ class TestCocoModeHandler:
         h.mode_manager.is_aiden_mode.return_value = True
         h.mode_manager.is_codex_mode.return_value = False
         h.mode_manager.is_gemini_mode.return_value = False
-        h.mode_manager.is_ttadk_mode.return_value = True
         h._exit_opposite_mode("m1", "c1", project=None)
         h._opposite_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
         h._aiden_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
         h._codex_handler.exit_mode.assert_not_called()
         h._gemini_handler.exit_mode.assert_not_called()
-        h._ttadk_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
 
 
 class TestClaudeModeHandler:
@@ -928,7 +728,6 @@ class TestClaudeModeHandler:
             "aiden": MagicMock(),
             "codex": MagicMock(),
             "gemini": MagicMock(),
-            "ttadk": MagicMock(),
         })
         # Keep attributes for test assertions
         h._opposite_handler = ctx.handlers["coco"]
@@ -936,7 +735,6 @@ class TestClaudeModeHandler:
         h._aiden_handler = ctx.handlers["aiden"]
         h._codex_handler = ctx.handlers["codex"]
         h._gemini_handler = ctx.handlers["gemini"]
-        h._ttadk_handler = ctx.handlers["ttadk"]
         return h, ctx
 
     def test_mode_attributes(self):
@@ -959,302 +757,13 @@ class TestClaudeModeHandler:
         h.mode_manager.is_aiden_mode.return_value = True
         h.mode_manager.is_codex_mode.return_value = False
         h.mode_manager.is_gemini_mode.return_value = True
-        h.mode_manager.is_ttadk_mode.return_value = False
         h._exit_opposite_mode("m1", "c1", project=None)
         h._opposite_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
         h._aiden_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
         h._codex_handler.exit_mode.assert_not_called()
         h._gemini_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
-        h._ttadk_handler.exit_mode.assert_not_called()
 
 
-class TestTTADKModeHandler:
-    def _make(self, **ctx_overrides):
-        ctx = _make_handler_context(**ctx_overrides)
-        h = TTADKModeHandler(ctx)
-        ctx.handlers.update({
-            "coco": MagicMock(),
-            "claude": MagicMock(),
-            "aiden": MagicMock(),
-            "codex": MagicMock(),
-            "gemini": MagicMock(),
-        })
-        # Keep attributes for test assertions
-        h._coco_handler = ctx.handlers["coco"]
-        h._claude_handler = ctx.handlers["claude"]
-        h._aiden_handler = ctx.handlers["aiden"]
-        h._codex_handler = ctx.handlers["codex"]
-        h._gemini_handler = ctx.handlers["gemini"]
-        return h, ctx
-
-    def test_is_in_opposite_mode_checks_all_other_programming_modes(self):
-        h, ctx = self._make()
-        _set_all_programming_mode_flags(ctx, False)
-        ctx.mode_manager.is_aiden_mode.return_value = True
-        assert h._is_in_opposite_mode("c1") is True
-
-    def test_exit_opposite_mode(self):
-        h, _ = self._make()
-        h.mode_manager.is_coco_mode.return_value = True
-        h.mode_manager.is_claude_mode.return_value = False
-        h.mode_manager.is_aiden_mode.return_value = True
-        h.mode_manager.is_codex_mode.return_value = True
-        h.mode_manager.is_gemini_mode.return_value = False
-        h._exit_opposite_mode("m1", "c1", project=None)
-        h._coco_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
-        h._claude_handler.exit_mode.assert_not_called()
-        h._aiden_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
-        h._codex_handler.exit_mode.assert_called_once_with("m1", "c1", project=None, silent=False)
-        h._gemini_handler.exit_mode.assert_not_called()
-
-    def test_set_mode_on_project_activate_does_not_hardcode_other_modes(self):
-        h, _ = self._make()
-        project = MagicMock()
-        h._set_mode_on_project(project, True, "sid", 4)
-        project.set_programming_mode.assert_called_once_with("ttadk", True, "sid", 4)
-        project.set_coco_mode.assert_not_called()
-        project.set_claude_mode.assert_not_called()
-
-    def test_programming_session_callbacks_react_only_for_user_task_completion(self):
-        from src.card.state.models import CardMetadata, CardState
-
-        add_reaction = MagicMock()
-        callbacks = build_programming_session_callbacks(
-            reply_text_fn=MagicMock(),
-            add_reaction=add_reaction,
-            message_id="origin_msg",
-            chat_id="chat_1",
-        )
-
-        assert callbacks.hooks
-        root_state = CardState(metadata=CardMetadata())
-        callbacks.hooks[0].on_terminal(root_state, "completed")
-        add_reaction.assert_called_once_with("origin_msg", "PARTY")
-
-        add_reaction.reset_mock()
-        subagent_state = CardState(metadata=CardMetadata(is_subagent=True))
-        callbacks.hooks[0].on_terminal(subagent_state, "completed")
-        add_reaction.assert_not_called()
-
-    @pytest.mark.parametrize(
-        ("stop_reason", "should_react"),
-        [
-            ("end_turn", True),
-            ("max_turn_requests", False),
-            ("cancelled", False),
-        ],
-    )
-    def test_non_streaming_fallback_reacts_only_after_completed_result(
-        self,
-        stop_reason,
-        should_react,
-    ):
-        from src.acp.models import PromptResult
-
-        h, _ = self._make()
-        h.reply_text = MagicMock()
-        h.reply_card = MagicMock()
-        h.add_reaction = MagicMock()
-        session = MagicMock()
-        session.send_prompt.return_value = PromptResult(
-            stop_reason=stop_reason,
-            text="result",
-        )
-
-        h._handle_response_non_streaming(
-            "origin_msg",
-            "chat_1",
-            "task",
-            session,
-            None,
-            "/repo",
-        )
-
-        if should_react:
-            h.add_reaction.assert_called_once_with("origin_msg", "PARTY")
-        else:
-            h.add_reaction.assert_not_called()
-
-    def test_enter_mode_builds_ttadk_entry_card(self):
-        ctx = _make_handler_context()
-        ctx.mode_manager.is_ttadk_mode.return_value = False
-        ctx.mode_manager.is_coco_mode.return_value = False
-        ctx.mode_manager.is_claude_mode.return_value = False
-        ctx.mode_manager.is_aiden_mode.return_value = False
-        ctx.mode_manager.is_codex_mode.return_value = False
-        ctx.mode_manager.is_gemini_mode.return_value = False
-        ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
-
-        ctx.project_manager.validate_project_path.return_value = (True, "ok")
-        project = MagicMock()
-        project.ttadk_session_snapshot = None
-        project.root_path = "/tmp"
-        project.project_name = "test"
-        project.project_id = "test_id"
-        project.ttadk_mode = False
-        project.coco_mode = False
-        project.claude_mode = False
-        ctx.project_manager.get_or_create_project_for_path.return_value = (project, False)
-
-        sess = MagicMock()
-        sess.session_id = "sid_ttadk"
-        sess.is_resumed = False
-        ctx.ttadk_manager.ensure_session.return_value = sess
-
-        h = TTADKModeHandler(ctx)
-        h._get_agent_type_override = MagicMock(return_value="ttadk_coco")
-        h._get_model_name_override = MagicMock(return_value="gpt-5.2")
-        h.reply_text = MagicMock()
-        h.reply_card = MagicMock(return_value="reply_1")
-        h.reply_card = MagicMock(return_value="reply_1")
-        h.add_reaction = MagicMock()
-        h.record_mode_transition = MagicMock()
-        h.register_message_project = MagicMock()
-
-        with patch("src.feishu.handlers.programming.CardBuilder.build_project_response_card") as mock_build:
-            mock_build.return_value = ("interactive", "{}")
-            h.enter_mode("m1", "c1", project=project)
-
-            mock_build.assert_called_once()
-            _, title, content = mock_build.call_args.args[:3]
-            assert "TTADK编程模式" in title
-            assert "已进入TTADK编程模式" in content
-            h.reply_card.assert_called_once()
-
-    def test_enter_mode_ttadk_degraded_session_sends_structured_error_card(self):
-        ctx = _make_handler_context()
-        ctx.mode_manager.is_ttadk_mode.return_value = False
-        ctx.mode_manager.is_coco_mode.return_value = False
-        ctx.mode_manager.is_claude_mode.return_value = False
-        ctx.mode_manager.is_aiden_mode.return_value = False
-        ctx.mode_manager.is_codex_mode.return_value = False
-        ctx.mode_manager.is_gemini_mode.return_value = False
-        ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
-        ctx.project_manager.validate_project_path.return_value = (True, "ok")
-
-        project = MagicMock()
-        project.ttadk_session_snapshot = None
-        project.root_path = "/tmp"
-        project.project_name = "test"
-        project.project_id = "test_id"
-        ctx.project_manager.get_or_create_project_for_path.return_value = (project, False)
-
-        sess = MagicMock()
-        sess.session_id = "sid_ttadk"
-        sess.is_resumed = False
-        sess._degraded_to = "coco"
-        sess._degraded_reason = "ttadk cli unavailable"
-        ctx.ttadk_manager.ensure_session.return_value = sess
-
-        h = TTADKModeHandler(ctx)
-        h._get_agent_type_override = MagicMock(return_value="ttadk_coco")
-        h._get_model_name_override = MagicMock(return_value="gpt-5.2")
-        h.reply_text = MagicMock()
-        h.reply_card = MagicMock(return_value="reply_1")
-        h.add_reaction = MagicMock()
-        h.record_mode_transition = MagicMock()
-        h.register_message_project = MagicMock()
-
-        with patch("src.feishu.handlers.programming.CardBuilder.build_project_response_card") as mock_build:
-            mock_build.return_value = ("interactive", "{}")
-            h.enter_mode("m1", "c1", project=project)
-
-        mock_build.assert_not_called()
-
-        h.reply_text.assert_not_called()
-        assert h.reply_card.call_count == 1
-        degraded_card = json.loads(h.reply_card.call_args_list[0].args[1])
-        card_text = json.dumps(degraded_card, ensure_ascii=False)
-        buttons = _collect_buttons(degraded_card)
-        button_blocks = _collect_button_layout_blocks(degraded_card)
-
-        assert "🟡 降级错误" in card_text
-        assert [button["value"]["action"] for button in button_blocks[-3]] == ["continue_degraded"]
-        assert [button["value"]["action"] for button in button_blocks[-2]] == ["show_error_details"]
-        assert [button["value"]["action"] for button in button_blocks[-1]] == ["retry_original"]
-        continue_payload = button_blocks[-3][0]["value"]
-        detail_payload = button_blocks[-2][0]["value"]
-        retry_payload = button_blocks[-1][0]["value"]
-        assert buttons[0]["text"]["content"] == "继续使用 Coco"
-        assert continue_payload == {
-            "action": "continue_degraded",
-            "chat_id": "c1",
-            "origin_message_id": "m1",
-            "degraded_to": "coco",
-        }
-        assert detail_payload["action"] == "show_error_details"
-        assert detail_payload["diagnostic_token"]
-        assert "details" not in detail_payload
-        from src.card.error_diagnostics import render_error_diagnostic
-
-        diagnostic_text = render_error_diagnostic(
-            detail_payload["diagnostic_token"],
-            chat_id="c1",
-            origin_message_id="m1",
-        )
-        assert "ttadk cli unavailable" in diagnostic_text
-        assert "下一步建议" in diagnostic_text
-        assert "重试原模式" in diagnostic_text
-        assert retry_payload == {
-            "action": "retry_original",
-            "chat_id": "c1",
-            "origin_message_id": "m1",
-            "original_mode": "ttadk_coco",
-            "retry_mode": "ttadk_coco",
-            "degraded_to": "coco",
-        }
-        assert continue_payload != retry_payload
-        assert detail_payload != retry_payload
-
-    def test_enter_mode_ttadk_startup_failure_sends_degraded_feedback_without_session_switch(self):
-        ctx = _make_handler_context()
-        ctx.mode_manager.is_ttadk_mode.return_value = False
-        ctx.mode_manager.is_coco_mode.return_value = False
-        ctx.mode_manager.is_claude_mode.return_value = False
-        ctx.mode_manager.is_aiden_mode.return_value = False
-        ctx.mode_manager.is_codex_mode.return_value = False
-        ctx.mode_manager.is_gemini_mode.return_value = False
-        ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
-        ctx.project_manager.validate_project_path.return_value = (True, "ok")
-
-        project = MagicMock()
-        project.ttadk_session_snapshot = None
-        project.root_path = "/tmp"
-        project.project_name = "test"
-        project.project_id = "test_id"
-        ctx.project_manager.get_or_create_project_for_path.return_value = (project, False)
-        ctx.ttadk_manager.ensure_session.side_effect = RuntimeError("ttadk cli unavailable")
-
-        h = TTADKModeHandler(ctx)
-        h._get_agent_type_override = MagicMock(return_value="ttadk_coco")
-        h._get_model_name_override = MagicMock(return_value="gpt-5.2")
-        h.reply_text = MagicMock()
-        h.reply_card = MagicMock(return_value="reply_1")
-        h.add_reaction = MagicMock()
-        h.record_mode_transition = MagicMock()
-        h.register_message_project = MagicMock()
-
-        with patch("src.feishu.handlers.programming.CardBuilder.build_project_response_card") as mock_build:
-            h.enter_mode("m1", "c1", project=project)
-
-        mock_build.assert_not_called()
-        h.reply_text.assert_not_called()
-        h.reply_card.assert_called_once()
-        ctx.mode_manager.enter_programming_mode.assert_not_called()
-        h.record_mode_transition.assert_not_called()
-        degraded_card = json.loads(h.reply_card.call_args.args[1])
-        button_blocks = _collect_button_layout_blocks(degraded_card)
-        assert not any(
-            button["value"].get("action") == "continue_degraded"
-            for block in button_blocks
-            for button in block
-        )
-        assert [button["value"]["action"] for button in button_blocks[-1]] == ["show_error_details"]
-        assert not any(
-            button["value"].get("action") == "retry_original"
-            for block in button_blocks
-            for button in block
-        )
 
 
 
@@ -1268,7 +777,6 @@ class TestProgrammingModeEnterExit:
         ctx.mode_manager.is_aiden_mode.return_value = False
         ctx.mode_manager.is_codex_mode.return_value = False
         ctx.mode_manager.is_gemini_mode.return_value = False
-        ctx.mode_manager.is_ttadk_mode.return_value = False
         ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
         ctx.project_manager.validate_project_path.return_value = (True, "ok")
         ctx.project_manager.get_or_create_project_for_path.return_value = (None, False)
@@ -1286,7 +794,6 @@ class TestProgrammingModeEnterExit:
             "aiden": MagicMock(),
             "codex": MagicMock(),
             "gemini": MagicMock(),
-            "ttadk": MagicMock(),
         })
         # Keep attributes for test assertions
         h._opposite_handler = ctx.handlers["claude"]
@@ -1294,7 +801,6 @@ class TestProgrammingModeEnterExit:
         h._aiden_handler = ctx.handlers["aiden"]
         h._codex_handler = ctx.handlers["codex"]
         h._gemini_handler = ctx.handlers["gemini"]
-        h._ttadk_handler = ctx.handlers["ttadk"]
         # Mock reply to avoid real API calls
         h.reply_text = MagicMock()
         h.reply_text = MagicMock()
@@ -1632,7 +1138,6 @@ class TestTopLevelProgrammingState:
         ctx.mode_manager.is_aiden_mode.return_value = False
         ctx.mode_manager.is_codex_mode.return_value = False
         ctx.mode_manager.is_gemini_mode.return_value = False
-        ctx.mode_manager.is_ttadk_mode.return_value = False
         ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
         ctx.project_manager.validate_project_path.return_value = (True, "ok")
         ctx.project_manager.get_or_create_project_for_path.return_value = (None, False)
@@ -1646,14 +1151,12 @@ class TestTopLevelProgrammingState:
             "aiden": MagicMock(),
             "codex": MagicMock(),
             "gemini": MagicMock(),
-            "ttadk": MagicMock(),
         })
         # Keep attributes for test assertions
         h._claude_handler = ctx.handlers["claude"]
         h._aiden_handler = ctx.handlers["aiden"]
         h._codex_handler = ctx.handlers["codex"]
         h._gemini_handler = ctx.handlers["gemini"]
-        h._ttadk_handler = ctx.handlers["ttadk"]
         h.reply_text = MagicMock()
         h.reply_text = MagicMock()
         h.reply_card = MagicMock()
@@ -1901,8 +1404,6 @@ class TestDeepHandler:
             root_path="/repo/project",
             acp_tool_name="coco",
             acp_model_name="deepseek-v4pro",
-            ttadk_tool_name=None,
-            ttadk_model_name=None,
         )
         engine = MagicMock()
         ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
@@ -1931,8 +1432,6 @@ class TestDeepHandler:
             root_path="/repo/project",
             acp_tool_name="coco",
             acp_model_name=None,
-            ttadk_tool_name=None,
-            ttadk_model_name=None,
         )
         engine = MagicMock()
         callbacks = MagicMock()
@@ -2952,8 +2451,6 @@ class TestNonStreamingHeartbeat:
         handler.get_streaming_manager = MagicMock(return_value=mock_streaming_mgr)
         handler.thinking_text = "🤔"
         handler._get_interaction_mode = MagicMock()
-        handler._get_ttadk_tool_display = MagicMock()
-        handler._get_ttadk_model_display = MagicMock()
         handler.mode_name = "Coco"
         handler.is_coco = True
         handler.ensure_request_id = MagicMock(return_value="req-1")

@@ -22,14 +22,12 @@ from src.feishu.handlers.programming import (
     CodexModeHandler,
     GeminiModeHandler,
     TraexModeHandler,
-    TTADKModeHandler,
 )
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.mode import InteractionMode
 from src.project.context import ProjectContext
 from src.project.manager import ProjectManager
-from src.ttadk.models import ModelListResult, ToolListResult, TTADKModel, TTADKTool
 from tests.helpers.session_call_recorder import SessionCallRecorder
 
 BACKENDS = (
@@ -39,7 +37,6 @@ BACKENDS = (
     ("codex", CodexModeHandler, "codex-model"),
     ("gemini", GeminiModeHandler, "gemini-model"),
     ("traex", TraexModeHandler, "traex-model"),
-    ("ttadk", TTADKModeHandler, "ttadk-model"),
 )
 
 
@@ -112,36 +109,6 @@ def test_public_model_selection_route_then_callback_uses_selected_backend(
     assert recorder.remote_call_topology() == (f"factory:{backend}", f"prompt:{backend}")
 
 
-def test_public_ttadk_route_and_combined_callback_reaches_ttadk_session(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    recorder = SessionCallRecorder()
-    handler, ctx, manager, project = _make_lane("ttadk", TTADKModeHandler, "ttadk-model", recorder, monkeypatch)
-    ctx.handlers["ttadk"] = handler
-    ttadk = MagicMock()
-    ttadk.get_tools.return_value = ToolListResult(tools=[TTADKTool(name="coco")])
-    ttadk.get_models.return_value = ModelListResult(models=[TTADKModel(name="ttadk-model")])
-    ttadk.get_current_tool.return_value = "coco"
-    ttadk.get_current_model.return_value = "ttadk-model"
-    ttadk.set_tool.return_value = True
-    ttadk.set_model.return_value = True
-    monkeypatch.setattr("src.feishu.handlers.ttadk_commands.get_ttadk_manager", lambda: ttadk)
-    monkeypatch.setattr("src.feishu.handlers.ttadk_commands.auto_update_ttadk", lambda: None)
-    system = SystemHandler(ctx)
-    system.reply_text = MagicMock()
-    system.reply_card = MagicMock()
-    system.update_card = MagicMock(return_value=True)
-
-    system.handle_intercepted_command(
-        "message-command", "chat-direct", "/ttadk", project,
-        command_match=SlashCommandParser.parse("/ttadk"),
-    )
-    system.handle_select_ttadk_combined("combined-card", "chat-direct", "coco", "ttadk-model", project)
-    _bind_selected_session(recorder, manager)
-    handler.handle_message("message-current-mode", "chat-direct", "task for ttadk", project)
-
-    assert recorder.remote_call_topology() == ("factory:ttadk_coco", "prompt:ttadk_coco")
-    assert recorder.prompt_calls[0].model == "ttadk-model"
 
 
 def _context(manager_key: str, manager: ACPSessionManager) -> HandlerContext:
@@ -165,7 +132,6 @@ def _context(manager_key: str, manager: ACPSessionManager) -> HandlerContext:
         codex_manager=managers["codex"],
         gemini_manager=managers["gemini"],
         traex_manager=managers["traex"],
-        ttadk_manager=managers["ttadk"],
         tui2acp_manager=MagicMock(),
         intent_recognizer=MagicMock(),
         scheduler=MagicMock(),
@@ -199,7 +165,6 @@ def _context(manager_key: str, manager: ACPSessionManager) -> HandlerContext:
         "codex",
         "gemini",
         "traex",
-        "ttadk",
     ):
         getattr(ctx.mode_manager, f"is_{name}_mode").return_value = False
     ctx.context_manager.store.get.return_value = None
@@ -212,12 +177,8 @@ def _project(backend: str, model: str) -> ProjectContext:
         project_name="direct-contract",
         root_path="/tmp/direct-lane",
     )
-    if backend == "ttadk":
-        project.ttadk_tool_name = "coco"
-        project.ttadk_model_name = model
-    else:
-        project.acp_tool_name = backend
-        project.acp_model_name = model
+    project.acp_tool_name = backend
+    project.acp_model_name = model
     return project
 
 
@@ -230,14 +191,6 @@ def _make_lane(
 ):
     if backend == "claude":
         monkeypatch.setattr("src.acp.manager.SyncClaudeCLISession", recorder.factory_for_backend(backend))
-        manager = ACPSessionManager(backend)
-    elif backend == "ttadk":
-        monkeypatch.setattr("src.acp.manager.SyncTTADKCLISession", recorder.factory_for_backend("ttadk_coco"))
-        monkeypatch.setattr("src.ttadk.get_ttadk_manager", lambda: MagicMock())
-        monkeypatch.setattr(
-            "src.ttadk.startup_common.precheck_ttadk_startup_model",
-            lambda **_kwargs: {"model": model},
-        )
         manager = ACPSessionManager(backend)
     else:
         manager = ACPSessionManager(backend, session_starter=recorder.session_factory)
@@ -336,10 +289,9 @@ def test_explicit_backend_keeps_single_target_factory_and_prompt(
     _bind_selected_session(recorder, manager)
     handler.handle_message("message-task", "chat-direct", f"task for {backend}", project)
 
-    expected_backend = "ttadk_coco" if backend == "ttadk" else backend
     assert recorder.remote_call_topology() == (
-        f"factory:{expected_backend}",
-        f"prompt:{expected_backend}",
+        f"factory:{backend}",
+        f"prompt:{backend}",
     )
     # Every backend, including Claude CLI, must retain the selected model at
     # the real factory/prompt boundary.

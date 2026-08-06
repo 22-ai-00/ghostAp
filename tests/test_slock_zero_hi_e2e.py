@@ -217,7 +217,7 @@ class TestZeroHIToolInteractionSuppression:
         """Every supported agent_type gets auto_approve=True."""
         engine, _ = engine_with_agent
 
-        for agent_type in ["coco", "claude", "codex", "gemini", "ttadk"]:
+        for agent_type in ["coco", "claude", "codex", "gemini"]:
             agent = AgentIdentity(
                 name=f"{agent_type}-Agent",
                 emoji="🔧",

@@ -115,17 +115,6 @@ RETRY_ORIGINAL = "retry_original"  # Retry the original mode/action that produce
 HELP_CATEGORY = "help_category"  # Navigate to a specific help category
 
 # ---------------------------------------------------------------------------
-# TTADK actions
-# ---------------------------------------------------------------------------
-SELECT_TTADK_TOOL = "select_ttadk_tool"  # Select a TTADK tool from the list
-TOGGLE_TTADK_YOLO = "toggle_ttadk_yolo"  # Toggle YOLO (auto-approve) mode for TTADK
-SELECT_TTADK_MODEL = "select_ttadk_model"  # Select a model for the TTADK tool
-REFRESH_TTADK_MODELS = "refresh_ttadk_models"  # Refresh available TTADK model list
-SELECT_TTADK_COMBINED = "select_ttadk_combined"  # Select combined tool+model in one action
-SELECT_TTADK_COMBINED_TOOL = "select_ttadk_combined_tool"  # Select tool in combined selection flow
-SHOW_TTADK_MENU = "show_ttadk_menu"  # Show TTADK tool/model selection menu
-
-# ---------------------------------------------------------------------------
 # ACP actions
 # ---------------------------------------------------------------------------
 SHOW_ACP_MENU = "show_acp_menu"  # Show ACP tool/model selection menu

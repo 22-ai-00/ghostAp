@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from ..ttadk.models import ACPModelOption
 from .model_selection import CODEX_REASONING_EFFORTS
+from .options import ACPModelOption
 
 _PROFILES = frozenset({"standard", "max"})
 

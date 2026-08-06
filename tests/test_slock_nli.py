@@ -469,9 +469,6 @@ class TestExtractRoleCreateParams:
         params = self.router._extract_role_create_params("用 aiden 来做")
         assert params.get("tool") == "aiden"
 
-    def test_extract_tool_ttadk(self):
-        params = self.router._extract_role_create_params("用ttadk创建角色")
-        assert params.get("tool") == "ttadk"
 
     def test_extract_role_coder(self):
         params = self.router._extract_role_create_params("建一个开发角色")

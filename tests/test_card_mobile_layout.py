@@ -17,16 +17,16 @@ def _degraded_error_card(degraded_to: str | None = "Coco") -> dict:
     continue_action = {"action": "continue_degraded", "request_id": "req-mobile"}
     retry_action = {
         "action": "retry_original",
-        "original_mode": "TTADK",
-        "retry_mode": "TTADK",
+        "original_mode": "Codex",
+        "retry_mode": "Codex",
         "request_id": "req-mobile",
     }
     if degraded_to is not None:
         continue_action["degraded_to"] = degraded_to
         retry_action["degraded_to"] = degraded_to
     _, card_json = SystemBuilder.build_error_card(
-        "TTADK 启动失败",
-        title="TTADK 暂不可用",
+        "Codex 启动失败",
+        title="Codex 暂不可用",
         severity="degraded",
         detail_action={"action": "show_error_details", "trace_id": "mobile-layout"},
         continue_action=continue_action,
@@ -147,7 +147,7 @@ class _PreviewButtonLayoutParser(HTMLParser):
             if self.capture_depth == 0:
                 label = "".join(self.text_chunks).strip()
                 # Only the "继续 Coco · 含完整 retry 上下文" preview card is required
-                # to match the production card with TTADK→Coco degrade fully.
+                # to match the production degraded card fully.
                 self.in_degraded = label.startswith("错误卡 · 降级错误（继续 Coco")
         if tag == "button":
             self.current_button_classes = None
@@ -175,7 +175,7 @@ def test_degraded_error_card_preview_covers_dynamic_and_unknown_modes() -> None:
     assert "继续 Aiden" in degraded_section or "继续使用 Aiden" in degraded_section
     assert "未知目标" in degraded_section
     assert "当前暂未确定可继续模式" in degraded_section
-    assert "TTADK 启动失败后不再自动切换到 Coco ACP" not in degraded_section
+    assert "启动失败后不再自动切换到 Coco ACP" not in degraded_section
 
     secondary_rows = [
         row for row in degraded_section.split('<div class="button-row button-row-secondary">')[1:]

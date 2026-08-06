@@ -28,7 +28,6 @@ class _FakeProject:
     project_name: str = "TestProject"
     root_path: str = "/tmp/test"
     bound_chat_id: str = ""
-    ttadk_mode: bool = False
     claude_mode: bool = False
     gemini_mode: bool = False
     coco_mode: bool = False

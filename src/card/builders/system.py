@@ -122,7 +122,7 @@ class SystemBuilder:
         initial_option: Optional[str] = None,
         value_extra: Optional[dict] = None,
     ) -> dict:
-        """Build a select_static element used by TTADK selection cards."""
+        """Build a reusable select_static element."""
         value = {"action": action}
         if value_extra:
             value.update(value_extra)
@@ -172,47 +172,6 @@ class SystemBuilder:
         return None
 
     @staticmethod
-    def build_ttadk_refresh_result_card(
-        tool: str,
-        result: any,
-    ) -> tuple[str, str]:
-        """Build a summary message for TTADK refresh result."""
-        lines = [UI_TEXT["system_ttadk_refresh_success"]]
-        if tool:
-            lines.append(UI_TEXT["system_ttadk_refresh_label_tool"].format(tool=tool))
-
-        source = getattr(result, "source", "")
-        if source:
-            lines.append(UI_TEXT["system_ttadk_refresh_label_source"].format(source=source))
-
-        warnings = getattr(result, "warnings", None)
-        if warnings:
-            lines.append(
-                UI_TEXT["system_ttadk_refresh_label_warning"].format(
-                    warnings="; ".join(warnings)
-                )
-            )
-
-        diagnostics = getattr(result, "diagnostics", None)
-        if diagnostics:
-            try:
-                attempts = (diagnostics or {}).get("attempts")
-                if attempts:
-                    lines.append(
-                        UI_TEXT["system_ttadk_refresh_label_diag"].format(
-                            attempts=attempts
-                        )
-                    )
-            except Exception:
-                logger.debug("failed to build TTADK refresh card diagnostics", exc_info=True)
-
-        footer = UI_TEXT["system_ttadk_refresh_footer"]
-        if footer:
-            lines.append(footer)
-
-        return "text", "\n".join(lines)
-
-    @staticmethod
     def build_switching_status_card(
         tool: str,
         model: str,
@@ -222,34 +181,6 @@ class SystemBuilder:
             tool=tool, model=model
         )
         return "text", msg
-
-    @staticmethod
-    def build_ttadk_info_content(
-        current_tool: Optional[str],
-        current_model: Optional[str],
-        tool_desc: dict[str, str],
-        model_desc: dict[str, str],
-    ) -> str:
-        """Build the Markdown content for TTADK status info."""
-        lines = [UI_TEXT["system_ttadk_info_header"]]
-
-        if current_tool:
-            tool_label = tool_desc.get(current_tool, UI_TEXT["system_ttadk_ai_tool_label"])
-            lines.append(f"{UI_TEXT['system_label_current_tool']}: `{current_tool}` - {tool_label}")
-        else:
-            lines.append(f"{UI_TEXT['system_label_current_tool']}: " + UI_TEXT["system_not_set"])
-
-        if current_model:
-            model_label = model_desc.get(current_model, current_model)
-            lines.append(f"{UI_TEXT['system_label_current_model']}: `{current_model}` - {model_label}")
-        else:
-            lines.append(f"{UI_TEXT['system_label_current_model']}: " + UI_TEXT["system_not_set"])
-
-        footer = UI_TEXT["system_ttadk_info_footer"]
-        if footer:
-            lines.append(footer)
-
-        return "\n".join(lines)
 
     @staticmethod
     def build_coco_status_content(
@@ -493,7 +424,6 @@ class SystemBuilder:
             "aiden": "Aiden",
             "codex": "Codex",
             "gemini": "Gemini",
-            "ttadk": "TTADK",
         }
         raw = str(mode or "").strip()
         return labels.get(raw.lower(), raw)
@@ -607,254 +537,6 @@ class SystemBuilder:
 
         card = CoreBuilder._wrap_card(header_title, header_template, elements)
         return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def _build_ttadk_yolo_toggle_button(
-        yolo_enabled: bool, project_id: Optional[str], view: str, tool_name: str = ""
-    ) -> dict:
-        enabled = bool(yolo_enabled)
-        label = UI_TEXT["system_ttadk_yolo_on"] if enabled else UI_TEXT["system_ttadk_yolo_off"]
-        return {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": label},
-            "type": "primary" if enabled else "default",
-            "value": {
-                "action": "toggle_ttadk_yolo",
-                "enabled": not enabled,
-                "project_id": project_id,
-                "view": view,
-                "tool_name": tool_name,
-            },
-        }
-
-    @staticmethod
-    def build_ttadk_tool_select_card(
-        tools: list, project_id: Optional[str] = None, yolo_enabled: bool = False, current_tool: Optional[str] = None
-    ) -> tuple[str, str]:
-        elements = [{"tag": "markdown", "content": UI_TEXT["system_ttadk_select_tool_prompt"]}]
-
-        elements.extend(
-            build_responsive_layout(
-                [SystemBuilder._build_ttadk_yolo_toggle_button(yolo_enabled, project_id, "tool_select")]
-            )
-        )
-        elements.append({"tag": "hr"})
-
-        options = [
-            SystemBuilder._select_option(
-                SystemBuilder._label_with_optional_description(tool.name, getattr(tool, "description", "")),
-                tool.name,
-            )
-            for tool in tools
-        ]
-
-        elements.append(
-            SystemBuilder._build_select_static(
-                placeholder_key="system_ttadk_select_tool_placeholder",
-                action="select_ttadk_tool",
-                options=options,
-                initial_option=current_tool,
-                value_extra={"project_id": project_id},
-            )
-        )
-
-        return SystemBuilder._wrap_system_card(UI_TEXT["system_ttadk_tool_select_title"], elements)
-
-    @staticmethod
-    def build_ttadk_model_select_card(
-        models: list, tool_name: str, project_id: Optional[str] = None, yolo_enabled: bool = False, current_model: Optional[str] = None
-    ) -> tuple[str, str]:
-        elements = [
-            {
-                "tag": "markdown",
-                "content": (
-                    UI_TEXT["system_ttadk_select_model_prompt"].format(tool=tool_name) + "\n" +
-                    UI_TEXT["system_ttadk_select_model_hint"]
-                ),
-            }
-        ]
-
-        elements.extend(
-            build_responsive_layout(
-                [SystemBuilder._build_ttadk_yolo_toggle_button(yolo_enabled, project_id, "model_select", tool_name)]
-            )
-        )
-        elements.append({"tag": "hr"})
-
-        options = [
-            SystemBuilder._select_option(
-                SystemBuilder._label_with_optional_description(model.name, getattr(model, "description", "")),
-                model.name,
-            )
-            for model in models
-        ]
-
-        elements.append(
-            SystemBuilder._build_select_static(
-                placeholder_key="system_ttadk_select_model_placeholder",
-                action="select_ttadk_model",
-                options=options,
-                initial_option=current_model,
-                value_extra={"tool_name": tool_name, "project_id": project_id},
-            )
-        )
-
-        # 辅助入口：强制刷新模型列表（常用于 Invalid model / 可用模型为空）
-        elements.append({"tag": "hr"})
-        elements.extend(
-            build_responsive_layout(
-                [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["system_ttadk_refresh_btn"]},
-                        "type": "primary",
-                        "value": {
-                            "action": "refresh_ttadk_models",
-                            "tool_name": tool_name,
-                            "project_id": project_id,
-                        },
-                    }
-                ]
-            )
-        )
-
-        return SystemBuilder._wrap_system_card(UI_TEXT["system_ttadk_model_select_title"].format(tool=tool_name), elements)
-
-    @staticmethod
-    def build_ttadk_combined_select_card(
-        tools: list,
-        models_by_tool: dict,
-        project_id: Optional[str] = None,
-        yolo_enabled: bool = False,
-        current_tool: Optional[str] = None,
-        current_model: Optional[str] = None,
-    ) -> tuple[str, str]:
-        """Build a combined TTADK tool + model selection card (single step)."""
-        elements = [{"tag": "markdown", "content": UI_TEXT["system_ttadk_combined_select_prompt"]}]
-
-        elements.extend(
-            build_responsive_layout(
-                [SystemBuilder._build_ttadk_yolo_toggle_button(yolo_enabled, project_id, "combined_select")]
-            )
-        )
-        elements.append({"tag": "hr"})
-
-        # Tool selection
-        tool_options = [
-            SystemBuilder._select_option(
-                SystemBuilder._label_with_optional_description(tool.name, getattr(tool, "description", "")),
-                tool.name,
-            )
-            for tool in tools
-        ]
-
-        elements.append({"tag": "markdown", "content": UI_TEXT["system_ttadk_label_tool"]})
-        elements.append(
-            SystemBuilder._build_select_static(
-                placeholder_key="system_ttadk_select_tool_placeholder",
-                action="select_ttadk_combined_tool",
-                options=tool_options,
-                initial_option=current_tool,
-                value_extra={"project_id": project_id},
-            )
-        )
-
-        # Model selection per tool (show current_tool's models or first tool's models by default)
-        if tools and models_by_tool:
-            selected_tool = current_tool
-            if not selected_tool or selected_tool not in models_by_tool:
-                selected_tool = tools[0].name
-            models = models_by_tool.get(selected_tool, [])
-            if models:
-                elements.append({"tag": "hr"})
-                elements.append({"tag": "markdown", "content": UI_TEXT["system_ttadk_label_model"].format(tool=selected_tool)})
-
-                model_options = [
-                    SystemBuilder._select_option(
-                        SystemBuilder._label_with_optional_description(model.name, getattr(model, "description", "")),
-                        model.name,
-                    )
-                    for model in models
-                ]
-
-                elements.append(
-                    SystemBuilder._build_select_static(
-                        placeholder_key="system_ttadk_select_model_placeholder",
-                        action="select_ttadk_combined",
-                        options=model_options,
-                        initial_option=current_model,
-                        value_extra={"tool_name": selected_tool, "project_id": project_id},
-                    )
-                )
-
-        # Refresh button
-        elements.append({"tag": "hr"})
-        elements.extend(
-            build_responsive_layout(
-                [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["system_ttadk_refresh_btn"]},
-                        "type": "primary",
-                        "value": {
-                            "action": "refresh_ttadk_models",
-                            "project_id": project_id,
-                        },
-                    }
-                ]
-            )
-        )
-
-        return SystemBuilder._wrap_system_card(UI_TEXT["system_ttadk_combined_title"], elements)
-
-    @staticmethod
-    def build_ttadk_soft_failure_card(
-        message: str,
-        project_id: Optional[str] = None,
-        *,
-        action: str = "show_ttadk_menu",
-        button_text: str = "",
-    ) -> tuple[str, str]:
-        # Clean the message for the banner (CoreBuilder adds its own emoji)
-        banner_msg = message.replace("⚠️ ", "").strip()
-        elements = [
-            CoreBuilder._build_banner_element(banner_msg, type="warning")
-        ]
-
-        effective_text = button_text or UI_TEXT["system_ttadk_btn_reenter"]
-        button = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": effective_text},
-            "type": "primary",
-            "value": {"action": action, "project_id": project_id},
-        }
-        elements.extend(build_responsive_layout([button]))
-
-        card = CoreBuilder._wrap_card(UI_TEXT["system_ttadk_unavailable_title"], "blue", elements)
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def _format_ttadk_soft_failure_message(reason: str) -> str:
-        cleaned = str(reason or "").strip()
-        if not cleaned:
-            cleaned = UI_TEXT["system_ttadk_unavailable"]
-        return UI_TEXT["system_ttadk_soft_failure_msg"].format(reason=cleaned)
-
-    @staticmethod
-    def build_ttadk_soft_failure_card_for(
-        reason: str,
-        project_id: Optional[str] = None,
-        *,
-        action: str = "show_ttadk_menu",
-        button_text: str = "",
-    ) -> tuple[str, str]:
-        message = SystemBuilder._format_ttadk_soft_failure_message(reason)
-        return SystemBuilder.build_ttadk_soft_failure_card(
-            message,
-            project_id,
-            action=action,
-            button_text=button_text or UI_TEXT["system_ttadk_btn_continue"],
-        )
 
     @staticmethod
     def build_acp_tool_select_card(
@@ -1413,7 +1095,7 @@ class SystemBuilder:
                     [
                         {
                             "tag": "button",
-                            "text": {"tag": "plain_text", "content": UI_TEXT["system_ttadk_refresh_btn"]},
+                            "text": {"tag": "plain_text", "content": UI_TEXT["system_refresh_models_btn"]},
                             "type": "primary",
                             "value": refresh_value,
                             "behaviors": [{"type": "callback", "value": refresh_value}],
@@ -1592,7 +1274,7 @@ class SystemBuilder:
                 [
                     {
                         "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["system_ttadk_refresh_btn"]},
+                        "text": {"tag": "plain_text", "content": UI_TEXT["system_refresh_models_btn"]},
                         "type": "default",
                         "value": refresh_value,
                         "behaviors": [{"type": "callback", "value": refresh_value}],
@@ -1646,7 +1328,7 @@ class SystemBuilder:
                 [
                     {
                         "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["system_ttadk_refresh_btn"]},
+                        "text": {"tag": "plain_text", "content": UI_TEXT["system_refresh_models_btn"]},
                         "type": "primary",
                         "value": {
                             "action": "refresh_acp_models",
@@ -1884,11 +1566,6 @@ class SystemBuilder:
                 "action": "show_status",
             },
             {
-                "text": UI_TEXT["system_menu_btn_ttadk"],
-                "type": "default",
-                "action": "show_ttadk_menu",
-            },
-            {
                 "text": UI_TEXT["system_menu_btn_acp"],
                 "type": "default",
                 "action": "show_acp_menu",
@@ -1976,7 +1653,6 @@ class SystemBuilder:
             InteractionMode.CODEX: UI_TEXT["system_mode_codex"],
             InteractionMode.GEMINI: UI_TEXT["system_mode_gemini"],
             InteractionMode.TRAEX: UI_TEXT["system_mode_traex"],
-            InteractionMode.TTADK: UI_TEXT["system_mode_ttadk"],
             InteractionMode.TUI2ACP: "🌉 Tui2ACP",
         }
 
@@ -2061,10 +1737,6 @@ class SystemBuilder:
             (
                 UI_TEXT["system_help_section_project"],
                 UI_TEXT["system_help_section_project_body"]
-            ),
-            (
-                UI_TEXT["system_help_section_ttadk"],
-                UI_TEXT["system_help_section_ttadk_body"]
             ),
             (
                 UI_TEXT["system_help_section_workflow"],

@@ -15,10 +15,8 @@ from ..utils.errors import get_error_detail
 from .claude_cli import SyncClaudeCLISession
 from .protocol import SyncSession
 from .tool_permissions import (
-    AuxiliarySessionPermissionError,
     apply_auxiliary_tool_profile,
 )
-from .ttadk_cli import SyncTTADKCLISession
 from .wrappers import ModelFailureAwareSession, RateLimitAwareSession
 
 logger = logging.getLogger(__name__)
@@ -67,7 +65,6 @@ def _normalize_acp_startup_model(agent_type: str, model_name: Optional[str]) -> 
     if (
         not model_name
         or agent in {"claude", "traex"}
-        or agent.startswith("ttadk_")
     ):
         return model_name
     normalized = normalize_acp_model_name(agent, model_name)
@@ -90,99 +87,24 @@ def close_session_safely(session: Optional[SyncSession]) -> None:
             logger.debug("关闭旧ACP session失败: %s", get_error_detail(e))
 
 
-def resolve_ttadk_engine_startup_model(
-    *,
-    agent_type: str,
-    cwd: str,
-    model_intent: Optional[str],
-) -> dict:
-    """为 Deep/Spec 引擎统一解析 TTADK 启动模型。
-
-    注意：该函数仅做"启动阶段预校验"，不做执行阶段强校验/纠错。
-    统一收敛到 `src.ttadk.startup_common.precheck_ttadk_startup_model()`，避免多处实现漂移。
-    """
-    from ..ttadk.startup_common import precheck_ttadk_startup_model
-    from ..utils.path import normalize_ttadk_cwd
-
-    raw_cwd = cwd
-    norm_cwd = normalize_ttadk_cwd(raw_cwd)
-    cwd = norm_cwd or raw_cwd
-    try:
-        if bool(getattr(get_settings(), "ttadk_cwd_debug_enabled", False)):
-            logger.debug(
-                "[TTADK:CWD] where=%s raw_cwd=%r normalized_cwd=%r",
-                "agent_session.resolve_ttadk_engine_startup_model",
-                raw_cwd,
-                norm_cwd,
-            )
-    except Exception:
-        logger.debug("resolve_ttadk_engine_startup_model: cwd debug logging failed", exc_info=True)
-
-    info = precheck_ttadk_startup_model(agent_type=agent_type, cwd=cwd, model_intent=model_intent)
-    # 兼容旧调用方字段名：resolved_model
-    # 说明：startup_common 已输出 resolved_model；这里仅做 best-effort 兜底，不覆盖其语义。
-    if "resolved_model" not in info:
-        info["resolved_model"] = info.get("model")
-    # 透出诊断（用于引擎日志/排障，不参与逻辑判断）
-    if "diagnostics" not in info:
-        info["diagnostics"] = {}
-    return info
-
 
 def create_sync_session(agent_type: str, cwd: str, model_name: Optional[str] = None) -> SyncSession:
     """Factory for creating a sync session by backend.
 
     - coco/default: ACP backend
     - claude: CLI backend
-    - ttadk_*: CLI backend（强隔离：TTADK 前缀不允许拉起 ACP Server）
     """
     from ..coco_model import get_coco_model_manager
-    from ..utils.path import normalize_ttadk_cwd
+    from ..utils.path import normalize_session_cwd
 
     agent_type = (agent_type or "").lower()
-    raw_cwd = cwd
-    norm_cwd = normalize_ttadk_cwd(raw_cwd)
-    cwd = norm_cwd or raw_cwd
-    try:
-        if bool(getattr(get_settings(), "ttadk_cwd_debug_enabled", False)):
-            logger.debug(
-                "[TTADK:CWD] where=%s raw_cwd=%r normalized_cwd=%r",
-                "agent_session.create_sync_session",
-                raw_cwd,
-                norm_cwd,
-            )
-    except Exception:
-        logger.debug("create_sync_session: cwd debug logging failed", exc_info=True)
+    cwd = normalize_session_cwd(cwd) or cwd
     if agent_type == "claude":
         return SyncClaudeCLISession(cwd=cwd, model_name=model_name)
 
     effective_model = model_name
     if not effective_model and agent_type in ("coco", ""):
         effective_model = get_coco_model_manager().get_current_model()
-
-    if agent_type.startswith("ttadk_"):
-        # 该工厂只负责构造 session：启动阶段预校验下沉到统一 helper，validated 才透传 -m。
-        try:
-            from ..ttadk.startup_common import precheck_ttadk_startup_model
-
-            info = precheck_ttadk_startup_model(agent_type=agent_type, cwd=cwd, model_intent=model_name)
-            model_name = info.get("model")
-            logger.info(
-                "[SessionFactory] ttadk precheck(startup): tool=%s input_model=%s model=%s validated=%s source=%s decision=%s fail_phase=%s warnings=%s",
-                info.get("tool") or "",
-                info.get("input_model") or "",
-                (model_name or "(auto)"),
-                bool(info.get("validated")),
-                info.get("source") or "unknown",
-                info.get("decision") or "",
-                info.get("fail_phase") or "",
-                list(info.get("warnings") or []),
-            )
-        except Exception:
-            logger.debug("create_sync_session: model resolution failed", exc_info=True)
-            model_name = None
-        # Switch to CLI backend
-        return SyncTTADKCLISession(agent_type=agent_type, cwd=cwd, model_name=model_name)
 
     effective_model = _normalize_acp_startup_model(agent_type or "coco", effective_model)
     return SyncACPSession(agent_type=agent_type or "coco", cwd=cwd, model_name=effective_model)
@@ -205,7 +127,6 @@ def create_engine_session(
     """Create and start a session for Deep/Spec/Slock engines.
 
     - Claude: CLI backend (no ACP retry needed)
-    - ttadk_*: CLI backend (no ACP retry needed)
     - Others: ACP backend with retry and progressive timeout
 
     If rate_limit_retry_enabled is True in settings, the returned session
@@ -222,43 +143,18 @@ def create_engine_session(
     """
     from ..acp.sync_adapter import start_session_with_retry
     from ..coco_model import get_coco_model_manager
-    from ..utils.path import normalize_ttadk_cwd
+    from ..utils.path import normalize_session_cwd
 
     settings = get_settings()
     agent_type = (agent_type or "").lower()
+    cwd = normalize_session_cwd(cwd) or cwd
     employee_env = current_employee_session_environment()
-    # TTADK/引擎侧 cwd 归一化：避免传入 "." 导致 TTADK 项目级缓存不落盘。
-    raw_cwd = cwd
-    norm_cwd = normalize_ttadk_cwd(raw_cwd)
-    cwd = norm_cwd or raw_cwd
-    try:
-        if bool(getattr(get_settings(), "ttadk_cwd_debug_enabled", False)):
-            logger.debug(
-                "[TTADK:CWD] where=%s raw_cwd=%r normalized_cwd=%r",
-                "agent_session.create_engine_session",
-                raw_cwd,
-                norm_cwd,
-            )
-    except Exception:
-        logger.debug("create_engine_session: cwd debug logging failed", exc_info=True)
-
-    # 日志语义：
-    # - TTADK: 传入的可能是"友好名/意图"，并不等于最终透传 -m 的真实模型名；避免用 `model=` 误导。
-    # - 非 TTADK: 依旧输出 `model=` 便于排障。
-    if agent_type.startswith("ttadk_"):
-        logger.info(
-            "[SessionFactory] create_engine_session: agent=%s cwd=%s input_model=%s (CLI mode)",
-            agent_type or "coco",
-            cwd,
-            model_name,
-        )
-    else:
-        logger.info(
-            "[SessionFactory] create_engine_session: agent=%s cwd=%s model=%s",
-            agent_type or "coco",
-            cwd,
-            model_name,
-        )
+    logger.info(
+        "[SessionFactory] create_engine_session: agent=%s cwd=%s model=%s",
+        agent_type or "coco",
+        cwd,
+        model_name,
+    )
 
     if agent_type == "claude" and (not require_tool_filter or employee_env is not None):
         session: SyncSession = SyncClaudeCLISession(
@@ -267,38 +163,6 @@ def create_engine_session(
             employee_process_env=employee_env,
         )
         session.start()
-    elif agent_type.startswith("ttadk_"):
-        # TTADK CLI mode: precheck model then use CLI session
-        # Switch to CLI backend as requested, replacing the previous ACP startup coordinator.
-        try:
-            from ..ttadk.startup_common import precheck_ttadk_startup_model
-
-            # 1. Precheck to resolve model name
-            info = precheck_ttadk_startup_model(agent_type=agent_type, cwd=cwd, model_intent=model_name)
-
-            resolved_model = info.get("model")  # Validated model ID or None (auto)
-
-            logger.info(
-                "[SessionFactory] ttadk cli startup: tool=%s input_model=%s model=%s validated=%s source=%s warnings=%s",
-                info.get("tool") or "",
-                info.get("input_model") or "",
-                (resolved_model or "(auto)"),
-                bool(info.get("validated")),
-                info.get("source") or "unknown",
-                list(info.get("warnings") or []),
-            )
-
-            # 2. Create CLI session
-            session = SyncTTADKCLISession(
-                agent_type=agent_type,
-                cwd=cwd,
-                model_name=resolved_model,
-                employee_process_env=employee_env,
-            )
-            session.start()
-
-        except Exception:
-            raise
     else:
         effective_model = model_name
         if not effective_model and agent_type in ("coco", ""):
@@ -342,7 +206,7 @@ def create_engine_session(
         )
 
     # Model failure (compaction/loop/failover) auto-repair wrapper.
-    # 说明：该 wrapper 只在 send_prompt 阶段生效，不影响启动时 TTADK/ACP 的既有重试逻辑。
+    # The wrapper only affects prompt execution, not startup retries.
     try:
         session = ModelFailureAwareSession(
             inner=session,
@@ -377,16 +241,11 @@ def create_auxiliary_session(
 
     from ..acp.sync_adapter import start_session_with_retry
     from ..coco_model import get_coco_model_manager
-    from ..utils.path import normalize_ttadk_cwd
+    from ..utils.path import normalize_session_cwd
 
     settings = get_settings()
     normalized_agent = (agent_type or "coco").strip().lower()
-    if normalized_agent.startswith("ttadk_"):
-        raise AuxiliarySessionPermissionError(
-            "TTADK CLI cannot enforce the auxiliary deny-all tool profile"
-        )
-
-    normalized_cwd = normalize_ttadk_cwd(cwd) or cwd
+    normalized_cwd = normalize_session_cwd(cwd) or cwd
     effective_model = model_name
     if not effective_model and normalized_agent == "coco":
         effective_model = get_coco_model_manager().get_current_model()
@@ -469,11 +328,11 @@ def create_review_session(
     """
     from ..acp.sync_adapter import start_session_with_retry
     from ..coco_model import get_coco_model_manager
-    from ..utils.path import normalize_ttadk_cwd
+    from ..utils.path import normalize_session_cwd
 
     settings = get_settings()
     agent_type = (agent_type or "coco").lower()
-    cwd = normalize_ttadk_cwd(cwd) or cwd
+    cwd = normalize_session_cwd(cwd) or cwd
     effective_startup_timeout = startup_timeout if startup_timeout is not None else settings.acp_startup_timeout
 
     logger.info(
@@ -485,17 +344,6 @@ def create_review_session(
         session: SyncSession = SyncClaudeCLISession(
             cwd=cwd,
             model_name=model_name,
-        )
-        session.start()
-        return session
-
-    if agent_type.startswith("ttadk_"):
-        from ..ttadk.startup_common import precheck_ttadk_startup_model
-        info = precheck_ttadk_startup_model(
-            agent_type=agent_type, cwd=cwd, model_intent=model_name
-        )
-        session = SyncTTADKCLISession(
-            agent_type=agent_type, cwd=cwd, model_name=info.get("model")
         )
         session.start()
         return session

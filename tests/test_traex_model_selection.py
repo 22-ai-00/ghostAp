@@ -142,8 +142,8 @@ def test_runtime_selection_without_cache_allows_only_standard_profile(tmp_path):
 
 
 def test_expand_acp_model_options_emits_each_explicit_variant():
+    from src.acp.options import ACPModelOption, ACPModelVariantOption
     from src.acp.traex_selection import expand_acp_model_options
-    from src.ttadk.models import ACPModelOption, ACPModelVariantOption
 
     model = ACPModelOption(
         name="c_o_new_thinking",
@@ -177,7 +177,7 @@ def test_expand_acp_model_options_emits_each_explicit_variant():
 
 
 def test_acp_model_variant_options_are_immutable():
-    from src.ttadk.models import ACPModelVariantOption
+    from src.acp.options import ACPModelVariantOption
 
     variant = ACPModelVariantOption(
         name="c_o_new_thinking/max/max",

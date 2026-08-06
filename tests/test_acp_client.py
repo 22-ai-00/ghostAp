@@ -1056,46 +1056,6 @@ def test_acp_manager_retries_start_failure(monkeypatch, caplog):
     assert '"stderr_snippet"' in joined
 
 
-def test_acp_manager_ttadk_start_failure_no_coco_acp_fallback(monkeypatch, caplog):
-    """TTADK 必须坚持 CLI 路径：启动失败时直接报错，不降级到 Coco ACP。"""
-    from types import SimpleNamespace
-
-    from src.acp import manager as mgr
-    from src.acp.startup_utils import StartupOperationalError
-    from tests.helpers import FakeSessionBase
-
-    class FakeFailCLISession(FakeSessionBase):
-        def describe_agent(self):
-            return "tool=coco backend=cli cwd=."
-
-        def start(self, startup_timeout: float = 60):
-            raise StartupOperationalError("boom_cli")
-
-        def is_server_healthy(self, healthcheck_timeout: float = 2.0) -> bool:
-            return False
-
-    # 若走到 ACP fallback，此断言会失败。
-    monkeypatch.setattr(
-        mgr, "SyncACPSession", lambda **kw: (_ for _ in ()).throw(AssertionError("unexpected_acp_fallback"))
-    )
-    monkeypatch.setattr("src.agent_session.SyncTTADKCLISession", FakeFailCLISession)
-    monkeypatch.setattr(
-        "src.ttadk.startup_common.precheck_ttadk_startup_model",
-        lambda **kw: {"model": None, "validated": False, "tool": "coco", "input_model": ""},
-    )
-    monkeypatch.setattr(
-        mgr,
-        "get_settings",
-        lambda: SimpleNamespace(acp_startup_retries=1, acp_healthcheck_timeout=0.01, ttadk_preheat_enabled=False),
-    )
-
-    caplog.set_level(logging.WARNING)
-    m = mgr.ACPSessionManager("ttadk", session_timeout=999999)
-    with pytest.raises(RuntimeError, match="启动 ttadk_coco CLI 失败"):
-        m.start_session("chat1", cwd=".", startup_timeout=0.01, agent_type_override="ttadk_coco")
-
-    joined = "\n".join(r.getMessage() for r in caplog.records)
-    assert "Error while starting TTADK CLI" in joined
 
 
 def test_supports_acp_serve_unsets_claudecode(monkeypatch):

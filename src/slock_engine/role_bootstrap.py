@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Supported tool_type values — used for config validation during bootstrap
 SUPPORTED_TOOL_TYPES: frozenset[str] = frozenset(
-    {"codex", "claude", "coco", "aiden", "gemini", "ttadk"}
+    {"codex", "claude", "coco", "aiden", "gemini"}
 )
 
 # Role → default personality traits mapping

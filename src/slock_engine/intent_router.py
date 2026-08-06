@@ -93,7 +93,7 @@ class IntentRouter:
     _ACTION_MAP: dict[str, SlockCommandAction] = {a.value: a for a in SlockCommandAction}
 
     # Known tool identifiers for role creation extraction
-    _KNOWN_TOOLS = {"codex", "claude", "coco", "gemini", "aiden", "traex", "ttadk"}
+    _KNOWN_TOOLS = {"codex", "claude", "coco", "gemini", "aiden", "traex"}
 
     # Role type keywords (Chinese -> English canonical)
     _ROLE_KEYWORDS: dict[str, str] = {
@@ -543,7 +543,7 @@ Output:"""
 
         Attempts to identify:
           - name: agent name (after 叫/叫做/named)
-          - tool: tool backend (codex/claude/coco/gemini/aiden/ttadk)
+          - tool: tool backend (codex/claude/coco/gemini/aiden/traex)
           - role: functional role (coder/reviewer/tester/planner/architect/writer)
         """
         params: dict[str, str] = {}

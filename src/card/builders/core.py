@@ -115,9 +115,7 @@ class CoreBuilder:
         # Resolve mode from project if not provided directly
         effective_mode = mode
         if effective_mode is None and project:
-            if getattr(project, "ttadk_mode", False):
-                effective_mode = InteractionMode.TTADK
-            elif getattr(project, "claude_mode", False):
+            if getattr(project, "claude_mode", False):
                 effective_mode = InteractionMode.CLAUDE
             elif getattr(project, "gemini_mode", False):
                 effective_mode = InteractionMode.GEMINI
@@ -133,8 +131,6 @@ class CoreBuilder:
                 return UI_TEXT["gemini_mode_title"]
             elif effective_mode == InteractionMode.TRAEX:
                 return UI_TEXT["system_mode_traex"]
-            elif effective_mode == InteractionMode.TTADK:
-                return UI_TEXT["system_mode_ttadk"]
             mode_icon = "🤖" if effective_mode == InteractionMode.COCO else "🧠"
             mode_name = UI_TEXT["coco_mode_title"] if effective_mode == InteractionMode.COCO else UI_TEXT["smart_mode_title"]
             return f"{mode_icon} {mode_name}"
@@ -143,15 +139,6 @@ class CoreBuilder:
             return f"🔮 {project.project_name} · Claude"
         elif effective_mode == InteractionMode.GEMINI:
             return f"✨ {project.project_name} · Gemini"
-        elif effective_mode == InteractionMode.TTADK:
-            tool = str(getattr(project, "ttadk_tool_name", "") or "").strip()
-            model = str(getattr(project, "ttadk_model_name", "") or "").strip()
-            suffix = ""
-            if tool and model:
-                suffix = f" · {tool}({model})"
-            elif tool:
-                suffix = f" · {tool}"
-            return f"🎮 {project.project_name} · TTADK{suffix}"
         elif effective_mode == InteractionMode.TRAEX:
             return f"🚀 {project.project_name} · Traex"
         elif effective_mode == InteractionMode.COCO:
@@ -169,22 +156,6 @@ class CoreBuilder:
             path = "~"
 
         return {"tag": "markdown", "content": f"📁 `{path}`"}
-
-    @staticmethod
-    def _build_ttadk_status_element(project: Optional[ProjectContext]) -> Optional[dict]:
-        if not project:
-            return None
-        tool = str(getattr(project, "ttadk_tool_name", "") or "").strip() or UI_TEXT["system_not_set"]
-        model = str(getattr(project, "ttadk_model_name", "") or "").strip() or UI_TEXT["system_auto"]
-        yolo_enabled = bool(getattr(project, "ttadk_yolo_enabled", False))
-        yolo_label = UI_TEXT["system_on"] if yolo_enabled else UI_TEXT["system_off"]
-        return {
-            "tag": "markdown",
-            "content": UI_TEXT["system_ttadk_status_banner"].format(
-                tool=tool, model=model, yolo=yolo_label
-            ),
-            "text_size": "notation",
-        }
 
     @staticmethod
     def _build_footer_buttons(
@@ -206,9 +177,7 @@ class CoreBuilder:
 
         effective_mode = mode
         if effective_mode is None and project:
-            if getattr(project, "ttadk_mode", False):
-                effective_mode = InteractionMode.TTADK
-            elif getattr(project, "claude_mode", False):
+            if getattr(project, "claude_mode", False):
                 effective_mode = InteractionMode.CLAUDE
             elif getattr(project, "gemini_mode", False):
                 effective_mode = InteractionMode.GEMINI

@@ -1,7 +1,7 @@
 """Programming mode handlers — config-driven template for all programming modes.
 
-The ``ProgrammingModeHandler`` captures the shared logic for Coco, Claude, Aiden,
-Codex, Gemini, Traex, and TTADK modes.  Concrete subclasses declare configuration
+The ``ProgrammingModeHandler`` captures the shared logic for direct programming
+modes. Concrete subclasses declare configuration
 attributes; the base class provides default implementations for all hooks.
 """
 
@@ -138,7 +138,6 @@ class ProgrammingModeHandler(BaseHandler):
         (InteractionMode.CODEX, "is_codex_mode", "codex"),
         (InteractionMode.GEMINI, "is_gemini_mode", "gemini"),
         (InteractionMode.TRAEX, "is_traex_mode", "traex"),
-        (InteractionMode.TTADK, "is_ttadk_mode", "ttadk"),
         (InteractionMode.TUI2ACP, "is_tui2acp_mode", "tui2acp"),
     )
 
@@ -327,15 +326,6 @@ class ProgrammingModeHandler(BaseHandler):
     def _get_interaction_mode(self):
         return self.interaction_mode
 
-    @staticmethod
-    def _ttadk_degraded_diagnostic_details(reason: object) -> str:
-        failure_summary = str(reason or "TTADK backend degraded").strip() or "TTADK backend degraded"
-        return (
-            f"失败摘要：{failure_summary}\n"
-            "下一步建议：可继续使用卡片上的可用模式，或查看诊断后重试原模式；"
-            "若持续失败，请检查 TTADK CLI、模型配置和本地登录状态。"
-        )
-
     def _get_snapshot(self, project: "ProjectContext"):
         getter = getattr(type(project), "get_programming_snapshot", None)
         if callable(getter):
@@ -381,15 +371,9 @@ class ProgrammingModeHandler(BaseHandler):
         self._current_model = value
 
     # ------------------------------------------------------------------
-    # dynamic agent overrides (for TTADK, etc.)
+    # dynamic agent overrides
     # ------------------------------------------------------------------
     def _get_agent_type_override(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
-        return None
-
-    def _get_ttadk_tool_display(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
-        return None
-
-    def _get_ttadk_model_display(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
         return None
 
     def _uses_claude_cli(self) -> bool:
@@ -411,8 +395,6 @@ class ProgrammingModeHandler(BaseHandler):
             project.set_gemini_mode(False)
         if current != InteractionMode.TRAEX:
             project.set_traex_mode(False)
-        if current != InteractionMode.TTADK:
-            project.set_ttadk_mode(False)
         if current != InteractionMode.TUI2ACP:
             project.set_tui2acp_mode(False)
 
@@ -552,40 +534,12 @@ class ProgrammingModeHandler(BaseHandler):
                 self.mode_name, silent, get_error_detail(e),
             )
             if not silent:
-                if self.mode_name == "TTADK":
-                    _, card_content = CardBuilder.build_error_card(
-                        UI_TEXT["mode_ttadk_degraded_msg"].format(
-                            tool=UI_TEXT["card_lifecycle_degraded_primary_unknown"],
-                            reason=get_error_detail(e) or UI_TEXT["mode_ttadk_startup_timeout"],
-                        ),
-                        title=UI_TEXT["mode_ttadk_degraded_title"],
-                        details=UI_TEXT["mode_ttadk_degraded_details_hint"],
-                        severity="degraded",
-                        detail_action={
-                            "action": "show_error_details",
-                            "chat_id": chat_id,
-                            "origin_message_id": message_id,
-                            "title": UI_TEXT["mode_ttadk_degraded_title"],
-                            "summary": get_error_detail(e) or UI_TEXT["mode_ttadk_startup_timeout"],
-                            "details": self._ttadk_degraded_diagnostic_details(
-                                get_error_detail(e) or UI_TEXT["mode_ttadk_startup_timeout"]
-                            ),
-                        },
-                        continue_action={
-                            "action": "continue_degraded",
-                            "chat_id": chat_id,
-                            "origin_message_id": message_id,
-                        },
-                        retry_action=None,
-                    )
-                    self.reply_card(message_id, card_content)
-                else:
-                    self.send_error_card(
-                        chat_id,
-                        e,
-                        title=UI_TEXT["mode_startup_timeout_title"].format(name=self.mode_name),
-                        origin_message_id=message_id,
-                    )
+                self.send_error_card(
+                    chat_id,
+                    e,
+                    title=UI_TEXT["mode_startup_timeout_title"].format(name=self.mode_name),
+                    origin_message_id=message_id,
+                )
             return False
         except Exception as e:
             logger.warning(
@@ -594,89 +548,12 @@ class ProgrammingModeHandler(BaseHandler):
                 exc_info=True,
             )
             if not silent:
-                if self.mode_name == "TTADK":
-                    _, card_content = CardBuilder.build_error_card(
-                        UI_TEXT["mode_ttadk_degraded_msg"].format(
-                            tool=UI_TEXT["card_lifecycle_degraded_primary_unknown"],
-                            reason=get_error_detail(e) or UI_TEXT["mode_ttadk_unavailable"],
-                        ),
-                        title=UI_TEXT["mode_ttadk_degraded_title"],
-                        details=UI_TEXT["mode_ttadk_degraded_details_hint"],
-                        severity="degraded",
-                        detail_action={
-                            "action": "show_error_details",
-                            "chat_id": chat_id,
-                            "origin_message_id": message_id,
-                            "title": UI_TEXT["mode_ttadk_degraded_title"],
-                            "summary": get_error_detail(e) or UI_TEXT["mode_ttadk_unavailable"],
-                            "details": self._ttadk_degraded_diagnostic_details(
-                                get_error_detail(e) or UI_TEXT["mode_ttadk_unavailable"]
-                            ),
-                        },
-                        continue_action={
-                            "action": "continue_degraded",
-                            "chat_id": chat_id,
-                            "origin_message_id": message_id,
-                        },
-                        retry_action=None,
-                    )
-                    self.reply_card(message_id, card_content)
-                else:
-                    self.send_error_card(
-                        chat_id,
-                        e,
-                        title=UI_TEXT["mode_startup_fail_title"].format(name=self.mode_name),
-                        origin_message_id=message_id,
-                    )
-            return False
-
-        degraded_marker = getattr(session, "_degraded_to", "")
-        is_ttadk_degraded = bool(
-            agent_type_override
-            and str(agent_type_override).lower().startswith("ttadk_")
-            and isinstance(degraded_marker, str)
-            and degraded_marker.strip()
-        )
-        try:
-            if is_ttadk_degraded:
-                degraded_to = getattr(session, "_degraded_to", "")
-                reason = getattr(session, "_degraded_reason", "")
-                if not silent:
-                    _, card_content = CardBuilder.build_error_card(
-                        UI_TEXT["mode_ttadk_degraded_msg"].format(
-                            tool=f"你可以继续使用 `{degraded_to}`，也可以查看详情或重试原模式。",
-                            reason=reason or "(empty)",
-                        ),
-                        title=UI_TEXT["mode_ttadk_degraded_title"],
-                        details=UI_TEXT["mode_ttadk_degraded_details_hint"],
-                        severity="degraded",
-                        detail_action={
-                            "action": "show_error_details",
-                            "chat_id": chat_id,
-                            "origin_message_id": message_id,
-                            "title": UI_TEXT["mode_ttadk_degraded_title"],
-                            "summary": reason or "TTADK backend degraded",
-                            "details": self._ttadk_degraded_diagnostic_details(reason),
-                        },
-                        continue_action={
-                            "action": "continue_degraded",
-                            "chat_id": chat_id,
-                            "origin_message_id": message_id,
-                            "degraded_to": str(degraded_to or ""),
-                        },
-                        retry_action={
-                            "action": "retry_original",
-                            "chat_id": chat_id,
-                            "origin_message_id": message_id,
-                            "original_mode": str(agent_type_override or ""),
-                            "retry_mode": str(agent_type_override or ""),
-                            "degraded_to": str(degraded_to or ""),
-                        },
-                    )
-                    self.reply_card(message_id, card_content)
-        except Exception:
-            logger.debug("best-effort TTADK degrade notification failed", exc_info=True)
-        if is_ttadk_degraded:
+                self.send_error_card(
+                    chat_id,
+                    e,
+                    title=UI_TEXT["mode_startup_fail_title"].format(name=self.mode_name),
+                    origin_message_id=message_id,
+                )
             return False
 
         if activate_mode and not thread_id:
@@ -696,8 +573,6 @@ class ProgrammingModeHandler(BaseHandler):
                 self._set_mode_on_project(project, True, snapshot.session_id, snapshot.query_count)
             if not silent:
                 mode_hint = UI_TEXT["mode_resume_hint_default"]
-                if self.mode_name == "TTADK":
-                    mode_hint = UI_TEXT["mode_resume_hint_ttadk"]
                 content = UI_TEXT["mode_resume_msg"].format(name=self.mode_name, session_id=session.session_id, query_count=snapshot.query_count, hint=mode_hint)
 
                 banner = CardBuilder._build_banner_element(UI_TEXT["mode_resume_banner"].format(name=self.mode_name), type="success")
@@ -718,8 +593,6 @@ class ProgrammingModeHandler(BaseHandler):
                 self._set_mode_on_project(project, True, session.session_id)
             if not silent:
                 content = UI_TEXT["mode_enter_msg"].format(emoji=self.mode_emoji, name=self.mode_name)
-                if self.mode_name == "TTADK":
-                    content += UI_TEXT["ttadk_extra_hint"]
 
                 banner = CardBuilder._build_banner_element(UI_TEXT["mode_enter_banner"].format(name=self.mode_name), type="success")
                 msg_type, card_content = CardBuilder.build_project_response_card(
@@ -864,10 +737,6 @@ class ProgrammingModeHandler(BaseHandler):
                 project_id = active.project_id if active else (session.session_id or "unknown")
                 if active:
                     project = active
-            if project and project.ttadk_tool_name:
-                tool_name = project.ttadk_tool_name
-            if project and project.ttadk_model_name:
-                model_name = project.ttadk_model_name
             if project and not tool_name and getattr(project, "acp_tool_name", None):
                 tool_name = project.acp_tool_name
             if project and not model_name and getattr(project, "acp_model_name", None):
@@ -1120,10 +989,6 @@ class ProgrammingModeHandler(BaseHandler):
         # Build metadata for new card system
         tool_name = None
         model_name = self._get_model_name_override(project)
-        if self.mode_name == "TTADK":
-            tool_name = self._get_ttadk_tool_display(project)
-            if not model_name:
-                model_name = self._get_ttadk_model_display(project)
 
         metadata = build_programming_metadata(
             self.mode_name,
@@ -1756,12 +1621,10 @@ class ProgrammingModeHandler(BaseHandler):
 
                 snapshot = self._get_snapshot(project)
                 if snapshot and snapshot.is_resumable:
-                    if self.is_coco:
-                        msg_type, card_content = CardBuilder.build_coco_resume_card(project)
-                    elif self.mode_name == "Claude":
-                        msg_type, card_content = CardBuilder.build_claude_resume_card(project)
-                    else:
-                        msg_type, card_content = CardBuilder.build_ttadk_resume_card(project)
+                    msg_type, card_content = CardBuilder._build_resume_card(
+                        project,
+                        self.mode_key,
+                    )
                     response_id = self.reply_card(message_id, card_content)
                     if response_id:
                         self.register_message_project(response_id, project)
@@ -1945,50 +1808,6 @@ class TraexModeHandler(ProgrammingModeHandler):
     mode_key = "traex"
     context_source = ContextSourceMode.TRAEX
     thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🚀", name="Traex")
-
-
-class TTADKModeHandler(ProgrammingModeHandler):
-    mode_name = "TTADK"
-    mode_emoji = "🎮"
-    interaction_mode = InteractionMode.TTADK
-    mode_key = "ttadk"
-    context_source = ContextSourceMode.TTADK
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🎮", name="TTADK")
-
-    def __init__(self, ctx):
-        super().__init__(ctx)
-        self._current_tool: Optional[str] = None
-
-    def _get_agent_type_override(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
-        tool = (project.ttadk_tool_name if project else None) or self._current_tool
-        if not tool:
-            from ...ttadk import get_ttadk_manager
-
-            tool = get_ttadk_manager().get_current_tool() or "coco"
-        return f"ttadk_{tool}"
-
-    def _get_model_name_override(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
-        model = (project.ttadk_model_name if project else None) or self._current_model
-        if not model:
-            from ...ttadk import get_ttadk_manager
-
-            model = get_ttadk_manager().get_current_model()
-        return model
-
-    def _get_ttadk_tool_display(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
-        agent_type = self._get_agent_type_override(project)
-        return agent_type.replace("ttadk_", "", 1) if agent_type else None
-
-    def _get_ttadk_model_display(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
-        return self._get_model_name_override(project)
-
-    @property
-    def current_tool(self) -> Optional[str]:
-        return self._current_tool
-
-    @current_tool.setter
-    def current_tool(self, value: Optional[str]):
-        self._current_tool = value
 
 
 class Tui2acpModeHandler(ProgrammingModeHandler):

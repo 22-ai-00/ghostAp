@@ -29,10 +29,10 @@ from src.slock_engine.card_templates import build_welcome_card
 # current Owner-visible commands from accidental hiding during catalog changes.
 MAIN_SLASH_COMMAND_BASELINE = frozenset({
     "/help", "/menu", "/tools", "/tools_status", "/coco", "/claude",
-    "/aiden", "/codex", "/gemini", "/traex", "/ttadk", "/tui2acp",
+    "/aiden", "/codex", "/gemini", "/traex", "/tui2acp",
     "/acp", "/model", "/exit", "/btw", "/coco_status", "/coco_info",
     "/claude_info", "/aiden_info", "/codex_info", "/gemini_info",
-    "/traex_info", "/ttadk_info", "/tui2acp_info", "/ttadk_refresh",
+    "/traex_info", "/tui2acp_info",
     "/projects", "/new", "/new-chat", "/switch", "/close", "/status",
     "/tasks", "/diff", "/trace", "/lock", "/unlock", "/setadmin",
     "/deep", "/deep_status", "/deep_update", "/stop_deep", "/spec",
@@ -53,7 +53,6 @@ DIRECT_COMPATIBILITY_ALIASES = (
     ("/enter_codex", "/codex"),
     ("/enter_gemini", "/gemini"),
     ("/enter_traex", "/traex"),
-    ("/enter_ttadk", "/ttadk"),
     ("/enter_tui2acp", "/tui2acp"),
 )
 

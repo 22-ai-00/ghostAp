@@ -5,7 +5,7 @@ from typing import Optional
 
 
 class InteractionMode(Enum):
-    """交互模式枚举（SMART/COCO/CLAUDE/SHELL/TTADK/AIDEN/CODEX/GEMINI/TRAEX/TUI2ACP）。"""
+    """交互模式枚举。"""
 
     SMART = "smart"
     COCO = "coco"
@@ -15,7 +15,6 @@ class InteractionMode(Enum):
     GEMINI = "gemini"
     TRAEX = "traex"
     SHELL = "shell"
-    TTADK = "ttadk"
     TUI2ACP = "tui2acp"
 
 
@@ -51,7 +50,6 @@ class ModeManager:
             InteractionMode.CODEX,
             InteractionMode.GEMINI,
             InteractionMode.TRAEX,
-            InteractionMode.TTADK,
             InteractionMode.TUI2ACP,
         )
 
@@ -196,10 +194,6 @@ class ModeManager:
         """进入 Codex 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.CODEX, auto=auto, project_id=project_id)
 
-    def enter_ttadk_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 TTADK 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.TTADK, auto=auto, project_id=project_id)
-
     def enter_gemini_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
         """进入 Gemini 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.GEMINI, auto=auto, project_id=project_id)
@@ -236,10 +230,6 @@ class ModeManager:
         """判断当前是否为 Codex 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.CODEX
 
-    def is_ttadk_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 TTADK 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.TTADK
-
     def is_gemini_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断当前是否为 Gemini 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.GEMINI
@@ -261,7 +251,7 @@ class ModeManager:
         return self.get_mode(chat_id, project_id) == InteractionMode.SHELL
 
     def is_programming_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断是否处于编程模式（COCO/CLAUDE/AIDEN/CODEX/GEMINI/TRAEX/TTADK）。"""
+        """判断是否处于编程模式。"""
         mode = self.get_mode(chat_id, project_id)
         return mode in self._programming_modes
 
@@ -277,6 +267,5 @@ class ModeManager:
             InteractionMode.GEMINI: "✨ Gemini 编程模式",
             InteractionMode.TRAEX: "🚀 Traex 编程模式",
             InteractionMode.SHELL: "💻 Shell 模式",
-            InteractionMode.TTADK: "🎮 TTADK 编程模式",
             InteractionMode.TUI2ACP: "🌉 Tui2ACP 编程模式",
         }.get(mode, "未知模式")

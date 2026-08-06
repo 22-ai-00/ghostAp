@@ -10,7 +10,7 @@ def test_workflow_model_lookup_uses_short_ttl_cache(monkeypatch):
         def get_models_for_tool(
             self,
             tool_name,
-            provider="ttadk",
+            provider="acp",
             cwd=None,
             current_model=None,
             force_refresh=True,
@@ -40,12 +40,12 @@ def test_workflow_model_lookup_does_not_rescan_all_tools(monkeypatch):
     class FakeDiscovery:
         def get_available_tools(self):
             scans.append("called")
-            return [{"tool_name": "traex", "provider": "ttadk"}]
+            return [{"tool_name": "traex", "provider": "acp"}]
 
         def get_models_for_tool(
             self,
             tool_name,
-            provider="ttadk",
+            provider="acp",
             cwd=None,
             current_model=None,
             force_refresh=True,
@@ -66,36 +66,6 @@ def test_workflow_model_lookup_does_not_rescan_all_tools(monkeypatch):
     assert calls == [("traex", "acp", "/repo", False)]
 
 
-def test_workflow_ttdak_model_selection_does_not_force_refresh(monkeypatch):
-    from src.feishu.handlers.workflow import WorkflowHandler
-
-    calls: list[tuple[str, str, str, bool]] = []
-
-    class FakeDiscovery:
-        def get_models_for_tool(
-            self,
-            tool_name,
-            provider="ttadk",
-            cwd=None,
-            current_model=None,
-            force_refresh=True,
-        ):
-            calls.append((tool_name, provider, cwd or "", force_refresh))
-            return [{"name": "doubao-seed", "display_name": "doubao-seed"}]
-
-    monkeypatch.setattr(
-        "src.acp.tool_discovery.AgentToolDiscovery",
-        FakeDiscovery,
-    )
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    models = handler._get_workflow_models_for_tool(
-        "doubao",
-        "/repo",
-    )
-
-    assert calls == [("doubao", "ttadk", "/repo", False)]
-    assert models == [{"name": "doubao-seed", "display_name": "doubao-seed", "description": ""}]
 
 
 def test_workflow_codex_model_lookup_preserves_effort_capabilities_and_cache(

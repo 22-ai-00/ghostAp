@@ -20,7 +20,6 @@ class _RegistryCaptureClient:
         self.prefix_actions: set[str] = set()
         self.handlers: dict[str, object] = {}
         self.replies: list[tuple[str, str]] = []
-        self.enter_ttadk_calls: list[tuple] = []
         self._project_manager = MagicMock()
         self._project_manager.get_active_project.return_value = None
 
@@ -34,8 +33,6 @@ class _RegistryCaptureClient:
     def _reply_text(self, message_id: str, text: str):
         self.replies.append((message_id, text))
 
-    def _handle_card_enter_ttadk(self, *args):
-        self.enter_ttadk_calls.append(args)
 
     def __getattr__(self, name):
         def _stub(*args, **kwargs):
@@ -70,13 +67,6 @@ def test_feishu_action_registry_uses_canonical_core_action_ids():
         action_ids.SHOW_ERROR_DETAILS,
         action_ids.RETRY_ORIGINAL,
         action_ids.HELP_CATEGORY,
-        action_ids.SELECT_TTADK_TOOL,
-        action_ids.TOGGLE_TTADK_YOLO,
-        action_ids.SELECT_TTADK_MODEL,
-        action_ids.REFRESH_TTADK_MODELS,
-        action_ids.SELECT_TTADK_COMBINED,
-        action_ids.SELECT_TTADK_COMBINED_TOOL,
-        action_ids.SHOW_TTADK_MENU,
         action_ids.SHOW_ACP_MENU,
         action_ids.SELECT_ACP_TOOL,
         action_ids.SELECT_ACP_MODEL,
@@ -194,7 +184,7 @@ def test_show_error_details_action_replies_with_diagnostics():
     client = _RegistryCaptureClient()
     init_action_registry(client)
     token = error_diagnostic_store.register(
-        title="TTADK 暂不可用",
+        title="Codex 暂不可用",
         summary="cli unavailable",
         details="stderr: boom at /home/alice/project/.env SECRET_TOKEN=abc123",
         chat_id="c1",
@@ -213,7 +203,7 @@ def test_show_error_details_action_replies_with_diagnostics():
 
     assert len(client.replies) == 1
     reply = client.replies[0][1]
-    assert "🔎 TTADK 暂不可用" in reply
+    assert "🔎 Codex 暂不可用" in reply
     assert "cli unavailable" in reply
     assert "payload must be ignored" not in reply
     assert "/home/alice" not in reply
@@ -275,23 +265,6 @@ def test_show_error_details_action_uses_payload_origin_message_binding_for_card_
     assert "origin-bound detail" in client.replies[0][1]
 
 
-def test_retry_original_action_uses_use_case_without_private_ttadk_handler():
-    from src.feishu.action_registry import init_action_registry
-
-    client = _RegistryCaptureClient()
-    init_action_registry(client)
-
-    handler = client.handlers[action_ids.RETRY_ORIGINAL]
-    payload = {"original_mode": "ttadk_coco", "retry_mode": "ttadk_coco", "degraded_to": "Coco", "origin_message_id": "m0"}
-    handler("m1", "c1", "p1", payload)
-
-    assert client.enter_ttadk_calls == []
-    assert client.replies == [
-        (
-            "m1",
-            "已收到重试请求，但当前卡片无法安全自动恢复 ttadk_coco。请重新发送原命令、查看诊断，或在卡片存在可继续模式时使用该模式。",
-        )
-    ]
 
 
 def test_retry_original_action_without_mode_returns_clear_feedback():

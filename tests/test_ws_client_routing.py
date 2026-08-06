@@ -322,7 +322,7 @@ def test_explicit_engine_command_reaches_its_final_handler_in_every_programming_
     """Persistent programming state may not consume any explicit engine command."""
     project = ProjectContext("proj_1", "GhostAP", "/tmp")
     mock_ws_client._get_mode_handler = MagicMock()
-    programming_modes = ("coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk")
+    programming_modes = ("coco", "claude", "aiden", "codex", "gemini", "traex")
     engine_cases = (
         ("/deep 深入完成复杂任务", "_handle_deep_command"),
         ("/spec 按规格迭代直到收敛", "_handle_spec_command"),

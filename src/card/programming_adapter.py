@@ -1,8 +1,7 @@
 """Programming mode adapter: bridges streaming card pattern to CardSession.
 
 Bridges streaming card pattern to CardSession for
-ProgrammingHandler.handle_response(). Supports all programming modes:
-Coco/Claude/Aiden/Codex/Gemini/Traex/TTADK/Tui2ACP.
+ProgrammingHandler.handle_response(). Supports all programming modes.
 """
 
 from __future__ import annotations
@@ -48,7 +47,6 @@ _MODE_DISPLAY: dict[str, tuple[str, str]] = {
     "codex": ("📝", "Codex"),
     "gemini": ("💎", "Gemini"),
     "traex": ("🚀", "Traex"),
-    "ttadk": ("🛠️", "TTADK"),
     "tui2acp": ("🔌", "Tui2ACP"),
 }
 
@@ -101,7 +99,7 @@ def build_programming_metadata(
     """Build CardMetadata for a programming mode session.
 
     Args:
-        mode_name: One of coco/claude/aiden/codex/gemini/traex/ttadk.
+        mode_name: Programming mode identifier.
         tool_name: Specific tool name (overrides mode default).
         model_name: Model name to display.
         project_name: Optional project name for header.

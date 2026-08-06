@@ -13,7 +13,7 @@ Agent。
 | 能力 | 产品边界 |
 | --- | --- |
 | 主 Bot 控制面 | 管理项目、员工、团队、任务、审批和审计，不冒充员工输出 |
-| 直接编程 | Coco、Claude、Aiden、Codex、Gemini、Traex、TTADK、TUI2ACP 等后端保持多轮直连 |
+| 直接编程 | Coco、Claude、Aiden、Codex、Gemini、Traex、TUI2ACP 等后端保持多轮直连 |
 | Agent Department | 持久员工拥有独立飞书 Bot、Channel、历史、记忆和停止语义 |
 | 专项与编排策略 | Deep、Spec、Workflow、Team/Slock 分别承接成熟专项执行与多 Agent 协作 |
 | 飞书交互 | 卡片持续展示任务状态、工具调用、模型选择和错误诊断 |
@@ -28,7 +28,7 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 | --- | --- |
 | 产品身份 | 主 Bot 是控制面；Employee Bot 是独立执行身份 |
 | 执行策略 | Smart、普通编程、Deep、Spec、Workflow、Team/Slock |
-| provider/transport | ACP 直接模式、Shell CLI 桥接、TTADK CLI 桥接 |
+| provider/transport | ACP 直接模式、Shell CLI 桥接 |
 | Host Shell | 独立的特权宿主执行能力，不是 Agent provider，也不是操作系统沙箱 |
 
 普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
@@ -113,9 +113,6 @@ WORKFLOW_TOTAL_TIMEOUT_S=3600
 WORKFLOW_AGENT_CALL_TIMEOUT_S=600
 WORKFLOW_SCRIPT_GEN_TIMEOUT_S=180
 
-TTADK_DEFAULT_TOOL=claude
-TTADK_DEFAULT_MODEL=
-
 SLOCK_DEFAULT_ROLES=planner:claude,coder:codex,reviewer:claude,tester:codex
 ```
 
@@ -172,7 +169,6 @@ PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就�
 | --- | --- |
 | `/help` | 查看完整帮助 |
 | `/coco`、`/claude`、`/aiden`、`/codex`、`/gemini`、`/traex` | 进入对应编程模式 |
-| `/ttadk` | 进入 TTADK 多工具编程模式 |
 | `/tui2acp` | 进入 TUI2ACP 桥接模式 |
 | `/model`、`/model list`、`/model <name>` | 查看或切换当前 ACP 工具模型 |
 | `/acp` | 查看 ACP 工具选择入口 |
@@ -251,7 +247,6 @@ Workflow 使用三步流程：选择主编排 Agent、选择评审 Agent 或 Aut
 | `src/mode/` | 聊天/项目交互模式状态 |
 | `src/acp/` | ACP 会话、Provider、模型发现、诊断和事件渲染 |
 | `src/agent_session/` | ACP 与 CLI 后端的统一会话抽象 |
-| `src/ttadk/` | TTADK 工具、模型和启动策略 |
 | `src/deep_engine/` | Deep 单次自主执行 |
 | `src/spec_engine/` | Spec 结构化闭环和多视角审查 |
 | `src/workflow_engine/` | JS Workflow 生成、验证、运行时和卡片渲染 |

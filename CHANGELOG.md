@@ -21,6 +21,7 @@ All notable changes to this project will be documented in this file.
 ### ⚠️ Breaking Changes
 
 - **Worktree mode removed**: `/worktree` and `/wt`, the Worktree engine, its cards, and its dedicated tests are gone. Existing historical cards are read-only and non-executable; use `/wf` as the supported multi-Agent orchestration entry. Legacy local branches and worktree directories are not deleted or migrated automatically.
+- **TTADK backend removed**: `/ttadk` and `/enter_ttadk`, TTADK CLI/session startup, model selection, cards, project state, configuration, implementation modules, and dedicated tests are gone. Surviving programming tools continue through their existing ACP or CLI transports.
 - **`DirectCardSession` 已删除**: `src/card/direct_session.py` 已移除。所有引擎渲染器现使用 `BaseRenderer.create_session()` → `CardSession.dispatch()`。
 - **`CardBuilder.build_engine_card()` 已移除**: 访问将触发 `AttributeError`。使用新管线 `renderer.create_session()` + `session.dispatch(CardEvent.*)` 替代。
 - **`src/card/adapter.py` 已删除**: 适配逻辑迁移至 `src/card/events/acp_adapter.py` 及 `src/card/protocols.py`。
@@ -30,6 +31,7 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 
+- **TTADK integration**: Removed `src/ttadk/`, its CLI session/wrapper layers, Feishu handler and callback surfaces, configuration/state fields, current documentation, UX references, and TTADK-specific tests.
 - **`src/card/direct_session.py`** (`DirectCardSession`): Replaced by `CardSession` (`src.card.session.core`). All engine renderers now use `BaseRenderer.create_session()` → `CardSession.dispatch()`.
 - **`src/card/adapter.py`**: Replaced by per-engine adapter functions in `src/card/events/acp_adapter.py` and engine-specific protocols in `src/card/protocols.py`.
 - **`src/card/events.py`** (top-level module): Refactored into `src/card/events/` package (`types.py`, `factories.py`, `payloads.py`, `acp_adapter.py`).

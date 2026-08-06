@@ -124,18 +124,12 @@ class TestModelFailoverHelpers:
     def test_extract_model_from_agent_args_coco_style(self):
         assert _extract_model_from_agent_args(["acp", "serve", "-c", "model.name=gpt-5.2"]) == "gpt-5.2"
 
-    def test_extract_model_from_agent_args_ttadk_style(self):
-        assert _extract_model_from_agent_args(["ttadk", "code", "-m", "gpt-5.2"]) == "gpt-5.2"
 
     def test_replace_model_in_agent_args_coco_style(self):
         args, ok = _replace_model_in_agent_args(["acp", "serve", "-c", "model.name=gpt-5.2"], "gpt-5.1")
         assert ok is True
         assert "model.name=gpt-5.1" in args
 
-    def test_replace_model_in_agent_args_ttadk_style(self):
-        args, ok = _replace_model_in_agent_args(["ttadk", "code", "-m", "gpt-5.2"], "gpt-5.1")
-        assert ok is True
-        assert args[args.index("-m") + 1] == "gpt-5.1"
 
 
 def test_apply_compaction_once_rebuilds_session_with_same_cmd_args(monkeypatch):

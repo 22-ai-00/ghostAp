@@ -13,7 +13,6 @@ def _mock_settings():
     """Provide a Settings mock with max_allowed_chat_ids=3 for small tests."""
     settings = MagicMock()
     settings.max_allowed_chat_ids = 3
-    settings.ttadk_yolo_default_enabled = False
     settings.max_evicted_cache = 200
     with patch("src.config.get_settings", return_value=settings):
         yield settings

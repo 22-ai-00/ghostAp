@@ -21,7 +21,6 @@ class TestSessionManagerHub:
         assert hub.aiden._agent_type == "aiden"
         assert hub.codex._agent_type == "codex"
         assert hub.gemini._agent_type == "gemini"
-        assert hub.ttadk._agent_type == "ttadk"
 
         # Verify some settings are passed
         assert hub.coco._session_timeout == 3600
@@ -40,7 +39,6 @@ class TestSessionManagerHub:
         hub.aiden.cleanup_all = MagicMock()
         hub.codex.cleanup_all = MagicMock()
         hub.gemini.cleanup_all = MagicMock()
-        hub.ttadk.cleanup_all = MagicMock()
 
         hub.cleanup_all()
 
@@ -49,7 +47,6 @@ class TestSessionManagerHub:
         hub.aiden.cleanup_all.assert_called_once()
         hub.codex.cleanup_all.assert_called_once()
         hub.gemini.cleanup_all.assert_called_once()
-        hub.ttadk.cleanup_all.assert_called_once()
 
     def test_cleanup_all_with_exception_isolation(self):
         settings = MagicMock()

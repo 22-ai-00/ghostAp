@@ -7,7 +7,6 @@ from src.access_control import (
     IngressAccessPolicy,
     IngressAccessPolicyProvider,
 )
-from src.agent.intent_recognizer import IntentType, TaskStep
 from src.config import IngressAccessMode
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.feishu.ws_client import FeishuWSClient
@@ -215,107 +214,7 @@ class TestCardActionHandler(unittest.TestCase):
                 "om_1", "oc_1", "p1", {"action": "enter_coco", "project_id": "p1"}
             )
 
-    def test_process_card_action_routes_refresh_ttadk_models(self):
-        """验证 TTADK 模型选择卡的『刷新模型列表』按钮可被正确路由。"""
-        with (
-            patch("src.feishu.ws_client.get_settings") as mock_get_settings,
-            patch("src.feishu.ws_client.ACPSessionManager"),
-            patch("src.feishu.ws_client.IntentRecognizer"),
-            patch("src.feishu.ws_client.ProjectManager"),
-            patch("src.feishu.ws_client.MessageProjectMapper"),
-            patch("src.feishu.ws_client.DeepEngineManager"),
-            patch("src.feishu.ws_client.ProgressReporter"),
-            patch("src.mode.ModeManager"),
-        ):
-            mock_settings = MagicMock()
-            mock_settings.app_id = "test_app_id"
-            mock_settings.app_secret = "test_app_secret"
-            mock_settings.streaming_enabled = False
-            mock_settings.task_scheduler_max_concurrent = 2
-            mock_settings.task_scheduler_per_key_concurrency = 1
-            mock_settings.message_cache_ttl = 300
-            mock_settings.message_cache_max_size = 1000
-            mock_settings.card.action_dedup_ttl = 1
-            mock_settings.card.action_dedup_max_size = 5000
-            mock_settings.system_command_concurrency = 10
-            mock_settings.spec_rate_limit_capacity = 100
-            mock_settings.spec_rate_limit_fill_rate = 50.0
-            mock_settings.spec_circuit_breaker_threshold = 10
-            mock_settings.spec_circuit_breaker_recovery = 5.0
-            mock_settings.message_expire_seconds = 30
-            mock_get_settings.return_value = mock_settings
 
-            client = FeishuWSClient(MagicMock())
-            client._handle_refresh_ttadk_models = MagicMock()
-
-            data = SimpleNamespace(
-                event=SimpleNamespace(
-                    action=SimpleNamespace(
-                        value={"action": "refresh_ttadk_models", "tool_name": "codex", "project_id": "p1"},
-                        tag="button",
-                        name="refresh",
-                    ),
-                    operator=SimpleNamespace(open_id="ou_x", user_id="u_x"),
-                    context=SimpleNamespace(open_message_id="om_1", open_chat_id="oc_1"),
-                )
-            )
-
-            client._process_card_action_async(data)
-            client._handle_refresh_ttadk_models.assert_called_once_with("om_1", "oc_1", "codex", "p1")
-
-    def test_process_card_action_ttadk_exception_uses_soft_failure_card(self):
-        """验证 TTADK 卡片动作异常时返回软失败提示。"""
-        with (
-            patch("src.feishu.ws_client.get_settings") as mock_get_settings,
-            patch("src.feishu.ws_client.ACPSessionManager"),
-            patch("src.feishu.ws_client.IntentRecognizer"),
-            patch("src.feishu.ws_client.ProjectManager"),
-            patch("src.feishu.ws_client.MessageProjectMapper"),
-            patch("src.feishu.ws_client.DeepEngineManager"),
-            patch("src.feishu.ws_client.ProgressReporter"),
-            patch("src.mode.ModeManager"),
-        ):
-            mock_settings = MagicMock()
-            mock_settings.app_id = "test_app_id"
-            mock_settings.app_secret = "test_app_secret"
-            mock_settings.streaming_enabled = False
-            mock_settings.task_scheduler_max_concurrent = 2
-            mock_settings.task_scheduler_per_key_concurrency = 1
-            mock_settings.message_cache_ttl = 300
-            mock_settings.message_cache_max_size = 1000
-            mock_settings.card.action_dedup_ttl = 1
-            mock_settings.card.action_dedup_max_size = 5000
-            mock_settings.system_command_concurrency = 10
-            mock_settings.spec_rate_limit_capacity = 100
-            mock_settings.spec_rate_limit_fill_rate = 50.0
-            mock_settings.spec_circuit_breaker_threshold = 10
-            mock_settings.spec_circuit_breaker_recovery = 5.0
-            mock_settings.message_expire_seconds = 30
-            mock_get_settings.return_value = mock_settings
-
-            client = FeishuWSClient(MagicMock())
-            client._reply_text = MagicMock()
-            client._reply_card = MagicMock()
-            client._action_dispatcher.dispatch = MagicMock(side_effect=Exception("boom"))
-
-            data = SimpleNamespace(
-                event=SimpleNamespace(
-                    action=SimpleNamespace(
-                        value={"action": "select_ttadk_tool", "tool_name": "codex", "project_id": "p1"},
-                        tag="button",
-                        name="tool",
-                    ),
-                    operator=SimpleNamespace(open_id="ou_x", user_id="u_x"),
-                    context=SimpleNamespace(open_message_id="om_1", open_chat_id="oc_1"),
-                )
-            )
-
-            client._process_card_action_async(data)
-
-            client._reply_card.assert_called_once()
-            _, card_content = client._reply_card.call_args.args[:2]
-            self.assertIn("已为你保留选择", card_content)
-            self.assertIn("继续进入TTADK", card_content)
 
     def test_handle_card_enter_claude_passes_project(self):
         """验证卡片入口 Claude 时把 project 透传给 enter_mode（避免选错项目导致显示 Coco 卡片）"""
@@ -503,99 +402,7 @@ class TestCardActionHandler(unittest.TestCase):
             )
 
 
-    def test_process_with_intent_routes_ttadk(self):
-        """Test that _process_with_intent routes to TTADK handler in TTADK mode."""
-        with (
-            patch("src.feishu.ws_client.get_settings") as mock_get_settings,
-            patch("src.feishu.ws_client.ACPSessionManager"),
-            patch("src.feishu.ws_client.IntentRecognizer"),
-            patch("src.feishu.ws_client.ProjectManager"),
-            patch("src.feishu.ws_client.MessageProjectMapper"),
-            patch("src.feishu.ws_client.DeepEngineManager"),
-            patch("src.feishu.ws_client.ProgressReporter"),
-            patch("src.mode.ModeManager"),
-        ):
-            mock_settings = MagicMock()
-            mock_settings.app_id = "test_app_id"
-            mock_settings.app_secret = "test_app_secret"
-            mock_settings.streaming_enabled = False
-            mock_settings.task_scheduler_max_concurrent = 2
-            mock_settings.task_scheduler_per_key_concurrency = 1
-            mock_settings.message_cache_ttl = 300
-            mock_settings.message_cache_max_size = 1000
-            mock_settings.card.action_dedup_ttl = 1
-            mock_settings.card.action_dedup_max_size = 5000
-            mock_settings.system_command_concurrency = 10
-            mock_settings.spec_rate_limit_capacity = 100
-            mock_settings.spec_rate_limit_fill_rate = 50.0
-            mock_settings.spec_circuit_breaker_threshold = 10
-            mock_settings.spec_circuit_breaker_recovery = 5.0
-            mock_settings.message_expire_seconds = 30
-            mock_get_settings.return_value = mock_settings
 
-            client = FeishuWSClient(MagicMock())
-            client._mode_manager = MagicMock()
-            client._mode_manager.is_programming_mode.return_value = True
-            client._mode_manager.get_mode.return_value = InteractionMode.TTADK
-
-            client._is_deep_command = MagicMock(return_value=False)
-            client._is_spec_command = MagicMock(return_value=False)
-            client._is_exit_command = MagicMock(return_value=False)
-
-            client._ttadk_handler = MagicMock()
-            client._ttadk_handler.handle_message = MagicMock()
-            client._add_reaction = MagicMock()
-
-            mock_project = MagicMock()
-
-            client._process_with_intent(
-                message_id="msg_1",
-                chat_id="chat_1",
-                text="hello ttadk",
-                project=mock_project,
-            )
-
-            client._ttadk_handler.handle_message.assert_called_once_with(
-                "msg_1", "chat_1", "hello ttadk", mock_project
-            )
-
-    def test_execute_single_task_ttadk_message_routes_to_ttadk_handler(self):
-        with (
-            patch("src.feishu.ws_client.get_settings") as mock_get_settings,
-            patch("src.feishu.ws_client.ACPSessionManager"),
-            patch("src.feishu.ws_client.IntentRecognizer"),
-            patch("src.feishu.ws_client.ProjectManager"),
-            patch("src.feishu.ws_client.MessageProjectMapper"),
-            patch("src.feishu.ws_client.DeepEngineManager"),
-            patch("src.feishu.ws_client.ProgressReporter"),
-            patch("src.mode.ModeManager"),
-        ):
-            mock_settings = MagicMock()
-            mock_settings.app_id = "test_app_id"
-            mock_settings.app_secret = "test_app_secret"
-            mock_settings.streaming_enabled = False
-            mock_settings.task_scheduler_max_concurrent = 2
-            mock_settings.task_scheduler_per_key_concurrency = 1
-            mock_settings.message_cache_ttl = 300
-            mock_settings.message_cache_max_size = 1000
-            mock_settings.card.action_dedup_ttl = 1
-            mock_settings.card.action_dedup_max_size = 5000
-            mock_settings.system_command_concurrency = 10
-            mock_settings.spec_rate_limit_capacity = 100
-            mock_settings.spec_rate_limit_fill_rate = 50.0
-            mock_settings.spec_circuit_breaker_threshold = 10
-            mock_settings.spec_circuit_breaker_recovery = 5.0
-            mock_settings.message_expire_seconds = 30
-            mock_get_settings.return_value = mock_settings
-
-            client = FeishuWSClient(MagicMock())
-            client._ttadk_handler = MagicMock()
-            client._ttadk_handler.handle_message = MagicMock()
-            client._mode_manager.get_mode.return_value = InteractionMode.TTADK
-
-            task = TaskStep(intent=IntentType.TTADK_MESSAGE, description="ttadk", data={})
-            client._execute_single_task("m1", "c1", task, "refactor this", project=None)
-            client._ttadk_handler.handle_message.assert_called_once_with("m1", "c1", "refactor this", None)
 
     def test_process_with_intent_routes_gemini(self):
         """Test that _process_with_intent routes to Gemini handler in GEMINI mode."""
@@ -1355,9 +1162,6 @@ class TestThreadPersistentProgramming(unittest.TestCase):
             ("gemini", "/enter_gemini"),
             ("traex", "/traex"),
             ("traex", "/enter_traex"),
-            ("ttadk", "/ttadk"),
-            ("ttadk", "/enter_ttadk"),
-            ("ttadk", "/acp"),
             ("tui2acp", "/tui2acp"),
             ("tui2acp", "/enter_tui2acp"),
         )
@@ -1387,7 +1191,7 @@ class TestThreadPersistentProgramming(unittest.TestCase):
         client = self._make_client()
         client._add_reaction = MagicMock()
 
-        for mode in ("coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk"):
+        for mode in ("coco", "claude", "aiden", "codex", "gemini", "traex"):
             handler = MagicMock()
             client._get_mode_handler = MagicMock(return_value=handler)
             project = MagicMock()
@@ -1611,8 +1415,8 @@ class TestThreadModeRetentionRobust(unittest.TestCase):
         client._project_manager.get_active_project.assert_not_called()
 
     def test_all_modes_resolve_from_thread_ctx(self):
-        """所有编程模式 (coco/claude/aiden/codex/gemini/traex/ttadk) 都能从 thread_ctx 正确解析"""
-        for mode in ("coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk"):
+        """所有编程模式都能从 thread_ctx 正确解析。"""
+        for mode in ("coco", "claude", "aiden", "codex", "gemini", "traex"):
             client = self._make_client()
             client.settings = MagicMock()
             client.settings.thread_programming_enabled = True

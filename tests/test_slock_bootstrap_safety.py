@@ -31,7 +31,6 @@ class TestToolTypeValidation:
         assert "coco" in SUPPORTED_TOOL_TYPES
         assert "aiden" in SUPPORTED_TOOL_TYPES
         assert "gemini" in SUPPORTED_TOOL_TYPES
-        assert "ttadk" in SUPPORTED_TOOL_TYPES
 
     def test_invalid_tool_type_skipped(self):
         """Invalid tool_type in config is skipped; valid ones are created."""

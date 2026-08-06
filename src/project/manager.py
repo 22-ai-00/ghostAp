@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..card.themes import get_available_themes
-from ..config import get_settings
 from ..utils.errors import get_error_detail
 from ..utils.lock_order import LockLevel, ordered_rlock
 from .context import ADD_CHAT_ID_REJECTED, ProjectContext, ProjectStatus
@@ -157,9 +156,6 @@ class ProjectManager:
 
             previous_color_index = self._color_index
             theme_color, emoji_prefix = self._get_next_theme()
-            settings = get_settings()
-            yolo_enabled = bool(getattr(settings, "ttadk_yolo_default_enabled", False))
-
             ctx = ProjectContext(
                 project_id=project_id,
                 project_name=project_name,
@@ -168,7 +164,6 @@ class ProjectManager:
                 status=ProjectStatus.ACTIVE,
                 theme_color=theme_color,
                 emoji_prefix=emoji_prefix,
-                ttadk_yolo_enabled=yolo_enabled,
                 owner_chat_id=chat_id or "",
                 allowed_chat_ids=OrderedDict([(chat_id, time.time())]) if chat_id else OrderedDict(),
             )
@@ -226,7 +221,6 @@ class ProjectManager:
                     )
             previous_color_index = self._color_index
             theme_color, emoji_prefix = self._get_next_theme()
-            settings = get_settings()
             ctx = ProjectContext(
                 project_id=resolved_id,
                 project_name=project_name,
@@ -235,9 +229,6 @@ class ProjectManager:
                 status=ProjectStatus.ACTIVE,
                 theme_color=theme_color,
                 emoji_prefix=emoji_prefix,
-                ttadk_yolo_enabled=bool(
-                    getattr(settings, "ttadk_yolo_default_enabled", False)
-                ),
                 owner_chat_id=owner_chat_id,
                 allowed_chat_ids=(
                     OrderedDict([(owner_chat_id, time.time())])

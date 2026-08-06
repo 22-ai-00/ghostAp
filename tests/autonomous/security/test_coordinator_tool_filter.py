@@ -69,7 +69,6 @@ def _install_fake_backend(
         lambda: SimpleNamespace(
             acp_startup_timeout=20,
             rate_limit_retry_enabled=False,
-            ttadk_cwd_debug_enabled=False,
         ),
     )
     monkeypatch.setattr(

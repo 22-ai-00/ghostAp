@@ -99,7 +99,6 @@ UI_TEXT = {
     "system_mode_codex": "💻 Codex 编程模式",
     "system_mode_gemini": "✨ Gemini 编程模式",
     "system_mode_traex": "🚀 Traex 编程模式",
-    "system_mode_ttadk": "🎮 TTADK 多工具模式",
     # Mode name labels (without emoji prefix, used in card title building)
     "mode_name_claude": "Claude 编程模式",
     "mode_name_coco": "编程模式",
@@ -115,20 +114,6 @@ UI_TEXT = {
     "qa_btn_stop": "⏹️ 停止",
     "qa_btn_new_project": "➕ 创建项目",
     "qa_btn_list_projects": "📋 项目列表",
-    "system_ttadk_refresh_success": "✅ 已触发 TTADK 模型列表强制刷新",
-    "system_ttadk_no_tool": "⚠️ 未指定 TTADK 工具，建议先发送 `/ttadk` 选择工具",
-    "system_ttadk_select_tool_error": "❌ 设置 TTADK 工具失败: {tool}",
-    "system_ttadk_refresh_error": "❌ 刷新 TTADK 模型列表失败",
-    "system_ttadk_get_tools_error": "❌ 获取 TTADK 工具列表失败: {error}",
-    "system_ttadk_model_warning": "⚠️ TTADK 模型列表可能不完整/不可信: {warnings}",
-    "system_ttadk_switching_model": "🔄 正在切换到模型: {model}…",
-    "system_ttadk_set_model_error": "❌ 设置 TTADK 模型失败: {model}",
-    "system_ttadk_handler_uninitialized": "❌ TTADK 处理器未初始化",
-    "system_ttadk_refresh_label_tool": "工具: `{tool}`",
-    "system_ttadk_refresh_label_source": "来源: `{source}`",
-    "system_ttadk_refresh_label_warning": "⚠️ 警告: {warnings}",
-    "system_ttadk_refresh_label_diag": "诊断: attempts={attempts}",
-    "system_ttadk_refresh_footer": "\n最短修复路径：若仍不可用，请确认在项目目录执行过 `ttadk init`，或切换 tool 后重试。",
     "system_switching_to": "🔄 正在切换到 {tool} / {model}…",
     "system_already_in_mode": "💭 当前已经在智能模式中",
     "system_not_set": "未设置",
@@ -164,12 +149,6 @@ UI_TEXT = {
     "acp_result_tools_header": "🛠️ 工具调用",
     "acp_result_tool_results_header": "📦 工具结果(本地记录)",
     "acp_result_files_header": "🗂️ 改动文件",
-    "system_ttadk_unavailable": "TTADK 暂不可用",
-    "system_ttadk_list_load_error": "暂时无法加载 TTADK 工具列表（{error}）",
-    "system_ttadk_model_load_error": "暂时无法加载 TTADK 模型列表（{error}）",
-    "system_ttadk_status_banner": "🎮 **TTADK 状态** · 工具: `{tool}` · 模型: `{model}` · 自动执行: `{yolo}`",
-    "system_ttadk_info_header": "**🎮 TTADK 当前状态**\n",
-    "system_ttadk_info_footer": "\n使用 `/ttadk` 切换工具或模型",
     "system_acp_tool_desc_coco": "字节跳动 AI",
     "system_acp_tool_coco_display": "字节跳动 AI 编程",
     "system_acp_tool_desc_claude": "Anthropic AI",
@@ -222,7 +201,6 @@ UI_TEXT = {
     "spec_review_select_message": "请选择后续多角色 review 可使用的工具；也可以直接 Auto 保持原流程。",
     "system_dir_changed_title": "目录已切换",
     "system_error_title": "操作失败",
-    "system_ttadk_ai_tool_label": "AI Tool",
     "system_coco_status_title": "**🤖 Coco 状态**\n",
     "system_coco_current_model": "当前模型: `{model}`",
     "system_coco_available_models": "\n**可用模型:**",
@@ -235,24 +213,7 @@ UI_TEXT = {
     "system_shell_no_output": "✅ 命令执行成功（无输出）",
     "system_shell_return_code": "返回码: `{code}`",
     "system_shell_stderr_label": "⚠️ **错误输出**:",
-    "system_ttadk_yolo_on": "⚡ 自动执行：开启（点击关闭）",
-    "system_ttadk_yolo_off": "⚡ 自动执行：关闭（点击开启）",
-    "system_ttadk_select_tool_prompt": "请选择要使用的 TTADK 工具：",
-    "system_ttadk_select_tool_placeholder": "选择工具",
-    "system_ttadk_tool_select_title": "🔧 TTADK 工具选择",
-    "system_ttadk_select_model_prompt": "请为 {tool} 选择模型：",
-    "system_ttadk_select_model_hint": "（若列表为空/不全，可点击下方『🔄 刷新模型列表』强制拉取）",
-    "system_ttadk_select_model_placeholder": "选择模型",
-    "system_ttadk_refresh_btn": "🔄 刷新模型列表",
-    "system_ttadk_model_select_title": "🤖 {tool} 模型选择",
-    "system_ttadk_combined_select_prompt": "请选择要使用的 TTADK 工具和模型：",
-    "system_ttadk_label_tool": "**🔧 工具**",
-    "system_ttadk_label_model": "**🤖 模型** (工具: {tool})",
-    "system_ttadk_combined_title": "🔧 TTADK 工具与模型选择",
-    "system_ttadk_unavailable_title": "⚠️ TTADK 暂不可用",
-    "system_ttadk_soft_failure_msg": "⚠️ {reason}\n\n已为你保留选择，可点击继续或稍后重试。",
-    "system_ttadk_btn_continue": "继续进入 TTADK",
-    "system_ttadk_btn_reenter": "🔄 重新进入 TTADK",
+    "system_refresh_models_btn": "🔄 刷新模型列表",
     "system_acp_tool_select_title": "🧩 ACP 工具选择",
     "system_acp_model_select_title": "💭 {tool} 模型选择",
     "system_menu_title": "📱 快捷菜单",
@@ -262,7 +223,6 @@ UI_TEXT = {
     "system_menu_btn_deep_task": "Deep",
     "system_menu_btn_workflow": "Workflow",
     "system_menu_btn_status": "状态",
-    "system_menu_btn_ttadk": "TTADK",
     "system_menu_btn_acp": "工具",
     "system_menu_btn_help": "📖 帮助",
     "system_help_title": "📖 GhostAP 使用帮助",
@@ -275,9 +235,8 @@ UI_TEXT = {
         "`/codex` · 进入 Codex 编程模式\n"
         "`/gemini` · 进入 Gemini 编程模式\n"
         "`/traex` · 进入 Traex 编程模式\n"
-        "`/ttadk` · 进入 TTADK 多工具编程模式\n"
         "`/exit` · 退出当前编程模式\n"
-        "`/coco_info` · `/claude_info` · `/aiden_info` · `/codex_info` · `/traex_info` · `/ttadk_info` · 查看会话/模型信息"
+        "`/coco_info` · `/claude_info` · `/aiden_info` · `/codex_info` · `/traex_info` · 查看会话/模型信息"
     ),
     "system_help_section_deep": "💭 Deep Engine · 复杂任务一次交付",
     "system_help_section_deep_body": (
@@ -303,11 +262,6 @@ UI_TEXT = {
         "`/switch <名称>` · 切换项目  ·  `/close <名称>` · 关闭项目\n"
         "`/status` · 查看所有引擎任务状态\n"
         "`/diff` · 查看最近两次版本变更"
-    ),
-    "system_help_section_ttadk": "🤖 TTADK 管理",
-    "system_help_section_ttadk_body": (
-        "`/ttadk_refresh` · 强制刷新模型列表\n"
-        "`/ttadk_info` · 查看当前工具和模型"
     ),
     "system_help_section_workflow": "⚡ Workflow · 多 Agent 编排执行",
     "system_help_section_workflow_body": (
@@ -359,8 +313,6 @@ UI_TEXT = {
     "system_tools_status_item": "{emoji} **{name}**\n   状态: {status}\n   最后使用: {last_used}{active_info}",
     "system_tools_status_active_session": "\n   🔴 活跃会话: {chat_id}",
     "system_tools_status_btn_enter": "进入 {name}",
-    "system_ttadk_switch_tool_error": "暂时无法切换 TTADK 工具到 {tool}",
-    "system_ttadk_switch_model_error": "暂时无法切换 TTADK 模型到 {model}",
     # Project Commands
     "project_create_success": "✅ 项目 **{name}** 创建成功\n\n📁 路径: `{path}`",
     "project_create_error": "❌ 创建项目失败: {error}",
@@ -511,9 +463,7 @@ UI_TEXT = {
     "mode_thinking_msg": "{emoji} {name} 正在思考…",
     "mode_resume_msg": "🔄 已恢复 {name} 会话\n\n• 会话 ID: `{session_id}`\n• 历史对话: {query_count} 条\n\n{hint}",
     "mode_resume_hint_default": "继续之前的对话吧！",
-    "mode_resume_hint_ttadk": "当前模式：🎮 TTADK（可点「切换 TTADK 工具」，或发送 `/exit` 退回智能模式）",
     "mode_session_fail_msg": "{name} 会话启动失败，请重新发送 /{cmd} 开始",
-    "ttadk_extra_hint": "\n\n可点击「切换 TTADK 工具」重新选择工具链",
     # ── Deep Engine Card Prompts ──
     "deep_error_no_detail": "任务异常中断，发送 {engine_cmd} 重试",
     "deep_error_fallback_no_prefix": "任务异常中断，发送 /deep 重试或 /help 查看可用命令",
@@ -586,13 +536,6 @@ UI_TEXT = {
     "mode_model_switch_error": "切换 {name} 模型失败: {error}",
     "mode_startup_timeout_title": "启动 {name} 会话超时",
     "mode_startup_fail_title": "启动 {name} 会话失败",
-    "mode_ttadk_startup_timeout": "TTADK 会话启动超时",
-    "mode_ttadk_unavailable": "TTADK 会话暂不可用",
-    "mode_ttadk_degraded_title": "TTADK 暂不可用",
-    "mode_ttadk_degraded_msg": "⚠️ TTADK 后端暂不可用。{tool}\n\n原因摘要：{reason}",
-    "mode_ttadk_degraded_details_hint": "诊断详情已收起，点击“查看详情”可查看本次失败摘要。",
-    "mode_ttadk_available_mode_label": "Coco",
-    "mode_ttadk_available_mode_value": "Coco",
     "mode_invalid_project_path": "⚠️ {msg}\n\n请切换到有效目录后重试",
     "mode_project_dir_label": "📂 项目目录: {path}",
     "mode_exec_complete": "✅ 执行完成",

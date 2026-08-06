@@ -15,7 +15,7 @@ from typing import Callable, Optional
 from ..acp import ACPEvent, ACPEventType, PromptResult
 from ..acp.outcome import PromptOutcome, classify_prompt_result
 from ..agent_session import create_engine_session
-from ..agent_session.backend_resolver import is_ttadk_type, resolve_cwd
+from ..agent_session.backend_resolver import resolve_cwd
 from ..engine_base import BaseEngine, BaseEngineManager
 from ..grill_me import DEEP_GRILL_ME_PROTOCOL
 from ..utils.debug_utils import MemorySnapshot
@@ -242,14 +242,11 @@ class DeepEngine(BaseEngine):
                 prompt = self._build_deep_prompt(requirement_text)
 
                 on_event = self._make_on_event(callbacks)
-                if is_ttadk_type(self._agent_type):
-                    timeout = self.settings.coco_execution_timeout
-                else:
-                    timeout = (
-                        self.settings.coco_execution_timeout
-                        if self._agent_type == "coco"
-                        else self.settings.claude_execution_timeout
-                    )
+                timeout = (
+                    self.settings.coco_execution_timeout
+                    if self._agent_type == "coco"
+                    else self.settings.claude_execution_timeout
+                )
                 def _before_retry(attempt: int, error: Exception):
                     # For Deep Engine, we clear the renderer and progress to avoid duplicated rendering
                     self._renderer.reset()
@@ -447,14 +444,11 @@ class DeepEngine(BaseEngine):
             resume_prompt = self._build_resume_prompt()
 
             on_event = self._make_on_event(callbacks)
-            if is_ttadk_type(self._agent_type):
-                timeout = self.settings.coco_execution_timeout
-            else:
-                timeout = (
-                    self.settings.coco_execution_timeout
-                    if self._agent_type == "coco"
-                    else self.settings.claude_execution_timeout
-                )
+            timeout = (
+                self.settings.coco_execution_timeout
+                if self._agent_type == "coco"
+                else self.settings.claude_execution_timeout
+            )
             result = self._session.send_prompt_with_retry(
                 resume_prompt, on_event=on_event, timeout=timeout,
                 retry_policy=RetryPolicy(max_retries=2, retry_delay=2.0)

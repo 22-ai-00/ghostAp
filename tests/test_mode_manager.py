@@ -30,11 +30,6 @@ class TestModeManagerBasics:
         assert old == InteractionMode.SMART
         assert mgr.get_mode("chat1") == InteractionMode.SHELL
 
-    def test_enter_ttadk_mode(self):
-        mgr = ModeManager()
-        old = mgr.enter_ttadk_mode("chat1")
-        assert old == InteractionMode.SMART
-        assert mgr.get_mode("chat1") == InteractionMode.TTADK
 
     def test_enter_traex_mode(self):
         mgr = ModeManager()
@@ -118,11 +113,6 @@ class TestModeManagerPredicates:
         mgr.enter_shell_mode("chat1")
         assert mgr.is_shell_mode("chat1") is True
 
-    def test_is_ttadk_mode(self):
-        mgr = ModeManager()
-        assert mgr.is_ttadk_mode("chat1") is False
-        mgr.enter_ttadk_mode("chat1")
-        assert mgr.is_ttadk_mode("chat1") is True
 
     def test_is_traex_mode(self):
         mgr = ModeManager()
@@ -137,9 +127,6 @@ class TestModeManagerPredicates:
         assert mgr.is_programming_mode("chat1") is True
         mgr.exit_to_smart("chat1")
         mgr.enter_claude_mode("chat1")
-        assert mgr.is_programming_mode("chat1") is True
-        mgr.exit_to_smart("chat1")
-        mgr.enter_ttadk_mode("chat1")
         assert mgr.is_programming_mode("chat1") is True
         mgr.exit_to_smart("chat1")
         mgr.enter_traex_mode("chat1")
@@ -159,8 +146,6 @@ class TestModeManagerDisplayName:
         assert "Claude" in mgr.get_mode_display_name("chat1")
         mgr.set_mode("chat1", InteractionMode.GEMINI)
         assert "Gemini" in mgr.get_mode_display_name("chat1")
-        mgr.set_mode("chat1", InteractionMode.TTADK)
-        assert "TTADK" in mgr.get_mode_display_name("chat1")
         mgr.set_mode("chat1", InteractionMode.TRAEX)
         assert "Traex" in mgr.get_mode_display_name("chat1")
         mgr.enter_shell_mode("chat1")
@@ -255,11 +240,11 @@ class TestModeManagerProjectLevel:
         mgr = ModeManager()
         mgr.enter_coco_mode("chat1", project_id="proj1")
         mgr.enter_claude_mode("chat1", project_id="proj2")
-        mgr.enter_ttadk_mode("chat1", project_id="proj3")
+        mgr.enter_traex_mode("chat1", project_id="proj3")
         assert mgr.is_coco_mode("chat1", project_id="proj1") is True
         assert mgr.is_claude_mode("chat1", project_id="proj1") is False
         assert mgr.is_claude_mode("chat1", project_id="proj2") is True
-        assert mgr.is_ttadk_mode("chat1", project_id="proj3") is True
+        assert mgr.is_traex_mode("chat1", project_id="proj3") is True
         assert mgr.is_programming_mode("chat1", project_id="proj1") is True
         assert mgr.is_programming_mode("chat1", project_id="proj2") is True
         assert mgr.is_programming_mode("chat1", project_id="proj3") is True

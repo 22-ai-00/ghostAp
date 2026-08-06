@@ -17,10 +17,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from src.acp.options import ACPModelOption
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.project.context import SessionSnapshot
-from src.ttadk.models import ACPModelOption
 
 
 def _make_handler():

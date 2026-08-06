@@ -138,7 +138,7 @@ def test_refactoring_issue_matrix_has_user_facing_closure_notes():
         "manager consistency",
         "UI text consistency",
         "card builder tests",
-        "TTADK model tests",
+        "ACP model tests",
         "新增或调整命令意图时",
         "类型绕过不再集中堆积",
         "新文案有清晰归属",

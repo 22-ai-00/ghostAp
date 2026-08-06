@@ -8,8 +8,8 @@ Protected regression scenarios:
 - Prefix command set in SystemHandler._prefix_handlers must not shrink
 - Deep engine commands (/deep, /deep_status, /stop_deep) must remain routable
 - Spec engine commands (/spec, /spec_status, /stop_spec, ...) must remain routable
-- Exit commands must cover all tool variants (coco/claude/aiden/codex/gemini/traex/ttadk)
-- Removed Worktree commands must not hide the surviving engine routes
+- Exit commands must cover all supported tool variants
+- Removed product modes must not hide the surviving engine routes
 """
 
 from __future__ import annotations
@@ -51,8 +51,6 @@ EXPECTED_EXACT_COMMANDS = frozenset({
     "/exit_gemini",
     "/end_traex",
     "/exit_traex",
-    "/end_ttadk",
-    "/exit_ttadk",
     "/coco_status",
     "/coco_info",
     "/claude_info",
@@ -64,11 +62,7 @@ EXPECTED_EXACT_COMMANDS = frozenset({
     "/project",
     "/switch",
     "/new-chat",
-    "/ttadk",
-    "/enter_ttadk",
     "/acp",
-    "/ttadk_info",
-    "/ttadk_refresh",
     "/menu",
     "/tools",
     "/tools_status",
@@ -123,8 +117,6 @@ EXPECTED_EXIT_COMMANDS = frozenset({
     "/exit_gemini",
     "/end_traex",
     "/exit_traex",
-    "/end_ttadk",
-    "/exit_ttadk",
 })
 
 EXPECTED_INTERCEPTABLE_EXACT = frozenset({
@@ -135,7 +127,6 @@ EXPECTED_INTERCEPTABLE_EXACT = frozenset({
     "/codex", "/enter_codex",
     "/gemini", "/enter_gemini",
     "/traex", "/enter_traex",
-    "/enter_ttadk",
     "/exit", "/quit",
     "/end_coco", "/exit_coco",
     "/end_claude", "/exit_claude",
@@ -143,14 +134,11 @@ EXPECTED_INTERCEPTABLE_EXACT = frozenset({
     "/end_codex", "/exit_codex",
     "/end_gemini", "/exit_gemini",
     "/end_traex", "/exit_traex",
-    "/end_ttadk", "/exit_ttadk",
     "/coco_status",
     "/coco_info", "/claude_info", "/aiden_info", "/codex_info", "/gemini_info", "/traex_info",
-    "/ttadk_info",
     "/projects", "/status", "/project", "/switch", "/new-chat",
     "/tasks", "/diff", "/trace",
-    "/ttadk", "/acp",
-    "/ttadk_refresh",
+    "/acp",
     "/menu", "/tools", "/tools_status",
     "/model", "/lock", "/unlock", "/setadmin", "/btw",
 })
@@ -245,12 +233,17 @@ class TestExitCommandRouting:
         assert not SystemHandler.is_exit_command("/deep hello")
 
 
-def test_removed_worktree_commands_do_not_hide_active_engines():
+def test_removed_product_modes_do_not_hide_active_engines():
     from src.feishu.product_catalog import ExecutionLane, get_public_actions, resolve_command
+    from src.mode.manager import InteractionMode
 
-    assert "/worktree" not in {action.command for action in get_public_actions()}
-    assert {lane.value for lane in ExecutionLane}.isdisjoint({"worktree"})
-    for token in ("/worktree", "/wt"):
+    removed_modes = {"worktree", "ttadk"}
+    public_commands = {action.command for action in get_public_actions()}
+
+    assert public_commands.isdisjoint({"/worktree", "/ttadk"})
+    assert {lane.value for lane in ExecutionLane}.isdisjoint(removed_modes)
+    assert {mode.value for mode in InteractionMode}.isdisjoint(removed_modes)
+    for token in ("/worktree", "/wt", "/ttadk", "/enter_ttadk"):
         assert resolve_command(token, "legacy goal") is None
     for token in ("/deep", "/spec", "/wf"):
         resolved = resolve_command(token, "keep working")

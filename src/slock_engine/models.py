@@ -217,7 +217,7 @@ class AgentIdentity:
     agent_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     name: str = ""
     emoji: str = "🤖"
-    agent_type: str = "coco"  # coco/claude/codex/gemini/ttadk
+    agent_type: str = "coco"  # coco/claude/codex/gemini
     model_name: str = ""
     model_profile: str = "standard"
     reasoning_effort: str = "default"

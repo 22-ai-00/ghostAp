@@ -44,8 +44,6 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
         normalized_agent = str(agent_type or "").strip().lower()
         normalized_name = str(engine_name or "").strip() or "Coco"
 
-        if normalized_agent.startswith("ttadk_"):
-            return SpecEngine._infer_engine_name(normalized_agent), normalized_agent, model_name
         if normalized_agent == "claude":
             return "Claude", "claude", None
         if normalized_agent in {"aiden", "codex", "gemini", "traex", "coco"}:
@@ -64,19 +62,6 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
             return SpecEngine._infer_engine_name(normalized_agent), normalized_agent, model_name
 
         from ..mode import InteractionMode
-        from ..ttadk import get_ttadk_manager
-
-        if normalized_name.lower() == "ttadk":
-            ttadk_manager = get_ttadk_manager()
-            current_tool = ttadk_manager.get_current_tool()
-            current_model = ttadk_manager.get_current_model()
-            identity = resolve_engine_identity(
-                mode=InteractionMode.TTADK,
-                ttadk_tool_name=current_tool,
-                ttadk_model_name=current_model,
-            )
-            return identity.engine_name, identity.agent_type, (model_name or identity.model_name)
-
         if normalized_name.lower().startswith("claude"):
             identity = resolve_engine_identity(mode=InteractionMode.CLAUDE)
             return identity.engine_name, identity.agent_type, identity.model_name

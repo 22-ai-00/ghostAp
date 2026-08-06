@@ -95,8 +95,6 @@ def test_application_startup_preheats_codex_model_capabilities_without_join(
         app_id="test-app-id",
         sandbox_timeout=30,
         default_acp_tool=None,
-        ttadk_preheat_enabled=False,
-        ttadk_preheat_on_startup=False,
         acp_model_preheat_on_startup=True,
     )
     app.feishu_client = None

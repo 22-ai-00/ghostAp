@@ -41,8 +41,6 @@ class SpecReviewSelectionItem:
     @property
     def agent_display_name(self) -> str:
         agent = _clean_str(self.agent_name)
-        if agent == "ttadk":
-            return "TTADK"
         return agent.upper() if agent else ""
 
     @property
@@ -86,8 +84,6 @@ class SpecReviewSelectionItem:
         if not provider or not tool_name:
             return None
         agent_name = _clean_str(data.get("agent_name"))
-        if not agent_name and provider == "ttadk" and tool_name != "ttadk":
-            agent_name = "ttadk"
         return cls(
             provider=provider,
             tool_name=tool_name,
@@ -147,8 +143,6 @@ class SpecReviewSelectionState:
 
 def _provider_display_name(provider: str) -> str:
     normalized = str(provider or "").strip().lower()
-    if normalized == "ttadk":
-        return "TTADK"
     if normalized == "acp":
         return "ACP"
     return normalized.upper() or "UNKNOWN"
@@ -158,8 +152,6 @@ def _build_selection_item(option: AgentToolOption) -> SpecReviewSelectionItem:
     provider = str(option.provider or "").strip().lower()
     tool_name = str(option.tool_name or "").strip().lower()
     agent_name = str(option.agent_name or "").strip().lower()
-    if not agent_name and provider == "ttadk" and tool_name != "ttadk":
-        agent_name = "ttadk"
     return SpecReviewSelectionItem(
         provider=provider,
         tool_name=tool_name,

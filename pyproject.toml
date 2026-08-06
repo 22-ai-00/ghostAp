@@ -117,7 +117,6 @@ exclude = [
     "src/project",
     "src/sandbox",
     "src/spec_engine",
-    "src/ttadk",
     "src/utils",
     # feishu 子模块暂不纳入 docstring 覆盖率（保留 ws_client.py）
     "src/feishu/handlers",

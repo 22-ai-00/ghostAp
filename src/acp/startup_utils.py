@@ -38,7 +38,6 @@ class StartupBackend(str, Enum):
 
     ACP = "acp"
     CLI = "cli"
-    TTADK_CLI = "ttadk_cli"
 
 
 class StartupErrorKind(str, Enum):
@@ -80,13 +79,6 @@ class StartupErrorClassification:
 
 
 @dataclass(frozen=True)
-class TtadkCliStartResult:
-    session: Any
-    actual_id: str
-    resolved_model: Optional[str]
-
-
-@dataclass(frozen=True)
 class AcpRetryStartResult:
     session: Any | None
     actual_id: str
@@ -117,8 +109,6 @@ class SessionStartupResult:
 
 
 def select_startup_backend(agent_type: str) -> StartupBackend:
-    if (agent_type or "").startswith("ttadk_"):
-        return StartupBackend.TTADK_CLI
     if agent_type == "claude":
         return StartupBackend.CLI
     return StartupBackend.ACP
@@ -153,69 +143,6 @@ class InjectedStarterFallback:
                 raise
             return None
         return session, actual_id, diagnostics
-
-
-class CwdNormalizer:
-    """Normalize startup cwd without leaking path utility details to the coordinator."""
-
-    def normalize(self, cwd: str, *, normalize_fn: Callable[[str], str | None]) -> str:
-        return normalize_startup_cwd(cwd, normalize_fn=normalize_fn)
-
-
-class TtadkCliStarter:
-    """Start TTADK CLI sessions without leaking class resolution into manager."""
-
-    phase = "ttadk_cli"
-
-    def start(
-        self,
-        *,
-        agent_type: str,
-        cwd: str,
-        model_name: Optional[str],
-        manager_factory: Callable[[], Any],
-        precheck_fn: Callable[..., dict[str, Any]],
-        manager_session_cls: Any,
-        agent_session_cls: Any,
-        original_session_cls: Any,
-        start_operation: Callable[..., Any],
-        deadline_monotonic: float,
-        monotonic_fn: Callable[[], float],
-    ) -> TtadkCliStartResult:
-        session_cls = self._resolve_session_class(
-            manager_session_cls=manager_session_cls,
-            agent_session_cls=agent_session_cls,
-            original_session_cls=original_session_cls,
-        )
-        precheck = precheck_ttadk_cli_startup(
-            agent_type=agent_type,
-            cwd=cwd or ".",
-            model_name=model_name,
-            manager_factory=manager_factory,
-            precheck_fn=precheck_fn,
-        )
-        resolved_model = precheck.get("model")
-        remaining = deadline_monotonic - monotonic_fn()
-        if remaining <= 0:
-            raise TimeoutError("ACP startup deadline exhausted during TTADK precheck")
-        session = session_cls(agent_type=agent_type, cwd=cwd or ".", model_name=resolved_model)
-        actual_id = start_operation(session.start, startup_timeout=remaining)
-        if monotonic_fn() >= deadline_monotonic:
-            AcpRetryStarter._close_session(session)
-            raise TimeoutError("ACP startup deadline exhausted during TTADK startup")
-        return TtadkCliStartResult(session=session, actual_id=actual_id, resolved_model=resolved_model)
-
-    @staticmethod
-    def _resolve_session_class(*, manager_session_cls: Any, agent_session_cls: Any, original_session_cls: Any) -> Any:
-        effective_cls = manager_session_cls
-        if original_session_cls is not None:
-            if manager_session_cls is not None and manager_session_cls is not original_session_cls:
-                return manager_session_cls
-            if agent_session_cls is not None and agent_session_cls is not original_session_cls:
-                return agent_session_cls
-        elif agent_session_cls is not None:
-            effective_cls = agent_session_cls
-        return effective_cls
 
 
 class AcpRetryStarter:
@@ -399,12 +326,6 @@ class StartupFailureReporter:
         )
 
 
-def _default_agent_session_module() -> Any:
-    from .. import agent_session as agent_session_mod
-
-    return agent_session_mod
-
-
 def _default_sync_acp_session_cls() -> Any:
     from .sync_adapter import SyncACPSession
 
@@ -415,12 +336,6 @@ def _default_sync_claude_cli_session_cls() -> Any:
     from ..agent_session import SyncClaudeCLISession
 
     return SyncClaudeCLISession
-
-
-def _default_sync_ttadk_cli_session_cls() -> Any:
-    from ..agent_session import SyncTTADKCLISession
-
-    return SyncTTADKCLISession
 
 
 class StartupBackendStrategy(Protocol):
@@ -579,178 +494,11 @@ class CliStartupBackendStrategy(AcpStartupBackendStrategy):
         )
 
 
-class TtadkCliStartupBackendStrategy:
-    """Start TTADK-wrapped tools through CLI bridge only."""
-
-    backend = StartupBackend.TTADK_CLI
-
-    def __init__(
-        self,
-        *,
-        ttadk_cli_starter: TtadkCliStarter,
-        failure_reporter: StartupFailureReporter,
-        sync_ttadk_cli_session_cls: Any | None,
-        agent_session_module: Any | None,
-        original_ttadk_cli_session_cls: Any | None,
-        get_settings_fn: Callable[[], Any],
-        monotonic_fn: Callable[[], float],
-    ) -> None:
-        self._ttadk_cli_starter = ttadk_cli_starter
-        self._failure_reporter = failure_reporter
-        self._sync_ttadk_cli_session_cls = sync_ttadk_cli_session_cls
-        self._agent_session_module = agent_session_module
-        self._original_ttadk_cli_session_cls = original_ttadk_cli_session_cls
-        self._get_settings = get_settings_fn
-        self._monotonic = monotonic_fn
-
-    def start(
-        self,
-        *,
-        request: SessionStartupRequest,
-        cwd: str,
-        model_name: Optional[str],
-        retry_plan: RetryPlan,
-    ) -> SessionStartupResult:
-        from ..ttadk import get_ttadk_manager
-        from ..ttadk.startup_common import precheck_ttadk_startup_model
-
-        agent_session_mod = self._agent_session_module or _default_agent_session_module()
-        try:
-            agent_cls = getattr(agent_session_mod, "SyncTTADKCLISession", None)
-        except (AttributeError, TypeError):
-            logger.warning("Error while getting TTADK CLI session class", exc_info=True)
-            agent_cls = None
-
-        try:
-            started = self._ttadk_cli_starter.start(
-                agent_type=request.effective_agent_type,
-                cwd=cwd or ".",
-                model_name=model_name,
-                manager_factory=get_ttadk_manager,
-                precheck_fn=precheck_ttadk_startup_model,
-                manager_session_cls=self._sync_ttadk_cli_session_cls or _default_sync_ttadk_cli_session_cls(),
-                agent_session_cls=agent_cls,
-                original_session_cls=self._original_ttadk_cli_session_cls,
-                start_operation=run_startup_operation,
-                deadline_monotonic=float(request.deadline_monotonic or 0),
-                monotonic_fn=self._monotonic,
-            )
-            logger.info(
-                "[ACP:%s] TTADK CLI Session started: key=%s, session=%s, model=%s",
-                request.effective_agent_type.upper(),
-                request.key[-16:],
-                started.actual_id[:8],
-                started.resolved_model,
-            )
-            return SessionStartupResult(
-                session=started.session,
-                actual_id=started.actual_id,
-                effective_agent_type=request.effective_agent_type,
-                model_name=model_name,
-            )
-        except STARTUP_OPERATIONAL_EXCEPTIONS as exc:
-            classify_startup_error(exc, phase="ttadk_cli", attempt=1, retries=1)
-            safe_detail = self._safe_ttadk_error_detail(exc)
-            logger.warning("Error while starting TTADK CLI: %s", safe_detail)
-            try:
-                self._failure_reporter.record(
-                    session_key=request.key,
-                    backend_kind="cli",
-                    error=exc or RuntimeError(safe_detail),
-                    diagnostics=None,
-                )
-            except (RuntimeError, OSError, TypeError, ValueError):
-                logger.debug(
-                    "[ACP:%s] session telemetry on_session_start_failed error",
-                    request.effective_agent_type.upper(),
-                    exc_info=True,
-                )
-            raise RuntimeError(f"启动 {request.effective_agent_type} CLI 失败: {safe_detail}")
-
-    def _safe_ttadk_error_detail(self, exc: Exception) -> str:
-        detail = str(exc or "").strip()
-        if not detail and exc is not None:
-            for key in ("stderr_snippet", "stdout_snippet", "stderr", "stdout"):
-                try:
-                    value = str(getattr(exc, key, "") or "").strip()
-                    if value:
-                        detail = value
-                        break
-                except (AttributeError, TypeError):
-                    logger.warning("Error while extracting error detail from attribute %s", key, exc_info=True)
-                    continue
-        if not detail:
-            _, err_repr = _format_error_type_and_repr(exc)
-            detail = err_repr or "unknown"
-        return _sanitize_startup_detail(detail, get_settings_fn=self._get_settings) or "start_failed"
-
-
-def _format_error_type_and_repr(err: object) -> tuple[str, str]:
-    try:
-        err_type = type(err).__name__
-    except Exception:
-        logger.warning("Error while formatting error type", exc_info=True)
-        err_type = "Exception"
-    try:
-        err_repr = repr(err)
-    except Exception:
-        logger.warning("Error while formatting error representation", exc_info=True)
-        err_repr = ""
-    if not (err_repr or "").strip():
-        err_repr = f"<{err_type}>"
-    return (err_type or "Exception", err_repr)
-
-
-def _sanitize_startup_detail(text: str, *, get_settings_fn: Callable[[], Any]) -> str:
-    """Redact and truncate startup detail for safe logging/user-facing errors."""
-
-    s = str(text or "")
-    if not s:
-        return ""
-    try:
-        from .diagnostics import get_diagnostics_config, redact_text, truncate_text
-
-        cfg = get_diagnostics_config(get_settings_fn=get_settings_fn)
-        if bool(getattr(cfg, "redact_enabled", True)):
-            s = redact_text(
-                s,
-                list(getattr(cfg, "redact_patterns", []) or []),
-                str(getattr(cfg, "redact_replacement", "***REDACTED***") or "***REDACTED***"),
-            )
-        lim = int(getattr(cfg, "snippet_limit", 240) or 240)
-        s = truncate_text(s, max(1, lim))
-    except (AttributeError, TypeError, ValueError, ImportError):
-        logger.warning("Error while sanitizing startup detail", exc_info=True)
-    return s
-
-
 def _coco_acp_args(model_name: Optional[str]) -> list[str]:
     args: list[str] = ["acp", "serve"]
     if model_name:
         args.extend(["-c", f"model.name={model_name}"])
     return args
-
-
-def resolve_ttadk_target_model_for_existing_session(
-    *,
-    agent_type: str,
-    cwd: str,
-    model_name: Optional[str],
-    manager_factory: Callable[[], Any],
-    precheck_fn: Callable[..., dict[str, Any]],
-) -> Optional[str]:
-    """Resolve a validated TTADK real model name for existing-session reuse checks."""
-
-    precheck = precheck_ttadk_cli_startup(
-        agent_type=agent_type,
-        cwd=cwd or ".",
-        model_name=model_name,
-        manager_factory=manager_factory,
-        precheck_fn=precheck_fn,
-    )
-    if bool(precheck.get("validated")):
-        return str(precheck.get("model") or "").strip() or None
-    return None
 
 
 class SessionStartupCoordinator:
@@ -764,9 +512,6 @@ class SessionStartupCoordinator:
         session_telemetry: Any,
         sync_acp_session_cls: Any | None = None,
         sync_claude_cli_session_cls: Any | None = None,
-        sync_ttadk_cli_session_cls: Any | None = None,
-        agent_session_module: Any | None = None,
-        original_ttadk_cli_session_cls: Any | None = None,
         get_settings_fn: Callable[[], Any] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
         monotonic_fn: Callable[[], float] | None = None,
@@ -775,8 +520,6 @@ class SessionStartupCoordinator:
         self._session_starter = session_starter
         self._session_telemetry = session_telemetry
         self._injected_starter = InjectedStarterFallback(session_starter)
-        self._cwd_normalizer = CwdNormalizer()
-        self._ttadk_cli_starter = TtadkCliStarter()
         self._acp_retry_starter = AcpRetryStarter()
         self._failure_reporter = StartupFailureReporter(
             telemetry=session_telemetry,
@@ -784,9 +527,6 @@ class SessionStartupCoordinator:
         )
         self._sync_acp_session_cls = sync_acp_session_cls
         self._sync_claude_cli_session_cls = sync_claude_cli_session_cls
-        self._sync_ttadk_cli_session_cls = sync_ttadk_cli_session_cls
-        self._agent_session_module = agent_session_module
-        self._original_ttadk_cli_session_cls = original_ttadk_cli_session_cls
         self._get_settings = get_settings_fn or self._default_get_settings
         self._sleep = sleep_fn or self._default_sleep
         self._monotonic = monotonic_fn or time.monotonic
@@ -809,15 +549,6 @@ class SessionStartupCoordinator:
                 sleep_fn=self._sleep,
                 monotonic_fn=self._monotonic,
             ),
-            StartupBackend.TTADK_CLI: TtadkCliStartupBackendStrategy(
-                ttadk_cli_starter=self._ttadk_cli_starter,
-                failure_reporter=self._failure_reporter,
-                sync_ttadk_cli_session_cls=self._sync_ttadk_cli_session_cls,
-                agent_session_module=self._agent_session_module,
-                original_ttadk_cli_session_cls=self._original_ttadk_cli_session_cls,
-                get_settings_fn=self._get_settings,
-                monotonic_fn=self._monotonic,
-            ),
         }
 
     @staticmethod
@@ -831,45 +562,6 @@ class SessionStartupCoordinator:
         import time
 
         time.sleep(seconds)
-
-    def _normalize_cwd(self, cwd: str) -> str:
-        try:
-            from ..utils.path import normalize_ttadk_cwd
-
-            raw_cwd = cwd
-            normalized = self._cwd_normalizer.normalize(raw_cwd, normalize_fn=normalize_ttadk_cwd)
-            try:
-                if bool(getattr(self._get_settings(), "ttadk_cwd_debug_enabled", False)):
-                    logger.debug(
-                        "[TTADK:CWD] where=%s raw_cwd=%r normalized_cwd=%r",
-                        "acp.startup.ensure_session",
-                        raw_cwd,
-                        normalized,
-                    )
-            except (AttributeError, TypeError):
-                logger.warning("Error while checking TTADK CWD debug flag", exc_info=True)
-            return normalized
-        except (ImportError, AttributeError, TypeError):
-            logger.warning("Error while normalizing TTADK CWD", exc_info=True)
-            return cwd
-
-    def resolve_ttadk_target_model_for_existing_session(
-        self,
-        *,
-        agent_type: str,
-        cwd: str,
-        model_name: Optional[str],
-    ) -> Optional[str]:
-        from ..ttadk import get_ttadk_manager
-        from ..ttadk.startup_common import precheck_ttadk_startup_model
-
-        return resolve_ttadk_target_model_for_existing_session(
-            agent_type=agent_type,
-            cwd=cwd or ".",
-            model_name=model_name,
-            manager_factory=get_ttadk_manager,
-            precheck_fn=precheck_ttadk_startup_model,
-        )
 
     def start(self, request: SessionStartupRequest) -> SessionStartupResult:
         deadline = request.deadline_monotonic
@@ -924,7 +616,9 @@ class SessionStartupCoordinator:
 
         if self._monotonic() >= deadline:
             raise TimeoutError("ACP startup deadline exhausted")
-        cwd = self._normalize_cwd(cwd)
+        from ..utils.path import normalize_session_cwd
+
+        cwd = normalize_startup_cwd(cwd, normalize_fn=normalize_session_cwd)
         if self._monotonic() >= deadline:
             raise TimeoutError("ACP startup deadline exhausted")
         return self._backend_strategies[backend].start(
@@ -979,23 +673,6 @@ def classify_startup_error(
         kind=StartupErrorKind.FATAL,
         action=StartupErrorAction.RAISE,
         phase=phase,
-    )
-
-
-def precheck_ttadk_cli_startup(
-    *,
-    agent_type: str,
-    cwd: str,
-    model_name: Optional[str],
-    manager_factory: Callable[[], Any],
-    precheck_fn: Callable[..., dict[str, Any]],
-) -> dict[str, Any]:
-    manager = manager_factory()
-    return precheck_fn(
-        agent_type=agent_type,
-        cwd=cwd or ".",
-        model_intent=model_name,
-        manager=manager,
     )
 
 

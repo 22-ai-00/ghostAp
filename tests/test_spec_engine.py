@@ -749,189 +749,8 @@ def test_spec_engine_review_circuit_skip_does_not_block_main_loop(monkeypatch, t
     assert (c2.review_diagnostics.get("fail_reason") or "") == "circuit_open"
 
 
-def test_ttadk_startup_model_log_uses_real_or_auto(caplog):
-    """启动点日志语义：model 字段只能是真实名或 (auto)。"""
-    # Use mock settings for engine to speed up test and avoid persistence
-    with patch("src.engine_base.get_settings") as mock_engine_settings:
-        s = MagicMock()
-        s.spec_max_cycles = 1
-        s.spec_execution_timeout = 5
-        s.spec_persist_every_phase = False
-        s.spec_review_enabled = False
-        s.spec_discovery_enabled = False
-        s.spec_generated_specs_per_cycle = 0
-        s.spec_max_cycles_limit = 5000
-        mock_engine_settings.return_value = s
-
-        engine = SpecEngine(chat_id="c", root_path="/tmp/test", agent_type="ttadk_codex", model_name="gpt-5.2")
-
-        caplog.set_level(logging.INFO, logger="src.agent_session")
-
-        class _S:
-            def __init__(self, *a, **k):
-                self.session_id = "sid"
-                self.created_at = 0.0
-                self.last_active = 0.0
-                self.message_count = 0
-                self.last_query = ""
-                self.is_resumed = False
-
-            def describe_agent(self):
-                return "dummy"
-
-            def start(self, startup_timeout: float = 60, **kwargs):
-                return "sid"
-
-            def load_session(self, session_id: str, timeout: float = 60):
-                del timeout
-                return None
-
-            def load_local_history(self, session_id=None, limit: int = 200):
-                return []
-
-            def cancel(self):
-                return None
-
-            def close(self):
-                return None
-
-            def to_snapshot(self):
-                return {}
-
-            def get_session_info(self):
-                return ""
-
-            def is_server_running(self):
-                return True
-
-            def is_server_healthy(self, healthcheck_timeout: float = 2.0):
-                return True
-
-            def send_prompt(self, *a, **k):
-                return MagicMock(stop_reason="end_turn")
-
-        class _SessSettings:
-            acp_startup_timeout = 20
-            rate_limit_retry_enabled = False
-
-        with (
-            patch("src.agent_session.factory.get_settings", return_value=_SessSettings()),
-            patch("src.ttadk.get_ttadk_manager", return_value=MagicMock()),
-            patch("src.ttadk.startup_common.precheck_ttadk_startup_model") as mk_precheck,
-            patch("src.agent_session.factory.SyncTTADKCLISession", return_value=_S()),
-        ):
-            mk_precheck.return_value = {
-                "tool": "codex",
-                "input_model": "gpt-5.2",
-                "model": "gpt-5.2-codex-ttadk",
-                "validated": True,
-                "source": "probe",
-                "decision": "precheck_validated",
-                "fail_phase": "",
-                "warnings": [],
-                "diagnostics": {"attempts": [{"phase": "precheck"}]},
-            }
-            caplog.clear()
-            engine.execute("do something")
-
-        text = "\n".join([r.getMessage() for r in caplog.records])
-        assert "[SessionFactory] ttadk cli startup:" in text
-        m = re.search(r"\bmodel=([^\s]+)", text)
-        assert m is not None
-        assert m.group(1) == "gpt-5.2-codex-ttadk"
-        assert m.group(1) != "gpt-5.2"
 
 
-def test_ttadk_resume_model_log_uses_real_or_auto(caplog):
-    """恢复路径同样要求：model 字段只能是真实名或 (auto)。"""
-    with patch("src.engine_base.get_settings") as mock_engine_settings:
-        s = MagicMock()
-        s.spec_max_cycles = 1
-        s.spec_execution_timeout = 5
-        s.spec_persist_every_phase = False
-        s.spec_review_enabled = False
-        s.spec_discovery_enabled = False
-        s.spec_generated_specs_per_cycle = 0
-        s.spec_max_cycles_limit = 5000
-        mock_engine_settings.return_value = s
-
-        engine = SpecEngine(chat_id="c", root_path="/tmp/test", agent_type="ttadk_codex", model_name="gpt-5.2")
-        engine._project = SpecProject.create(name="p", root_path="/tmp/test")
-        engine._project.status = SpecProjectStatus.PAUSED
-
-        caplog.set_level(logging.INFO, logger="src.agent_session")
-
-        class _S:
-            def __init__(self, *a, **k):
-                self.session_id = "sid"
-                self.created_at = 0.0
-                self.last_active = 0.0
-                self.message_count = 0
-                self.last_query = ""
-                self.is_resumed = False
-
-            def describe_agent(self):
-                return "dummy"
-
-            def start(self, startup_timeout: float = 60, **kwargs):
-                return "sid"
-
-            def load_session(self, session_id: str, timeout: float = 60):
-                del timeout
-                return None
-
-            def load_local_history(self, session_id=None, limit: int = 200):
-                return []
-
-            def cancel(self):
-                return None
-
-            def close(self):
-                return None
-
-            def to_snapshot(self):
-                return {}
-
-            def get_session_info(self):
-                return ""
-
-            def is_server_running(self):
-                return True
-
-            def is_server_healthy(self, healthcheck_timeout: float = 2.0):
-                return True
-
-            def send_prompt(self, *a, **k):
-                return MagicMock(stop_reason="end_turn")
-
-        class _SessSettings:
-            acp_startup_timeout = 20
-            rate_limit_retry_enabled = False
-
-        with (
-            patch("src.agent_session.factory.get_settings", return_value=_SessSettings()),
-            patch("src.ttadk.get_ttadk_manager", return_value=MagicMock()),
-            patch("src.ttadk.startup_common.precheck_ttadk_startup_model") as mk_precheck,
-            patch("src.agent_session.factory.SyncTTADKCLISession", return_value=_S()),
-        ):
-            mk_precheck.return_value = {
-                "tool": "codex",
-                "input_model": "gpt-5.2",
-                "model": None,  # (auto)
-                "validated": False,
-                "source": "defaults",
-                "decision": "precheck_auto",
-                "fail_phase": "",
-                "warnings": ["no_m_passthrough"],
-                "diagnostics": {"attempts": [{"phase": "precheck"}]},
-            }
-            caplog.clear()
-            engine.resume()
-
-        text = "\n".join([r.getMessage() for r in caplog.records])
-        assert "[SessionFactory] ttadk cli startup:" in text
-        assert "model=(auto)" in text
-        assert re.search(r"\bmodel=gpt-5\.2\b", text) is None
 
 
 def test_try_switch_model_claude_returns_false_without_switch(monkeypatch, tmp_path):
@@ -941,7 +760,7 @@ def test_try_switch_model_claude_returns_false_without_switch(monkeypatch, tmp_p
     engine._models_tried = []
     engine._current_model = None
 
-    # claude CLI 模式不应进入 coco/ttadk 的模型切换分支
+    # claude CLI 模式不应进入 ACP 模型切换分支
     assert engine._try_switch_model(callbacks=MagicMock()) is False
 
 
@@ -2129,8 +1948,8 @@ class TestSpecEngineManager:
         engine = SpecEngine(chat_id="c1", root_path=str(tmp_path))
         engine._project = SpecProject.create(root_path=str(tmp_path))
         engine._project.requirement = "req"
-        engine._agent_type = "ttadk_codex"
-        engine.engine_name = "TTADK"
+        engine._agent_type = "codex"
+        engine.engine_name = "Codex"
         engine._current_model = "gpt-5.2"
         engine._model_name = "gpt-5.2"
         engine._models_tried = ["claude-3.7-sonnet", "gpt-5.2"]
@@ -2140,31 +1959,12 @@ class TestSpecEngineManager:
         e2 = mgr.load_or_create_from_disk("c1", str(tmp_path), engine_name="Coco")
         assert e2.project is not None
         assert e2.project.requirement == "req"
-        assert e2.engine_name == "TTADK"
-        assert e2._agent_type == "ttadk_codex"
+        assert e2.engine_name == "Codex"
+        assert e2._agent_type == "codex"
         assert e2._current_model == "gpt-5.2"
         assert e2._models_tried == ["claude-3.7-sonnet", "gpt-5.2"]
         assert getattr(e2, "_resume_meta", None)
 
-    @patch("src.engine_base.get_settings")
-    def test_get_or_create_preserves_explicit_ttadk_identity(self, mock_settings):
-        s = MagicMock()
-        s.spec_max_cycles = 10
-        s.spec_convergence_window = 2
-        s.spec_execution_timeout = 300
-        mock_settings.return_value = s
-
-        mgr = SpecEngineManager()
-        engine = mgr.get_or_create(
-            "chat1",
-            "/tmp/a",
-            engine_name="TTADK",
-            agent_type="ttadk_codex",
-            model_name="gpt-5.2",
-        )
-        assert engine.engine_name == "TTADK"
-        assert engine._agent_type == "ttadk_codex"
-        assert engine._model_name == "gpt-5.2"
 
     @patch("src.spec_engine.engine.delete_task_state")
     @patch("src.spec_engine.engine.create_engine_session")
@@ -2206,7 +2006,7 @@ class TestSpecEngineManager:
             requirement="recover me",
             project_path="/tmp/a",
             chat_id="chat1",
-            agent_type="ttadk_codex",
+            agent_type="codex",
             current_cycle=2,
             current_phase="build",
             last_error="boom",
@@ -2214,8 +2014,8 @@ class TestSpecEngineManager:
             models_tried=["claude-3.7-sonnet", "gpt-5.2"],
             project_snapshot=project.to_dict(),
             runtime_context={
-                "agent_type": "ttadk_codex",
-                "engine_name": "TTADK",
+                "agent_type": "codex",
+                "engine_name": "Codex",
                 "model_name": "gpt-5.2",
                 "current_model": "gpt-5.2",
                 "models_tried": ["claude-3.7-sonnet", "gpt-5.2"],
@@ -2296,7 +2096,6 @@ class TestSpecHandler:
             codex_manager=MagicMock(),
             gemini_manager=MagicMock(),
             traex_manager=MagicMock(),
-            ttadk_manager=MagicMock(),
             tui2acp_manager=MagicMock(),
             intent_recognizer=MagicMock(),
             scheduler=MagicMock(),

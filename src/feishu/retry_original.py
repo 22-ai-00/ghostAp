@@ -43,12 +43,6 @@ _ALLOWED_RETRY_MODES = {
     "aiden": "Aiden",
     "codex": "Codex",
     "gemini": "Gemini",
-    "ttadk": "TTADK",
-    "ttadk_coco": "ttadk_coco",
-    "ttadk_claude": "ttadk_claude",
-    "ttadk_aiden": "ttadk_aiden",
-    "ttadk_codex": "ttadk_codex",
-    "ttadk_gemini": "ttadk_gemini",
 }
 
 

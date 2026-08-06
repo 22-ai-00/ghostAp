@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 _WORKFLOW_MODEL_CACHE_TTL_S = 5 * 60
 _WORKFLOW_MODEL_PREHEAT_LIMIT = 2
-_WORKFLOW_ACP_MODEL_TOOLS = {"coco", "claude", "aiden", "codex", "gemini", "traex"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -3820,7 +3819,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             return copied
 
         now = time.monotonic()
-        provider = "acp" if tool_name in _WORKFLOW_ACP_MODEL_TOOLS else "ttadk"
+        provider = "acp"
         generation = 0
         if provider == "acp":
             from ...acp.helper import get_acp_model_cache_generation

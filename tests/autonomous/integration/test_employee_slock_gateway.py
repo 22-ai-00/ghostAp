@@ -1625,26 +1625,6 @@ def test_employee_public_runner_preserves_typed_terminal_outcome(
         )
 
 
-def test_employee_ttadk_backend_uses_explicitly_scoped_session_path() -> None:
-    from src.slock_engine.engine import SlockEngine
-    from src.slock_engine.models import AgentIdentity
-
-    engine = object.__new__(SlockEngine)
-    calls = []
-    engine._run_acp_session = lambda *_args, **_kwargs: calls.append("spawn")  # type: ignore[method-assign]
-    agent = AgentIdentity(
-        agent_id="agt_ttadk",
-        agent_type="ttadk_codex",
-        security_profile="employee_v1",
-    )
-
-    engine.run_agent_session(
-        agent,
-        "prompt",
-        env={"HOME": "/tmp/employee", "PATH": "/usr/bin"},
-    )
-
-    assert calls == ["spawn"]
 
 
 def test_employee_process_env_excludes_manager_vault_and_peer_secrets() -> None:

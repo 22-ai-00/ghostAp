@@ -35,9 +35,7 @@ class ReviewAgentBinding:
     def from_selection_item(cls, item: SpecReviewSelectionItem) -> "ReviewAgentBinding":
         provider = str(item.provider or "").strip().lower()
         tool_name = str(item.tool_name or "").strip().lower()
-        if provider == "ttadk":
-            agent_type = f"ttadk_{tool_name}" if tool_name else "ttadk_coco"
-        elif provider == "cli":
+        if provider == "cli":
             agent_type = tool_name or "claude"
         else:
             agent_type = tool_name or "coco"

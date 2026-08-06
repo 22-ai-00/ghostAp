@@ -865,11 +865,10 @@ def format_startup_failure_log_line(
         include_attempts_summary = (
             attempts is not None
             or (isinstance(diag, dict) and ("attempts" in diag))
-            or (str(agent_type or "").startswith("ttadk_"))
         )
     except Exception:
         logger.warning("Error while determining include_attempts_summary", exc_info=True)
-        include_attempts_summary = bool(str(agent_type or "").startswith("ttadk_"))
+        include_attempts_summary = False
 
     attempts_summary = ""
     if include_attempts_summary:

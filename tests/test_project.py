@@ -129,9 +129,6 @@ class TestProjectContext:
         )
         ctx.set_coco_mode(True, "session_456", 10)
         ctx.set_traex_mode(True, "session_traex", 7)
-        ctx.ttadk_tool_name = "codex"
-        ctx.ttadk_model_name = "gpt-5.2"
-        ctx.ttadk_yolo_enabled = True
 
         snapshot = ctx.to_snapshot()
 
@@ -139,9 +136,6 @@ class TestProjectContext:
         assert snapshot["project_name"] == "Test Project"
         assert snapshot["coco_session_snapshot"]["session_id"] == "session_456"
         assert snapshot["traex_session_snapshot"]["session_id"] == "session_traex"
-        assert snapshot["ttadk_tool_name"] == "codex"
-        assert snapshot["ttadk_model_name"] == "gpt-5.2"
-        assert snapshot["ttadk_yolo_enabled"] is True
 
         restored = ProjectContext.from_snapshot(snapshot)
 
@@ -150,9 +144,6 @@ class TestProjectContext:
         assert restored.theme_color == ctx.theme_color
         assert restored.coco_session_snapshot.session_id == "session_456"
         assert restored.traex_session_snapshot.session_id == "session_traex"
-        assert restored.ttadk_tool_name == "codex"
-        assert restored.ttadk_model_name == "gpt-5.2"
-        assert restored.ttadk_yolo_enabled is True
 
     def test_snapshot_compare_and_clear_is_atomic_with_replacement(self):
         ctx = ProjectContext(
@@ -858,7 +849,6 @@ class TestEvictionCallbackOutsideLock:
 
         settings = MagicMock()
         settings.max_allowed_chat_ids = 2
-        settings.ttadk_yolo_default_enabled = False
         settings.max_evicted_cache = 200
 
         with patch("src.config.get_settings", return_value=settings):
@@ -906,7 +896,6 @@ class TestEvictionCleansActiveProject:
 
         settings = MagicMock()
         settings.max_allowed_chat_ids = 2
-        settings.ttadk_yolo_default_enabled = False
         settings.max_evicted_cache = 200
 
         with patch("src.config.get_settings", return_value=settings):
@@ -942,7 +931,6 @@ class TestEvictionCleansActiveProject:
 
         settings = MagicMock()
         settings.max_allowed_chat_ids = 2
-        settings.ttadk_yolo_default_enabled = False
         settings.max_evicted_cache = 200
 
         with patch("src.config.get_settings", return_value=settings):
@@ -984,7 +972,6 @@ class TestConcurrentSetActiveNoTOCTOU:
 
         settings = MagicMock()
         settings.max_allowed_chat_ids = 3
-        settings.ttadk_yolo_default_enabled = False
         settings.max_evicted_cache = 200
 
         with patch("src.config.get_settings", return_value=settings):
@@ -1082,7 +1069,6 @@ class TestCreateProjectPassesOrderedDict:
     def test_allowed_chat_ids_is_ordered_dict(self, temp_storage):
         settings = MagicMock()
         settings.max_allowed_chat_ids = 50
-        settings.ttadk_yolo_default_enabled = False
         settings.max_evicted_cache = 200
 
         with patch("src.config.get_settings", return_value=settings):

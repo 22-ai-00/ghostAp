@@ -31,9 +31,9 @@ class TestModeManagerIsolation:
 
     def test_get_project_mode_isolated(self):
         mm = ModeManager()
-        mm.set_mode("chat_A", InteractionMode.TTADK, project_id="proj1")
+        mm.set_mode("chat_A", InteractionMode.TRAEX, project_id="proj1")
 
-        assert mm.get_project_mode("chat_A", "proj1") == InteractionMode.TTADK
+        assert mm.get_project_mode("chat_A", "proj1") == InteractionMode.TRAEX
         # chat_B has no mode set for proj1
         assert mm.get_project_mode("chat_B", "proj1") is None
 

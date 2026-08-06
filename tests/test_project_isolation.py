@@ -226,7 +226,6 @@ class TestCardActionCrossChatIsolation:
             codex_manager=MagicMock(),
             gemini_manager=MagicMock(),
             traex_manager=MagicMock(),
-            ttadk_manager=MagicMock(),
             tui2acp_manager=MagicMock(),
             intent_recognizer=MagicMock(),
             scheduler=MagicMock(),
@@ -256,7 +255,6 @@ class TestCardActionCrossChatIsolation:
         ctx.mode_manager.is_aiden_mode.return_value = False
         ctx.mode_manager.is_codex_mode.return_value = False
         ctx.mode_manager.is_gemini_mode.return_value = False
-        ctx.mode_manager.is_ttadk_mode.return_value = False
         ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
         ctx.project_manager.validate_project_path.return_value = (True, "ok")
         ctx.project_manager.get_or_create_project_for_path.return_value = (None, False)
@@ -274,7 +272,6 @@ class TestCardActionCrossChatIsolation:
             "aiden": MagicMock(),
             "codex": MagicMock(),
             "gemini": MagicMock(),
-            "ttadk": MagicMock(),
         })
         return h, ctx
 
@@ -376,7 +373,6 @@ class TestHintEvictedVsNeverBound:
         from unittest.mock import patch as mock_patch
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 2
-        mock_settings.ttadk_yolo_default_enabled = False
 
         pm.create_project(None, "proj2", str(tmp_path / "p2"), chat_id="chatOwner")
         with mock_patch("src.config.get_settings", return_value=mock_settings):
@@ -398,7 +394,6 @@ class TestOnEvictionCallback:
 
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 2
-        mock_settings.ttadk_yolo_default_enabled = False
 
         callback = MagicMock()
         pm.on_eviction = callback
@@ -432,7 +427,6 @@ class TestOnEvictionCallback:
 
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 2
-        mock_settings.ttadk_yolo_default_enabled = False
 
         pm.on_eviction = MagicMock(side_effect=RuntimeError("boom"))
 
@@ -452,7 +446,6 @@ class TestGetActiveProjectAfterEviction:
 
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 2
-        mock_settings.ttadk_yolo_default_enabled = False
 
         pm.create_project(None, "proj_ev", str(tmp_path / "ev"), chat_id="chatOwner")
         with mock_patch("src.config.get_settings", return_value=mock_settings):
@@ -470,7 +463,6 @@ class TestGetActiveProjectAfterEviction:
 
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 3
-        mock_settings.ttadk_yolo_default_enabled = False
 
         pm.create_project(None, "proj_vis", str(tmp_path / "vis"), chat_id="chatOwner")
         with mock_patch("src.config.get_settings", return_value=mock_settings):
@@ -586,7 +578,6 @@ class TestSetActiveProjectRollback:
         # Activate old_proj for chatA, then deactivate it so status is IDLE
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 50
-        mock_settings.ttadk_yolo_default_enabled = False
         with patch("src.config.get_settings", return_value=mock_settings):
             pm.set_active_project("chatA", "old_proj")
         old_ctx = pm.get_project_for_diagnostics("old_proj")
@@ -601,7 +592,6 @@ class TestSetActiveProjectRollback:
         # Ensure capacity is full with only owner entries
         mock_settings_tight = MagicMock()
         mock_settings_tight.max_allowed_chat_ids = 1
-        mock_settings_tight.ttadk_yolo_default_enabled = False
         with patch("src.config.get_settings", return_value=mock_settings_tight):
             success, msg = pm.set_active_project("chatA", "new_proj")
 
@@ -621,7 +611,6 @@ class TestSetActiveProjectRollback:
 
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 50
-        mock_settings.ttadk_yolo_default_enabled = False
         with patch("src.config.get_settings", return_value=mock_settings):
             pm.set_active_project("chatA", "old_proj")
         old_ctx = pm.get_project_for_diagnostics("old_proj")
@@ -631,7 +620,6 @@ class TestSetActiveProjectRollback:
         new_ctx.owner_chat_id = "owner_only"
         mock_settings_tight = MagicMock()
         mock_settings_tight.max_allowed_chat_ids = 1
-        mock_settings_tight.ttadk_yolo_default_enabled = False
         with patch("src.config.get_settings", return_value=mock_settings_tight):
             success, _ = pm.set_active_project("chatA", "new_proj")
 
@@ -647,7 +635,6 @@ class TestValidateProjectPathIsolation:
         """AC-R01: Passing a chat_id that is not in allowed_chat_ids returns rejection."""
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 50
-        mock_settings.ttadk_yolo_default_enabled = False
         with patch("src.config.get_settings", return_value=mock_settings):
             pm.create_project(None, "secret", str(tmp_path / "s"), chat_id="chatOwner")
             pm.set_active_project("chatOwner", "secret")
@@ -660,7 +647,6 @@ class TestValidateProjectPathIsolation:
         """Owner chat can validate its own project."""
         mock_settings = MagicMock()
         mock_settings.max_allowed_chat_ids = 50
-        mock_settings.ttadk_yolo_default_enabled = False
         with patch("src.config.get_settings", return_value=mock_settings):
             pm.create_project(None, "mine", str(tmp_path / "m"), chat_id="chatOwner")
             pm.set_active_project("chatOwner", "mine")

@@ -652,8 +652,8 @@ def test_sync_adapter_startup_fail_log_has_err_type_and_err_repr(monkeypatch, ca
             return ""
 
     class _FakeSession:
-        def __init__(self, agent_type: str, cwd: str, model_name=None, ttadk_use_pty=None):
-            self._agent_cmd = "ttadk"
+        def __init__(self, agent_type: str, cwd: str, model_name=None):
+            self._agent_cmd = "codex"
             self._agent_args = ["acp", "serve"]
 
         def start(self, startup_timeout: float = 60, **kwargs):
@@ -668,7 +668,7 @@ def test_sync_adapter_startup_fail_log_has_err_type_and_err_repr(monkeypatch, ca
     caplog.set_level("WARNING")
     with pytest.raises(sa.ACPStartupError):
         sa.start_session_with_retry(
-            agent_type="ttadk_codex",
+            agent_type="codex",
             cwd="/tmp",
             startup_timeout=0.1,
             model_name="gpt-5.2",
@@ -700,8 +700,8 @@ def test_sync_adapter_startup_fail_diagnostics_summary_redacted_and_truncated(mo
             return ""
 
     class _FakeSession:
-        def __init__(self, agent_type: str, cwd: str, model_name=None, ttadk_use_pty=None):
-            self._agent_cmd = "ttadk"
+        def __init__(self, agent_type: str, cwd: str, model_name=None):
+            self._agent_cmd = "codex"
             # include sensitive args for redaction
             self._agent_args = ["acp", "serve", "--token=abc123", "--api_key=sk-secret-1234567890"]
 
@@ -719,7 +719,7 @@ def test_sync_adapter_startup_fail_diagnostics_summary_redacted_and_truncated(mo
     caplog.set_level("WARNING")
     with pytest.raises(sa.ACPStartupError):
         sa.start_session_with_retry(
-            agent_type="ttadk_codex",
+            agent_type="codex",
             cwd="/tmp",
             startup_timeout=0.1,
             model_name="gpt-5.2",
@@ -757,7 +757,7 @@ def test_build_startup_diagnostics_has_error_text_and_fail_reason(monkeypatch):
     e.stderr = "Invalid model: foo. Model must be one of: bar,baz"
 
     d = sa.build_startup_diagnostics(
-        agent_type="ttadk_codex",
+            agent_type="codex",
         cwd="/tmp",
         model_name="foo",
         session=None,
@@ -807,7 +807,7 @@ def test_normalize_startup_diagnostics_redacts_and_truncates(monkeypatch):
         acp_diagnostics_total_limit = 200
 
     raw = {
-        "cmd": "ttadk",
+        "cmd": "codex",
         "args": ["--token=abc123", "--x=" + ("y" * 200)],
         "stderr_snippet": "token=abc123 sk-secret-1234567890 " + ("x" * 2000),
         "error_text": "token=abc123 " + ("z" * 2000),
@@ -829,52 +829,6 @@ def test_normalize_startup_diagnostics_redacts_and_truncates(monkeypatch):
     assert len(str(out.get("error_text") or "")) <= 200
 
 
-def test_start_session_with_retry_ttadk_startup_error_empty_message_has_fail_reason_and_error_text(monkeypatch, caplog):
-    """回归A：TTADKStartupError('') 时，启动失败日志必须包含非空 fail_reason/error_text（不再出现空串）。"""
-
-    class _Cfg:
-        acp_startup_retries = 1
-        acp_diagnostics_redact_enabled = False
-        acp_diagnostics_redact_patterns = []
-        acp_diagnostics_redact_replacement = "***REDACTED***"
-        acp_diagnostics_args_limit = 80
-        acp_diagnostics_snippet_limit = 120
-        acp_diagnostics_total_limit = 500
-
-    monkeypatch.setattr(sa, "get_settings", lambda: _Cfg())
-
-    from src.ttadk.manager import TTADKStartupError
-
-    class _FakeSession:
-        def __init__(self, agent_type: str, cwd: str, model_name=None, ttadk_use_pty=None):
-            self._agent_cmd = "ttadk"
-            self._agent_args = ["acp", "serve"]
-
-        def start(self, startup_timeout: float = 60, **kwargs):
-            # Empty message on purpose
-            raise TTADKStartupError("")
-
-        def describe_agent(self):
-            return "fake"
-
-        def close(self):
-            return None
-
-    caplog.set_level("WARNING")
-    with pytest.raises(sa.ACPStartupError):
-        sa.start_session_with_retry(
-            agent_type="ttadk_claude",
-            cwd="/tmp",
-            startup_timeout=0.1,
-            model_name="gpt-5.2",
-            session_cls=_FakeSession,
-            log_failures=True,
-        )
-
-    logs = "\n".join([r.getMessage() for r in caplog.records])
-    assert "Engine session start failed" in logs
-    assert "fail_reason=" in logs
-    assert "error_text=" in logs
 
 
 def test_start_session_with_retry_honors_single_attempt_override(monkeypatch):
@@ -884,7 +838,7 @@ def test_start_session_with_retry_honors_single_attempt_override(monkeypatch):
     attempts: list[float] = []
 
     class _FakeSession:
-        def __init__(self, agent_type: str, cwd: str, ttadk_use_pty=None):
+        def __init__(self, agent_type: str, cwd: str):
             self._agent_cmd = agent_type
             self._agent_args = []
 
@@ -932,7 +886,7 @@ def test_start_agent_session_with_diagnostics_attaches_non_empty_error_text(monk
             return ""
 
     class _FakeSession:
-        def __init__(self, agent_type: str, cwd: str, model_name=None, ttadk_use_pty=None):
+        def __init__(self, agent_type: str, cwd: str, model_name=None):
             self.session_id = ""
 
         def start(self, startup_timeout: float = 60, **kwargs):
@@ -946,7 +900,7 @@ def test_start_agent_session_with_diagnostics_attaches_non_empty_error_text(monk
 
     with pytest.raises(Exception) as ei:
         sa.start_agent_session_with_diagnostics(
-            agent_type="ttadk_codex",
+            agent_type="codex",
             cwd="/tmp",
             startup_timeout=0.1,
             model_name="gpt-5.2",
@@ -975,8 +929,8 @@ def test_start_session_with_retry_runtime_error_empty_message_has_fail_reason_an
     monkeypatch.setattr(sa, "get_settings", lambda: _Cfg())
 
     class _FakeSession:
-        def __init__(self, agent_type: str, cwd: str, model_name=None, ttadk_use_pty=None):
-            self._agent_cmd = "ttadk"
+        def __init__(self, agent_type: str, cwd: str, model_name=None):
+            self._agent_cmd = "codex"
             self._agent_args = ["acp", "serve"]
 
         def start(self, startup_timeout: float = 60, **kwargs):
@@ -991,7 +945,7 @@ def test_start_session_with_retry_runtime_error_empty_message_has_fail_reason_an
     caplog.set_level("WARNING")
     with pytest.raises(sa.ACPStartupError):
         sa.start_session_with_retry(
-            agent_type="ttadk_claude",
+            agent_type="claude",
             cwd="/tmp",
             startup_timeout=0.1,
             model_name="gpt-5.2",
@@ -1263,37 +1217,9 @@ class TestResolveAgentSpec:
         monkeypatch.setattr(sa, "get_settings", lambda: settings)
         assert sa.resolve_agent_spec("coco") == ("/custom/coco", ["serve"])
 
-    def test_ttadk_coco_no_model(self, monkeypatch):
-        """resolve_agent_spec returns ttadk spec for ttadk_coco without model."""
-        monkeypatch.setattr(sa, "get_settings", lambda: _fake_settings())
-        assert sa.resolve_agent_spec("ttadk_coco") == (
-            "python3",
-            ["-m", "src.ttadk.wrapper", "ttadk", "code", "-t", "coco", "-a", "acp", "-a", "serve"],
-        )
 
-    def test_ttadk_claude_no_model(self, monkeypatch):
-        """resolve_agent_spec returns ttadk spec for ttadk_claude without model."""
-        monkeypatch.setattr(sa, "get_settings", lambda: _fake_settings())
-        assert sa.resolve_agent_spec("ttadk_claude") == (
-            "python3",
-            ["-m", "src.ttadk.wrapper", "ttadk", "code", "-t", "claude", "-a", "acp", "-a", "serve"],
-        )
 
-    def test_ttadk_with_model(self, monkeypatch):
-        """resolve_agent_spec returns ttadk spec with model parameter."""
-        monkeypatch.setattr(sa, "get_settings", lambda: _fake_settings())
-        assert sa.resolve_agent_spec("ttadk_coco", model_name="gpt-4") == (
-            "python3",
-            ["-m", "src.ttadk.wrapper", "ttadk", "code", "-t", "coco", "-m", "gpt-4", "-a", "acp", "-a", "serve"],
-        )
 
-    def test_ttadk_case_insensitive(self, monkeypatch):
-        """resolve_agent_spec handles case-insensitive ttadk prefix."""
-        monkeypatch.setattr(sa, "get_settings", lambda: _fake_settings())
-        assert sa.resolve_agent_spec("TTADK_COCO") == (
-            "python3",
-            ["-m", "src.ttadk.wrapper", "ttadk", "code", "-t", "coco", "-a", "acp", "-a", "serve"],
-        )
 
 
 def test_build_startup_diagnostics_timeout_s_unparseable_is_none():

@@ -85,12 +85,6 @@ class ProjectContext:
     traex_session_snapshot: Optional[SessionSnapshot] = None
     traex_mode: bool = False
 
-    ttadk_session_snapshot: Optional[SessionSnapshot] = None
-    ttadk_mode: bool = False
-    ttadk_tool_name: Optional[str] = None
-    ttadk_model_name: Optional[str] = None
-    ttadk_yolo_enabled: bool = False
-
     tui2acp_session_snapshot: Optional[SessionSnapshot] = None
     tui2acp_mode: bool = False
     tui2acp_adapter_name: Optional[str] = None
@@ -265,7 +259,6 @@ class ProjectContext:
         "codex": ("codex_mode", "codex_session_snapshot"),
         "gemini": ("gemini_mode", "gemini_session_snapshot"),
         "traex": ("traex_mode", "traex_session_snapshot"),
-        "ttadk": ("ttadk_mode", "ttadk_session_snapshot"),
         "tui2acp": ("tui2acp_mode", "tui2acp_session_snapshot"),
     }
 
@@ -426,12 +419,6 @@ class ProjectContext:
     def update_traex_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
         self.update_programming_snapshot("traex", query, query_count, session_id)
 
-    def set_ttadk_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("ttadk", enabled, session_id, query_count)
-
-    def update_ttadk_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("ttadk", query, query_count, session_id)
-
     def set_tui2acp_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
         self.set_programming_mode("tui2acp", enabled, session_id, query_count)
 
@@ -468,9 +455,6 @@ class ProjectContext:
             "status": self.status.value,
             "created_at": self.created_at,
             "last_active": self.last_active,
-            "ttadk_tool_name": self.ttadk_tool_name,
-            "ttadk_model_name": self.ttadk_model_name,
-            "ttadk_yolo_enabled": self.ttadk_yolo_enabled,
             "tui2acp_adapter_name": self.tui2acp_adapter_name,
             "acp_tool_name": self.acp_tool_name,
             "acp_model_name": self.acp_model_name,
@@ -519,13 +503,6 @@ class ProjectContext:
 
     @classmethod
     def from_snapshot(cls, data: dict) -> "ProjectContext":
-        try:
-            from ..config import get_settings
-
-            yolo_default = bool(getattr(get_settings(), "ttadk_yolo_default_enabled", False))
-        except Exception:
-            yolo_default = False
-
         ctx = cls(
             project_id=data["project_id"],
             project_name=data["project_name"],
@@ -540,11 +517,7 @@ class ProjectContext:
             codex_mode=data.get("codex_mode", False),
             gemini_mode=data.get("gemini_mode", False),
             traex_mode=data.get("traex_mode", False),
-            ttadk_mode=data.get("ttadk_mode", False),
             tui2acp_mode=data.get("tui2acp_mode", False),
-            ttadk_tool_name=data.get("ttadk_tool_name"),
-            ttadk_model_name=data.get("ttadk_model_name"),
-            ttadk_yolo_enabled=data.get("ttadk_yolo_enabled", yolo_default),
             tui2acp_adapter_name=data.get("tui2acp_adapter_name"),
             acp_tool_name=data.get("acp_tool_name"),
             acp_model_name=data.get("acp_model_name"),

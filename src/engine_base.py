@@ -356,21 +356,8 @@ class BaseEngineManager(Generic[T]):
 
     def _resolve_identity(self, engine_name: str) -> tuple[str, str, Optional[str]]:
         from .mode import InteractionMode
-        from .ttadk import get_ttadk_manager
-
         normalized = (engine_name or "").strip().lower()
-        ttadk_tool = None
-        ttadk_model = None
-        if normalized == "ttadk":
-            mode = InteractionMode.TTADK
-            try:
-                ttadk_manager = get_ttadk_manager()
-                ttadk_tool = ttadk_manager.get_current_tool()
-                ttadk_model = ttadk_manager.get_current_model()
-            except Exception:
-                ttadk_tool = None
-                ttadk_model = None
-        elif normalized.startswith("claude"):
+        if normalized.startswith("claude"):
             mode = InteractionMode.CLAUDE
         elif normalized.startswith("aiden"):
             mode = InteractionMode.AIDEN
@@ -383,11 +370,7 @@ class BaseEngineManager(Generic[T]):
         else:
             mode = InteractionMode.COCO
 
-        identity = resolve_engine_identity(
-            mode=mode,
-            ttadk_tool_name=ttadk_tool,
-            ttadk_model_name=ttadk_model,
-        )
+        identity = resolve_engine_identity(mode=mode)
         return identity.engine_name, identity.agent_type, identity.model_name
 
     def _create_engine(

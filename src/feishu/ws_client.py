@@ -2,7 +2,7 @@
 
 职责概览：
 - 接收飞书 WS 事件（消息、卡片动作、反应等）并做基础校验/去重。
-- 将用户消息路由到不同 handler（SMART/COCO/CLAUDE/SHELL/TTADK 以及 Deep/Spec 引擎）。
+- 将用户消息路由到不同 handler（SMART/编程/SHELL 以及 Deep/Spec 引擎）。
 - 通过 `TaskScheduler` 提供：按项目串行、全局并发限制、系统命令快通道、背压与熔断。
 
 关键设计点：
@@ -111,7 +111,6 @@ from .handlers import (
     SpecHandler,
     SystemHandler,
     TraexModeHandler,
-    TTADKModeHandler,
     Tui2acpModeHandler,
     WorkflowHandler,
 )
@@ -250,9 +249,7 @@ _SILENT_DEDUP_ACTIONS = {
     "workflow_review_select_model_profile",
     "workflow_review_select_model_effort",
     "workflow_review_select_model", "spec_review_select_tool",
-    "spec_review_select_model", "select_ttadk_tool",
-    "select_ttadk_model", "select_ttadk_combined",
-    "select_ttadk_combined_tool", "select_acp_tool",
+    "spec_review_select_model", "select_acp_tool",
     "select_acp_model", "slock_new_role_select_tool",
     "slock_new_role_select_model",
     "slock_role_add_pick", "slock_role_add_confirm",
@@ -379,13 +376,6 @@ class FeishuWSClient:
         )
         self._traex_manager = ACPSessionManager(
             "traex",
-            session_timeout=self.settings.coco_session_timeout,
-            keepalive_interval=self.settings.acp_keepalive_interval,
-            idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
-            idle_health_config=idle_health_cfg,
-        )
-        self._ttadk_manager = ACPSessionManager(
-            "ttadk",
             session_timeout=self.settings.coco_session_timeout,
             keepalive_interval=self.settings.acp_keepalive_interval,
             idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
@@ -556,7 +546,6 @@ class FeishuWSClient:
             codex_manager=self._codex_manager,
             gemini_manager=self._gemini_manager,
             traex_manager=self._traex_manager,
-            ttadk_manager=self._ttadk_manager,
             tui2acp_manager=self._tui2acp_manager,
             intent_recognizer=self._intent_recognizer,
             scheduler=self._scheduler,
@@ -635,7 +624,6 @@ class FeishuWSClient:
         codex_handler = CodexModeHandler(self._handler_ctx)
         gemini_handler = GeminiModeHandler(self._handler_ctx)
         traex_handler = TraexModeHandler(self._handler_ctx)
-        ttadk_handler = TTADKModeHandler(self._handler_ctx)
         tui2acp_handler = Tui2acpModeHandler(self._handler_ctx)
         deep_handler = DeepHandler(self._handler_ctx)
         deep_handler.renderer = DeepRenderer(deep_handler)
@@ -657,7 +645,6 @@ class FeishuWSClient:
         self._codex_handler = codex_handler
         self._gemini_handler = gemini_handler
         self._traex_handler = traex_handler
-        self._ttadk_handler = ttadk_handler
         self._tui2acp_handler = tui2acp_handler
         self._deep_handler = deep_handler
         self._spec_handler = spec_handler
@@ -674,7 +661,6 @@ class FeishuWSClient:
             "codex": self._codex_manager,
             "gemini": self._gemini_manager,
             "traex": self._traex_manager,
-            "ttadk": self._ttadk_manager,
             "tui2acp": self._tui2acp_manager,
         })
         self._handler_ctx.handlers.update({
@@ -684,7 +670,6 @@ class FeishuWSClient:
             "codex": codex_handler,
             "gemini": gemini_handler,
             "traex": traex_handler,
-            "ttadk": ttadk_handler,
             "tui2acp": tui2acp_handler,
             "deep": deep_handler,
             "spec": spec_handler,
@@ -1558,7 +1543,6 @@ class FeishuWSClient:
             InteractionMode.CODEX: ContextSourceMode.CODEX,
             InteractionMode.GEMINI: ContextSourceMode.GEMINI,
             InteractionMode.TRAEX: ContextSourceMode.TRAEX,
-            InteractionMode.TTADK: ContextSourceMode.TTADK,
             InteractionMode.TUI2ACP: ContextSourceMode.TUI2ACP,
         }
         return mapping.get(mode, ContextSourceMode.SMART)
@@ -1590,7 +1574,7 @@ class FeishuWSClient:
 
                     # Resolve mode from ModeManager (single source of truth).
                     _proj_mode = self._mode_manager.get_mode(chat_id, project_id=project_id)
-                    if _proj_mode.value in {"coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk"}:
+                    if _proj_mode.value in {"coco", "claude", "aiden", "codex", "gemini", "traex"}:
                         auto_enter_mode = _proj_mode.value
 
                     if auto_enter_mode:
@@ -2670,7 +2654,6 @@ class FeishuWSClient:
             InteractionMode.CODEX: self._codex_handler,
             InteractionMode.GEMINI: self._gemini_handler,
             InteractionMode.TRAEX: self._traex_handler,
-            InteractionMode.TTADK: self._ttadk_handler,
             InteractionMode.TUI2ACP: self._tui2acp_handler,
         }
         return _map.get(mode)
@@ -2707,7 +2690,6 @@ class FeishuWSClient:
             InteractionMode.CODEX,
             InteractionMode.GEMINI,
             InteractionMode.TRAEX,
-            InteractionMode.TTADK,
             InteractionMode.TUI2ACP,
         }:
             if project is None:
@@ -2865,7 +2847,7 @@ class FeishuWSClient:
                 self._start_spec_engine(message_id, chat_id, text, project)
             return
 
-        if auto_enter_mode and auto_enter_mode in {"coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk"}:
+        if auto_enter_mode and auto_enter_mode in {"coco", "claude", "aiden", "codex", "gemini", "traex"}:
             from ..mode import InteractionMode
             handler = self._get_mode_handler(InteractionMode(auto_enter_mode))
             if handler:
@@ -3734,26 +3716,7 @@ class FeishuWSClient:
             _action = locals().get("action_type", "unknown")
             try:
                 if _mid != "unknown":
-                    if str(_action).startswith("ttadk") or _action in {
-                        "show_ttadk_menu",
-                        "select_ttadk_tool",
-                        "select_ttadk_model",
-                        "refresh_ttadk_models",
-                        "toggle_ttadk_yolo",
-                    }:
-                        try:
-                            from ..card import CardBuilder
-
-                            _pid = locals().get("project_id")
-                            msg_type, card_content = CardBuilder.build_ttadk_soft_failure_card_for(
-                                "操作超时",
-                                project_id=_pid or None,
-                            )
-                            self._reply_card(_mid, card_content)
-                        except Exception:
-                            self._reply_text(_mid, "⏳ 操作超时，请稍后重试或发送 /ttadk 重新进入")
-                    else:
-                        self._reply_text(_mid, f"⏳ 操作超时 ({_action}): {get_error_detail(e)}")
+                    self._reply_text(_mid, f"⏳ 操作超时 ({_action}): {get_error_detail(e)}")
             except Exception:
                 logger.debug("failed to reply timeout action error", exc_info=True)
         except Exception as e:
@@ -3764,26 +3727,7 @@ class FeishuWSClient:
             _action = locals().get("action_type", "unknown")
             try:
                 if _mid != "unknown":
-                    if str(_action).startswith("ttadk") or _action in {
-                        "show_ttadk_menu",
-                        "select_ttadk_tool",
-                        "select_ttadk_model",
-                        "refresh_ttadk_models",
-                        "toggle_ttadk_yolo",
-                    }:
-                        try:
-                            from ..card import CardBuilder
-
-                            project_id = locals().get("project_id")
-                            msg_type, card_content = CardBuilder.build_ttadk_soft_failure_card_for(
-                                "操作未完成",
-                                project_id=project_id or None,
-                            )
-                            self._reply_card(_mid, card_content)
-                        except Exception:
-                            self._reply_text(_mid, "⚠️ 操作未完成，请稍后重试或发送 /ttadk 重新进入")
-                    else:
-                        self._reply_text(_mid, f"❌ 操作失败 ({_action}): {get_error_detail(e)}")
+                    self._reply_text(_mid, f"❌ 操作失败 ({_action}): {get_error_detail(e)}")
             except Exception:
                 logger.debug("failed to reply action failure error", exc_info=True)
         finally:

@@ -75,8 +75,6 @@ class SpecHandler(BaseEngineHandler):
         current_mode = self.ctx.mode_manager.get_mode(chat_id, project_id=project_id)
         identity = resolve_engine_identity(
             mode=current_mode,
-            ttadk_tool_name=getattr(project, "ttadk_tool_name", None) if project else None,
-            ttadk_model_name=getattr(project, "ttadk_model_name", None) if project else None,
             acp_tool_name=getattr(project, "acp_tool_name", None) if project else None,
             acp_model_name=getattr(project, "acp_model_name", None) if project else None,
         )
@@ -103,13 +101,10 @@ class SpecHandler(BaseEngineHandler):
     def _get_available_spec_review_tools(self) -> list[dict]:
         return self._agent_tool_discovery().get_available_tools()
 
-    def _get_ttadk_spec_review_tools(self) -> list[dict]:
-        return self._agent_tool_discovery().get_ttadk_tools()
-
     def _get_spec_review_models_for_tool(
         self,
         tool_name: str,
-        provider: str = "ttadk",
+        provider: str = "acp",
         cwd: Optional[str] = None,
         current_model: Optional[str] = None,
     ) -> list[dict]:
@@ -119,19 +114,6 @@ class SpecHandler(BaseEngineHandler):
         from ...acp.traex_selection import expand_model_option_dicts
 
         return expand_model_option_dicts(models)
-
-    @staticmethod
-    def _normalize_ttadk_tool_option(tool: dict) -> dict:
-        item = dict(tool or {})
-        item["provider"] = "ttadk"
-        item["agent_name"] = item.get("agent_name") or "ttadk"
-        display_name = str(item.get("display_name") or item.get("tool_name") or item.get("name") or "").strip()
-        prefix = "TTADK · "
-        if display_name.startswith(prefix):
-            display_name = display_name[len(prefix):].strip()
-        if display_name:
-            item["display_name"] = display_name
-        return item
 
     def _dispatch_spec_review_tool_select(
         self,
@@ -465,22 +447,6 @@ class SpecHandler(BaseEngineHandler):
             return
 
         ctrl = self._spec_review_selection_controller()
-        state = ctrl._get_state(project)
-        selected_dicts = [item.to_dict() for item in state.selected_items]
-
-        if provider == "ttadk" and tool_name == "ttadk":
-            tools = [self._normalize_ttadk_tool_option(t) for t in self._get_ttadk_spec_review_tools()]
-            self._dispatch_spec_review_tool_select(
-                message_id=message_id,
-                chat_id=chat_id,
-                project=project,
-                tools=tools,
-                selected=selected_dicts,
-                message="请选择 TTADK 工具",
-                thread_root_id=thread_root_id,
-            )
-            return
-
         option = AgentToolOption(
             provider=provider,
             tool_name=tool_name,

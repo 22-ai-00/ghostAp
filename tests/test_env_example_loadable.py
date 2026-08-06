@@ -86,7 +86,6 @@ class TestEnvExampleLoadable:
 
         # Also set any values that would be empty strings but need content
         monkeypatch.setenv("DEFAULT_ACP_TOOL", "coco")
-        monkeypatch.setenv("TTADK_DEFAULT_TOOL", "coco")
 
         # Validate Settings can load without exceptions
         settings = Settings(_env_file=str(temp_env))

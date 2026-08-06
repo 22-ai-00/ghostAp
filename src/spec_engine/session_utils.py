@@ -64,20 +64,10 @@ def try_switch_model(
     if agent_type == "claude":
         return False, current_model, None, models_tried, None
 
-    if agent_type.startswith("ttadk"):
-        from ..ttadk import get_ttadk_manager
-        from ..utils.path import normalize_ttadk_cwd
-
-        ttadk_manager = get_ttadk_manager()
-        tool_name = agent_type.replace("ttadk_", "")
-        result = ttadk_manager.get_models(cwd=normalize_ttadk_cwd(root_path), tool_name=tool_name)
-        all_models = [m.name for m in result.models]
-        apply_switch = ttadk_manager.set_model
-    else:
-        model_manager = get_coco_model_manager()
-        result = model_manager.get_models()
-        all_models = [m.name for m in result.models]
-        apply_switch = model_manager.set_model
+    model_manager = get_coco_model_manager()
+    result = model_manager.get_models()
+    all_models = [m.name for m in result.models]
+    apply_switch = model_manager.set_model
 
     available = [m for m in all_models if m not in models_tried]
     if not available:
@@ -137,15 +127,6 @@ def initialize_model_context(agent_type: str) -> tuple[Optional[str], list[str]]
 
     if agent_type == "claude":
         return None, []
-
-    if agent_type.startswith("ttadk"):
-        try:
-            from ..ttadk import get_ttadk_manager
-
-            current_model = get_ttadk_manager().get_current_model()
-        except Exception:
-            current_model = None
-        return current_model, [current_model] if current_model else []
 
     current_model = get_coco_model_manager().get_current_model()
     return current_model, [current_model] if current_model else []

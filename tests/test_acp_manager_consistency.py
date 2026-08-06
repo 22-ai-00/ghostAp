@@ -951,15 +951,6 @@ class TestACPSessionManagerConsistency(unittest.TestCase):
         assert "classify_manager_idle_health" in manager_source
         assert "IdleHealthConfig._resolve_for_manager" not in manager_source
 
-    def test_manager_has_no_ttadk_startup_private_responsibilities(self):
-        root = Path(__file__).resolve().parents[1]
-        manager_source = (root / "src" / "acp" / "manager.py").read_text(encoding="utf-8")
-        startup_source = (root / "src" / "acp" / "startup_utils.py").read_text(encoding="utf-8")
-
-        assert "precheck_ttadk_startup_model" not in manager_source
-        assert "_degrade_ttadk" not in manager_source
-        assert "precheck_ttadk_startup_model" in startup_source
-        assert "_degrade_ttadk" not in startup_source
 
     def test_public_idle_health_facade_matches_legacy_classification(self):
         from src.acp import telemetry

@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import src.acp.helper as _helper_mod
 from src.acp.helper import fetch_acp_models
+from src.acp.options import ACPModelOption
 from src.coco_model.manager import DEFAULT_MODELS
-from src.ttadk.models import ACPModelOption
 
 
 def test_fetch_codex_models_timeout_returns_empty_without_adapter_models(monkeypatch, tmp_path):
@@ -226,7 +226,7 @@ def test_background_preheat_deduplicates_codex(monkeypatch):
 
 def test_fetch_acp_models_non_coco_caches_successful_probe(monkeypatch):
     """Successful probe for non-coco tools is cached in _acp_probe_cache."""
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     probe_results = [
         ACPModelOption(name="model-a", description="A", is_default=True),
@@ -253,7 +253,7 @@ def test_fetch_acp_models_non_coco_caches_successful_probe(monkeypatch):
 
 def test_fetch_acp_models_non_coco_uses_cache_on_probe_failure(monkeypatch):
     """When probe fails for non-coco tool, cached result is used as fallback."""
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     # Pre-populate cache
     _helper_mod._acp_probe_cache.clear()
@@ -280,7 +280,7 @@ def test_fetch_acp_models_non_coco_uses_cache_on_probe_failure(monkeypatch):
 
 def test_fetch_acp_models_non_coco_expired_cache_not_used(monkeypatch):
     """Expired cache entries are not returned; falls back to current_model."""
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     # Pre-populate cache with expired entry (TTL + 10s ago)
     _helper_mod._acp_probe_cache.clear()
@@ -315,7 +315,7 @@ def test_fetch_acp_models_concurrent_probes_coalesce_to_single_call(monkeypatch)
     """Concurrent lookups for the same (tool, cwd) run the probe only once."""
     import threading
 
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
     _helper_mod._acp_neg_cache.clear()
@@ -386,7 +386,7 @@ def test_fetch_acp_models_negative_cache_skips_reprobe(monkeypatch):
 
 def test_fetch_acp_models_negative_cache_expires_and_reprobes(monkeypatch):
     """Once the negative-cache TTL passes, the tool is probed again."""
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
     _helper_mod._acp_neg_cache.clear()
@@ -418,7 +418,7 @@ def test_fetch_acp_models_negative_cache_expires_and_reprobes(monkeypatch):
 def test_fetch_acp_models_cache_hit_returns_independent_copies(monkeypatch):
     """A cache hit must not let one caller's is_default leak into the cache
     or into another caller's list."""
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
     _helper_mod._acp_neg_cache.clear()
@@ -449,7 +449,7 @@ def test_fetch_acp_models_cache_hit_returns_independent_copies(monkeypatch):
 
 
 def test_first_probe_current_model_does_not_poison_shared_default_cache(monkeypatch):
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
     _helper_mod._acp_neg_cache.clear()
@@ -484,7 +484,7 @@ def test_first_probe_current_model_does_not_poison_shared_default_cache(monkeypa
 
 
 def test_fetch_codex_models_marks_composite_current_model_by_base(monkeypatch):
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
     _helper_mod._acp_neg_cache.clear()
@@ -523,7 +523,7 @@ def test_fetch_codex_models_marks_composite_current_model_by_base(monkeypatch):
 
 
 def test_unknown_current_model_keeps_provider_default(monkeypatch):
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
     _helper_mod._acp_neg_cache.clear()
@@ -550,7 +550,7 @@ def test_unknown_current_model_keeps_provider_default(monkeypatch):
 
 
 def test_removed_effort_keeps_existing_base_model_selected(monkeypatch):
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
     _helper_mod._acp_neg_cache.clear()
@@ -589,7 +589,7 @@ def test_removed_effort_keeps_existing_base_model_selected(monkeypatch):
 def test_fetch_acp_models_different_cwd_probed_separately(monkeypatch):
     """Cache/single-flight are keyed by (tool, cwd), so distinct cwds probe
     independently."""
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
     _helper_mod._acp_neg_cache.clear()
@@ -615,7 +615,7 @@ def test_fetch_codex_models_prefers_adapter_probe_over_local_codex_cache(monkeyp
     """Codex model picker must reflect the running ACP adapter, not stale CLI cache."""
     from src.acp import helper as helper_mod
     from src.acp.helper import fetch_acp_models
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     helper_mod._acp_probe_cache.clear()
     helper_mod._acp_neg_cache.clear()
@@ -747,7 +747,7 @@ def test_extract_models_from_config_options_skips_non_model_category():
 def test_probe_acp_models_falls_back_to_config_options(monkeypatch):
     """probe_acp_models returns models from config_options when
     available_models is empty (traex behavior)."""
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     _helper_mod._acp_probe_cache.clear()
 
@@ -1283,7 +1283,7 @@ def test_extract_traex_capabilities_without_cache_only_uses_standard_profile(
 
 def test_mark_default_matches_traex_composite_variant():
     from src.acp.helper import _mark_default
-    from src.ttadk.models import ACPModelOption, ACPModelVariantOption
+    from src.acp.options import ACPModelOption, ACPModelVariantOption
 
     models = [
         ACPModelOption(
@@ -1305,7 +1305,7 @@ def test_mark_default_matches_traex_composite_variant():
 
 def test_invalidate_acp_model_cache_clears_entries_and_increments_generation():
     from src.acp import helper
-    from src.ttadk.models import ACPModelOption
+    from src.acp.options import ACPModelOption
 
     key = helper._probe_key("traex", "/repo")
     with helper._acp_probe_cache_lock:

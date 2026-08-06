@@ -49,12 +49,11 @@ def _build_generic_error_blob(error: Exception) -> str:
     """将 error 转成可匹配的通用文本 blob（best-effort, never raises）。
 
     注意：该函数用于 compaction/loop/failover 等"通用模型失败"检测。
-    Invalid model 的"可用模型列表提取/诊断上下文构造"必须收敛到 `src.ttadk.models.build_invalid_model_context`
-    等 SSOT 入口，避免在上层重复实现/分叉规则。
+    Provider-specific parsing stays outside this generic error collector.
     """
     parts: list[str] = []
     parts.append(get_error_detail(error))
-    # 兼容 ACPStartupError/TTADKProbeError 等携带 snippet 字段的异常
+    # 兼容携带 snippet 字段的启动异常
     for k in ("stderr_snippet", "stdout_snippet", "stderr", "stdout", "message"):
         try:
             v = getattr(error, k, None)
@@ -147,20 +146,6 @@ def _extract_model_from_agent_args(args: list[str]) -> str:
                 logger.debug("_extract_model_from_agent_args: model.name= split failed", exc_info=True)
                 continue
 
-    # ttadk wrapper: python3 -m <wrapper_module> ... ttadk code ... -m <model>
-    # 注意：args 中可能同时存在两处 "-m"：
-    # - python 的 "-m <module>"
-    # - ttadk code 的 "-m <model>"（我们需要提取这个）
-    try:
-        for i in range(len(xs) - 1):
-            if xs[i] == "ttadk" and xs[i + 1] == "code":
-                for j in range(i + 2, len(xs) - 1):
-                    if xs[j] == "-m":
-                        return str(xs[j + 1] or "").strip()
-                break
-    except Exception:
-        logger.debug("_extract_model_from_agent_args: ttadk model extraction failed", exc_info=True)
-
     # generic: first -m <value>
     for i, x in enumerate(xs):
         if x == "-m" and i + 1 < len(xs):
@@ -197,18 +182,6 @@ def _replace_model_in_agent_args(args: list[str], new_model: str) -> tuple[list[
     if replaced:
         return (out, True)
 
-    # ttadk wrapper: locate "ttadk code" then replace its "-m <model>"
-    try:
-        for i in range(len(out) - 1):
-            if str(out[i] or "") == "ttadk" and str(out[i + 1] or "") == "code":
-                for j in range(i + 2, len(out) - 1):
-                    if str(out[j] or "") == "-m":
-                        out[j + 1] = new_model
-                        return (out, True)
-                break
-    except (TypeError, IndexError):
-        logger.debug("_replace_model_in_agent_args: ttadk model replacement failed", exc_info=True)
-
     # generic: first -m <value>
     for i, x in enumerate(out):
         if x == "-m" and i + 1 < len(out):
@@ -216,51 +189,6 @@ def _replace_model_in_agent_args(args: list[str], new_model: str) -> tuple[list[
             return (out, True)
 
     return (out, False)
-
-
-def _remove_model_in_agent_args(args: list[str]) -> tuple[list[str], bool]:
-    """在 agent_args 中移除 model 参数（best-effort）。
-
-    目前主要用于 TTADK 运行期 Invalid model 自愈的 auto 回退：移除 `-m <model>`。
-
-    返回 (new_args, removed)。
-    """
-    try:
-        xs = [str(x) for x in (args or [])]
-    except (TypeError, ValueError):
-        logger.debug("_remove_model_in_agent_args: args conversion failed", exc_info=True)
-        xs = list(args or [])
-
-    # 优先只移除 ttadk code 的 "-m <model>"，避免误删 python 的 "-m <module>"。
-    try:
-        for i in range(len(xs) - 1):
-            if str(xs[i] or "") == "ttadk" and str(xs[i + 1] or "") == "code":
-                out = list(xs)
-                for j in range(i + 2, len(out) - 1):
-                    if str(out[j] or "") == "-m":
-                        # delete "-m" and its value
-                        try:
-                            del out[j : j + 2]
-                        except (IndexError, TypeError):
-                            return (list(xs), False)
-                        return (out, True)
-                return (list(xs), False)
-    except (TypeError, IndexError):
-        logger.debug("_remove_model_in_agent_args: ttadk model removal failed", exc_info=True)
-
-    # fallback: remove first -m <value>
-    out2: list[str] = []
-    removed = False
-    i = 0
-    while i < len(xs):
-        x = str(xs[i] or "")
-        if x == "-m":
-            removed = True
-            i += 2
-            continue
-        out2.append(x)
-        i += 1
-    return (out2, removed)
 
 
 def _apply_compaction_once(
@@ -289,7 +217,7 @@ def _apply_compaction_once(
     if not agent_type or not cwd:
         return None
 
-    # 继承 cmd/args（特别是 TTADK wrapper / PTY 等启动参数）
+    # 继承 cmd/args 启动参数
     agent_cmd = str(getattr(session, "_agent_cmd", "") or "")
     agent_args = list(getattr(session, "_agent_args", []) or [])
 

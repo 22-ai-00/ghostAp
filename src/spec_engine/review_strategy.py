@@ -368,16 +368,13 @@ class AdaptiveRoleReviewStrategy(ReviewStrategy):
 def _default_agent_label(agent_type: str, model_name: str | None) -> str:
     normalized = str(agent_type or "coco").strip()
     display = normalized
-    if normalized.startswith("ttadk_"):
-        display = f"TTADK {normalized.replace('ttadk_', '', 1).title()}"
-    else:
-        display = {
-            "coco": "Coco",
-            "codex": "Codex",
-            "aiden": "Aiden",
-            "claude": "Claude",
-            "gemini": "Gemini",
-        }.get(normalized.lower(), normalized.title())
+    display = {
+        "coco": "Coco",
+        "codex": "Codex",
+        "aiden": "Aiden",
+        "claude": "Claude",
+        "gemini": "Gemini",
+    }.get(normalized.lower(), normalized.title())
     model = str(model_name or "").strip() or "默认模型"
     return f"{display} / {model}"
 

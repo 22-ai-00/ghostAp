@@ -69,18 +69,6 @@ def test_claude_review_model_reaches_first_prompt_argv_and_env(tmp_path):
     )
 
 
-def test_create_review_session_ttadk(tmp_path):
-    with patch("src.ttadk.startup_common.precheck_ttadk_startup_model") as pre, \
-         patch("src.agent_session.factory.SyncTTADKCLISession") as Cls:
-        pre.return_value = {"model": "gpt-5.2"}
-        fake = _FakeSession()
-        Cls.return_value = fake
-        s = create_review_session("ttadk_coco", str(tmp_path), model_name="gpt-5.2")
-        assert s is fake
-        assert fake.started is True
-        # TTADK CLI session got the resolved model from precheck
-        _, kwargs = Cls.call_args
-        assert kwargs.get("model_name") == "gpt-5.2"
 
 
 def test_create_review_session_acp(tmp_path):

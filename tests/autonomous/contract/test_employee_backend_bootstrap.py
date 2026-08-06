@@ -19,7 +19,7 @@ from src.slock_engine.models import AgentIdentity
 
 @pytest.mark.parametrize(
     "backend",
-    ("codex", "coco", "traex", "claude", "gemini", "ttadk_codex"),
+    ("codex", "coco", "traex", "claude", "gemini"),
 )
 def test_every_backend_receives_same_explicit_employee_bootstrap(
     tmp_path: Path,
@@ -167,7 +167,7 @@ def test_traex_projection_rejects_group_readable_auth(tmp_path: Path) -> None:
     assert not (tmp_path / "employee").exists()
 
 
-@pytest.mark.parametrize("backend", ("claude", "ttadk_codex"))
+@pytest.mark.parametrize("backend", ("claude",))
 def test_employee_cli_backend_captures_explicit_env_without_switching_to_acp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -180,22 +180,9 @@ def test_employee_cli_backend_captures_explicit_env_without_switching_to_acp(
         lambda: SimpleNamespace(
             rate_limit_retry_enabled=False,
             acp_startup_timeout=1.0,
-            ttadk_cwd_debug_enabled=False,
         ),
     )
     monkeypatch.setattr(session_factory.SyncClaudeCLISession, "start", lambda self: "sid")
-    monkeypatch.setattr(session_factory.SyncTTADKCLISession, "start", lambda self: "sid")
-    monkeypatch.setattr(
-        "src.ttadk.startup_common.precheck_ttadk_startup_model",
-        lambda **_kwargs: {
-            "tool": "codex",
-            "input_model": "",
-            "model": None,
-            "validated": True,
-            "source": "test",
-            "warnings": (),
-        },
-    )
 
     with employee_session_environment(env):
         session = session_factory.create_engine_session(

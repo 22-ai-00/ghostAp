@@ -62,7 +62,7 @@ class TestErrorDiagnosticContext:
 
         store = ErrorDiagnosticStore(ttl_seconds=60, max_details_chars=80)
         token = store.register(
-            title="TTADK 暂不可用",
+            title="Codex 暂不可用",
             summary="cli unavailable",
             details="command: /home/alice/project/.venv/bin/coco --token SECRET_TOKEN=abc123\n"
             "stderr: failed at /data00/home/alice/work/ghostAp/src/main.py\n"
@@ -74,7 +74,7 @@ class TestErrorDiagnosticContext:
 
         rendered = store.render(token, chat_id="c1", origin_message_id="m1", request_id="req-1")
 
-        assert "TTADK 暂不可用" in rendered
+        assert "Codex 暂不可用" in rendered
         assert "cli unavailable" in rendered
         assert "/home/alice" not in rendered
         assert "/data00/home/alice" not in rendered

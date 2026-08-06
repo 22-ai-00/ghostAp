@@ -4,7 +4,6 @@ import logging
 import shutil
 from dataclasses import dataclass
 
-from ..ttadk import get_ttadk_manager
 from .helper import fetch_acp_models
 from .providers import get_providers, tool_registry
 
@@ -43,7 +42,7 @@ _KNOWN_TOOLS: tuple[_KnownTool, ...] = (
 
 
 class AgentToolDiscovery:
-    """Discover available tools and their models from ACP, CLI, and TTADK."""
+    """Discover available tools and their models from ACP and CLI providers."""
 
     _TOP_LEVEL_PRIORITY = {
         ("acp", "coco"): 0,
@@ -56,7 +55,6 @@ class AgentToolDiscovery:
         ("cli", "claude"): 3,
         ("acp", "traex"): 4,
         ("cli", "traex"): 4,
-        ("ttadk", "ttadk"): 90,
     }
 
     def get_available_tools(self) -> list[dict]:
@@ -98,17 +96,6 @@ class AgentToolDiscovery:
             )
             seen.add(known.name)
 
-        if self.get_ttadk_tools():
-            tools.append(
-                AgentToolOption(
-                    provider="ttadk",
-                    tool_name="ttadk",
-                    display_name="TTADK",
-                    description="TTADK 多工具入口",
-                    supports_model=False,
-                ).__dict__
-            )
-
         return self._sort_top_level_tools(tools)
 
     def _is_acp_provider_available(self, tool_name: str, provider_obj: object) -> bool:
@@ -141,43 +128,15 @@ class AgentToolDiscovery:
 
         return sorted(tools, key=key)
 
-    def get_ttadk_tools(self) -> list[dict]:
-        tools: list[dict] = []
-        try:
-            result = get_ttadk_manager().get_tools()
-            for tool in result.tools:
-                name = str(tool.name or "").strip()
-                if not name:
-                    continue
-                tools.append(
-                    AgentToolOption(
-                        provider="ttadk",
-                        tool_name=name,
-                        display_name=name,
-                        agent_name="ttadk",
-                        description=f"TTADK · {name}",
-                        supports_model=True,
-                        model_optional=True,
-                        skip_model_selection=getattr(
-                            tool,
-                            "skip_model_selection",
-                            False,
-                        ),
-                    ).__dict__
-                )
-        except Exception:
-            logger.debug("TTADK tool discovery failed", exc_info=True)
-        return tools
-
     def get_models_for_tool(
         self,
         tool_name: str,
-        provider: str = "ttadk",
+        provider: str = "acp",
         cwd: str | None = None,
         current_model: str | None = None,
         force_refresh: bool = True,
     ) -> list[dict]:
-        """Return available models for an ACP or TTADK tool."""
+        """Return available models for an ACP tool."""
         if provider == "acp":
             try:
                 acp_models = fetch_acp_models(
@@ -222,25 +181,4 @@ class AgentToolDiscovery:
             except Exception:
                 return []
 
-        try:
-            models_result = get_ttadk_manager().get_models(
-                tool_name=tool_name,
-                cwd=cwd,
-                force_refresh=force_refresh,
-            )
-            warnings = list(getattr(models_result, "warnings", []) or [])
-            source = str(getattr(models_result, "source", "") or "").strip().lower()
-            if source == "defaults" or "models_untrusted" in warnings:
-                return []
-            return [
-                {
-                    "name": model.name,
-                    "display_name": getattr(model, "friendly_name", None)
-                    or getattr(model, "display_name", None)
-                    or model.name,
-                    "is_default": getattr(model, "is_default", False),
-                }
-                for model in (models_result.models if models_result else [])
-            ]
-        except Exception:
-            return []
+        return []

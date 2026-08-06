@@ -837,7 +837,6 @@ class BaseHandler:
             InteractionMode.CODEX: ContextSourceMode.CODEX,
             InteractionMode.GEMINI: ContextSourceMode.GEMINI,
             InteractionMode.TRAEX: ContextSourceMode.TRAEX,
-            InteractionMode.TTADK: ContextSourceMode.TTADK,
             InteractionMode.TUI2ACP: ContextSourceMode.TUI2ACP,
         }
         return mapping.get(mode, ContextSourceMode.SMART)
@@ -931,8 +930,6 @@ class BaseHandler:
                 project = None
         identity = resolve_engine_identity(
             mode=current_mode,
-            ttadk_tool_name=getattr(project, "ttadk_tool_name", None) if project else None,
-            ttadk_model_name=getattr(project, "ttadk_model_name", None) if project else None,
             acp_tool_name=getattr(project, "acp_tool_name", None) if project else None,
             acp_model_name=getattr(project, "acp_model_name", None) if project else None,
         )

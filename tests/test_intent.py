@@ -80,7 +80,6 @@ class TestIntentRecognizerQuickMatch:
         [
             ("退出", "coco"),
             ("exit", "claude"),
-            ("退出", "ttadk"),
         ],
     )
     def test_exit_keyword_in_programming_mode(self, recognizer, text, current_mode):
@@ -162,11 +161,6 @@ class TestIntentRecognizerContextHint:
         assert result.primary_intent == IntentType.TOOLS_STATUS
         assert result.confidence == 1.0
 
-    def test_exact_command_ttadk(self, recognizer):
-        result = recognizer._quick_match("/ttadk")
-        assert result is not None
-        assert result.primary_intent == IntentType.TTADK_MESSAGE
-        assert result.confidence == 1.0
 
 
 class TestIntentResult:
@@ -213,7 +207,6 @@ class TestIntentTypeMapping:
         assert recognizer.INTENT_MAP["unknown"] == IntentType.UNKNOWN
         assert recognizer.INTENT_MAP["show_tools"] == IntentType.SHOW_TOOLS
         assert recognizer.INTENT_MAP["tools_status"] == IntentType.TOOLS_STATUS
-        assert recognizer.INTENT_MAP["ttadk_message"] == IntentType.TTADK_MESSAGE
 
 
 # ── Boundary test cases ──────────────────────────────────────────────

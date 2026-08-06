@@ -75,7 +75,6 @@ def _install_fake_backend(
         lambda: SimpleNamespace(
             acp_startup_timeout=20,
             rate_limit_retry_enabled=False,
-            ttadk_cwd_debug_enabled=False,
         ),
     )
     monkeypatch.setattr(
@@ -157,7 +156,6 @@ def test_auxiliary_session_fails_closed_without_filter_support(monkeypatch) -> N
         lambda: SimpleNamespace(
             acp_startup_timeout=20,
             rate_limit_retry_enabled=False,
-            ttadk_cwd_debug_enabled=False,
         ),
     )
     monkeypatch.setattr(
@@ -173,33 +171,3 @@ def test_auxiliary_session_fails_closed_without_filter_support(monkeypatch) -> N
         )
 
     assert session.closed is True
-
-
-def test_auxiliary_session_rejects_unenforced_ttadk_cli(monkeypatch) -> None:
-    create_auxiliary_session = getattr(
-        agent_session,
-        "create_auxiliary_session",
-        None,
-    )
-    assert callable(create_auxiliary_session), (
-        "coordination-only sessions need a purpose-specific deny-all factory"
-    )
-    started = False
-
-    def _unexpected_start(**_kwargs):
-        nonlocal started
-        started = True
-        raise AssertionError("TTADK CLI must not start for a deny-all auxiliary session")
-
-    monkeypatch.setattr(
-        "src.acp.sync_adapter.start_session_with_retry",
-        _unexpected_start,
-    )
-
-    with pytest.raises(RuntimeError, match="TTADK"):
-        create_auxiliary_session(
-            agent_type="ttadk_codex",
-            cwd="/project",
-        )
-
-    assert started is False

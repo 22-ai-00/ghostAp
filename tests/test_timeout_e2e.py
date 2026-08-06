@@ -346,25 +346,6 @@ class TestInternalDiagnosticsGuard:
         assert result.error is not None
         assert len(result.error.strip()) > 0, "ModelListResult.error is empty for bare Exception"
 
-    def test_ttadk_manager_tool_list_error_nonempty(self):
-        """TTADKManager: ToolListResult.error non-empty for typed exception."""
-        from src.ttadk.manager import TTADKManager
-
-        mgr = TTADKManager.__new__(TTADKManager)
-        mgr._cached_tools = None
-        mgr._tool_cache_time = 0.0
-        mgr._tool_cache_ttl = 0.0
-        mgr._lock = __import__("threading").Lock()
-
-        mgr._load_tools = MagicMock(side_effect=OSError("tool load failed"))
-        mgr._ensure_initialized = lambda: None
-        mgr._is_tool_cache_valid = MagicMock(return_value=False)
-        with patch("src.ttadk.manager.get_settings") as ms:
-            ms.return_value = MagicMock(ttadk_tool_cache_ttl=0)
-            result = mgr.get_tools()
-
-        assert result.error is not None
-        assert len(result.error.strip()) > 0, "ToolListResult.error is empty for OSError"
 
 
 # ---------------------------------------------------------------------------
@@ -391,21 +372,6 @@ class TestUserFacingEmptyGuardFinal:
         # Must not end with just ": "
         assert not result.text.strip().endswith(":")
 
-    # --- agent_session.py: TTADK session ---
-    def test_ttadk_session_bare_timeout_nonempty(self):
-        from src.agent_session import SyncTTADKCLISession
-
-        session = SyncTTADKCLISession(agent_type="ttadk_coco", cwd="/tmp")
-        session.session_id = "test-session"
-
-        with patch("src.agent_session.subprocess.Popen", side_effect=TimeoutError()):
-            result = session.send_prompt("test")
-
-        assert result.stop_reason == "error"
-        assert len(result.text.strip()) > 0, "TTADK session error text is empty"
-        assert "执行异常" in result.text
-        assert not result.text.strip().endswith(":")
-
     # --- programming.py: ACP execute exception ---
     def test_programming_acp_execute_bare_exception_nonempty(self):
         """programming.py:708 — f'❌ 执行异常: {get_error_detail(e)}' guard."""
@@ -425,7 +391,7 @@ class TestUserFacingEmptyGuardFinal:
 
         for exc in [TimeoutError(), Exception()]:
             detail = get_error_detail(exc)
-            msg = f"切换 TTADK 模型失败: {detail}"
+            msg = f"切换模型失败: {detail}"
             assert len(detail.strip()) > 0, f"Empty detail for {type(exc).__name__}"
             assert not msg.strip().endswith(": ")
 

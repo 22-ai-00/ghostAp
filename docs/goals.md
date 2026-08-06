@@ -136,11 +136,10 @@
 
   绝对不能破坏：
 
-  - Deep / Spec / Worktree / Workflow 引擎逻辑和路由。
+  - Deep / Spec / Workflow 引擎逻辑和路由。
   - 主 GhostAP Bot 现有 WebSocket 连接和消息入口。
   - Slock `_run_acp_session` 内部执行语义。
   - SMART、普通编程模式和 topic-scoped engine 状态合同。
-  - TTADK CLI bridge 语义。
   - Journal SSOT、frozen domain、Effect dispatch 前锚定、默认拒绝策略。
   - 不得把 app_secret 写入 identity.json、Journal、日志、卡片、异常、argv、环境变量或普通 IPC。
 
@@ -394,7 +393,7 @@
   - `/stop` 终态竞态正确。
   - `/fire` 可恢复且不伪报删除开放平台应用。
   - 主 Bot send count 在员工响应中为 0。
-  - Deep/Spec/Worktree/Workflow 和主 Bot WS 无回归。
+  - Deep/Spec/Workflow 和主 Bot WS 无回归。
   - 自动化、故障注入、重启恢复、配置校验全部通过。
   - 真实飞书租户 E2E 完成。
   - dev 已 push，HEAD 与 origin/dev 一致。

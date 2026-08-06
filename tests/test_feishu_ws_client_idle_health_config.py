@@ -16,7 +16,6 @@ def test_feishu_ws_client_uses_default_acp_session_managers():
 
     # 仅做存在性与类型层面的 smoke 检查，避免真正启动 ACP/CLI 会话
     assert client._coco_manager is not None
-    assert client._ttadk_manager is not None
 
 
 def test_feishu_ws_client_injects_default_session_telemetry_adapter():
@@ -30,4 +29,3 @@ def test_feishu_ws_client_injects_default_session_telemetry_adapter():
     assert isinstance(client._aiden_manager._session_telemetry, DefaultSessionTelemetryAdapter)
     assert isinstance(client._codex_manager._session_telemetry, DefaultSessionTelemetryAdapter)
     assert isinstance(client._gemini_manager._session_telemetry, DefaultSessionTelemetryAdapter)
-    assert isinstance(client._ttadk_manager._session_telemetry, DefaultSessionTelemetryAdapter)

@@ -32,7 +32,6 @@ class IntentType(Enum):
     CODEX_MESSAGE = "codex_message"
     GEMINI_MESSAGE = "gemini_message"
     TRAEX_MESSAGE = "traex_message"
-    TTADK_MESSAGE = "ttadk_message"
     CREATE_PROJECT = "create_project"
     SWITCH_PROJECT = "switch_project"
     LIST_PROJECTS = "list_projects"
@@ -145,7 +144,6 @@ class IntentRecognizer:
         "codex_message": IntentType.CODEX_MESSAGE,
         "gemini_message": IntentType.GEMINI_MESSAGE,
         "traex_message": IntentType.TRAEX_MESSAGE,
-        "ttadk_message": IntentType.TTADK_MESSAGE,
         "change_dir": IntentType.CHANGE_DIR,
         "shell": IntentType.SHELL_COMMAND,
         "create_project": IntentType.CREATE_PROJECT,
@@ -195,10 +193,6 @@ class IntentRecognizer:
         "/enter_traex": (IntentType.ENTER_TRAEX, "进入 Traex 编程模式"),
         "/end_traex": (IntentType.EXIT_TRAEX, "退出 Traex 编程模式"),
         "/exit_traex": (IntentType.EXIT_TRAEX, "退出 Traex 编程模式"),
-        "/ttadk": (IntentType.TTADK_MESSAGE, "打开 TTADK 菜单"),
-        "/enter_ttadk": (IntentType.TTADK_MESSAGE, "进入 TTADK 编程模式"),
-        "/end_ttadk": (IntentType.EXIT_MODE, "退出 TTADK 编程模式"),
-        "/exit_ttadk": (IntentType.EXIT_MODE, "退出 TTADK 编程模式"),
         "/exit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/quit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/projects": (IntentType.LIST_PROJECTS, "查看项目列表"),
@@ -390,7 +384,6 @@ class IntentRecognizer:
     ENTER_CODEX_KEYWORDS = {"进入codex模式", "codex模式", "进入codex", "使用codex"}
     ENTER_GEMINI_KEYWORDS = {"进入gemini模式", "gemini模式", "进入gemini", "使用gemini"}
     ENTER_TRAEX_KEYWORDS = {"进入traex模式", "traex模式", "进入traex", "使用traex"}
-    ENTER_TTADK_KEYWORDS = {"进入ttadk模式", "ttadk模式", "进入ttadk", "使用ttadk", "多工具模式"}
     EXIT_MODE_KEYWORDS = {"退出模式", "退出编程模式"}
 
     DEEP_MODE_KEYWORDS = {"deep模式", "深度模式", "deep agent", "复杂任务", "大任务"}
@@ -438,7 +431,6 @@ class IntentRecognizer:
             ("enter_codex_keyword", IntentRecognizer._match_enter_codex_keyword),
             ("enter_gemini_keyword", IntentRecognizer._match_enter_gemini_keyword),
             ("enter_traex_keyword", IntentRecognizer._match_enter_traex_keyword),
-            ("enter_ttadk_keyword", IntentRecognizer._match_enter_ttadk_keyword),
             ("programming_exit_keyword", IntentRecognizer._match_programming_exit_keyword),
             ("project_list_keyword", IntentRecognizer._match_project_list_keyword),
             ("cd_command", IntentRecognizer._match_cd_command),
@@ -747,21 +739,9 @@ class IntentRecognizer:
             )
         return None
 
-    def _match_enter_ttadk_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
-        text_lower = self._lower(text)
-        if any(kw in text_lower for kw in self.ENTER_TTADK_KEYWORDS):
-            return IntentResult.single(
-                intent=IntentType.TTADK_MESSAGE,
-                confidence=0.95,
-                original_text=text,
-                reasoning="检测到 TTADK 模式关键词",
-                description="进入 TTADK 编程模式",
-            )
-        return None
-
     def _match_programming_exit_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
         text_lower = self._lower(text)
-        is_programming = current_mode in ("coco", "claude", "aiden", "codex", "gemini", "traex", "ttadk")
+        is_programming = current_mode in ("coco", "claude", "aiden", "codex", "gemini", "traex")
         if is_programming and len(text) < 20:
             if any(kw in text_lower for kw in self.EXIT_KEYWORDS):
                 return IntentResult.single(
@@ -913,8 +893,6 @@ class IntentRecognizer:
             return IntentType.GEMINI_MESSAGE
         elif current_mode == "traex":
             return IntentType.TRAEX_MESSAGE
-        elif current_mode == "ttadk":
-            return IntentType.TTADK_MESSAGE
         else:
             return IntentType.SHELL_COMMAND
 

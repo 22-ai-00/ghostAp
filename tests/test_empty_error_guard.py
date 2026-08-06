@@ -226,46 +226,6 @@ class TestSpecHandlerEmptyGuard:
         assert "超时" in result
 
 
-class TestSystemHandlerRefreshModelsIntegration:
-    """system.py: handle_refresh_ttadk_models reply_error must never
-    produce empty-tail message for bare TimeoutError or Exception."""
-
-    def _make_handler(self):
-        from src.feishu.handlers.system import SystemHandler
-
-        ctx = MagicMock()
-        ctx.settings = MagicMock()
-        ctx.settings.ref_note_enabled = False
-        handler = SystemHandler(ctx)
-        return handler
-
-    @pytest.mark.parametrize("exc,check_timeout,check_msg", [
-        pytest.param(TimeoutError(), True, None, id="bare_timeout"),
-        pytest.param(Exception(), False, None, id="bare_exception"),
-        pytest.param(TimeoutError("模型服务不可用"), False, "模型服务不可用", id="named_timeout"),
-    ])
-    def test_reply_error_nonempty(self, exc, check_timeout, check_msg):
-        handler = self._make_handler()
-        sent = []
-        handler.reply_error = lambda mid, content, **kw: sent.append(content)
-        handler._resolve_ttadk_cwd = lambda *a, **kw: "/tmp"
-        handler._maybe_log_ttadk_cwd = lambda **kw: None
-
-        mock_mgr = MagicMock()
-        mock_mgr.get_current_tool.return_value = "coco"
-        mock_mgr.refresh_models.side_effect = exc
-
-        with patch("src.feishu.handlers.ttadk_commands.get_ttadk_manager", return_value=mock_mgr):
-            handler.handle_refresh_ttadk_models("msg1", "chat1", "coco")
-
-        assert len(sent) == 1
-        msg = sent[0]
-        assert msg
-        assert not msg.endswith(": ")
-        if check_timeout:
-            assert "超时" in msg
-        if check_msg:
-            assert check_msg in msg
 
 
 _EXPECTED_METRICS_KEYS = {
@@ -466,7 +426,7 @@ class TestRunAsyncTimeoutWrapping:
 # ---------------------------------------------------------------------------
 # get_error_detail: always non-empty for all exception variants
 # (consolidates: TestGetErrorDetailNeverEmpty, TestSpecEngineInternalEmptyGuard,
-#  TestMainAppEmptyGuard, TestSystemHandlerTTADKRefreshEmptyGuard,
+#  TestMainAppEmptyGuard,
 #  TestBaseHandlerFallbackTimeoutContext,
 #  TestTimeoutErrorE2EDetail)
 # ---------------------------------------------------------------------------
