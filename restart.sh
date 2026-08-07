@@ -19,8 +19,6 @@ PROJECT_LAUNCHCTL_ID=$(printf '%s' "$PROJECT_DIR" | cksum | awk '{print $1}')
 LAUNCHCTL_LABEL="${GHOSTAP_LAUNCHCTL_LABEL:-com.ghostap.local.${PROJECT_LAUNCHCTL_ID}}"
 CODEX_ACP_NPM_PACKAGE="${GHOSTAP_CODEX_ACP_NPM_PACKAGE:-@agentclientprotocol/codex-acp@1.1.7}"
 PREPARE_CODEX_ACP="${GHOSTAP_PREPARE_CODEX_ACP:-1}"
-TUI2ACP_NPM_PACKAGE="${GHOSTAP_TUI2ACP_NPM_PACKAGE:-tui2acp}"
-PREPARE_TUI2ACP="${GHOSTAP_PREPARE_TUI2ACP:-1}"
 SYNC_PYTHON_DEPENDENCIES="${GHOSTAP_SYNC_PYTHON_DEPENDENCIES:-1}"
 PREPARE_EMPLOYEE_SANDBOX="${GHOSTAP_PREPARE_EMPLOYEE_SANDBOX:-1}"
 
@@ -355,31 +353,6 @@ prepare_codex_acp_dependency() {
     fi
 }
 
-prepare_tui2acp_dependency() {
-    if [ "$PREPARE_TUI2ACP" = "0" ]; then
-        log_restart "tui2acp preheat skipped"
-        return
-    fi
-    if command -v tui2acp >/dev/null 2>&1; then
-        log_restart "tui2acp already available"
-        return
-    fi
-    if ! command -v npm >/dev/null 2>&1; then
-        echo "⚠️  未找到 npm，tui2acp 无法自动安装"
-        log_restart "tui2acp missing npm"
-        return
-    fi
-
-    echo "准备 tui2acp 依赖..."
-    if npm install -g "$TUI2ACP_NPM_PACKAGE" >/dev/null 2>&1; then
-        log_restart "tui2acp installed package=$TUI2ACP_NPM_PACKAGE"
-        echo "✅ tui2acp 已安装"
-    else
-        echo "⚠️  tui2acp 安装失败，后续 /tui2acp 可能无法使用"
-        log_restart "tui2acp install failed package=$TUI2ACP_NPM_PACKAGE"
-    fi
-}
-
 wait_for_pid_exit() {
     local target_pid="$1"
     local timeout="$2"
@@ -481,7 +454,6 @@ start_service() {
     prepare_python_dependencies || return 1
     prepare_employee_sandbox_dependency
     prepare_codex_acp_dependency
-    prepare_tui2acp_dependency
     log_restart "start begin cmd=$(service_command_label)"
     previous_running_pids=$(get_running_pids)
     start_service_process "$start_log_mode"

@@ -19,6 +19,7 @@ from src.acp.models import (
     ACPGoalInfo,
     ACPImageInfo,
     ACPSessionInfo,
+    ToolCallInfo,
 )
 from src.acp.session import ACPSession
 
@@ -1392,3 +1393,191 @@ def test_prompt_does_not_repeat_image_already_emitted_by_tool_update(
     )
 
     assert images == [image_id]
+
+
+def test_prompt_collector_keeps_terminal_child_against_stale_same_call_update(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    completed = ToolCallInfo(
+        id="list-agents-1",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    stale = ToolCallInfo(
+        id="list-agents-1",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    class Connection:
+        async def prompt(self, **_kwargs):
+            session._dispatch_event(
+                ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_UPDATE,
+                    tool_call=completed,
+                )
+            )
+            session._dispatch_event(
+                ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_UPDATE,
+                    tool_call=stale,
+                )
+            )
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = Connection()
+    session._session_id = "session-collaboration-snapshot"
+
+    result = asyncio.run(session.prompt("reconcile agents"))
+
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].subagent_states == completed.subagent_states
+
+
+def test_prompt_collector_preserves_distinct_idless_tool_calls(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    active = ToolCallInfo(
+        id="",
+        title="first idless call",
+        kind="execute",
+        status="in_progress",
+    )
+    completed = ToolCallInfo(
+        id="",
+        title="unrelated idless call",
+        kind="read",
+        status="completed",
+    )
+
+    class Connection:
+        async def prompt(self, **_kwargs):
+            session._dispatch_event(
+                ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_UPDATE,
+                    tool_call=active,
+                )
+            )
+            session._dispatch_event(
+                ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_DONE,
+                    tool_call=completed,
+                )
+            )
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = Connection()
+    session._session_id = "session-idless-tools"
+
+    result = asyncio.run(session.prompt("collect idless tools"))
+
+    assert result.tool_calls == [active, completed]
+
+
+def test_prompt_collector_preserves_idless_terminal_before_named_followup(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    terminal = ToolCallInfo(
+        id="",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    followup = ToolCallInfo(
+        id="followup-1",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    class Connection:
+        async def prompt(self, **_kwargs):
+            session._dispatch_event(
+                ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_DONE,
+                    tool_call=terminal,
+                )
+            )
+            session._dispatch_event(
+                ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_DONE,
+                    tool_call=followup,
+                )
+            )
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = Connection()
+    session._session_id = "session-tool-order"
+
+    result = asyncio.run(session.prompt("reconcile agents"))
+
+    assert [tool.title for tool in result.tool_calls] == [
+        "list_agents",
+        "followup_task",
+    ]
+
+
+def test_prompt_collector_keeps_malformed_receiver_evidence_across_updates(
+    tmp_path: Path,
+) -> None:
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    malformed = ToolCallInfo(
+        id="list-agents-1",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        collaboration_receivers="child-a",  # type: ignore[arg-type]
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+    terminal = ToolCallInfo(
+        id="list-agents-1",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+
+    class Connection:
+        async def prompt(self, **_kwargs):
+            for tool_call in (malformed, terminal):
+                session._dispatch_event(
+                    ACPEvent(
+                        event_type=ACPEventType.TOOL_CALL_UPDATE,
+                        tool_call=tool_call,
+                    )
+                )
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = Connection()
+    session._session_id = "session-malformed-receiver"
+
+    result = asyncio.run(session.prompt("reconcile agents"))
+
+    assert result.tool_calls
+    assert result.tool_calls[0].child_metadata_malformed is True

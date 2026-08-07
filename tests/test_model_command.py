@@ -124,6 +124,20 @@ class TestResolveCurrentAcpTool(unittest.TestCase):
         tool = self.handler._resolve_current_acp_tool("chat1", project=project)
         self.assertEqual(tool, "codex")
 
+    def test_unknown_project_tool_is_cleared_before_mode_fallback(self):
+        self.handler.mode_manager.is_aiden_mode.return_value = True
+        project = SimpleNamespace(
+            project_id="project-1",
+            acp_tool_name="unknown-provider",
+            acp_model_name="stale-model",
+        )
+
+        tool = self.handler._resolve_current_acp_tool("chat1", project=project)
+
+        self.assertEqual(tool, "aiden")
+        self.assertIsNone(project.acp_tool_name)
+        self.assertIsNone(project.acp_model_name)
+
 
 # ---------------------------------------------------------------------------
 # handle_model_command — list / show card

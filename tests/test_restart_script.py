@@ -430,7 +430,6 @@ source "$1"
 prepare_python_dependencies() { printf '%s\n' dependencies >> "$CAPTURE"; }
 prepare_employee_sandbox_dependency() { :; }
 prepare_codex_acp_dependency() { :; }
-prepare_tui2acp_dependency() { :; }
 log_restart() { :; }
 start_service_process() {
     STARTED_PID=4242
@@ -479,7 +478,6 @@ source "$1"
 prepare_python_dependencies() { :; }
 prepare_employee_sandbox_dependency() { :; }
 prepare_codex_acp_dependency() { :; }
-prepare_tui2acp_dependency() { :; }
 log_restart() { :; }
 start_service_process() {
     STARTED_PID=4242
@@ -527,7 +525,6 @@ source "$1"
 prepare_python_dependencies() { :; }
 prepare_employee_sandbox_dependency() { :; }
 prepare_codex_acp_dependency() { :; }
-prepare_tui2acp_dependency() { :; }
 log_restart() { :; }
 start_service_process() { STARTED_PID=4242; }
 wait_for_service_readiness() { RUNNING_PIDS=4242; }

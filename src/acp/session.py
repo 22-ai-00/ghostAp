@@ -27,6 +27,7 @@ from .client import (
     LocalImageEmissionBudget,
     emit_referenced_changed_local_image_events,
 )
+from .collaboration import merge_tool_call_sequence
 from .models import (
     ACPEvent,
     ACPEventType,
@@ -709,7 +710,7 @@ class ACPSession:
         start_ts = time.time()
 
         # Collector aggregates text/tool calls/plan/modified_files.
-        collected_tool_calls: dict[str, Any] = {}
+        collected_tool_call_snapshots: list[Any] = []
         emitted_image_ids: set[str] = set()
         image_budget = LocalImageEmissionBudget()
         result = PromptResult(stop_reason="")
@@ -717,8 +718,8 @@ class ACPSession:
         image_snapshot: object = {}
 
         async def _drain_prompt_tail() -> None:
-            quiet_s = 0.2 if "tui2acp" in self._agent_cmd else 0.05
-            max_drain_s = 0.6 if "tui2acp" in self._agent_cmd else 0.15
+            quiet_s = 0.05
+            max_drain_s = 0.15
             drain_started = time.monotonic()
             while time.monotonic() - drain_started < max_drain_s:
                 quiet_for = time.monotonic() - max(
@@ -748,8 +749,9 @@ class ACPSession:
                             ACPEventType.TOOL_CALL_DONE,
                         ):
                             if ev.tool_call:
-                                # Keep the latest state per tool_call_id
-                                collected_tool_calls[ev.tool_call.id] = ev.tool_call
+                                collected_tool_call_snapshots.append(
+                                    ev.tool_call
+                                )
                                 for p in ev.tool_call.locations or []:
                                     if p:
                                         result.add_modified_file(p)
@@ -858,11 +860,17 @@ class ACPSession:
                         self._event_handler = None
                         self._event_generation += 1
 
-        # Finalize aggregated tool call list (preserve insertion order by first-seen)
+        # Finalize named snapshots at their latest observation position while
+        # preserving every anonymous call as an independent event.
         try:
-            # If we have a dict keyed by id, the values are the latest states.
-            result.tool_calls = list(collected_tool_calls.values())
+            result.tool_calls = merge_tool_call_sequence(
+                collected_tool_call_snapshots
+            )
         except Exception:
+            # Never turn malformed provider evidence into an empty successful
+            # result.  The outcome reducer will classify raw unknown objects or
+            # non-terminal snapshots fail-closed.
+            result.tool_calls = list(collected_tool_call_snapshots)
             logger.debug("[ACP:%s] tool_calls finalization failed", self._agent_cmd, exc_info=True)
 
         result.stop_reason = str(getattr(response, "stop_reason", "") or "")

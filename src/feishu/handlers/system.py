@@ -192,11 +192,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/project": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/switch": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/new-chat": lambda m, c, t, p: self._handle_new_chat_project_args(m, c, ""),
-            "/tui2acp": lambda m, c, t, p: self.handle_tui2acp_command(m, c, p),
-            "/enter_tui2acp": lambda m, c, t, p: self.handle_tui2acp_command(m, c, p),
-            "/exit_tui2acp": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_tui2acp": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/tui2acp_info": lambda m, c, t, p: self.get_handler("tui2acp").show_info(m, c, p),
             "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, p),
             "/menu": lambda m, c, t, p: self.handle_menu_command(m, c, p),
             "/tools": lambda m, c, t, p: self.show_tools_list(m, c, p),
@@ -404,11 +399,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_gemini",
             "/end_traex",
             "/exit_traex",
-            "/tui2acp",
-            "/enter_tui2acp",
-            "/exit_tui2acp",
-            "/end_tui2acp",
-            "/tui2acp_info",
             "/coco_status",
             "/coco_info",
             "/claude_info",
@@ -839,7 +829,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             InteractionMode.AIDEN,
             InteractionMode.CODEX,
             InteractionMode.GEMINI,
-            InteractionMode.TUI2ACP,
         }
         thread_id = get_current_thread_id()
         if thread_id:
@@ -1460,7 +1449,16 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         3. Default: "coco"
         """
         if project and getattr(project, "acp_tool_name", ""):
-            return str(project.acp_tool_name).lower()
+            from ...project.context import ProjectContext
+
+            tool_name = ProjectContext.normalize_acp_tool_name(
+                project.acp_tool_name
+            )
+            if tool_name:
+                project.acp_tool_name = tool_name
+                return tool_name
+            project.acp_tool_name = None
+            project.acp_model_name = None
 
         mode_to_tool = {
             "coco": "coco",
@@ -1592,134 +1590,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             self.get_handler("codex").exit_mode(message_id, chat_id, project)
         elif current_mode == InteractionMode.GEMINI:
             self.get_handler("gemini").exit_mode(message_id, chat_id, project)
-        elif current_mode == InteractionMode.TUI2ACP:
-            self.get_handler("tui2acp").exit_mode(message_id, chat_id, project)
         else:
             self.reply_text(message_id, UI_TEXT["system_already_in_mode"])
-
-    # ------------------------------------------------------------------
-    # Tui2ACP adapter selection
-    # ------------------------------------------------------------------
-
-    _TUI2ACP_ADAPTERS = [
-        {"name": "coco", "emoji": "🤖", "description": "Coco (TraeCLI)"},
-        {"name": "claude", "emoji": "🔮", "description": "Claude Code"},
-        {"name": "codex", "emoji": "⚡", "description": "OpenAI Codex CLI"},
-    ]
-
-    def handle_tui2acp_command(
-        self,
-        message_id: str,
-        chat_id: str,
-        project: Optional["ProjectContext"] = None,
-        from_card: bool = False,
-    ):
-        """Show tui2acp adapter selection card. Auto-installs if missing."""
-        import shutil
-        import subprocess
-
-        def _find_tui2acp() -> str | None:
-            """Find tui2acp in PATH + common npm-global locations."""
-            found = shutil.which("tui2acp")
-            if found:
-                return found
-            import os
-            home = os.path.expanduser("~")
-            extra_dirs = [
-                os.path.join(home, ".npm-global", "bin"),
-                os.path.join(home, ".local", "bin"),
-                "/opt/homebrew/bin",
-                "/usr/local/bin",
-            ]
-            for d in extra_dirs:
-                candidate = os.path.join(d, "tui2acp")
-                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                    return candidate
-            return None
-
-        if not _find_tui2acp():
-            if not shutil.which("npm"):
-                self.reply_text(
-                    message_id,
-                    "❌ tui2acp 未安装且未找到 npm，无法自动安装。请手动安装 Node.js 和 npm 后重试。",
-                )
-                return
-            self.reply_text(message_id, "⏳ tui2acp 未安装，正在自动安装...")
-            try:
-                subprocess.run(
-                    ["npm", "install", "-g", "tui2acp"],
-                    capture_output=True, text=True, timeout=120,
-                )
-            except Exception:
-                pass
-            if not _find_tui2acp():
-                self.reply_text(
-                    message_id,
-                    "❌ tui2acp 自动安装失败。请手动运行 `npm install -g tui2acp`。",
-                )
-                return
-
-        current_adapter = None
-        if project:
-            current_adapter = getattr(project, "tui2acp_adapter_name", None)
-
-        _, card_content = CardBuilder.build_tui2acp_adapter_select_card(
-            self._TUI2ACP_ADAPTERS,
-            project_id=project.project_id if project else None,
-            current_adapter=current_adapter,
-        )
-        if from_card:
-            self.update_card(message_id, card_content)
-        else:
-            self.reply_card(message_id, card_content)
-
-    def handle_select_tui2acp_adapter(
-        self,
-        message_id: str,
-        chat_id: str,
-        adapter_name: str,
-        project_id: Optional[str] = None,
-    ):
-        """Handle card callback when user picks a tui2acp adapter."""
-        adapter = (adapter_name or "").strip().lower()
-        if not adapter:
-            self.reply_text(message_id, "❌ 请选择一个 adapter")
-            return
-
-        project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
-
-        if project:
-            project.tui2acp_adapter_name = adapter
-            project.acp_tool_name = "tui2acp"
-
-        handler = self.get_handler("tui2acp")
-        if handler:
-            handler.current_adapter = adapter
-            handler.enter_mode(message_id, chat_id, project=project)
-
-    def handle_select_tui2acp_custom_command(
-        self,
-        message_id: str,
-        chat_id: str,
-        custom_command: str,
-        project_id: Optional[str] = None,
-    ):
-        """Handle form submission when user enters a custom tui2acp command."""
-        command = (custom_command or "").strip()
-        if not command:
-            self.reply_text(message_id, "❌ 请输入工具启动命令")
-            return
-
-        project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
-
-        if project:
-            project.tui2acp_adapter_name = f"custom:{command}"
-            project.acp_tool_name = "tui2acp"
-
-        handler = self.get_handler("tui2acp")
-        if handler:
-            handler.current_adapter = f"custom:{command}"
-            handler.enter_mode(message_id, chat_id, project=project)
 
     # ------------------------------------------------------------------
     # Shell command submission

@@ -172,7 +172,7 @@ def init_action_registry(client: 'FeishuWSClient') -> None:
 
 def register_programming_mode_actions(client: 'FeishuWSClient') -> None:
     """Register enter/exit/resume/new actions for all programming modes."""
-    mode_names = ("coco", "claude", "aiden", "codex", "gemini", "traex", "tui2acp")
+    mode_names = ("coco", "claude", "aiden", "codex", "gemini", "traex")
     for mode in mode_names:
         enter = getattr(client, f"_handle_card_enter_{mode}")
         exit_ = getattr(client, f"_handle_card_exit_{mode}")
@@ -186,26 +186,6 @@ def register_programming_mode_actions(client: 'FeishuWSClient') -> None:
             exact=f"resume_{mode}",
         )
         client._register_action(new, exact=f"new_{mode}")
-    # Tui2ACP
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_select_tui2acp_adapter(
-            mid, cid, val.get("adapter_name", ""), pid
-        ),
-        exact=action_ids.SELECT_TUI2ACP_ADAPTER,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_select_tui2acp_custom_command(
-            mid, cid, val.get("_form_value", {}).get("custom_command", ""), pid
-        ),
-        exact=action_ids.SELECT_TUI2ACP_CUSTOM_COMMAND,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._handle_tui2acp_command(
-            mid, cid, _resolve_project(client, pid, cid), True
-        ),
-        exact=action_ids.SHOW_TUI2ACP_MENU,
-    )
-
     client._register_action(
         lambda mid, cid, pid, val: client._handle_spec_review_use_auto(mid, cid, pid, val),
         exact=action_ids.SPEC_REVIEW_USE_AUTO,

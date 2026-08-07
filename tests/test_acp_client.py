@@ -25,7 +25,8 @@ from acp.schema import (
 
 import src.acp.client as acp_client
 from src.acp.client import ACPHistoryStore, GhostAPClient, _parse_plan, _parse_tool_call
-from src.acp.models import ACPEvent, ACPGoalInfo, ACPSessionInfo
+from src.acp.models import ACPEvent, ACPGoalInfo, ACPSessionInfo, PromptResult
+from src.acp.outcome import PromptOutcome, classify_prompt_result
 from src.acp.sync_adapter import resolve_agent_spec
 from src.sandbox.executor import SandboxExecutor
 
@@ -1418,6 +1419,84 @@ class TestParseToolCall:
         assert tc.subagent_path == "/root/card-audit"
         assert tc.subagent_activity == "started"
 
+    @pytest.mark.parametrize(
+        ("container_name", "container"),
+        [
+            ("subagent", "malformed-container"),
+            ("collaboration", "malformed-container"),
+            ("subagent", {}),
+            ("collaboration", {}),
+        ],
+    )
+    def test_codex_malformed_child_metadata_container_fails_closed(
+        self,
+        container_name: str,
+        container: object,
+    ):
+        update = MockToolCallStart(
+            tool_call_id="malformed-child-container",
+            title="child metadata",
+            kind="other",
+            status="completed",
+            field_meta={
+                "codex": {container_name: container},
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.child_metadata_malformed is True
+        assessment = classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        )
+        assert assessment.outcome is PromptOutcome.INCOMPLETE
+        assert "malformed" in assessment.incomplete_tool_diagnostics[0]
+
+    def test_codex_non_string_collaboration_tool_fails_closed(self):
+        update = MockToolCallStart(
+            tool_call_id="malformed-collaboration-tool",
+            title="child metadata",
+            kind="other",
+            status="completed",
+            field_meta={
+                "codex": {"collaboration": {"tool": 123}},
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.child_metadata_malformed is True
+        assert classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        ).outcome is PromptOutcome.INCOMPLETE
+
+    @pytest.mark.parametrize(
+        "collaboration",
+        [
+            {"senderThreadId": "thread-parent"},
+            {"receiverThreadIds": []},
+            {"model": "gpt-test"},
+        ],
+    )
+    def test_codex_collaboration_without_tool_fails_closed(
+        self,
+        collaboration: dict[str, object],
+    ):
+        update = MockToolCallStart(
+            tool_call_id="missing-collaboration-tool",
+            title="child metadata",
+            kind="other",
+            status="completed",
+            field_meta={"codex": {"collaboration": collaboration}},
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.child_metadata_malformed is True
+        assert classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        ).outcome is PromptOutcome.INCOMPLETE
+
     def test_codex_collaboration_states_are_normalized_by_thread(self):
         update = MockToolCallStart(
             tool_call_id="collaboration-call-private",
@@ -1462,11 +1541,11 @@ class TestParseToolCall:
             tool_call_id="collaboration-call-private",
             title="wait_agent",
             kind="other",
-            status="in_progress",
+            status="completed",
             raw_input={
                 "receiverThreadIds": "thread-a",
                 "agentsStates": {
-                    "thread-a": {"status": "running", "message": "正在核查"},
+                    "thread-a": {"status": "completed", "message": "已核查"},
                 },
             },
             field_meta={
@@ -1483,7 +1562,115 @@ class TestParseToolCall:
 
         assert tc.collaboration_receivers == ()
         assert tc.subagent_states == (
-            {"source_id": "thread-a", "status": "running", "message": "正在核查"},
+            {"source_id": "thread-a", "status": "completed", "message": "已核查"},
+            {"source_id": "", "status": "malformed", "message": ""},
+        )
+        assert classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        ).outcome is PromptOutcome.INCOMPLETE
+
+    def test_codex_collaboration_marks_mixed_receiver_ids_malformed(self):
+        update = MockToolCallStart(
+            tool_call_id="collaboration-call-private",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            raw_input={
+                "agentsStates": {
+                    "thread-a": {"status": "completed", "message": "done"},
+                },
+            },
+            field_meta={
+                "codex": {
+                    "collaboration": {
+                        "tool": "list_agents",
+                        "receiverThreadIds": ["thread-a", 123],
+                    }
+                }
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.collaboration_receivers == ("thread-a",)
+        assert tc.subagent_states[-1] == {
+            "source_id": "",
+            "status": "malformed",
+            "message": "",
+        }
+
+    def test_codex_numeric_subagent_identity_is_not_string_coerced(self):
+        update = MockToolCallStart(
+            tool_call_id="activity-call-private",
+            title="Interrupt subagent",
+            kind="other",
+            status="completed",
+            field_meta={
+                "codex": {
+                    "subagent": {
+                        "threadId": 123,
+                        "path": "/root/reviewer",
+                        "activity": "interrupted",
+                    }
+                }
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.subagent_source_id is None
+        assert tc.subagent_activity == "interrupted"
+        assert classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        ).outcome is PromptOutcome.INCOMPLETE
+
+    def test_codex_collaboration_receiver_without_state_is_pending(self):
+        update = MockToolCallStart(
+            tool_call_id="spawn-call-private",
+            title="spawn_agent",
+            kind="other",
+            status="completed",
+            raw_input={"receiverThreadIds": ["thread-a"]},
+            field_meta={
+                "codex": {
+                    "collaboration": {
+                        "tool": "spawn_agent",
+                        "receiverThreadIds": ["thread-a"],
+                    }
+                }
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.subagent_states == (
+            {"source_id": "thread-a", "status": "pending", "message": ""},
+        )
+
+    def test_codex_collaboration_preserves_malformed_state_evidence(self):
+        update = MockToolCallStart(
+            tool_call_id="wait-call-private",
+            title="wait_agent",
+            kind="other",
+            status="completed",
+            raw_input={
+                "receiverThreadIds": ["thread-a"],
+                "agentsStates": "provider-malformed-secret",
+            },
+            field_meta={
+                "codex": {
+                    "collaboration": {
+                        "tool": "wait_agent",
+                        "receiverThreadIds": ["thread-a"],
+                    }
+                }
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.subagent_states == (
+            {"source_id": "thread-a", "status": "malformed", "message": ""},
         )
 
 

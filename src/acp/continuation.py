@@ -1,14 +1,18 @@
-"""Bounded same-session continuation for ordinary ACP pending plans."""
+"""Bounded same-session continuation for incomplete ACP prompt state."""
 
 from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol, TypeVar
 
-from .finalization import run_prompt_with_finalization
+from .collaboration import merge_tool_call_sequence
+from .finalization import (
+    _primary_timeout_with_cleanup_reserve,
+    run_prompt_with_finalization,
+)
 from .models import ACPEvent, PromptResult, ToolCallInfo
 from .outcome import (
     PromptAssessment,
@@ -20,6 +24,8 @@ logger = logging.getLogger(__name__)
 
 MAX_ORDINARY_CONTINUATIONS = 1
 _monotonic = time.monotonic
+_PLAN_CONTINUATION = "plan"
+_CHILD_RECONCILIATION = "child_reconciliation"
 
 
 class _PromptSession(Protocol):
@@ -65,6 +71,23 @@ def _build_continuation_prompt(pending_plan_entries: int) -> str:
     )
 
 
+def _build_child_reconciliation_prompt(
+    unresolved_child_tool_calls: int,
+) -> str:
+    return (
+        "[GhostAP 子代理状态对账指令]\n"
+        "上一轮自然结束，但结构化结果中仍有 "
+        f"{unresolved_child_tool_calls} 个协作工具携带未终态子代理状态。"
+        "这可能是异步 FINAL_ANSWER 已到达、而协作快照尚未刷新的竞态。\n"
+        "请先调用 list_agents 获取权威最新状态；对仍为 running/pending "
+        "的子代理，使用 wait_agent 等待并接收其最终结果。不要仅凭已收到文本"
+        "或 end_turn 推断子代理完成，也不要重复已经完成的实现。\n"
+        "本指令不新增任何权限，不得扩大原任务范围，也不得中止或取消子代理。"
+        "所有子代理进入 completed/failed/cancelled 终态后，整合现有结果并"
+        "如实给出最终答复。"
+    )
+
+
 def _notify_continuation_start(callback: Callable[[], None] | None) -> None:
     """Close the current stream turn without claiming another send occurred."""
     if callback is None:
@@ -75,66 +98,35 @@ def _notify_continuation_start(callback: Callable[[], None] | None) -> None:
         logger.warning("prompt continuation callback failed", exc_info=True)
 
 
+def _retire_reconciliation_timeout(
+    session: SessionT,
+    callback: Callable[[SessionT, float], None] | None,
+    *,
+    deadline: float,
+    error: BaseException | None,
+) -> None:
+    """Poison and retire a timed-out reconciliation without another turn."""
+    try:
+        setattr(session, "_force_dead", True)
+        if callback is not None:
+            callback(session, max(0.0, deadline - _monotonic()))
+    except Exception as retirement_error:
+        if error is not None:
+            raise ExceptionGroup(
+                "ACP child reconciliation timeout and retirement both failed",
+                [error, retirement_error],
+            ) from None
+        raise
+
+
 def _merge_tool_calls(
     previous: list[ToolCallInfo],
     current: list[ToolCallInfo],
 ) -> list[ToolCallInfo]:
-    merged: dict[str, ToolCallInfo] = {}
-    anonymous: list[ToolCallInfo] = []
-    for tool_call in [*previous, *current]:
-        if tool_call.id:
-            prior = merged.get(tool_call.id)
-            if prior is None or not prior.subagent_states:
-                merged[tool_call.id] = tool_call
-                continue
-            if not tool_call.subagent_states:
-                merged[tool_call.id] = replace(
-                    tool_call,
-                    subagent_states=prior.subagent_states,
-                )
-                continue
-            children: dict[str, dict] = {}
-            anonymous_children: list[dict] = []
-            for child in prior.subagent_states:
-                if not isinstance(child, Mapping):
-                    anonymous_children.append(child)
-                    continue
-                source_id = str(child.get("source_id") or "").strip()
-                if source_id:
-                    children[source_id] = child
-                else:
-                    anonymous_children.append(child)
-            for child in tool_call.subagent_states:
-                if not isinstance(child, Mapping):
-                    anonymous_children.append(child)
-                    continue
-                source_id = str(child.get("source_id") or "").strip()
-                if not source_id:
-                    anonymous_children.append(child)
-                    continue
-                prior_child = children.get(source_id)
-                prior_status = str(
-                    (prior_child or {}).get("status") or ""
-                ).strip().casefold()
-                current_status = str(
-                    child.get("status") or ""
-                ).strip().casefold()
-                if (
-                    prior_status in {"running", "pending"}
-                    and current_status
-                    not in {"completed", "failed", "cancelled"}
-                ):
-                    continue
-                children[source_id] = child
-            merged[tool_call.id] = replace(
-                tool_call,
-                subagent_states=tuple(
-                    [*children.values(), *anonymous_children]
-                ),
-            )
-        else:
-            anonymous.append(tool_call)
-    return [*merged.values(), *anonymous]
+    return merge_tool_call_sequence(
+        [*previous, *current],
+        generation_boundary_index=len(previous),
+    )
 
 
 def _merge_prompt_results(
@@ -163,20 +155,33 @@ def _merge_prompt_results(
     )
 
 
-def _eligible_for_ordinary_continuation(
+def _continuation_kind(
     result: PromptResult,
     assessment: PromptAssessment,
     *,
     entered_finalization: bool,
-) -> bool:
-    return (
-        not entered_finalization
-        and result.goal is None
-        and assessment.outcome is PromptOutcome.INCOMPLETE
-        and assessment.stop_reason == "end_turn"
-        and assessment.pending_plan_entries > 0
+) -> str | None:
+    if (
+        entered_finalization
+        or result.goal is not None
+        or assessment.outcome is not PromptOutcome.INCOMPLETE
+        or assessment.stop_reason != "end_turn"
+    ):
+        return None
+    if (
+        assessment.pending_plan_entries > 0
         and assessment.incomplete_tool_calls == 0
-    )
+    ):
+        return _PLAN_CONTINUATION
+    if (
+        assessment.pending_plan_entries == 0
+        and assessment.incomplete_tool_calls > 0
+        and assessment.incomplete_outer_tool_calls == 0
+        and assessment.incomplete_tool_calls
+        == assessment.unresolved_child_tool_calls
+    ):
+        return _CHILD_RECONCILIATION
+    return None
 
 
 def run_prompt_with_continuation(
@@ -192,13 +197,14 @@ def run_prompt_with_continuation(
     replace_dead_session: Callable[[float], SessionT] | None = None,
     retire_finalization_session: Callable[[SessionT, float], None] | None = None,
 ) -> PromptContinuationResult:
-    """Run one prompt and at most one safe same-session continuation.
+    """Run a prompt with one bounded plan turn and one child reconciliation.
 
     ``on_continuation_start`` is a best-effort structural boundary hook for
-    closing streamed blocks. Its invocation does not mean the continuation was
-    sent. If the hook consumes the remaining deadline, the first incomplete
-    result is returned with zero automatic continuations so the caller can use
-    its ordinary incomplete/timeout handling.
+    closing streamed blocks for either plan continuation or child-state
+    reconciliation. Its invocation does not mean the follow-up was sent. If the
+    hook consumes the remaining deadline, the first incomplete result is returned
+    with zero automatic continuations so the caller can use its ordinary
+    incomplete/timeout handling.
     """
     deadline = _monotonic() + float(timeout_s)
     finalization_scope = (
@@ -235,35 +241,87 @@ def run_prompt_with_continuation(
     ever_entered_finalization = entered_finalization
     assessment = classify_prompt_result(result)
     automatic_continuations = 0
+    plan_continuations = 0
+    child_reconciliations = 0
+    continuation_kind = _continuation_kind(
+        result,
+        assessment,
+        entered_finalization=entered_finalization,
+    )
 
-    while (
-        automatic_continuations < MAX_ORDINARY_CONTINUATIONS
-        and _eligible_for_ordinary_continuation(
-            result,
-            assessment,
-            entered_finalization=entered_finalization,
-        )
-    ):
+    while continuation_kind is not None:
+        if (
+            continuation_kind == _PLAN_CONTINUATION
+            and plan_continuations >= MAX_ORDINARY_CONTINUATIONS
+        ) or (
+            continuation_kind == _CHILD_RECONCILIATION
+            and child_reconciliations >= MAX_ORDINARY_CONTINUATIONS
+        ):
+            break
         remaining_budget = deadline - _monotonic()
         if remaining_budget <= 0:
             break
-        continuation_prompt = _build_continuation_prompt(
-            assessment.pending_plan_entries
+        continuation_prompt = (
+            _build_continuation_prompt(assessment.pending_plan_entries)
+            if continuation_kind == _PLAN_CONTINUATION
+            else _build_child_reconciliation_prompt(
+                assessment.unresolved_child_tool_calls
+            )
         )
         _notify_continuation_start(on_continuation_start)
         remaining_budget = deadline - _monotonic()
         if remaining_budget <= 0:
             break
-        next_result, entered_finalization = run_turn(
-            continuation_prompt,
-            remaining_budget,
-        )
+        if continuation_kind == _PLAN_CONTINUATION:
+            next_result, entered_finalization = run_turn(
+                continuation_prompt,
+                remaining_budget,
+            )
+            plan_continuations += 1
+        else:
+            # Reconciliation is itself the single safe cleanup turn. Running it
+            # through the ordinary timeout-finalization wrapper could send a
+            # third prompt or replace the session, defeating that bound.
+            reconciliation_timeout = _primary_timeout_with_cleanup_reserve(
+                remaining_budget
+            )
+            try:
+                next_result = session.send_prompt(
+                    continuation_prompt,
+                    on_event=on_event,
+                    timeout=reconciliation_timeout,
+                )
+            except TimeoutError as timeout_error:
+                _retire_reconciliation_timeout(
+                    session,
+                    retire_finalization_session,
+                    deadline=deadline,
+                    error=timeout_error,
+                )
+                raise
+            if (
+                str(next_result.stop_reason or "").strip().casefold()
+                == "timeout"
+            ):
+                _retire_reconciliation_timeout(
+                    session,
+                    retire_finalization_session,
+                    deadline=deadline,
+                    error=None,
+                )
+            entered_finalization = False
+            child_reconciliations += 1
         ever_entered_finalization = (
             ever_entered_finalization or entered_finalization
         )
         automatic_continuations += 1
         result = _merge_prompt_results(result, next_result)
         assessment = classify_prompt_result(result)
+        continuation_kind = _continuation_kind(
+            result,
+            assessment,
+            entered_finalization=ever_entered_finalization,
+        )
 
     goal = result.goal
     goal_status = (
@@ -272,16 +330,21 @@ def run_prompt_with_continuation(
         else ""
     )
     awaiting_user_input = (
-        goal is not None
-        and not ever_entered_finalization
-        and goal_status in {"paused", "blocked"}
-    ) or (
-        goal is None
-        and automatic_continuations == MAX_ORDINARY_CONTINUATIONS
-        and _eligible_for_ordinary_continuation(
-            result,
-            assessment,
-            entered_finalization=ever_entered_finalization,
+        assessment.outcome is PromptOutcome.INCOMPLETE
+        and assessment.stop_reason == "end_turn"
+        and (
+            (
+                goal is not None
+                and not ever_entered_finalization
+                and assessment.incomplete_tool_calls == 0
+                and goal_status in {"paused", "blocked"}
+            )
+            or (
+                goal is None
+                and assessment.incomplete_tool_calls == 0
+                and plan_continuations == MAX_ORDINARY_CONTINUATIONS
+                and continuation_kind == _PLAN_CONTINUATION
+            )
         )
     )
     return PromptContinuationResult(

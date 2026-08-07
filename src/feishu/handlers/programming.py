@@ -84,16 +84,28 @@ def _incomplete_notice(execution: object) -> str:
 def _log_prompt_execution(mode_name: str, execution: object) -> None:
     assessment = execution.assessment
     goal = getattr(execution.result, "goal", None)
+    raw_goal_status = getattr(goal, "status", None)
+    goal_status = (
+        raw_goal_status.strip().casefold()
+        if isinstance(raw_goal_status, str)
+        and raw_goal_status.strip().casefold()
+        in {"active", "paused", "blocked", "completed"}
+        else "unknown"
+    )
     logger.info(
         "%s ACP执行判定: entered_finalization=%s goal_status=%s "
         "automatic_continuations=%s pending_plan_entries=%s "
-        "incomplete_tool_calls=%s",
+        "incomplete_tool_calls=%s incomplete_outer_tool_calls=%s "
+        "unresolved_child_tool_calls=%s unresolved_tools=%s",
         mode_name,
         execution.entered_finalization,
-        getattr(goal, "status", None),
+        goal_status,
         execution.automatic_continuations,
         assessment.pending_plan_entries,
         assessment.incomplete_tool_calls,
+        assessment.incomplete_outer_tool_calls,
+        assessment.unresolved_child_tool_calls,
+        ";".join(assessment.incomplete_tool_diagnostics) or "none",
     )
 
 
@@ -138,7 +150,6 @@ class ProgrammingModeHandler(BaseHandler):
         (InteractionMode.CODEX, "is_codex_mode", "codex"),
         (InteractionMode.GEMINI, "is_gemini_mode", "gemini"),
         (InteractionMode.TRAEX, "is_traex_mode", "traex"),
-        (InteractionMode.TUI2ACP, "is_tui2acp_mode", "tui2acp"),
     )
 
     def __init__(self, ctx):
@@ -395,8 +406,6 @@ class ProgrammingModeHandler(BaseHandler):
             project.set_gemini_mode(False)
         if current != InteractionMode.TRAEX:
             project.set_traex_mode(False)
-        if current != InteractionMode.TUI2ACP:
-            project.set_tui2acp_mode(False)
 
     def _iter_other_programming_mode_entries(self):
         current = self._get_interaction_mode()
@@ -1293,7 +1302,10 @@ class ProgrammingModeHandler(BaseHandler):
                 unfinished_subagent_status="cancelled",
             )
         except Exception as e:
-            if entered_finalization[0] and not retirement_completed[0]:
+            if (
+                entered_finalization[0]
+                or getattr(active_session[0], "_force_dead", False) is True
+            ) and not retirement_completed[0]:
                 try:
                     _retire_session(active_session[0])
                 except Exception:
@@ -1317,23 +1329,6 @@ class ProgrammingModeHandler(BaseHandler):
                     "cancelled" if entered_finalization[0] else "failed"
                 ),
             )
-            if self.interaction_mode == InteractionMode.TUI2ACP and self._is_terminal_state_error(e):
-                try:
-                    self._get_session_manager().end_session(
-                        chat_id,
-                        project_id=project_id,
-                        thread_id=_thread_id,
-                    )
-                    logger.info(
-                        "[%s] ended terminal ACP session after prompt rejection: chat=%s project=%s thread=%s session=%s",
-                        self.mode_name,
-                        chat_id[:12] if chat_id else "?",
-                        project_id or "-",
-                        (_thread_id or "-")[:12],
-                        (getattr(session, "session_id", "") or "none")[:8],
-                    )
-                except Exception:
-                    logger.debug("[%s] terminal session cleanup failed", self.mode_name, exc_info=True)
             from ...utils.errors import GhostAPError
             if isinstance(e, GhostAPError) and e.quick_actions:
                 self.send_error_card(chat_id, e, title=UI_TEXT["mode_exec_exception_title"], origin_message_id=message_id)
@@ -1364,7 +1359,11 @@ class ProgrammingModeHandler(BaseHandler):
         try:
             if project:
                 final_session = active_session[0]
-                if entered_finalization[0]:
+                if (
+                    entered_finalization[0]
+                    or retirement_completed[0]
+                    or getattr(final_session, "_force_dead", False) is True
+                ):
                     self._clear_snapshot_for_session(project, session)
                     self._clear_snapshot_for_session(project, final_session)
                 else:
@@ -1392,11 +1391,6 @@ class ProgrammingModeHandler(BaseHandler):
 
         if card_message_id and project:
             self.register_message_project(card_message_id, project)
-
-    @staticmethod
-    def _is_terminal_state_error(exc: Exception) -> bool:
-        detail = get_error_detail(exc)
-        return "terminal state" in detail.lower() and "session" in detail.lower()
 
     def _handle_response_non_streaming(
         self, message_id: str, chat_id: str, text: str, session: SyncSession, project, global_working_dir: str,
@@ -1578,6 +1572,18 @@ class ProgrammingModeHandler(BaseHandler):
             msg_type, content = CardBuilder.build_error_card(e, title=UI_TEXT["mode_exec_timeout_title"], project=project)
             self.reply_card(message_id, content)
         except Exception as e:
+            if (
+                getattr(active_session[0], "_force_dead", False) is True
+                and not retirement_completed[0]
+            ):
+                try:
+                    _retire_session(active_session[0])
+                except Exception:
+                    logger.error(
+                        "%s ACP安全收尾会话退休失败",
+                        self.mode_name,
+                        exc_info=True,
+                    )
             msg_type, content = CardBuilder.build_error_card(e, title=UI_TEXT["mode_exec_exception_title"], project=project)
             self.reply_card(message_id, content)
         finally:
@@ -1808,28 +1814,3 @@ class TraexModeHandler(ProgrammingModeHandler):
     mode_key = "traex"
     context_source = ContextSourceMode.TRAEX
     thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🚀", name="Traex")
-
-
-class Tui2acpModeHandler(ProgrammingModeHandler):
-    mode_name = "Tui2ACP"
-    mode_emoji = "🌉"
-    interaction_mode = InteractionMode.TUI2ACP
-    mode_key = "tui2acp"
-    context_source = ContextSourceMode.TUI2ACP
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🌉", name="Tui2ACP")
-
-    def __init__(self, ctx):
-        super().__init__(ctx)
-        self._current_adapter: Optional[str] = None
-
-    def _get_agent_type_override(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
-        adapter = (getattr(project, "tui2acp_adapter_name", None) if project else None) or self._current_adapter
-        return f"tui2acp_{adapter}" if adapter else "tui2acp_claude"
-
-    @property
-    def current_adapter(self) -> Optional[str]:
-        return self._current_adapter
-
-    @current_adapter.setter
-    def current_adapter(self, value: Optional[str]):
-        self._current_adapter = value

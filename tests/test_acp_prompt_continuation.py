@@ -301,6 +301,417 @@ def test_pending_plan_with_active_tool_is_not_continued() -> None:
     assert execution.awaiting_user_input is False
 
 
+def test_unresolved_child_gets_one_bounded_reconciliation_turn() -> None:
+    runner = _runner()
+    first_result = PromptResult(
+        stop_reason="end_turn",
+        text="reviewer final answer arrived asynchronously",
+        tool_calls=[
+            ToolCallInfo(
+                id="wait-before-final-answer",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+    reconciled_result = PromptResult(
+        stop_reason="end_turn",
+        text="all reviewers are terminal",
+        tool_calls=[
+            ToolCallInfo(
+                id="list-after-final-answer",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "completed"},
+                ),
+            )
+        ],
+    )
+    session = _FakeSession(first_result, reconciled_result)
+    continuation_starts: list[str] = []
+    clock = _FakeClock()
+
+    with patch("src.acp.continuation._monotonic", clock):
+        execution = runner(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+            on_continuation_start=lambda: continuation_starts.append(
+                "reconciling"
+            ),
+        )
+
+    assert len(session.calls) == 2
+    assert "子代理状态对账指令" in session.calls[1].text
+    assert continuation_starts == ["reconciling"]
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.assessment.incomplete_tool_calls == 0
+    assert execution.awaiting_user_input is False
+
+
+def test_unresolved_child_still_fails_closed_after_one_reconciliation() -> None:
+    runner = _runner()
+
+    def running_snapshot(tool_id: str) -> PromptResult:
+        return PromptResult(
+            stop_reason="end_turn",
+            tool_calls=[
+                ToolCallInfo(
+                    id=tool_id,
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    subagent_states=(
+                        {"source_id": "reviewer", "status": "running"},
+                    ),
+                )
+            ],
+        )
+
+    session = _FakeSession(
+        running_snapshot("list-before-reconciliation"),
+        running_snapshot("list-after-reconciliation"),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.assessment.incomplete_tool_calls == 1
+    assert execution.awaiting_user_input is False
+
+
+def test_plan_then_child_reconciliation_each_get_one_bounded_turn() -> None:
+    runner = _runner()
+    plan_completed_with_running_child = PromptResult(
+        stop_reason="end_turn",
+        plan=PlanInfo(
+            entries=[
+                PlanEntryInfo(content="implementation", status="completed"),
+            ]
+        ),
+        tool_calls=[
+            ToolCallInfo(
+                id="review-running",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+    reviewer_completed = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="review-completed",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "completed"},
+                ),
+            )
+        ],
+    )
+    session = _FakeSession(
+        _pending_result(),
+        plan_completed_with_running_child,
+        reviewer_completed,
+    )
+    clock = _FakeClock()
+
+    with patch("src.acp.continuation._monotonic", clock):
+        execution = runner(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+        )
+
+    assert len(session.calls) == 3
+    assert "自动续做指令" in session.calls[1].text
+    assert "子代理状态对账指令" in session.calls[2].text
+    assert [call.timeout for call in session.calls] == [60, 60, 63]
+    assert execution.automatic_continuations == 2
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.awaiting_user_input is False
+
+
+def test_child_reconciliation_then_plan_each_get_one_bounded_turn() -> None:
+    runner = _runner()
+    child_running = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="review-running",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+    child_completed_with_plan = _pending_result()
+    child_completed_with_plan.tool_calls = [
+        ToolCallInfo(
+            id="review-completed",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            subagent_states=(
+                {"source_id": "reviewer", "status": "completed"},
+            ),
+        )
+    ]
+    session = _FakeSession(
+        child_running,
+        child_completed_with_plan,
+        _complete_result(),
+    )
+    clock = _FakeClock()
+
+    with patch("src.acp.continuation._monotonic", clock):
+        execution = runner(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+        )
+
+    assert len(session.calls) == 3
+    assert "子代理状态对账指令" in session.calls[1].text
+    assert "自动续做指令" in session.calls[2].text
+    assert [call.timeout for call in session.calls] == [60, 63, 60]
+    assert execution.automatic_continuations == 2
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.awaiting_user_input is False
+
+
+def test_unresolved_child_overrides_paused_goal_after_reconciliation() -> None:
+    runner = _runner()
+
+    def running_snapshot(*, goal: ACPGoalInfo | None = None) -> PromptResult:
+        return PromptResult(
+            stop_reason="end_turn",
+            goal=goal,
+            tool_calls=[
+                ToolCallInfo(
+                    id="list-agents",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    subagent_states=(
+                        {"source_id": "reviewer", "status": "running"},
+                    ),
+                )
+            ],
+        )
+
+    session = _FakeSession(
+        running_snapshot(),
+        running_snapshot(
+            goal=ACPGoalInfo(objective="review", status="paused")
+        ),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.assessment.unresolved_child_tool_calls == 1
+    assert execution.awaiting_user_input is False
+
+
+def test_child_reconciliation_timeout_does_not_start_finalization_or_replace_session() -> None:
+    runner = _runner()
+    child_running = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="review-running",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+    session = _FakeSession(
+        child_running,
+        TimeoutError("reconciliation deadline"),
+        _complete_result(),
+    )
+    finalization_starts: list[str] = []
+    replacements: list[float] = []
+    retirements: list[tuple[object, float]] = []
+
+    with pytest.raises(TimeoutError, match="reconciliation deadline"):
+        runner(
+            session,
+            "original task",
+            timeout_s=90,
+            finalization_reserve_s=30,
+            on_finalization_start=lambda: finalization_starts.append(
+                "finalizing"
+            ),
+            replace_dead_session=lambda budget: (
+                replacements.append(budget) or session
+            ),
+            retire_finalization_session=lambda active, budget: (
+                retirements.append((active, budget))
+            ),
+        )
+
+    assert len(session.calls) == 2
+    assert finalization_starts == []
+    assert replacements == []
+    assert retirements and retirements[0][0] is session
+    assert session._force_dead is True
+
+
+def test_structured_child_reconciliation_timeout_retires_without_third_turn() -> None:
+    runner = _runner()
+    child_running = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="review-running",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+    session = _FakeSession(
+        child_running,
+        PromptResult(stop_reason="timeout", text="still reconciling"),
+        _complete_result(),
+    )
+    retirements: list[tuple[object, float]] = []
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+        retire_finalization_session=lambda active, budget: (
+            retirements.append((active, budget))
+        ),
+    )
+
+    assert len(session.calls) == 2
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.assessment.stop_reason == "timeout"
+    assert execution.entered_finalization is False
+    assert retirements and retirements[0][0] is session
+    assert session._force_dead is True
+
+
+@pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens"])
+def test_non_natural_stop_after_reconciliation_never_waits_on_paused_goal(
+    stop_reason: str,
+) -> None:
+    runner = _runner()
+    child_running = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="review-running",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+    non_natural = PromptResult(
+        stop_reason=stop_reason,
+        goal=ACPGoalInfo(objective="review", status="paused"),
+        tool_calls=[
+            ToolCallInfo(
+                id="review-completed",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "completed"},
+                ),
+            )
+        ],
+    )
+    session = _FakeSession(child_running, non_natural)
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert execution.assessment.stop_reason == stop_reason
+    assert execution.awaiting_user_input is False
+
+
+def test_active_outer_tool_does_not_trigger_child_reconciliation() -> None:
+    runner = _runner()
+    session = _FakeSession(
+        PromptResult(
+            stop_reason="end_turn",
+            tool_calls=[
+                ToolCallInfo(
+                    id="outer-still-running",
+                    title="exec",
+                    kind="execute",
+                    status="in_progress",
+                )
+            ],
+        )
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 1
+    assert execution.automatic_continuations == 0
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+
+
 @pytest.mark.parametrize(
     "stop_reason",
     ["cancelled", "refusal", "max_tokens", "max_turn_requests", "timeout"],
@@ -469,7 +880,7 @@ def test_running_child_snapshot_is_replaced_by_authoritative_terminal_update() -
     )
 
 
-def test_running_child_snapshot_ignores_nonauthoritative_unknown_update() -> None:
+def test_running_child_snapshot_retains_unknown_update_fail_closed() -> None:
     from src.acp.continuation import _merge_tool_calls
 
     previous_child = {
@@ -496,7 +907,738 @@ def test_running_child_snapshot_ignores_nonauthoritative_unknown_update() -> Non
 
     merged = _merge_tool_calls([previous], [current])
 
-    assert merged[0].subagent_states == (previous_child,)
+    assert merged[0].subagent_states == (
+        previous_child,
+        {"source_id": "child-a", "status": "future-state"},
+    )
+
+
+def test_terminal_child_snapshot_is_sticky_with_same_outer_call_id() -> None:
+    from src.acp.continuation import _merge_tool_calls
+
+    previous = ToolCallInfo(
+        id="list-1",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    current = ToolCallInfo(
+        id="list-1",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+
+    assert merged[0].subagent_states == previous.subagent_states
+
+
+def test_same_outer_id_explicit_followup_starts_new_child_generation() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    previous = ToolCallInfo(
+        id="provider-reused-id",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    current = ToolCallInfo(
+        id="provider-reused-id",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_same_followup_terminal_snapshot_is_sticky_with_same_outer_id() -> None:
+    from src.acp.collaboration import merge_tool_call_snapshot
+    from src.acp.outcome import classify_prompt_result
+
+    previous = ToolCallInfo(
+        id="followup-1",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    current = ToolCallInfo(
+        id="followup-1",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = [merge_tool_call_snapshot(previous, current)]
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert merged[0].subagent_states == previous.subagent_states
+    assert assessment.outcome is PromptOutcome.COMPLETED
+
+
+def test_same_followup_id_reused_across_turns_starts_new_generation() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    previous = ToolCallInfo(
+        id="provider-reused-followup",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    current = ToolCallInfo(
+        id="provider-reused-followup",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert merged[-1].subagent_states == current.subagent_states
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    "malformed_previous",
+    [
+        ToolCallInfo(
+            id="same-call",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            collaboration_tool="list_agents",
+            collaboration_receivers=("child-a", 123),  # type: ignore[arg-type]
+            subagent_states=(
+                {"source_id": "child-a", "status": "running"},
+            ),
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="Start child",
+            kind="other",
+            status="completed",
+            subagent_source_id=123,  # type: ignore[arg-type]
+            subagent_activity="started",
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="Start child",
+            kind="other",
+            status="completed",
+            subagent_source_id="child-a",
+            subagent_activity="future-activity",
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            collaboration_receivers=0,  # type: ignore[arg-type]
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="Child activity",
+            kind="other",
+            status="completed",
+            subagent_source_id=0,  # type: ignore[arg-type]
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="collaboration",
+            kind="other",
+            status="completed",
+            collaboration_tool=0,  # type: ignore[arg-type]
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            subagent_states=0,  # type: ignore[arg-type]
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            subagent_states={},  # type: ignore[arg-type]
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            child_metadata_malformed=None,  # type: ignore[arg-type]
+        ),
+    ],
+)
+def test_same_id_merge_preserves_prior_malformed_child_metadata(
+    malformed_previous: ToolCallInfo,
+) -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    current = ToolCallInfo(
+        id="same-call",
+        title="clean terminal update",
+        kind="other",
+        status="completed",
+    )
+
+    merged = _merge_tool_calls([malformed_previous], [current])
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        ToolCallInfo(
+            id="same-call",
+            title="future_restart_agent",
+            kind="other",
+            status="completed",
+            collaboration_tool="future_restart_agent",
+            collaboration_receivers=("child-a",),
+            subagent_states=(
+                {"source_id": "child-a", "status": "running"},
+            ),
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="Start child",
+            kind="other",
+            status="completed",
+            subagent_source_id="child-a",
+            subagent_activity="started",
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="Child interaction",
+            kind="other",
+            status="completed",
+            subagent_source_id="child-a",
+            subagent_activity="interacted",
+        ),
+        ToolCallInfo(
+            id="same-call",
+            title="Failed child interruption",
+            kind="other",
+            status="failed",
+            subagent_source_id="child-a",
+            subagent_activity="interrupted",
+        ),
+    ],
+)
+def test_same_id_ambiguous_restart_cannot_reuse_prior_terminal(
+    current: ToolCallInfo,
+) -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    previous = ToolCallInfo(
+        id="same-call",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_merge_preserves_anonymous_terminal_before_named_followup() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    terminal = ToolCallInfo(
+        id="",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    followup = ToolCallInfo(
+        id="followup-1",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = _merge_tool_calls([terminal], [followup])
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert [tool.title for tool in merged] == ["list_agents", "followup_task"]
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_merge_orders_reused_named_call_by_its_latest_snapshot() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    reused_terminal = ToolCallInfo(
+        id="reused",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    later_terminal = ToolCallInfo(
+        id="later-old-terminal",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    reused_followup = ToolCallInfo(
+        id="reused",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = _merge_tool_calls(
+        [reused_terminal, later_terminal],
+        [reused_followup],
+    )
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert [tool.id for tool in merged] == [
+        "reused",
+        "later-old-terminal",
+        "reused",
+    ]
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_stale_same_action_update_keeps_original_lifecycle_position() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    list_terminal = ToolCallInfo(
+        id="list-x",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    followup_running = ToolCallInfo(
+        id="follow-y",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = _merge_tool_calls(
+        [],
+        [list_terminal, followup_running, list_terminal],
+    )
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert [tool.id for tool in merged] == ["list-x", "follow-y"]
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+
+
+def test_stale_same_followup_update_does_not_reopen_newer_terminal() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    followup_running = ToolCallInfo(
+        id="follow-x",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+    list_terminal = ToolCallInfo(
+        id="list-y",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+
+    merged = _merge_tool_calls(
+        [],
+        [followup_running, list_terminal, followup_running],
+    )
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert [tool.id for tool in merged] == ["follow-x", "list-y"]
+    assert assessment.outcome is PromptOutcome.COMPLETED
+
+
+def test_cross_turn_reused_passive_call_moves_later_terminal_snapshot() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    reused_terminal = ToolCallInfo(
+        id="reused-list",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    followup_running = ToolCallInfo(
+        id="follow-running",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = _merge_tool_calls(
+        [reused_terminal, followup_running],
+        [reused_terminal],
+    )
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert [tool.id for tool in merged] == [
+        "reused-list",
+        "follow-running",
+        "reused-list",
+    ]
+    assert assessment.outcome is PromptOutcome.COMPLETED
+
+
+def test_cross_turn_reused_passive_without_state_does_not_inherit_terminal() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    reused_terminal = ToolCallInfo(
+        id="reused-list",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    followup_running = ToolCallInfo(
+        id="follow-running",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+    empty_refresh = ToolCallInfo(
+        id="reused-list",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+    )
+
+    merged = _merge_tool_calls(
+        [reused_terminal, followup_running],
+        [empty_refresh],
+    )
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert len(merged) == 3
+    assert merged[-1].subagent_states == ()
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+
+
+def test_cross_turn_unrelated_id_collision_does_not_inherit_child_state() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    reused_terminal = ToolCallInfo(
+        id="reused-id",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    followup_running = ToolCallInfo(
+        id="follow-running",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+    unrelated_current = ToolCallInfo(
+        id="reused-id",
+        title="read",
+        kind="read",
+        status="completed",
+    )
+
+    merged = _merge_tool_calls(
+        [reused_terminal, followup_running],
+        [unrelated_current],
+    )
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert [tool.title for tool in merged] == [
+        "list_agents",
+        "followup_task",
+        "read",
+    ]
+    assert merged[-1].subagent_states == ()
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+
+
+@pytest.mark.parametrize("new_action", ["wait_agent", "followup_task"])
+def test_same_turn_changed_action_without_state_does_not_inherit_terminal(
+    new_action: str,
+) -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    reused_terminal = ToolCallInfo(
+        id="reused-action",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    followup_running = ToolCallInfo(
+        id="follow-running",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+    changed_action = ToolCallInfo(
+        id="reused-action",
+        title=new_action,
+        kind="other",
+        status="completed",
+        collaboration_tool=new_action,
+    )
+
+    merged = _merge_tool_calls(
+        [],
+        [reused_terminal, followup_running, changed_action],
+    )
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert len(merged) == 3
+    assert merged[-1].subagent_states == ()
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+
+
+def test_same_turn_passive_metadata_enrichment_keeps_original_position() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    unclassified_terminal = ToolCallInfo(
+        id="enriched-list",
+        title="child snapshot",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    enriched_terminal = ToolCallInfo(
+        id="enriched-list",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "child-a", "status": "completed"},
+        ),
+    )
+    followup_running = ToolCallInfo(
+        id="follow-running",
+        title="followup_task",
+        kind="other",
+        status="completed",
+        collaboration_tool="followup_task",
+        collaboration_receivers=("child-a",),
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+
+    merged = _merge_tool_calls(
+        [],
+        [unclassified_terminal, followup_running, enriched_terminal],
+    )
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert [tool.id for tool in merged] == ["enriched-list", "follow-running"]
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+
+
+def test_malformed_child_container_is_not_reinterpreted_during_merge() -> None:
+    from src.acp.continuation import _merge_tool_calls
+    from src.acp.outcome import classify_prompt_result
+
+    previous = ToolCallInfo(
+        id="list-1",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        subagent_states=(
+            {"source_id": "child-a", "status": "running"},
+        ),
+    )
+    current = ToolCallInfo(
+        id="list-1",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        subagent_states={  # type: ignore[arg-type]
+            "source_id": "child-a",
+            "status": "completed",
+        },
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+    assessment = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    )
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
 
 
 def test_timeout_exception_does_not_start_ordinary_continuation() -> None:

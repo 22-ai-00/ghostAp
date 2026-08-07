@@ -784,6 +784,8 @@ def test_end_turn_with_active_tool_is_incomplete() -> None:
     assert assessment.outcome is PromptOutcome.INCOMPLETE
     assert assessment.pending_plan_entries == 0
     assert assessment.incomplete_tool_calls == 1
+    assert assessment.incomplete_outer_tool_calls == 1
+    assert assessment.unresolved_child_tool_calls == 0
     assert "工具" in assessment.detail
 
 
@@ -879,6 +881,578 @@ def test_completed_outer_wait_with_running_child_is_incomplete() -> None:
 
     assert assessment.outcome is PromptOutcome.INCOMPLETE
     assert assessment.incomplete_tool_calls == 1
+    assert assessment.incomplete_outer_tool_calls == 0
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_receiver_without_state_fails_closed() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="spawn-child",
+                title="spawn_agent",
+                kind="other",
+                status="completed",
+                collaboration_tool="spawn_agent",
+                collaboration_receivers=("child-a",),
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.incomplete_tool_calls == 1
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_started_subagent_activity_fails_closed_until_terminal_snapshot() -> None:
+    started = ToolCallInfo(
+        id="subagent-started",
+        title="Start reviewer",
+        kind="other",
+        status="completed",
+        subagent_source_id="child-a",
+        subagent_activity="started",
+    )
+
+    pending = classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=[started])
+    )
+    completed = classify_prompt_result(
+        PromptResult(
+            stop_reason="end_turn",
+            tool_calls=[
+                started,
+                ToolCallInfo(
+                    id="child-terminal",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    subagent_states=(
+                        {"source_id": "child-a", "status": "completed"},
+                    ),
+                ),
+            ],
+        )
+    )
+
+    assert pending.outcome is PromptOutcome.INCOMPLETE
+    assert pending.unresolved_child_tool_calls == 1
+    assert completed.outcome is PromptOutcome.COMPLETED
+
+
+def test_unknown_activity_remains_invalid_even_with_terminal_child_state() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="unknown-activity",
+                title="subagent activity",
+                kind="other",
+                status="completed",
+                subagent_source_id="child-a",
+                subagent_activity="future-activity",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_later_terminal_child_snapshot_resolves_stale_running_call() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="spawn-child",
+                title="spawn_agent",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "running"},
+                ),
+            ),
+            ToolCallInfo(
+                id="list-agents-after-final-answer",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.COMPLETED
+    assert assessment.incomplete_tool_calls == 0
+
+
+def test_terminal_child_snapshot_is_sticky_against_late_running_snapshot() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="wait-child-completed",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+            ToolCallInfo(
+                id="stale-list-agents",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "running"},
+                ),
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.COMPLETED
+    assert assessment.incomplete_tool_calls == 0
+
+
+def test_terminal_snapshot_resolves_only_the_matching_child() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="wait-two-children",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "running"},
+                    {"source_id": "child-b", "status": "running"},
+                ),
+            ),
+            ToolCallInfo(
+                id="child-a-finished",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.incomplete_tool_calls == 1
+
+
+def test_successful_followup_task_reactivates_terminal_child() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="child-first-turn-terminal",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+            ToolCallInfo(
+                id="child-followup",
+                title="followup_task",
+                kind="other",
+                status="completed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=("child-a",),
+                subagent_states=(
+                    {"source_id": "child-a", "status": "running"},
+                ),
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.incomplete_tool_calls == 1
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_failed_followup_with_running_evidence_fails_closed() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="child-terminal",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+            ToolCallInfo(
+                id="failed-followup",
+                title="followup_task",
+                kind="other",
+                status="failed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=("child-a",),
+                subagent_states=(
+                    {"source_id": "child-a", "status": "running"},
+                ),
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_terminal_snapshot_resolves_failed_followup_running_evidence() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="child-terminal-before-followup",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+            ToolCallInfo(
+                id="failed-followup",
+                title="followup_task",
+                kind="other",
+                status="failed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=("child-a",),
+                subagent_states=(
+                    {"source_id": "child-a", "status": "running"},
+                ),
+            ),
+            ToolCallInfo(
+                id="child-terminal-after-followup",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.COMPLETED
+    assert assessment.incomplete_tool_calls == 0
+    assert assessment.unresolved_child_tool_calls == 0
+
+
+@pytest.mark.parametrize("activity", ["started", "interacted", "interrupted"])
+def test_failed_followup_activity_conflicts_with_same_source_terminal(
+    activity: str,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="failed-followup",
+                title="followup_task",
+                kind="other",
+                status="failed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=("child-a",),
+                subagent_source_id="child-a",
+                subagent_activity=activity,
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    "later_tool",
+    [
+        ToolCallInfo(
+            id="unknown-action",
+            title="future_restart_agent",
+            kind="other",
+            status="completed",
+            collaboration_tool="future_restart_agent",
+            collaboration_receivers=("child-a",),
+            subagent_states=(
+                {"source_id": "child-a", "status": "running"},
+            ),
+        ),
+        ToolCallInfo(
+            id="activity-started",
+            title="Start subagent",
+            kind="other",
+            status="completed",
+            subagent_source_id="child-a",
+            subagent_activity="started",
+        ),
+    ],
+)
+def test_ambiguous_child_restart_cannot_reuse_prior_terminal_state(
+    later_tool: ToolCallInfo,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="child-terminal",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+            later_tool,
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("outer_status", "activity"),
+    [
+        ("completed", "interacted"),
+        ("failed", "interrupted"),
+    ],
+)
+def test_transient_activity_reopens_prior_terminal_child(
+    outer_status: str,
+    activity: str,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="child-terminal",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+            ToolCallInfo(
+                id="child-activity",
+                title="child activity",
+                kind="other",
+                status=outer_status,
+                subagent_source_id="child-a",
+                subagent_activity=activity,
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+@pytest.mark.parametrize("collaboration_tool", ["spawn_agent", "followup_task"])
+def test_successful_child_start_without_identity_fails_closed(
+    collaboration_tool: str,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="missing-child-identity",
+                title=collaboration_tool,
+                kind="other",
+                status="completed",
+                collaboration_tool=collaboration_tool,
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_later_unknown_snapshot_remains_independent_fail_closed_evidence() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="known-running-child",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "running"},
+                ),
+            ),
+            ToolCallInfo(
+                id="unknown-child-refresh",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "child-a", "status": "future-state"},
+                ),
+            ),
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.incomplete_tool_calls == 2
+    assert assessment.unresolved_child_tool_calls == 2
+
+
+@pytest.mark.parametrize(
+    "child_snapshots",
+    [
+        (
+            {"source_id": "child-a", "status": "future-state"},
+            {"source_id": "child-a", "status": "completed"},
+        ),
+        (
+            {"source_id": "child-a", "status": "completed"},
+            {"source_id": "child-a", "status": "future-state"},
+        ),
+    ],
+)
+def test_unknown_child_evidence_is_not_erased_by_terminal_snapshot(
+    child_snapshots: tuple[dict, dict],
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id=f"snapshot-{index}",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(child,),
+            )
+            for index, child in enumerate(child_snapshots)
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.incomplete_tool_calls == 1
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    "source_id",
+    [None, "", 123],
+)
+def test_terminal_child_with_invalid_identity_fails_closed(
+    source_id: object,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="terminal-without-identity",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": source_id, "status": "completed"},
+                ),
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.incomplete_tool_calls == 1
+
+
+@pytest.mark.parametrize("raw_children", [{}, "", 0])
+def test_malformed_empty_child_container_fails_closed(
+    raw_children: object,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="malformed-child-container",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=raw_children,  # type: ignore[arg-type]
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
+
+
+def test_malformed_empty_receiver_container_fails_closed() -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="malformed-receiver-container",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers={},  # type: ignore[arg-type]
+            )
+        ],
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
+    assert assessment.unresolved_child_tool_calls == 1
 
 
 @pytest.mark.parametrize(

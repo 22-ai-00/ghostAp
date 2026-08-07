@@ -53,7 +53,6 @@ class ContextSourceMode(Enum):
     TRAEX = "traex"
     SHELL = "shell"
     DEEP_ENGINE = "deep_engine"
-    TUI2ACP = "tui2acp"
 
 
 # ---------------------------------------------------------------------------

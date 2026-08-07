@@ -96,6 +96,10 @@ class ToolCallInfo:
     collaboration_receivers: tuple[str, ...] = ()
     collaboration_model: Optional[str] = None
     subagent_states: tuple[dict, ...] = ()
+    # Sticky fail-closed marker for malformed provider child metadata.  This is
+    # carried across same-id snapshots so a later clean update cannot erase
+    # evidence that the lifecycle stream was structurally ambiguous.
+    child_metadata_malformed: bool = False
 
 
 @dataclass

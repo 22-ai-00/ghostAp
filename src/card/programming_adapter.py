@@ -47,7 +47,6 @@ _MODE_DISPLAY: dict[str, tuple[str, str]] = {
     "codex": ("📝", "Codex"),
     "gemini": ("💎", "Gemini"),
     "traex": ("🚀", "Traex"),
-    "tui2acp": ("🔌", "Tui2ACP"),
 }
 
 _AGENT_TOOL_TITLES = {"agent", "subagent", "task"}

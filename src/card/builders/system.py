@@ -608,74 +608,6 @@ class SystemBuilder:
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
-    def build_tui2acp_adapter_select_card(
-        adapters: list[dict],
-        project_id: Optional[str] = None,
-        current_adapter: Optional[str] = None,
-    ) -> tuple[str, str]:
-        """Build an interactive card for tui2acp adapter selection."""
-
-        elements = [{"tag": "markdown", "content": "**选择要通过 tui2acp 桥接的 AI 工具：**"}]
-
-        buttons = []
-        for adapter in adapters or []:
-            name = adapter.get("name", "")
-            emoji = adapter.get("emoji", "🤖")
-            desc = adapter.get("description", "")
-            btn_text = f"{emoji} {name}"
-            if desc:
-                btn_text += f" ({desc})"
-            btn_text = SystemBuilder._mobile_safe_button_label(btn_text)
-
-            buttons.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_text},
-                    "type": "primary" if name == current_adapter else "default",
-                    "value": {
-                        "action": "select_tui2acp_adapter",
-                        "adapter_name": name,
-                        "project_id": project_id,
-                    },
-                }
-            )
-
-        elements.extend(build_responsive_layout(buttons))
-
-        # Custom command input form
-        elements.append({"tag": "hr"})
-        elements.append({"tag": "markdown", "content": "**其他工具：** 输入启动命令直接进入 TUI2ACP"})
-        elements.append({
-            "tag": "form",
-            "name": "tui2acp_custom_command_form",
-            "elements": [
-                {
-                    "tag": "input",
-                    "name": "custom_command",
-                    "placeholder": {
-                        "tag": "plain_text",
-                        "content": "例如: aider --model gpt-4o",
-                    },
-                    "max_length": 200,
-                },
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "🚀 启动"},
-                    "type": "primary",
-                    "action_type": "form_action",
-                    "name": "custom_command_submit",
-                    "value": {
-                        "action": "select_tui2acp_custom_command",
-                        "project_id": project_id,
-                    },
-                },
-            ],
-        })
-
-        card = CoreBuilder._wrap_card("🌉 Tui2ACP 工具选择", "purple", elements)
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
     def build_slock_role_tool_select_card(
         role_name: str,
         tools: list[dict],
@@ -1653,7 +1585,6 @@ class SystemBuilder:
             InteractionMode.CODEX: UI_TEXT["system_mode_codex"],
             InteractionMode.GEMINI: UI_TEXT["system_mode_gemini"],
             InteractionMode.TRAEX: UI_TEXT["system_mode_traex"],
-            InteractionMode.TUI2ACP: "🌉 Tui2ACP",
         }
 
         current_mode_str = mode_emoji.get(current_mode, UI_TEXT["system_mode_smart"])

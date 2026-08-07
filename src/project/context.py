@@ -85,10 +85,6 @@ class ProjectContext:
     traex_session_snapshot: Optional[SessionSnapshot] = None
     traex_mode: bool = False
 
-    tui2acp_session_snapshot: Optional[SessionSnapshot] = None
-    tui2acp_mode: bool = False
-    tui2acp_adapter_name: Optional[str] = None
-
     acp_tool_name: Optional[str] = None
     acp_model_name: Optional[str] = None
 
@@ -259,7 +255,6 @@ class ProjectContext:
         "codex": ("codex_mode", "codex_session_snapshot"),
         "gemini": ("gemini_mode", "gemini_session_snapshot"),
         "traex": ("traex_mode", "traex_session_snapshot"),
-        "tui2acp": ("tui2acp_mode", "tui2acp_session_snapshot"),
     }
 
     def set_programming_mode(self, mode_type: str, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
@@ -419,12 +414,6 @@ class ProjectContext:
     def update_traex_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
         self.update_programming_snapshot("traex", query, query_count, session_id)
 
-    def set_tui2acp_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("tui2acp", enabled, session_id, query_count)
-
-    def update_tui2acp_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("tui2acp", query, query_count, session_id)
-
     def get_status_emoji(self) -> str:
         status_map = {
             ProjectStatus.IDLE: "⚪",
@@ -455,7 +444,6 @@ class ProjectContext:
             "status": self.status.value,
             "created_at": self.created_at,
             "last_active": self.last_active,
-            "tui2acp_adapter_name": self.tui2acp_adapter_name,
             "acp_tool_name": self.acp_tool_name,
             "acp_model_name": self.acp_model_name,
             "theme_color": self.theme_color,
@@ -501,8 +489,20 @@ class ProjectContext:
         base_ts = time.time() - len(raw)
         return OrderedDict((str(entry), base_ts + i) for i, entry in enumerate(raw))
 
+    @staticmethod
+    def normalize_acp_tool_name(tool_name: object) -> Optional[str]:
+        """Return a registered ACP tool name, or ``None`` for stale input."""
+        name = str(tool_name or "").strip().lower()
+        if not name:
+            return None
+        from ..acp.providers import get_providers, tool_registry
+
+        get_providers()
+        return name if tool_registry.get_provider(name) else None
+
     @classmethod
     def from_snapshot(cls, data: dict) -> "ProjectContext":
+        acp_tool_name = cls.normalize_acp_tool_name(data.get("acp_tool_name"))
         ctx = cls(
             project_id=data["project_id"],
             project_name=data["project_name"],
@@ -517,10 +517,8 @@ class ProjectContext:
             codex_mode=data.get("codex_mode", False),
             gemini_mode=data.get("gemini_mode", False),
             traex_mode=data.get("traex_mode", False),
-            tui2acp_mode=data.get("tui2acp_mode", False),
-            tui2acp_adapter_name=data.get("tui2acp_adapter_name"),
-            acp_tool_name=data.get("acp_tool_name"),
-            acp_model_name=data.get("acp_model_name"),
+            acp_tool_name=acp_tool_name,
+            acp_model_name=data.get("acp_model_name") if acp_tool_name else None,
             theme_color=data.get("theme_color", "green"),
             emoji_prefix=data.get("emoji_prefix", "🟢"),
             env_vars=data.get("env_vars", {}),

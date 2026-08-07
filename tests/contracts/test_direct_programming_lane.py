@@ -132,7 +132,6 @@ def _context(manager_key: str, manager: ACPSessionManager) -> HandlerContext:
         codex_manager=managers["codex"],
         gemini_manager=managers["gemini"],
         traex_manager=managers["traex"],
-        tui2acp_manager=MagicMock(),
         intent_recognizer=MagicMock(),
         scheduler=MagicMock(),
         project_manager=MagicMock(),

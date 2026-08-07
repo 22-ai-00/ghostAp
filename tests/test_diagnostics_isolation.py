@@ -345,7 +345,6 @@ class TestTraceProjectIsolation:
             codex_manager=MagicMock(),
             gemini_manager=MagicMock(),
             traex_manager=MagicMock(),
-            tui2acp_manager=MagicMock(),
             intent_recognizer=MagicMock(),
             scheduler=MagicMock(),
             project_manager=MagicMock(),

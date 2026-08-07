@@ -11,7 +11,6 @@ from .programming import (
     GeminiModeHandler,
     ProgrammingModeHandler,
     TraexModeHandler,
-    Tui2acpModeHandler,
 )
 from .project import ProjectHandler
 from .slock import SlockHandler
@@ -28,7 +27,6 @@ __all__ = [
     "CodexModeHandler",
     "GeminiModeHandler",
     "TraexModeHandler",
-    "Tui2acpModeHandler",
     "DeepHandler",
     "SpecHandler",
     "SlockHandler",

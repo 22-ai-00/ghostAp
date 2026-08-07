@@ -330,10 +330,6 @@ class CardBuilder:
         return SystemBuilder.build_acp_tool_select_card(tools, project_id=project_id, current_tool=current_tool)
 
     @staticmethod
-    def build_tui2acp_adapter_select_card(adapters: list[dict], project_id: Optional[str] = None, current_adapter: Optional[str] = None) -> tuple[str, str]:
-        return SystemBuilder.build_tui2acp_adapter_select_card(adapters, project_id=project_id, current_adapter=current_adapter)
-
-    @staticmethod
     def build_slock_role_tool_select_card(
         role_name: str,
         tools: list[dict],

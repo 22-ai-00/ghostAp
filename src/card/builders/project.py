@@ -636,7 +636,6 @@ class ProjectBuilder:
             "codex": "Codex",
             "gemini": "Gemini",
             "traex": "Traex",
-            "tui2acp": "Tui2ACP",
         }
         mode_name = mode_names.get(mode, mode.title())
         snapshot = project.get_programming_snapshot(mode)

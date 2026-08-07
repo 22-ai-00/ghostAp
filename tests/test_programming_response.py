@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import ExitStack, contextmanager, nullcontext
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -15,9 +16,17 @@ from src.acp.models import (
     PlanEntryInfo,
     PlanInfo,
     PromptResult,
+    ToolCallInfo,
 )
-from src.acp.outcome import PromptAssessment, PromptOutcome
-from src.feishu.handlers.programming import ClaudeModeHandler, Tui2acpModeHandler
+from src.acp.outcome import (
+    PromptAssessment,
+    PromptOutcome,
+    classify_prompt_result,
+)
+from src.feishu.handlers.programming import (
+    ClaudeModeHandler,
+    _log_prompt_execution,
+)
 
 
 class _FakeProgrammingCardSession:
@@ -89,7 +98,10 @@ class _QueuedPromptSession:
         self.calls.append((text, on_event, timeout))
         if len(self.calls) == 1 and self._first_event is not None:
             on_event(self._first_event)
-        return self._results.pop(0)
+        result = self._results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
 
 def _pending_result(text: str = "partial") -> PromptResult:
@@ -163,20 +175,135 @@ def _make_handler():
     ctx.message_linker = MagicMock()
     ctx.context_manager = MagicMock()
 
-    with patch.object(Tui2acpModeHandler, "settings", new_callable=PropertyMock, return_value=ctx.settings):
-        handler = Tui2acpModeHandler.__new__(Tui2acpModeHandler)
-        handler.ctx = ctx
-        handler._settings = ctx.settings
-        handler._current_adapter = None
-
-    handler.mode_name = "Tui2ACP"
-    handler.is_coco = False
+    handler = ClaudeModeHandler(ctx)
     handler.reply_text = MagicMock()
     handler.add_reaction = MagicMock()
     handler.register_message_project = MagicMock()
     handler.ensure_request_id = MagicMock(return_value="req-1")
-    handler._get_model_name_override = MagicMock(return_value=None)
     return handler
+
+
+def test_handler_helper_matches_claude_initialization_contract():
+    handler = _make_handler()
+
+    assert handler._current_model is None
+    assert handler._get_model_name_override() is None
+
+
+def test_prompt_execution_log_identifies_child_only_incompleteness(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="opaque-provider-call-id",
+                title="secret command must not be logged",
+                kind="other",
+                status="completed",
+                content="secret prompt must not be logged",
+                collaboration_tool="wait_agent",
+                subagent_states=(
+                    {
+                        "source_id": "opaque-child-id",
+                        "status": "running",
+                        "message": "secret child output must not be logged",
+                    },
+                ),
+            )
+        ],
+    )
+    assessment = classify_prompt_result(result)
+    execution = PromptContinuationResult(
+        result=result,
+        assessment=assessment,
+        automatic_continuations=0,
+        awaiting_user_input=False,
+        entered_finalization=False,
+    )
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="src.feishu.handlers.programming",
+    ):
+        _log_prompt_execution("Codex", execution)
+
+    assert "incomplete_outer_tool_calls=0" in caplog.text
+    assert "unresolved_child_tool_calls=1" in caplog.text
+    assert "unresolved_tools=wait_agent:completed[running]" in caplog.text
+    assert "opaque-provider-call-id" not in caplog.text
+    assert "opaque-child-id" not in caplog.text
+    assert "secret" not in caplog.text
+
+
+def test_prompt_execution_log_allowlists_provider_controlled_categories(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="opaque-call",
+                title="opaque-title",
+                kind="sk-proj-kind-secret",
+                status="sk-proj-outer-secret",
+                collaboration_tool="sk-proj-tool-secret",
+                subagent_states=(
+                    {
+                        "source_id": "opaque-child",
+                        "status": "sk-proj-child-secret",
+                    },
+                ),
+            )
+        ],
+    )
+    assessment = classify_prompt_result(result)
+    execution = PromptContinuationResult(
+        result=result,
+        assessment=assessment,
+        automatic_continuations=0,
+        awaiting_user_input=False,
+        entered_finalization=False,
+    )
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="src.feishu.handlers.programming",
+    ):
+        _log_prompt_execution("Codex", execution)
+
+    assert "unresolved_tools=unknown:unknown[unknown]" in caplog.text
+    assert "sk-proj" not in caplog.text
+
+
+def test_prompt_execution_log_allowlists_provider_goal_status(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    result = PromptResult(
+        stop_reason="end_turn",
+        goal=ACPGoalInfo(
+            objective="secret objective must not be logged",
+            status="sk-proj-goal-secret",
+        ),
+    )
+    assessment = classify_prompt_result(result)
+    execution = PromptContinuationResult(
+        result=result,
+        assessment=assessment,
+        automatic_continuations=0,
+        awaiting_user_input=False,
+        entered_finalization=False,
+    )
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="src.feishu.handlers.programming",
+    ):
+        _log_prompt_execution("Codex", execution)
+
+    assert "goal_status=unknown" in caplog.text
+    assert "sk-proj" not in caplog.text
+    assert "secret objective" not in caplog.text
 
 
 @contextmanager
@@ -213,14 +340,6 @@ def _streaming_environment(adapter_cls=_FakeProgrammingCardSession):
             )
         )
         yield
-
-
-def _make_claude_handler():
-    handler = _make_handler()
-    handler.__class__ = ClaudeModeHandler
-    handler.mode_name = "Claude"
-    handler.interaction_mode = ClaudeModeHandler.interaction_mode
-    return handler
 
 
 def test_streaming_pending_plan_continues_on_same_session_and_finishes():
@@ -347,7 +466,7 @@ def test_non_streaming_second_pending_plan_renders_waiting_without_success():
         for element in card["body"]["elements"]
         if element.get("tag") == "markdown"
     )
-    assert "Tui2ACP · 等待用户确认" in markdown
+    assert "Claude · 等待用户确认" in markdown
     assert "自动续做已完成，仍需你的确认后才能继续" in markdown
     assert "仍有 1 个计划项未完成" in markdown
     handler.add_reaction.assert_not_called()
@@ -493,74 +612,6 @@ def test_provider_goal_after_finalization_fails_with_timeout_truth(
         assert "Codex Goal 已确认暂停" in adapter.failed_text
     else:
         assert "Codex Goal 已确认暂停" not in adapter.failed_text
-
-
-def test_tui2acp_terminal_state_prompt_error_ends_manager_session():
-    handler = _make_handler()
-    manager = MagicMock()
-    handler._get_session_manager = MagicMock(return_value=manager)
-
-    session = MagicMock()
-    session.session_id = "sid-1"
-    session.message_count = 1
-    session.send_prompt.side_effect = RuntimeError(
-        "Session sid-1 is in terminal state"
-    )
-
-    with (
-        patch("src.card.delivery.factory.create_card_delivery", return_value=MagicMock()),
-        patch("src.card.delivery.feishu_client.FeishuCardAPIClient", return_value=MagicMock()),
-        patch("src.card.session.CardSession", return_value=MagicMock()),
-        patch("src.card.session.factory.CardSessionFactory", return_value=MagicMock()),
-        patch("src.card.programming_adapter.ProgrammingCardSession", _FakeProgrammingCardSession),
-    ):
-        handler.handle_response(
-            "msg-1",
-            "chat-1",
-            "hello",
-            session,
-            None,
-            "/tmp",
-            "/tmp",
-        )
-
-    manager.end_session.assert_called_once_with(
-        "chat-1",
-        project_id=None,
-        thread_id=None,
-    )
-
-
-def test_terminal_state_prompt_error_does_not_end_regular_acp_session():
-    handler = _make_claude_handler()
-    manager = MagicMock()
-    handler._get_session_manager = MagicMock(return_value=manager)
-
-    session = MagicMock()
-    session.session_id = "sid-1"
-    session.message_count = 1
-    session.send_prompt.side_effect = RuntimeError(
-        "Session sid-1 is in terminal state"
-    )
-
-    with (
-        patch("src.card.delivery.factory.create_card_delivery", return_value=MagicMock()),
-        patch("src.card.delivery.feishu_client.FeishuCardAPIClient", return_value=MagicMock()),
-        patch("src.card.session.CardSession", return_value=MagicMock()),
-        patch("src.card.session.factory.CardSessionFactory", return_value=MagicMock()),
-        patch("src.card.programming_adapter.ProgrammingCardSession", _FakeProgrammingCardSession),
-    ):
-        handler.handle_response(
-            "msg-1",
-            "chat-1",
-            "hello",
-            session,
-            None,
-            "/tmp",
-            "/tmp",
-        )
-
-    manager.end_session.assert_not_called()
 
 
 def test_programming_handle_response_builds_channel_card_client():
@@ -793,3 +844,54 @@ def test_programming_timeout_fallback_keeps_earlier_main_transcript():
     fallback = handler.reply_text.call_args.args[1]
     assert "early-main-before-timeout" in fallback
     assert "stream deadline" in fallback
+
+
+@pytest.mark.parametrize(
+    "reconciliation_result",
+    [
+        TimeoutError("reconciliation deadline"),
+        PromptResult(stop_reason="timeout", text="reconciliation timed out"),
+    ],
+)
+def test_reconciliation_timeout_retirement_cannot_repersist_snapshot(
+    reconciliation_result: PromptResult | BaseException,
+) -> None:
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler._retire_finalization_session = MagicMock()
+    handler._clear_snapshot_for_session = MagicMock()
+    handler._update_snapshot_on_project = MagicMock()
+    project = MagicMock()
+    project.project_name = "ghostAp"
+    project.root_path = "/tmp/ghostAp"
+    project.project_id = "project-1"
+    child_running = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="review-running",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+    session = _QueuedPromptSession(child_running, reconciliation_result)
+
+    with _streaming_environment():
+        handler.handle_response(
+            "msg-reconciliation-timeout",
+            "chat-1",
+            "finish the task",
+            session,
+            project,
+            "/tmp",
+            "/tmp",
+        )
+
+    handler._retire_finalization_session.assert_called_once()
+    handler._update_snapshot_on_project.assert_not_called()
+    assert handler._clear_snapshot_for_session.call_count >= 2

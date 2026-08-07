@@ -129,13 +129,6 @@ SELECT_ACP_MODEL_PROFILE = "select_acp_model_profile"  # Profile dropdown change
 SELECT_ACP_MODEL_EFFORT = "select_acp_model_effort"  # Effort dropdown change
 
 # ---------------------------------------------------------------------------
-# Tui2ACP actions
-# ---------------------------------------------------------------------------
-SELECT_TUI2ACP_ADAPTER = "select_tui2acp_adapter"  # Select a tui2acp adapter
-SELECT_TUI2ACP_CUSTOM_COMMAND = "select_tui2acp_custom_command"  # Custom command for tui2acp
-SHOW_TUI2ACP_MENU = "show_tui2acp_menu"  # Show tui2acp adapter selection menu
-
-# ---------------------------------------------------------------------------
 # Slock actions
 # ---------------------------------------------------------------------------
 SLOCK_NEW_ROLE_SELECT_TOOL = "slock_new_role_select_tool"  # Select a tool while creating a Slock role

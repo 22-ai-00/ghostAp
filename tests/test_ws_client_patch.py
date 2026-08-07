@@ -1162,8 +1162,6 @@ class TestThreadPersistentProgramming(unittest.TestCase):
             ("gemini", "/enter_gemini"),
             ("traex", "/traex"),
             ("traex", "/enter_traex"),
-            ("tui2acp", "/tui2acp"),
-            ("tui2acp", "/enter_tui2acp"),
         )
         for mode, command in cases:
             with self.subTest(mode=mode, command=command):

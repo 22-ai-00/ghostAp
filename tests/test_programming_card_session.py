@@ -112,7 +112,6 @@ class TestBuildProgrammingMetadata:
             "codex",
             "gemini",
             "traex",
-            "tui2acp",
         ]
         for mode in modes:
             meta = build_programming_metadata(mode)
@@ -3084,6 +3083,70 @@ class TestNonStreamingFallback:
         )
 
         assert session._force_dead is True
+        handler.reply_card.assert_called_once()
+
+    def test_non_streaming_exception_retries_force_dead_session_retirement(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from src.feishu.handlers.programming import ProgrammingModeHandler
+
+        class Session:
+            _force_dead = False
+
+        session = Session()
+        retire = MagicMock(
+            side_effect=[
+                RuntimeError("first retirement lock unavailable"),
+                None,
+            ]
+        )
+        handler = SimpleNamespace(
+            settings=SimpleNamespace(
+                coco_execution_timeout=60,
+                claude_execution_timeout=60,
+                programming_finalization_reserve_s=0,
+                repo_lock_hard_timeout=120,
+            ),
+            is_coco=True,
+            mode_name="Coco",
+            upload_acp_image=MagicMock(),
+            reply_card=MagicMock(),
+            reply_text=MagicMock(),
+            add_reaction=MagicMock(),
+            _replace_timed_out_session=MagicMock(),
+            _retire_finalization_session=retire,
+        )
+
+        def fail_initial_retirement(
+            active,
+            _text,
+            *,
+            retire_finalization_session,
+            **_kwargs,
+        ):
+            active._force_dead = True
+            retire_finalization_session(active, 1.0)
+
+        with patch(
+            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            side_effect=fail_initial_retirement,
+        ):
+            ProgrammingModeHandler._handle_response_non_streaming(
+                handler,
+                "message-1",
+                "chat-1",
+                "reconcile child",
+                session,
+                None,
+                "/workspace",
+            )
+
+        assert retire.call_count == 2
+        assert all(
+            call.kwargs["active_session"] is session
+            for call in retire.call_args_list
+        )
         handler.reply_card.assert_called_once()
 
     def test_result_text_used_as_primary_response(self):

@@ -705,51 +705,6 @@ def _resolve_with_auto_update(command: str) -> bool:
     return False
 
 
-@lru_cache(maxsize=1)
-def _resolve_tui2acp_adapters_dir() -> Optional[str]:
-    """Locate tui2acp's bundled adapter YAML directory.
-
-    The built-in declarative adapter registry inside tui2acp ships incomplete
-    configs (missing `states`) that crash at construction time for adapters
-    like pi-coding-agent / aichat / sgpt / open-interpreter. The package's
-    `adapters/` directory contains complete YAML configs; we point tui2acp at
-    them via `--adapters-dir` to override the broken built-ins.
-    """
-    import os
-    import shutil
-
-    from ..utils.env import build_clean_env
-
-    _augmented_path = build_clean_env().get("PATH", "")
-
-    # 1. Resolve via the tui2acp executable's npm install location.
-    bin_path = shutil.which("tui2acp", path=_augmented_path)
-    if bin_path:
-        try:
-            real = os.path.realpath(bin_path)
-            # Typical layouts:
-            #   <prefix>/lib/node_modules/tui2acp/dist/cli.js (real)
-            #   <prefix>/lib/node_modules/tui2acp/adapters/  (target)
-            pkg_root = os.path.dirname(os.path.dirname(real))
-            candidate = os.path.join(pkg_root, "adapters")
-            if os.path.isdir(candidate):
-                return candidate
-        except Exception:
-            logger.debug("tui2acp adapters-dir resolve via realpath failed", exc_info=True)
-
-    # 2. Fallback: probe common npm-global install locations.
-    home = os.path.expanduser("~")
-    for prefix in (
-        os.path.join(home, ".npm-global"),
-        "/opt/homebrew",
-        "/usr/local",
-    ):
-        candidate = os.path.join(prefix, "lib", "node_modules", "tui2acp", "adapters")
-        if os.path.isdir(candidate):
-            return candidate
-    return None
-
-
 def resolve_agent_spec(agent_type: str, model_name: Optional[str] = None) -> tuple[str, list[str]]:
     """Resolve (command, args) for spawning an ACP agent process over stdio."""
     agent_type = (agent_type or "").lower()
@@ -758,41 +713,6 @@ def resolve_agent_spec(agent_type: str, model_name: Optional[str] = None) -> tup
     override_cmd, override_args = settings.get_acp_command(agent_type)
     if override_cmd:
         return override_cmd, override_args
-
-    if agent_type.startswith("tui2acp_"):
-        import shutil
-
-        from ..utils.env import build_clean_env
-
-        _augmented_path = build_clean_env().get("PATH", "")
-        if not shutil.which("tui2acp", path=_augmented_path):
-            raise AgentSpecResolveError(
-                "tui2acp 未安装或不在 PATH 中，请运行: npm install -g tui2acp",
-                agent_cmd="tui2acp",
-                agent_args=[],
-            )
-        adapter_name = agent_type[len("tui2acp_"):]
-
-        # Custom command mode: "custom:<full command>"
-        if adapter_name.startswith("custom:"):
-            custom_cmd = adapter_name[len("custom:"):]
-            # First word is the agent name for tui2acp
-            parts = custom_cmd.split()
-            agent_name = parts[0] if parts else "custom"
-            args = ["--agent", agent_name, "--unsafe", "--minimal"]
-            adapters_dir = _resolve_tui2acp_adapters_dir()
-            if adapters_dir:
-                args.extend(["--adapters-dir", adapters_dir])
-            return "tui2acp", args
-
-        args = ["--adapter", adapter_name, "--unsafe", "--minimal"]
-        # tui2acp's built-in declarative adapter registry has incomplete
-        # configs (missing `states`) that crash on construction. Force loading
-        # the bundled adapter YAML files so adapter configs are complete.
-        adapters_dir = _resolve_tui2acp_adapters_dir()
-        if adapters_dir:
-            args.extend(["--adapters-dir", adapters_dir])
-        return "tui2acp", args
 
     # Delegate to ToolRegistry for registered tools, or fallback.
     # NOTE: this also triggers a best-effort async preheat so that common

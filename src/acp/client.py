@@ -943,30 +943,68 @@ def _is_todo_tool(title: str, raw_input: Any) -> bool:
     return False
 
 
-def _codex_namespaced_metadata(update: Any) -> tuple[dict, dict]:
-    """Return normalized Codex subagent/collaboration metadata containers."""
+def _codex_namespaced_metadata(update: Any) -> tuple[dict, dict, bool]:
+    """Return Codex child metadata plus a durable malformed-container flag."""
     meta = getattr(update, "field_meta", None) or getattr(update, "_meta", None)
     if not isinstance(meta, Mapping):
-        return {}, {}
+        return {}, {}, False
+    if "codex" not in meta:
+        return {}, {}, False
     codex = meta.get("codex")
     if not isinstance(codex, Mapping):
-        return {}, {}
+        return {}, {}, True
     subagent = codex.get("subagent")
     collaboration = codex.get("collaboration")
+    malformed = (
+        (
+            "subagent" in codex
+            and (
+                not isinstance(subagent, Mapping)
+                or not subagent
+            )
+        )
+        or (
+            "collaboration" in codex
+            and (
+                not isinstance(collaboration, Mapping)
+                or not collaboration
+            )
+        )
+    )
+    if isinstance(collaboration, Mapping):
+        raw_tool = collaboration.get("tool")
+        if not isinstance(raw_tool, str) or not raw_tool.strip():
+            malformed = True
     return (
         dict(subagent) if isinstance(subagent, Mapping) else {},
         dict(collaboration) if isinstance(collaboration, Mapping) else {},
+        malformed,
     )
 
 
 def _parse_subagent_metadata(update: Any) -> tuple[str, str, str]:
     """Extract the stable child thread, display path, and lifecycle activity."""
-    subagent, _ = _codex_namespaced_metadata(update)
+    subagent, _, _ = _codex_namespaced_metadata(update)
     if not subagent:
         return "", "", ""
-    source_id = str(subagent.get("threadId") or "").strip()
-    path = str(subagent.get("path") or "").strip()
-    activity = str(subagent.get("activity") or "").strip().lower()
+    raw_source_id = subagent.get("threadId")
+    raw_path = subagent.get("path")
+    raw_activity = subagent.get("activity")
+    source_id = (
+        raw_source_id.strip()
+        if isinstance(raw_source_id, str)
+        else ""
+    )
+    path = raw_path.strip() if isinstance(raw_path, str) else ""
+    activity = (
+        raw_activity.strip().casefold()
+        if isinstance(raw_activity, str)
+        else "malformed"
+        if raw_activity is not None
+        else ""
+    )
+    if not source_id and not activity:
+        activity = "malformed"
     return source_id, path, activity
 
 
@@ -975,21 +1013,31 @@ def _parse_collaboration_metadata(
     raw_input: Any,
 ) -> tuple[str, tuple[str, ...], str, tuple[dict, ...]]:
     """Normalize Codex collaboration state without exposing provider ids."""
-    _, collaboration = _codex_namespaced_metadata(update)
+    _, collaboration, _ = _codex_namespaced_metadata(update)
     if not collaboration:
         return "", (), "", ()
 
-    tool = str(collaboration.get("tool") or "").strip()
-    raw_receivers = collaboration.get("receiverThreadIds")
-    if not isinstance(raw_receivers, (list, tuple)) and isinstance(raw_input, Mapping):
-        raw_receivers = raw_input.get("receiverThreadIds")
-    if not isinstance(raw_receivers, (list, tuple)):
-        raw_receivers = ()
-    receivers = tuple(
-        value
-        for item in (raw_receivers or ())
-        if (value := str(item or "").strip())
-    )
+    raw_tool = collaboration.get("tool")
+    tool = raw_tool.strip() if isinstance(raw_tool, str) else ""
+    receiver_containers: list[object] = []
+    if "receiverThreadIds" in collaboration:
+        receiver_containers.append(collaboration.get("receiverThreadIds"))
+    if isinstance(raw_input, Mapping) and "receiverThreadIds" in raw_input:
+        receiver_containers.append(raw_input.get("receiverThreadIds"))
+    receiver_malformed = False
+    normalized_receivers: list[str] = []
+    for raw_receivers in receiver_containers:
+        if not isinstance(raw_receivers, (list, tuple)):
+            receiver_malformed = True
+            continue
+        for item in raw_receivers:
+            if not isinstance(item, str) or not item.strip():
+                receiver_malformed = True
+                continue
+            receiver = item.strip()
+            if receiver not in normalized_receivers:
+                normalized_receivers.append(receiver)
+    receivers = tuple(normalized_receivers)
 
     model = ""
     raw_states: Any = None
@@ -999,7 +1047,17 @@ def _parse_collaboration_metadata(
 
     states: list[dict] = []
     if isinstance(raw_states, Mapping):
-        normalized_states = {str(key): value for key, value in raw_states.items()}
+        normalized_states: dict[str, object] = {}
+        malformed_identity = False
+        for raw_source_id, raw_state in raw_states.items():
+            if not isinstance(raw_source_id, str) or not raw_source_id.strip():
+                malformed_identity = True
+                continue
+            source_id = raw_source_id.strip()
+            if source_id in normalized_states:
+                malformed_identity = True
+                continue
+            normalized_states[source_id] = raw_state
         ordered_ids = list(receivers)
         ordered_ids.extend(
             source_id
@@ -1007,16 +1065,65 @@ def _parse_collaboration_metadata(
             if source_id not in ordered_ids
         )
         for source_id in ordered_ids:
-            raw_state = normalized_states.get(source_id)
-            if not isinstance(raw_state, Mapping):
+            if source_id not in normalized_states:
+                states.append(
+                    {
+                        "source_id": source_id,
+                        "status": "pending",
+                        "message": "",
+                    }
+                )
                 continue
+            raw_state = normalized_states[source_id]
+            if not isinstance(raw_state, Mapping):
+                states.append(
+                    {
+                        "source_id": source_id,
+                        "status": "malformed",
+                        "message": "",
+                    }
+                )
+                continue
+            raw_status = raw_state.get("status")
             states.append(
                 {
                     "source_id": source_id,
-                    "status": str(raw_state.get("status") or "").strip(),
+                    "status": (
+                        raw_status.strip()
+                        if isinstance(raw_status, str)
+                        else "malformed"
+                        if raw_status is not None
+                        else ""
+                    ),
                     "message": str(raw_state.get("message") or "").strip(),
                 }
             )
+        if malformed_identity:
+            states.append(
+                {"source_id": "", "status": "malformed", "message": ""}
+            )
+    elif raw_states is None:
+        states.extend(
+            {"source_id": source_id, "status": "pending", "message": ""}
+            for source_id in receivers
+        )
+    else:
+        states.extend(
+            {"source_id": source_id, "status": "malformed", "message": ""}
+            for source_id in receivers
+        )
+        if not receivers:
+            states.append(
+                {"source_id": "", "status": "malformed", "message": ""}
+            )
+    if receiver_malformed:
+        malformed_receiver = {
+            "source_id": "",
+            "status": "malformed",
+            "message": "",
+        }
+        if malformed_receiver not in states:
+            states.append(malformed_receiver)
     return tool, receivers, model, tuple(states)
 
 
@@ -1033,6 +1140,7 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
     subagent_source_id, subagent_path, subagent_activity = (
         _parse_subagent_metadata(update)
     )
+    _, _, child_metadata_malformed = _codex_namespaced_metadata(update)
     (
         collaboration_tool,
         collaboration_receivers,
@@ -1171,6 +1279,7 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
         collaboration_receivers=collaboration_receivers,
         collaboration_model=collaboration_model or None,
         subagent_states=subagent_states,
+        child_metadata_malformed=child_metadata_malformed,
     )
 
 
