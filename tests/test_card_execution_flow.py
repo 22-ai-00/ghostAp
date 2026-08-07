@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import render_card
-from src.card.state.models import CardMetadata, CardState, ContentBlock
+from src.card.state.models import CardMetadata, CardState, ContentBlock, FooterState
 
 
 def _body(state: CardState) -> list[dict]:
@@ -16,7 +16,12 @@ def _execution_elements(body: list[dict]) -> list[dict]:
     return [
         element
         for element in body
-        if "执行记录" in str(element) or "正在分析" in str(element) or "正在调用" in str(element)
+        if (
+            "执行记录" in str(element)
+            or "正在分析" in str(element)
+            or "正在调用" in str(element)
+            or "执行中" in str(element)
+        )
     ]
 
 
@@ -82,8 +87,81 @@ def test_running_programming_card_shows_active_command_as_current_action():
 
     assert len(elements) == 1
     assert elements[0]["tag"] == "column_set"
-    assert "正在调用 Bash" in str(elements[0])
-    assert "pytest tests/test_card_renderer.py" in str(elements[0])
+    content = elements[0]["columns"][0]["elements"][0]["content"]
+    assert content.splitlines() == [
+        "⚙️ **运行测试**",
+        "🔧 **执行中**：uv run python -m pytest tests/test_card_renderer.py -q",
+    ]
+
+
+def test_raw_command_title_is_shown_once_as_full_command_after_short_action():
+    command = (
+        "UV_CACHE_DIR=/tmp/ghostap-uv-cache uv run python -m pytest "
+        "tests/test_card_execution_flow.py tests/test_footer_v2.py -q "
+        "-k 'command or footer'"
+    )
+    state = CardState(
+        blocks=(
+            ContentBlock(
+                kind="tool_call",
+                block_id="t-command",
+                status="active",
+                tool_name=command,
+                tool_input=command,
+                is_latest_active=True,
+            ),
+        ),
+        footer=FooterState(
+            status="tool_running",
+            status_text=f"🔧 执行中: {command}",
+        ),
+        metadata=CardMetadata(
+            mode_name="Codex",
+            tool_name="codex",
+            engine_type=None,
+        ),
+    )
+
+    body = _body(state)
+    current = next(
+        element
+        for element in body
+        if element.get("tag") == "column_set" and "执行中" in str(element)
+    )
+    content = current["columns"][0]["elements"][0]["content"]
+
+    assert content.startswith("⚙️ **运行测试**\n🔧 **执行中**：")
+    assert str(body).count(command) == 1
+    assert "正在调用" not in content
+
+
+def test_phase_like_tool_title_is_not_duplicated_or_left_in_footer():
+    state = CardState(
+        blocks=(
+            ContentBlock(
+                kind="tool_call",
+                block_id="t-compact",
+                status="active",
+                tool_name="Context compacting",
+                tool_input="Context compacting",
+                is_latest_active=True,
+            ),
+        ),
+        footer=FooterState(
+            status="tool_running",
+            status_text="🔧 执行中: Context compacting",
+        ),
+        metadata=CardMetadata(
+            mode_name="Codex",
+            tool_name="codex",
+            engine_type=None,
+        ),
+    )
+
+    body = _body(state)
+
+    assert str(body).count("Context compacting") == 1
+    assert str(body).count("执行中") == 0
 
 
 def test_execution_history_does_not_mark_an_older_active_tool_completed():

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>普通编程任务可见性预览</title>
+  <style>
+    :root { --ink:#17202a; --muted:#68717d; --paper:#fffdf7; --line:#ddd6c7; --blue:#1769aa; --blue-soft:#eaf5ff; --amber:#9a5b00; --amber-soft:#fff4da; --green:#18794e; --gray-soft:#f1f2f4; }
+    * { box-sizing: border-box; }
+    body { margin:0; color:var(--ink); background:radial-gradient(circle at 12% 8%,#d9eefc 0 9%,transparent 30%),radial-gradient(circle at 90% 88%,#f8dfae 0 8%,transparent 28%),#edf0eb; font-family:"Avenir Next","PingFang SC","Microsoft YaHei",sans-serif; }
+    main { width:min(1080px,calc(100% - 28px)); margin:36px auto; }
+    h1 { margin:0 0 8px; font-family:"Iowan Old Style","Songti SC",serif; font-size:clamp(28px,5vw,48px); letter-spacing:-.03em; }
+    .lede { margin:0 0 24px; color:var(--muted); }
+    .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px; }
+    .card { overflow:hidden; border:1px solid rgba(23,32,42,.13); border-radius:20px; background:var(--paper); box-shadow:0 18px 48px rgba(23,32,42,.12); }
+    .card header { padding:18px 20px; color:white; background:linear-gradient(110deg,#155f96,#228ac0); }
+    .card.failed header { background:linear-gradient(110deg,#7e2f2f,#b24a38); }
+    .card h2 { margin:0; font-size:18px; }
+    .body { padding:18px; }
+    .action,.panel { border:1px solid var(--line); border-radius:14px; padding:14px 16px; }
+    .action { margin-bottom:14px; border-color:#a8d4ed; background:var(--blue-soft); }
+    .action strong { color:var(--blue); }
+    .command { margin-top:9px; overflow-wrap:anywhere; font-family:"SFMono-Regular",Consolas,monospace; font-size:12px; line-height:1.55; }
+    .panel { border-color:#dfad57; background:var(--amber-soft); }
+    .panel-title { color:var(--amber); font-weight:700; }
+    .task { display:grid; grid-template-columns:auto 1fr; gap:9px; padding:11px 0; border-bottom:1px dashed rgba(154,91,0,.25); }
+    .task:last-child { border-bottom:0; }
+    .task-title { font-weight:650; }
+    .meta,.result,footer { color:var(--muted); font-size:12px; line-height:1.55; }
+    .result { margin-top:3px; }
+    .status { display:inline-block; margin-right:6px; padding:2px 7px; border-radius:99px; background:white; font-size:11px; }
+    .done { color:var(--green); }
+    .cancelled { color:#5d6570; background:var(--gray-soft); }
+    footer { margin-top:16px; padding-top:13px; border-top:1px solid var(--line); }
+    .note { margin-top:20px; padding:14px 16px; border-left:4px solid var(--blue); background:rgba(255,255,255,.7); }
+    @media (max-width:760px) { main { margin:22px auto; } .grid { grid-template-columns:1fr; } .card { border-radius:16px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>任务进展要能解释结果</h1>
+    <p class="lede">普通编程主卡：当前命令只出现一次，子任务同时说明“做什么、到哪一步、为何未完成”。</p>
+    <section class="grid">
+      <article class="card">
+        <header><h2>正在执行</h2></header>
+        <div class="body">
+          <section class="action">
+            <strong>⚙️ 运行针对性测试</strong>
+            <div class="command">🔧 执行中：UV_CACHE_DIR=/tmp/ghostap-uv-cache uv run python -m pytest tests/test_card_execution_flow.py tests/test_footer_v2.py -q</div>
+          </section>
+          <section class="panel">
+            <div class="panel-title">🟠 并行子任务 · 2 个 · 运行中 1 / 完成 1</div>
+            <div class="task"><span>🟠</span><div><div class="task-title"><span class="status">执行中</span>分析最近一次失败日志</div><div class="meta">#1.a · 子代理 · gpt-5.6-sol/ultra</div><div class="result">进展：已定位到 ACP 收尾阶段</div></div></div>
+            <div class="task"><span>✅</span><div><div class="task-title"><span class="status done">已完成</span>核对卡片重复渲染</div><div class="meta">#1.b · 子代理 · gpt-5.6-sol/ultra</div><div class="result">结果：确认同一工具状态被正文和页脚重复展示</div></div></div>
+          </section>
+          <footer>📂 ~/work/github/ghostAp<br>🔧 codex · 🧩 gpt-5.6-sol/ultra · ⏱ 用时 00:33:39</footer>
+        </div>
+      </article>
+      <article class="card failed">
+        <header><h2>任务已停止</h2></header>
+        <div class="body">
+          <section class="panel">
+            <div class="panel-title">⚪ 并行子任务 · 2 个 · 完成 1 / 取消 1</div>
+            <div class="task"><span>⚪</span><div><div class="task-title"><span class="status cancelled">已取消</span>审查子代理终态归并修复</div><div class="meta">#2.f · 子代理 · gpt-5.6-sol/ultra</div><div class="result">结果：未收到最终结果，已随主任务停止</div></div></div>
+            <div class="task"><span>✅</span><div><div class="task-title"><span class="status done">已完成</span>任务说明暂缺</div><div class="meta">#2.e · 子代理 · gpt-5.6-sol/ultra</div><div class="result">结果：provider 未返回可展示的任务标题</div></div></div>
+          </section>
+          <footer>📂 ~/work/github/ghostAp<br>🔧 codex · 🧩 gpt-5.6-sol/ultra · ⏱ 用时 01:59:38</footer>
+        </div>
+      </article>
+    </section>
+    <p class="note">终态卡不再显示残留的 Context compacting 或“执行中”；内部 snake_case 标题会转换为可读短语，但不会伪造不存在的任务说明。</p>
+  </main>
+</body>
+</html>

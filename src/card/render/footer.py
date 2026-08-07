@@ -206,7 +206,13 @@ def render_now_tool_hint(tool) -> str:
     payload = _tool_payload(tool)
     brief_fn = _TOOL_BRIEF.get(name)
     brief = brief_fn(payload) if brief_fn else name
+    if brief.casefold() == name.casefold():
+        return f"⚙ **{name}**"
     return f"⚙ **{name}** · {brief}"
+
+
+def _uses_unified_execution_flow(state: CardState) -> bool:
+    return not state.metadata.is_subagent and state.metadata.engine_type is None
 
 
 def render_subagent_badge(metadata: CardMetadata) -> str:
@@ -226,7 +232,10 @@ def build_footer_atoms(state: CardState) -> list[RenderAtom]:
     atoms: list[RenderAtom] = []
 
     # Child cards already show their active action and relationship above.
-    if not state.metadata.is_subagent:
+    if (
+        not state.metadata.is_subagent
+        and not _uses_unified_execution_flow(state)
+    ):
         running_tool = _find_running_tool(state)
         tool_hint = render_now_tool_hint(running_tool)
         if tool_hint:
@@ -268,9 +277,16 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
         state,
         is_final_terminal=is_final_terminal,
     )
+    uses_unified_execution = _uses_unified_execution_flow(state)
+    hide_tool_status = (
+        uses_unified_execution
+        and state.footer.status == "tool_running"
+    )
 
     # Determine if we have any status/progress content to show
-    has_status_content = state.footer.status is not None
+    has_status_content = (
+        state.footer.status is not None and not hide_tool_status
+    )
     # Also render footer for terminal states (tool/model/duration)
     has_meta_content = bool(
         state.metadata.tool_name
@@ -279,7 +295,9 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
         or elapsed_seconds is not None
     )
     # Check for active tool hint
-    running_tool = _find_running_tool(state)
+    running_tool = (
+        None if uses_unified_execution else _find_running_tool(state)
+    )
     tool_hint = (
         render_now_tool_hint(running_tool)
         if running_tool and not state.metadata.is_subagent
@@ -311,7 +329,7 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
             {"tag": "markdown", "content": tool_hint, "text_size": "notation"}
         )
 
-    status_text = state.footer.status_text or ""
+    status_text = "" if hide_tool_status else (state.footer.status_text or "")
     if state.metadata.is_subagent:
         display_terminal = "archived" if state.metadata.frozen else state.terminal
         status_text = _SUBTASK_TERMINAL_STATUS.get(
@@ -454,6 +472,8 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
 
 
 def _find_running_tool(state: CardState) -> ContentBlock | None:
+    if state.terminal in _FINAL_TERMINAL_STATUSES:
+        return None
     for block in reversed(state.blocks):
         if getattr(block, "kind", "") != "tool_call":
             continue

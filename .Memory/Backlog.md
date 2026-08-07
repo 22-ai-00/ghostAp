@@ -28,4 +28,7 @@
 | B059 | 2026-08-05 | `SlockHandler._has_slock_permission()` 标注返回 `bool`，但配置管理员且 sender 为空时会因布尔表达式返回空字符串；当前调用方均按 truthiness 使用且保持拒绝，后续应显式 `bool(...)` 收紧类型合同。 | Low | 测试资产深度精简审计 | Open | — |
 | B060 | 2026-08-05 | `FeishuCardAPIClient` 为 CardKit 实体路由新增的进程内 ID 集合尚无有界生命周期，`card.update` 的 sequence conflict / 普通运输失败也缺直接错误映射回归；后续以有界路由注册表取代集合并补参数化故障注入。 | Low | Deep 消息洪泛终审 | Open | — |
 
+| B061 | 2026-08-07 | 普通编程首轮耗尽约 6600 秒后虽进入预留收尾，但 provider 可把剩余约 600 秒全部用于上下文压缩，仍未返回最终答复。调整 reserve 会压缩主执行预算，单次日志不足以证明安全阈值；需增加 finalization 阶段耗时/事件观测并基于多次样本设计自适应收尾预算。 | Medium | 普通编程超时日志复盘 | Open | — |
+| B062 | 2026-08-07 | SandboxExecutor 日志曾发现仓库由聊天 A 持锁却为聊天 B 执行的告警，发生于另一仓库且未证明与本次卡片问题相关；需定位漏加 repo lock 的 handler 并补跨聊天隔离回归。 | Medium | 普通编程日志复盘 | Open | — |
+
 > **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。强化多副本档的外部验收条件由 [employee runtime profiles ADR](../docs/adr-employee-runtime-profiles.md) 持续承载，不作为本地代码已证明能力。

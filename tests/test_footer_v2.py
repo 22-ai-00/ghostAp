@@ -133,7 +133,7 @@ def test_now_tool_hint_for_grep_pattern():
 def test_now_tool_hint_unknown_tool_falls_back_to_name():
     line = render_now_tool_hint(_tool("MysteryTool"))
 
-    assert line == "⚙ **MysteryTool** · MysteryTool"
+    assert line == "⚙ **MysteryTool**"
 
 
 def test_now_tool_hint_none_when_no_running_tool():
@@ -146,16 +146,67 @@ def test_now_tool_hint_none_when_no_running_tool():
 # --- Footer renders ⚙ tool hint for active tools (v2) ---
 
 
-def test_footer_renders_now_tool_hint_for_running_tool():
-    """Footer should show ⚙ **tool** hint when an active tool exists."""
+def test_engine_footer_renders_now_tool_hint_for_running_tool():
+    """Engine footer keeps its tool hint because it has no unified execution flow."""
     state = CardState(
         blocks=(_tool("Bash", tool_input='{"command": "uv run pytest"}'),),
         footer=FooterState(status="tool_running", status_text="执行中"),
+        metadata=CardMetadata(engine_type="deep"),
     )
 
     elements = render_footer(state)
 
     assert any("⚙ **Bash**" in el.get("content", "") for el in elements)
+
+
+def test_programming_footer_omits_current_tool_owned_by_execution_flow():
+    command = "uv run python -m pytest tests/test_footer_v2.py -q"
+    state = CardState(
+        blocks=(_tool(command, tool_input=command),),
+        footer=FooterState(
+            status="tool_running",
+            status_text=f"🔧 执行中: {command}",
+        ),
+        metadata=CardMetadata(
+            tool_name="codex",
+            model_name="gpt-5",
+            engine_type=None,
+        ),
+    )
+
+    content = "\n".join(
+        element.get("content", "")
+        for element in render_footer(state)
+        if element.get("tag") == "markdown"
+    )
+
+    assert "⚙" not in content
+    assert "执行中" not in content
+    assert command not in content
+    assert "🔧 codex · 🧩 gpt-5" in content
+
+
+def test_terminal_footer_never_shows_stale_active_tool():
+    state = CardState(
+        blocks=(_tool("Context compacting", tool_input="Context compacting"),),
+        terminal="failed",
+        footer=FooterState(
+            status="tool_running",
+            status_text="🔧 执行中: Context compacting",
+            duration_seconds=120,
+        ),
+        metadata=CardMetadata(tool_name="codex", engine_type=None),
+    )
+
+    content = "\n".join(
+        element.get("content", "")
+        for element in render_footer(state)
+        if element.get("tag") == "markdown"
+    )
+
+    assert "Context compacting" not in content
+    assert "执行中" not in content
+    assert "⏱ 用时 00:02:00" in content
 
 
 def test_frozen_footer_continuation():
@@ -452,6 +503,7 @@ def test_footer_tool_hint_bash_shows_command():
     state = CardState(
         blocks=(_tool("Bash", tool_input='{"command": "npm run build"}'),),
         footer=FooterState(status="tool_running", status_text="执行中"),
+        metadata=CardMetadata(engine_type="deep"),
     )
 
     elements = render_footer(state)

@@ -45,6 +45,49 @@ def _promote_last_active_tool(blocks: tuple) -> tuple:
     return updated
 
 
+def _replace_tool_blocks(
+    blocks: tuple,
+    *,
+    block_id: str,
+    replacement: ToolBlock,
+) -> tuple:
+    """Collapse every copy of one logical tool call into one block."""
+    updated: list = []
+    inserted = False
+    for block in blocks:
+        if (
+            block.kind == "tool_call"
+            and getattr(block, "block_id", "") == block_id
+        ):
+            if not inserted:
+                updated.append(replacement)
+                inserted = True
+            continue
+        updated.append(block)
+    if not inserted:
+        updated.append(replacement)
+    return tuple(updated)
+
+
+def _footer_for_active_tools(footer, blocks: tuple):
+    active = next(
+        (
+            block
+            for block in reversed(blocks)
+            if block.kind == "tool_call" and block.status == "active"
+        ),
+        None,
+    )
+    if active is None:
+        return replace(footer, status=None, status_text=None)
+    tool_name = active.tool_name or "工具"
+    return replace(
+        footer,
+        status="tool_running",
+        status_text=UI_TEXT["card_tool_running"].format(tool_name=tool_name),
+    )
+
+
 def reduce_tool(state: CardState, event: CardEvent) -> CardState:
     """Handle TOOL_STARTED / TOOL_DELTA / TOOL_DONE / TOOL_FAILED."""
     match event.type:
@@ -52,14 +95,41 @@ def reduce_tool(state: CardState, event: CardEvent) -> CardState:
             block_id = event.payload.get("block_id", "")
             tool_name = event.payload.get("tool_name", "")
             tool_input = event.payload.get("tool_input", "")
-            new_block = ToolBlock(
-                block_id=block_id, status="active",
-                tool_name=tool_name, tool_input=tool_input, content="",
-                is_latest_active=True,
+            idx = state.block_index.get(block_id)
+            existing = (
+                state.blocks[idx]
+                if (
+                    idx is not None
+                    and idx < len(state.blocks)
+                    and state.blocks[idx].kind == "tool_call"
+                )
+                else None
             )
-            blocks = _demote_latest_tool_blocks(state.blocks) + (new_block,)
-            footer = replace(state.footer, status="tool_running",
-                             status_text=UI_TEXT["card_tool_running"].format(tool_name=tool_name))
+            if existing is not None and existing.status != "active":
+                return state
+            if existing is None:
+                new_block = ToolBlock(
+                    block_id=block_id,
+                    status="active",
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    content="",
+                    is_latest_active=True,
+                )
+            else:
+                new_block = replace(
+                    existing,
+                    status="active",
+                    tool_name=tool_name or existing.tool_name,
+                    tool_input=tool_input or existing.tool_input,
+                    is_latest_active=True,
+                )
+            blocks = _replace_tool_blocks(
+                _demote_latest_tool_blocks(state.blocks),
+                block_id=block_id,
+                replacement=new_block,
+            )
+            footer = _footer_for_active_tools(state.footer, blocks)
             return replace(state, blocks=blocks, footer=footer)
 
         case CardEventType.TOOL_DELTA:
@@ -98,11 +168,15 @@ def reduce_tool(state: CardState, event: CardEvent) -> CardState:
                             tool_summary = str(b.tool_summary).strip()
                 updated = replace(b, status="completed", is_latest_active=False,
                                      tool_output=tool_output, tool_summary=tool_summary)
-                blocks = state.blocks[:idx] + (updated,) + state.blocks[idx + 1:]
+                blocks = _replace_tool_blocks(
+                    state.blocks,
+                    block_id=block_id,
+                    replacement=updated,
+                )
                 blocks = _promote_last_active_tool(blocks)
-                footer = replace(state.footer, status=None, status_text=None)
+                footer = _footer_for_active_tools(state.footer, blocks)
                 return replace(state, blocks=blocks, footer=footer)
-            footer = replace(state.footer, status=None, status_text=None)
+            footer = _footer_for_active_tools(state.footer, state.blocks)
             return replace(state, footer=footer)
 
         case CardEventType.TOOL_FAILED:
@@ -113,11 +187,15 @@ def reduce_tool(state: CardState, event: CardEvent) -> CardState:
             if idx is not None and idx < len(state.blocks) and state.blocks[idx].kind == "tool_call":
                 b = state.blocks[idx]
                 updated = replace(b, status="failed", tool_output=error, is_latest_active=False)
-                blocks = state.blocks[:idx] + (updated,) + state.blocks[idx + 1:]
+                blocks = _replace_tool_blocks(
+                    state.blocks,
+                    block_id=block_id,
+                    replacement=updated,
+                )
                 blocks = _promote_last_active_tool(blocks)
-                footer = replace(state.footer, status=None, status_text=None)
+                footer = _footer_for_active_tools(state.footer, blocks)
                 return replace(state, blocks=blocks, footer=footer)
-            footer = replace(state.footer, status=None, status_text=None)
+            footer = _footer_for_active_tools(state.footer, state.blocks)
             return replace(state, footer=footer)
 
     return state

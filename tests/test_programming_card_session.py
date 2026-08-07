@@ -2462,9 +2462,12 @@ class TestProgrammingCardSession:
 
         pcs.finish()
 
-        assert pcs.session.state.metadata.subagents[0]["status"] == "cancelled"
+        summary = pcs.session.state.metadata.subagents[0]
+        assert summary["status"] == "cancelled"
+        assert summary["progress"] == "未收到最终结果，已随主任务停止"
         body = str(render_card(pcs.session.state, RenderBudget())[0]._card_json["body"]["elements"])
-        assert "⚪ 实现后端接口" in body
+        assert "**已取消** · 实现后端接口" in body
+        assert "结果：未收到最终结果，已随主任务停止" in body
         assert "取消 1" in body
         assert "完成 1" not in body
 
@@ -2509,7 +2512,7 @@ class TestProgrammingCardSession:
             )[0]._card_json["body"]["elements"]
         )
         assert pcs.session.state.terminal == "running"
-        assert "❌ 验证终态交付" in body
+        assert "❌ **失败** · 验证终态交付" in body
         assert "原因：backend timed out while waiting for final card" in body
 
     def test_subagent_panel_sanitizes_untrusted_label_at_render_boundary(self):
@@ -2594,7 +2597,8 @@ class TestProgrammingCardSession:
         assert pcs.session.state.terminal == "cancelled"
         assert pcs.session.state.metadata.subagents[0]["status"] == "cancelled"
         body = str(render_card(pcs.session.state, RenderBudget())[0]._card_json["body"]["elements"])
-        assert "⚪ 实现后端接口" in body
+        assert "⚪ **已取消** · 实现后端接口" in body
+        assert "结果：未收到最终结果，已随主任务停止" in body
         assert "取消 1" in body
         assert "运行中 1" not in body
 
@@ -2714,7 +2718,8 @@ class TestProgrammingCardSession:
         rendered_text = str(body)
 
         assert "执行记录" in rendered_text
-        assert "bash" in rendered_text
+        assert "运行测试" in rendered_text
+        assert "pytest tests/test_example.py -q" in rendered_text
         assert "pytest tests/test_example.py" in rendered_text
         assert "先说明目标。" in rendered_text
         assert "后续正文继续更新。" in rendered_text

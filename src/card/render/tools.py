@@ -54,6 +54,17 @@ _SUBAGENT_STATUS_ICONS = {
     "failed": "❌",
     "cancelled": "⚪",
 }
+_SUBAGENT_STATUS_LABELS = {
+    "running": "执行中",
+    "active": "执行中",
+    "completed": "已完成",
+    "failed": "失败",
+    "cancelled": "已取消",
+}
+_GENERIC_SUBAGENT_LABELS = {"agent", "subagent", "task", "子任务"}
+_SUBAGENT_SLUG_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9]*(?:[_-]{1,2}[A-Za-z0-9]+)+$"
+)
 _SUBAGENT_SEQUENCE_RE = re.compile(
     r"^[1-9]\d{0,5}(?:\.[A-Za-z0-9]{1,8}){0,4}$"
 )
@@ -82,6 +93,24 @@ def _safe_subagent_metadata(
 def _safe_subagent_sequence(value: object) -> str:
     sequence = str(value or "").strip()
     return sequence if _SUBAGENT_SEQUENCE_RE.fullmatch(sequence) else ""
+
+
+def _safe_subagent_label(value: object) -> str:
+    raw = str(value or "").strip()
+    fallback = "任务说明暂缺"
+    if (
+        not raw
+        or raw.casefold() in _GENERIC_SUBAGENT_LABELS
+        or re.fullmatch(r"子任务(?:\s+\d+)?", raw)
+    ):
+        return fallback
+    if _SUBAGENT_SLUG_RE.fullmatch(raw):
+        raw = re.sub(r"[_-]+", " ", raw)
+    return sanitize_tool_failure_detail(
+        raw,
+        fallback=fallback,
+        max_chars=60,
+    )
 
 
 def _is_empty_data(value) -> bool:
@@ -165,14 +194,10 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
             or item.get("name")
             or f"子任务 {idx}"
         )
-        label = sanitize_tool_failure_detail(
-            raw_label,
-            fallback=f"子任务 {idx}",
-            max_chars=60,
-        )
+        label = _safe_subagent_label(raw_label)
         tool = _safe_subagent_metadata(
             item.get("tool") or item.get("tool_name"),
-            fallback="tool",
+            fallback="子代理",
             max_chars=24,
         )
         model = _safe_subagent_metadata(
@@ -185,7 +210,11 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
         )
         seq_part = f" · #{seq}" if seq else ""
         model_part = f" · {model}" if model else ""
-        lines.append(f"- {icon} {label}{seq_part} · {tool}{model_part}")
+        status_label = _SUBAGENT_STATUS_LABELS.get(status, "状态未知")
+        lines.append(
+            f"- {icon} **{status_label}** · {label}"
+            f"{seq_part} · {tool}{model_part}"
+        )
         if item.get("progress"):
             progress = _safe_subagent_metadata(
                 item["progress"],
@@ -193,7 +222,12 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
                 max_chars=180,
             )
             if progress:
-                lines.append(f"  - 进展：{progress}")
+                detail_label = (
+                    "进展"
+                    if status in {"running", "active"}
+                    else "结果"
+                )
+                lines.append(f"  - {detail_label}：{progress}")
         if status == "failed" and item.get("error"):
             error_detail = sanitize_tool_failure_detail(
                 item["error"],

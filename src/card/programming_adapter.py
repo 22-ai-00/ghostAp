@@ -418,28 +418,7 @@ class ProgrammingCardSession:
             self._close_text_blocks()
         if self._reasoning_active:
             self._close_reasoning_blocks()
-        summary_changed = False
-        terminal_statuses = {"completed", "failed", "cancelled"}
-        for tool_id, existing in list(self._agent_summaries.items()):
-            if existing.get("status") in terminal_statuses:
-                continue
-            self._agent_summaries[tool_id] = {
-                **existing,
-                "status": "cancelled",
-            }
-            summary_changed = True
-        if summary_changed and not self._rotator.current.closed:
-            try:
-                self._dispatch_card_event(
-                    CardEvent.tool_model_changed(
-                        subagents=tuple(self._agent_summaries.values())
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to publish cancelled subagent summary; "
-                    "continuing parent terminal transition"
-                )
+        self._finish_agent_summaries(terminal_status="cancelled")
         self._dispatch_card_event(CardEvent.cancelled(reason=reason))
         self._stop_ticker()
 
@@ -1414,12 +1393,21 @@ class ProgrammingCardSession:
 
     def _finish_agent_summaries(self, *, terminal_status: str) -> None:
         summary_changed = False
+        terminal_progress = {
+            "cancelled": "未收到最终结果，已随主任务停止",
+            "failed": "未收到最终结果，主任务已结束",
+        }.get(terminal_status)
         for tool_id, existing in list(self._agent_summaries.items()):
             if existing.get("status") in {"completed", "failed", "cancelled"}:
                 continue
             self._agent_summaries[tool_id] = {
                 **existing,
                 "status": terminal_status,
+                **(
+                    {"progress": terminal_progress}
+                    if terminal_progress
+                    else {}
+                ),
             }
             summary_changed = True
         if summary_changed and not self._rotator.current.closed:

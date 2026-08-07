@@ -73,6 +73,42 @@ class TestMainReducer:
         assert by_id["tool2"].status == "completed"
         assert by_id["tool2"].is_latest_active is False
         assert by_id["tool1"].is_latest_active is True
+        assert s.footer.status == "tool_running"
+        assert "Grep" in (s.footer.status_text or "")
+
+    def test_duplicate_tool_start_is_idempotent_and_done_clears_active_state(self):
+        s = reduce_card_state(None, CardEvent.started(), metadata=_meta())
+
+        event = CardEvent.tool_started(
+            "tool-compact",
+            "Context compacting",
+            "Context compacting",
+        )
+        s = reduce_card_state(s, event)
+        s = reduce_card_state(s, event)
+
+        matching = [
+            block
+            for block in s.blocks
+            if block.kind == "tool_call" and block.block_id == "tool-compact"
+        ]
+        assert len(matching) == 1
+        assert matching[0].status == "active"
+
+        s = reduce_card_state(
+            s,
+            CardEvent.tool_done("tool-compact", tool_output="done"),
+        )
+
+        matching = [
+            block
+            for block in s.blocks
+            if block.kind == "tool_call" and block.block_id == "tool-compact"
+        ]
+        assert len(matching) == 1
+        assert matching[0].status == "completed"
+        assert s.footer.status is None
+        assert s.footer.status_text is None
 
     def test_only_one_latest_active_invariant_after_chain(self):
         s = reduce_card_state(None, CardEvent.started(), metadata=_meta())
