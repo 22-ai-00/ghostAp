@@ -168,7 +168,10 @@ def _build_finalization_prompt(original_task: str, reserve_s: float | int) -> st
         "[GhostAP 运行时收尾指令]\n"
         f"当前任务已进入预留收尾阶段，剩余执行预算最多 {reserve_s} 秒。"
         "立即停止扩大范围；不要创建新的子代理，也不要给现有子代理追加新任务。\n"
-        "请只做安全且有界的收尾：检查现有子代理并等待或中止仍在运行的任务；"
+        "禁止调用 wait_agent、spawn_agent、followup_task 或 send_message。"
+        "先且仅调用一次 list_agents 获取权威状态；只对 running/pending 子代理逐个"
+        "调用 interrupt_agent；随后再调用一次 list_agents 确认终态，不要等待。\n"
+        "请只做安全且有界的其余收尾："
         "保存当前已完成成果；运行最必要的针对性验证；只执行原任务已明确授权的"
         "提交、推送或其他外部动作；如仍有未完成项，必须如实列出，不能伪装成功。"
         "务必在本轮结束前给出完整最终答复。\n\n"
@@ -177,6 +180,29 @@ def _build_finalization_prompt(original_task: str, reserve_s: float | int) -> st
         "<original_user_task>\n"
         f"{task}\n"
         "</original_user_task>"
+    )
+
+
+def _send_runtime_finalization_prompt(
+    session: SessionT,
+    text: str,
+    *,
+    on_event: Callable[[ACPEvent], None] | None,
+    timeout: float | int,
+) -> PromptResult:
+    """Use a single-turn collector when the concrete session supports it."""
+    method = getattr(type(session), "send_finalization_prompt", None)
+    if callable(method):
+        return method(
+            session,
+            text,
+            on_event=on_event,
+            timeout=timeout,
+        )
+    return session.send_prompt(
+        text,
+        on_event=on_event,
+        timeout=timeout,
     )
 
 
@@ -287,7 +313,8 @@ def run_prompt_with_finalization(
     final_timeout_arg = _timeout_arg(final_timeout, reserve_timeout)
 
     try:
-        result = finalization_session.send_prompt(
+        result = _send_runtime_finalization_prompt(
+            finalization_session,
             _build_finalization_prompt(
                 text if finalization_task_text is None else finalization_task_text,
                 final_timeout_arg,

@@ -1345,6 +1345,7 @@ class SyncACPSession:
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         timeout: Optional[int] = None,
         idle_timeout: Optional[float] = None,
+        await_goal_quiescence: bool = True,
     ) -> PromptResult:
         """Send one prompt, rejecting concurrent callers on this wrapper."""
         prompt_lock = getattr(self, "_prompt_lock", None)
@@ -1359,9 +1360,24 @@ class SyncACPSession:
                 on_event=on_event,
                 timeout=timeout,
                 idle_timeout=idle_timeout,
+                await_goal_quiescence=await_goal_quiescence,
             )
         finally:
             prompt_lock.release()
+
+    def send_finalization_prompt(
+        self,
+        text: str,
+        on_event: Optional[Callable[[ACPEvent], None]] = None,
+        timeout: Optional[int] = None,
+    ) -> PromptResult:
+        """Run the terminal cleanup turn without following new Goal turns."""
+        return self.send_prompt(
+            text,
+            on_event=on_event,
+            timeout=timeout,
+            await_goal_quiescence=False,
+        )
 
     def _send_prompt_once(
         self,
@@ -1369,6 +1385,7 @@ class SyncACPSession:
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         timeout: Optional[int] = None,
         idle_timeout: Optional[float] = None,
+        await_goal_quiescence: bool = True,
     ) -> PromptResult:
         """Send prompt synchronously, blocking until completion.
 
@@ -1403,7 +1420,11 @@ class SyncACPSession:
         event_cb = _activity_on_event if use_adaptive else on_event
 
         future = asyncio.run_coroutine_threadsafe(
-            self._acp_session.prompt(text, on_event=event_cb),
+            self._acp_session.prompt(
+                text,
+                on_event=event_cb,
+                await_goal_quiescence=await_goal_quiescence,
+            ),
             self._loop,
         )
         self._active_future = future

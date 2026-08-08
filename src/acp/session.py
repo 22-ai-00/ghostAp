@@ -686,7 +686,13 @@ class ACPSession:
             logger.debug("[ACP:%s] health_check failed", self._agent_cmd, exc_info=True)
             return False
 
-    async def prompt(self, text: str, on_event: Optional[Callable[[ACPEvent], None]] = None) -> PromptResult:
+    async def prompt(
+        self,
+        text: str,
+        on_event: Optional[Callable[[ACPEvent], None]] = None,
+        *,
+        await_goal_quiescence: bool = True,
+    ) -> PromptResult:
         """Send one prompt, rejecting concurrent use of the same ACP session."""
         if not self._prompt_lock.acquire(blocking=False):
             raise RuntimeError("ACP prompt is already running for this session")
@@ -694,7 +700,11 @@ class ACPSession:
             with self._handler_lock:
                 if self._closing:
                     raise RuntimeError("ACP session is closing")
-            return await self._prompt_once(text, on_event=on_event)
+            return await self._prompt_once(
+                text,
+                on_event=on_event,
+                await_goal_quiescence=await_goal_quiescence,
+            )
         finally:
             self._prompt_lock.release()
 
@@ -702,6 +712,8 @@ class ACPSession:
         self,
         text: str,
         on_event: Optional[Callable[[ACPEvent], None]] = None,
+        *,
+        await_goal_quiescence: bool = True,
     ) -> PromptResult:
         """Run a prompt while the cross-thread prompt ownership gate is held."""
         if not self._conn or not self._session_id:
@@ -830,7 +842,10 @@ class ACPSession:
                 await _drain_prompt_tail()
                 _discover_changed_images()
                 with self._handler_lock:
-                    should_wait = self._goal_requires_prompt_wait_locked()
+                    goal_requires_wait = self._goal_requires_prompt_wait_locked()
+                    should_wait = (
+                        await_goal_quiescence and goal_requires_wait
+                    )
                     lifecycle_revision = self._lifecycle_revision
                     if not should_wait:
                         if (

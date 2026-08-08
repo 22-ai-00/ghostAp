@@ -60,6 +60,7 @@ _SUBAGENT_PROVIDER_STATUS: dict[str, TaskStatus] = {
     "pending": "in_progress",
     "running": "in_progress",
     "completed": "completed",
+    "cancelled": "cancelled",
     "shutdown": "completed",
     "errored": "failed",
     "failed": "failed",
@@ -73,6 +74,7 @@ _SUBAGENT_PROVIDER_PROGRESS = {
     "pending": "准备中",
     "running": "执行中",
     "completed": "已完成",
+    "cancelled": "已取消",
     "shutdown": "已完成并停止",
     "errored": "执行失败",
     "failed": "执行失败",
@@ -81,6 +83,19 @@ _SUBAGENT_PROVIDER_PROGRESS = {
     "interrupted": "已中断",
 }
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_TRANSIENT_SUBAGENT_PROGRESS = frozenset({
+    "准备中",
+    "执行中",
+    "已启动",
+    "正在启动",
+    "启动未完成",
+    "已与主 Agent 交互",
+    "正在与主 Agent 交互",
+    "交互未完成",
+    "正在中断",
+    "中断未完成",
+    "动态已更新",
+})
 
 
 class TaskIdResolver:
@@ -891,10 +906,16 @@ class TaskOrchestrator:
                 max_chars=180,
                 opaque_ids=opaque_ids,
             )
-            progress = message or _SUBAGENT_PROVIDER_PROGRESS.get(
+            default_progress = _SUBAGENT_PROVIDER_PROGRESS.get(
                 raw_status,
                 "执行中",
             )
+            progress = message or default_progress
+            if (
+                status in _TERMINAL_TASK_STATUSES
+                and progress in _TRANSIENT_SUBAGENT_PROGRESS
+            ):
+                progress = default_progress
             self._publish_subagent_progress(source_id, progress)
             if status in _TERMINAL_TASK_STATUSES:
                 self._finalize_task_session(

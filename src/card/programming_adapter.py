@@ -59,6 +59,7 @@ _SUBAGENT_STATE_STATUS = {
     "pending": "running",
     "running": "running",
     "completed": "completed",
+    "cancelled": "cancelled",
     "errored": "failed",
     "failed": "failed",
     "interrupted": "cancelled",
@@ -72,6 +73,7 @@ _SUBAGENT_STATE_PROGRESS = {
     "pending": "准备中",
     "running": "执行中",
     "completed": "已完成",
+    "cancelled": "已取消",
     "errored": "执行失败",
     "failed": "执行失败",
     "interrupted": "已中断",
@@ -79,6 +81,24 @@ _SUBAGENT_STATE_PROGRESS = {
     "notfound": "状态不可用",
     "not_found": "状态不可用",
 }
+_TERMINAL_SUBAGENT_PROGRESS = {
+    "completed": "已完成",
+    "failed": "执行失败",
+    "cancelled": "已取消",
+}
+_TRANSIENT_SUBAGENT_PROGRESS = frozenset({
+    "准备中",
+    "执行中",
+    "已启动",
+    "正在启动",
+    "启动未完成",
+    "已与主 Agent 交互",
+    "正在与主 Agent 交互",
+    "交互未完成",
+    "正在中断",
+    "中断未完成",
+    "动态已更新",
+})
 _TOOL_CARD_EVENT_TYPES = frozenset({
     CardEventType.TOOL_STARTED,
     CardEventType.TOOL_DELTA,
@@ -1124,10 +1144,24 @@ class ProgrammingCardSession:
                 max_chars=180,
                 opaque_ids=opaque_ids,
             )
+            default_progress = _SUBAGENT_STATE_PROGRESS.get(
+                raw_status,
+                "执行中",
+            )
+            normalized_message = message
+            if (
+                incoming_status in _TERMINAL_AGENT_STATUSES
+                and normalized_message in _TRANSIENT_SUBAGENT_PROGRESS
+            ):
+                normalized_message = ""
             if existing_status in _TERMINAL_AGENT_STATUSES:
                 if incoming_status != existing_status:
                     continue
-                if not message or message == str(existing.get("progress") or ""):
+                if (
+                    not normalized_message
+                    or normalized_message
+                    == str(existing.get("progress") or "")
+                ):
                     continue
 
             existing_label = str(existing.get("label") or "").strip()
@@ -1135,7 +1169,7 @@ class ProgrammingCardSession:
             if self._is_generic_task_label(label):
                 label = "子任务"
 
-            progress = message or _SUBAGENT_STATE_PROGRESS.get(raw_status, "执行中")
+            progress = normalized_message or default_progress
             summary = {
                 **existing,
                 "label": label,
@@ -1398,7 +1432,21 @@ class ProgrammingCardSession:
             "failed": "未收到最终结果，主任务已结束",
         }.get(terminal_status)
         for tool_id, existing in list(self._agent_summaries.items()):
-            if existing.get("status") in {"completed", "failed", "cancelled"}:
+            existing_status = str(existing.get("status") or "").strip().lower()
+            if existing_status in _TERMINAL_AGENT_STATUSES:
+                fallback_progress = _TERMINAL_SUBAGENT_PROGRESS.get(
+                    existing_status
+                )
+                if (
+                    fallback_progress
+                    and existing.get("progress")
+                    in _TRANSIENT_SUBAGENT_PROGRESS
+                ):
+                    self._agent_summaries[tool_id] = {
+                        **existing,
+                        "progress": fallback_progress,
+                    }
+                    summary_changed = True
                 continue
             self._agent_summaries[tool_id] = {
                 **existing,
