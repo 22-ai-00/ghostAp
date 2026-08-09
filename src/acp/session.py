@@ -12,6 +12,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from acp.exceptions import RequestError
@@ -910,6 +911,38 @@ class ACPSession:
 
         start_ts = time.time()
 
+        codex_child_monitor = None
+        if self._uses_official_codex_acp():
+            try:
+                from .codex_rollout_reconciliation import (
+                    CodexChildLifecycleMonitor,
+                )
+
+                env_override = self._env_override or {}
+                raw_codex_home = str(
+                    env_override.get("CODEX_HOME") or ""
+                ).strip()
+                if raw_codex_home:
+                    codex_home = raw_codex_home
+                else:
+                    raw_home = str(env_override.get("HOME") or "").strip()
+                    codex_home = (
+                        str(Path(raw_home).expanduser() / ".codex")
+                        if raw_home
+                        else None
+                    )
+                codex_child_monitor = CodexChildLifecycleMonitor(
+                    parent_session_id=self._session_id,
+                    cwd=self._cwd,
+                    logical_task_started_at=start_ts,
+                    codex_home=codex_home,
+                )
+            except Exception:
+                logger.warning(
+                    "[ACP:CODEX] child lifecycle monitor initialization failed",
+                    exc_info=True,
+                )
+
         # Collector aggregates text/tool calls/plan/modified_files.
         collected_tool_call_snapshots: list[Any] = []
         emitted_image_ids: set[str] = set()
@@ -1017,6 +1050,8 @@ class ACPSession:
                             emitted_image_ids.add(ev.image.image_id)
                         elif ev.event_type == ACPEventType.PLAN_UPDATE:
                             result.set_plan(ev.plan)
+                        if codex_child_monitor is not None and ev.tool_call:
+                            codex_child_monitor.observe_tool_call(ev.tool_call)
                         if child_lifecycle_event:
                             if child_call_id:
                                 self._logical_task_child_call_ids.add(
@@ -1072,6 +1107,42 @@ class ACPSession:
             event_generation = self._event_generation
             self._event_handler = _collector
         collector_detached = False
+        child_monitor_stop = asyncio.Event()
+        child_monitor_task: asyncio.Task[None] | None = None
+
+        def _emit_codex_child_lifecycle() -> None:
+            if codex_child_monitor is None:
+                return
+            try:
+                evidence = codex_child_monitor.poll(ended_at=time.time())
+            except Exception:
+                logger.warning(
+                    "[ACP:CODEX] child lifecycle polling failed closed",
+                    exc_info=True,
+                )
+                return
+            if evidence is not None:
+                _collector(
+                    ACPEvent(
+                        event_type=ACPEventType.TOOL_CALL_DONE,
+                        tool_call=evidence,
+                    )
+                )
+
+        async def _poll_codex_child_lifecycle() -> None:
+            from .codex_rollout_reconciliation import (
+                CODEX_CHILD_LIFECYCLE_POLL_INTERVAL_S,
+            )
+
+            while not child_monitor_stop.is_set():
+                _emit_codex_child_lifecycle()
+                try:
+                    await asyncio.wait_for(
+                        child_monitor_stop.wait(),
+                        timeout=CODEX_CHILD_LIFECYCLE_POLL_INTERVAL_S,
+                    )
+                except TimeoutError:
+                    continue
 
         # Deferred child events already participate in the authoritative result
         # above. Reconciliation turns must also project the exact same evidence
@@ -1121,6 +1192,11 @@ class ACPSession:
                 else {}
             )
 
+            if codex_child_monitor is not None:
+                child_monitor_task = asyncio.create_task(
+                    _poll_codex_child_lifecycle()
+                )
+
             response: PromptResponse = await self._conn.prompt(
                 session_id=self._session_id,
                 prompt=[text_block(text)],
@@ -1132,6 +1208,7 @@ class ACPSession:
                 # before making the final atomic quiescence decision.
                 await _drain_prompt_tail()
                 _discover_changed_images()
+                _emit_codex_child_lifecycle()
                 with self._handler_lock:
                     goal_requires_wait = self._goal_requires_prompt_wait_locked()
                     child_requires_wait = (
@@ -1162,6 +1239,13 @@ class ACPSession:
                 await _drain_prompt_tail()
 
         finally:
+            child_monitor_stop.set()
+            if child_monitor_task is not None:
+                child_monitor_task.cancel()
+                try:
+                    await child_monitor_task
+                except asyncio.CancelledError:
+                    pass
             if self._client is not None:
                 self._client.release_local_image_snapshot(image_snapshot)
             if not collector_detached:

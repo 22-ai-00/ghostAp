@@ -1420,6 +1420,7 @@ class SyncACPSession:
         *,
         started_at: float,
         ended_at: float,
+        logical_task_started_at: float | None = None,
         on_event: Optional[Callable[[ACPEvent], None]] = None,
     ) -> PromptResult:
         """Recover strict list_agents evidence omitted by official Codex ACP."""
@@ -1453,6 +1454,7 @@ class SyncACPSession:
                 result,
                 session_id=session_id,
                 cwd=self._cwd,
+                logical_task_started_at=logical_task_started_at,
                 started_at=started_at,
                 ended_at=ended_at,
                 codex_home=codex_home,

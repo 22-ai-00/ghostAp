@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +18,7 @@ from src.acp.codex_rollout_reconciliation import (
 )
 from src.acp.models import ACPEventType, PromptResult, ToolCallInfo
 from src.acp.outcome import PromptOutcome, classify_prompt_result
+from src.acp.session import ACPSession
 from src.acp.sync_adapter import SyncACPSession
 
 
@@ -73,6 +75,70 @@ def _write_rollout(
         encoding="utf-8",
     )
     return path
+
+
+def _write_child_rollout(
+    root: Path,
+    *,
+    parent_session_id: str,
+    child_thread_id: str,
+    cwd: Path,
+    agent_path: str,
+    lifecycle: list[tuple[str, str, str]],
+    recorded_parent_id: str | None = None,
+) -> Path:
+    path = (
+        root
+        / "sessions"
+        / "2026"
+        / "08"
+        / "08"
+        / f"rollout-2026-08-08T09-00-00-{child_thread_id}.jsonl"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    events = [
+        {
+            "timestamp": "2026-08-08T09:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": child_thread_id,
+                "session_id": parent_session_id,
+                "parent_thread_id": recorded_parent_id or parent_session_id,
+                "cwd": str(cwd),
+                "thread_source": "subagent",
+                "agent_path": agent_path,
+            },
+        },
+        *[
+            {
+                "timestamp": timestamp,
+                "type": "event_msg",
+                "payload": {"type": event_type, "turn_id": turn_id},
+            }
+            for timestamp, event_type, turn_id in lifecycle
+        ],
+    ]
+    path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _append_child_lifecycle(
+    path: Path,
+    *,
+    event_type: str,
+    turn_id: str,
+) -> None:
+    timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    event = {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {"type": event_type, "turn_id": turn_id},
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event) + "\n")
 
 
 def _append_list_agents_output(
@@ -138,6 +204,239 @@ def _completed_agents() -> list[dict]:
             for index in range(3)
         ],
     ]
+
+
+def _single_child_result(
+    *,
+    source_id: str = "thread-reviewer",
+    path: str = "/root/reviewer",
+) -> PromptResult:
+    return PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="activity-reviewer",
+                title="Interact with subagent",
+                kind="other",
+                status="completed",
+                subagent_source_id=source_id,
+                subagent_path=path,
+                subagent_activity="interacted",
+            ),
+            ToolCallInfo(
+                id="stale-list-agents",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "running",
+                        "message": "",
+                    },
+                ),
+            ),
+        ],
+    )
+
+
+def test_child_task_complete_overrides_stale_parent_agents_states(
+    tmp_path: Path,
+) -> None:
+    parent_session_id = "parent-session-0001"
+    child_thread_id = "child-thread-00001"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    _write_rollout(
+        codex_home,
+        session_id=parent_session_id,
+        cwd=cwd,
+        output_agents=[
+            {"agent_name": "/root", "agent_status": "running"},
+            {"agent_name": "/root/reviewer", "agent_status": "running"},
+        ],
+    )
+    _write_child_rollout(
+        codex_home,
+        parent_session_id=parent_session_id,
+        child_thread_id=child_thread_id,
+        cwd=cwd,
+        agent_path="/root/reviewer",
+        lifecycle=[
+            ("2026-08-08T09:26:54.100Z", "task_started", "turn-review"),
+            ("2026-08-08T09:26:55.100Z", "task_complete", "turn-review"),
+        ],
+    )
+
+    enriched, evidence = enrich_codex_reconciliation_result(
+        _single_child_result(source_id=child_thread_id),
+        session_id=parent_session_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        started_at=_timestamp("2026-08-08T09:26:56.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert evidence is not None
+    assert evidence.id.startswith("rollout-child-lifecycle:")
+    assert evidence.subagent_states == (
+        {
+            "source_id": child_thread_id,
+            "status": "completed",
+            "message": "",
+        },
+    )
+    assert enriched.tool_calls[-1] is evidence
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.COMPLETED
+
+
+def test_child_latest_generation_without_terminal_blocks_parent_fallback(
+    tmp_path: Path,
+) -> None:
+    parent_session_id = "parent-session-0002"
+    child_thread_id = "child-thread-00002"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    _write_rollout(
+        codex_home,
+        session_id=parent_session_id,
+        cwd=cwd,
+        output_agents=[
+            {"agent_name": "/root", "agent_status": "running"},
+            {
+                "agent_name": "/root/reviewer",
+                "agent_status": {"completed": "stale"},
+            },
+        ],
+    )
+    _write_child_rollout(
+        codex_home,
+        parent_session_id=parent_session_id,
+        child_thread_id=child_thread_id,
+        cwd=cwd,
+        agent_path="/root/reviewer",
+        lifecycle=[
+            ("2026-08-08T09:26:54.100Z", "task_started", "turn-one"),
+            ("2026-08-08T09:26:55.100Z", "task_complete", "turn-one"),
+            ("2026-08-08T09:26:56.100Z", "task_started", "turn-two"),
+        ],
+    )
+    original = _single_child_result(source_id=child_thread_id)
+
+    enriched, evidence = enrich_codex_reconciliation_result(
+        original,
+        session_id=parent_session_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        started_at=_timestamp("2026-08-08T09:26:56.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence is None
+
+
+@pytest.mark.parametrize(
+    ("terminal_event", "expected_status"),
+    [("task_complete", "completed"), ("turn_aborted", "cancelled")],
+)
+def test_child_rollout_terminal_event_mapping(
+    tmp_path: Path,
+    terminal_event: str,
+    expected_status: str,
+) -> None:
+    parent_session_id = "parent-session-0003"
+    child_thread_id = "child-thread-00003"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    _write_rollout(
+        codex_home,
+        session_id=parent_session_id,
+        cwd=cwd,
+        output_agents=[
+            {"agent_name": "/root", "agent_status": "running"},
+            {"agent_name": "/root/reviewer", "agent_status": "running"},
+        ],
+    )
+    _write_child_rollout(
+        codex_home,
+        parent_session_id=parent_session_id,
+        child_thread_id=child_thread_id,
+        cwd=cwd,
+        agent_path="/root/reviewer",
+        lifecycle=[
+            ("2026-08-08T09:26:54.100Z", "task_started", "turn-review"),
+            ("2026-08-08T09:26:55.100Z", terminal_event, "turn-review"),
+        ],
+    )
+
+    _, evidence = enrich_codex_reconciliation_result(
+        _single_child_result(source_id=child_thread_id),
+        session_id=parent_session_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        started_at=_timestamp("2026-08-08T09:26:56.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert evidence is not None
+    assert evidence.subagent_states[0]["status"] == expected_status
+
+
+def test_child_rollout_wrong_parent_fails_closed_without_parent_fallback(
+    tmp_path: Path,
+) -> None:
+    parent_session_id = "parent-session-0004"
+    child_thread_id = "child-thread-00004"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    _write_rollout(
+        codex_home,
+        session_id=parent_session_id,
+        cwd=cwd,
+        output_agents=[
+            {"agent_name": "/root", "agent_status": "running"},
+            {
+                "agent_name": "/root/reviewer",
+                "agent_status": {"completed": "stale"},
+            },
+        ],
+    )
+    _write_child_rollout(
+        codex_home,
+        parent_session_id=parent_session_id,
+        child_thread_id=child_thread_id,
+        cwd=cwd,
+        agent_path="/root/reviewer",
+        recorded_parent_id="different-parent-001",
+        lifecycle=[
+            ("2026-08-08T09:26:54.100Z", "task_started", "turn-review"),
+            ("2026-08-08T09:26:55.100Z", "task_complete", "turn-review"),
+        ],
+    )
+    original = _single_child_result(source_id=child_thread_id)
+
+    enriched, evidence = enrich_codex_reconciliation_result(
+        original,
+        session_id=parent_session_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        started_at=_timestamp("2026-08-08T09:26:56.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence is None
 
 
 def test_rollout_list_agents_terminal_states_are_mapped_without_messages(
@@ -387,6 +686,114 @@ def test_rollout_reconciliation_waits_for_delayed_function_output(
     assert classify_prompt_result(enriched).outcome is PromptOutcome.COMPLETED
 
 
+def test_official_codex_prompt_streams_child_rollout_terminal_before_return(
+    tmp_path: Path,
+) -> None:
+    parent_session_id = "parent-session-live1"
+    child_thread_id = "child-thread-live01"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    child_rollout = _write_child_rollout(
+        codex_home,
+        parent_session_id=parent_session_id,
+        child_thread_id=child_thread_id,
+        cwd=cwd,
+        agent_path="/root/live-reviewer",
+        lifecycle=[],
+    )
+    session = ACPSession(
+        agent_cmd="npx",
+        agent_args=["--yes", "@agentclientprotocol/codex-acp@1.1.7"],
+        cwd=str(cwd),
+        env={"CODEX_HOME": str(codex_home)},
+    )
+    session._session_id = parent_session_id
+
+    async def exercise() -> None:
+        terminal_seen = asyncio.Event()
+        prompt_returned = False
+        received = []
+
+        def receive(event) -> None:
+            received.append(event)
+            tool_call = event.tool_call
+            if tool_call is None:
+                return
+            if any(
+                state.get("source_id") == child_thread_id
+                and state.get("status") == "completed"
+                for state in tool_call.subagent_states
+            ):
+                assert prompt_returned is False
+                terminal_seen.set()
+
+        class Connection:
+            async def prompt(self, **_kwargs):
+                session._dispatch_event(
+                    SimpleNamespace(
+                        event_type=ACPEventType.TOOL_CALL_DONE,
+                        tool_call=ToolCallInfo(
+                            id="spawn-live-reviewer",
+                            title="spawn_agent",
+                            kind="other",
+                            status="completed",
+                            subagent_source_id=child_thread_id,
+                            subagent_path="/root/live-reviewer",
+                            subagent_activity="started",
+                            collaboration_tool="spawn_agent",
+                            collaboration_receivers=(child_thread_id,),
+                            subagent_states=(
+                                {
+                                    "source_id": child_thread_id,
+                                    "status": "running",
+                                    "message": "",
+                                },
+                            ),
+                        ),
+                    )
+                )
+                _append_child_lifecycle(
+                    child_rollout,
+                    event_type="task_started",
+                    turn_id="turn-live",
+                )
+                await asyncio.sleep(0.03)
+                _append_child_lifecycle(
+                    child_rollout,
+                    event_type="task_complete",
+                    turn_id="turn-live",
+                )
+                await asyncio.wait_for(terminal_seen.wait(), timeout=0.8)
+                return SimpleNamespace(stop_reason="end_turn")
+
+        session._conn = Connection()
+        result = await session.prompt(
+            "run live reviewer",
+            on_event=receive,
+            await_goal_quiescence=False,
+        )
+        prompt_returned = True
+
+        terminal_calls = [
+            tool_call
+            for tool_call in result.tool_calls
+            if any(
+                state.get("source_id") == child_thread_id
+                and state.get("status") == "completed"
+                for state in tool_call.subagent_states
+            )
+        ]
+        assert terminal_calls
+        assert any(
+            event.tool_call is not None
+            and event.tool_call.id.startswith("rollout-child-lifecycle:")
+            for event in received
+        )
+
+    asyncio.run(exercise())
+
+
 def test_sync_official_codex_enrichment_uses_session_home_and_emits_event(
     tmp_path: Path,
 ) -> None:
@@ -432,6 +839,7 @@ def test_sync_official_codex_enrichment_uses_session_home_and_emits_event(
         original,
         session_id=session.session_id,
         cwd=session._cwd,
+        logical_task_started_at=None,
         started_at=1.0,
         ended_at=2.0,
         codex_home=str(tmp_path / "isolated-home" / ".codex"),

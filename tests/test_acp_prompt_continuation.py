@@ -548,10 +548,12 @@ def test_child_reconciliation_applies_session_terminal_evidence_once() -> None:
             *,
             started_at: float,
             ended_at: float,
+            logical_task_started_at: float,
             on_event: Callable[[ACPEvent], None] | None = None,
         ) -> PromptResult:
             assert started_at > 0
             assert ended_at >= started_at
+            assert 0 < logical_task_started_at <= started_at
             assert on_event is None
             self.enrichment_calls += 1
             return PromptResult(

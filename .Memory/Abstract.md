@@ -959,3 +959,4 @@
 
 ## 2026-06-29
 - **WF卡片乱码+进度+Traex修复** — bridge.py ensure_ascii导致中文\uXXXX乱码、FeishuCardAPIClient缺surrogate清理、两处内联卡片缺schema 2.0引发200830错误、脚本生成阶段缺实时进度反馈、Traex model=None导致Internal error；全部修复，Workflow回归 2019 passed → [详细记录](2026-06-29.md)
+- Codex child rollout 权威终态实时对账（2026-08-09）

@@ -378,6 +378,7 @@ def run_prompt_with_continuation(
     incomplete/timeout handling.
     """
     deadline = _monotonic() + float(timeout_s)
+    logical_task_started_at = time.time()
     finalization_scope = (
         text if finalization_task_text is None else finalization_task_text
     )
@@ -543,6 +544,7 @@ def run_prompt_with_continuation(
                         result,
                         started_at=reconciliation_started_at,
                         ended_at=reconciliation_finished_at,
+                        logical_task_started_at=logical_task_started_at,
                         on_event=on_event,
                     )
                     if isinstance(enriched, PromptResult):
