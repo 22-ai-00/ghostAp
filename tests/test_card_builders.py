@@ -148,6 +148,21 @@ def test_help_card_mentions_new_chat_project_group():
     assert "项目群" in card_text
 
 
+def test_help_card_keeps_employee_commands_without_legacy_group_section():
+    SystemBuilder._build_help_card_cached.cache_clear()
+
+    _, card_json = SystemBuilder.build_help_card(
+        session_idle_timeout=600,
+        session_idle_warn_at_remaining=120,
+        lock_undo_window_seconds=300,
+    )
+
+    card_text = json.dumps(json.loads(card_json), ensure_ascii=False)
+    assert "数字员工" in card_text
+    assert "Slock" not in card_text
+    assert "/new-team" not in card_text
+
+
 def test_help_card_omits_quick_action_buttons():
     """The documentation-only help card should leave quick actions to /menu."""
     SystemBuilder._build_help_card_cached.cache_clear()

@@ -84,9 +84,9 @@ class DispatchBinding:
     thread_root_id: str
     thread_id: str
     chat_id: str
-    slock_engine_identity: str
-    slock_chat_id: str
-    slock_root_identity: str
+    team_identity: str
+    team_chat_id: str
+    team_root_identity: str
     tool: str
     model: str
     profile: str
@@ -128,7 +128,7 @@ class DispatchBinding:
             "run_id",
             "message_id",
             "chat_id",
-            "slock_chat_id",
+            "team_chat_id",
             "tool",
             "model",
             "profile",
@@ -157,7 +157,7 @@ class DispatchBinding:
             ("run_id", "run_"),
             ("message_id", "om_"),
             ("chat_id", "oc_"),
-            ("slock_chat_id", "oc_"),
+            ("team_chat_id", "oc_"),
         ):
             object.__setattr__(
                 self,
@@ -172,8 +172,8 @@ class DispatchBinding:
             )
         for name in (
             "payload_digest",
-            "slock_engine_identity",
-            "slock_root_identity",
+            "team_identity",
+            "team_root_identity",
             "render_contract_digest",
             "context_snapshot_hash",
             "context_watermark_digest",
@@ -282,7 +282,7 @@ class GatewayExecutionStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class AgentExecutionSpec:
-    """Frozen copy of every Slock identity field used by employee execution."""
+    """Frozen copy of every Team identity field used by employee execution."""
 
     agent_id: str
     name: str
@@ -307,7 +307,7 @@ class AgentExecutionSpec:
 
     @classmethod
     def from_agent(cls, agent: Any) -> AgentExecutionSpec:
-        from src.slock_engine.models import AgentIdentity
+        from src.autonomous.workforce.identity import AgentIdentity
 
         if not isinstance(agent, AgentIdentity):
             raise TypeError("agent must be AgentIdentity")
@@ -335,7 +335,7 @@ class AgentExecutionSpec:
         )
 
     def materialize(self) -> Any:
-        from src.slock_engine.models import AgentIdentity
+        from src.autonomous.workforce.identity import AgentIdentity
 
         return AgentIdentity(
             agent_id=self.agent_id,

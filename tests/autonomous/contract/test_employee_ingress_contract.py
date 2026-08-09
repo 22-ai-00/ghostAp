@@ -587,7 +587,7 @@ def test_phase3_manifest_is_local_strict_and_exposes_collectable_ipc_selector() 
     task6 = {
         gate.id: gate for gate in manifest.gates if gate.id in {"EI-ACP-ONCE-01", "EI-TERMINAL-01", "EI-RECOVERY-01"}
     }
-    assert task6["EI-ACP-ONCE-01"].environment == "local_slock_harness"
+    assert task6["EI-ACP-ONCE-01"].environment == "local_team_harness"
     assert task6["EI-TERMINAL-01"].environment == "local_process_harness"
     assert task6["EI-RECOVERY-01"].environment == "local_process_harness"
     assert all(Path(gate.selector.split("::", 1)[0]).is_file() for gate in task6.values())

@@ -2,19 +2,11 @@
 
 from __future__ import annotations
 
-import time
-
-import pytest
-
 from src.autonomous.provisioning.channel import (
     ChannelConnectionManager,
     ChannelState,
-    ChannelStatus,
 )
 from src.autonomous.provisioning.slash_commands import (
-    EMPLOYEE_COMMANDS,
-    CommandSyncResult,
-    SlashCommand,
     SlashCommandManager,
 )
 

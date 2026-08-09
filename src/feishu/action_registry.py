@@ -384,36 +384,6 @@ def register_programming_mode_actions(client: 'FeishuWSClient') -> None:
         ),
         exact=action_ids.SELECT_ACP_MODEL_EFFORT,
     )
-    client._register_action(
-        lambda mid, cid, pid, val: client._slock_handler.handle_new_role_select_tool(
-            mid, cid, val, _resolve_project(client, pid, cid)
-        ),
-        exact=action_ids.SLOCK_NEW_ROLE_SELECT_TOOL,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._slock_handler.handle_new_role_tool_dropdown_change(
-            mid, cid, val, _resolve_project(client, pid, cid)
-        ),
-        exact=action_ids.SLOCK_NEW_ROLE_SELECT_TOOL_DROPDOWN,
-    )
-    client._register_action(
-        lambda mid, cid, pid, val: client._slock_handler.handle_new_role_select_model(
-            mid, cid, val, _resolve_project(client, pid, cid)
-        ),
-        exact=action_ids.SLOCK_NEW_ROLE_SELECT_MODEL,
-    )
-    for action in (
-        action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_GROUP,
-        action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_PROFILE,
-        action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_EFFORT,
-    ):
-        client._register_action(
-            lambda mid, cid, pid, val: client._slock_handler.handle_new_role_model_cascade_select(
-                mid, cid, val, _resolve_project(client, pid, cid)
-            ),
-            exact=action,
-        )
-
     # System
     client._register_action(
         lambda mid, cid, pid, val: client._show_full_help(
@@ -538,14 +508,6 @@ def register_programming_mode_actions(client: 'FeishuWSClient') -> None:
     client._register_action(
         lambda mid, cid, pid, val, type=None: client._spec_handler.handle_card_action(mid, cid, type, val),
         prefix="spec_",
-    )
-    client._register_action(
-        lambda mid, cid, pid, val, type=None: client._slock_handler.handle_card_action(mid, cid, type, val),
-        prefix="slock_",
-    )
-    client._register_action(
-        lambda mid, cid, pid, val, type=None: client._slock_handler.handle_card_action(mid, cid, type, val),
-        prefix="employee_runtime_",
     )
 
     # Generic ENGINE_STOP — routes to correct handler based on engine_type in value

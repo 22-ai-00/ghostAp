@@ -11,7 +11,7 @@ from src.autonomous.runtime.employee_actor import (
     EmployeeAssignment,
 )
 from src.autonomous.runtime.employee_session import EmployeeSessionBootstrap
-from src.slock_engine.models import AgentIdentity
+from src.autonomous.workforce.identity import AgentIdentity
 
 
 class _Session:

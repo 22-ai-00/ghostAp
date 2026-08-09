@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from src.autonomous.scheduler.triggers import (
-    TriggerDefinition,
     TriggerService,
     TriggerState,
     TriggerType,

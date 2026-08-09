@@ -30,7 +30,7 @@ def test_every_started_attempt_has_one_terminal_or_action_required(tmp_path) -> 
     from unittest.mock import patch
 
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -105,7 +105,7 @@ def test_history_blob_is_staged_before_atomic_terminal_commit() -> None:
 
 def test_employee_terminal_card_hook_runs_after_atomic_terminal_anchor(tmp_path) -> None:
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -150,7 +150,7 @@ def test_recovery_rebuilds_missing_terminal_snapshot_without_rerunning_acp(
     tmp_path,
 ) -> None:
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -207,7 +207,7 @@ def test_terminal_commit_section_never_replays_full_journal(
     from contextlib import contextmanager
 
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -250,7 +250,7 @@ def test_terminal_head_race_retries_without_restaging_or_rerunning_acp(
     monkeypatch,
 ) -> None:
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -310,7 +310,7 @@ def test_history_failure_blocks_false_success_and_recovery_requires_action(
 ) -> None:
     from src.autonomous.data.service import DataBlobError
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -350,7 +350,7 @@ def test_legacy_router_only_dispatch_recovers_to_action_required(tmp_path) -> No
     from tests.autonomous.integration.test_employee_router_queues import (
         _commit_dispatch,
     )
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -376,7 +376,7 @@ def test_anchored_terminal_apply_failure_keeps_live_history_blob(
     """Once the frame anchors, its referenced blob is live despite apply failure."""
 
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -418,7 +418,7 @@ def test_anchored_terminal_apply_failure_keeps_live_history_blob(
 
 
 def test_gateway_result_has_explicit_timeout_cancel_and_failure_states() -> None:
-    """The Slock runner's Optional[str] must never be interpreted as success."""
+    """The Team runner's Optional[str] must never be interpreted as success."""
 
     from src.autonomous.ingress import dispatch
 
@@ -442,7 +442,7 @@ def test_attempt_binding_and_dispatch_commit_require_one_frame() -> None:
         reduce_gateway_frame,
     )
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import _binding
+    from tests.autonomous.integration.test_employee_team_gateway import _binding
 
     binding = _binding(dispatch)
     bound = JournalEvent(
@@ -487,7 +487,7 @@ def test_first_attempt_terminal_wins_and_identical_replay_is_idempotent() -> Non
         reduce_gateway_frame,
     )
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import _binding
+    from tests.autonomous.integration.test_employee_team_gateway import _binding
 
     binding = _binding(dispatch)
     state = GatewayProjectionState()
@@ -591,7 +591,7 @@ def test_terminal_history_requires_exact_record_identity(mismatch) -> None:
         reduce_gateway_frame,
     )
     from src.autonomous.ingress import dispatch
-    from tests.autonomous.integration.test_employee_slock_gateway import _binding
+    from tests.autonomous.integration.test_employee_team_gateway import _binding
 
     binding = _binding(dispatch)
     state = GatewayProjectionState()

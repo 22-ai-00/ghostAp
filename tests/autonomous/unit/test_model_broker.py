@@ -6,15 +6,12 @@ import pytest
 
 from src.autonomous.broker.model_broker import (
     ModelBroker,
-    ModelCall,
-    ModelCallResult,
     ModelCallState,
     RateLimiter,
     _compute_hash,
 )
 from src.autonomous.domain import GoalActivationAuthorization
 from src.autonomous.policy.budget_manager import BudgetManager
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

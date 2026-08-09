@@ -75,7 +75,7 @@ class _ProjectionHeadChanged(RuntimeError):
 
 
 class AuthorizedGroupMemoryReader:
-    """ACL wrapper around the legacy Slock full-L2 read port."""
+    """ACL wrapper around the legacy Team full-L2 read port."""
 
     def __init__(
         self,

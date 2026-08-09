@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from src.slock_engine.models import AgentIdentity
+from src.autonomous.workforce.identity import AgentIdentity
 
 
 @dataclass(frozen=True, slots=True)

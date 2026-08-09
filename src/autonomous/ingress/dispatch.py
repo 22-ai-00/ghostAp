@@ -4,34 +4,28 @@ New code belongs under :mod:`src.autonomous.gateway`; this import path remains
 stable for the Phase 3 integration boundary.
 """
 
-from ..gateway.context_prompt import (
+from ..gateway import (
     RENDER_CONTRACT_DIGEST,
-    RenderedEmployeePrompt,
-    render_employee_context,
-)
-from ..gateway.coordinator import (
+    AgentExecutionSpec,
+    DispatchBinding,
+    DispatchPermit,
+    DispatchPermitAuthorityError,
+    DispatchPermitConsumedError,
+    EmployeeActionRequiredError,
     EmployeeCancellationOutcome,
     EmployeeDispatchCoordinator,
     EmployeeDispatchError,
+    EmployeeTeamGateway,
     FinalizedEmployeeAttempt,
+    GatewayExecutionResult,
+    GatewayExecutionStatus,
     PreparedEmployeeDispatch,
+    RenderedEmployeePrompt,
+    render_employee_context,
 )
 from ..gateway.env_scope import (
     EmployeeEnvironmentAuthority,
     EmployeeProcessEnvironmentMaterial,
-)
-from ..gateway.models import (
-    AgentExecutionSpec,
-    DispatchBinding,
-    DispatchPermit,
-    DispatchPermitConsumedError,
-    GatewayExecutionResult,
-    GatewayExecutionStatus,
-)
-from ..gateway.slock import (
-    DispatchPermitAuthorityError,
-    EmployeeActionRequiredError,
-    EmployeeSlockGateway,
 )
 
 __all__ = [
@@ -50,7 +44,7 @@ __all__ = [
     "GatewayExecutionStatus",
     "DispatchPermitAuthorityError",
     "EmployeeActionRequiredError",
-    "EmployeeSlockGateway",
+    "EmployeeTeamGateway",
     "EmployeeEnvironmentAuthority",
     "EmployeeProcessEnvironmentMaterial",
     "render_employee_context",

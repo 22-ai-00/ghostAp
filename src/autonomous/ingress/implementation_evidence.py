@@ -138,7 +138,7 @@ class Phase3ImplementationGate:
             in {
                 "employee_channel_bridge",
                 "employee_router_queue",
-                "employee_slock_gateway",
+                "employee_team_gateway",
                 "employee_terminal_pipeline",
             }
             else "chaos_security"
@@ -173,13 +173,13 @@ class Phase3ImplementationGate:
                 or self.environment != "local_process_harness"
             ):
                 raise ValueError(f"invalid Router queue profile for {self.id}")
-        elif self.artifact_kind == "employee_slock_gateway":
+        elif self.artifact_kind == "employee_team_gateway":
             if (
-                self.artifact_profile_id != "employee-slock-gateway-v1"
+                self.artifact_profile_id != "employee-team-gateway-v1"
                 or wheel is not None
-                or self.environment != "local_slock_harness"
+                or self.environment != "local_team_harness"
             ):
-                raise ValueError(f"invalid employee Slock gateway profile for {self.id}")
+                raise ValueError(f"invalid employee Team gateway profile for {self.id}")
         elif self.artifact_kind == "employee_terminal_pipeline":
             if (
                 self.artifact_profile_id != "employee-terminal-pipeline-v1"

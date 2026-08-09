@@ -9,7 +9,7 @@ from src.autonomous.runtime.employee_actor import (
 )
 from src.autonomous.runtime.employee_session import EmployeeSessionBootstrap
 from src.autonomous.runtime.employee_supervisor import EmployeeRuntimeSupervisor
-from src.slock_engine.models import AgentIdentity
+from src.autonomous.workforce.identity import AgentIdentity
 
 
 class _Session:

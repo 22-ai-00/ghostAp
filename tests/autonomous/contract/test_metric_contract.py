@@ -7,9 +7,6 @@ import math
 import pytest
 
 from src.autonomous.acceptance.metrics import (
-    PercentileResult,
-    WilsonInterval,
-    ZeroEventBound,
     percentiles,
     wilson_confidence_interval,
     zero_event_upper_bound,

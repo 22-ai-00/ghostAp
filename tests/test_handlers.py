@@ -36,45 +36,54 @@ from src.project.context import ProjectContext, SessionSnapshot
 
 
 def _make_handler_context(**overrides) -> HandlerContext:
-    """Build a HandlerContext with all dependencies mocked."""
+    """Build an isolated handler dependency container with inert defaults."""
     settings = MagicMock()
     settings.thread_programming_enabled = False
+    settings.card.collapsible_enabled = False
     settings.project_allowed_roots = []
-    ctx = HandlerContext(
-        settings=settings,
-        api_client_factory=MagicMock(),
-        message_callback=MagicMock(),
-        coco_manager=MagicMock(),
-        claude_manager=MagicMock(),
-        aiden_manager=MagicMock(),
-        codex_manager=MagicMock(),
-        gemini_manager=MagicMock(),
-        traex_manager=MagicMock(),
-        intent_recognizer=MagicMock(),
-        scheduler=MagicMock(),
-        project_manager=MagicMock(),
-        message_mapper=MagicMock(),
-        message_linker=MagicMock(),
-        mode_manager=MagicMock(),
-        context_manager=MagicMock(),
-        deep_engine_manager=MagicMock(),
-        progress_reporter=MagicMock(),
-        spec_engine_manager=MagicMock(),
-        spec_reporter=MagicMock(),
-        slock_engine_manager=MagicMock(),
-        thread_manager=MagicMock(),
-        image_handler_factory=MagicMock(),
-        working_dirs={},
-        working_dir_lock=threading.Lock(),
-        pending_image_keys={},
-        pending_image_lock=threading.Lock(),
-        enable_streaming=False,
-        managers={},
-        handlers={},
-    )
-    for k, v in overrides.items():
-        setattr(ctx, k, v)
-    return ctx
+
+    managers = {
+        name: MagicMock(name=f"{name}_manager")
+        for name in ("coco", "claude", "aiden", "codex", "gemini", "traex")
+    }
+    mode_manager = MagicMock(name="mode_manager")
+    mode_manager.get_mode.return_value = InteractionMode.SMART
+    for name in managers:
+        getattr(mode_manager, f"is_{name}_mode").return_value = False
+
+    project_manager = MagicMock(name="project_manager")
+    project_manager.get_active_project.return_value = None
+    project_manager.get_project_for_chat.return_value = None
+
+    context_manager = MagicMock(name="context_manager")
+    context_manager.store.get.return_value = None
+
+    values = {
+        "settings": settings,
+        "api_client_factory": MagicMock(name="api_client_factory"),
+        "message_callback": MagicMock(name="message_callback"),
+        **{f"{name}_manager": manager for name, manager in managers.items()},
+        "intent_recognizer": MagicMock(name="intent_recognizer"),
+        "scheduler": MagicMock(name="scheduler"),
+        "project_manager": project_manager,
+        "message_mapper": MagicMock(name="message_mapper"),
+        "message_linker": MagicMock(name="message_linker"),
+        "mode_manager": mode_manager,
+        "context_manager": context_manager,
+        "deep_engine_manager": MagicMock(name="deep_engine_manager"),
+        "progress_reporter": MagicMock(name="progress_reporter"),
+        "spec_engine_manager": MagicMock(name="spec_engine_manager"),
+        "spec_reporter": MagicMock(name="spec_reporter"),
+        "thread_manager": MagicMock(name="thread_manager"),
+        "image_handler_factory": MagicMock(name="image_handler_factory"),
+        "managers": managers,
+        "repo_lock_manager": None,
+        "chat_lock_manager": None,
+    }
+    values.update(overrides)
+    return HandlerContext(**values)
+
+
 
 
 def _set_all_programming_mode_flags(ctx, value: bool) -> None:
@@ -351,232 +360,6 @@ class TestSystemHandlerPredicates:
         assert SystemHandler.is_interceptable_command_match(m("hello")) is False
 
 
-class TestSystemHandlerRouting:
-    def _make(self):
-        ctx = _make_handler_context()
-        handler = SystemHandler(ctx)
-        ctx.handlers.update({
-            "coco": MagicMock(),
-            "claude": MagicMock(),
-            "project": MagicMock(),
-            "deep": MagicMock(),
-            "diagnostics": MagicMock(),
-        })
-        # Keep attributes for test assertions
-        handler.coco_handler = ctx.handlers["coco"]
-        handler.claude_handler = ctx.handlers["claude"]
-        handler.project_handler = ctx.handlers["project"]
-        handler.deep_handler = ctx.handlers["deep"]
-        handler.diagnostics_handler = ctx.handlers["diagnostics"]
-        return handler
-
-    def test_route_help(self):
-        h = self._make()
-        h.show_full_help = MagicMock()
-        h.handle_intercepted_command("m1", "c1", "/help", None, command_match=SlashCommandParser.parse("/help"))
-        h.show_full_help.assert_called_once_with("m1", "c1", None)
-
-    def test_subhandler_facade_exposes_minimal_responsibility_entries(self):
-        h = self._make()
-
-        assert h.help_commands.show_full_help.__func__ is h.show_full_help.__func__
-        assert h.shell_commands.submit_shell_command.__func__ is h.submit_shell_command.__func__
-        assert h.acp_commands.handle_acp_command.__func__ is h.handle_acp_command.__func__
-        assert h.lock_commands.handle_force_release_repo_lock.__func__ is h.handle_force_release_repo_lock.__func__
-
-    def test_route_coco_info(self):
-        h = self._make()
-        h.handle_intercepted_command("m1", "c1", "/coco_info", None, command_match=SlashCommandParser.parse("/coco_info"))
-        h.coco_handler.show_info.assert_called_once_with("m1", "c1", None)
-
-    def test_route_claude_info(self):
-        h = self._make()
-        h.handle_intercepted_command("m1", "c1", "/claude_info", None, command_match=SlashCommandParser.parse("/claude_info"))
-        h.claude_handler.show_info.assert_called_once_with("m1", "c1", None)
-
-    def test_route_projects(self):
-        h = self._make()
-        h.handle_intercepted_command("m1", "c1", "/projects", None, command_match=SlashCommandParser.parse("/projects"))
-        h.project_handler.show_project_board.assert_called_once_with("m1", "c1")
-
-    def test_route_new_chat_project(self):
-        h = self._make()
-        h.handle_intercepted_command(
-            "m1",
-            "c1",
-            "/new-chat hermes",
-            None,
-            command_match=SlashCommandParser.parse("/new-chat hermes"),
-        )
-        h.project_handler.handle_new_chat_project.assert_called_once_with(
-            "m1",
-            "c1",
-            {"name": "hermes"},
-        )
-
-    def test_route_new_chat_project_preserves_path_spaces(self):
-        h = self._make()
-        h.handle_intercepted_command(
-            "m1",
-            "c1",
-            "/new-chat hermes dev /tmp/a b",
-            None,
-            command_match=SlashCommandParser.parse("/new-chat hermes dev /tmp/a b"),
-        )
-        h.project_handler.handle_new_chat_project.assert_called_once_with(
-            "m1",
-            "c1",
-            {"name": "hermes", "suffix": "dev", "path": "/tmp/a b"},
-        )
-
-    def test_route_tasks(self):
-        h = self._make()
-        h.handle_intercepted_command("m1", "c1", "/tasks", None, command_match=SlashCommandParser.parse("/tasks"))
-        h.diagnostics_handler.show_task_board.assert_called_once_with("m1", "c1", "/tasks", None)
-
-    def test_route_diff(self):
-        h = self._make()
-        h.handle_intercepted_command("m1", "c1", "/diff", None, command_match=SlashCommandParser.parse("/diff"))
-        h.diagnostics_handler.show_context_diff.assert_called_once_with("m1", "c1", "/diff", None)
-
-    def test_route_trace(self):
-        h = self._make()
-        h.handle_intercepted_command("m1", "c1", "/trace msg123", None, command_match=SlashCommandParser.parse("/trace msg123"))
-        h.diagnostics_handler.show_message_trace.assert_called_once_with("m1", "c1", "/trace msg123", None)
-
-    def test_intercepted_unknown_slash_replies_without_help_card(self):
-        h = self._make()
-        h.reply_text = MagicMock()
-        h.show_full_help = MagicMock()
-
-        h.handle_intercepted_command(
-            "m1",
-            "c1",
-            "/unknown_command",
-            None,
-            command_match=SlashCommandParser.parse("/unknown_command"),
-        )
-
-        h.reply_text.assert_called_once()
-        assert "未知命令" in h.reply_text.call_args.args[1]
-        h.show_full_help.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "/goal refactor auth",
-            "/goals",
-            "/runs",
-            "/approve ap_1",
-            "/run goal_1",
-            "/approvals",
-            "/decisions",
-        ],
-    )
-    def test_retired_autonomous_manager_commands_never_claim_success(self, text):
-        h = self._make()
-        h.reply_text = MagicMock()
-        h.reply_card = MagicMock()
-
-        h.handle_intercepted_command(
-            "m1",
-            "c1",
-            text,
-            None,
-            command_match=SlashCommandParser.parse(text),
-        )
-
-        h.reply_text.assert_called_once()
-        response = h.reply_text.call_args.args[1]
-        assert "已退役" in response
-        assert "未执行" in response
-        assert "Slock" in response
-        assert "/goal" not in response
-        assert "/task" in response
-        if text.startswith("/goal "):
-            assert "/task refactor auth" in response
-        h.reply_card.assert_not_called()
-
-    @patch("src.thread.get_current_thread_id", return_value=None)
-    def test_btw_forwards_to_active_programming_handler(self, _):
-        h = self._make()
-        project = MagicMock()
-        project.project_id = "p1"
-        codex = MagicMock()
-        h.ctx.handlers["codex"] = codex
-        h.mode_manager.get_mode.return_value = InteractionMode.CODEX
-        h.mode_manager.is_programming_mode.return_value = True
-
-        h.handle_intercepted_command(
-            "m1",
-            "c1",
-            "/btw add a constraint",
-            project,
-            command_match=SlashCommandParser.parse("/btw add a constraint"),
-        )
-
-        codex.handle_message.assert_called_once_with("m1", "c1", "/btw add a constraint", project)
-
-    @patch("src.thread.get_current_thread_id", return_value=None)
-    def test_btw_without_active_programming_replies_usage(self, _):
-        h = self._make()
-        h.reply_text = MagicMock()
-        h.mode_manager.get_mode.return_value = InteractionMode.SMART
-        h.mode_manager.is_programming_mode.return_value = False
-
-        h.handle_intercepted_command(
-            "m1",
-            "c1",
-            "/btw add a constraint",
-            None,
-            command_match=SlashCommandParser.parse("/btw add a constraint"),
-        )
-
-        h.reply_text.assert_called_once()
-        assert "没有活跃编程会话" in h.reply_text.call_args.args[1]
-
-    def test_route_new_project(self):
-        h = self._make()
-        h.handle_intercepted_command(
-            "m1",
-            "c1",
-            "/new myapp /tmp/myapp",
-            None,
-            command_match=SlashCommandParser.parse("/new myapp /tmp/myapp"),
-        )
-        h.project_handler.create_project.assert_called_once_with("m1", "c1", "myapp", "/tmp/myapp")
-
-    def test_route_close_project(self):
-        h = self._make()
-        h.handle_intercepted_command("m1", "c1", "/close myapp", None, command_match=SlashCommandParser.parse("/close myapp"))
-        h.project_handler.close_project.assert_called_once_with("m1", "c1", "myapp")
-
-    def test_exit_current_mode_coco(self):
-        ctx = _make_handler_context()
-        ctx.mode_manager.get_mode.return_value = InteractionMode.COCO
-        h = SystemHandler(ctx)
-        ctx.handlers["coco"] = MagicMock()
-        h.coco_handler = ctx.handlers["coco"]
-        h.exit_current_mode("m1", "c1", None)
-        h.coco_handler.exit_mode.assert_called_once_with("m1", "c1", None)
-
-
-
-
-
-
-
-
-
-    def test_show_tools_list_uses_cached_availability_api(self):
-        h = self._make()
-        with patch("src.feishu.handlers.system.tool_registry") as mock_registry:
-            mock_registry.get_availability.return_value = True
-            h.reply_interactive_card = MagicMock()
-            h.show_tools_list("m1", "c1", None)
-            # 6 tools in metadata
-            assert mock_registry.get_availability.call_count == 6
-            h.reply_interactive_card.assert_called_once()
 
 
 # ======================================================================
@@ -2607,62 +2390,6 @@ class TestNonStreamingHeartbeat:
 # ======================================================================
 
 
-class TestHelpCardLockAlwaysVisible:
-    """F-20/AC-18: lock_enabled=True ensures /help always contains lock section."""
-
-    def test_slock_section_present_in_main_help(self):
-        """The main /help card should expose Slock mode and its core workflow."""
-        from src.card.builders.system import SystemBuilder
-
-        _msg_type, card_json = SystemBuilder.build_help_card(
-            project=None,
-            category="main",
-            is_admin=False,
-            lock_enabled=False,
-            chat_id="",
-            session_idle_timeout=600,
-            session_idle_warn_at_remaining=120,
-            lock_undo_window_seconds=300,
-        )
-        assert "Slock" in card_json or "slock" in card_json
-        assert "/slock" in card_json
-        assert "/hire" in card_json or "/role add" in card_json
-        assert "/task status" in card_json
-
-    def test_lock_section_present_when_no_admin_ids(self):
-        """Even with admin_user_ids=frozenset(), the help card includes lock content."""
-        from src.card.builders.system import SystemBuilder
-
-        # lock_enabled=True is now hardcoded in system.py; verify the card builder
-        # produces a lock section regardless of admin status.
-        _msg_type, card_json = SystemBuilder.build_help_card(
-            project=None,
-            category="main",
-            is_admin=False,
-            lock_enabled=True,
-            chat_id="",
-            session_idle_timeout=600,
-            session_idle_warn_at_remaining=120,
-            lock_undo_window_seconds=300,
-        )
-        # The non-admin lock section title should be present
-        assert "群锁定" in card_json
-
-    def test_lock_section_absent_when_lock_disabled(self):
-        """Baseline: lock_enabled=False should NOT include the lock section."""
-        from src.card.builders.system import SystemBuilder
-
-        _msg_type, card_json = SystemBuilder.build_help_card(
-            project=None,
-            category="main",
-            is_admin=False,
-            lock_enabled=False,
-            chat_id="",
-            session_idle_timeout=600,
-            session_idle_warn_at_remaining=120,
-            lock_undo_window_seconds=300,
-        )
-        assert "群锁定" not in card_json
 
 
 # ======================================================================

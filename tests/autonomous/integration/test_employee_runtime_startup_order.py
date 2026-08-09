@@ -444,7 +444,7 @@ def test_production_dispatch_ignores_main_bot_group_command_observation(
                     {
                         "type": "message",
                         "chat_type": "group",
-                        "content": {"text": "/role list"},
+                        "content": {"text": "/help"},
                     },
                 )
             )
@@ -517,7 +517,7 @@ def test_employee_group_projection_maps_app_open_id_to_owner_principal() -> None
         "type": "message",
         "message_type": "text",
         "chat_type": "group",
-        "content": {"text": "/role list"},
+        "content": {"text": "/help"},
         "sender_id": "ou_employee_app",
         "sender_union_id": "on_owner",
         "sender_id_type": "open_id",

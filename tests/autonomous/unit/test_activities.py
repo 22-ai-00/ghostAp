@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from src.autonomous.scheduler.activities import (
-    Activity,
     ActivityExecutor,
     ActivityNotFound,
     ActivityState,
@@ -164,7 +163,7 @@ async def test_list_active_filters_by_run(executor: ActivityExecutor) -> None:
         run_id="run_1",
         fencing_token=1,
     )
-    a2 = await executor.create(
+    await executor.create(
         activity_type=ActivityType.EXECUTION,
         run_id="run_2",
         fencing_token=1,

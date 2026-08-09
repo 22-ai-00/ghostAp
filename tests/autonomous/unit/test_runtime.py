@@ -7,11 +7,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from src.autonomous.broker.model_broker import ModelBroker, ModelCallResult, RateLimiter
+from src.autonomous.broker.model_broker import ModelBroker
 from src.autonomous.broker.tool_broker import (
     CapabilityRegistry,
-    DispatchRequest,
-    DispatchResult,
     ToolBroker,
 )
 from src.autonomous.domain import (
@@ -24,13 +22,8 @@ from src.autonomous.domain import (
 from src.autonomous.policy.budget_manager import BudgetManager
 from src.autonomous.runtime.runtime import (
     AgentRuntime,
-    RuntimeResult,
-    ToolProposal,
     TurnInput,
-    TurnOutput,
-    TurnRecord,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

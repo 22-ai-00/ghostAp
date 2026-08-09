@@ -370,12 +370,14 @@ def test_streaming_pending_plan_continues_on_same_session_and_finishes():
     assert adapter.kwargs["continuation_visibility_timeout"] >= 2.0
 
 
-def test_streaming_second_pending_plan_waits_without_failing():
+def test_streaming_retries_pending_plan_three_times_then_reports_incomplete():
     handler = _make_handler()
     handler.ctx.channel_client_factory = MagicMock(return_value=object())
     session = _QueuedPromptSession(
         _pending_result("first partial"),
         _pending_result("second partial"),
+        _pending_result("third partial"),
+        _pending_result("fourth partial"),
     )
 
     with _streaming_environment():
@@ -390,12 +392,11 @@ def test_streaming_second_pending_plan_waits_without_failing():
         )
 
     adapter = _FakeProgrammingCardSession.last
-    assert len(session.calls) == 2
-    assert adapter.continuation_boundaries == 1
+    assert len(session.calls) == 4
+    assert adapter.continuation_boundaries == 3
     assert adapter.finished is False
-    assert adapter.failed_text is None
-    assert adapter.waiting_reason is not None
-    assert "确认" in adapter.waiting_reason
+    assert adapter.failed_text is not None
+    assert adapter.waiting_reason is None
 
 
 def test_non_streaming_pending_plan_continues_and_replies_with_success():
@@ -427,7 +428,7 @@ def test_non_streaming_pending_plan_continues_and_replies_with_success():
     handler.add_reaction.assert_called_once()
 
 
-def test_non_streaming_second_pending_plan_renders_waiting_without_success():
+def test_non_streaming_retries_pending_plan_then_renders_incomplete():
     handler = _make_handler()
     handler.reply_card = MagicMock()
     handler.upload_acp_image = MagicMock(return_value="img-waiting")
@@ -440,6 +441,8 @@ def test_non_streaming_second_pending_plan_renders_waiting_without_success():
     session = _QueuedPromptSession(
         _pending_result("first partial"),
         _pending_result("second partial"),
+        _pending_result("third partial"),
+        _pending_result("fourth partial"),
         first_event=ACPEvent(
             event_type=ACPEventType.IMAGE_CHUNK,
             image=image,
@@ -455,7 +458,7 @@ def test_non_streaming_second_pending_plan_renders_waiting_without_success():
         "/tmp",
     )
 
-    assert len(session.calls) == 2
+    assert len(session.calls) == 4
     assert "自动续做指令" in session.calls[1][0]
     handler.upload_acp_image.assert_called_once_with(image)
     handler.reply_text.assert_not_called()
@@ -466,8 +469,8 @@ def test_non_streaming_second_pending_plan_renders_waiting_without_success():
         for element in card["body"]["elements"]
         if element.get("tag") == "markdown"
     )
-    assert "Claude · 等待用户确认" in markdown
-    assert "自动续做已完成，仍需你的确认后才能继续" in markdown
+    assert "等待用户确认" not in markdown
+    assert "未完成" in markdown
     assert "仍有 1 个计划项未完成" in markdown
     handler.add_reaction.assert_not_called()
 

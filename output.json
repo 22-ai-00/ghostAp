@@ -1,6 +1,0 @@
-{
-  "role_id": "user",
-  "verdict": "PASS",
-  "summary": "Slock的交互理念已由'需关注各种后台命令'优化为'进群直接发送任务即可，系统自动路由处理'，代码层面通过调整默认角色、被动激活模式(passive mode)等支持该产品理念。整体实现满足需求。",
-  "suggestions": []
-}

@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from src.autonomous.domain import Effect, EffectState
 from src.autonomous.reporter.finalization import (
     DispositionType,
     EffectDisposition,
@@ -13,7 +14,6 @@ from src.autonomous.reporter.finalization import (
     FinalizationRecord,
     FinalizationState,
 )
-from src.autonomous.domain import Effect, EffectState
 
 
 class FakeJournal:

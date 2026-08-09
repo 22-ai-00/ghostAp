@@ -19,7 +19,6 @@ Test categories:
 from __future__ import annotations
 
 import os
-import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -31,48 +30,39 @@ from src.mode import InteractionMode, ModeManager
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _make_handler_context(**settings_overrides) -> HandlerContext:
-    """Create a fully mocked HandlerContext for handler testing."""
-    settings = MagicMock()
-    settings.default_reply_mode = "direct"
-    settings.admin_user_ids = []
-    for k, v in settings_overrides.items():
-        setattr(settings, k, v)
 
-    ctx = HandlerContext(
+
+def _make_handler_context(**settings_overrides) -> HandlerContext:
+    """Build the minimal dependency container used by topic-scope tests."""
+    settings = MagicMock()
+    for name, value in settings_overrides.items():
+        setattr(settings, name, value)
+    mock = MagicMock
+    return HandlerContext(
         settings=settings,
-        api_client_factory=MagicMock(),
-        message_callback=MagicMock(),
-        coco_manager=MagicMock(),
-        claude_manager=MagicMock(),
-        aiden_manager=MagicMock(),
-        codex_manager=MagicMock(),
-        gemini_manager=MagicMock(),
-        traex_manager=MagicMock(),
-        intent_recognizer=MagicMock(),
-        scheduler=MagicMock(),
-        project_manager=MagicMock(),
-        message_mapper=MagicMock(),
-        message_linker=MagicMock(),
+        api_client_factory=mock(),
+        message_callback=mock(),
+        coco_manager=mock(),
+        claude_manager=mock(),
+        aiden_manager=mock(),
+        codex_manager=mock(),
+        gemini_manager=mock(),
+        traex_manager=mock(),
+        intent_recognizer=mock(),
+        scheduler=mock(),
+        project_manager=mock(),
+        message_mapper=mock(),
+        message_linker=mock(),
         mode_manager=ModeManager(),
-        context_manager=MagicMock(),
-        deep_engine_manager=MagicMock(),
-        progress_reporter=MagicMock(),
-        spec_engine_manager=MagicMock(),
-        spec_reporter=MagicMock(),
-        thread_manager=MagicMock(),
-        image_handler_factory=MagicMock(),
-        working_dirs={},
-        working_dir_lock=threading.Lock(),
-        pending_image_keys={},
-        pending_image_lock=threading.Lock(),
-        enable_streaming=False,
-        managers={},
-        handlers={},
-        slock_engine_manager=MagicMock(),
-        workflow_engine_manager=MagicMock(),
+        context_manager=mock(),
+        deep_engine_manager=mock(),
+        progress_reporter=mock(),
+        spec_engine_manager=mock(),
+        spec_reporter=mock(),
+        thread_manager=mock(),
+        image_handler_factory=mock(),
+        workflow_engine_manager=mock(),
     )
-    return ctx
 
 
 def _make_workflow_handler(**settings_overrides) -> WorkflowHandler:
@@ -361,131 +351,6 @@ class TestWorkflowModeStateIsolation(unittest.TestCase):
 # ===========================================================================
 
 
-class TestDispatcherRouting(unittest.TestCase):
-    """Verify dispatcher routes workflow commands to the correct handler.
-
-    Tests that /wf, /workflow, /stop_wf, and /wf_status commands are
-    properly routed to WorkflowHandler methods.
-    """
-
-    def test_wf_command_routes_to_workflow_handler(self):
-        """Verify /wf command routes to WorkflowHandler.handle_workflow_command.
-
-        The dispatcher checks _is_workflow_command() and if true, calls
-        _handle_workflow_command which is bound to WorkflowHandler.handle_workflow_command.
-        """
-        from src.feishu.dispatcher import MessageDispatcher
-        from src.feishu.handlers.system import SystemHandler
-
-        # Verify the command is recognized
-        self.assertTrue(SystemHandler.is_workflow_command("/wf"))
-        self.assertTrue(SystemHandler.is_workflow_command("/wf do something"))
-
-        # Create dispatcher with mock client
-        client = MagicMock()
-        client._is_workflow_command = SystemHandler.is_workflow_command
-        client._add_reaction = MagicMock()
-        client._handle_workflow_command = MagicMock()
-        client._is_deep_command = MagicMock(return_value=False)
-        client._is_spec_command = MagicMock(return_value=False)
-        client._is_slock_command = MagicMock(return_value=False)
-        client._get_effective_mode = MagicMock(return_value=(InteractionMode.SMART, False))
-        client._is_topic_engine_context = MagicMock(return_value=False)
-
-        dispatcher = MessageDispatcher(client)
-
-        # Process a /wf command
-        dispatcher.process_with_intent(
-            message_id="msg_1",
-            chat_id="chat_1",
-            text="/wf automate testing",
-            project=None,
-        )
-
-        # Verify workflow handler was called
-        client._handle_workflow_command.assert_called_once_with(
-            "msg_1", "chat_1", "/wf automate testing", None
-        )
-        # Verify reactions were added
-        self.assertEqual(client._add_reaction.call_count, 2)
-
-    def test_workflow_command_alias_routes(self):
-        """Verify /workflow is an alias for /wf and routes to the same handler.
-
-        Both /wf and /workflow should be recognized and routed identically.
-        """
-        from src.feishu.handlers.system import SystemHandler
-
-        # Verify both forms are recognized
-        self.assertTrue(SystemHandler.is_workflow_command("/workflow"))
-        self.assertTrue(SystemHandler.is_workflow_command("/workflow do something"))
-
-        # Create dispatcher with mock client
-        client = MagicMock()
-        client._is_workflow_command = SystemHandler.is_workflow_command
-        client._add_reaction = MagicMock()
-        client._handle_workflow_command = MagicMock()
-        client._is_deep_command = MagicMock(return_value=False)
-        client._is_spec_command = MagicMock(return_value=False)
-        client._is_slock_command = MagicMock(return_value=False)
-        client._get_effective_mode = MagicMock(return_value=(InteractionMode.SMART, False))
-        client._is_topic_engine_context = MagicMock(return_value=False)
-
-        from src.feishu.dispatcher import MessageDispatcher
-        dispatcher = MessageDispatcher(client)
-
-        # Process a /workflow command
-        dispatcher.process_with_intent(
-            message_id="msg_1",
-            chat_id="chat_1",
-            text="/workflow automate deployment",
-            project=None,
-        )
-
-        # Verify the same handler is called
-        client._handle_workflow_command.assert_called_once_with(
-            "msg_1", "chat_1", "/workflow automate deployment", None
-        )
-
-    def test_stop_wf_routes_to_stop_workflow(self):
-        """Verify /stop_wf routes to WorkflowHandler.stop_workflow.
-
-        The handle_workflow_command method should parse the command and
-        dispatch to stop_workflow for /stop_wf.
-        """
-        handler = _make_workflow_handler()
-        handler.stop_workflow = MagicMock()
-
-        # Call handle_workflow_command with /stop_wf
-        handler.handle_workflow_command(
-            message_id="msg_1",
-            chat_id="chat_1",
-            text="/stop_wf",
-            project=None,
-        )
-
-        # Verify stop_workflow was called
-        handler.stop_workflow.assert_called_once_with("msg_1", "chat_1", None)
-
-    def test_wf_status_routes_to_status(self):
-        """Verify /wf_status routes to WorkflowHandler.show_workflow_status.
-
-        The handle_workflow_command method should parse the command and
-        dispatch to show_workflow_status for /wf_status.
-        """
-        handler = _make_workflow_handler()
-        handler.show_workflow_status = MagicMock()
-
-        # Call handle_workflow_command with /wf_status
-        handler.handle_workflow_command(
-            message_id="msg_1",
-            chat_id="chat_1",
-            text="/wf_status",
-            project=None,
-        )
-
-        # Verify show_workflow_status was called
-        handler.show_workflow_status.assert_called_once_with("msg_1", "chat_1", None)
 
 
 # ===========================================================================

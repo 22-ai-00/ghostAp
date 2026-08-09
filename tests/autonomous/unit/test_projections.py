@@ -2,29 +2,22 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from src.autonomous.domain.enums import (
     EffectState,
     GoalState,
-    GoalType,
-    PlanState,
-    RiskLevel,
     RunState,
     StepState,
 )
-from src.autonomous.journal.frame import JournalEvent, TransactionFrame
+from src.autonomous.journal import JournalWriter, MemoryAnchor
+from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.projections import (
     InboxRecord,
     ProjectionError,
     ProjectionRepository,
     ProjectionState,
-    apply_event,
-    apply_frame,
 )
-from src.autonomous.journal import MemoryAnchor, JournalWriter
 
 HMAC_KEY = b"test-projections-key-at-least-32-bytes!!"
 

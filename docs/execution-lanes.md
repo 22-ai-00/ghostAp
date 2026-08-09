@@ -17,14 +17,12 @@ does not hide the Owner's entry from the product surface.
 | Spec | `/spec` | mature | Existing protected Spec execution strategy. |
 | Workflow | `/wf`, `/workflow` | developing | Existing RunSpec/reviewer execution stays visible; IR v2 and durable ports are unfinished. |
 | Team | `/team`, `/new-team` | developing | Existing employee collaboration stays visible; its unified durable task graph is unfinished. |
-| Slock | `/slock` | developing | Existing group collaboration stays visible; the unique execution fact source is unfinished. |
 
 When an action has an unmet execution prerequisite, its product entry must state
 that concrete blocker.  GhostAP must not substitute hidden entries for runtime
 validation.
 
 Explicit Direct, Deep, and Spec commands always take priority over SMART or
-Slock automatic activation.  This is a routing-safety rule, not a maturity or
 release policy.  Listed aliases and card actions remain compatible.
 
 `/goal` is a retired standalone-Manager command.  It remains a deterministic,

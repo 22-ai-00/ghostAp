@@ -27,8 +27,6 @@ class ExecutionLane(str, Enum):
     DEEP = "deep"
     SPEC = "spec"
     WORKFLOW = "workflow"
-    TEAM = "team"
-    SLOCK = "slock"
 
 
 class ProductRole(str, Enum):
@@ -168,22 +166,11 @@ PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/wf_list", "列出 Workflow 模板", aliases=("/workflow_list",)),
     _action("/wf_delete", "删除 Workflow 模板", "/wf_delete <名称>", aliases=("/workflow_delete",)),
     _action("/wf_history", "查看 Workflow 执行历史", aliases=("/workflow_history",)),
-    _action("/slock", "激活或管理当前 Slock 团队", "/slock [status|stop|help]", aliases=("/s",)),
-    _action("/slocks", "查看全部 Slock 团队"),
-    _action("/new-team", "创建 Slock 协作团队", "/new-team <团队名>", aliases=("/nt",)),
-    _action("/new-role", "创建 Slock 角色", "/new-role <名称>", aliases=("/nr",)),
     _action("/hire", "雇佣持久数字员工", "/hire <名字> [选项]", aliases=("/h",)),
     _action("/fire", "退役持久数字员工", "/fire <名字>"),
     _action("/employees", "查看在职数字员工", aliases=("/roster",)),
     _action("/history", "查看数字员工执行历史", "/history [员工名]"),
     _action("/employee-memory", "查看数字员工记忆摘要", "/employee-memory <员工名>"),
-    _action("/role", "管理 Slock 群内角色", "/role [list|add|remove|info|move]", aliases=("/r",)),
-    _action("/task", "查看 Slock 任务", "/task [list|status]", aliases=("/t",)),
-    _action("/team", "管理 Slock 团队", "/team [list|status|dissolve]", aliases=("/tm",)),
-    _action("/council", "发起 Slock 多 Agent 评议", "/council <问题>", aliases=("/c",)),
-    _action("/discuss", "发起或管理 Slock 讨论", "/discuss [主题|stop|history|list]"),
-    _action("/memory", "查看 Slock 记忆", "/memory [list|group|员工名]"),
-    _action("/plan", "查看 Slock 计划", "/plan [list|计划ID]", aliases=("/p",)),
 )
 
 
@@ -248,8 +235,6 @@ _EXECUTION_LANE_DESCRIPTORS: tuple[ExecutionLaneDescriptor, ...] = (
     ExecutionLaneDescriptor(ExecutionLane.DEEP, "deep", "Deep", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),
     ExecutionLaneDescriptor(ExecutionLane.SPEC, "spec", "Spec", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),
     ExecutionLaneDescriptor(ExecutionLane.WORKFLOW, "wf", "Workflow", CompletionLabel.DEVELOPING, RuntimeHealth.AVAILABLE, compatibility_alias_action_ids=("wf",), blocking_reason="冻结 IR v2 与耐久执行端口尚未完成；当前 Workflow 保持既有 RunSpec 与 reviewer 合同。"),
-    ExecutionLaneDescriptor(ExecutionLane.TEAM, "team", "Team", CompletionLabel.DEVELOPING, RuntimeHealth.AVAILABLE, ("new-team",), blocking_reason="Team 的统一耐久任务图尚未收敛；当前群协作入口仍按现有员工运行时执行。"),
-    ExecutionLaneDescriptor(ExecutionLane.SLOCK, "slock", "Slock", CompletionLabel.DEVELOPING, RuntimeHealth.AVAILABLE, blocking_reason="Slock 尚未收敛到唯一执行事实源；当前命令和卡片动作继续保持兼容。"),
 )
 
 

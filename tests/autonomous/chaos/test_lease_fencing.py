@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import pytest
 
+from src.autonomous.domain.plans import PlanStep
 from src.autonomous.scheduler.activities import (
     ActivityExecutor,
     ActivityType,
     StaleLease,
 )
 from src.autonomous.scheduler.scheduler import DurableScheduler
-from src.autonomous.domain.plans import PlanStep
 
 
 class FakeJournal:

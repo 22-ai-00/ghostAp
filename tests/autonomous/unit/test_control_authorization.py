@@ -8,7 +8,6 @@ from src.autonomous.domain.control import Principal
 from src.autonomous.policy.authorization import (
     AuthorizationDenied,
     AuthorizationEnvelope,
-    AuthorizationResult,
     ControlAuthorizationGate,
     Operation,
     ResourceACL,

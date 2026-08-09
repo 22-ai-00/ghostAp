@@ -64,7 +64,7 @@ def test_unknown_dispatch_recovers_action_required_without_rerun(
 ) -> None:
     """EI-RECOVERY-01 replays an unknown dispatch once and never reruns ACP."""
 
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -107,7 +107,7 @@ def test_actor_terminal_is_preserved_when_gateway_recovery_follows_process_death
 
     from src.autonomous.journal.frame import JournalEvent
     from src.autonomous.journal.writer import CommitState
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -177,7 +177,7 @@ def test_actor_completed_digest_without_result_is_action_required_after_restart(
 
     from src.autonomous.journal.frame import JournalEvent
     from src.autonomous.journal.writer import CommitState
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -282,7 +282,7 @@ def _reopen_recovery_harness(
         ingress_service=ingress,
         registry_provider=lambda: ProjectedAgentRegistry(
             workforce,
-            storage_base_path=str(tmp_path / "registry-slock"),
+            storage_base_path=str(tmp_path / "registry-employee"),
         ),
         channel_status_provider=prior.router._channels,  # noqa: SLF001
         requester_acl=prior.router._requester_acl,  # noqa: SLF001
@@ -326,7 +326,7 @@ def _reopen_recovery_harness(
         router=router,
         data_service=data,
         channel_supervisor=prior.channels,
-        slock_manager=prior.manager,
+        team_runtime=prior.team_runtime,
         context_service=prior.context,
         environment_provider=lambda authority: EmployeeProcessEnvironmentMaterial(
             tenant_key=authority.tenant_key,
@@ -338,7 +338,7 @@ def _reopen_recovery_harness(
         ),
         registry_factory=lambda state: ProjectedAgentRegistry(
             state,
-            storage_base_path=str(tmp_path / "registry-slock"),
+            storage_base_path=str(tmp_path / "registry-employee"),
         ),
     )
     coordinator = EmployeeDispatchCoordinator(**coordinator_kwargs)
@@ -390,7 +390,7 @@ def test_recovery_commit_section_never_replays_full_journal(
 ) -> None:
     from contextlib import contextmanager
 
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
@@ -492,19 +492,13 @@ def test_coordinator_prepare_and_finalize_follow_complete_lock_order(
     monkeypatch,
 ) -> None:
     import src.autonomous.workforce.projection as workforce_projection
-    import src.slock_engine.activation as activation
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
     harness = _real_coordinator_harness(tmp_path)
     held = {}
     trace = []
-    monkeypatch.setattr(
-        activation,
-        "_SLOCK_ACTIVATION_LOCK",
-        _TraceRLock("activation", 0, held, trace),
-    )
     monkeypatch.setattr(
         workforce_projection,
         "_WORKFORCE_COMMIT_LOCK",
@@ -546,7 +540,6 @@ def test_coordinator_prepare_and_finalize_follow_complete_lock_order(
 
     acquired_stacks = [item[3] for item in trace if item[1] == "acquire"]
     expected = (
-        "activation",
         "workforce",
         "hire",
         "ingress",

@@ -13,9 +13,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from src.slock_engine.activation import slock_activation_guard
-from src.slock_engine.manager import SlockEngineResolutionError
-
 from ..context.models import ContextUnavailableError, ContextUnavailableReason
 from ..data.models import (
     DataKind,
@@ -33,6 +30,7 @@ from ..journal.projections import apply_frame
 from ..journal.writer import CommitState, JournalWriter
 from ..runtime.employee_supervisor import EmployeeRuntimeSupervisor
 from ..supervisor.channel_models import ChannelProcessState
+from ..team.runtime import TeamRuntimeResolutionError, team_runtime_guard
 from ..workforce.registry import ProjectedAgentRegistry
 from .context_prompt import RenderedEmployeePrompt, render_employee_context
 from .env_scope import (
@@ -54,7 +52,7 @@ from .projection import (
     GatewayProjectionState,
     reduce_gateway_frame,
 )
-from .slock import EmployeeSlockGateway
+from .team import EmployeeTeamGateway
 
 logger = logging.getLogger(__name__)
 
@@ -156,11 +154,11 @@ class EmployeeDispatchCoordinator:
         data_service: EmployeeDataService,
         data_sink: EmployeeDataSink | None = None,
         channel_supervisor: object,
-        slock_manager: object,
+        team_runtime: object,
         context_service: object,
         environment_provider: EnvironmentProvider,
         registry_factory: RegistryFactory | None = None,
-        gateway: EmployeeSlockGateway | None = None,
+        gateway: EmployeeTeamGateway | None = None,
         timeout_seconds: float = 600.0,
         clock: Callable[[], datetime] | None = None,
         attempt_lifecycle: EmployeeAttemptLifecycle | None = None,
@@ -179,7 +177,7 @@ class EmployeeDispatchCoordinator:
         self._data = data_service
         self._data_sink = data_sink
         self._channels = channel_supervisor
-        self._slock_manager = slock_manager
+        self._team_runtime = team_runtime
         self._context = context_service
         self._environment_provider = environment_provider
         self._registry_factory = registry_factory or ProjectedAgentRegistry
@@ -191,7 +189,7 @@ class EmployeeDispatchCoordinator:
             if gateway is None and employee_runtime_mode == "actor"
             else None
         )
-        self._gateway = gateway or EmployeeSlockGateway(
+        self._gateway = gateway or EmployeeTeamGateway(
             runtime_mode=employee_runtime_mode,
             runtime_supervisor=self._employee_runtime,
             shadow_observer=shadow_observer,
@@ -341,7 +339,7 @@ class EmployeeDispatchCoordinator:
 
         registry = self._registry_factory(self._hire.projection_state)
         employee = registry.get(grant.request.tenant_key, grant.request.agent_id)
-        agent = registry.as_slock_identity(
+        agent = registry.as_execution_identity(
             grant.request.tenant_key,
             grant.request.agent_id,
         )
@@ -395,15 +393,15 @@ class EmployeeDispatchCoordinator:
             )
             return None
         # Detect a team stop committed during the lock-free effect scan before
-        # entering any Slock activation boundary; the guarded check below is
+        # entering any Team activation boundary; the guarded check below is
         # repeated to close later races as well.
         self._require_presynchronized_head(captured_head)
 
         try:
-            activation_context = self._slock_manager.employee_activation_guard(
+            activation_context = self._team_runtime.employee_activation_guard(
                 chat_id=grant.request.chat_id,
             )
-            with activation_context as slock_binding, ExitStack() as stack:
+            with activation_context as team_binding, ExitStack() as stack:
                 stack.enter_context(self._projection_sync_lock)
                 stack.enter_context(self._hire.employee_dispatch_guard())
                 stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
@@ -416,7 +414,7 @@ class EmployeeDispatchCoordinator:
                     grant.request.tenant_key,
                     grant.request.agent_id,
                 )
-                current_agent = current_registry.as_slock_identity(
+                current_agent = current_registry.as_execution_identity(
                     grant.request.tenant_key,
                     grant.request.agent_id,
                 )
@@ -459,7 +457,7 @@ class EmployeeDispatchCoordinator:
                 binding = self._build_binding(
                     grant=grant,
                     employee=current,
-                    slock_binding=slock_binding,
+                    team_binding=team_binding,
                     rendered=rendered,
                     authority_connection=authority_connection,
                 )
@@ -495,10 +493,10 @@ class EmployeeDispatchCoordinator:
                 )
                 result = self._commit_events_unlocked(events)
                 self._apply_committed_frame_unlocked(result.frame)
-        except SlockEngineResolutionError:
+        except TeamRuntimeResolutionError:
             self._router.reject_dispatch_candidate(
                 grant.record.acceptance_id,
-                reason_code="slock_unavailable",
+                reason_code="team_unavailable",
             )
             return None
         timeout_seconds = self._timeout_seconds
@@ -520,7 +518,7 @@ class EmployeeDispatchCoordinator:
         permit = self._gateway.issue_permit(
             binding=binding,
             prompt=rendered.prompt,
-            engine=slock_binding.engine,
+            engine=team_binding.engine,
             agent=agent,
             timeout_seconds=timeout_seconds,
             env=env,
@@ -543,16 +541,24 @@ class EmployeeDispatchCoordinator:
             return False
         if not isinstance(step_id, str) or not step_id:
             return False
-        aggregate_id = f"{run_id}:{step_id}"
+        # Coordinator mode anchors the full assignment identity.  The retained
+        # Team ``legacy_pipeline`` writes the same effect under run/step.  Both
+        # are Team-owned Journal facts; newest matching evidence wins.
+        effect_coordinates = {
+            (f"{run_id}:assignment:{step_id}", "team.v2.effect."),
+            (f"{run_id}:{step_id}", "team.effect."),
+        }
         state = ""
         for frame in self._writer.replay():
             for event in frame.events:
-                if (
-                    event.aggregate_id == aggregate_id
-                    and event.event_type.startswith("team.effect.")
-                    and event.payload.get("effect_type") == "employee_dispatch"
-                ):
-                    state = event.event_type.rsplit(".", 1)[-1]
+                if event.payload.get("effect_type") != "employee_dispatch":
+                    continue
+                for aggregate_id, event_prefix in effect_coordinates:
+                    if event.aggregate_id == aggregate_id and event.event_type.startswith(
+                        event_prefix
+                    ):
+                        state = event.event_type.rsplit(".", 1)[-1]
+                        break
         return state in {"prepared", "executing"}
 
     def _presynchronize_domains(self) -> tuple[int, str]:
@@ -763,7 +769,7 @@ class EmployeeDispatchCoordinator:
             for _attempt in range(3):
                 captured_head = self._presynchronize_domains()
                 try:
-                    with slock_activation_guard(), ExitStack() as stack:
+                    with team_runtime_guard(), ExitStack() as stack:
                         stack.enter_context(self._projection_sync_lock)
                         stack.enter_context(self._hire.employee_dispatch_guard())
                         stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
@@ -850,7 +856,7 @@ class EmployeeDispatchCoordinator:
                 captured_head = self._presynchronize_domains()
                 owner_active = self._team_assignment_effect_is_active(part)
                 try:
-                    with slock_activation_guard(), ExitStack() as stack:
+                    with team_runtime_guard(), ExitStack() as stack:
                         stack.enter_context(self._projection_sync_lock)
                         stack.enter_context(self._hire.employee_dispatch_guard())
                         stack.enter_context(
@@ -970,7 +976,7 @@ class EmployeeDispatchCoordinator:
             for _attempt in range(3):
                 captured_head = self._presynchronize_domains()
                 try:
-                    with slock_activation_guard(), ExitStack() as stack:
+                    with team_runtime_guard(), ExitStack() as stack:
                         stack.enter_context(self._projection_sync_lock)
                         stack.enter_context(self._hire.employee_dispatch_guard())
                         stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
@@ -1241,7 +1247,7 @@ class EmployeeDispatchCoordinator:
         self,
         captured_head: tuple[int, str],
     ) -> int:
-        with slock_activation_guard(), ExitStack() as stack:
+        with team_runtime_guard(), ExitStack() as stack:
             stack.enter_context(self._projection_sync_lock)
             stack.enter_context(self._hire.employee_dispatch_guard())
             stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
@@ -1310,7 +1316,7 @@ class EmployeeDispatchCoordinator:
         *,
         grant,
         employee,
-        slock_binding,
+        team_binding,
         rendered: RenderedEmployeePrompt,
         authority_connection: str,
     ) -> DispatchBinding:
@@ -1342,9 +1348,9 @@ class EmployeeDispatchCoordinator:
             thread_root_id=grant.request.thread_root_message_id,
             thread_id=grant.request.feishu_thread_id,
             chat_id=grant.request.chat_id,
-            slock_engine_identity=slock_binding.engine_identity,
-            slock_chat_id=slock_binding.chat_id,
-            slock_root_identity=slock_binding.root_identity,
+            team_identity=team_binding.engine_identity,
+            team_chat_id=team_binding.chat_id,
+            team_root_identity=team_binding.root_identity,
             tool=employee.tool,
             model=employee.model,
             profile=employee.profile,

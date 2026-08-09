@@ -6,21 +6,18 @@ import time
 
 import pytest
 
-from src.autonomous.supervisor.reconciler import (
-    Reconciler,
-    ReconciliationAction,
-    ReconciliationActionType,
-    ReconciliationReport,
-)
+from src.autonomous.domain import Effect, EffectState
 from src.autonomous.supervisor.cleanup import (
     Cleanup,
     CleanupConfig,
-    CleanupResult,
     CleanupTarget,
     CleanupTargetType,
 )
-from src.autonomous.domain import Effect, EffectState
-
+from src.autonomous.supervisor.reconciler import (
+    Reconciler,
+    ReconciliationActionType,
+    ReconciliationReport,
+)
 
 # ---------------------------------------------------------------------------
 # Fakes

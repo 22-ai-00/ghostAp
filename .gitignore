@@ -80,7 +80,6 @@ image.png
 
 # TTADK runtime artifacts
 .ghostap/
-slock/
 .ttadk_sandbox/
 .aiden/
 .harness/

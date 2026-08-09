@@ -18,10 +18,6 @@ from typing import Any, Protocol
 
 import lark_oapi as lark
 
-from src.slock_engine.memory_manager import (
-    MemoryManager,
-    default_slock_storage_base,
-)
 from src.utils.async_helpers import safe_wait_for
 from src.utils.path import canonicalize_user_home_path
 
@@ -31,6 +27,7 @@ from ...trust.resolver import TrustZoneResolver
 from ..acceptance.main_bot_audit import MainBotSendAuditLog
 from ..acceptance.release_trust import ReleaseTrustProvider
 from ..context.group_ledger import GroupContextLedger, GroupEventPayload
+from ..context.group_memory import EmployeeGroupMemoryStore
 from ..context.lark_source import LarkEmployeeMessageSourceFactory
 from ..context.models import ContextUnavailableError, ThreadContextConfig
 from ..context.runtime import (
@@ -87,6 +84,7 @@ from ..team import (
     TeamTarget,
 )
 from ..workforce.credential_vault import CredentialReceipt, CredentialVault
+from ..workforce.identity import default_employee_storage_base
 from ..workforce.registry import ProjectedAgentRegistry
 from .fire_authority import JournalFireAuthority
 from .fire_effects import (
@@ -716,8 +714,8 @@ EmployeeEnvironmentProvider = Callable[
 ]
 
 
-class _SlockMembershipHealth:
-    """Treat an unavailable or ambiguous activated Slock as degraded."""
+class _TeamMembershipHealth:
+    """Treat an unavailable or ambiguous activated Team as degraded."""
 
     def __init__(self, manager: object) -> None:
         self._manager = manager
@@ -768,7 +766,7 @@ class EmployeeDepartmentRuntime:
         self._dispatch_thread: threading.Thread | None = None
         self._dispatch_stop = threading.Event()
         self._execution_blockers: tuple[str, ...] = ()
-        self._slock_manager: object | None = None
+        self._team_runtime: object | None = None
         self._environment_provider: EmployeeEnvironmentProvider | None = None
         self._context_source_factory: EmployeeMessageSourceFactory | None = None
         self._context_service: EmployeeContextService | None = None
@@ -819,7 +817,7 @@ class EmployeeDepartmentRuntime:
         team_notification: Callable[..., object] | None = None,
         context_source_factory: EmployeeMessageSourceFactory | None = None,
         group_memory_backend: Any = None,
-        slock_engine_manager: object | None = None,
+        team_runtime: object | None = None,
         employee_environment_provider: EmployeeEnvironmentProvider | None = None,
         membership_health: Any = None,
         manager_client_factory: Callable[[], Any] | None = None,
@@ -881,7 +879,7 @@ class EmployeeDepartmentRuntime:
         runtime._writer = writer
         runtime._vault = vault
         runtime._data_keyring = material.data_keyring
-        runtime._slock_manager = slock_engine_manager
+        runtime._team_runtime = team_runtime
         runtime._environment_provider = employee_environment_provider
         owned_main_bot_send_audit: MainBotSendAuditLog | None = None
         if main_bot_send_audit is None:
@@ -975,11 +973,11 @@ class EmployeeDepartmentRuntime:
                 )
                 decision_provider = None
                 if team_runtime_mode == "coordinator":
-                    if slock_engine_manager is None:
+                    if team_runtime is None:
                         raise RuntimeError("team coordinator project resolver is unavailable")
 
                     def resolve_coordinator_cwd(run: object) -> str:
-                        binding = slock_engine_manager.resolve_employee_engine(
+                        binding = team_runtime.resolve_employee_engine(
                             chat_id=run.chat_id
                         )
                         return binding.canonical_root
@@ -1868,8 +1866,8 @@ class EmployeeDepartmentRuntime:
         try:
             legacy_base = str(
                 canonicalize_user_home_path(
-                    getattr(settings, "autonomous_slock_storage_base", None)
-                    or default_slock_storage_base()
+                    getattr(settings, "autonomous_employee_storage_base", None)
+                    or default_employee_storage_base()
                 )
             )
             self._data = build_employee_data_composition(
@@ -1981,7 +1979,7 @@ class EmployeeDepartmentRuntime:
             return
         data.service.rebuild_projection()
         if data.state.data_authority.mode == "legacy":
-            from ..migration.slock_data_importer import SlockDataImporter
+            from ..migration.employee_data_importer import EmployeeDataImporter
 
             legacy_base = data.memory_facade.legacy_base_path
             if legacy_base is None:
@@ -1993,7 +1991,7 @@ class EmployeeDepartmentRuntime:
                 ):
                     if employee.state is EmployeeState.ARCHIVED:
                         continue
-                    result = SlockDataImporter(
+                    result = EmployeeDataImporter(
                         service=data.service,
                         legacy_base=legacy_base,
                         tenant_key=employee.tenant_key,
@@ -2020,7 +2018,7 @@ class EmployeeDepartmentRuntime:
             or self._service is None
             or self._vault is None
             or not callable(manager_client_factory)
-            or self._slock_manager is None
+            or self._team_runtime is None
         ):
             self._membership = None
             return
@@ -2035,7 +2033,7 @@ class EmployeeDepartmentRuntime:
 
         def team_owner(chat_id: str) -> str:
             try:
-                getter = getattr(self._slock_manager, "get_activated_engine", None)
+                getter = getattr(self._team_runtime, "get_activated_engine", None)
                 engine = getter(chat_id) if callable(getter) else None
                 channel = getattr(engine, "channel", None)
                 return str(getattr(channel, "owner_id", "") or "")
@@ -2056,7 +2054,7 @@ class EmployeeDepartmentRuntime:
                 ),
                 team_owner_resolver=team_owner,
                 team_active_resolver=lambda chat_id: bool(
-                    self._slock_manager.get_activated_engine(chat_id)
+                    self._team_runtime.get_activated_engine(chat_id)
                 ),
             )
         except Exception as exc:
@@ -2095,8 +2093,8 @@ class EmployeeDepartmentRuntime:
 
         legacy_base = str(
             canonicalize_user_home_path(
-                getattr(settings, "autonomous_slock_storage_base", None)
-                or default_slock_storage_base()
+                getattr(settings, "autonomous_employee_storage_base", None)
+                or default_employee_storage_base()
             )
         )
         authority = JournalFireAuthority(
@@ -2161,8 +2159,8 @@ class EmployeeDepartmentRuntime:
         ):
             self._execution_blockers = ("employee_gateway",)
             return
-        if self._slock_manager is None or not callable(getattr(self._slock_manager, "employee_activation_guard", None)):
-            self._execution_blockers = ("slock_gateway",)
+        if self._team_runtime is None or not callable(getattr(self._team_runtime, "employee_activation_guard", None)):
+            self._execution_blockers = ("team_runtime",)
             return
         if not callable(self._environment_provider):
             self._execution_blockers = ("employee_environment",)
@@ -2170,8 +2168,8 @@ class EmployeeDepartmentRuntime:
         try:
             legacy_base = str(
                 canonicalize_user_home_path(
-                    getattr(settings, "autonomous_slock_storage_base", None)
-                    or default_slock_storage_base()
+                    getattr(settings, "autonomous_employee_storage_base", None)
+                    or default_employee_storage_base()
                 )
             )
 
@@ -2182,7 +2180,7 @@ class EmployeeDepartmentRuntime:
                     storage_base_path=legacy_base,
                 )
 
-            health = membership_health or _SlockMembershipHealth(self._slock_manager)
+            health = membership_health or _TeamMembershipHealth(self._team_runtime)
             constraints_digest = hashlib.sha256(b"ghostap.employee-execution-constraints.v1").hexdigest()
             self._router = DurableEmployeeIngressRouter(
                 writer=self._writer,
@@ -2239,7 +2237,7 @@ class EmployeeDepartmentRuntime:
                 data_service=self._data.service,
                 data_sink=self._data,
                 channel_supervisor=self._channels,
-                slock_manager=self._slock_manager,
+                team_runtime=self._team_runtime,
                 context_service=self._context_service,
                 environment_provider=self._environment_provider,
                 registry_factory=lambda state: ProjectedAgentRegistry(
@@ -2253,7 +2251,7 @@ class EmployeeDepartmentRuntime:
                 team_owner_resolver=lambda chat_id: str(
                     getattr(
                         getattr(
-                            self._slock_manager.get_activated_engine(chat_id),
+                            self._team_runtime.get_activated_engine(chat_id),
                             "channel",
                             None,
                         ),
@@ -2495,7 +2493,7 @@ class EmployeeDepartmentRuntime:
                     continue
                 # Employee Bot subscriptions also observe group slash commands
                 # owned by the main Bot.  Consume those after employee-specific
-                # controls so commands such as ``/role list`` cannot be routed
+                # controls so main-Bot slash commands cannot be routed
                 # into every employee mailbox as coding work.
                 if self._handle_main_bot_group_command_ingress(acceptance_id):
                     worked = True
@@ -4428,8 +4426,8 @@ class EmployeeDepartmentRuntime:
         try:
             legacy_base = str(
                 canonicalize_user_home_path(
-                    getattr(settings, "autonomous_slock_storage_base", None)
-                    or default_slock_storage_base()
+                    getattr(settings, "autonomous_employee_storage_base", None)
+                    or default_employee_storage_base()
                 )
             )
             if self._data is None:
@@ -4443,7 +4441,7 @@ class EmployeeDepartmentRuntime:
                 )
             backend = group_memory_backend
             if backend is None:
-                backend = MemoryManager(str(Path(legacy_base).expanduser()))
+                backend = EmployeeGroupMemoryStore(str(Path(legacy_base).expanduser()))
                 self._owns_group_memory_backend = True
             self._group_memory_backend = backend
             self._context_acl = parse_requester_acl(settings)
@@ -4489,6 +4487,7 @@ class EmployeeDepartmentRuntime:
             logger.error(
                 "employee Context composition unavailable: %s",
                 type(exc).__name__,
+                exc_info=True,
             )
             if self._context_source_factory is not None:
                 try:
@@ -4528,7 +4527,18 @@ class EmployeeDepartmentRuntime:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             self._loop = loop
+
+            def keep_selector_wakeable() -> None:
+                # Some constrained hosts reject writes to asyncio's internal
+                # socketpair.  Thread-safe submissions still reach ``_ready``
+                # but cannot wake an indefinitely blocked selector.  Keeping a
+                # short timer pending provides a bounded, network-free wakeup
+                # path for both activity submission and shutdown.
+                if not self._closing:
+                    loop.call_later(0.1, keep_selector_wakeable)
+
             loop.call_soon(self._loop_ready.set)
+            loop.call_soon(keep_selector_wakeable)
             loop.run_forever()
             pending = asyncio.all_tasks(loop)
             for task in pending:
@@ -4587,7 +4597,12 @@ class EmployeeDepartmentRuntime:
         try:
             await self._configure_intent(intent_id)
             succeeded = True
-        except Exception:
+        except Exception as exc:
+            logger.error(
+                "employee provisioning attempt failed; entering automatic recovery: %s",
+                type(exc).__name__,
+                exc_info=True,
+            )
             current = self._require_service().get_state(intent_id)
             has_disposed_failure = current is not None and any(
                 effect_state is HireEffectState.ACTION_REQUIRED
@@ -4842,7 +4857,12 @@ class EmployeeDepartmentRuntime:
                     force_slash_refresh=True,
                 )
                 return True
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "employee provisioning recovery attempt failed: %s",
+                    type(exc).__name__,
+                    exc_info=True,
+                )
                 continue
         self._require_service().mark_recovery_action_required(
             intent_id,

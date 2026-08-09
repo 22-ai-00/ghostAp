@@ -203,7 +203,7 @@ _TERMINAL_REASONS = frozenset(
         "canceled",
         "timeout",
         "action_required",
-        "slock_unavailable",
+        "team_unavailable",
         "context_unavailable",
         "canonical_context_unavailable",
         "team_step_inactive",
@@ -218,7 +218,7 @@ _DISPATCH_TERMINAL_REASONS = frozenset(
 )
 _DISPATCH_REJECTION_REASONS = frozenset(
     {
-        "slock_unavailable",
+        "team_unavailable",
         "context_unavailable",
         "canonical_context_unavailable",
         "team_step_inactive",

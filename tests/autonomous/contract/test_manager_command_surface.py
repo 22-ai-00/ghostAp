@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.autonomous.manager.handler import ManagerHandler, REQUIRED_COMMANDS
+from src.autonomous.manager.handler import REQUIRED_COMMANDS, ManagerHandler
 
 
 class FakeDep:

@@ -61,7 +61,7 @@ export default async function() {
       `Analyze other engines for completion control patterns to learn from:
       1. src/deep_engine/ - how does deep mode handle completion? Look at ContextPersistenceHook
       2. src/workflow_engine/ - how does workflow track phase completion and verify task success?
-      3. src/slock_engine/ - task classifier and autonomous resolver patterns for intent confidence
+      3. src/autonomous/manager/cards.py + src/autonomous/coordinator.py - team/employee workflow state and card orchestration patterns for intent confidence
       4. Any verification/validation loops in other engines (e.g., verify patterns, checkpoints)
 
       Compare: which engines have the strongest completion guarantees? What patterns do they use?

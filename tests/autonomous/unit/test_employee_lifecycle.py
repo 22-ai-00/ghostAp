@@ -6,7 +6,6 @@ import pytest
 
 from src.autonomous.employees import (
     CollaborationPlanner,
-    Employee,
     EmployeeManager,
     EmployeeState,
     WorkerType,

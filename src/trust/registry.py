@@ -1,6 +1,6 @@
 """Durable single-source registry for managed Feishu groups.
 
-The registry deliberately owns no Feishu, Project, Slock, or Employee runtime
+The registry deliberately owns no Feishu, Project, retired team model, or Employee runtime
 dependencies.  Callers run those operations as a saga and only hold this
 registry's leaf lock while validating and replacing its JSON snapshot.
 """

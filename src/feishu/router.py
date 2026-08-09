@@ -144,9 +144,7 @@ FORWARDING_MAP: dict[str, tuple[str, str]] = {
     "_build_context_diff_report": ("diagnostics", "_build_context_diff_report"),
     "_submit_diff_report": ("diagnostics", "_submit_diff_report"),
     "_show_message_trace": ("diagnostics", "show_message_trace"),
-    # --- Slock Engine ---
-    "_handle_slock_command": ("slock", "handle_slock_command"),
-    "_handle_slock_message": ("slock", "handle_message"),
+    # --- Team Engine ---
     # --- Workflow Engine ---
     "_handle_workflow_command": ("workflow", "handle_workflow_command"),
     "_start_workflow": ("workflow", "start_workflow"),
@@ -199,7 +197,6 @@ def _handler_classes() -> dict[str, type]:
         TraexModeHandler,
     )
     from .handlers.project import ProjectHandler
-    from .handlers.slock import SlockHandler
     from .handlers.spec import SpecHandler
     from .handlers.system import SystemHandler
     from .handlers.workflow import WorkflowHandler
@@ -214,7 +211,6 @@ def _handler_classes() -> dict[str, type]:
         "system": SystemHandler,
         "deep": DeepHandler,
         "spec": SpecHandler,
-        "slock": SlockHandler,
         "workflow": WorkflowHandler,
         "project": ProjectHandler,
         "diagnostics": DiagnosticsHandler,

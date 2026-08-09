@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
+from src.autonomous.domain import ProgressSnapshot, RunState
 from src.autonomous.reporter.reporter import (
     DeliveryState,
     OutboxEntry,
     Reporter,
     ReportType,
 )
-from src.autonomous.domain import ProgressSnapshot, RunState
 
 
 class TestReporter:
@@ -77,7 +75,7 @@ class TestReporter:
     @pytest.mark.asyncio
     async def test_idempotency_key_dedup(self) -> None:
         reporter = Reporter(deliver_fn=lambda t, p: True)
-        id1 = await reporter.enqueue(
+        await reporter.enqueue(
             ReportType.PROGRESS_UPDATE, "ch1", {"msg": "a"}, idempotency_key="key_1"
         )
         await reporter.flush()

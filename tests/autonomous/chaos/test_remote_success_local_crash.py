@@ -6,10 +6,9 @@ import pytest
 
 from src.autonomous.broker.dispatch_gate import (
     DispatchGate,
-    DispatchOutcome,
     EffectNotPrepared,
 )
-from src.autonomous.domain.effects import CapabilityDescriptor, Effect, EffectState
+from src.autonomous.domain.effects import CapabilityDescriptor
 from src.autonomous.domain.enums import RiskLevel
 
 
@@ -163,6 +162,7 @@ def test_revocation_race_gate_closed_before_dispatch() -> None:
     gate.close_gate("run_1", reason="kill_switch_activated")
 
     import asyncio
+
     from src.autonomous.broker.dispatch_gate import DispatchGateClosed
 
     async def adapter(params: dict) -> dict:

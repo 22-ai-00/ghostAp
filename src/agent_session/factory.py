@@ -59,7 +59,7 @@ def _normalize_acp_startup_model(agent_type: str, model_name: Optional[str]) -> 
 
     Some providers expose UI-facing values that are not valid backend model IDs
     when passed back to their CLI/ACP protocol. Keep this at the session-factory
-    boundary so Deep/Spec/Review/Slock share the same normalization.
+    boundary so Deep/Spec/Review/employee share the same normalization.
     """
     agent = (agent_type or "").strip().lower()
     if (
@@ -124,7 +124,7 @@ def create_engine_session(
     startup_retries: Optional[int] = None,
     startup_log_failures: Optional[bool] = None,
 ) -> SyncSession:
-    """Create and start a session for Deep/Spec/Slock engines.
+    """Create and start a session for Deep/Spec/employee engines.
 
     - Claude: CLI backend (no ACP retry needed)
     - Others: ACP backend with retry and progressive timeout
@@ -133,8 +133,8 @@ def create_engine_session(
     is wrapped with RateLimitAwareSession for automatic retry on throttling.
 
     Keyword args:
-        thread_id: Optional isolation key for concurrent sessions (e.g. slock agents).
-        auto_approve: If True, suppress interactive confirmation prompts (slock mode).
+        thread_id: Optional isolation key for concurrent sessions (e.g. employee agents).
+        auto_approve: If True, suppress interactive confirmation prompts (employee mode).
         require_tool_filter: If True, choose a backend that exposes set_tool_filter.
         startup_timeout: Optional ACP startup budget override.
         startup_retries: Optional ACP startup attempt override.

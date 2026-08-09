@@ -26,8 +26,6 @@ logger = logging.getLogger(__name__)
 
 _WORKFLOW_MODEL_CACHE_TTL_S = 5 * 60
 _WORKFLOW_MODEL_PREHEAT_LIMIT = 2
-
-
 @dataclass(frozen=True, slots=True)
 class _WorkflowLifecycleOwner:
     """Linearization token shared by generation, card delivery, and queued start."""
@@ -87,6 +85,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         super().__init__(ctx)
         # Workflow uses its own renderer (card JSON comes from WorkflowProgressRenderer)
         from ...workflow_engine.renderer import WorkflowProgressRenderer  # noqa: F401
+
+    def _auto_execute_workflow(self) -> bool:
+        """Whether workflow should auto-start after script generation."""
+        settings = getattr(self.ctx, "settings", None)
+        return bool(getattr(settings, "workflow_auto_execute", True))
 
     # ------------------------------------------------------------------
     # Topic-engine free-text entry point
@@ -1827,16 +1830,54 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 return
 
             project_id = project.project_id if project else ""
-            self._start_pending_workflow_execution(
-                message_id=gen_msg_id or message_id,
-                chat_id=chat_id,
-                project_id=project_id,
-                project=project,
-                root_path=root_path,
-                engine=engine,
-                allow_server_side_start=True,
-                generation_owner=owner,
-            )
+            auto_execute = self._auto_execute_workflow()
+            started = False
+            if auto_execute:
+                started = self._start_pending_workflow_execution(
+                    message_id=gen_msg_id or message_id,
+                    chat_id=chat_id,
+                    project_id=project_id,
+                    project=project,
+                    root_path=root_path,
+                    engine=engine,
+                    allow_server_side_start=True,
+                    generation_owner=owner,
+                )
+
+            if not auto_execute or not started:
+                with owner.delivery_lock:
+                    if not _owner_can_deliver():
+                        return
+                    with engine._lock:
+                        pending = engine.project.pending if engine.project else None
+                        if (
+                            not engine.project
+                            or engine.project.status != WorkflowStatus.AWAITING_CONFIRM
+                            or not pending
+                            or pending.engine_session_key == ""
+                        ):
+                            return
+                    _script_content = self._read_pending_script(engine)
+                confirm_card = self._build_confirm_card(
+                    meta=pending.meta,
+                    requirement=pending.requirement or "",
+                    engine_session_key=pending.engine_session_key or "",
+                    chat_id=chat_id,
+                    project_id=project_id,
+                    is_fallback=pending.is_fallback,
+                    selected_tools=pending.selected_tools,
+                    script_content=_script_content,
+                    orchestrator_binding=pending.orchestrator_binding,
+                    review_agents=pending.review_agents,
+                    auto_reviewer=pending.auto_reviewer,
+                    show_confirm_action=True,
+                )
+                self._replace_or_send_workflow_card(
+                    card_message_id=gen_msg_id,
+                    chat_id=chat_id,
+                    card=confirm_card,
+                    origin_message_id=origin_message_id,
+                )
         except Exception as exc:
             logger.error(
                 "Workflow script generation failed: %s",
@@ -7275,6 +7316,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         orchestrator_binding: dict | None = None,
         review_agents: list[dict] | None = None,
         auto_reviewer: bool | None = None,
+        show_confirm_action: bool | None = None,
     ) -> dict:
         """Build a Feishu card showing the workflow script preview for confirmation.
 
@@ -7455,6 +7497,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         }
 
         primary_buttons: list[dict] = []
+        show_confirm_action = (
+            bool(show_confirm_action)
+            if show_confirm_action is not None
+            else True
+        )
 
         if has_mismatch:
             fill_missing_value = {
@@ -7488,22 +7535,34 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 }
             )
 
-        confirm_disabled = has_mismatch
-        confirm_disabled_tips = "脚本需要的工具尚未全部启用，请先点击『一键补齐缺失工具』" if confirm_disabled else None
-        confirm_btn: dict = {
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "✅ 确认执行"},
-            "type": "primary" if not confirm_disabled else "default",
-            "value": confirm_value,
-            "behaviors": [{"type": "callback", "value": confirm_value}],
-            "disabled": confirm_disabled,
-        }
-        if confirm_disabled_tips:
-            confirm_btn["disabled_tips"] = {
-                "tag": "plain_text",
-                "content": confirm_disabled_tips,
+        if show_confirm_action:
+            confirm_disabled = has_mismatch
+            confirm_disabled_tips = (
+                "脚本需要的工具尚未全部启用，请先点击『一键补齐缺失工具』"
+                if confirm_disabled
+                else None
+            )
+            confirm_btn: dict = {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "✅ 确认执行"},
+                "type": "primary" if not confirm_disabled else "default",
+                "value": confirm_value,
+                "behaviors": [{"type": "callback", "value": confirm_value}],
+                "disabled": confirm_disabled,
             }
-        primary_buttons.append(confirm_btn)
+            if confirm_disabled_tips:
+                confirm_btn["disabled_tips"] = {
+                    "tag": "plain_text",
+                    "content": confirm_disabled_tips,
+                }
+            primary_buttons.append(confirm_btn)
+        else:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "✅ 全自动执行已开启：脚本已准备就绪，将直接进入运行，无需点击确认。",
+                }
+            )
 
         primary_buttons.append(
             {

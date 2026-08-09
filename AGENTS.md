@@ -62,16 +62,9 @@ uv run python scripts/test_inventory.py tests/
 - `src/project/`、`src/project_chat/`、`src/thread/`：项目上下文、项目聊天绑定和线程上下文。
 - `src/chat_lock.py`、`src/repo_lock.py`、`src/utils/lock_order.py`：聊天/仓库锁定和锁定顺序强制执行。
 - `src/config/`：pydantic 设置包和配置验证。
-- `src/slock_engine/activation_guard.py`：被动自动激活的权限检查和速率限制保护。
-- `src/slock_engine/autonomous_resolver.py`：不确定意图的自主解析器。
-- `src/slock_engine/role_bootstrap.py`：创建新 slock 组时自动创建角色引导。
-- `src/slock_engine/task_classifier.py`：消息分类器（任务/聊天/不确定）。
-- `src/slock_engine/task_queue.py`：任务队列管理。
-- `src/slock_engine/safe_error.py`：安全错误消息工具（从 `src/utils/errors` 重导出）。
 
 ## 自主工作系统 (`src/autonomous/`)
 
-v5 自主系统使用 Journal-backed 持久化架构取代 Slock 内存执行核心。关键规则：
 
 - **Journal 是唯一事实源**。所有状态变更通过 `JournalWriter.write_event()` 记录。投影和快照可从 Journal 重放重建。
 - **域对象冻结**。`domain/` 下的 dataclass 都是 `frozen=True`，状态变更使用 `dataclasses.replace()` 而非赋值。
@@ -80,7 +73,6 @@ v5 自主系统使用 Journal-backed 持久化架构取代 Slock 内存执行核
 - **默认拒绝**。Policy 层对所有操作默认拒绝，需显式授权。
 - **Assist 不写入**。`assist` 模式下系统只读，R4 风险始终拒绝。
 - **飞书 SDK 使用官方包**。消息/卡片投递使用 `lark-oapi`，WebSocket 事件订阅使用 `lark-channel-sdk`。不要手写 HTTP 调用。
-- **员工雇佣通过 `/hire`**。`/hire <名字>` 全局可用，复用 ACP 工具/模型发现展示交互式选择卡片。员工作为飞书 bot 智能体持久化到本地，可被邀请加入 slock 群协作。
 
 关键模块入口：
 
@@ -93,7 +85,6 @@ v5 自主系统使用 Journal-backed 持久化架构取代 Slock 内存执行核
 - `src/autonomous/manager/feishu_adapter.py`：使用 lark-oapi 的飞书投递适配器。
 - `src/autonomous/manager/cards.py`：交互式卡片模板（员工创建、进度、审批）。
 - `src/autonomous/supervisor/supervisor.py`：系统启动/恢复/关闭。
-- `src/autonomous/migration/slock_compat.py`：Slock 兼容层（4 种模式）。
 
 测试命令：
 

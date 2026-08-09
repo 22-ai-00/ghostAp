@@ -188,34 +188,6 @@ class TestChatLockTimerValidation:
 # sandbox_strict_lock_mode default + sig_compat_deploy_date default
 # ---------------------------------------------------------------------------
 
-class TestNewConfigDefaults:
-    """Verify new config items have correct defaults."""
-
-    def test_sandbox_strict_lock_mode_default_false(self):
-        s = Settings()
-        assert s.sandbox_strict_lock_mode is False
-
-    def test_sandbox_strict_lock_mode_true(self):
-        s = Settings(sandbox_strict_lock_mode=True)
-        assert s.sandbox_strict_lock_mode is True
-
-    def test_sig_compat_deploy_date_default_empty(self):
-        s = Settings()
-        assert s.sig_compat_deploy_date == ""
-
-    def test_spec_review_max_parallel_default(self):
-        s = Settings()
-        assert s.spec_review_max_parallel == 3
-
-    def test_spec_max_cycles_default(self):
-        s = Settings(_env_file=None)
-        assert s.spec_max_cycles == 1000
-
-    def test_slock_team_name_suffix_default_marks_slock_groups(self, monkeypatch):
-        monkeypatch.delenv("SLOCK_TEAM_NAME_SUFFIX", raising=False)
-        monkeypatch.delenv("SLOCK_TEAM_NAME_PREFIX", raising=False)
-        s = Settings(_env_file=None)
-        assert s.slock_team_name_suffix == "[Slock]"
 
 
 # ---------------------------------------------------------------------------

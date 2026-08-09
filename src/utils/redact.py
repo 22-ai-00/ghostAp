@@ -1,6 +1,6 @@
 """Sensitive information redaction utility for user-facing outputs.
 
-Used by slock_engine and other modules to sanitize text before sending
+Used by employee_engine and other modules to sanitize text before sending
 to Feishu group chats, cards, or text notifications.
 """
 

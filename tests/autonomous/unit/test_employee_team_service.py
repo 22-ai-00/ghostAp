@@ -60,7 +60,7 @@ class _DeadlineBackend(_Backend):
         return TeamAttemptResult(
             "timeout",
             history_record_id="hist_timeout",
-            error_code="slock_session_timeout",
+            error_code="employee_session_timeout",
         )
 
 
@@ -478,10 +478,10 @@ def test_deadline_final_poll_observes_gateway_terminal_result(tmp_path) -> None:
 
     assert backend.result_calls == 2
     assert result.status == "timeout"
-    assert result.error_code == "slock_session_timeout"
+    assert result.error_code == "employee_session_timeout"
     assert any(
         event.event_type == "team.step.failed"
-        and event.payload["error_code"] == "slock_session_timeout"
+        and event.payload["error_code"] == "employee_session_timeout"
         for frame in writer.replay()
         for event in frame.events
     )

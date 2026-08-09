@@ -1,6 +1,5 @@
 """Tests for PolicyEngine: risk matrix, standing orders, authorization types."""
 
-import tempfile
 
 import pytest
 
@@ -12,7 +11,6 @@ from src.autonomous.policy.policy_engine import (
     PolicyContext,
     PolicyDecision,
     PolicyEngine,
-    PolicyResult,
 )
 
 

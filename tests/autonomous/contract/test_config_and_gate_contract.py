@@ -28,6 +28,7 @@ def test_locked_lark_dependencies() -> None:
 
 def test_employee_credential_settings_default_fail_closed_and_redact(settings: Settings) -> None:
     empty = settings
+    assert empty.autonomous_employee_storage_base == "~/.ghostap/slock"
     assert empty.autonomous_credential_dir == "~/.ghostap/slock/credentials"
     assert empty.autonomous_credential_keys.get_secret_value() == ""
     assert empty.autonomous_credential_active_key_id == ""
@@ -40,6 +41,31 @@ def test_employee_credential_settings_default_fail_closed_and_redact(settings: S
         autonomous_credential_active_key_id="k1",
     )
     assert keyring_json not in repr(configured)
+
+
+def test_only_two_employee_data_paths_remain_explicit_continuity_abi() -> None:
+    env_example = Path(".env.example").read_text(encoding="utf-8")
+
+    continuity_abi_paths = {
+        line
+        for line in env_example.splitlines()
+        if line.startswith(
+            (
+                "AUTONOMOUS_EMPLOYEE_STORAGE_BASE=",
+                "AUTONOMOUS_CREDENTIAL_DIR=",
+            )
+        )
+    }
+    assert continuity_abi_paths == {
+        "AUTONOMOUS_EMPLOYEE_STORAGE_BASE=~/.ghostap/slock",
+        "AUTONOMOUS_CREDENTIAL_DIR=~/.ghostap/slock/credentials",
+    }
+    assert "SLOCK_" not in env_example
+    assert "slock_auto_activate_default_policy" not in Settings.model_fields
+    assert "slock_default_wake_policy" not in Settings.model_fields
+    assert "slock_default_roles" not in Settings.model_fields
+    assert "autonomous_compatibility_mode" not in Settings.model_fields
+    assert "AUTONOMOUS_COMPATIBILITY_MODE=" not in env_example
 
 
 def test_employee_data_settings_default_fail_closed_and_redact(settings: Settings) -> None:
@@ -128,7 +154,6 @@ def test_env_example_documents_employee_thread_context_settings() -> None:
 
 def test_autonomous_settings_are_fail_closed_by_default(settings: Settings) -> None:
     assert settings.autonomous_deployment_mode == AutonomousDeploymentMode.OFF
-    assert settings.autonomous_compatibility_mode == "legacy"
     assert settings.autonomous_memory_enabled is False
     assert settings.autonomous_vc_enabled is False
     assert settings.autonomous_write_enabled is False

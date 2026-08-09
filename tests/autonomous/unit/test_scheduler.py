@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
-import time
-
 import pytest
 
+from src.autonomous.domain.plans import PlanStep
 from src.autonomous.scheduler.scheduler import (
     DurableScheduler,
-    LeaseGrant,
-    QueueEntry,
 )
-from src.autonomous.domain.plans import PlanStep
 
 
 class FakeJournal:

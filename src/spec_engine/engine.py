@@ -1351,10 +1351,8 @@ class SpecEngine(BaseEngine):
                         f"（{completion_gate_error}）"
                     )
                 if cycle.review_result.requires_manual_confirmation or manual_confirmation_reason:
-                    message = (
-                        f"{manual_confirmation_reason or '审查输出无法可靠判定'}；"
-                        "已暂停，需人工确认后再恢复执行"
-                    )
+                    base_message = manual_confirmation_reason or "审查输出无法可靠判定"
+                    message = f"{base_message}；已暂停，需人工确认后再恢复执行"
                     logger.warning(
                         "[Spec:%s] %s",
                         self._project.name,

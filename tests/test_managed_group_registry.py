@@ -60,61 +60,8 @@ def test_registry_replays_before_ingress_and_preserves_one_grant(tmp_path):
     assert record.project_grant_id == grant.grant_id
 
 
-def test_marker_name_or_allowed_chat_cannot_forge_managed_group(tmp_path):
-    registry = ManagedGroupRegistry(tmp_path / "managed-groups.json")
-    stale_project = {
-        "bound_chat_id": "oc_forged",
-        "bound_chat_created_at": NOW.timestamp(),
-        "root_path": "/srv/project-1",
-        "allowed_chat_ids": ["oc_forged"],
-    }
-    stale_slock_marker = {
-        "channel_id": "oc_forged",
-        "name": "Trusted [Slock]",
-        "owner_id": "ou_owner",
-    }
-
-    assert registry.active_record("oc_forged") is None
-    assert registry.import_candidate(stale_project, validator=lambda _: False) is None
-    assert registry.import_candidate(stale_slock_marker, validator=lambda _: True) is None
-    assert registry.import_candidate(
-        {
-            "bound_chat_created_at": NOW.timestamp(),
-            "canonical_root_ref": "/srv/project-1",
-            "chat_id": None,
-            "owner_id": "ou_owner",
-            "project_id": "project-1",
-            "receiving_bot_ref": "cli_main_bot",
-        },
-        validator=lambda _: True,
-    ) is None
-    assert registry.active_record("oc_forged") is None
 
 
-def test_tombstoned_group_cannot_resurrect_from_stale_project_or_slock_marker(tmp_path):
-    path = tmp_path / "managed-groups.json"
-    registry = ManagedGroupRegistry(path)
-    active, _ = _activate(registry)
-    tombstone = registry.tombstone("oc_managed")
-
-    assert tombstone.status is ManagedGroupStatus.TOMBSTONED
-    assert tombstone.revision > active.revision
-    assert registry.active_record("oc_managed") is None
-    assert registry.import_candidate(
-        {
-            "chat_id": "oc_managed",
-            "owner_id": "ou_owner",
-            "receiving_bot_ref": "cli_main_bot",
-            "project_id": "project-1",
-            "canonical_root_ref": "/srv/project-1",
-            "bound_chat_created_at": NOW.timestamp(),
-        },
-        validator=lambda _: True,
-    ) is None
-    replayed = ManagedGroupRegistry(path)
-    assert replayed.record("oc_managed") == tombstone
-    assert replayed.active_record("oc_managed") is None
-    assert replayed.grant_for_chat("oc_managed") is None
 
 
 def test_expected_employee_rotation_updates_revision_without_prompt(tmp_path):

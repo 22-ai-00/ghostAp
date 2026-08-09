@@ -129,14 +129,8 @@ SELECT_ACP_MODEL_PROFILE = "select_acp_model_profile"  # Profile dropdown change
 SELECT_ACP_MODEL_EFFORT = "select_acp_model_effort"  # Effort dropdown change
 
 # ---------------------------------------------------------------------------
-# Slock actions
+# Team actions
 # ---------------------------------------------------------------------------
-SLOCK_NEW_ROLE_SELECT_TOOL = "slock_new_role_select_tool"  # Select a tool while creating a Slock role
-SLOCK_NEW_ROLE_SELECT_TOOL_DROPDOWN = "slock_new_role_select_tool_dropdown"  # Tool dropdown change in unified hire card
-SLOCK_NEW_ROLE_SELECT_MODEL = "slock_new_role_select_model"  # Select a model and create the Slock role
-SLOCK_NEW_ROLE_SELECT_MODEL_GROUP = "slock_new_role_select_model_group"
-SLOCK_NEW_ROLE_SELECT_MODEL_PROFILE = "slock_new_role_select_model_profile"
-SLOCK_NEW_ROLE_SELECT_MODEL_EFFORT = "slock_new_role_select_model_effort"
 
 # ---------------------------------------------------------------------------
 # Lock actions

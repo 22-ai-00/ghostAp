@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from src.acp.employee_selection import compose_employee_model_selection
-from src.slock_engine.memory_manager import default_slock_storage_base
-from src.slock_engine.models import AgentIdentity
+from src.autonomous.workforce.identity import AgentIdentity, default_employee_storage_base
 
 from ..domain import BotPrincipal, EmployeeDefinition, EmployeeState, WorkerType
 from .projection import workforce_projection_guard
@@ -48,7 +47,7 @@ class ProjectedAgentRegistry:
     ) -> None:
         self._state = state
         self._storage_base = Path(
-            storage_base_path or default_slock_storage_base()
+            storage_base_path or default_employee_storage_base()
         )
 
     def get(self, tenant_key: str, agent_id: str) -> EmployeeDefinition | None:
@@ -104,7 +103,7 @@ class ProjectedAgentRegistry:
             )
         ]
 
-    def as_slock_identity(
+    def as_execution_identity(
         self,
         tenant_key: str,
         agent_id: str,
@@ -131,7 +130,7 @@ class ProjectedAgentRegistry:
             system_prompt=employee.persona,
             role=employee.role or "custom",
             permissions=list(employee.permissions),
-            memory_path=str(agent_dir / "MEMORY.md"),
+            memory_path=str(agent_dir / "memory" / "MEMORY.md"),
             notes_path=str(agent_dir / "NOTES.md"),
             workspace_path=str(agent_dir / "workspace"),
             owner_group=groups[0] if groups else "",

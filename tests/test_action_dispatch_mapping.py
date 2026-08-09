@@ -6,8 +6,6 @@ import ast
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
-
 from src.card.actions import dispatch as action_ids
 from src.card.error_diagnostics import error_diagnostic_store
 
@@ -71,11 +69,6 @@ def test_feishu_action_registry_uses_canonical_core_action_ids():
         action_ids.SELECT_ACP_TOOL,
         action_ids.SELECT_ACP_MODEL,
         action_ids.REFRESH_ACP_MODELS,
-        action_ids.SLOCK_NEW_ROLE_SELECT_TOOL,
-        action_ids.SLOCK_NEW_ROLE_SELECT_MODEL,
-        action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_GROUP,
-        action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_PROFILE,
-        action_ids.SLOCK_NEW_ROLE_SELECT_MODEL_EFFORT,
         action_ids.FORCE_RELEASE_REPO_LOCK,
         action_ids.CONFIRM_LOCK,
         action_ids.CANCEL_LOCK,
@@ -87,46 +80,7 @@ def test_feishu_action_registry_uses_canonical_core_action_ids():
     }
 
     assert expected_exact <= client.exact_actions
-    assert {"deep_", "spec_", "slock_"} <= client.prefix_actions
-
-
-@pytest.mark.parametrize(
-    "action_type",
-    (
-        "employee_runtime_show_status",
-        "employee_runtime_recycle_session",
-        "employee_runtime_rebuild_workspace",
-        "employee_runtime_lint_knowledge",
-        "employee_runtime_retry_review",
-    ),
-)
-def test_employee_runtime_action_dispatches_to_slock_handler(action_type: str) -> None:
-    """Runtime status-card actions must be reachable from the global dispatcher."""
-    from src.feishu.action_dispatcher import ActionDispatcher
-    from src.feishu.action_registry import init_action_registry
-
-    client = _RegistryCaptureClient()
-    client._slock_handler = MagicMock()
-    dispatcher = ActionDispatcher()
-    client._register_action = dispatcher.register
-    init_action_registry(client)
-    value = {"agent_id": "agt_atlas", "review_id": "review_1"}
-
-    handled = dispatcher.dispatch(
-        action_type,
-        "message_1",
-        "chat_1",
-        None,
-        value,
-    )
-
-    assert handled is True
-    client._slock_handler.handle_card_action.assert_called_once_with(
-        "message_1",
-        "chat_1",
-        action_type,
-        value,
-    )
+    assert {"deep_", "spec_"} <= client.prefix_actions
 
 
 def test_select_acp_model_default_option_passes_none_model():

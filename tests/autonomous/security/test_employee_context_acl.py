@@ -16,6 +16,7 @@ from src.autonomous.context import (
     ContextUnavailableError,
     ContextUnavailableReason,
 )
+from src.autonomous.context.group_memory import EmployeeGroupMemoryStore
 from src.autonomous.data.facades import (
     EmployeeDocumentMaterializer,
     EmployeeMemoryFacade,
@@ -36,7 +37,6 @@ from src.autonomous.domain import (
 )
 from src.autonomous.journal.projections import ProjectionState
 from src.autonomous.workforce.registry import ProjectedAgentRegistry
-from src.slock_engine.memory_manager import MemoryManager
 
 
 def _project_l1(
@@ -243,7 +243,7 @@ def test_l1_rejects_legacy_by_default_and_any_dual_source(
 def test_canonical_path_nested_under_legacy_root_is_not_a_second_source(
     tmp_path: Path,
 ) -> None:
-    base = tmp_path / "slock"
+    base = tmp_path / "team"
     materializer = EmployeeDocumentMaterializer(base / "agents")
     state = DataProjectionState()
     content = b"canonical"
@@ -403,13 +403,16 @@ def test_l2_reads_only_authorized_chat_and_sanitizes_backend_failure() -> None:
     assert raised.value.__context__ is None
 
 
-def test_l2_adapter_reads_existing_slock_full_group_memory(tmp_path: Path) -> None:
+def test_l2_adapter_reads_existing_employee_group_memory(tmp_path: Path) -> None:
     state = _workforce_state()
-    memory = MemoryManager(base_path=str(tmp_path / "slock"))
-    try:
-        memory.write_group_memory("oc_1", "full shared memory")
-        reader = _group_reader(state, allowed=True, backend=memory)
+    base = tmp_path / "team"
+    memory_path = base / "groups" / "oc_1" / "SHARED_MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("full shared memory", encoding="utf-8")
+    reader = _group_reader(
+        state,
+        allowed=True,
+        backend=EmployeeGroupMemoryStore(str(base)),
+    )
 
-        assert reader.read(_request()) == "full shared memory"
-    finally:
-        memory.shutdown()
+    assert reader.read(_request()) == "full shared memory"

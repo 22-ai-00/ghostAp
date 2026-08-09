@@ -1,4 +1,4 @@
-"""Writer-authority fencing for the legacy Slock employee registry."""
+"""Writer-authority fencing for the legacy Team employee registry."""
 
 from __future__ import annotations
 

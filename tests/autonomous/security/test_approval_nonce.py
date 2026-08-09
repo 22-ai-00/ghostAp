@@ -7,7 +7,6 @@ import pytest
 
 from src.autonomous.domain.control import GoalActivationAuthorization, Principal
 from src.autonomous.policy.authorization import (
-    AuthorizationDenied,
     AuthorizationEnvelope,
     ControlAuthorizationGate,
     Operation,

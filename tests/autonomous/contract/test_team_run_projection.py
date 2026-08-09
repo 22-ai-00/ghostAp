@@ -145,6 +145,58 @@ def test_terminal_run_rejects_unrelated_new_open_effect() -> None:
         _apply_event({run.run_id: run}, {}, {}, {}, event)
 
 
+def test_dispatch_authorization_consumes_exact_team_v2_assignment_effect() -> None:
+    from types import SimpleNamespace
+
+    from src.autonomous.gateway import EmployeeDispatchCoordinator
+
+    run_id = "teamrun2_authority"
+    part = {"team_run_id": run_id, "team_step_id": "3"}
+
+    def authorized(event: JournalEvent) -> bool:
+        coordinator = object.__new__(EmployeeDispatchCoordinator)
+        coordinator._writer = SimpleNamespace(  # noqa: SLF001
+            replay=lambda: (SimpleNamespace(events=(event,)),)
+        )
+        return coordinator._team_assignment_effect_is_active(part)  # noqa: SLF001
+
+    assert authorized(
+        JournalEvent(
+            "team.v2.effect.executing",
+            f"{run_id}:assignment:3",
+            {"effect_type": "employee_dispatch"},
+        )
+    )
+    assert not authorized(
+        JournalEvent(
+            "team.effect.executing",
+            f"{run_id}:assignment:3",
+            {"effect_type": "employee_dispatch"},
+        )
+    )
+    assert not authorized(
+        JournalEvent(
+            "team.v2.effect.executing",
+            f"{run_id}:3",
+            {"effect_type": "employee_dispatch"},
+        )
+    )
+
+
+def test_gateway_package_is_the_canonical_dispatch_import_surface() -> None:
+    from src.autonomous.gateway import (
+        EmployeeDispatchCoordinator,
+        EmployeeTeamGateway,
+    )
+    from src.autonomous.gateway.coordinator import (
+        EmployeeDispatchCoordinator as CoordinatorImplementation,
+    )
+    from src.autonomous.gateway.team import EmployeeTeamGateway as GatewayImplementation
+
+    assert EmployeeDispatchCoordinator is CoordinatorImplementation
+    assert EmployeeTeamGateway is GatewayImplementation
+
+
 @pytest.mark.parametrize(
     ("terminal_phase", "aggregate_suffix", "repair_phase"),
     [

@@ -75,11 +75,11 @@ UI_TEXT = {
     "system_help_project_section": "\n\n📋 **项目管理命令**\n• `/projects` - 查看项目看板\n• `/new 名称 路径` - 创建新项目\n• `/switch 名称` - 切换项目\n• `/status` - 查看所有引擎任务状态（Deep/Spec）\n• `/status <task_id>` - 查看指定任务详情\n• `/diff` - 查看最近两次版本变更（Diff 报告）",
     "system_autonomous_manager_retired": (
         "⚠️ 独立 Autonomous Manager 命令面已退役，本次命令未执行。"
-        "请在 Slock 团队群使用 `/task <描述>`；团队与任务状态使用 `/slock status`、`/task status`。"
+        "请使用 `/hire <名字>` 创建数字员工，并通过员工自己的会话继续任务。"
     ),
     "system_autonomous_manager_retired_goal": (
         "⚠️ 独立 Autonomous Manager 命令面已退役；原命令未执行。"
-        "请在 Slock 团队群改用 `/task {task}` 创建团队任务。"
+        "请先使用 `/hire <名字>` 创建数字员工，再在员工会话中提交任务：{task}"
     ),
     "system_new_project_usage": "用法: `/new 项目名 [路径]`",
     "system_close_project_usage": "用法: `/close <项目名>`\n例如: `/close myApp`",
@@ -275,28 +275,13 @@ UI_TEXT = {
         "别名：`/workflow` · `/workflow_status` · `/stop_workflow`\n"
         "流程：需求分析 → 生成脚本 → 自动执行 → 多 Agent 并行/流水线 → 汇总结果"
     ),
-    "system_help_section_slock": "🎭 Slock · 飞书群内多 Agent 协作",
-    "system_help_section_slock_body": (
-        "**直接在群里发任务即可，Agent 自动处理。** 无需任何前置命令。\n\n"
-        "**创建团队:**\n"
-        "`/new-team <团队名>` · 创建飞书协作群并激活 Slock\n\n"
-        "**员工管理:**\n"
-        "`/hire <名字>` · 雇佣新员工（全局）\n"
-        "`/role add [名字]` · 添加员工到当前群（不跟名字弹出选择）\n"
-        "`/role remove <名字>` · 从群中移除员工\n"
-        "`/role list` · 查看群内角色  ·  `/role info <名字>` · 查看详情\n\n"
-        "**运维:**\n"
-        "`/slock` · 手动激活  ·  `/slock status` · 查看状态  ·  `/slock stop` · 停止\n"
-        "`/task status` · 任务看板  ·  `/slocks` · 查询所有 Slock 群\n"
-        "`/team dissolve <名>` · 解散团队"
-    ),
     "system_help_section_hire": "👤 数字员工 · 雇佣与管理",
     "system_help_section_hire_body": (
         "`/hire <名字>` · 雇佣新员工（弹出工具+模型选择）\n"
         "`/hire <名字> --tool codex --model o3-pro` · 带参数直接创建\n"
         "`/hire <名字> --prompt \"约束描述\"` · 设定员工身份约束\n"
-        "员工创建后存储在本地，可被邀请到 Slock 群参与协作\n"
-        "群内 @员工名 即可分配任务"
+        "每位员工保留独立身份、记忆、会话、配置和工作空间\n"
+        "员工无需加入特殊群或切换额外模式即可持续工作"
     ),
     "system_help_tips": (
         "**💡 使用提示**\n"
@@ -553,7 +538,7 @@ UI_TEXT = {
         "可查看脱敏诊断后重新发起或从会话历史恢复任务。"
     ),
     "mode_exec_waiting_title": "等待用户确认",
-    "mode_exec_waiting_msg": "⏸️ 自动续做已完成，仍需你的确认后才能继续：{reason}",
+    "mode_exec_waiting_msg": "⚠️ 本次任务未完成：{reason}\n请在新一轮明确你的选择/授权后继续。",
     "mode_exec_timeout_title": "执行超时",
     "mode_exec_exception_title": "执行异常",
     "mode_exec_timeout_msg": "⏳ 执行超时: {error}",

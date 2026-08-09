@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import json
-import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -21,49 +20,42 @@ from src.project.mapper import MessageLinker
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_handler(**settings_overrides) -> BaseHandler:
-    """Create a BaseHandler with fully mocked context."""
-    settings = MagicMock()
-    settings.default_reply_mode = "direct"
-    for k, v in settings_overrides.items():
-        setattr(settings, k, v)
 
+
+def _make_handler(default_reply_mode: str = "thread") -> BaseHandler:
+    """Build a BaseHandler with isolated messaging dependencies."""
+    settings = MagicMock()
+    settings.default_reply_mode = default_reply_mode
+    message_linker = MagicMock()
+    message_linker.resolve_origin.return_value = None
+    mock = MagicMock
     ctx = HandlerContext(
         settings=settings,
-        api_client_factory=MagicMock(),
-        message_callback=MagicMock(),
-        coco_manager=MagicMock(),
-        claude_manager=MagicMock(),
-        aiden_manager=MagicMock(),
-        codex_manager=MagicMock(),
-        gemini_manager=MagicMock(),
-        traex_manager=MagicMock(),
-        intent_recognizer=MagicMock(),
-        scheduler=MagicMock(),
-        project_manager=MagicMock(),
-        message_mapper=MagicMock(),
-        message_linker=MagicMock(),
-        mode_manager=MagicMock(),
-        context_manager=MagicMock(),
-        deep_engine_manager=MagicMock(),
-        progress_reporter=MagicMock(),
-        spec_engine_manager=MagicMock(),
-        spec_reporter=MagicMock(),
-        thread_manager=MagicMock(),
-        image_handler_factory=MagicMock(),
-        working_dirs={},
-        working_dir_lock=threading.Lock(),
-        pending_image_keys={},
-        pending_image_lock=threading.Lock(),
-        enable_streaming=False,
-        managers={},
-        handlers={},
-        slock_engine_manager=MagicMock(),
+        api_client_factory=mock(),
+        message_callback=mock(),
+        coco_manager=mock(),
+        claude_manager=mock(),
+        aiden_manager=mock(),
+        codex_manager=mock(),
+        gemini_manager=mock(),
+        traex_manager=mock(),
+        intent_recognizer=mock(),
+        scheduler=mock(),
+        project_manager=mock(),
+        message_mapper=mock(),
+        message_linker=message_linker,
+        mode_manager=mock(),
+        context_manager=mock(),
+        deep_engine_manager=mock(),
+        progress_reporter=mock(),
+        spec_engine_manager=mock(),
+        spec_reporter=mock(),
+        thread_manager=mock(),
+        image_handler_factory=mock(),
     )
-    h = BaseHandler(ctx)
-    # Mock the im_client (attached by handler_context or externally)
-    h.im_client = MagicMock()
-    return h
+    handler = BaseHandler(ctx)
+    handler.im_client = mock()
+    return handler
 
 
 def _success_response(message_id: str = "resp_msg_001"):

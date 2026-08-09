@@ -68,8 +68,9 @@ The legacy standalone Autonomous Manager command surface is retired. Its
 in-memory approvals and pre-Journal state mutations are not a second production
 runtime and must never report that work was accepted. Those commands fail
 closed with migration guidance. The supported production path is the
-Journal-backed Slock employee runtime through `/goal`, `/slock status`, and
-`/task status`.
+Journal-backed Team employee runtime: the main Bot manages employees through
+`/hire` and `/fire`, while employee Bots expose their own `/task`, `/status`,
+and `/memory` controls.
 
 Employee App manifest evidence also distinguishes desired local configuration
 from observed remote state. A new hire records only the desired manifest. An

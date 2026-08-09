@@ -7,8 +7,6 @@ inbox event is ever created in the projection state.
 
 from __future__ import annotations
 
-import pytest
-
 from src.autonomous.journal import JournalWriter, MemoryAnchor
 from src.autonomous.journal.projections import ProjectionRepository, ProjectionState
 from src.autonomous.manager.admission import (

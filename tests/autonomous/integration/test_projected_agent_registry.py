@@ -10,13 +10,14 @@ from src.autonomous.workforce.registry import (
 from tests.autonomous.workforce_helpers import commit_events, seed_workforce_state
 
 
-def test_projected_registry_is_global_and_returns_fresh_slock_view(tmp_path) -> None:
+def test_projected_registry_is_global_and_returns_fresh_employee_execution_identity(tmp_path) -> None:
     _, state = seed_workforce_state(tmp_path)
-    registry = ProjectedAgentRegistry(state)
+    storage_base = tmp_path / "employee-store"
+    registry = ProjectedAgentRegistry(state, storage_base_path=str(storage_base))
 
     employee = registry.get("tenant_1", "agt_1")
-    first = registry.as_slock_identity("tenant_1", "agt_1")
-    second = registry.as_slock_identity("tenant_1", "agt_1")
+    first = registry.as_execution_identity("tenant_1", "agt_1")
+    second = registry.as_execution_identity("tenant_1", "agt_1")
 
     assert employee is not None
     assert first is not None
@@ -27,6 +28,12 @@ def test_projected_registry_is_global_and_returns_fresh_slock_view(tmp_path) -> 
     assert first.agent_type == employee.tool
     assert first.model_name == employee.model
     assert first.system_prompt == employee.persona
+    assert first.memory_path == str(
+        storage_base / "agents" / employee.agent_id / "memory" / "MEMORY.md"
+    )
+    assert first.workspace_path == str(
+        storage_base / "agents" / employee.agent_id / "workspace"
+    )
     assert not hasattr(first, "app_id")
     assert not hasattr(first, "credential_ref")
 
@@ -74,7 +81,7 @@ def test_projected_registry_is_tenant_scoped_and_read_only(tmp_path) -> None:
         ("get", ("agt_1",)),
         ("find_by_name", ("Atlas",)),
         ("list_agents", ()),
-        ("as_slock_identity", ("agt_1",)),
+        ("as_execution_identity", ("agt_1",)),
     ],
 )
 def test_projected_registry_rejects_empty_tenant(
@@ -106,7 +113,7 @@ def test_archived_employee_is_hidden_but_tombstone_is_retained(tmp_path) -> None
     assert registry.get("tenant_1", "agt_1") is None
     assert registry.find_by_name("tenant_1", "Atlas") is None
     assert registry.list_agents("tenant_1") == []
-    assert registry.as_slock_identity("tenant_1", "agt_1") is None
+    assert registry.as_execution_identity("tenant_1", "agt_1") is None
 
 
 def test_context_binding_requires_active_visible_membership_and_exact_principal(

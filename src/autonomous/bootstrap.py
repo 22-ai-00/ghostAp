@@ -19,7 +19,7 @@ class AutonomousContainer:
     """Legacy standalone composition shell; not wired into production routing.
 
     Production autonomous work is composed by ``EmployeeDepartmentRuntime`` and
-    entered from Slock. This compatibility shell remains importable for older
+    entered from Team. This compatibility shell remains importable for older
     callers, but its Manager command surface is deliberately retired.
 
     Uses:

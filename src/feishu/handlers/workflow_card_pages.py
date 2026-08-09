@@ -34,7 +34,7 @@ class WorkflowCardPageDelivery:
             page_message_ids.append(None)
         self._page_message_ids = page_message_ids
         self._last_pages: list[dict[str, Any]] = []
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
 
     @property
     def page_message_ids(self) -> tuple[str | None, ...]:

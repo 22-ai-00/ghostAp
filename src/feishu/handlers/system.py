@@ -57,7 +57,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
     """Help, exit, shell, directory, and intercepted-command handling."""
 
     # `/status` remains the established Deep/Spec diagnostics command. The
-    # Standalone v5 Manager was superseded by the Journal-backed employee/Slock
+    # Standalone v5 Manager was superseded by the Journal-backed employee/Team
     # runtime. Keep its old spellings fail-closed with an explicit migration
     # message instead of reviving the obsolete process-local command surface.
     _RETIRED_AUTONOMOUS_MANAGER_COMMANDS = retired_command_tokens()

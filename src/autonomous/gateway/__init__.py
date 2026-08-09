@@ -5,6 +5,13 @@ from .context_prompt import (
     RenderedEmployeePrompt,
     render_employee_context,
 )
+from .coordinator import (
+    EmployeeCancellationOutcome,
+    EmployeeDispatchCoordinator,
+    EmployeeDispatchError,
+    FinalizedEmployeeAttempt,
+    PreparedEmployeeDispatch,
+)
 from .models import (
     AgentExecutionSpec,
     DispatchBinding,
@@ -18,10 +25,10 @@ from .projection import (
     GatewayProjectionState,
     reduce_gateway_frame,
 )
-from .slock import (
+from .team import (
     DispatchPermitAuthorityError,
     EmployeeActionRequiredError,
-    EmployeeSlockGateway,
+    EmployeeTeamGateway,
 )
 
 __all__ = [
@@ -31,13 +38,18 @@ __all__ = [
     "DispatchBinding",
     "DispatchPermit",
     "DispatchPermitConsumedError",
+    "EmployeeCancellationOutcome",
+    "EmployeeDispatchCoordinator",
+    "EmployeeDispatchError",
     "GatewayExecutionResult",
     "GatewayExecutionStatus",
     "GatewayProjectionError",
     "GatewayProjectionState",
     "DispatchPermitAuthorityError",
     "EmployeeActionRequiredError",
-    "EmployeeSlockGateway",
+    "EmployeeTeamGateway",
+    "FinalizedEmployeeAttempt",
+    "PreparedEmployeeDispatch",
     "reduce_gateway_frame",
     "render_employee_context",
 ]

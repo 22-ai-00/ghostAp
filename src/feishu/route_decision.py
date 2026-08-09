@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 from .product_catalog import is_programming_entry_command
 
@@ -24,9 +24,6 @@ class RouteTarget(str, Enum):
     DEEP_ENGINE = "deep"
     SPEC_ENGINE = "spec"
     WORKFLOW_ENGINE = "workflow"
-    SLOCK_COMMAND = "slock_command"
-    SLOCK_MESSAGE = "slock_message"
-    SLOCK_AUTO_ACTIVATE = "slock_auto_activate"
     PROGRAMMING_MODE = "programming"
     SHELL = "shell"
     SYSTEM_COMMAND = "system_command"
@@ -76,10 +73,6 @@ class CommandRouter:
         from .handlers.system import SystemHandler
         return SystemHandler.is_workflow_command(text)
 
-    @staticmethod
-    def is_slock_command(text: str, chat_id: str = "", manager: Any = None) -> Any:
-        from ..slock_engine.gateway import is_slock_command
-        return is_slock_command(text, chat_id, manager=manager)
 
     @staticmethod
     def is_programming_entry(text: str) -> bool:

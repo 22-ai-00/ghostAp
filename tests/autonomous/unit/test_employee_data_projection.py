@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import secrets
 from pathlib import Path
 
@@ -22,16 +21,12 @@ from src.autonomous.data.projection import (
     DataProjectionState,
     JournalHead,
     is_data_event,
-    reduce_data_event,
 )
 from src.autonomous.data.service import (
-    DataBlobError,
     DataConflictError,
-    DataWriteDisabledError,
     EmployeeDataService,
 )
 from src.autonomous.journal.blob_store import AesGcmEncryptionProvider, BlobStore
-from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.writer import CommitState, JournalWriter
 
 
@@ -170,7 +165,7 @@ class TestRecordHistory:
     def test_idempotent_retry_returns_existing(self, service: EmployeeDataService) -> None:
         record = _record()
         payload = _payload(record)
-        first = service.record_history(record, payload)
+        service.record_history(record, payload)
         second = service.record_history(record, payload)
         assert second.record == record
 

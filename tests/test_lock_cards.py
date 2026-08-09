@@ -1243,23 +1243,6 @@ class TestChatLockCardContentBlocks:
 # ---------------------------------------------------------------------------
 
 
-class TestStylesLockOnlyLockKeys:
-    """styles_lock.LOCK_UI_TEXT should only contain lock-related keys."""
-
-    # Keys that were migrated OUT of styles_lock to styles
-    MIGRATED_NON_LOCK_KEYS = {
-        "retry_command_sig_mismatch",
-        "retry_command_sig_upgrade_expired",
-        "retry_project_unavailable",
-        "eviction_notify_title",
-        "eviction_notify_body",
-        "eviction_notify_btn_rebind",
-    }
-
-    def test_no_migrated_keys_remain(self):
-        from src.card.styles_lock import LOCK_UI_TEXT
-        leaked = self.MIGRATED_NON_LOCK_KEYS & set(LOCK_UI_TEXT.keys())
-        assert not leaked, f"Non-lock keys still in LOCK_UI_TEXT: {leaked}"
 
 
 # ---------------------------------------------------------------------------

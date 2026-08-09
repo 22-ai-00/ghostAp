@@ -1,4 +1,4 @@
-"""Path security utilities for Slock engine.
+"""Path security utilities for employee engine.
 
 Provides path restriction and blacklist checking utilities shared between
 ACP client and MemoryManager to ensure consistent security policies.
@@ -15,10 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def get_tool_path_restrictions() -> list[str]:
-    """Read slock_tool_path_restrictions from Settings (lazy, best-effort)."""
+    """Read employee_tool_path_restrictions from Settings (lazy, best-effort)."""
     try:
         from ..config import get_settings
-        return getattr(get_settings(), "slock_tool_path_restrictions", []) or []
+        return getattr(get_settings(), "employee_tool_path_restrictions", []) or []
     except Exception:
         return []
 
@@ -58,9 +58,9 @@ def get_acp_blacklist() -> tuple[list[str], list[str], list[str]]:
     try:
         from ..config import get_settings
         settings = get_settings()
-        files = getattr(settings, "slock_acp_blacklist_files", []) or []
-        dirs = getattr(settings, "slock_acp_blacklist_dirs", []) or []
-        exts = getattr(settings, "slock_acp_blacklist_exts", []) or []
+        files = getattr(settings, "employee_acp_blacklist_files", []) or []
+        dirs = getattr(settings, "employee_acp_blacklist_dirs", []) or []
+        exts = getattr(settings, "employee_acp_blacklist_exts", []) or []
         return files, dirs, exts
     except Exception:
         return [], [], []

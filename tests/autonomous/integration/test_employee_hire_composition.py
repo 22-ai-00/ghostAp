@@ -47,6 +47,7 @@ from src.autonomous.provisioning.hire_state import (
 from src.autonomous.provisioning.lark_app import RegistrationResult
 from src.autonomous.provisioning.slash_commands import VerifiedSlashState
 from src.autonomous.supervisor.employee_channels import ChannelProcessState, ChannelSendReceipt
+from src.autonomous.team.runtime import TeamRuntime
 from src.autonomous.team.service import EmployeeTeamService
 from src.autonomous.workforce.projection import commit_workforce_events
 
@@ -81,7 +82,7 @@ def _settings(
         autonomous_employee_outbox_blob_dir=str(tmp_path / "outbox-blobs"),
         autonomous_employee_attachment_staging_dir=str(tmp_path / "attachments"),
         autonomous_state_dir=str(tmp_path / "state"),
-        autonomous_slock_storage_base=str(tmp_path / "slock"),
+        autonomous_employee_storage_base=str(tmp_path / "employee-store"),
         autonomous_worker_sandbox_verified=True,
         autonomous_employee_service_instance_id="ghostap-prod-a",
         autonomous_main_bot_audit_dir=str(tmp_path / "main-bot-audit"),
@@ -259,14 +260,14 @@ class _Channels:
         self.closed = True
 
 
-class _SlockManager:
+class _TeamManager:
     @contextmanager
     def employee_activation_guard(self, **_kwargs):
-        raise RuntimeError("no activated Slock in composition-only test")
+        raise RuntimeError("no activated Team in composition-only test")
         yield
 
     def resolve_employee_engine(self, **_kwargs):
-        raise RuntimeError("no activated Slock in composition-only test")
+        raise RuntimeError("no activated Team in composition-only test")
 
 
 class _HealthyMembership:
@@ -554,7 +555,7 @@ def _runtime(
 ) -> EmployeeDepartmentRuntime:
     """Compose the built-in local runtime; release verdicts are obsolete."""
     del release_evidence_ready
-    kwargs.setdefault("slock_engine_manager", _SlockManager())
+    kwargs.setdefault("team_runtime", _TeamManager())
     kwargs.setdefault(
         "employee_environment_provider",
         lambda authority: EmployeeProcessEnvironmentMaterial(
@@ -679,7 +680,7 @@ def test_runtime_composes_canonical_membership_service(tmp_path: Path) -> None:
     runtime.close()
 
 
-def test_task7_execution_readiness_requires_slock_gateway(tmp_path: Path) -> None:
+def test_task7_execution_readiness_requires_team_runtime(tmp_path: Path) -> None:
     runtime = _runtime(
         _settings(tmp_path, limit=1, context_configured=True),
         release_evidence_ready=True,
@@ -689,11 +690,11 @@ def test_task7_execution_readiness_requires_slock_gateway(tmp_path: Path) -> Non
         notification_link=lambda *_: None,
         context_source_factory=_ContextSourceFactory(),
         group_memory_backend=_GroupMemory(),
-        slock_engine_manager=None,
+        team_runtime=None,
     )
 
     assert runtime.hire_readiness().ready is True
-    assert runtime.execution_readiness().blockers == ("slock_gateway",)
+    assert runtime.execution_readiness().blockers == ("team_runtime",)
     runtime.close()
 
 
@@ -1454,6 +1455,10 @@ def test_prepared_group_reply_resumes_on_new_channel_generation(
 
 def test_team_assignment_uses_canonical_employee_ingress_queue(tmp_path: Path) -> None:
     channels = _Channels()
+    team_runtime = TeamRuntime(
+        project_root_resolver=lambda _chat_id: str(tmp_path),
+        session_host=SimpleNamespace(close=lambda: None),
+    )
     settings = _settings(tmp_path, limit=1, context_configured=True)
     settings.allowed_chat_ids = frozenset({"oc_employee_team"})
     runtime = _runtime(
@@ -1467,6 +1472,7 @@ def test_team_assignment_uses_canonical_employee_ingress_queue(tmp_path: Path) -
         context_source_factory=_AssemblingContextSourceFactory(),
         group_memory_backend=_GroupMemory(),
         membership_health=_HealthyMembership(),
+        team_runtime=team_runtime,
     )
     active = _activate_employee(runtime, channels)
     channels.statuses[active.agent_id].tenant_key = active.tenant_key
@@ -1497,16 +1503,18 @@ def test_team_assignment_uses_canonical_employee_ingress_queue(tmp_path: Path) -
     runtime._dispatch = _NoDispatch()  # type: ignore[assignment]
     backend = runtime.team_service._backend
     target = backend.list_active(active.tenant_key, "oc_employee_team")[0]
-    runtime.team_service._commit_effect(  # noqa: SLF001
-        "teamrun_integration:analysis",
-        "employee_dispatch",
-        "prepared",
-    )
-    runtime.team_service._commit_effect(  # noqa: SLF001
-        "teamrun_integration:analysis",
-        "employee_dispatch",
-        "executing",
-    )
+
+    def commit_assignment_effect(state: str) -> None:
+        runtime.team_service._commit(  # noqa: SLF001
+            JournalEvent(
+                event_type=f"team.v2.effect.{state}",
+                aggregate_id="teamrun_integration:assignment:analysis",
+                payload={"effect_type": "employee_dispatch"},
+            )
+        )
+
+    commit_assignment_effect("prepared")
+    commit_assignment_effect("executing")
     acceptance_id = backend.submit(
         run_id="teamrun_integration",
         step_id="analysis",
@@ -1534,24 +1542,22 @@ def test_team_assignment_uses_canonical_employee_ingress_queue(tmp_path: Path) -
         active = original_check(part)
         if check_calls == 2:
             assert active is True
-            runtime.team_service._commit_effect(  # noqa: SLF001
-                "teamrun_integration:analysis",
-                "employee_dispatch",
-                "action_required",
-            )
+            commit_assignment_effect("action_required")
         return active
 
     real_dispatch._team_assignment_effect_is_active = race_after_active_check  # type: ignore[method-assign]  # noqa: SLF001
     # The effect changes after the check but before dispatch commit. The head
     # CAS must force a retry, which then terminalizes the stale assignment.
     assert real_dispatch.prepare_next() is None
-    assert check_calls == 3
+    post_prepare = runtime.ingress_router.state.by_acceptance_id[acceptance_id]
+    assert check_calls == 3, (post_prepare.state, post_prepare.reason_code)
     terminal = runtime.ingress_router.state.by_acceptance_id[acceptance_id]
     assert terminal.state == "terminal"
     assert terminal.reason_code == "team_step_inactive"
     runtime._dispatch = real_dispatch
     runtime._dispatch_thread = None
     runtime.close()
+    team_runtime.close()
 
 
 def test_runtime_recovers_team_before_it_can_start_dispatch(
@@ -1718,7 +1724,7 @@ def _persist_queued_team_assignment_then_crash(root: str, pipe) -> None:
 
 @pytest.mark.slow
 def test_queued_team_assignment_restart_never_dispatches_acp(tmp_path: Path) -> None:
-    """A real process crash is recovered before Context/Slock/ACP dispatch."""
+    """A real process crash is recovered before Context/Team/ACP dispatch."""
 
     import multiprocessing
 
@@ -1739,9 +1745,9 @@ def test_queued_team_assignment_restart_never_dispatches_acp(tmp_path: Path) -> 
     process.join(10)
     assert process.exitcode == 0
 
-    from src.slock_engine.manager import ActivatedSlockBinding
+    from src.autonomous.team.runtime import TeamExecutionBinding
 
-    class _CountingEngine:
+    class _CountingSessionHost:
         def __init__(self):
             self.run_agent_session_calls = 0
 
@@ -1749,7 +1755,7 @@ def test_queued_team_assignment_restart_never_dispatches_acp(tmp_path: Path) -> 
             self.run_agent_session_calls += 1
             return "must not execute"
 
-    class _CountingSlock:
+    class _CountingTeamRuntime:
         def __init__(self, engine):
             self.engine = engine
             self.activation_calls = 0
@@ -1757,12 +1763,11 @@ def test_queued_team_assignment_restart_never_dispatches_acp(tmp_path: Path) -> 
         @contextmanager
         def employee_activation_guard(self, *, chat_id, **_kwargs):
             self.activation_calls += 1
-            yield ActivatedSlockBinding(
+            yield TeamExecutionBinding(
                 engine_identity="e" * 64,
                 chat_id=chat_id,
                 root_identity="r" * 64,
                 canonical_root=str(tmp_path),
-                channel_id=chat_id,
                 engine=self.engine,
             )
 
@@ -1797,8 +1802,8 @@ def test_queued_team_assignment_restart_never_dispatches_acp(tmp_path: Path) -> 
             self.open_calls += 1
             yield _CountingContextSource(scope, self)
 
-    engine = _CountingEngine()
-    slock = _CountingSlock(engine)
+    engine = _CountingSessionHost()
+    team_runtime = _CountingTeamRuntime(engine)
     context_source = _CountingContextFactory()
     restarted = _runtime(
         settings,
@@ -1811,7 +1816,7 @@ def test_queued_team_assignment_restart_never_dispatches_acp(tmp_path: Path) -> 
         context_source_factory=context_source,
         group_memory_backend=_GroupMemory(),
         membership_health=_HealthyMembership(),
-        slock_engine_manager=slock,
+        team_runtime=team_runtime,
     )
     try:
         deadline = time.monotonic() + 5
@@ -1832,7 +1837,7 @@ def test_queued_team_assignment_restart_never_dispatches_acp(tmp_path: Path) -> 
         assert not restarted.dispatch_coordinator.state.attempts
         assert context_source.open_calls == 0
         assert context_source.api_calls == 0
-        assert slock.activation_calls == 0
+        assert team_runtime.activation_calls == 0
         assert engine.run_agent_session_calls == 0
     finally:
         restarted.close()
@@ -2025,7 +2030,7 @@ def test_local_composition_canonicalizes_symlinked_home_prefix(
     settings.autonomous_employee_ingress_blob_dir = "~/.ghostap/ingress-blobs"
     settings.autonomous_employee_outbox_blob_dir = "~/.ghostap/outbox-blobs"
     settings.autonomous_employee_attachment_staging_dir = "~/.ghostap/attachments"
-    settings.autonomous_slock_storage_base = "~/.ghostap/slock"
+    settings.autonomous_employee_storage_base = "~/.ghostap/slock"
 
     runtime = EmployeeDepartmentRuntime.from_settings(
         settings,
@@ -2226,7 +2231,7 @@ def test_legacy_release_session_expiry_cannot_close_local_admission(tmp_path: Pa
         notification_link=lambda *_: None,
         context_source_factory=_ContextSourceFactory(),
         group_memory_backend=_GroupMemory(),
-        slock_engine_manager=_SlockManager(),
+        team_runtime=_TeamManager(),
         employee_environment_provider=lambda authority: EmployeeProcessEnvironmentMaterial(
             authority.tenant_key,
             authority.agent_id,
@@ -2298,7 +2303,7 @@ def test_active_employee_requires_employee_scoped_context_probe_and_same_head(
     )
     assert runtime.context_service is not None
     assert runtime.data_composition is not None
-    assert runtime.data_composition.document_materializer.root == (tmp_path / "slock" / "agents")
+    assert runtime.data_composition.document_materializer.root == (tmp_path / "employee-store" / "agents")
     active = _activate_employee(runtime, channels)
 
     readiness = runtime.execution_readiness(active.agent_id)

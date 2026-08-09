@@ -362,7 +362,7 @@ def test_gateway_lifecycle_renders_one_monotonic_card_for_all_terminal_states(
     expected,
 ) -> None:
     from src.autonomous.ingress import dispatch as gateway
-    from tests.autonomous.integration.test_employee_slock_gateway import _binding
+    from tests.autonomous.integration.test_employee_team_gateway import _binding
 
     service, writer, _anchor = _runtime(tmp_path)
     lifecycle = EmployeeOutboxLifecycle(service)

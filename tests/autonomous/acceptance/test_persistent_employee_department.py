@@ -6,8 +6,8 @@ import inspect
 from pathlib import Path
 
 from src.autonomous.acceptance.employee_release import EmployeeReleaseManifest
+from src.autonomous.gateway import EmployeeTeamGateway
 from src.autonomous.gateway.coordinator import EmployeeDispatchCoordinator
-from src.autonomous.gateway.slock import EmployeeSlockGateway
 from src.autonomous.team.service import EmployeeTeamService
 from src.config.settings import Settings
 
@@ -51,7 +51,7 @@ def test_legacy_runtime_modes_can_only_be_selected_explicitly() -> None:
         is inspect.Parameter.empty
     )
     assert (
-        inspect.signature(EmployeeSlockGateway).parameters["runtime_mode"].default
+        inspect.signature(EmployeeTeamGateway).parameters["runtime_mode"].default
         is inspect.Parameter.empty
     )
     assert (

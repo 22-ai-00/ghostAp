@@ -67,7 +67,6 @@ from ..project import (
     ProjectContextManager,
     ProjectManager,
 )
-from ..slock_engine import SlockEngineManager
 from ..spec_engine import SpecEngineManager, SpecReporter
 from ..tasking import TaskPriority, TaskScheduler, TaskSpec
 from ..thread import (
@@ -107,7 +106,6 @@ from .handlers import (
     DiagnosticsHandler,
     GeminiModeHandler,
     ProjectHandler,
-    SlockHandler,
     SpecHandler,
     SystemHandler,
     TraexModeHandler,
@@ -164,10 +162,10 @@ def _employee_hire_status_text(employee_name: str, status: str) -> str | None:
     if status == "ready":
         return (
             f"✅ 员工 **{employee_name}** 配置完成，正在等待激活。"
-            "请先私聊该员工发送 `/status`，激活成功后再将其加入 Slock 群。"
+            "请先私聊该员工发送 `/status`，激活成功后再将其加入 Team 群。"
         )
     if status == "active":
-        return f"✅ 员工 **{employee_name}** 已激活，可以加入 Slock 群协作。"
+        return f"✅ 员工 **{employee_name}** 已激活，可以加入 Team 群协作。"
     if status == "action_required":
         return (
             f"⚠️ 员工 **{employee_name}** 创建未能自动收敛，已转为人工处理；"
@@ -249,11 +247,6 @@ _SILENT_DEDUP_ACTIONS = {
     "workflow_review_select_model_effort",
     "workflow_review_select_model", "spec_review_select_tool",
     "spec_review_select_model", "select_acp_tool",
-    "select_acp_model", "slock_new_role_select_tool",
-    "slock_new_role_select_model",
-    "slock_role_add_pick", "slock_role_add_confirm",
-    "slock_role_add_select",
-    "slock_new_role_select_tool_dropdown",
 }
 
 _CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
@@ -261,8 +254,7 @@ _SHUTDOWN_SCHEDULER_DRAIN_S = 5.0
 _SHUTDOWN_DELEGATED_DRAIN_S = 5.0
 # The managed-trust cutover first shipped at 2026-07-31 20:25 UTC.  Archives
 # created after this boundary may be the startup regression repaired by the
-# legacy Slock migration; older dissolved markers remain permanently retired.
-_LEGACY_SLOCK_TRUST_CUTOVER_NS = 1_785_529_500_000_000_000
+# legacy Team migration; older dissolved markers remain permanently retired.
 
 
 def _build_task_scheduler(
@@ -443,7 +435,8 @@ class FeishuWSClient:
         self._progress_reporter = ProgressReporter()
         self._spec_engine_manager = SpecEngineManager()
         self._spec_reporter = SpecReporter()
-        self._slock_engine_manager = SlockEngineManager()
+        from ..autonomous.team.runtime import TeamRuntime
+        self._team_runtime = TeamRuntime()
 
         from ..workflow_engine.manager import WorkflowEngineManager
         self._workflow_engine_manager = WorkflowEngineManager()
@@ -478,7 +471,7 @@ class FeishuWSClient:
                 self.settings,
                 managed_group_registry=self._managed_group_registry,
                 managed_group_owner_id=self._managed_group_owner_id,
-                slock_engine_manager=self._slock_engine_manager,
+                team_runtime=self._team_runtime,
                 employee_environment_provider=lambda authority: local_employee_environment(
                     authority,
                     traex_auth_home=getattr(
@@ -549,7 +542,6 @@ class FeishuWSClient:
             progress_reporter=self._progress_reporter,
             spec_engine_manager=self._spec_engine_manager,
             spec_reporter=self._spec_reporter,
-            slock_engine_manager=self._slock_engine_manager,
             workflow_engine_manager=self._workflow_engine_manager,
             thread_manager=self._thread_manager,
 
@@ -622,7 +614,6 @@ class FeishuWSClient:
         project_handler = ProjectHandler(self._handler_ctx)
         system_handler = SystemHandler(self._handler_ctx)
         diagnostics_handler = DiagnosticsHandler(self._handler_ctx)
-        slock_handler = SlockHandler(self._handler_ctx)
         workflow_handler = WorkflowHandler(self._handler_ctx)
 
         # ------------------------------------------------------------------
@@ -640,7 +631,6 @@ class FeishuWSClient:
         self._project_handler = project_handler
         self._system_handler = system_handler
         self._diagnostics_handler = diagnostics_handler
-        self._slock_handler = slock_handler
         self._workflow_handler = workflow_handler
 
         self._handler_ctx.managers.update({
@@ -663,7 +653,6 @@ class FeishuWSClient:
             "project": project_handler,
             "system": system_handler,
             "diagnostics": diagnostics_handler,
-            "slock": slock_handler,
             "workflow": workflow_handler,
         })
 
@@ -956,7 +945,7 @@ class FeishuWSClient:
             return False
 
         # Ask every delegated execution surface to stop before destroying ACP
-        # sessions.  Employee runtime close waits for its Team executor; Slock
+        # sessions.  Employee runtime close waits for its Team executor; Team
         # tasks are delegated to a separate bounded executor, so explicitly
         # pause their sessions and observe that executor as well.
         deep_resources = EngineResourceGroup("deep_engine", self._deep_engine_manager)
@@ -968,7 +957,6 @@ class FeishuWSClient:
         deep_engines = deep_resources.stop_running_engines()
         spec_engines = spec_resources.stop_running_engines()
         workflow_engines = workflow_resources.stop_running_engines()
-        slock_engines = self._quiesce_slock_activities()
 
         if not self._wait_for_employee_runtime_recovery(
             _SHUTDOWN_DELEGATED_DRAIN_S
@@ -1002,14 +990,6 @@ class FeishuWSClient:
             EngineResourceGroup.wait_stopped(workflow_engines)
             and delegated_idle
         )
-        delegated_idle = (
-            self._wait_slock_activities(
-                slock_engines,
-                timeout_s=_SHUTDOWN_DELEGATED_DRAIN_S,
-            )
-            and delegated_idle
-        )
-
         if not delegated_idle:
             logger.error(
                 "delegated engine work did not drain; preserving shared dependencies"
@@ -1052,10 +1032,6 @@ class FeishuWSClient:
         deep_resources.cleanup_all()
         spec_resources.cleanup_all()
         workflow_resources.cleanup_all()
-        try:
-            self._slock_engine_manager.cleanup_all()
-        except Exception as e:
-            logger.debug("清理slock_engine_manager失败: %s", get_error_detail(e))
 
         # Only after execution surfaces have quiesced may their shared ACP
         # sessions be destroyed.
@@ -1095,70 +1071,7 @@ class FeishuWSClient:
             logger.debug("RepoLockManager shutdown in close() skipped", exc_info=True)
         return True
 
-    def _quiesce_slock_activities(self) -> list[Any]:
-        """Cancel Slock work delegated beyond the message scheduler."""
 
-        try:
-            engines = list(self._slock_engine_manager.list_engines())
-        except Exception:
-            logger.debug("failed to list Slock engines during shutdown", exc_info=True)
-            return []
-        for engine in engines:
-            try:
-                pause = getattr(engine, "pause", None)
-                stop = getattr(engine, "stop", None)
-                if callable(pause):
-                    pause()
-                elif callable(stop):
-                    stop()
-            except Exception:
-                logger.debug("failed to quiesce Slock engine", exc_info=True)
-            seen_executors: set[int] = set()
-            for name in ("_executor", "_discussion_executor"):
-                executor = getattr(engine, name, None)
-                if executor is None or id(executor) in seen_executors:
-                    continue
-                seen_executors.add(id(executor))
-                shutdown = getattr(executor, "shutdown", None)
-                if not callable(shutdown):
-                    continue
-                try:
-                    shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    logger.debug(
-                        "failed to fence Slock executor %s",
-                        name,
-                        exc_info=True,
-                    )
-        return engines
-
-    @staticmethod
-    def _wait_slock_activities(
-        engines: list[Any],
-        *,
-        timeout_s: float,
-    ) -> bool:
-        """Boundedly observe Slock delegated executors after cancellation."""
-
-        deadline = time.monotonic() + max(0.0, timeout_s)
-        while True:
-            pending = 0
-            for engine in engines:
-                for name in ("_executor", "_discussion_executor"):
-                    executor = getattr(engine, name, None)
-                    count = getattr(executor, "pending_count", 0)
-                    if isinstance(count, int) and count > 0:
-                        pending += count
-            if pending == 0:
-                return True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                logger.error(
-                    "Slock delegated activities did not drain pending=%s",
-                    pending,
-                )
-                return False
-            time.sleep(min(0.05, remaining))
 
     def _on_thread_evicted(self, ctx) -> None:
         for mgr in self._handler_ctx.managers.values():
@@ -1395,25 +1308,8 @@ class FeishuWSClient:
         """判断是否为 Workflow Engine 命令。"""
         return SystemHandler.is_workflow_command(text)
 
-    def _is_slock_command(self, text: str, chat_id: str = "") -> "bool | str":
-        """判断是否为 Slock Engine 命令。"""
-        from ..slock_engine.slash_commands import is_slock_command
-        manager = getattr(self, '_slock_engine_manager', None)
-        return is_slock_command(text, chat_id=chat_id, manager=manager)
 
-    def _is_slock_active(self, chat_id: str) -> bool:
-        """Check if a chat has an active slock engine."""
-        manager = getattr(self, '_slock_engine_manager', None)
-        if manager is None:
-            return False
-        return manager.is_slock_active(chat_id)
 
-    def _is_slock_managed_chat(self, chat_id: str) -> bool:
-        """Check if a chat is registered as managed by the slock engine."""
-        manager = getattr(self, '_slock_engine_manager', None)
-        if manager is None:
-            return False
-        return manager.is_managed_chat(chat_id)
 
     # ------------------------------------------------------------------
     # Passive mode auto-activate helpers
@@ -1450,67 +1346,7 @@ class FeishuWSClient:
                     removed += 1
         return removed
 
-    def _should_auto_activate_slock(self, chat_id: str, text: str, *, chat_type: str = "group") -> bool:
-        """Check if message should trigger slock auto-activation.
 
-        Short-circuits for already-managed chats to avoid redundant classification
-        overhead. Only performs task classification for unmanaged group chats.
-
-        Returns True if:
-        - Chat is already managed by slock (short-circuit), or
-        - Chat is an unmanaged group AND text is classified as a task
-        """
-        from .slock_dispatch import should_auto_activate
-
-        return should_auto_activate(
-            chat_id,
-            text,
-            chat_type=chat_type,
-            is_managed=self._is_slock_managed_chat(chat_id),
-        )
-
-    def _auto_activate_slock(
-        self, chat_id: str, text: str, project: "Optional[ProjectContext]" = None
-    ) -> tuple[bool, str]:
-        """Auto-activate slock for an unmanaged chat on first valid task message.
-
-        Returns a tuple of (success, reason):
-        - success: True if activation succeeded, False if denied/failed.
-        - reason: A string indicating the result. One of:
-            - ACTIVATION_ALLOWED: activation succeeded
-            - ACTIVATION_DENIED_RATE_LIMIT: rate limit exceeded
-            - ACTIVATION_DENIED_ADMIN_REQUIRED: admin-only policy
-            - ACTIVATION_DENIED_NOT_WHITELISTED: not in whitelist
-            - "error": activation failed with exception
-
-        Idempotent: if the chat becomes managed between check and call, the
-        slock handler's activate_slock will detect the existing engine and
-        short-circuit. Uses _auto_activate_lock to prevent concurrent bootstrap
-        for the same chat.
-
-        Guarded by ActivationGuard for permission and rate-limit checks.
-        """
-        from ..thread.manager import get_current_sender_id
-        from .slock_dispatch import try_passive_activation
-
-        sender_id = get_current_sender_id() or ""
-        effective_trust = self._resolve_effective_trust(
-            sender_id=sender_id,
-            chat_id=chat_id,
-            chat_type="group",
-        )
-
-        return try_passive_activation(
-            chat_id,
-            text,
-            project=project,
-            settings=self.settings,
-            is_managed_fn=lambda: self._is_slock_managed_chat(chat_id),
-            get_chat_lock_fn=lambda: self._get_chat_lock(chat_id),
-            slock_handler=self._slock_handler,
-            card_sender=self._system_handler,
-            effective_trust=effective_trust,
-        )
 
     @staticmethod
     def _is_interceptable_command_match(command_match: CommandMatch | None) -> bool:
@@ -2353,21 +2189,9 @@ class FeishuWSClient:
                     managed_group.project_id,
                     chat_id,
                 )
-                standalone_team = False
-                if (
-                    trusted_project is None
-                    and managed_group.project_id.startswith("team:")
-                ):
-                    engine = self._slock_engine_manager.get_activated_engine(chat_id)
-                    standalone_team = bool(
-                        self._slock_engine_manager.is_managed_chat(chat_id)
-                        and engine is not None
-                        and os.path.realpath(getattr(engine, "root_path", ""))
-                        == os.path.realpath(managed_group.canonical_root_ref)
-                    )
-                if trusted_project is None and not standalone_team:
+                if trusted_project is None:
                     return
-                if trusted_project is not None and (
+                if (
                     getattr(trusted_project, "project_id", None)
                     != managed_group.project_id
                     or getattr(trusted_project, "root_path", None)
@@ -3817,11 +3641,9 @@ class FeishuWSClient:
         chat_id = getattr(event, "chat_id", "")
         if not isinstance(chat_id, str) or not chat_id.startswith("oc_"):
             return
-        manager = self._slock_engine_manager
         try:
             registry = getattr(self, "_managed_group_registry", None)
             if type(registry) is not ManagedGroupRegistry:
-                manager.retire_deleted_chat(chat_id)
                 return
             record = registry.record(chat_id)
             revoke_required = (
@@ -3833,7 +3655,6 @@ class FeishuWSClient:
                     chat_id,
                     requested_at=datetime.now(UTC),
                 )
-            manager.retire_deleted_chat(chat_id)
             project_manager = getattr(self, "_project_manager", None)
             if project_manager is None or not project_manager.revoke_managed_chat(chat_id):
                 raise OSError("project managed-chat revocation was not persisted")
@@ -3841,12 +3662,12 @@ class FeishuWSClient:
                 registry.complete_revoke(chat_id)
         except Exception:
             logger.exception(
-                "failed to retire deleted Slock chat=%s",
+                "failed to revoke deleted managed group chat=%s",
                 chat_id[:12],
             )
             raise
 
-    def _reconcile_managed_groups_before_slock_restore(self) -> None:
+    def _reconcile_managed_groups_before_team_start(self) -> None:
         """Reconcile pending revokes and validated legacy Project candidates."""
 
         from ..project_chat.lark_chat_client import (
@@ -3976,21 +3797,12 @@ class FeishuWSClient:
                 self._project_manager.quarantine_bound_chat(saga.chat_id)
 
         for chat_id in self._managed_group_registry.pending_revokes():
-            marker_disposition = (
-                self._slock_engine_manager.prepare_revoke_marker(chat_id)
-            )
             result = remote.delete_chat(chat_id)
             if result is False:
-                if self._slock_engine_manager.restore_revoke_marker(
-                    marker_disposition
-                ):
-                    self._managed_group_registry.cancel_revoke(chat_id)
                 continue
             if not self._project_manager.revoke_managed_chat(chat_id):
                 continue
             self._managed_group_registry.complete_revoke(chat_id)
-
-        self._migrate_legacy_slock_groups(remote)
 
         pending_saga_chat_ids = {
             saga.chat_id
@@ -4076,69 +3888,6 @@ class FeishuWSClient:
             if sent:
                 self._managed_group_registry.mark_migration_reported(chat_id)
 
-    def _migrate_legacy_slock_groups(self, remote) -> None:
-        """Validate and import pre-Registry Slock markers before restoration."""
-
-        from ..project_chat.lark_chat_client import ManagedChatValidation
-
-        candidates = self._slock_engine_manager.managed_group_migration_candidates(
-            owner_id=self._managed_group_owner_id,
-            receiving_bot_ref=self._managed_group_receiving_bot_ref,
-            archived_after_ns=_LEGACY_SLOCK_TRUST_CUTOVER_NS,
-        )
-        for raw_candidate in candidates:
-            candidate = dict(raw_candidate)
-            chat_id = candidate.get("chat_id")
-            project_id = candidate.get("project_id")
-            if not isinstance(chat_id, str) or not isinstance(project_id, str):
-                continue
-            # Any Registry record, including a tombstone, is authoritative.
-            if self._managed_group_registry.record(chat_id) is not None:
-                continue
-            validation = remote.validate_managed_chat(
-                chat_id,
-                self._managed_group_owner_id,
-            )
-            if validation is not ManagedChatValidation.VALID:
-                self._managed_group_registry.record_migration_disposition(
-                    chat_id,
-                    project_id=project_id,
-                    status=validation.value,
-                )
-                logger.warning(
-                    "legacy Slock migration remains inactive chat=%s disposition=%s",
-                    chat_id[:12],
-                    validation.value,
-                )
-                continue
-            archived_path = candidate.pop("_archived_path", "")
-            if archived_path:
-                try:
-                    self._slock_engine_manager.restore_archived_chat_marker(
-                        chat_id,
-                        archived_path,
-                    )
-                except (OSError, ValueError):
-                    logger.exception(
-                        "legacy Slock marker restore failed chat=%s",
-                        chat_id[:12],
-                    )
-                    continue
-            imported = self._managed_group_registry.import_candidate(
-                candidate,
-                validator=lambda _facts: True,
-            )
-            if imported is None:
-                logger.warning(
-                    "legacy Slock Registry import rejected chat=%s",
-                    chat_id[:12],
-                )
-                continue
-            logger.info(
-                "legacy Slock group validated and imported chat=%s project=%s",
-                chat_id[:12],
-                project_id,
-            )
 
     def rotate_main_managed_group_bot(
         self,
@@ -4236,27 +3985,13 @@ class FeishuWSClient:
         return event_builder.build()
 
     def _restore_trusted_ingress_dependencies(self, root: str) -> None:
-        """Restore authority dependencies before any WS admission opens."""
+        """Restore managed-group authority before WS admission opens."""
 
         try:
-            self._reconcile_managed_groups_before_slock_restore()
+            self._reconcile_managed_groups_before_team_start()
         except Exception:
             logger.exception("Managed-group startup reconciliation failed")
             raise
-
-        registry = getattr(self, "_managed_group_registry", None)
-        try:
-            restored = self._slock_engine_manager.restore_from_disk(
-                root,
-                managed_group_active=lambda chat_id: (
-                    type(registry) is ManagedGroupRegistry
-                    and registry.active_record(chat_id) is not None
-                ),
-            )
-            if restored:
-                logger.info("Restored %d slock engine(s) from disk", restored)
-        except (OSError, ValueError, KeyError):
-            logger.warning("Failed to restore slock engines from disk", exc_info=True)
 
     def start(self):
         """启动 WS 长连接并进入重连循环。
@@ -4271,7 +4006,7 @@ class FeishuWSClient:
         self._ws_health_monitor.start_watchdog()
         self._start_main_slash_command_sync()
 
-        # Registry reconciliation must precede marker-based Slock restore.
+        # Registry reconciliation must precede marker-based Team restore.
         import os
         _root = os.getcwd()
         self._restore_trusted_ingress_dependencies(_root)

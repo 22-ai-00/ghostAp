@@ -70,11 +70,11 @@
     },
     {
       "id": "EI-ACP-ONCE-01",
-      "selector": "tests/autonomous/integration/test_employee_slock_gateway.py::test_replay_dispatches_one_real_slock_session",
+      "selector": "tests/autonomous/integration/test_employee_team_gateway.py::test_replay_dispatches_one_real_team_session",
       "evidence_level": "integration",
-      "environment": "local_slock_harness",
-      "artifact_kind": "employee_slock_gateway",
-      "artifact_profile_id": "employee-slock-gateway-v1",
+      "environment": "local_team_harness",
+      "artifact_kind": "employee_team_gateway",
+      "artifact_profile_id": "employee-team-gateway-v1",
       "sdk_wheel_sha256": null,
       "selector_state": "collectable",
       "status": "pending"

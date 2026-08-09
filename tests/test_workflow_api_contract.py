@@ -24,7 +24,6 @@ Covers three guarantees the rest of the codebase relies on:
 from __future__ import annotations
 
 import inspect
-import logging
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -100,42 +99,27 @@ def _collect_workflow_action_ids_only() -> list[str]:
     return sorted(ids)
 
 
+
+
 def _collect_registered_workflow_handlers() -> dict[str, Any]:
-    """Capture the handler callable registered for each action id."""
+    """Capture exact workflow registrations without constructing a WS client."""
+    workflow_action_ids = frozenset(_collect_workflow_action_ids_only())
+    handlers: dict[str, Any] = {}
+    client = MagicMock()
 
-    class _CaptureClient:
-        def __init__(self) -> None:
-            self.handlers: dict[str, Any] = {}
+    def register(
+        handler: Any,
+        *,
+        exact: str | None = None,
+        prefix: str | None = None,
+    ) -> None:
+        del prefix
+        if exact in workflow_action_ids:
+            handlers[exact] = handler
 
-        def _register_action(
-            self,
-            handler: Any,
-            *,
-            exact: str = "",
-            prefix: str = "",
-            **_kwargs: Any,
-        ) -> None:
-            # We only track exact-match workflow entries. Prefix-based
-            # registrations (deep_*, spec_*, slock_*, ...) are handled by
-            # generic dispatch and don't participate in the workflow
-            # signature contract.
-            if exact:
-                self.handlers[exact] = handler
-
-        def __getattr__(self, name: str) -> Any:
-            # Every other attribute referenced during registration (Feishu
-            # helpers, settings, etc.) is stubbed out — we only care about
-            # the per-action handler callables bound by ``_register_action``.
-            return MagicMock()
-
-    client = _CaptureClient()
-    logging.disable(logging.CRITICAL)
-    try:
-        _action_registry_module.register_programming_mode_actions(client)
-    finally:
-        logging.disable(logging.NOTSET)
-
-    return client.handlers
+    client._register_action.side_effect = register
+    _action_registry_module.register_programming_mode_actions(client)
+    return handlers
 
 
 def _resolve_handler_method(registration: Any):

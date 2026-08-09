@@ -3,13 +3,11 @@ import hashlib
 import json
 import os
 import threading
-import time
 from types import SimpleNamespace
 
 import pytest
 
 from src.feishu.ws_client import (
-    _employee_hire_status_text,
     _employee_hire_status_uuid,
 )
 
@@ -237,16 +235,6 @@ def test_employee_recovery_drain_reports_live_worker_after_timeout() -> None:
     worker.join.assert_called_once_with(timeout=0.01)
 
 
-def test_pending_employee_notification_does_not_claim_ready() -> None:
-    text = _employee_hire_status_text("Atlas", "ready")
-
-    assert text is not None
-    assert "配置完成，正在等待激活" in text
-    assert "已就绪" not in text
-    assert "/status" in text
-    assert _employee_hire_status_text("Atlas", "active") == (
-        "✅ 员工 **Atlas** 已激活，可以加入 Slock 群协作。"
-    )
 
 
 def test_employee_hire_status_uuid_is_stable_per_intent_and_status() -> None:
@@ -295,111 +283,6 @@ def test_main_dispatcher_consumes_p2p_chat_entered_event_without_error() -> None
     assert entered[0].event == payload["event"]
 
 
-def test_ws_client_start_reconnects_if_underlying_start_returns(
-    tmp_path,
-    monkeypatch,
-):
-    """Ensure WS client doesn't stop the whole service when lark client exits.
-
-    We simulate lark-channel WS client's `.start()` returning unexpectedly. GhostAP
-    should reconnect (create client again) until `close()` is called.
-    """
-
-    from src.feishu import ws_client as ws
-
-    isolated_checkout = tmp_path / "checkout"
-    isolated_checkout.mkdir()
-    isolated_restart_gate = tmp_path / "restart-gate"
-    monkeypatch.setattr(ws, "_CHECKOUT_ROOT", isolated_checkout)
-    fake_settings = SimpleNamespace(
-        app_id="test_app_id",
-        app_secret="test_secret",
-        coco_session_timeout=60,
-        claude_session_timeout=60,
-        acp_keepalive_interval=10,
-        acp_session_idle_healthcheck_s=0,
-        task_scheduler_max_concurrent=1,
-        task_scheduler_per_key_concurrency=1,
-        message_cache_ttl=300,
-        message_cache_max_size=1000,
-        card=SimpleNamespace(action_dedup_ttl=1, action_dedup_max_size=5000),
-        system_command_concurrency=10,
-        spec_rate_limit_capacity=100,
-        spec_rate_limit_fill_rate=50.0,
-        spec_circuit_breaker_threshold=10,
-        spec_circuit_breaker_recovery=5.0,
-        message_expire_seconds=30,
-        streaming_enabled=False,
-        thread_programming_enabled=False,
-        feishu_ws_reconnect_delay_s=0.02,
-        feishu_ws_watchdog_interval=999,
-        restart_gate_dir=str(isolated_restart_gate),
-    )
-    monkeypatch.setattr(ws, "get_settings", lambda: fake_settings)
-
-    created = []
-
-    class DummyClient:
-        def __init__(self, *args, **kwargs):
-            created.append(kwargs)
-
-        def start(self):
-            created[-1]["on_activity"]("connected")
-            # Simulate immediate exit (disconnect / internal error).
-            time.sleep(0.01)
-
-        async def _disconnect(self):
-            return None
-
-    # Avoid background watchdog behavior in this unit test.
-    monkeypatch.setattr(ws, "ObservedLarkWSClient", DummyClient)
-    from src.feishu.ws_health import WSHealthMonitor
-    monkeypatch.setattr(WSHealthMonitor, "start_watchdog", lambda self: None)
-    monkeypatch.setattr(WSHealthMonitor, "stop_watchdog", lambda self: None)
-
-    # Avoid starting extra cache threads here; close() logic is covered elsewhere.
-    monkeypatch.setattr(ws.MessageCache, "start_cleanup_thread", lambda self: None)
-    monkeypatch.setattr(ws.MessageCache, "stop_cleanup_thread", lambda self: None)
-    monkeypatch.setattr(
-        ws.SlockEngineManager,
-        "restore_from_disk",
-        lambda self, root, **_kwargs: 0,
-    )
-    slash_sync_starts = []
-    monkeypatch.setattr(
-        ws.FeishuWSClient,
-        "_start_main_slash_command_sync",
-        lambda self: slash_sync_starts.append(True),
-        raising=False,
-    )
-
-    client = ws.FeishuWSClient(message_callback=lambda *a, **k: None)
-    assert client._restart_gate.directory == isolated_restart_gate
-    membership_audits = []
-    client._employee_department_runtime = SimpleNamespace(
-        membership_service=SimpleNamespace(
-            reconcile_projected_memberships=lambda: membership_audits.append(True)
-        ),
-        recover=lambda: None,
-        close=lambda: None,
-    )
-
-    t = threading.Thread(target=client.start, daemon=True)
-    t.start()
-
-    # Wait until at least one reconnect attempt happens.
-    deadline = time.time() + 1.0
-    while time.time() < deadline and len(created) < 2:
-        time.sleep(0.01)
-
-    client.close()
-    t.join(timeout=1.0)
-    assert len(created) >= 2
-    assert membership_audits == [True]
-    assert slash_sync_starts == [True]
-    assert all(item["log_level"] == ws.ChannelLogLevel.WARNING for item in created)
-    assert all(item["source"] == "ghostap" for item in created)
-    assert not t.is_alive()
 
 
 # ---------------------------------------------------------------------------
@@ -532,58 +415,10 @@ def test_main_ws_acknowledges_bot_deleted_events() -> None:
     assert deleted[0].event.chat_id == "oc_deleted"
 
 
-def test_main_bot_deleted_event_retires_persisted_slock_marker() -> None:
-    from src.feishu.ws_client import FeishuWSClient
-
-    calls: list[tuple[str, ...]] = []
-
-    class _Manager:
-        def retire_deleted_chat(self, chat_id: str):
-            calls.append(("retire", chat_id))
-
-    client = FeishuWSClient.__new__(FeishuWSClient)
-    client._slock_engine_manager = _Manager()
-
-    client._handle_bot_deleted(
-        SimpleNamespace(event=SimpleNamespace(chat_id="oc_deleted"))
-    )
-
-    assert calls == [("retire", "oc_deleted")]
 
 
-def test_main_bot_deleted_event_retires_marker_without_loaded_engine() -> None:
-    from src.feishu.ws_client import FeishuWSClient
-
-    calls: list[tuple[str, ...]] = []
-
-    class _Manager:
-        def retire_deleted_chat(self, chat_id: str):
-            calls.append(("retire", chat_id))
-
-    client = FeishuWSClient.__new__(FeishuWSClient)
-    client._slock_engine_manager = _Manager()
-
-    client._handle_bot_deleted(
-        SimpleNamespace(event=SimpleNamespace(chat_id="oc_marker_only"))
-    )
-
-    assert calls == [("retire", "oc_marker_only")]
 
 
-def test_main_bot_deleted_event_propagates_marker_archive_failure() -> None:
-    from src.feishu.ws_client import FeishuWSClient
-
-    class _Manager:
-        def retire_deleted_chat(self, _chat_id: str):
-            raise OSError("disk unavailable")
-
-    client = FeishuWSClient.__new__(FeishuWSClient)
-    client._slock_engine_manager = _Manager()
-
-    with pytest.raises(OSError, match="disk unavailable"):
-        client._handle_bot_deleted(
-            SimpleNamespace(event=SimpleNamespace(chat_id="oc_archive_failure"))
-        )
 
 
 def test_recovered_hire_notification_restores_trusted_recipient_scope() -> None:

@@ -189,9 +189,9 @@ def test_pending_plan_continues_once_on_the_same_session() -> None:
     assert order == ["send:1", "boundary", "send:2"]
 
 
-def test_second_pending_plan_stops_after_one_continuation() -> None:
+def test_pending_plan_stops_after_three_automatic_continuations() -> None:
     runner = _runner()
-    session = _FakeSession(_pending_result(), _pending_result())
+    session = _FakeSession(*(_pending_result() for _ in range(4)))
     continuation_starts: list[str] = []
     clock = _FakeClock()
 
@@ -206,13 +206,13 @@ def test_second_pending_plan_stops_after_one_continuation() -> None:
             ),
         )
 
-    assert len(session.calls) == 2
-    assert continuation_starts == ["continuing"]
-    assert session.continuation_calls == [session.calls[1]]
-    assert execution.automatic_continuations == 1
+    assert len(session.calls) == 4
+    assert continuation_starts == ["continuing"] * 3
+    assert session.continuation_calls == session.calls[1:]
+    assert execution.automatic_continuations == 3
     assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
     assert execution.assessment.pending_plan_entries == 1
-    assert execution.awaiting_user_input is True
+    assert execution.awaiting_user_input is False
 
 
 def test_missing_second_turn_plan_keeps_prior_plan_pending() -> None:
@@ -255,7 +255,12 @@ def test_missing_second_turn_plan_keeps_prior_plan_pending() -> None:
     second_tool_calls = list(text_only_result.tool_calls)
     second_tool_results = list(text_only_result.tool_results)
     second_modified_files = set(text_only_result.modified_files)
-    session = _FakeSession(first_result, text_only_result)
+    session = _FakeSession(
+        first_result,
+        text_only_result,
+        text_only_result,
+        text_only_result,
+    )
     clock = _FakeClock()
 
     with patch("src.acp.continuation._monotonic", clock):
@@ -266,7 +271,7 @@ def test_missing_second_turn_plan_keeps_prior_plan_pending() -> None:
             finalization_reserve_s=30,
         )
 
-    assert len(session.calls) == 2
+    assert len(session.calls) == 4
     assert text_only_result.plan is None
     assert execution.result is not text_only_result
     assert execution.result.plan is first_result.plan
@@ -280,15 +285,18 @@ def test_missing_second_turn_plan_keeps_prior_plan_pending() -> None:
     assert execution.result.tool_results == [
         *first_tool_results,
         *second_tool_results,
+        *second_tool_results,
+        *second_tool_results,
     ]
     assert execution.result.modified_files == {
         "src/first.py",
         "src/second.py",
     }
-    assert execution.result.output_tokens == 18
+    assert execution.result.output_tokens == 40
     assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
     assert execution.assessment.pending_plan_entries == 1
-    assert execution.awaiting_user_input is True
+    assert execution.automatic_continuations == 3
+    assert execution.awaiting_user_input is False
     assert first_result.tool_calls == first_tool_calls
     assert first_result.tool_calls[0] is prior_tool
     assert first_result.tool_results == first_tool_results
@@ -319,6 +327,101 @@ def test_pending_plan_with_active_tool_is_not_continued() -> None:
     assert execution.assessment.pending_plan_entries == 1
     assert execution.assessment.incomplete_tool_calls == 1
     assert execution.awaiting_user_input is False
+
+
+def test_safe_choice_uses_default_and_continues_without_user_input() -> None:
+    runner = _runner()
+    session = _FakeSession(
+        PromptResult(stop_reason="end_turn", text="请选择 A 或 B 实现方案"),
+        _complete_result(),
+    )
+
+    execution = runner(
+        session,
+        "implement the feature",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert "自动续做默认决策" in session.calls[1].text
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.awaiting_user_input is False
+
+
+def test_dangerous_confirmation_never_auto_authorizes_or_reports_success() -> None:
+    runner = _runner()
+    session = _FakeSession(
+        PromptResult(
+            stop_reason="end_turn",
+            text="请确认是否部署到生产环境并删除旧数据",
+        )
+    )
+
+    execution = runner(
+        session,
+        "prepare the change",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 1
+    assert execution.automatic_continuations == 0
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.awaiting_user_input is True
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    (
+        "Please confirm deployment to production",
+        "Can I delete production data?",
+        "May I use the administrator credentials?",
+    ),
+)
+def test_english_dangerous_questions_never_auto_authorize(prompt: str) -> None:
+    session = _FakeSession(PromptResult(stop_reason="end_turn", text=prompt))
+
+    execution = _runner()(
+        session,
+        "prepare the local change",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 1
+    assert execution.automatic_continuations == 0
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.awaiting_user_input is True
+
+
+def test_structured_dangerous_plan_never_hides_behind_generic_confirmation() -> None:
+    session = _FakeSession(
+        PromptResult(
+            stop_reason="end_turn",
+            text="Please confirm the next step",
+            plan=PlanInfo(
+                entries=[
+                    PlanEntryInfo(
+                        content="Deploy to production",
+                        status="pending",
+                    )
+                ]
+            ),
+        )
+    )
+
+    execution = _runner()(
+        session,
+        "prepare the local change",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 1
+    assert execution.automatic_continuations == 0
+    assert execution.awaiting_user_input is True
 
 
 def test_explicit_user_confirmation_preempts_child_reconciliation() -> None:

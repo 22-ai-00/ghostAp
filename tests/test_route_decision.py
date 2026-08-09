@@ -11,9 +11,7 @@ from src.feishu.route_decision import RouteTarget
 
 @pytest.fixture
 def dispatcher():
-    client = MagicMock()
-    client._slock_engine_manager = None
-    return MessageDispatcher(client)
+    return MessageDispatcher(MagicMock())
 
 
 class TestResolveCommandRoute:

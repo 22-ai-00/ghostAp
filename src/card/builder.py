@@ -329,49 +329,7 @@ class CardBuilder:
     def build_acp_tool_select_card(tools: list, project_id: Optional[str] = None, current_tool: Optional[str] = None) -> tuple[str, str]:
         return SystemBuilder.build_acp_tool_select_card(tools, project_id=project_id, current_tool=current_tool)
 
-    @staticmethod
-    def build_slock_role_tool_select_card(
-        role_name: str,
-        tools: list[dict],
-        project_id: Optional[str] = None,
-        *,
-        value_extra: Optional[dict] = None,
-    ) -> tuple[str, str]:
-        return SystemBuilder.build_slock_role_tool_select_card(
-            role_name,
-            tools,
-            project_id=project_id,
-            value_extra=value_extra,
-        )
 
-    @staticmethod
-    def build_slock_role_unified_select_card(
-        role_name: str,
-        tools: list[dict],
-        models: list,
-        tool_name: str,
-        project_id: Optional[str] = None,
-        current_model: Optional[str] = None,
-        *,
-        pending_group: Optional[str] = None,
-        pending_profile: Optional[str] = None,
-        pending_effort: Optional[str] = None,
-        profile_markdown: Optional[str] = None,
-        value_extra: Optional[dict] = None,
-    ) -> tuple[str, str]:
-        return SystemBuilder.build_slock_role_unified_select_card(
-            role_name,
-            tools,
-            models,
-            tool_name,
-            project_id=project_id,
-            current_model=current_model,
-            pending_group=pending_group,
-            pending_profile=pending_profile,
-            pending_effort=pending_effort,
-            profile_markdown=profile_markdown,
-            value_extra=value_extra,
-        )
 
     @staticmethod
     def build_acp_model_select_card(

@@ -249,3 +249,4 @@ def test_removed_product_modes_do_not_hide_active_engines():
         resolved = resolve_command(token, "keep working")
         assert resolved is not None
         assert resolved.action.command == token
+

@@ -167,7 +167,7 @@ def test_remove_only_removes_chat_membership_not_global_employee(tmp_path) -> No
     assert fx.hire.projection_state.bot_principals["bot_1"].credential_ref == "cred_1"
 
 
-def test_retirement_cleanup_is_admin_remove_only_and_does_not_require_live_slock(tmp_path) -> None:
+def test_retirement_cleanup_is_admin_remove_only_and_does_not_require_live_team(tmp_path) -> None:
     fx = _fixture(tmp_path, member_groups=("oc_team",), team_active=False)
     commit_workforce_events(
         fx.writer,

@@ -23,13 +23,13 @@ _T = TypeVar("_T")
 #    restores the pre-refactor parallelism (the old ``asyncio.run()`` created a
 #    fresh loop per call in the caller's own thread) WITHOUT the earlier
 #    single-shared-loop bottleneck, where independent operations — ACP model
-#    probes, coco probes, slock autonomous-resolve — serialized head-of-line
+#    probes, coco probes, employee autonomous-resolve — serialized head-of-line
 #    behind one loop. Loops are still centralized and reused (one per worker
 #    thread), so we don't reintroduce "scattered competing loops".
 #
 # 2. ``_get_bridge_loop`` — a single persistent background loop for callers that
-#    submit work from another thread via ``run_coroutine_threadsafe`` (slock NLI
-#    classification, slock engine autonomous resolve). These need a loop that is
+#    submit work from another thread via ``run_coroutine_threadsafe`` (employee NLI
+#    classification, employee engine autonomous resolve). These need a loop that is
 #    *already running* in a separate thread.
 
 _BRIDGE_LOOP: asyncio.AbstractEventLoop | None = None

@@ -1,6 +1,5 @@
 """Tests for BudgetManager: NaN, negative, concurrent oversell, version-CAS."""
 
-import math
 
 import pytest
 

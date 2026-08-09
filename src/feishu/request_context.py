@@ -58,10 +58,4 @@ class RequestContext:
     def is_slash_command(self) -> bool:
         return (self.text or "").strip().startswith("/")
 
-    @property
-    def slock_context_allowed(self) -> bool:
-        return not self.is_in_programming and not self.is_topic_engine_context
 
-    @property
-    def slock_auto_activate_allowed(self) -> bool:
-        return self.slock_context_allowed and self.project is None

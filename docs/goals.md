@@ -56,8 +56,6 @@
     - 安全可重建 identity.json
     - Tenant-aware ProjectedAgentRegistry
     - Legacy/V5 authority cutover 与持久化失败恢复
-    - Slock importer 随机 `agt_` ID 和持久 alias/source hash
-  - 员工数据面 Phase 7 已完成 production cutover：真实 Slock Gateway terminal 与 L1/summary/skill/reasoning producer、typed ACL read ports、员工 `/history`/`/memory`、主 Bot 管理员读取、独立 data authority、legacy import、live Blob 校验及 restart materialization rebuild 已全部接线；canonical employee 不再进入旧 history/root MEMORY writer。
   - `/hire` 的生产形态代码已经实现，不再只是内存脚手架：
     - 官方 `lark-oapi==1.7.1` 一键创建应用 adapter 与精确 manifest
     - Journal/Vault-backed durable Hire Saga 与 callback bridge
@@ -67,10 +65,8 @@
     - 真实员工 Bot `/status`、nonce、主 Bot send-count=0 的激活验证
     - `EmployeeDepartmentRuntime` 生产 composition、恢复 supervisor 和 FeishuWSClient 生命周期接线
     - 首次启动自动生成本地 Journal/Vault/Data 密钥并使用本地 FileAnchor
-  - `/hire` 不再降级写入 `AgentRegistry.legacy()`；`/new-role` 继续只负责 Slock 虚拟角色。没有 production service 或 readiness 时必须 fail-close。
   - 旧的独立 Autonomous Manager 命令面（`/goal`、`/goals`、`/run`、`/runs`、
     `/approve`、`/approvals`、`/decisions`）不再作为生产入口，已明确退役并 fail-close；
-    当前工作从 Employee Bot 的 `/task` 或 Slock 团队入口进入。兼容模块可导入不代表
     旧目标命令已接入消息调度器。
   - `/hire` 管理员 DM 卡片权限 Bug 已修复：消息事件入口保存官方 `event.message.chat_type` 与 origin/chat/operator；卡片回调不再读取不存在的 `context.chat_type`。只有服务端明确无 provenance 记录时才查询 Chat API，并且只读结构字段 `chat_mode`；API 结果必须原子写回完整可信绑定。来源查询/写入失败、残缺、过期、跨 chat、跨 operator 或并发冲突均 fail-close。
   - readiness 反馈已接入处理器：只有 provider 明确返回 `ready=True` 且无 blockers 才派发真实 Hire；否则向管理员显示具体安全门禁，不再误报“不是管理员”，也不降级创建本地虚拟角色。
@@ -89,14 +85,13 @@
       故障注入均证明 `CONTEXT_UNAVAILABLE` 零 task/ACP 派发；Phase 3 已把 durable ingress 接入该服务
     - Phase 3 Task 0-7 已完成 durable employee ingress、Projected Registry/ACL/membership
       authority、Journal-backed bounded Router、锚定 dispatch attempt、Context gate、
-      真实 Slock `_run_acp_session`、原子 terminal history 与生产 composition/recovery/handoff；
       本地九 selector 已精确聚合；员工 runtime 现在由本地安全自举直接启用，真实租户证据只用于验收，
       不再作为启动门禁
     - Phase 4 Employee Response Channel 已完成：冻结 snapshot/binding/effect、员工密钥加密 Blob、
       Journal replay、稳定 UUIDv5 单卡 create、employee child public `update_card` patch、四元组回执栅栏、
       terminal fencing、恢复 worker 与 runtime ownership 均已接线；旧 in-memory provisioning response 已删除，
       delivery coordinator 不持有主 Bot 端口，因此不存在 fallback 路径
-    - Phase 5 已完成真实团队 membership、`/role add/remove` 与 `/stop` 唯一终态；Bot 成员关系只由
+    - Phase 5 已完成真实团队 membership 与 `/stop` 唯一终态；Bot 成员关系只由
       `member_id_type=app_id` 变更和目标员工凭据 `is_in_chat` 观察确认，未知结果默认拒绝
     - Phase 6 已完成生产 `/fire`：legacy `provisioning/fire.py` 仅保留兼容测试，新路径使用 shared
       Journal 的 RETIRING/Effects/ACTION_REQUIRED/ARCHIVED 状态机、durable 单员工 ingress closure、
@@ -123,9 +118,8 @@
   - 每个员工是独立飞书 Bot，拥有自己的 app_id/app_secret、名字、头像、Slash Commands。
   - 使用一键创建应用 SDK 完成 `/hire` Provisioning Saga。
   - 每员工使用独立 Channel SDK WebSocket。
-  - 底层执行复用现有 Slock `_run_acp_session`。
-  - 支持 `/task`、`/status`、`/history`、`/memory`、`/stop`。
-  - 支持 `/fire`、团队 membership、`/role add/remove`。
+  - 支持任务提交查询链路、`/status`、`/history`、`/memory`、`/stop`。
+  - 支持 `/fire` 与团队 membership 管理。
   - 执行历史按日 JSONL，但 Journal + encrypted Blob 才是事实源。
   - L1、skill、reasoning 使用 Journal-first 数据面。
   - Context 顺序严格为：
@@ -138,7 +132,6 @@
 
   - Deep / Spec / Workflow 引擎逻辑和路由。
   - 主 GhostAP Bot 现有 WebSocket 连接和消息入口。
-  - Slock `_run_acp_session` 内部执行语义。
   - SMART、普通编程模式和 topic-scoped engine 状态合同。
   - Journal SSOT、frozen domain、Effect dispatch 前锚定、默认拒绝策略。
   - 不得把 app_secret 写入 identity.json、Journal、日志、卡片、异常、argv、环境变量或普通 IPC。
@@ -189,7 +182,6 @@
      - 已完成：Task 6 真实页间 mutation、deadline/token/partial SDK、restart/rotation/shutdown
        failure injection；所有 mandatory Context failure 均零 delegate/task/ACP 派发，三路终审批准
      - Phase 2 handoff 已关闭；下一阶段是 durable employee ingress
-  3. 已完成：Durable employee ingress、Router 与 Slock gateway：
      - 设计与现有实现审计已完成，实施计划见
        `docs/2026-07-13-autonomous-durable-ingress-plan.md`；Task 0-5 的 durable Inbox、
        official Channel ACK bridge、附件暂存、Journal-backed Router、Task 6 真实执行与
@@ -247,7 +239,6 @@
        EI-QUEUE-01、Ruff、文档、配置与 diff 门禁通过，独立 Spec/Code review 均批准且无
        Critical/Important
      - 已完成 Task 6：Router dispatch、attempt binding 与 dispatch committed 在同一锚定帧；
-       0/多 Slock、authority/credential/generation/membership 漂移与 Context 失败均 durable
        fail-close，full projection replay 保持在短提交锁之外
      - 已完成 Task 6：每个 accepted attempt 最多一次调用现有 `_run_acp_session`；
        completed/failed/canceled/timeout/action_required 全部原子进入数据面，restart recovery
@@ -257,14 +248,12 @@
        provider/secret 异常不泄露，真实子进程验证 Manager/Vault/peer secret 不继承
      - 已完成 Task 6：visible `/hire` 卡片到 typed request、Journal projection、
        `ProjectedAgentRegistry` 的模型三元组只组合一次；Hire admission 在 anchor 前拒绝
-       composite/未知 effort/不支持 profile，普通 `/new-role` 保留 legacy composite 语义
+       composite/未知 effort/不支持 profile，legacy composite 语义保留为历史兼容，不再作为新入口。
      - Task 6 最终 224 affected、1686 full Autonomous 测试通过；changed-file Ruff、
        `git diff --check` 通过，独立 Spec/Code review 均批准且无 Critical/Important
      - 已完成 Task 7：`EmployeeDepartmentRuntime` 现拥有 Inbox/Router/Gateway/附件/data，
-       FeishuWSClient 注入真实 Slock manager 与无共享 provider secret 的 runtime 环境端口；恢复先把
        unknown dispatch 收敛为 action_required，再启动有退避的 Journal 派发 worker；关停先停 ACK admission，
        超时未排空时保留 Journal/Vault 等依赖资源
-     - 已完成 Task 7：execution readiness 对 ingress/router/context/data/Slock/environment/recovery
        缺口稳定 fail-close；修复共享 Journal 推进后 Router workforce projection 过期导致合法消息
        `authority_stale` 的组合缺陷，并覆盖真实 anchored Inbox → owned Router queue
      - 已完成 Task 7：九个 `EI-*` exact selector 全部本地通过；全局 FI-29 只接受绑定
@@ -282,15 +271,14 @@
        Gateway terminal 卡只在原子执行终态提交后 append，runtime 负责恢复、worker、readiness 与逆序关闭
      - 员工 Bot 自己发送；主 Bot fallback 路径不存在。fresh Autonomous
        `1723 passed, 2 skipped, 1 warning in 397.51s`，共享回归 `193 passed`
-  5. 团队 membership、`/role add/remove` 与 `/stop` 终态竞态：
+  5. 团队 membership 与 `/stop` 终态竞态：
      - **已完成**。实施计划与官方 API 合约见
        `docs/2026-07-14-autonomous-membership-stop-plan.md`
      - canonical `employee_v1` membership 现由 Journal-backed 状态机管理；Manager Bot 使用
        `member_id_type=app_id` 串行调用官方群成员增删 API，目标员工 Bot 使用
        `members/is_in_chat` 证明最终状态。普通成员列表与 Chat API `chat_type` 均不再作为 Bot
        membership/会话结构依据
-     - `/role add/remove` 在 handler 与 service 两层重验管理员/团队创建者、租户、ACTIVE visible
-       employee、BotPrincipal/App ID、激活 Slock 团队；成功只在远端观察确认后返回。remove 仅移除
+     - 团队 membership 管理在 handler 与 service 两层重验管理员/团队创建者、租户、ACTIVE visible
        当前 chat，不删除全局员工、credential 或其他群关系；legacy virtual role 保留独立旧路径
      - Bot added/deleted 事件已接入 low-level employee Channel，并先进入 Durable Inbox；事件只触发
        员工凭据 `is_in_chat` 对账，乱序/重复事件不会直接改投影。未知结果进入
@@ -300,7 +288,6 @@
        返回已结束，cancel-first 强制唯一 `canceled` 终态，迟到 ACP success 不可覆盖
      - `/stop` 权限为管理员、当前团队创建者或原任务发起人；命令结果通过员工 Durable Outbox
        投递，无主 Bot fallback。重启对已锚定 cancel 直接收敛 canceled，不重跑 ACP
-     - fresh Autonomous `1763 passed, 2 skipped, 1 warning in 401.21s`；共享 Slock/WS 回归
        `269 passed`；`ruff check src/autonomous/`、配置校验与 `git diff --check` 通过
      - Phase 5 当时不提升旧 release readiness；后续内置员工决策已把默认 limit 调整为 8，
        显式设为 0 仍是关闭开关，下一阶段为 `/fire` durable Saga
@@ -316,13 +303,11 @@
        credential 销毁证明哈希及 `external_app_disposition=manual_deletion_required`；终态消息明确
        GhostAP 未删除开放平台应用，仍需管理员手动停用/删除
      - 已完成：同消息幂等重投、credential projection 崩溃补写、归档内容 hash 复核和 symlink 拒绝；
-       fresh Autonomous `1774 passed, 2 skipped, 1 warning in 399.34s`，共享 Slock/WS/docs 回归
        `277 passed`，Ruff、配置校验和 `git diff --check` 通过
      - Phase 6 不提升 release readiness；visible limit 仍为 0，下一阶段是数据面真实
        producer/handler/Supervisor cutover
   7. 数据面真实 producer/handler/Supervisor cutover：
      - **已完成**。实施与审核见 `docs/2026-07-14-autonomous-data-cutover-plan.md`；canonical
-       `employee_v1` 在所有 legacy Slock 入口 fail-close，真实 Gateway 直接复用 `_run_acp_session` 且不写
        `execution_history.jsonl` 或根 `MEMORY.md`，legacy virtual role 行为保持不变
      - terminal history 与 Gateway/Router 终态继续原子锚定；completed attempt 在员工 Outbox terminal
        之前，以 attempt ID 幂等发布 L1、chat/thread `memory_summary`、skill profile 和 task-scoped reasoning。
@@ -340,7 +325,6 @@
        materialization；history 分片和查询统一使用配置时区。多轮 grill 自动采纳并关闭伪 membership、
        data writer 漂移、summary terminal 崩溃窗口、source_id 链、root MEMORY 冲突和 migration symlink
      - fresh Autonomous `1791 passed, 2 skipped, 1 warning in 401.32s`；受影响回归 `265 passed`，
-       共享 Slock/memory/handler/docs `208 passed`；changed-file Ruff、配置校验和 `git diff --check` 通过
      - Phase 7 完成后，Phase 8 将员工能力从外部发布门禁切换为内置本地启动
   8. 内置 Visible Employee 启动：
      - 默认 visible limit 为 8；显式 0 是运维关闭开关

@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from src.autonomous.scheduler.activities import (
-    Activity,
     ActivityExecutor,
     ActivityState,
     ActivityType,
@@ -34,7 +33,7 @@ async def test_checkpointed_activity_resumable_after_restart() -> None:
         fencing_token=5,
     )
     await executor.start(activity.activity_id, fencing_token=5)
-    cp = await executor.checkpoint(
+    await executor.checkpoint(
         activity.activity_id,
         fencing_token=5,
         data={"files_processed": 42, "cursor": "abc123"},

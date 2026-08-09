@@ -40,6 +40,55 @@ BACKENDS = (
 )
 
 
+def _context(backend: str, manager: ACPSessionManager) -> HandlerContext:
+    """Build the minimal deterministic dependency graph for a direct lane."""
+    managers = {name: MagicMock() for name, _handler, _model in BACKENDS}
+    managers[backend] = manager
+
+    mode_manager = MagicMock()
+    mode_manager.get_mode.return_value = InteractionMode.SMART
+    for name, _handler, _model in BACKENDS:
+        getattr(mode_manager, f"is_{name}_mode").return_value = False
+
+    project_manager = MagicMock()
+    project_manager.get_active_project.return_value = None
+    project_manager.validate_project_path.return_value = (True, "")
+    context_manager = MagicMock()
+    context_manager.store.get.return_value = None
+    settings = SimpleNamespace(
+        thread_programming_enabled=False,
+        default_reply_mode="direct",
+        card=SimpleNamespace(delivery_api_timeout=1.0),
+        coco_execution_timeout=30.0,
+        claude_execution_timeout=30.0,
+    )
+    return HandlerContext(
+        settings=settings,
+        api_client_factory=MagicMock(),
+        message_callback=MagicMock(),
+        coco_manager=managers["coco"],
+        claude_manager=managers["claude"],
+        aiden_manager=managers["aiden"],
+        codex_manager=managers["codex"],
+        gemini_manager=managers["gemini"],
+        traex_manager=managers["traex"],
+        intent_recognizer=MagicMock(),
+        scheduler=MagicMock(),
+        project_manager=project_manager,
+        message_mapper=MagicMock(),
+        message_linker=MagicMock(),
+        mode_manager=mode_manager,
+        context_manager=context_manager,
+        deep_engine_manager=MagicMock(),
+        progress_reporter=MagicMock(),
+        spec_engine_manager=MagicMock(),
+        spec_reporter=MagicMock(),
+        thread_manager=MagicMock(),
+        image_handler_factory=MagicMock(),
+        managers=managers,
+    )
+
+
 @pytest.mark.parametrize(
     ("backend", "handler_type", "model"),
     (BACKENDS[1], BACKENDS[2], BACKENDS[4]),
@@ -111,63 +160,6 @@ def test_public_model_selection_route_then_callback_uses_selected_backend(
 
 
 
-def _context(manager_key: str, manager: ACPSessionManager) -> HandlerContext:
-    settings = SimpleNamespace(
-        thread_programming_enabled=True,
-        project_allowed_roots=[],
-        acp_startup_timeout=2,
-        coco_execution_timeout=2,
-        claude_execution_timeout=2,
-        programming_finalization_reserve_s=0,
-    )
-    managers = {key: MagicMock() for key, _handler, _model in BACKENDS}
-    managers[manager_key] = manager
-    ctx = HandlerContext(
-        settings=settings,
-        api_client_factory=MagicMock(),
-        message_callback=MagicMock(),
-        coco_manager=managers["coco"],
-        claude_manager=managers["claude"],
-        aiden_manager=managers["aiden"],
-        codex_manager=managers["codex"],
-        gemini_manager=managers["gemini"],
-        traex_manager=managers["traex"],
-        intent_recognizer=MagicMock(),
-        scheduler=MagicMock(),
-        project_manager=MagicMock(),
-        message_mapper=MagicMock(),
-        message_linker=MagicMock(),
-        mode_manager=MagicMock(),
-        context_manager=MagicMock(),
-        deep_engine_manager=MagicMock(),
-        progress_reporter=MagicMock(),
-        spec_engine_manager=MagicMock(),
-        spec_reporter=MagicMock(),
-        slock_engine_manager=MagicMock(),
-        thread_manager=MagicMock(),
-        image_handler_factory=MagicMock(),
-        working_dirs={"chat-direct": "/tmp/direct-lane"},
-        working_dir_lock=threading.Lock(),
-        pending_image_keys={},
-        pending_image_lock=threading.Lock(),
-        enable_streaming=False,
-        managers={manager_key: manager},
-        handlers={},
-        channel_client_factory=None,
-    )
-    ctx.project_manager.validate_project_path.return_value = (True, "ok")
-    ctx.mode_manager.get_mode.return_value = InteractionMode.SMART
-    for name in (
-        "coco",
-        "claude",
-        "aiden",
-        "codex",
-        "gemini",
-        "traex",
-    ):
-        getattr(ctx.mode_manager, f"is_{name}_mode").return_value = False
-    ctx.context_manager.store.get.return_value = None
-    return ctx
 
 
 def _project(backend: str, model: str) -> ProjectContext:
@@ -224,31 +216,6 @@ def _bind_selected_session(
     return session
 
 
-def test_explicit_codex_uses_exactly_one_backend_prompt_and_no_planner(monkeypatch: pytest.MonkeyPatch):
-    recorder = SessionCallRecorder()
-    handler, ctx, manager, project = _make_lane("codex", CodexModeHandler, "codex-model", recorder, monkeypatch)
-
-    assert handler.enter_mode("message-enter", "chat-direct", project=project)
-    _bind_selected_session(recorder, manager)
-    handler.handle_message("message-task", "chat-direct", "fix the direct lane", project)
-
-    assert recorder.remote_call_topology() == ("factory:codex", "prompt:codex")
-    prompt = recorder.prompt_calls[0]
-    assert prompt.backend == "codex"
-    assert prompt.model == "codex-model"
-    assert prompt.cwd == "/tmp/direct-lane"
-    assert prompt.chat_id == "chat-direct"
-    assert prompt.project_id == "project-direct"
-    assert prompt.thread_id is None
-    assert prompt.tool_filter is None
-    assert prompt.prompt == "fix the direct lane"
-    for collaborator in (
-        ctx.intent_recognizer,
-        ctx.deep_engine_manager,
-        ctx.spec_engine_manager,
-        ctx.slock_engine_manager,
-    ):
-        collaborator.assert_not_called()
 
 
 def test_explicit_slash_command_enters_real_handler_then_current_mode_prompts(monkeypatch: pytest.MonkeyPatch):

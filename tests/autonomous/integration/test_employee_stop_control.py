@@ -22,14 +22,14 @@ from src.autonomous.team import (
     TeamRunState,
     TeamTarget,
 )
-from tests.autonomous.integration.test_employee_slock_gateway import (
+from tests.autonomous.integration.test_employee_team_gateway import (
     _binding,
     _real_coordinator_harness,
     _runtime_model,
 )
 
 
-def test_cancel_before_permit_execution_never_calls_slock(tmp_path, monkeypatch) -> None:
+def test_cancel_before_permit_execution_never_calls_employee_session(tmp_path, monkeypatch) -> None:
     harness = _real_coordinator_harness(tmp_path)
     calls: list[str] = []
     monkeypatch.setattr(
@@ -63,7 +63,7 @@ def test_team_owner_bound_cancellation_anchors_before_live_interrupt(
         team_assignment=True,
         team_deadline_at="2026-07-14T00:02:00Z",
     )
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _commit_team_effect,
     )
 
@@ -98,7 +98,7 @@ def test_team_queued_cancel_retries_when_dispatch_binds_after_head_capture(
 ) -> None:
     """A bind racing queued cancel must still leave a durable cancel frame."""
 
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _commit_team_effect,
     )
 
@@ -434,7 +434,7 @@ def test_team_timeout_anchors_cancel_interrupts_live_runner_before_retry(
 def test_team_queued_cancel_is_idempotent_after_effect_terminal_and_restart(
     tmp_path,
 ) -> None:
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _commit_team_effect,
     )
 
@@ -482,7 +482,7 @@ def test_team_queued_cancel_is_idempotent_after_effect_terminal_and_restart(
 def test_team_live_cancel_is_idempotent_after_effect_terminal_and_restart(
     tmp_path,
 ) -> None:
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _commit_team_effect,
     )
 
@@ -527,7 +527,7 @@ def test_team_cancel_after_gateway_terminal_is_stably_already_terminal(tmp_path)
         GatewayExecutionResult,
         GatewayExecutionStatus,
     )
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _commit_team_effect,
     )
 
@@ -617,7 +617,7 @@ def test_stop_allows_configured_admin_and_team_owner(tmp_path) -> None:
 
 def test_gateway_running_cancel_invokes_engine_and_overrides_late_success() -> None:
     from src.autonomous.ingress import dispatch as module
-    from src.slock_engine.models import AgentIdentity
+    from src.autonomous.workforce.identity import AgentIdentity
 
     binding = _binding(module)
     entered = threading.Event()
@@ -638,7 +638,7 @@ def test_gateway_running_cancel_invokes_engine_and_overrides_late_success() -> N
             return True
 
     engine = _Engine()
-    gateway = module.EmployeeSlockGateway(runtime_mode="legacy_one_shot")
+    gateway = module.EmployeeTeamGateway(runtime_mode="legacy_one_shot")
     permit = gateway.issue_permit(
         binding=binding,
         prompt="budgeted",

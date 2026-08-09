@@ -9,7 +9,6 @@ import pytest
 from src.autonomous.broker.dispatch_gate import (
     DispatchGate,
     DispatchGateClosed,
-    PreparedEffect,
     StaleEpoch,
 )
 from src.autonomous.domain.effects import CapabilityDescriptor

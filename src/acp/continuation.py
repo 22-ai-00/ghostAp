@@ -22,8 +22,9 @@ from .outcome import (
 
 logger = logging.getLogger(__name__)
 
-MAX_ORDINARY_CONTINUATIONS = 1
+MAX_ORDINARY_CONTINUATIONS = 3
 MAX_CHILD_RECONCILIATIONS = 1
+MAX_USER_CONFIRMATION_CONTINUATIONS = MAX_ORDINARY_CONTINUATIONS
 _monotonic = time.monotonic
 _PLAN_CONTINUATION = "plan"
 _CHILD_RECONCILIATION = "child_reconciliation"
@@ -37,6 +38,59 @@ _USER_INPUT_MARKERS = (
     "please choose",
     "please reply",
     "need your confirmation",
+    "can i ",
+    "may i ",
+    "should i ",
+    "do you want me to",
+    "would you like me to",
+    "are you sure",
+)
+_USER_INPUT_DANGEROUS_MARKERS = (
+    "凭据",
+    "凭证",
+    "api key",
+    "apikey",
+    "credential",
+    "secret",
+    "密码",
+    "password",
+    "token",
+    "权限",
+    "permission",
+    "授权",
+    "authorization",
+    "authenticate",
+    "其他进程",
+    "并发修改",
+    "接管",
+    "部署",
+    "deploy",
+    "production",
+    "发布",
+    "发布到",
+    "publish",
+    "release to",
+    "删除",
+    "delete",
+    "清空",
+    "wipe",
+    "purge",
+    "销毁",
+    "destroy",
+    "格式化",
+    "format disk",
+    "移除",
+    "remove data",
+    "清理",
+    "付费",
+    "billing",
+    "charge",
+    "pay",
+    "购买",
+    "purchase",
+    "rm -",
+    "drop ",
+    "truncate",
 )
 
 
@@ -114,9 +168,83 @@ def _notify_continuation_start(callback: Callable[[], None] | None) -> None:
         logger.warning("prompt continuation callback failed", exc_info=True)
 
 
+def _confirmation_context(result: PromptResult) -> str:
+    """Collect visible and structured evidence relevant to authorization."""
+    parts = [str(result.text or "")]
+    if result.plan is not None:
+        parts.extend(str(entry.content or "") for entry in result.plan.entries)
+    for tool_call in result.tool_calls:
+        parts.extend((str(tool_call.title or ""), str(tool_call.kind or "")))
+    parts.extend(str(item) for item in result.tool_results)
+    return "\n".join(parts).strip().casefold()
+
+
 def _requests_explicit_user_input(result: PromptResult) -> bool:
     text = str(result.text or "").strip().casefold()
-    return bool(text and any(marker in text for marker in _USER_INPUT_MARKERS))
+    if not text:
+        return False
+    if any(marker in text for marker in _USER_INPUT_MARKERS):
+        return True
+    return text.endswith(("?", "？")) and _has_dangerous_confirmation_requirement(
+        _confirmation_context(result)
+    )
+
+
+def _has_dangerous_confirmation_requirement(text: str) -> bool:
+    normalized = (text or "").strip().casefold()
+    if not normalized:
+        return False
+    return any(marker in normalized for marker in _USER_INPUT_DANGEROUS_MARKERS)
+
+
+def _auto_confirmable_prompt(
+    result: PromptResult,
+    assessment: PromptAssessment,
+) -> bool:
+    if not _requests_explicit_user_input(result):
+        return False
+    if _has_dangerous_confirmation_requirement(_confirmation_context(result)):
+        return False
+    return (
+        assessment.outcome is PromptOutcome.INCOMPLETE
+        and assessment.stop_reason == "end_turn"
+    )
+
+
+def _requires_user_confirmation(result: PromptResult) -> bool:
+    return (
+        _requests_explicit_user_input(result)
+        and _has_dangerous_confirmation_requirement(_confirmation_context(result))
+    )
+
+
+def _normalize_user_input_assessment(
+    result: PromptResult,
+    assessment: PromptAssessment,
+) -> PromptAssessment:
+    """Never report a turn that explicitly asks a question as completed."""
+    if (
+        assessment.outcome is PromptOutcome.COMPLETED
+        and assessment.stop_reason == "end_turn"
+        and _requests_explicit_user_input(result)
+    ):
+        return replace(
+            assessment,
+            outcome=PromptOutcome.INCOMPLETE,
+            detail="模型仍在请求选择或授权，任务尚未完成。",
+        )
+    return assessment
+
+
+def _build_confirmation_default_prompt() -> str:
+    return (
+        "[GhostAP 自动续做默认决策]\n"
+        "上一步出现了“请选择/请确认”等提示，但未出现明确新增权限、发布部署、"
+        "删除数据、不可逆外部副作用的高风险诉求。\n"
+        "本次按“文档推荐选项 + 最小可逆本地默认值”自动继续，不要再次询问。"
+        "这不构成新增授权：不得猜测凭据或权限，不得发布、部署、付费、删除数据，"
+        "也不得执行不可逆外部操作；若确实需要这些授权，请只说明精确阻塞项。"
+    )
 
 
 def _send_child_reconciliation_prompt(
@@ -285,17 +413,51 @@ def run_prompt_with_continuation(
     first_turn_budget = deadline - _monotonic()
     result, entered_finalization = run_turn(text, first_turn_budget)
     ever_entered_finalization = entered_finalization
-    assessment = classify_prompt_result(result)
+    assessment = _normalize_user_input_assessment(
+        result,
+        classify_prompt_result(result),
+    )
     automatic_continuations = 0
     plan_continuations = 0
     child_reconciliations = 0
-    continuation_kind = _continuation_kind(
-        result,
-        assessment,
-        entered_finalization=entered_finalization,
-    )
+    explicit_confirmation_continuations = 0
 
-    while continuation_kind is not None:
+    while True:
+        continuation_kind = _continuation_kind(
+            result,
+            assessment,
+            entered_finalization=ever_entered_finalization,
+        )
+
+        if continuation_kind is None:
+            if (
+                not ever_entered_finalization
+                and explicit_confirmation_continuations
+                < MAX_USER_CONFIRMATION_CONTINUATIONS
+                and _auto_confirmable_prompt(result, assessment)
+            ):
+                _notify_continuation_start(on_continuation_start)
+                remaining_budget = deadline - _monotonic()
+                if remaining_budget <= 0:
+                    break
+                next_result, entered_finalization = run_turn(
+                    _build_confirmation_default_prompt(),
+                    remaining_budget,
+                    replay_deferred_child_events=True,
+                )
+                explicit_confirmation_continuations += 1
+                ever_entered_finalization = (
+                    ever_entered_finalization or entered_finalization
+                )
+                automatic_continuations += 1
+                result = _merge_prompt_results(result, next_result)
+                assessment = _normalize_user_input_assessment(
+                    result,
+                    classify_prompt_result(result),
+                )
+                continue
+            break
+
         if (
             continuation_kind == _PLAN_CONTINUATION
             and plan_continuations >= MAX_ORDINARY_CONTINUATIONS
@@ -304,9 +466,7 @@ def run_prompt_with_continuation(
             and child_reconciliations >= MAX_CHILD_RECONCILIATIONS
         ):
             break
-        remaining_budget = deadline - _monotonic()
-        if remaining_budget <= 0:
-            break
+
         continuation_prompt = (
             _build_continuation_prompt(assessment.pending_plan_entries)
             if continuation_kind == _PLAN_CONTINUATION
@@ -392,11 +552,9 @@ def run_prompt_with_continuation(
                         "Codex child reconciliation evidence enrichment failed",
                         exc_info=True,
                     )
-        assessment = classify_prompt_result(result)
-        continuation_kind = _continuation_kind(
+        assessment = _normalize_user_input_assessment(
             result,
-            assessment,
-            entered_finalization=ever_entered_finalization,
+            classify_prompt_result(result),
         )
 
     goal = result.goal
@@ -411,19 +569,13 @@ def run_prompt_with_continuation(
         and (
             (
                 not ever_entered_finalization
-                and _requests_explicit_user_input(result)
+                and _requires_user_confirmation(result)
             )
             or (
                 goal is not None
                 and not ever_entered_finalization
                 and assessment.incomplete_tool_calls == 0
                 and goal_status in {"paused", "blocked"}
-            )
-            or (
-                goal is None
-                and assessment.incomplete_tool_calls == 0
-                and plan_continuations == MAX_ORDINARY_CONTINUATIONS
-                and continuation_kind == _PLAN_CONTINUATION
             )
         )
     )

@@ -19,7 +19,6 @@ engineering environment.
 - `/hire <name>` creates a durable Employee Bot through the controlled
   tool/model/profile flow. Arbitrary `/hire --prompt` input is rejected.
 - The standalone Autonomous Manager command surface is retired. Employee and team
-  work is exposed through the Agent Department and Slock entry points that are
   actually connected to production.
 - Deep and Spec remain protected execution strategies rather than being rewritten
   as a shared workflow.

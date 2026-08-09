@@ -1246,7 +1246,13 @@ class ProgrammingModeHandler(BaseHandler):
             streamed_response = prog_session.get_final_text()
             result_text = (getattr(result, "text", None) or "").strip()
             response_text = streamed_response or result_text
-            if assessment.outcome is PromptOutcome.COMPLETED:
+            if execution.awaiting_user_input:
+                notice = UI_TEXT["mode_exec_waiting_msg"].format(
+                    reason=assessment.detail,
+                )
+                final_response = _append_execution_notice(response_text, notice)
+                prog_session.wait_for_user_confirmation(notice)
+            elif assessment.outcome is PromptOutcome.COMPLETED:
                 prog_session.finish(
                     fallback_text=result_text,
                     unfinished_subagent_status="cancelled",
@@ -1262,12 +1268,6 @@ class ProgrammingModeHandler(BaseHandler):
                 )
                 final_response = _append_execution_notice(response_text, notice)
                 prog_session.cancel(reason=assessment.stop_reason)
-            elif execution.awaiting_user_input:
-                notice = UI_TEXT["mode_exec_waiting_msg"].format(
-                    reason=assessment.detail,
-                )
-                final_response = _append_execution_notice(response_text, notice)
-                prog_session.wait_for_user_confirmation(notice)
             else:
                 notice = _incomplete_notice(execution)
                 final_response = _append_execution_notice(response_text, notice)

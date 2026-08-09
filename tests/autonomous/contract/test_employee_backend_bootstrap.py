@@ -14,7 +14,7 @@ from src.autonomous.gateway.env_scope import (
     build_employee_process_env,
 )
 from src.autonomous.runtime.employee_session import EmployeeSessionBootstrap
-from src.slock_engine.models import AgentIdentity
+from src.autonomous.workforce.identity import AgentIdentity
 
 
 @pytest.mark.parametrize(

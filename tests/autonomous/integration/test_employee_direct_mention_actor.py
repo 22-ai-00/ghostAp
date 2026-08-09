@@ -78,7 +78,7 @@ def test_multiple_mentions_become_team_task_not_direct_fanout() -> None:
 def test_runtime_direct_dispatch_creates_one_normal_employee_ingress(tmp_path) -> None:
     from src.autonomous.provisioning.composition import _RuntimeTeamBackend
     from src.autonomous.provisioning.hire_state import HirePhase
-    from tests.autonomous.integration.test_employee_slock_gateway import (
+    from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 

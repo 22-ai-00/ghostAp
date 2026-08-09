@@ -1,13 +1,5 @@
-"""Migration package for Slock-to-Autonomous kernel transition."""
+"""Employee data migration helpers."""
 
-from .slock_compat import CompatibilityMode, SlockCompatLayer
-from .slock_importer import ImportPlan, ImportResult, SlockImporter, VerificationReport
+from .employee_data_importer import EmployeeDataImporter
 
-__all__ = [
-    "CompatibilityMode",
-    "ImportPlan",
-    "ImportResult",
-    "SlockCompatLayer",
-    "SlockImporter",
-    "VerificationReport",
-]
+__all__ = ["EmployeeDataImporter"]

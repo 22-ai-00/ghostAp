@@ -5,10 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import SecretStr
 
 from src.agent.intent_recognizer import IntentResult, IntentType, TaskStep
-from src.config import get_settings
 from src.feishu.image_handler import FeishuImageHandler, ImageDownloadResult
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.feishu.ws_client import (
@@ -24,64 +22,89 @@ from src.thread import set_current_thread_id
 
 
 @pytest.fixture
-def mock_ws_client(tmp_path: Path):
-    # Patch heavy components and side-effects to keep tests fast and isolated
-    settings = get_settings().model_copy(deep=True)
-    settings.autonomous_state_dir = str(tmp_path / "state")
-    settings.autonomous_journal_dir = str(tmp_path / "journal")
-    settings.autonomous_anchor_path = str(tmp_path / "journal.anchor")
-    settings.autonomous_credential_dir = str(tmp_path / "credentials")
-    settings.autonomous_data_blob_dir = str(tmp_path / "data-blobs")
-    settings.autonomous_employee_ingress_blob_dir = str(tmp_path / "ingress-blobs")
-    settings.autonomous_employee_outbox_blob_dir = str(tmp_path / "outbox-blobs")
-    settings.autonomous_employee_attachment_staging_dir = str(tmp_path / "attachments")
-    settings.autonomous_main_bot_audit_dir = str(tmp_path / "main-bot-audit")
-    settings.autonomous_main_bot_audit_anchor_path = str(tmp_path / "main-bot-audit.anchor")
-    settings.autonomous_visible_employee_limit = 8
-    settings.autonomous_journal_hmac_key = SecretStr("")
-    settings.autonomous_credential_keys = SecretStr("")
-    settings.autonomous_credential_active_key_id = ""
-    settings.autonomous_data_keys = SecretStr("")
-    settings.autonomous_data_active_key_id = ""
-    # Routing tests exercise downstream behavior, so their synthetic events
-    # must cross the production deny-by-default ingress contract explicitly.
-    settings.admin_user_ids = frozenset({"ou_admin"})
-    settings.allowed_user_ids = frozenset({"ou_test", "ou_user"})
-    settings.allowed_chat_ids = frozenset({"oc_456", "oc_dm"})
+def mock_ws_client():
+    """Build the real routing graph without external sessions or worker threads."""
+    scheduler = MagicMock()
+    scheduler._restart_gate = MagicMock()
+    audit = SimpleNamespace(
+        record_attempt=MagicMock(),
+        mark_incomplete=MagicMock(),
+    )
 
-    with patch("src.feishu.ws_client.ACPSessionManager"), \
-         patch("src.feishu.ws_client.configure_logging_with_trace"), \
-         patch("src.feishu.ws_client.get_settings", return_value=settings), \
-         patch(
-             "src.autonomous.provisioning.composition.default_slock_storage_base",
-             return_value=str(tmp_path / "slock"),
-         ):
+    def _runtime_from_settings(_settings, **kwargs):
+        runtime = SimpleNamespace(
+            hire_service=object(),
+            fire_service=object(),
+            membership_service=object(),
+            data_composition=object(),
+            team_service=object(),
+            main_bot_outbound_audit=audit,
+            readiness=lambda: SimpleNamespace(ready=True),
+            _environment_provider=lambda _authority: SimpleNamespace(
+                credential_env={},
+                provider_files={
+                    "traex_auth_json": str(
+                        Path.home() / ".trae" / "cli" / "auth.json"
+                    )
+                },
+            ),
+            close=MagicMock(),
+        )
+        runtime._service = SimpleNamespace(
+            _on_registration_status=kwargs["notification_status"],
+        )
+        return runtime
 
-        def dummy_callback(*args, **kwargs):
-            pass
+    with (
+        patch("src.feishu.ws_client.get_settings") as mock_get_settings,
+        patch("src.feishu.ws_client._build_task_scheduler", return_value=scheduler),
+        patch("src.feishu.ws_client.ACPSessionManager"),
+        patch("src.feishu.ws_client.IntentRecognizer"),
+        patch("src.feishu.ws_client.ProjectManager"),
+        patch("src.feishu.ws_client.MessageProjectMapper"),
+        patch("src.feishu.ws_client.DeepEngineManager"),
+        patch("src.feishu.ws_client.ProgressReporter"),
+        patch("src.feishu.ws_client.SpecEngineManager"),
+        patch("src.feishu.ws_client.SpecReporter"),
+        patch("src.mode.ModeManager"),
+        patch("src.workflow_engine.manager.WorkflowEngineManager"),
+        patch(
+            "src.autonomous.provisioning.composition.EmployeeDepartmentRuntime.from_settings",
+            side_effect=_runtime_from_settings,
+        ),
+    ):
+        settings = MagicMock()
+        settings.app_id = "test_app_id"
+        settings.app_secret = "test_app_secret"
+        settings.admin_user_ids = ""
+        settings.allowed_user_ids = ""
+        settings.allowed_chat_ids = ""
+        settings.ingress_access_mode = "legacy_allow_all"
+        settings.admin_bootstrap_scope = "p2p_only"
+        settings.streaming_enabled = False
+        settings.task_scheduler_max_concurrent = 2
+        settings.task_scheduler_per_key_concurrency = 1
+        settings.system_command_concurrency = 10
+        settings.message_cache_ttl = 300
+        settings.message_cache_max_size = 1000
+        settings.message_expire_seconds = 30
+        settings.card.action_dedup_ttl = 1
+        settings.card.action_dedup_max_size = 5000
+        settings.spec_rate_limit_capacity = 100
+        settings.spec_rate_limit_fill_rate = 50.0
+        settings.spec_circuit_breaker_threshold = 10
+        settings.spec_circuit_breaker_recovery = 5.0
+        settings.autonomous_visible_employee_limit = 1
+        mock_get_settings.return_value = settings
 
-        client = FeishuWSClient(message_callback=dummy_callback)
+        client = FeishuWSClient(MagicMock())
+        client._project_manager.get_active_project.return_value = None
+        try:
+            yield client
+        finally:
+            client.close()
 
-        # This fixture exercises the legacy downstream router in isolation.
-        # Production startup performs durable recovery before opening WS, and
-        # a real Registry is covered by managed-group ingress tests.
-        client._recover_employee_runtime_after_handler_binding()
-        client._managed_group_registry = None
 
-        # Patch the intent recognizer dynamically for tests
-        client._intent_recognizer = MagicMock()
-
-        # Patch the scheduler to intercept task submissions without real execution
-        client._scheduler.submit = MagicMock()
-
-        # Mock out message duplicate check to always pass
-        client._message_cache.is_duplicate = MagicMock(return_value=False)
-
-        # Block real Feishu API calls (add_reaction triggers real HTTP requests)
-        client._add_reaction = MagicMock()
-
-        yield client
-        client.close()
 
 
 def create_mock_message(text: str, message_id="om_123", chat_id="oc_456", message_type="text"):
@@ -289,31 +312,6 @@ def test_handle_message_plain_message_does_not_fallback_to_recent_engine_topic(m
     assert not spec.queue_key or ":t:thread-deep" not in spec.queue_key
 
 
-def test_project_chat_programming_mode_is_not_stolen_by_slock_managed_chat(mock_ws_client: FeishuWSClient):
-    """项目群已在普通编程态时，Slock managed 标记不能抢走自由文本。"""
-    project = ProjectContext("proj_1", "GhostAP", "/tmp")
-    mock_ws_client._project_manager.find_by_bound_chat_id = MagicMock(return_value=project)
-    mock_ws_client._mode_manager.set_mode("chat_456", InteractionMode.COCO, project_id="proj_1")
-    mock_ws_client._slock_engine_manager.register_managed_chat("chat_456")
-    mock_ws_client._coco_handler = MagicMock()
-    mock_ws_client._handle_slock_message = MagicMock()
-
-    mock_ws_client._dispatch_message_logic(
-        "msg_prog_slock",
-        "chat_456",
-        "继续修复项目群编程",
-        project,
-        None,
-        command_match=None,
-    )
-
-    mock_ws_client._handle_slock_message.assert_not_called()
-    mock_ws_client._coco_handler.handle_message.assert_called_once_with(
-        "msg_prog_slock",
-        "chat_456",
-        "继续修复项目群编程",
-        project,
-    )
 
 
 def test_explicit_engine_command_reaches_its_final_handler_in_every_programming_mode(

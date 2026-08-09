@@ -300,22 +300,18 @@ def make_settings():
 
 
 @pytest.fixture(autouse=True)
-def _block_real_slock_storage(monkeypatch, tmp_path):
-    """Prevent tests from accidentally writing to ~/.ghostap/slock/.
+def _block_real_employee_storage(monkeypatch, tmp_path):
+    """Prevent tests from accidentally writing to the legacy default employee store."""
 
-    Any test that creates a SlockEngine or MemoryManager without explicitly
-    passing memory_base_path/base_path will get a RuntimeError instead of
-    silently polluting the real storage directory.
-    """
     def _guarded_default():
         raise RuntimeError(
-            "[conftest] Real default_slock_storage_base() called in tests! "
-            "Pass memory_base_path=str(tmp_path) to SlockEngine or "
-            "base_path=str(tmp_path) to MemoryManager."
+            "[conftest] Real default_employee_storage_base() called in tests! "
+            "Pass an explicit storage_base_path=str(tmp_path / \"employee\") to "
+            "ProjectedAgentRegistry/identity-backed tests."
         )
     try:
         monkeypatch.setattr(
-            "src.slock_engine.memory_manager.default_slock_storage_base",
+            "src.autonomous.workforce.identity.default_employee_storage_base",
             _guarded_default,
         )
     except Exception:

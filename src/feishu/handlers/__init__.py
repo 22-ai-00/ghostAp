@@ -13,7 +13,6 @@ from .programming import (
     TraexModeHandler,
 )
 from .project import ProjectHandler
-from .slock import SlockHandler
 from .spec import SpecHandler
 from .system import SystemHandler
 from .workflow import WorkflowHandler
@@ -29,7 +28,6 @@ __all__ = [
     "TraexModeHandler",
     "DeepHandler",
     "SpecHandler",
-    "SlockHandler",
     "ProjectHandler",
     "SystemHandler",
     "DiagnosticsHandler",

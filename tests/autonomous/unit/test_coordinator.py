@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from src.autonomous.coordinator import Coordinator, GoalActivationResult
-from src.autonomous.planner import Planner, PlanCompilationResult
-from src.autonomous.domain.enums import GoalState, GoalType
+from src.autonomous.coordinator import Coordinator
+from src.autonomous.planner import Planner
 
 
 class FakeJournal:

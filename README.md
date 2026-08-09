@@ -15,7 +15,6 @@ Agent。
 | 主 Bot 控制面 | 管理项目、员工、团队、任务、审批和审计，不冒充员工输出 |
 | 直接编程 | Coco、Claude、Aiden、Codex、Gemini、Traex 后端保持多轮直连 |
 | Agent Department | 持久员工拥有独立飞书 Bot、Channel、历史、记忆和停止语义 |
-| 专项与编排策略 | Deep、Spec、Workflow、Team/Slock 分别承接成熟专项执行与多 Agent 协作 |
 | 飞书交互 | 卡片持续展示任务状态、工具调用、模型选择和错误诊断 |
 | Host Shell | 特权宿主机执行，只能关闭或显式授权；超时、截断和命令过滤不构成操作系统沙箱 |
 | 本地持久化 | Journal、Vault、Blob 和项目状态面向单机文件存储，不承诺多副本线性一致性或对特权宿主机的回滚抵抗 |
@@ -27,7 +26,6 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 | 维度 | 说明 |
 | --- | --- |
 | 产品身份 | 主 Bot 是控制面；Employee Bot 是独立执行身份 |
-| 执行策略 | Smart、普通编程、Deep、Spec、Workflow、Team/Slock |
 | provider/transport | ACP 直接模式、Shell CLI 桥接 |
 | Host Shell | 独立的特权宿主执行能力，不是 Agent provider，也不是操作系统沙箱 |
 
@@ -113,7 +111,6 @@ WORKFLOW_TOTAL_TIMEOUT_S=3600
 WORKFLOW_AGENT_CALL_TIMEOUT_S=600
 WORKFLOW_SCRIPT_GEN_TIMEOUT_S=180
 
-SLOCK_DEFAULT_ROLES=planner:claude,coder:codex,reviewer:claude,tester:codex
 ```
 
 这些字段构成显式安全姿态：空授权列表不代表公开访问；Host Shell 默认关闭；
@@ -197,8 +194,6 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 | `/spec_status`、`/spec_guide <引导>`、`/spec_pause`、`/spec_resume`、`/stop_spec` | 管理 Spec 任务 |
 | `/wf <需求>` | 生成并执行 JS Workflow 编排脚本 |
 | `/wf_status`、`/wf_help`、`/wf_save`、`/wf_list`、`/wf_history`、`/stop_wf` | 管理 Workflow |
-| `/slock`、`/new-team <名称>` | 启用或创建 Slock 多 Agent 团队 |
-| `/slock status`、`/task status`、`/new-role <名称>`、`/team dissolve <名称>` | 管理 Slock 团队 |
 
 ### Agent Department（持久数字员工）
 
@@ -227,7 +222,6 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 
 - Journal、加密 Blob/Vault 是事实源，`identity.json` 仅是可安全重建的投影，不含密钥。
 - 员工使用自己的 Bot 接收任务、更新卡片和返回结果，不回退到主 Bot 代发。
-- 员工可加入 Slock 团队；在员工 Bot 中使用 `/task`、`/status`、`/history`、
   `/memory` 和 `/stop` 管理其工作。
 - `/hire` 拒绝任意提示词注入；工作风格由受控 role/profile 与持久上下文形成。
 
@@ -249,7 +243,6 @@ Workflow 使用三步流程：选择主编排 Agent、选择评审 Agent 或 Aut
 | `src/deep_engine/` | Deep 单次自主执行 |
 | `src/spec_engine/` | Spec 结构化闭环和多视角审查 |
 | `src/workflow_engine/` | JS Workflow 生成、验证、运行时和卡片渲染 |
-| `src/slock_engine/` | 群内多 Agent 团队、角色、任务队列和记忆 |
 | `src/autonomous/` | v5 自主工作系统（详见下方） |
 | `src/card/` | CardSession 事件管线、纯渲染和卡片投递 |
 | `src/project/`、`src/project_chat/`、`src/thread/` | 项目、群绑定和线程上下文 |
@@ -288,7 +281,6 @@ src/autonomous/
 ├── reporter/                 # 持久发件箱和效果处置 Saga
 ├── supervisor/               # 启动/恢复/关闭和对账
 ├── manager/                  # 命令处理、飞书卡片、lark-oapi 适配器
-├── migration/                # Slock 幂等导入和兼容层
 ├── acceptance/               # 77 门禁清单、统计度量、证据存储
 └── feishu/                   # 能力探测和功能可见性门控
 ```

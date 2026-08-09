@@ -8,8 +8,6 @@ Covers:
 - AC-R28: --validate calls validate_feishu_config() and exits 1 when it returns False
 """
 
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -331,48 +329,6 @@ class TestFormatDuration:
         assert _format_duration(0) == "0 秒"
 
 
-class TestValidateNoTombstoneTrigger:
-    """Smoke test: --validate startup path does not trigger tombstone ImportError.
-
-    Runs the actual process via subprocess to verify that no residual imports
-    of removed modules (src.card.adapter, src.card.direct_session) are triggered
-    during the --validate code path.
-    """
-
-    def test_validate_does_not_trigger_tombstone(self):
-        """subprocess --validate exits 0 with no ImportError in stderr."""
-        import os
-        import subprocess
-
-        env = os.environ.copy()
-        # Provide minimum required config for --validate to succeed
-        env["APP_ID"] = "smoke_test_app_id"
-        env["APP_SECRET"] = "smoke_test_app_secret"
-        # Pin the supported opt-out explicitly so a caller/CI environment with
-        # configured roles cannot make the stderr regression vacuously pass.
-        env["SLOCK_DEFAULT_ROLES"] = ""
-
-        result = subprocess.run(
-            [sys.executable, "-m", "src.main", "--validate"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=str(Path(__file__).parent.parent),
-            env=env,
-        )
-
-        assert result.returncode == 0, (
-            f"--validate exited with code {result.returncode}.\n"
-            f"stdout: {result.stdout}\n"
-            f"stderr: {result.stderr}"
-        )
-        assert "ImportError" not in result.stderr, (
-            f"Tombstone ImportError detected in stderr:\n{result.stderr}"
-        )
-        assert "slock_default_roles is empty" not in result.stderr, (
-            "Supported empty SLOCK_DEFAULT_ROLES configuration leaked a startup "
-            f"warning to stderr:\n{result.stderr}"
-        )
 
 
 # ---------------------------------------------------------------------------

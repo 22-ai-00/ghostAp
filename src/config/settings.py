@@ -7,7 +7,6 @@ import math
 import os
 import re
 import shlex
-import warnings
 from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -26,48 +25,6 @@ from src.autonomous.config import AutonomousDeploymentMode
 
 from .card import CardSessionConfig
 from .spec import SpecReviewConfig
-
-# ---------------------------------------------------------------------------
-# Slock discussion constants (copied from src/slock_engine/discussion_manager.py)
-# Keep in sync with discussion_manager.py when updating.
-# Using static copies here to avoid circular imports and ensure Settings can
-# be imported independently without triggering slock_engine imports.
-# ---------------------------------------------------------------------------
-
-# Signals that indicate discussion convergence (agents agreeing)
-_DEFAULT_CONVERGENCE_SIGNALS: frozenset[str] = frozenset({
-    "AGREE",
-    "LGTM",
-    "同意",
-    "认可",
-    "没问题",
-    "looks good",
-    "sounds good",
-    "no further suggestions",
-})
-
-# Markers that indicate uncertainty in agent output (triggers discussion)
-_DEFAULT_UNCERTAINTY_MARKERS: frozenset[str] = frozenset({
-    "不确定",
-    "需要确认",
-    "需要讨论",
-    "needs review",
-    "需要审查",
-    "not sure",
-    "i'm not sure",
-    "uncertain",
-    "maybe",
-    "可能",
-    "也许",
-})
-
-
-def _emit_slock_prefix_deprecation_warning() -> None:
-    warnings.warn(
-        "SLOCK_TEAM_NAME_PREFIX is deprecated, use SLOCK_TEAM_NAME_SUFFIX instead",
-        DeprecationWarning,
-        stacklevel=3,
-    )
 
 
 class Settings(BaseSettings):
@@ -229,6 +186,10 @@ class Settings(BaseSettings):
     # Workflow Engine
     # ------------------------------------------------------------------
 
+    # Generated workflows start immediately by default. Disable only when an
+    # operator explicitly wants the legacy confirmation-card step.
+    workflow_auto_execute: bool = True
+
     # Sub-workflow budget ratio: fraction of parent budget allocated to each sub-workflow.
     # Prevents a single sub-workflow from consuming the entire parent budget.
     # Range: 5% to 50% (enforced via Field validation).
@@ -322,7 +283,6 @@ class Settings(BaseSettings):
     spec_objective_verify_timeout: int = 300
     spec_completion_control_active_verify: bool = True
     spec_completion_gate_enabled: bool = True
-
     @property
     def spec_review(self) -> "SpecReviewConfig":
         """Structured view of spec review / retry / circuit-breaker settings."""
@@ -604,13 +564,17 @@ class Settings(BaseSettings):
     # is derived separately from runtime safety attestations.
     # ------------------------------------------------------------------
     autonomous_deployment_mode: AutonomousDeploymentMode = AutonomousDeploymentMode.OFF
-    autonomous_compatibility_mode: Literal["legacy", "shadow_read", "manager_only", "disabled"] = "legacy"
     autonomous_write_enabled: bool = False
     autonomous_state_dir: str = "~/.ghostap/autonomy"
     autonomous_journal_dir: str = "~/.ghostap/autonomy/journal"
     autonomous_journal_hmac_key: SecretStr = SecretStr("")
     autonomous_snapshot_dir: str = "~/.ghostap/autonomy/snapshots"
     autonomous_blob_dir: str = "~/.ghostap/autonomy/blobs"
+    # Team employee data-continuity ABI. Keep this root stable so existing
+    # employee workspaces remain discoverable across upgrades.
+    autonomous_employee_storage_base: str = "~/.ghostap/slock"
+    # Team employee credential continuity ABI. Credentials remain below the
+    # established employee storage root and must not be relocated implicitly.
     autonomous_credential_dir: str = "~/.ghostap/slock/credentials"
     autonomous_credential_keys: SecretStr = SecretStr("")
     autonomous_credential_active_key_id: str = ""
@@ -666,8 +630,7 @@ class Settings(BaseSettings):
         le=3600,
         allow_inf_nan=False,
     )
-    # Persistent coordination is the normal employee-team runtime. The legacy
-    # path remains an explicit rollback mode until real-tenant soak is signed.
+    # Persistent coordination is the normal employee-Team runtime.
     autonomous_team_runtime_mode: Literal["legacy_pipeline", "coordinator"] = (
         "coordinator"
     )
@@ -723,7 +686,7 @@ class Settings(BaseSettings):
         le=1_000_000,
     )
     # ``actor`` is the normal employee runtime and never falls back to one-shot.
-    # ``shadow`` and ``legacy_one_shot`` remain explicit rollback diagnostics.
+    # Other declared modes are reserved for controlled diagnostics.
     autonomous_employee_runtime_mode: Literal[
         "legacy_one_shot", "shadow", "actor"
     ] = "actor"
@@ -939,186 +902,6 @@ class Settings(BaseSettings):
     max_allowed_chat_ids: int = 50  # 每个 project 最多关联的 chat_id 数量
     max_evicted_cache: int = 200  # evicted_chat_ids 有界 LRU 上限
     project_chat_suffix: str = "dev"  # 项目专属群名称后缀
-    slock_team_name_suffix: str = Field(
-        default="[Slock]",
-        description="/new-team 创建 Slock 协作群时追加的名称后缀",
-        validation_alias=AliasChoices("slock_team_name_suffix", "slock_team_name_prefix"),
-    )
-
-    # Slock 引擎运行参数 --------------------------------------------------------
-    slock_reply_mode: str = Field(default="direct", description="Slock 群回复模式: direct（不开话题） / thread（话题回复）")
-    slock_max_parallel_agents: int = Field(default=4, ge=1, description="Slock 最大并行 Agent 数（ThreadPool workers）")
-    slock_max_queue_size: int = Field(default=8, ge=1, description="Slock 执行队列最大深度，超出时拒绝提交")
-    slock_queue_wait_timeout: int = Field(default=60, ge=1, le=600, description="Slock 排队等待超时（秒），超时未执行则取消")
-    slock_max_open_tasks: int = Field(default=50, ge=1, description="Slock 单群最大未完成任务数，超出时拒绝创建")
-    slock_agent_execution_timeout: int = Field(default=600, ge=30, description="Slock 单 Agent 执行超时（秒），超时后取消 ACP session")
-    slock_observer_flush_timeout: int = Field(default=30, ge=5, description="ObserverLearningQueue flush 操作超时（秒）")
-    slock_observer_max_queue_size: int = Field(default=10000, ge=100, description="ObserverLearningQueue 最大队列深度，超出时丢弃最旧记录")
-    slock_assign_rate_limit: int = Field(default=5, ge=1, description="非管理员每分钟最大任务提交数（rate-limit）")
-    slock_escalation_timeout: int = Field(default=1800, ge=60, description="Slock 升级请求自动中止超时（秒），默认 30 分钟")
-    slock_idle_scan_interval: int = Field(default=10, ge=1, description="空闲角色扫描 TODO 池间隔（秒）")
-    slock_auto_plan_delay: int = Field(default=5, ge=1, le=30, description="任务创建后自动触发规划的延迟（秒）")
-    slock_role_evolution_threshold: int = Field(default=3, ge=1, description="角色进化触发阈值（每完成 N 个任务自动更新角色身份描述）")
-
-    # Slock Discussion / NLI / Memory Enhancement ----------------------------
-    slock_discussion_enabled: bool = Field(default=True, description="是否启用 Agent 间自动讨论（默认开启）")
-    slock_discussion_broadcast_rounds: bool = Field(default=True, description="讨论时逐轮以角色身份卡片单独发送到群")
-    slock_discussion_live_card: bool = Field(default=False, description="讨论时是否显示合并式总览卡片（逐轮广播开启时默认关闭）")
-    slock_max_discussion_rounds: int = Field(default=3, ge=1, le=10, description="讨论链最大轮次，超限强制收敛")
-    slock_uncertainty_markers: list[str] = Field(
-        default_factory=lambda: list(_DEFAULT_UNCERTAINTY_MARKERS),
-        description="触发讨论的不确定性标记词列表（如 '不确定', 'needs review'）",
-    )
-    slock_convergence_signals: list[str] = Field(
-        default_factory=lambda: list(_DEFAULT_CONVERGENCE_SIGNALS),
-        description="讨论收敛信号词列表（如 'AGREE', 'LGTM', '同意'）",
-    )
-    slock_discussion_trigger_rules: str = Field(
-        default="coder->reviewer,architect->coder",
-        description="讨论触发规则（role->role 格式，逗号分隔）",
-    )
-    slock_nli_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0, description="NLI 意图分类置信度阈值，低于此值 fallback 到 agent 路由")
-    slock_nli_timeout: float = Field(default=2.5, ge=0.1, description="NLI 意图分类超时（秒），超时直接 fallback")
-    slock_memory_summarize_threshold: int = Field(default=4000, ge=1000, description="L1 active_context 超过此字符数时触发 LLM 摘要压缩")
-    slock_conversation_replay_rounds: int = Field(default=5, ge=1, le=20, description="从 messages.jsonl 回读的最近对话轮数")
-    slock_inject_team_roster: bool = Field(default=True, description="构造 agent prompt 时注入同 channel 队友花名册（动态来自 AgentRegistry，不写死角色）")
-    slock_team_roster_max_entries: int = Field(default=20, ge=0, le=200, description="花名册最多列出的队友数量，0=禁用")
-    slock_default_wake_policy: str = Field(default="smart_judge", description="未设置 agent.wake_policy / channel.wake_policy 时的兜底唤醒策略：on_mention=仅被 @ 才参与路由，smart_judge=按技能与上下文智能判断（兼容现行行为）")
-    slock_discussion_token_budget: int = Field(default=50000, ge=1000, description="单次讨论链的 token 预算上限")
-    slock_max_parallel_discussions: int = Field(default=3, ge=1, le=10, description="同一 channel 内最大并行讨论数，超出时排队")
-    slock_discussion_timeout: int = Field(default=300, ge=30, description="讨论 watchdog 超时秒数，超时自动终止讨论")
-    slock_arbiter_max_tokens: int = Field(default=500, ge=100, le=2000, description="讨论最终仲裁者（final arbiter）的最大输出 token 数")
-    slock_tool_path_restrictions: list[str] = Field(default_factory=list, description="Slock ACP 工具允许访问的根路径列表")
-    slock_dangerous_shell_patterns: list[str] = Field(default_factory=list, description="追加的 Slock shell 危险命令正则")
-    slock_memory_summarize_timeout: float = Field(default=30.0, ge=1.0, le=120.0, description="LLM 记忆摘要压缩超时（秒），过短会导致摘要失败退化为截断")
-    slock_proactive_followup_enabled: bool = Field(default=True, description="是否允许 Agent 在交付结果后主动跟进")
-    slock_proactive_followup_delay: int = Field(default=60, ge=10, le=600, description="结果交付后等待用户反馈的秒数，超时则主动跟进")
-    slock_autonomous_task_planning_enabled: bool = Field(
-        default=True,
-        description="Slock 普通任务消息是否自动进入任务看板和多角色协作规划，而不是直接单 Agent 回复",
-    )
-    slock_resolution_learning_enabled: bool = Field(default=True, description="是否将自主决策假设持久化以复用（减少重复 LLM 调用）")
-    slock_freshness_gate_enabled: bool = Field(default=True, description="发送前检查 channel 是否有新消息（Freshness Gate），防止过期回复")
-    slock_freshness_max_retries: int = Field(default=2, ge=0, le=5, description="Freshness Gate 检查不通过时最大重试次数，超出强制发送")
-    slock_freshness_reeval_timeout: float = Field(default=15.0, ge=1.0, le=60.0, description="Freshness 重新评估的 LLM 超时（秒）")
-    slock_orchestrator_degradation_enabled: bool = Field(default=True, description="协调者不可用时允许执行 agent 自主推进计划")
-    slock_semantic_prefilter_enabled: bool = Field(default=True, description="路由前进行 agent 语义自评估，明显不相关的 agent 直接跳过")
-    slock_behavior_convergence_enabled: bool = Field(default=True, description="连续失败时自动写入回避策略到 agent 记忆")
-    slock_behavior_convergence_threshold: int = Field(default=3, ge=2, le=10, description="连续失败 N 次后触发行为收敛")
-    slock_action_card_enabled: bool = Field(default=True, description="副作用操作（shell/commit/delete）强制走 Action Card 确认流")
-
-    # Slock Memory Capacity & Task Chain -------------------------------------------
-    slock_l1_max_size: int = Field(default=51200, ge=1024, description="L1 agent 私有记忆最大字节数（默认 50KB），超出触发摘要压缩")
-    slock_l2_max_size: int = Field(default=204800, ge=1024, description="L2 group 共享记忆最大字节数（默认 200KB），超出触发 FIFO 截断")
-    slock_l3_max_size: int = Field(default=1048576, ge=1024, description="L3 全局 wiki 最大字节数（默认 1MB），超出触发 FIFO 截断")
-    slock_chain_templates: str = Field(
-        default="coder->reviewer->tester,planner->coder->reviewer->tester",
-        description="预置任务协作链模板（role->role->role 格式，逗号分隔多条链）",
-        # MIGRATION NOTE (v2.x): Default changed from "coder->reviewer->tester" to include
-        # planner chain. For existing deployments, this may trigger auto-planning if planner
-        # role exists. The orchestrator guards against creating plans when required roles
-        # are missing — no action needed unless you want to opt out (override via env var).
-    )
-    slock_auto_plan_timeout: int = Field(default=30, ge=5, le=300, description="协作计划自动启动等待秒数（用户无否决则自动执行）")
-    slock_role_response_timeout: int = Field(default=120, ge=10, le=300, description="角色主动参与的响应超时秒数，超时则 escalate 或选择次优角色")
-    slock_passive_mode: bool = Field(
-        default=True,
-        description="被动模式：True 时 dispatcher 仅检查 is_managed_chat 即路由消息到 slock，无需 is_slock_active 前置检查",
-    )
-    slock_default_roles: str = Field(
-        default="",
-        description=(
-            "新建 slock 群时自动创建的预置角色（格式: role:tool_type,role:tool_type）；留空则不自动创建。"
-            " 合法 tool_type: codex, claude, coco, aiden, gemini"
-        ),
-    )
-
-    # Slock Auto-Activation Guard ------------------------------------------------
-    slock_auto_activate_whitelist_user_ids: str = Field(
-        default="",
-        description="被动激活白名单用户 ID（逗号分隔），留空则根据 slock_auto_activate_default_policy 决定权限范围",
-    )
-    slock_auto_activate_default_policy: str = Field(
-        default="allow_all",
-        description=(
-            "自动激活默认策略：'allow_all'（默认）时白名单为空则允许所有用户触发；"
-            "'admin_only' 时白名单为空则仅 admin 可触发"
-        ),
-    )
-
-    @field_validator("slock_auto_activate_default_policy")
-    @classmethod
-    def _validate_auto_activate_policy(cls, v: str) -> str:
-        valid = {"admin_only", "allow_all"}
-        if v not in valid:
-            raise ValueError(f"slock_auto_activate_default_policy 必须是 {valid} 之一，当前值: {v!r}")
-        return v
-
-    @field_validator("slock_default_wake_policy", mode="before")
-    @classmethod
-    def _validate_default_wake_policy(cls, v: str) -> str:
-        normalized = (v or "smart_judge").strip().lower().replace("-", "_")
-        valid = {"on_mention", "smart_judge"}
-        if normalized not in valid:
-            raise ValueError(f"slock_default_wake_policy 必须是 {valid} 之一，当前值: {v!r}")
-        return normalized
-
-    @field_validator("slock_default_roles")
-    @classmethod
-    def _validate_default_roles(cls, v: str) -> str:
-        if not v:
-            return v
-        valid_tool_types = {"codex", "claude", "coco", "aiden", "gemini"}
-        for pair in v.split(","):
-            pair = pair.strip()
-            if not pair:
-                continue
-            if ":" not in pair:
-                raise ValueError(
-                    f"slock_default_roles 格式错误: {pair!r}，应为 role:tool_type"
-                )
-            _, tool_type = pair.rsplit(":", 1)
-            tool_type = tool_type.strip().lower()
-            if tool_type not in valid_tool_types:
-                raise ValueError(
-                    f"slock_default_roles 非法 tool_type: {tool_type!r}，合法值: {valid_tool_types}"
-                )
-        return v
-    slock_auto_activate_rate_limit_per_user: int = Field(
-        default=3, ge=1, le=30,
-        description="单用户每分钟最大自动激活次数",
-    )
-    slock_auto_activate_rate_limit_global: int = Field(
-        default=10, ge=1, le=100,
-        description="全局每分钟最大自动激活次数",
-    )
-    slock_bootstrap_timeout: int = Field(
-        default=10, ge=1, le=60,
-        description="默认角色 bootstrap 同步等待超时（秒），超时后队列仍继续消费",
-    )
-    slock_patrol_interval: int = Field(
-        default=30, ge=5, le=300,
-        description="Proactive patrol loop 巡检间隔（秒），检查 SLA 超时和空闲 Agent 认领",
-    )
-    slock_task_default_sla: int = Field(
-        default=300, ge=30, le=3600,
-        description="任务默认 SLA 超时（秒），超时后巡检器发送提醒并尝试重新分配",
-    )
-    slock_session_affinity_window: int = Field(
-        default=120, ge=10, le=600,
-        description="会话粘性窗口（秒），同一用户连续消息优先路由给同一 Agent",
-    )
-
-    @field_validator("slock_team_name_suffix", mode="before")
-    @classmethod
-    def _warn_deprecated_slock_prefix(cls, v: str) -> str:
-        """Emit deprecation warning when the old alias is used."""
-        # The warning fires unconditionally here; the alias mapping is handled
-        # by Pydantic's validation_alias. We detect usage of the old env var
-        # by checking os.environ for the deprecated key name.
-        if os.environ.get("SLOCK_TEAM_NAME_PREFIX") is not None:
-            _emit_slock_prefix_deprecation_warning()
-        return v
 
     @field_validator("max_allowed_chat_ids", mode="before")
     @classmethod
@@ -1329,16 +1112,6 @@ class Settings(BaseSettings):
             )
         return self
 
-    @model_validator(mode="after")
-    def _log_slock_default_roles_empty(self) -> "Settings":
-        """Note when optional automatic role provisioning is disabled."""
-        if not self.slock_default_roles:
-            _logging.getLogger(__name__).info(
-                "slock_default_roles is empty. No preset roles will be auto-created when creating new slock groups. "
-                "Configure SLOCK_DEFAULT_ROLES in .env if you want automatic role provisioning "
-                "(e.g., 'planner:claude,coder:codex,reviewer:claude,tester:codex')."
-            )
-        return self
 
     @property
     def command_blacklist(self) -> list[str]:
