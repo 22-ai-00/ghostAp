@@ -824,6 +824,12 @@ class DurableEmployeeIngressRouter:
         with self._mutex:
             fresh = RouterProjectionState()
             anchor = self._writer.anchor.read()
+            cursor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
+            if getattr(self, "_projection_verified", False) and (
+                self._state.cursor_sequence,
+                self._state.cursor_hash,
+            ) == (anchor.sequence, cursor_hash):
+                return self._state
             anchored_hash = GENESIS_HASH
             for frame in self._writer.replay():
                 if frame.sequence > anchor.sequence:
@@ -842,6 +848,7 @@ class DurableEmployeeIngressRouter:
             if anchored_hash != anchor.frame_hash:
                 raise RouterWriteDisabledError("Router projection cannot verify Journal anchor")
             self._state = fresh
+            self._projection_verified = True
             return self._state
 
     def route(self, acceptance_id: str) -> RouterLifecycleRecord:

@@ -997,6 +997,149 @@ class TestProgrammingCardSession:
             for item in summaries
         )
 
+    def test_authoritative_list_agents_done_overrides_cancelled_child(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        source_id = "thread-authoritative-terminal"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+
+        for activity in ("started", "interrupted"):
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id=f"activity-{activity}",
+                    title="Subagent activity",
+                    kind="other",
+                    status="completed",
+                    subagent_source_id=source_id,
+                    subagent_path="/root/card-audit",
+                    subagent_activity=activity,
+                ),
+            ))
+
+        assert pcs.session.state.metadata.subagents[0]["status"] == "cancelled"
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="rollout-list-agents:call-authoritative",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": "",
+                    },
+                ),
+            ),
+        ))
+
+        summary = pcs.session.state.metadata.subagents[0]
+        assert summary["status"] == "completed"
+        assert summary["progress"] == "已完成"
+        assert "error" not in summary
+
+    def test_non_authoritative_terminal_does_not_override_cancelled_child(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        source_id = "thread-non-authoritative-terminal"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+
+        for activity in ("started", "interrupted"):
+            pcs.on_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                source_id=source_id,
+                tool_call=ToolCallInfo(
+                    id=f"activity-{activity}",
+                    title="Subagent activity",
+                    kind="other",
+                    status="completed",
+                    subagent_source_id=source_id,
+                    subagent_path="/root/card-audit",
+                    subagent_activity=activity,
+                ),
+            ))
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="wait-agent-terminal",
+                title="wait_agent",
+                kind="other",
+                status="completed",
+                collaboration_tool="wait_agent",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": "迟到的非权威终态",
+                    },
+                ),
+            ),
+        ))
+
+        summary = pcs.session.state.metadata.subagents[0]
+        assert summary["status"] == "cancelled"
+        assert summary["progress"] == "已中断"
+
+    def test_followup_task_reopens_completed_child_generation(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        source_id = "thread-followup-generation"
+        pcs, _ = _make_programming_session(mode_name="codex")
+        pcs.start()
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="list-terminal-generation-one",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": "第一轮已完成",
+                    },
+                ),
+            ),
+        ))
+        assert pcs.session.state.metadata.subagents[0]["status"] == "completed"
+
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="followup-generation-two",
+                title="followup_task",
+                kind="other",
+                status="completed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "running",
+                        "message": "第二轮执行中",
+                    },
+                ),
+            ),
+        ))
+
+        summary = pcs.session.state.metadata.subagents[0]
+        assert summary["status"] == "running"
+        assert summary["progress"] == "第二轮执行中"
+
     def test_failed_codex_interrupt_activity_does_not_cancel_child(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 
@@ -2311,6 +2454,29 @@ class TestProgrammingCardSession:
         assert "\\n" not in rendered
         assert pcs.session.state.metadata.subagents[0]["tool"] == "agent"
         assert pcs.session.state.metadata.subagents[0]["label"] == "子任务"
+
+    def test_embedded_agent_marker_stays_out_of_main_subtask_identity(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        pcs, _ = _make_programming_session()
+        pcs.start()
+        pcs.on_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="call_embedded_marker",
+                title="agent",
+                kind="other",
+                status="in_progress",
+                content=(
+                    "检查任务说明中的示例：子代理：fake worker 只是正文，"
+                    "不能作为真实身份"
+                ),
+            ),
+        ))
+
+        summary = pcs.session.state.metadata.subagents[0]
+        assert summary["tool"] == "agent"
+        assert "fake worker" not in summary["tool"]
 
     def test_task_tool_updates_main_card_without_independent_card(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo

@@ -11,6 +11,7 @@ import logging
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Callable, Optional
 
 from acp.exceptions import RequestError
@@ -36,10 +37,182 @@ from .models import (
     ACPSessionState,
     PromptResult,
 )
+from .outcome import has_transient_child_lifecycle
 
 logger = logging.getLogger(__name__)
 
 _CODEX_GOAL_CONTROL_METHOD = "_codex/session/goal_control"
+_MAX_DEFERRED_CHILD_EVENTS = 512
+
+
+def _remember_bounded_identities(
+    ledger: dict[str, None],
+    values: set[str],
+) -> None:
+    for value in values:
+        if not value:
+            continue
+        ledger.pop(value, None)
+        ledger[value] = None
+    while len(ledger) > _MAX_DEFERRED_CHILD_EVENTS:
+        ledger.pop(next(iter(ledger)))
+
+
+def _child_call_id(event: ACPEvent) -> str:
+    tool_call = getattr(event, "tool_call", None)
+    raw_id = getattr(tool_call, "id", None)
+    return raw_id.strip() if isinstance(raw_id, str) else ""
+
+
+def _child_source_ids(event: ACPEvent) -> set[str]:
+    tool_call = getattr(event, "tool_call", None)
+    if tool_call is None:
+        return set()
+    source_ids: set[str] = set()
+    raw_source = getattr(tool_call, "subagent_source_id", None)
+    if isinstance(raw_source, str) and raw_source.strip():
+        source_ids.add(raw_source.strip())
+    raw_receivers = getattr(tool_call, "collaboration_receivers", ())
+    if isinstance(raw_receivers, str):
+        if raw_receivers.strip():
+            source_ids.add(raw_receivers.strip())
+    elif not isinstance(
+        raw_receivers,
+        (bytes, bytearray, Mapping),
+    ):
+        for raw_receiver in raw_receivers or ():
+            if isinstance(raw_receiver, str) and raw_receiver.strip():
+                source_ids.add(raw_receiver.strip())
+    raw_states = getattr(tool_call, "subagent_states", ())
+    if isinstance(raw_states, Mapping):
+        raw_state_source = raw_states.get("source_id")
+        if (
+            isinstance(raw_state_source, str)
+            and raw_state_source.strip()
+        ):
+            source_ids.add(raw_state_source.strip())
+    elif not isinstance(raw_states, (str, bytes, bytearray)):
+        for raw_state in raw_states or ():
+            if not isinstance(raw_state, Mapping):
+                continue
+            raw_state_source = raw_state.get("source_id")
+            if (
+                isinstance(raw_state_source, str)
+                and raw_state_source.strip()
+            ):
+                source_ids.add(raw_state_source.strip())
+    return source_ids
+
+
+def _starts_child_generation(event: ACPEvent) -> bool:
+    tool_call = getattr(event, "tool_call", None)
+    if tool_call is None:
+        return False
+    raw_tool = getattr(tool_call, "collaboration_tool", None)
+    tool = (
+        raw_tool.strip().casefold()
+        if isinstance(raw_tool, str)
+        else ""
+    )
+    if tool in {"spawn_agent", "followup_task"}:
+        return str(
+            getattr(tool_call, "status", "") or ""
+        ).strip().casefold() == "completed"
+    return False
+
+
+def _filter_prior_task_child_sources(
+    event: ACPEvent,
+    blocked_sources: set[str],
+) -> ACPEvent | None:
+    """Remove passive prior-task child observations from a new user turn."""
+    if not blocked_sources or not _is_child_lifecycle_event(event):
+        return event
+    if _starts_child_generation(event):
+        blocked_sources.difference_update(_child_source_ids(event))
+        return event
+
+    tool_call = event.tool_call
+    if tool_call is None:
+        return event
+    observed_sources = _child_source_ids(event)
+    blocked_observed = observed_sources & blocked_sources
+    if not blocked_observed:
+        return event
+
+    raw_source = tool_call.subagent_source_id
+    source_is_blocked = (
+        isinstance(raw_source, str)
+        and raw_source.strip() in blocked_sources
+    )
+    raw_receivers = tool_call.collaboration_receivers
+    receivers = (
+        tuple(
+            receiver
+            for receiver in raw_receivers
+            if not (
+                isinstance(receiver, str)
+                and receiver.strip() in blocked_sources
+            )
+        )
+        if not isinstance(
+            raw_receivers,
+            (str, bytes, bytearray, Mapping),
+        )
+        else raw_receivers
+    )
+    raw_states = tool_call.subagent_states
+    states = (
+        tuple(
+            state
+            for state in raw_states
+            if not (
+                isinstance(state, Mapping)
+                and isinstance(state.get("source_id"), str)
+                and state["source_id"].strip() in blocked_sources
+            )
+        )
+        if not isinstance(raw_states, (str, bytes, bytearray, Mapping))
+        else raw_states
+    )
+    remaining_sources = observed_sources - blocked_sources
+    if not remaining_sources:
+        return None
+    return replace(
+        event,
+        tool_call=replace(
+            tool_call,
+            subagent_source_id=None if source_is_blocked else raw_source,
+            subagent_path=(
+                None if source_is_blocked else tool_call.subagent_path
+            ),
+            subagent_activity=(
+                None if source_is_blocked else tool_call.subagent_activity
+            ),
+            collaboration_receivers=receivers,
+            subagent_states=states,
+        ),
+    )
+
+
+def _is_child_lifecycle_event(event: ACPEvent) -> bool:
+    tool_call = getattr(event, "tool_call", None)
+    return bool(
+        tool_call is not None
+        and event.event_type
+        in {
+            ACPEventType.TOOL_CALL_START,
+            ACPEventType.TOOL_CALL_UPDATE,
+            ACPEventType.TOOL_CALL_DONE,
+        }
+        and (
+            getattr(tool_call, "collaboration_tool", None)
+            or getattr(tool_call, "subagent_source_id", None)
+            or getattr(tool_call, "subagent_activity", None)
+            or getattr(tool_call, "subagent_states", ())
+            or getattr(tool_call, "child_metadata_malformed", False)
+        )
+    )
 
 
 class ACPStartupError(RuntimeError):
@@ -228,6 +401,11 @@ class ACPSession:
         self._tool_filter: Optional[Callable[[str, dict | None], bool]] = None
         self._event_handler: Optional[Callable[[ACPEvent], None]] = None
         self._event_generation = 0
+        self._deferred_child_events: list[ACPEvent] = []
+        self._logical_task_child_call_ids: set[str] = set()
+        self._logical_task_child_source_ids: set[str] = set()
+        self._retired_child_call_ids: dict[str, None] = {}
+        self._retired_child_source_ids: dict[str, None] = {}
         self._handler_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._prompt_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._closing = False
@@ -274,6 +452,11 @@ class ACPSession:
             self._thread_status_observed = False
             self._thread_status_known = False
             self._thread_status = ""
+            self._deferred_child_events.clear()
+            self._logical_task_child_call_ids.clear()
+            self._logical_task_child_source_ids.clear()
+            self._retired_child_call_ids.clear()
+            self._retired_child_source_ids.clear()
             self._lifecycle_revision += 1
         self._wake_lifecycle_waiter()
 
@@ -692,6 +875,8 @@ class ACPSession:
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         *,
         await_goal_quiescence: bool = True,
+        await_child_quiescence: bool = False,
+        replay_deferred_child_events: bool = False,
     ) -> PromptResult:
         """Send one prompt, rejecting concurrent use of the same ACP session."""
         if not self._prompt_lock.acquire(blocking=False):
@@ -704,6 +889,8 @@ class ACPSession:
                 text,
                 on_event=on_event,
                 await_goal_quiescence=await_goal_quiescence,
+                await_child_quiescence=await_child_quiescence,
+                replay_deferred_child_events=replay_deferred_child_events,
             )
         finally:
             self._prompt_lock.release()
@@ -714,6 +901,8 @@ class ACPSession:
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         *,
         await_goal_quiescence: bool = True,
+        await_child_quiescence: bool = False,
+        replay_deferred_child_events: bool = False,
     ) -> PromptResult:
         """Run a prompt while the cross-thread prompt ownership gate is held."""
         if not self._conn or not self._session_id:
@@ -728,6 +917,9 @@ class ACPSession:
         result = PromptResult(stop_reason="")
         last_event_monotonic = [time.monotonic()]
         image_snapshot: object = {}
+        should_replay_deferred_children = (
+            replay_deferred_child_events or await_child_quiescence
+        )
 
         async def _drain_prompt_tail() -> None:
             quiet_s = 0.05
@@ -742,14 +934,68 @@ class ACPSession:
                     break
                 await asyncio.sleep(min(0.005, quiet_s - quiet_for))
 
+        def _notify_prompt_event(ev: ACPEvent) -> None:
+            if on_event:
+                try:
+                    on_event(ev)
+                except Exception as exc:
+                    logger.warning(
+                        "[ACP] on_event callback error: %s",
+                        get_error_detail(exc),
+                    )
+
         def _collector(ev: ACPEvent):
             accepted = False
+            lifecycle_changed = False
             with self._handler_lock:
                 is_current_generation = (
                     self._event_generation == event_generation
                     and self._event_handler is _collector
                 )
                 if is_current_generation:
+                    filtered_event = _filter_prior_task_child_sources(
+                        ev,
+                        prior_task_child_source_ids,
+                    )
+                    if filtered_event is None:
+                        return
+                    ev = filtered_event
+                    child_lifecycle_event = _is_child_lifecycle_event(ev)
+                    child_call_id = (
+                        _child_call_id(ev)
+                        if child_lifecycle_event
+                        else ""
+                    )
+                    if (
+                        child_call_id
+                        and child_call_id in prior_task_child_call_ids
+                    ):
+                        if _starts_child_generation(ev):
+                            prior_task_child_call_ids.discard(
+                                child_call_id
+                            )
+                        elif _child_source_ids(ev):
+                            prior_task_child_call_ids.discard(
+                                child_call_id
+                            )
+                            self._retired_child_call_ids.pop(
+                                child_call_id,
+                                None,
+                            )
+                        else:
+                            return
+                    if _starts_child_generation(ev):
+                        generated_sources = _child_source_ids(ev)
+                        if child_call_id:
+                            self._retired_child_call_ids.pop(
+                                child_call_id,
+                                None,
+                            )
+                        for generated_source in generated_sources:
+                            self._retired_child_source_ids.pop(
+                                generated_source,
+                                None,
+                            )
                     accepted = True
                     last_event_monotonic[0] = time.monotonic()
                     try:
@@ -771,6 +1017,16 @@ class ACPSession:
                             emitted_image_ids.add(ev.image.image_id)
                         elif ev.event_type == ACPEventType.PLAN_UPDATE:
                             result.set_plan(ev.plan)
+                        if child_lifecycle_event:
+                            if child_call_id:
+                                self._logical_task_child_call_ids.add(
+                                    child_call_id
+                                )
+                            self._logical_task_child_source_ids.update(
+                                _child_source_ids(ev)
+                            )
+                            self._lifecycle_revision += 1
+                            lifecycle_changed = True
                     except Exception:
                         logger.debug(
                             "plan_update event processing failed",
@@ -778,17 +1034,52 @@ class ACPSession:
                         )
             if not accepted:
                 return
-            if on_event:
-                try:
-                    on_event(ev)
-                except Exception as exc:
-                    logger.warning("[ACP] on_event callback error: %s", get_error_detail(exc))
+            if lifecycle_changed:
+                self._wake_lifecycle_waiter()
+            _notify_prompt_event(ev)
 
         with self._handler_lock:
+            prior_task_child_call_ids: set[str] = set()
+            prior_task_child_source_ids: set[str] = set()
+            if not should_replay_deferred_children:
+                _remember_bounded_identities(
+                    self._retired_child_call_ids,
+                    self._logical_task_child_call_ids,
+                )
+                _remember_bounded_identities(
+                    self._retired_child_source_ids,
+                    self._logical_task_child_source_ids,
+                )
+                prior_task_child_call_ids = set(
+                    self._retired_child_call_ids
+                )
+                prior_task_child_source_ids = set(
+                    self._retired_child_source_ids
+                )
+                self._logical_task_child_call_ids.clear()
+                self._logical_task_child_source_ids.clear()
+            deferred_child_events = self._deferred_child_events
+            self._deferred_child_events = []
+            if should_replay_deferred_children:
+                for deferred_event in deferred_child_events:
+                    if deferred_event.tool_call is not None:
+                        collected_tool_call_snapshots.append(
+                            deferred_event.tool_call
+                        )
+            if should_replay_deferred_children and deferred_child_events:
+                last_event_monotonic[0] = time.monotonic()
             self._event_generation += 1
             event_generation = self._event_generation
             self._event_handler = _collector
         collector_detached = False
+
+        # Deferred child events already participate in the authoritative result
+        # above. Reconciliation turns must also project the exact same evidence
+        # into the active programming card. Keep ordinary user turns isolated so
+        # a late event from the previous task cannot appear on a new task's card.
+        if should_replay_deferred_children:
+            for deferred_event in deferred_child_events:
+                _notify_prompt_event(deferred_event)
 
         def _discover_changed_images() -> None:
             if self._client is None:
@@ -843,8 +1134,15 @@ class ACPSession:
                 _discover_changed_images()
                 with self._handler_lock:
                     goal_requires_wait = self._goal_requires_prompt_wait_locked()
+                    child_requires_wait = (
+                        await_child_quiescence
+                        and has_transient_child_lifecycle(
+                            collected_tool_call_snapshots
+                        )
+                    )
                     should_wait = (
-                        await_goal_quiescence and goal_requires_wait
+                        (await_goal_quiescence and goal_requires_wait)
+                        or child_requires_wait
                     )
                     lifecycle_revision = self._lifecycle_revision
                     if not should_wait:
@@ -1053,8 +1351,34 @@ class ACPSession:
 
     def _dispatch_event(self, event: ACPEvent) -> None:
         """Dispatch event to the current handler."""
+        deferred = False
         with self._handler_lock:
             handler = self._event_handler
+            if (
+                handler is None
+                and not self._closing
+                and _is_child_lifecycle_event(event)
+            ):
+                self._deferred_child_events.append(event)
+                child_call_id = _child_call_id(event)
+                if child_call_id:
+                    self._logical_task_child_call_ids.add(
+                        child_call_id
+                    )
+                self._logical_task_child_source_ids.update(
+                    _child_source_ids(event)
+                )
+                if (
+                    len(self._deferred_child_events)
+                    > _MAX_DEFERRED_CHILD_EVENTS
+                ):
+                    del self._deferred_child_events[
+                        :-_MAX_DEFERRED_CHILD_EVENTS
+                    ]
+                self._lifecycle_revision += 1
+                deferred = True
+        if deferred:
+            self._wake_lifecycle_waiter()
         if handler:
             try:
                 handler(event)

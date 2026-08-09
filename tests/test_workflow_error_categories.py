@@ -299,7 +299,9 @@ def test_runtime_timeout_callback_is_not_reported_as_invalid_state():
     """Runtime timeout is a workflow execution failure, not a callback state mismatch."""
 
     handler = _create_mock_handler()
-    handler._reply_workflow_error = MagicMock()
+    handler._resolve_origin = MagicMock(return_value="origin_msg")
+    handler._build_error_card = MagicMock(return_value={"error": "timeout"})
+    handler._replace_or_send_workflow_card = MagicMock()
 
     callbacks = WorkflowHandler._build_workflow_callbacks(
         handler,
@@ -310,6 +312,33 @@ def test_runtime_timeout_callback_is_not_reported_as_invalid_state():
 
     callbacks.on_error("Workflow execution exceeded total timeout of 1800s")
 
-    handler._reply_workflow_error.assert_called_once()
-    call_args = handler._reply_workflow_error.call_args
-    assert call_args[0][1] == "runtime_timeout"
+    handler._build_error_card.assert_called_once_with(
+        "runtime_timeout",
+        detail="Workflow execution exceeded total timeout of 1800s",
+    )
+    handler._replace_or_send_workflow_card.assert_called_once()
+
+
+def test_cancelled_reviewer_is_reported_as_review_failure():
+    """Nested reviewer cancellation is not a top-level lifecycle mismatch."""
+    handler = _create_mock_handler()
+    handler._resolve_origin = MagicMock(return_value="origin_msg")
+    handler._build_error_card = MagicMock(return_value={"error": "review"})
+    handler._replace_or_send_workflow_card = MagicMock()
+    callbacks = WorkflowHandler._build_workflow_callbacks(
+        handler,
+        message_id="msg_123",
+        chat_id="chat_123",
+        project=None,
+    )
+
+    detail = (
+        "Independent review failed: traex/model: Reviewer did not complete "
+        "normally (stop_reason=cancelled)"
+    )
+    callbacks.on_error(detail)
+
+    handler._build_error_card.assert_called_once_with(
+        "review_failed",
+        detail=detail,
+    )

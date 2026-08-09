@@ -1220,6 +1220,47 @@ class WorkflowScriptMixin:
                 args.setdefault("target", token)
         return args
 
+    @staticmethod
+    def _workflow_error_card_category(error_msg: str) -> str:
+        """Map an execution error to the Workflow card surface once."""
+        from ...workflow_engine.errors import ErrorCategory, categorize_error
+
+        category = categorize_error(error_msg)
+        if category == ErrorCategory.TOOL_NOT_ALLOWED:
+            return "forbidden"
+        if category == ErrorCategory.SCRIPT_VALIDATION:
+            return "invalid_argument"
+        if category == ErrorCategory.RUNTIME_TIMEOUT:
+            return "runtime_timeout"
+        if category == ErrorCategory.REVIEW_FAILED:
+            return "review_failed"
+        if category in (ErrorCategory.AGENT_LIMIT, ErrorCategory.CANCELLED):
+            return "invalid_state"
+        return "internal_error"
+
+    def _workflow_is_running_for_card(
+        self,
+        chat_id: str,
+        project: Optional["ProjectContext"],
+    ) -> bool:
+        """Read the authoritative engine state before exposing a stop action."""
+        from ...workflow_engine.models import WorkflowStatus
+
+        try:
+            root_path = self._get_root_path(chat_id, project)
+            engine = self.ctx.workflow_engine_manager.get(chat_id, root_path)
+            if engine is None:
+                return False
+            with engine._lock:
+                wf_project = engine.project
+                return bool(
+                    wf_project is not None
+                    and wf_project.status == WorkflowStatus.RUNNING
+                )
+        except Exception:
+            logger.debug("Failed to resolve Workflow status for progress action", exc_info=True)
+            return False
+
     def _build_workflow_callbacks(
         self,
         message_id: str,
@@ -1228,12 +1269,16 @@ class WorkflowScriptMixin:
     ):
         """Build WorkflowEngineCallbacks that update the Feishu card."""
         from ...workflow_engine.engine import WorkflowEngineCallbacks
+        from .workflow_card_pages import WorkflowCardPageDelivery
 
-        card_message_id: list[str] = [message_id]  # Mutable ref for card updates
+        card_message_id: list[str | None] = [message_id]  # Mutable ref for card updates
+        page_delivery = WorkflowCardPageDelivery(card_message_id)
         terminal_sent: list[bool] = [False]
         project_id = getattr(project, "project_id", "") or ""
 
-        def on_progress(card_data: dict[str, Any]) -> None:
+        def on_progress(
+            card_data: dict[str, Any] | list[dict[str, Any]],
+        ) -> None:
             """Update the progress card in Feishu."""
             if terminal_sent[0]:
                 logger.debug("Ignored workflow progress update after terminal card was sent")
@@ -1242,14 +1287,21 @@ class WorkflowScriptMixin:
                 # Inject a "停止" button while the workflow is still running so
                 # users can stop it directly from the progress card. Guard so
                 # any failure here never breaks the progress update itself.
-                self._inject_workflow_stop_button(card_data, chat_id, project_id)
-                new_id = self._replace_or_send_workflow_rendered_card(
-                    card_message_id=card_message_id[0],
+                status_card = card_data[0] if isinstance(card_data, list) and card_data else card_data
+                if isinstance(status_card, dict):
+                    self._inject_workflow_stop_button(
+                        status_card,
+                        chat_id,
+                        project_id,
+                        is_running=self._workflow_is_running_for_card(chat_id, project),
+                    )
+                delivery_result = page_delivery.deliver(
+                    card_data,
+                    replace_or_send=self._replace_or_send_workflow_rendered_card,
                     chat_id=chat_id,
-                    card_data=card_data,
                 )
-                if new_id:
-                    card_message_id[0] = new_id
+                if delivery_result.status_message_id:
+                    card_message_id[0] = delivery_result.status_message_id
             except Exception:
                 logger.debug("Failed to update workflow progress card", exc_info=True)
 
@@ -1267,13 +1319,16 @@ class WorkflowScriptMixin:
                     project=project,
                 )
                 card_data = render_completion_card(wf_project, report_status=report_status)
-                new_id = self._replace_or_send_workflow_rendered_card(
-                    card_message_id=card_message_id[0],
+                delivery_result = page_delivery.deliver(
+                    card_data,
+                    replace_or_send=self._replace_or_send_workflow_rendered_card,
                     chat_id=chat_id,
-                    card_data=card_data,
+                    terminal=True,
                 )
-                if new_id:
-                    card_message_id[0] = new_id
+                if delivery_result.status_message_id:
+                    card_message_id[0] = delivery_result.status_message_id
+                if not delivery_result.status_delivered:
+                    raise RuntimeError("Card delivery returned None")
             except Exception:
                 self._reply_workflow_completion_fallback(
                     message_id=message_id,
@@ -1283,31 +1338,17 @@ class WorkflowScriptMixin:
         def on_error(error_msg: str) -> None:
             """Error notification — sanitize before showing to user."""
             terminal_sent[0] = True
-            from ...workflow_engine.errors import (
-                ErrorCategory,
-                _strip_internal_details,
-                categorize_error,
-            )
+            from ...workflow_engine.errors import _strip_internal_details
 
-            category = categorize_error(error_msg)
-            if category == ErrorCategory.TOOL_NOT_ALLOWED:
-                workflow_category = "forbidden"
-            elif category == ErrorCategory.SCRIPT_VALIDATION:
-                workflow_category = "invalid_argument"
-            elif category == ErrorCategory.RUNTIME_TIMEOUT:
-                workflow_category = "runtime_timeout"
-            elif category in (
-                ErrorCategory.AGENT_LIMIT,
-                ErrorCategory.CANCELLED,
-            ):
-                workflow_category = "invalid_state"
-            else:
-                workflow_category = "internal_error"
-
-            self._reply_workflow_error(
-                message_id,
+            workflow_category = self._workflow_error_card_category(error_msg)
+            card = self._build_error_card(
                 workflow_category,
                 detail=_strip_internal_details(error_msg or ""),
+            )
+            self._replace_or_send_workflow_card(
+                card_message_id=card_message_id[0],
+                chat_id=chat_id,
+                card=card,
             )
 
         def on_log(msg: str) -> None:
@@ -1325,13 +1366,14 @@ class WorkflowScriptMixin:
         card_data: dict[str, Any],
         chat_id: str,
         project_id: str,
+        *,
+        is_running: bool,
     ) -> None:
         """Append a "停止" button row to a RUNNING progress card.
 
         ``card_data`` is the renderer output ``{"header": ..., "elements": [...]}``.
-        We only call this from ``on_progress`` (invoked while the workflow is
-        executing), so it is always safe to add the stop button here — the
-        completion card is delivered via a separate ``on_done`` callback.
+        ``on_progress`` also carries terminal flushes, so callers must pass the
+        authoritative RUNNING state rather than inferring it from callback type.
 
         The button value carries only ``action``/``chat_id``/``project_id``.
         The handler delegates to ``stop_workflow``, which re-derives auth from
@@ -1341,7 +1383,7 @@ class WorkflowScriptMixin:
         from ...card.render.buttons import build_responsive_button_row
         from ...card.ui_text import UI_TEXT
 
-        if not isinstance(card_data, dict):
+        if not is_running or not isinstance(card_data, dict):
             return
         elements = card_data.get("elements")
         if not isinstance(elements, list):

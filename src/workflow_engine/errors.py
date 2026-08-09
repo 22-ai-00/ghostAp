@@ -20,6 +20,7 @@ class ErrorCategory(Enum):
     TOOL_NOT_ALLOWED = "tool_not_allowed"
     SCRIPT_VALIDATION = "script_validation"
     RUNTIME_TIMEOUT = "runtime_timeout"
+    REVIEW_FAILED = "review_failed"
     INTERNAL_ERROR = "internal_error"
     CANCELLED = "cancelled"
 
@@ -66,6 +67,9 @@ _USER_MESSAGES: dict[ErrorCategory, str] = {
     ),
     ErrorCategory.RUNTIME_TIMEOUT: (
         "工作流等待响应超时，请重试或增加超时限制。"
+    ),
+    ErrorCategory.REVIEW_FAILED: (
+        "一个或多个独立评审 Agent 未正常完成，Workflow 已按安全策略停止。"
     ),
     ErrorCategory.INTERNAL_ERROR: (
         "发生内部错误，请重试。如问题持续，请联系管理员。"
@@ -228,6 +232,9 @@ _PERMANENT_ERROR_KEYWORDS: tuple[str, ...] = (
 # Category detection rules: (category, keyword_list, match_all)
 # Rules are checked in order; first match wins.
 _CATEGORY_RULES: list[tuple[ErrorCategory, tuple[str, ...], bool]] = [
+    # A nested reviewer may itself end as cancelled.  Classify the top-level
+    # review contract failure before the generic cancellation keywords.
+    (ErrorCategory.REVIEW_FAILED, ("independent review failed",), False),
     (ErrorCategory.AGENT_LIMIT, ("limit exceeded",), False),
     (ErrorCategory.AGENT_LIMIT, ("max agents",), False),
     (ErrorCategory.AGENT_LIMIT, ("agent limit",), False),

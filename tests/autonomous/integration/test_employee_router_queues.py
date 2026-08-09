@@ -175,6 +175,49 @@ class _SelectiveRejectAnchor(MemoryAnchor):
         )
 
 
+def test_projection_rebuild_skips_replay_until_journal_head_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _module_ref, writer, ingress, new_router = _stack(tmp_path)
+    router = new_router()
+    replay_calls: list[int] = []
+    original_replay = writer.replay
+
+    def counted_replay(from_sequence: int = 1):
+        replay_calls.append(from_sequence)
+        return original_replay(from_sequence)
+
+    monkeypatch.setattr(writer, "replay", counted_replay)
+    try:
+        ingress.rebuild_projection()
+        router.rebuild_projection()
+        assert replay_calls == []
+
+        aggregate_id = "projection-refresh:test"
+        writer.commit(
+            (
+                JournalEvent(
+                    event_type="projection.refresh_requested",
+                    aggregate_id=aggregate_id,
+                    payload={},
+                ),
+            ),
+            writer.get_aggregate_versions((aggregate_id,)),
+        )
+
+        ingress.rebuild_projection()
+        router.rebuild_projection()
+        assert replay_calls == [1, 1]
+
+        ingress.rebuild_projection()
+        router.rebuild_projection()
+        assert replay_calls == [1, 1]
+    finally:
+        ingress.close()
+        writer.close()
+
+
 def _stack(
     tmp_path: Path,
     *,

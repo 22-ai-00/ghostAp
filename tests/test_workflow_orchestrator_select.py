@@ -789,6 +789,18 @@ def test_handle_orchestrator_remove_and_clear():
     assert len(restored2.orchestrator_selections) == 0
 
 
+def test_selection_snapshot_restore_preserves_inline_error_message():
+    from src.workflow_engine.selection_flow import SelectionFlowController
+
+    controller = SelectionFlowController(step=1)
+    controller.error_message = "请至少选择一个主编排 Agent（工具 + 模型）。"
+
+    restored = SelectionFlowController()
+    restored.restore(controller.snapshot())
+
+    assert restored.error_message == controller.error_message
+
+
 def test_handle_orchestrator_finish_writes_binding():
     """handle_workflow_orchestrator_finish 应将 selected_items 写入 pending.orchestrator_binding
     并将状态转至 AWAITING_TOOL_SELECT。

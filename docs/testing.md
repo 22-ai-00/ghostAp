@@ -23,6 +23,43 @@ uv run python scripts/test_inventory.py tests/
 
 `slow` 不是跳过标签。验证真实超时、跨进程故障、断线重放、ACK 边界或外部运行时的测试仍是发布门禁，只是不应阻塞每次本地快速反馈。预计超过 1 秒且确实依赖真实等待/进程的测试应标记 `slow`；能用 Event、假时钟或注入超时值稳定验证的，优先消除真实等待。
 
+## Workflow 真实租户多卡验收
+
+`scripts/validate_workflow_tenant.py` 是只读、显式 opt-in 的证据校验器；它不会连接飞书或发送消息。真实验收必须在专用测试 chat 中走完整 `/wf` 交互，且任务应产生至少两个结果页。原始 tenant/chat/message ID 不得写入证据文件，只记录对应的小写 SHA-256 摘要。
+
+先用本次运行的非机密绑定创建默认失败的 `0600` 检查清单；文件采用独占创建，已存在时会拒绝覆盖：
+
+```bash
+uv run python scripts/validate_workflow_tenant.py \
+  --template-out /tmp/workflow-live-capture.json \
+  --run-id <run-id> \
+  --service-instance-id <service-instance-id> \
+  --tenant-hash <sha256> \
+  --chat-id-hash <sha256> \
+  --expected-result-count <count>
+```
+
+执行真实 `/wf` 后填写以下证据，任何默认值都不能通过：
+
+- `events` 按实际发生顺序记录 `create`、`patch`、`freeze`、`finish`，序号连续；每页始终使用同一个 `message_id_hash`，每次载荷记录 `payload_sha256`。
+- 新续页的 `create` 必须早于旧页 `freeze`；旧页冻结后不得再记录 `patch`；最后仅最新页记录 `finish`。
+- `checks` 逐项确认 origin/recipient 绑定、历史页冻结后哈希不变、全部终态结果可见、停止按钮消失、桌面端和移动端连续展示。
+- `artifacts` 记录脱敏事件日志、桌面截图和移动截图的 SHA-256；`attestor` 记录验收人，`observed_result_count` 必须等于绑定的预期数量。
+
+最后使用完全相同的绑定显式打开 live 门禁；退出码 `0/1/2` 分别表示通过、失败、缺少绑定或尚未验收：
+
+```bash
+GHOSTAP_WORKFLOW_ACCEPTANCE_LIVE=1 \
+uv run python scripts/validate_workflow_tenant.py \
+  --live \
+  --live-results /tmp/workflow-live-capture.json \
+  --run-id <run-id> \
+  --service-instance-id <service-instance-id> \
+  --tenant-hash <sha256> \
+  --chat-id-hash <sha256> \
+  --expected-result-count <count>
+```
+
 ## 执行通道纵向合同
 
 `tests/contracts/test_direct_programming_lane.py` 从显式 Slash 命令或当前 programming mode 一直覆盖到真实 session-manager/factory 请求。测试侧 recorder 只替换进程/远端传输边界，并记录 backend、实际 factory model、cwd、chat/project/thread session key、tool filter 与 prompt；它不以 mocks 重建路由。显式 Direct 请求的准入是一个目标 factory 加一个目标 prompt，且没有 classifier、planner、reviewer 或 coordinator 调用。

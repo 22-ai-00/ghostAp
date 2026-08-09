@@ -2515,9 +2515,14 @@ class EmployeeDepartmentRuntime:
         worked = dispatch.dispatch_next() is not None or worked
         worked = self._reconcile_terminal_ingress() > 0 or worked
         worked = self._drain_employee_outbox_once() or worked
+        gc_now = time.monotonic()
+        if gc_now < getattr(self, "_employee_dispatch_next_gc_at", 0.0):
+            return worked
         if self._outbox is not None:
             worked = self._outbox.gc_superseded_snapshots() > 0 or worked
-        return ingress.gc_terminal_payloads() > 0 or worked
+        worked = ingress.gc_terminal_payloads() > 0 or worked
+        self._employee_dispatch_next_gc_at = gc_now + 60.0
+        return worked
 
     @staticmethod
     def _unknown_employee_ingress_trust() -> EffectiveTrust:

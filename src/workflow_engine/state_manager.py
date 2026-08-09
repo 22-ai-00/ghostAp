@@ -51,6 +51,17 @@ class WorkflowStateManager:
         self._delta_context_tokens: int = 0
         self._label_counters: Dict[str, int] = {}
         self._rebuild_indexes()
+        self._next_agent_call_index = (
+            max(
+                (
+                    agent.call_index
+                    for phase in self._project.phases
+                    for agent in phase.agents
+                ),
+                default=-1,
+            )
+            + 1
+        )
 
     # ------------------------------------------------------------------
     # Public: state-changing events
@@ -85,6 +96,8 @@ class WorkflowStateManager:
             target_phase = self._find_or_create_phase(phase)
             now = time.time()
             effective_label = self._make_unique_label(label or "agent")
+            call_index = self._next_agent_call_index
+            self._next_agent_call_index += 1
             agent = AgentProgress(
                 label=effective_label,
                 tool=tool,
@@ -93,6 +106,8 @@ class WorkflowStateManager:
                 task_summary=task_summary,
                 status=AgentStatus.RUNNING,
                 started_at=now,
+                activity_updated_at=now,
+                call_index=call_index,
             )
             target_phase.agents.append(agent)
             # Map insert must happen atomically with the agent-list append so
@@ -139,6 +154,9 @@ class WorkflowStateManager:
             agent.token_usage = token_usage
             agent.duration_s = duration_s
             agent.error = None
+            raw_result = result.get("result")
+            agent.result = str(raw_result) if raw_result is not None else None
+            agent.current_activity = ""
             agent.finished_at = time.time()
 
             if not was_terminal:
@@ -146,7 +164,7 @@ class WorkflowStateManager:
             self._project.metrics.total_tokens += token_usage
             self._project.metrics.total_duration_s += duration_s
 
-    def on_agent_failed(self, label: str, error: str) -> None:
+    def on_agent_failed(self, label: str, error: str, result: str | None = None) -> None:
         """Update agent status to FAILED."""
         with self._write_locked():
             agent = self._label_to_agent.get(label)
@@ -164,6 +182,8 @@ class WorkflowStateManager:
             now = time.time()
             agent.status = AgentStatus.FAILED
             agent.error = error
+            agent.result = str(result) if result is not None else None
+            agent.current_activity = ""
             agent.finished_at = now
             if agent.duration_s <= 0 and agent.started_at:
                 agent.duration_s = max(0.0, now - agent.started_at)
@@ -179,6 +199,7 @@ class WorkflowStateManager:
             if self._is_terminal_agent(agent):
                 return
             agent.current_activity = activity
+            agent.activity_updated_at = time.time()
 
     def update_agent_subagents(
         self,
@@ -260,6 +281,7 @@ class WorkflowStateManager:
                 agent.current_activity = (
                     f"子 Agent {latest_index + 1} · {latest.progress or status_text}"
                 )
+                agent.activity_updated_at = time.time()
             return changed
 
     def on_agent_aborted(self, label: str, reason: str = "Aborted by race loser") -> None:
@@ -284,6 +306,7 @@ class WorkflowStateManager:
             now = time.time()
             agent.status = AgentStatus.CANCELLED
             agent.error = reason
+            agent.current_activity = ""
             agent.finished_at = now
             if agent.duration_s <= 0 and agent.started_at:
                 agent.duration_s = max(0.0, now - agent.started_at)
@@ -403,6 +426,9 @@ class WorkflowStateManager:
                             started_at=agent.started_at,
                             finished_at=agent.finished_at,
                             current_activity=agent.current_activity,
+                            activity_updated_at=agent.activity_updated_at,
+                            result=agent.result,
+                            call_index=agent.call_index,
                             subagents=[
                                 item.model_copy(deep=True)
                                 for item in agent.subagents

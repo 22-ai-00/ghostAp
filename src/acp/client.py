@@ -190,6 +190,51 @@ def _permission_execute_tool_name(command: str) -> str:
     return "git"
 
 
+def _normalize_permission_execute_command(
+    command_value: Any,
+) -> tuple[Optional[str], Optional[list[str]]]:
+    """Normalize an ACP execute command without weakening command checks.
+
+    ACP providers may send either a shell command string or a canonical argv
+    array.  ``shlex.join`` preserves argv boundaries in the string consumed by
+    the existing tool, dangerous-command, and sandbox policies.  Other shapes
+    remain fail-closed rather than being coerced with ``str()``.
+    """
+    if command_value is None or command_value == "":
+        return None, None
+    if isinstance(command_value, str):
+        if "\x00" in command_value:
+            raise ValueError("execute command contains NUL")
+        return command_value, None
+    if isinstance(command_value, (list, tuple)):
+        if not command_value:
+            raise ValueError("execute argv must not be empty")
+        if not all(isinstance(arg, str) for arg in command_value):
+            raise ValueError("execute argv must contain only strings")
+        argv = list(command_value)
+        if any("\x00" in arg for arg in argv):
+            raise ValueError("execute argv contains NUL")
+        return shlex.join(argv), argv
+    raise ValueError("execute command must be a string or argv array")
+
+
+def _permission_request_diagnostics(tool_call: Any) -> tuple[str, str]:
+    """Return non-sensitive permission payload shape diagnostics."""
+    raw_kind = getattr(tool_call, "kind", None)
+    kind = raw_kind.strip().casefold() if isinstance(raw_kind, str) else "unknown"
+    raw_input = getattr(tool_call, "raw_input", None)
+    command_value: Any = None
+    if isinstance(raw_input, Mapping):
+        for key in ("command", "cmd", "shell_command"):
+            if key in raw_input:
+                command_value = raw_input.get(key)
+                break
+    elif kind == "execute":
+        command_value = raw_input
+    shape = "missing" if command_value is None else type(command_value).__name__
+    return kind or "unknown", shape
+
+
 def _permission_tool_request(
     tool_call: Any,
     *,
@@ -212,20 +257,21 @@ def _permission_tool_request(
 
     command_value: Any = None
     if isinstance(raw_input, Mapping):
-        command_value = (
-            raw_input.get("command")
-            or raw_input.get("cmd")
-            or raw_input.get("shell_command")
-        )
+        for key in ("command", "cmd", "shell_command"):
+            candidate = raw_input.get(key)
+            if candidate is None or candidate == "":
+                continue
+            command_value = candidate
+            break
     elif isinstance(raw_input, str):
         command_value = raw_input
-    if command_value and not isinstance(command_value, str):
-        raise ValueError("execute command must be a string")
-    command = command_value if isinstance(command_value, str) and command_value else None
+    command, argv = _normalize_permission_execute_command(command_value)
     if command is None:
         return "execute", tool_args, None
 
     tool_args["command"] = command
+    if argv is not None:
+        tool_args["argv"] = argv
     tool_args.setdefault("cwd", root_dir)
     return _permission_execute_tool_name(command), tool_args, command
 
@@ -1008,22 +1054,71 @@ def _parse_subagent_metadata(update: Any) -> tuple[str, str, str]:
     return source_id, path, activity
 
 
+_COMPATIBLE_COLLABORATION_TOOLS = frozenset(
+    {
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "spawn_agent",
+        "wait_agent",
+    }
+)
+
+
+def _compatible_collaboration_tool(
+    update: Any,
+    raw_input: Any,
+    raw_output: Any,
+) -> str:
+    """Recognize allowlisted Codex frames that predate namespaced metadata."""
+    title = getattr(update, "title", None)
+    normalized_title = (
+        title.strip().casefold().replace("-", "_").replace(" ", "_")
+        if isinstance(title, str)
+        else ""
+    )
+    if normalized_title not in _COMPATIBLE_COLLABORATION_TOOLS:
+        return ""
+    has_lifecycle_payload = any(
+        isinstance(payload, Mapping)
+        and (
+            "agentsStates" in payload
+            or "receiverThreadIds" in payload
+        )
+        for payload in (raw_input, raw_output)
+    )
+    return normalized_title if has_lifecycle_payload else ""
+
+
 def _parse_collaboration_metadata(
     update: Any,
     raw_input: Any,
+    raw_output: Any,
 ) -> tuple[str, tuple[str, ...], str, tuple[dict, ...]]:
     """Normalize Codex collaboration state without exposing provider ids."""
-    _, collaboration, _ = _codex_namespaced_metadata(update)
-    if not collaboration:
+    _, collaboration, metadata_malformed = _codex_namespaced_metadata(update)
+    if collaboration:
+        raw_tool = collaboration.get("tool")
+        tool = raw_tool.strip() if isinstance(raw_tool, str) else ""
+    elif not metadata_malformed:
+        tool = _compatible_collaboration_tool(
+            update,
+            raw_input,
+            raw_output,
+        )
+        if not tool:
+            return "", (), "", ()
+    else:
         return "", (), "", ()
 
-    raw_tool = collaboration.get("tool")
-    tool = raw_tool.strip() if isinstance(raw_tool, str) else ""
     receiver_containers: list[object] = []
     if "receiverThreadIds" in collaboration:
         receiver_containers.append(collaboration.get("receiverThreadIds"))
     if isinstance(raw_input, Mapping) and "receiverThreadIds" in raw_input:
         receiver_containers.append(raw_input.get("receiverThreadIds"))
+    if isinstance(raw_output, Mapping) and "receiverThreadIds" in raw_output:
+        receiver_containers.append(raw_output.get("receiverThreadIds"))
     receiver_malformed = False
     normalized_receivers: list[str] = []
     for raw_receivers in receiver_containers:
@@ -1041,9 +1136,15 @@ def _parse_collaboration_metadata(
 
     model = ""
     raw_states: Any = None
-    if isinstance(raw_input, Mapping):
-        model = str(raw_input.get("model") or "").strip()
-        raw_states = raw_input.get("agentsStates")
+    for payload in (raw_input, raw_output):
+        if not isinstance(payload, Mapping):
+            continue
+        if not model:
+            model = str(payload.get("model") or "").strip()
+        if "agentsStates" in payload:
+            # Completed output is visited last and is authoritative over a
+            # stale input snapshot from the start of the same invocation.
+            raw_states = payload.get("agentsStates")
 
     states: list[dict] = []
     if isinstance(raw_states, Mapping):
@@ -1146,7 +1247,7 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
         collaboration_receivers,
         collaboration_model,
         subagent_states,
-    ) = _parse_collaboration_metadata(update, raw_input)
+    ) = _parse_collaboration_metadata(update, raw_input, raw_output)
 
     def _json_dump(obj: Any) -> str:
         try:
@@ -1657,11 +1758,14 @@ class GhostAPClient(Client):
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
         # Permission filters apply to every ACP kind before auto-approval.
+        safety_stage = "tool_request"
+        permission_kind, command_shape = _permission_request_diagnostics(tool_call)
         try:
             permission_tool, tool_args, command = _permission_tool_request(
                 tool_call,
                 root_dir=self._root_dir,
             )
+            safety_stage = "tool_filter"
             if not self._is_tool_allowed(permission_tool, tool_args):
                 denied_data = {
                     "outcome": "cancelled",
@@ -1677,6 +1781,7 @@ class GhostAPClient(Client):
 
             # Keep the existing hard and sandbox checks for executable commands.
             if command is not None:
+                safety_stage = "dangerous_command"
                 hard_ok, hard_reason = _ACP_PERMISSION_DANGEROUS_CHECK.check(command, None)
                 if not hard_ok:
                     logger.info("[ACP] Reject dangerous auto-approved command: %s (%s)", command, hard_reason)
@@ -1691,6 +1796,7 @@ class GhostAPClient(Client):
                         },
                     )
                     return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+                safety_stage = "sandbox"
                 ok, reason = self._sandbox.is_command_safe(command)
                 if not ok:
                     logger.info("[ACP] Reject unsafe command: %s (%s)", command, reason)
@@ -1706,11 +1812,23 @@ class GhostAPClient(Client):
                     )
                     return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         except Exception as e:
-            logger.warning("[ACP] Permission safety check failed closed: %s", type(e).__name__)
+            logger.warning(
+                "[ACP] Permission safety check failed closed: error=%s stage=%s kind=%s command_shape=%s",
+                type(e).__name__,
+                safety_stage,
+                permission_kind,
+                command_shape,
+            )
             self._record(
                 session_id,
                 "permission",
-                {"outcome": "cancelled", "reason": "permission_safety_check_failed"},
+                {
+                    "outcome": "cancelled",
+                    "reason": "permission_safety_check_failed",
+                    "stage": safety_stage,
+                    "kind": permission_kind,
+                    "command_shape": command_shape,
+                },
             )
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 

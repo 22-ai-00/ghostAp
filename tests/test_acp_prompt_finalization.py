@@ -60,6 +60,21 @@ class _ActiveGoalTimeoutThenCompleteSession(_TimeoutThenCompleteSession):
         return super().send_prompt(*args, **kwargs)
 
 
+class _SingleTurnTimeoutThenCompleteSession(_TimeoutThenCompleteSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finalization_calls: list[tuple[str, float | int | None]] = []
+
+    def send_finalization_prompt(
+        self,
+        text: str,
+        on_event: Callable[[object], None] | None = None,
+        timeout: float | int | None = None,
+    ) -> PromptResult:
+        self.finalization_calls.append((text, timeout))
+        return PromptResult(stop_reason="end_turn", text="single-turn finalized")
+
+
 def _runner():
     runner = getattr(acp, "run_prompt_with_finalization", None)
     assert callable(runner), "deadline-aware prompt finalization is not implemented"
@@ -84,7 +99,100 @@ def test_timeout_reserves_a_second_prompt_for_safe_finalization() -> None:
     finalization_prompt = session.calls[1][0]
     assert "original task" in finalization_prompt
     assert "不要创建新的子代理" in finalization_prompt
+    assert "禁止调用 wait_agent" in finalization_prompt
+    assert "先且仅调用一次 list_agents" in finalization_prompt
+    assert "interrupt_agent" in finalization_prompt
+    assert "不要启动新的验证" in finalization_prompt
+    assert "运行最必要的针对性验证" not in finalization_prompt
     assert "最终答复" in finalization_prompt
+
+
+def test_timeout_finalization_uses_single_turn_entrypoint_when_supported() -> None:
+    session = _SingleTurnTimeoutThenCompleteSession()
+
+    result = _runner()(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert result.text == "single-turn finalized"
+    assert len(session.calls) == 1
+    assert session.calls[0][1] == 60
+    assert len(session.finalization_calls) == 1
+    assert session.finalization_calls[0][1] == 30
+
+
+def test_sync_finalization_prompt_does_not_follow_new_goal_turns() -> None:
+    session = object.__new__(SyncACPSession)
+    expected = PromptResult(stop_reason="end_turn", text="finalized")
+
+    with patch.object(
+        SyncACPSession,
+        "send_prompt",
+        autospec=True,
+        return_value=expected,
+    ) as send_prompt:
+        result = SyncACPSession.send_finalization_prompt(
+            session,
+            "finalize",
+            timeout=30,
+        )
+
+    assert result is expected
+    send_prompt.assert_called_once_with(
+        session,
+        "finalize",
+        on_event=None,
+        timeout=30,
+        await_goal_quiescence=False,
+        replay_deferred_child_events=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("agent_type", "agent_args", "await_child_quiescence"),
+    (
+        ("traex", [], True),
+        (
+            "codex",
+            ["@agentclientprotocol/codex-acp@1.1.7"],
+            False,
+        ),
+    ),
+)
+def test_sync_reconciliation_prompt_uses_provider_terminal_strategy(
+    agent_type: str,
+    agent_args: list[str],
+    await_child_quiescence: bool,
+) -> None:
+    session = object.__new__(SyncACPSession)
+    session._agent_type = agent_type
+    session._agent_args = agent_args
+    expected = PromptResult(stop_reason="end_turn", text="reconciled")
+
+    with patch.object(
+        SyncACPSession,
+        "send_prompt",
+        autospec=True,
+        return_value=expected,
+    ) as send_prompt:
+        result = SyncACPSession.send_reconciliation_prompt(
+            session,
+            "reconcile",
+            timeout=30,
+        )
+
+    assert result is expected
+    send_prompt.assert_called_once_with(
+        session,
+        "reconcile",
+        on_event=None,
+        timeout=30,
+        await_child_quiescence=await_child_quiescence,
+        replay_deferred_child_events=True,
+    )
 
 
 def test_cli_style_timeout_result_also_enters_finalization() -> None:

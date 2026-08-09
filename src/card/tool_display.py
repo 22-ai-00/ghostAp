@@ -290,12 +290,14 @@ def extract_agent_tool_name(
     content = str(getattr(tool_call, "content", "") or "").strip()
     marker = "子代理："
     for line in content.splitlines():
-        if marker not in line:
+        stripped_line = line.strip()
+        if not stripped_line.startswith(marker):
             continue
-        candidate = line.split(marker, 1)[1].strip()
+        candidate = stripped_line[len(marker):].strip()
         candidate = _CONTROL_SEPARATOR_RE.split(candidate, maxsplit=1)[0].strip()
         if (
             candidate
+            and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,31}", candidate)
             and not _INLINE_STRUCTURED_RE.search(candidate)
             and not is_unhelpful_display_label(candidate)
         ):

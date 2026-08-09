@@ -352,6 +352,7 @@ class SelectionFlowController:
             "orchestrator_selections": dict(self.orchestrator_selections),
             "review_selections": dict(self.review_selections),
             "review_auto_mode": self.review_auto_mode,
+            "error_message": self.error_message,
         }
 
     def restore(self, data: dict[str, Any]) -> None:
@@ -364,6 +365,7 @@ class SelectionFlowController:
         self.orchestrator_selections = dict(data.get("orchestrator_selections", {}))
         self.review_selections = dict(data.get("review_selections", {}))
         self.review_auto_mode = bool(data.get("review_auto_mode", False))
+        self.error_message = str(data.get("error_message") or "")
         if self.review_auto_mode and self.review_selections:
             # Legacy snapshots could contain both after an explicit selection
             # was added from an Auto card. Preserve that latest explicit choice.

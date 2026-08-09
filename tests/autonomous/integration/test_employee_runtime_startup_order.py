@@ -254,6 +254,88 @@ def test_production_dispatch_tick_reaps_idle_employee_sessions() -> None:
     assert calls == ["sweep_idle"]
 
 
+def test_idle_dispatch_ticks_refresh_on_head_change_and_throttle_blob_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = [100.0]
+    head = {"sequence": 0, "hash": ""}
+    calls = {"ingress_rebuild": 0, "router_rebuild": 0, "blob_gc": 0}
+
+    class _Guard:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return None
+
+    class _Projection:
+        def __init__(self, name: str) -> None:
+            self._name = name
+            self.state = SimpleNamespace(
+                by_acceptance_id={},
+                cursor_sequence=0,
+                cursor_hash="",
+            )
+
+        def rebuild_projection(self):
+            if (
+                self.state.cursor_sequence,
+                self.state.cursor_hash,
+            ) == (head["sequence"], head["hash"]):
+                return
+            calls[f"{self._name}_rebuild"] += 1
+            self.state.cursor_sequence = head["sequence"]
+            self.state.cursor_hash = head["hash"]
+
+        def synchronize_projection_unlocked(self):
+            if (
+                self.state.cursor_sequence,
+                self.state.cursor_hash,
+            ) != (head["sequence"], head["hash"]):
+                self.rebuild_projection()
+
+    class _Ingress(_Projection):
+        def employee_dispatch_guard(self, *, router):
+            assert router is runtime._router  # noqa: SLF001
+            return _Guard()
+
+        def gc_terminal_payloads(self):
+            calls["blob_gc"] += 1
+            return 0
+
+    class _Dispatch:
+        employee_runtime = None
+
+        def dispatch_next(self):
+            return None
+
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    monkeypatch.setattr(
+        "src.autonomous.provisioning.composition.time.monotonic",
+        lambda: now[0],
+    )
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = _Ingress("ingress")  # type: ignore[assignment]  # noqa: SLF001
+    runtime._router = _Projection("router")  # type: ignore[assignment]  # noqa: SLF001
+    runtime._dispatch = _Dispatch()  # type: ignore[assignment]  # noqa: SLF001
+
+    runtime._drain_employee_dispatch_once()  # noqa: SLF001
+    runtime._drain_employee_dispatch_once()  # noqa: SLF001
+
+    assert calls == {"ingress_rebuild": 0, "router_rebuild": 0, "blob_gc": 1}
+
+    head.update(sequence=1, hash="frame-1")
+    runtime._drain_employee_dispatch_once()  # noqa: SLF001
+
+    assert calls == {"ingress_rebuild": 1, "router_rebuild": 1, "blob_gc": 1}
+
+    now[0] += 60.0
+    runtime._drain_employee_dispatch_once()  # noqa: SLF001
+
+    assert calls == {"ingress_rebuild": 1, "router_rebuild": 1, "blob_gc": 2}
+
+
 def test_production_dispatch_projects_group_context_before_routing_and_gc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -478,8 +560,15 @@ def test_employee_group_projection_maps_app_open_id_to_owner_principal() -> None
 async def test_channel_acceptance_callback_does_not_repeat_group_projection_after_gc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import asyncio
+
     calls: list[str] = []
     acceptance_id = "acc_group_message"
+
+    async def run_inline(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
 
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 

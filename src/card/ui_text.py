@@ -804,6 +804,8 @@ UI_TEXT = {
     "workflow_error_forbidden_body": "只有 Workflow 发起者或管理员可以执行此操作。\n\n💡 如需操作请联系发起者或管理员",
     "workflow_error_runtime_timeout_title": "Workflow 执行超时",
     "workflow_error_runtime_timeout_body": "Workflow 已达到执行时间上限。\n\n🔎 细节：{detail}\n\n💡 恢复方式：缩小任务范围、减少并行 Agent 数量，或重新发起 `/wf` 让编排器生成更短超时和 fallback 的动态流程",
+    "workflow_error_review_failed_title": "独立评审失败",
+    "workflow_error_review_failed_body": "一个或多个独立评审 Agent 未正常结束，因此 Workflow 按安全策略未发布成功结果。\n\n🔎 细节：{detail}\n\n💡 可重新发起 `/wf`，或改用当前可用的评审 Agent",
     "workflow_error_internal_error_title": "服务内部错误",
     "workflow_error_internal_error_body": "Workflow 执行过程中发生内部错误。{detail}\n\n💡 请稍后重试，或重新发起 `/wf` 基于当前工具选择生成脚本并自动执行；如持续出现请联系管理员",
     # --- Workflow entry help ---

@@ -448,7 +448,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
         requirement = (value.get("requirement") or "").strip()
 
-        self._show_agent_selection_card(
+        self._start_workflow_with_defaults(
             message_id=message_id,
             chat_id=chat_id,
             requirement=requirement,
@@ -489,17 +489,12 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         requirement: str,
         project: Optional["ProjectContext"] = None,
     ) -> None:
-        """Start a workflow: show tool selection first, then generate script.
+        """Start a workflow and use the default auto policy to launch generation.
 
-        Flow (tool-selection-first):
-        1. User sends /wf <requirement>
-        2. Show tool selection card with recommended tools
-        3. User confirms tool selection → generate script based on selected tools
-        4. Show confirmation card with script preview and tool distinction
-        5. User can regenerate script with different tools, or confirm to execute
-
-        If `requirement` matches a known template name, skips tool selection and
-        goes directly to script generation (template tools are fixed).
+        默认流程：
+        1. 使用默认编排器（若可用）与 Auto 审核策略；
+        2. 跳过手工选择步骤，直接进入脚本生成与确认阶段。
+        用户仍可在确认卡片上返回工具选择卡片进行手工调整。
         """
         project = self._ensure_project(message_id, chat_id, project)
         if not project:
@@ -593,11 +588,6 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             project=project,
         )
 
-        # Templates now also go through the standard three-step flow:
-        #   agent selection → tool selection → confirmation.
-        # This keeps templates consistent with AI-generated workflows and
-        # gives the user a chance to inspect / override the template's
-        # default tools before execution.
         # We detect whether `requirement` is a template name here so
         # downstream handlers can record it in pending state (e.g. to
         # initialize default tool selection from template meta.tools).
@@ -634,8 +624,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     pre_engine.project.pending = pending
                 pending.is_template_hint = template_name
 
-        # Standard three-step flow regardless of template vs AI path.
-        self._show_agent_selection_card(
+        # Auto-run with defaults: skip manual orchestrator/reviewer selection by default.
+        self._start_workflow_with_defaults(
             message_id=message_id,
             chat_id=chat_id,
             requirement=requirement,
@@ -869,6 +859,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         all_tools: dict[str, str],
         recommended_tools: list[str],
         default_selected: list[str],
+        session_key: str | None = None,
     ) -> tuple[Any, str, str]:
         """Initialize tool selection state (separated from card building for update_card reuse).
 
@@ -881,7 +872,10 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             Tuple of (engine, project_id, session_key)
         """
         from ...thread import get_current_sender_id
-        from ...workflow_engine.models import PendingConfirmation, WorkflowStatus
+        from ...workflow_engine.models import (
+            PendingConfirmation,
+            WorkflowStatus,
+        )
 
         # Store pending state
         engine_name = self.get_engine_name(chat_id, project_id=(project.project_id if project else None))
@@ -895,7 +889,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
 
             engine._project = WorkflowProject()
 
-        existing_pending = engine.project.pending
+        existing_pending = (
+            engine.project.pending
+            if isinstance(engine.project.pending, PendingConfirmation)
+            else None
+        )
         existing_orchestrator = existing_pending.orchestrator_agent if existing_pending else None
         template_hint = existing_pending.is_template_hint if existing_pending else None
         template_tools: list[str] = []
@@ -925,10 +923,11 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             effective_default = list(default_selected)
 
         engine.project.status = WorkflowStatus.AWAITING_TOOL_SELECT
+        engine_session_key = session_key or uuid.uuid4().hex
         engine.project.pending = PendingConfirmation(
             requirement=requirement,
             initiator_user_id=get_current_sender_id() or "",
-            engine_session_key=uuid.uuid4().hex,
+            engine_session_key=engine_session_key,
             selected_tools=effective_default,
             script_path=None,
             meta=None,
@@ -940,6 +939,108 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         session_key = engine.project.pending.engine_session_key if engine.project and engine.project.pending else ""
 
         return engine, project_id, session_key
+
+    def _start_workflow_with_defaults(
+        self,
+        message_id: str,
+        chat_id: str,
+        requirement: str,
+        project: "ProjectContext" | None,
+        root_path: str,
+        admission_owner: _WorkflowLifecycleOwner | None,
+    ) -> None:
+        """Initialize default tool bindings and jump directly to generation."""
+        all_tools, recommended_tools, _other_tools, default_selected = self._resolve_tool_lists()
+        if not all_tools:
+            self.send_text_to_chat(
+                chat_id,
+                "当前环境未检测到可用的 Workflow 编程工具，请安装 Traex/Claude/Codex 等 CLI 后重试。",
+            )
+            return
+
+        engine, _project_id, session_key = self._init_tool_selection_state(
+            chat_id=chat_id,
+            requirement=requirement,
+            project=project,
+            root_path=root_path,
+            all_tools=all_tools,
+            recommended_tools=recommended_tools,
+            default_selected=default_selected,
+            session_key=admission_owner.session_key if admission_owner else None,
+        )
+        if not engine.project or not engine.project.pending:
+            return
+
+        from ...spec_engine.review_agents import ReviewAgentBinding
+        from ...workflow_engine.constants import DEFAULT_ORCHESTRATOR_AGENT
+        from ...workflow_engine.models import WorkflowStatus
+
+        selected_tools = list(dict.fromkeys(engine.project.pending.selected_tools or []))
+        if not selected_tools:
+            selected_tools = list(dict.fromkeys(default_selected))
+        if not selected_tools:
+            selected_tools = list(all_tools.keys())
+
+        with engine._lock:
+            if (
+                admission_owner is not None
+                and (
+                    vars(engine).get("_workflow_selection_owner") is not admission_owner
+                    or admission_owner.stop_event.is_set()
+                )
+            ):
+                return
+
+            pending = engine.project.pending
+            if pending is None:
+                return
+
+            available_tools = list(all_tools.keys())
+            orchestrator_tool = DEFAULT_ORCHESTRATOR_AGENT
+            if orchestrator_tool not in available_tools:
+                if selected_tools:
+                    orchestrator_tool = selected_tools[0]
+                if orchestrator_tool not in available_tools and available_tools:
+                    orchestrator_tool = available_tools[0]
+
+            if not orchestrator_tool or orchestrator_tool not in available_tools:
+                self._reply_workflow_error(
+                    message_id,
+                    "invalid_argument",
+                    detail="未检测到可用 workflow 工具，无法开始自动编排。",
+                )
+                return
+
+            selected_tools = [tool for tool in selected_tools if tool in available_tools]
+            if orchestrator_tool not in selected_tools:
+                selected_tools.append(orchestrator_tool)
+
+            pending.orchestrator_agent = orchestrator_tool
+            pending.orchestrator_binding = ReviewAgentBinding(
+                provider="workflow",
+                tool_name=orchestrator_tool,
+                display_name=orchestrator_tool,
+                agent_type=orchestrator_tool,
+                model_name=None,
+                model_display_name=None,
+                use_default_model=True,
+            )
+            pending.auto_reviewer = True
+            if pending.review_agents is None:
+                pending.review_agents = []
+            pending.selected_tools = selected_tools
+            engine.project.status = WorkflowStatus.GENERATING_SCRIPT
+
+        self._schedule_generate_and_show_confirm_card(
+            message_id=message_id,
+            chat_id=chat_id,
+            requirement=requirement,
+            project=project,
+            root_path=root_path,
+            selected_tools=selected_tools,
+            expected_session_key=session_key,
+            engine=engine,
+        )
 
     def _build_tool_selection_card(
         self,
@@ -2571,6 +2672,8 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         message_id: str,
         chat_id: str,
         project: Optional["ProjectContext"] = None,
+        *,
+        terminal_is_noop: bool = False,
     ) -> None:
         """Stop the running workflow for the current project.
 
@@ -2593,6 +2696,7 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         delivery_owners: list[_WorkflowLifecycleOwner] = []
         artifacts_to_remove: list[str] = []
         runtime_active = False
+        terminal_notice: WorkflowStatus | None = None
         with engine._lock:
             wf_project = engine.project
             pending = getattr(wf_project, "pending", None) if wf_project else None
@@ -2654,7 +2758,10 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
             )
 
             if not lifecycle_active:
-                error = ("invalid_state", "当前没有运行中的 Workflow 任务")
+                if terminal_is_noop and terminal_committed:
+                    terminal_notice = status
+                else:
+                    error = ("invalid_state", "当前没有运行中的 Workflow 任务")
             elif not stored_initiator or not current_user:
                 error = ("forbidden", "无法验证操作者身份，停止请求被拒绝")
             elif current_user != stored_initiator and current_user not in admin_ids:
@@ -2698,6 +2805,18 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     wf_project.status = WorkflowStatus.IDLE
                     wf_project.pending = None
                     wf_project.script_path = None
+
+        if terminal_notice is not None:
+            terminal_label = {
+                WorkflowStatus.COMPLETED: "已完成",
+                WorkflowStatus.FAILED: "失败",
+                WorkflowStatus.CANCELLED: "已取消",
+            }.get(terminal_notice, "已结束")
+            self.reply_text(
+                message_id,
+                f"Workflow 任务已结束，当前状态：{terminal_label}。",
+            )
+            return
 
         if error is not None:
             self._reply_workflow_error(
@@ -2748,7 +2867,12 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         # Resolve root_path defensively so a missing project still lets the
         # underlying stop_workflow re-derive engine state from the chat.
         self._get_root_path(chat_id, project)
-        self.stop_workflow(message_id, chat_id, project)
+        self.stop_workflow(
+            message_id,
+            chat_id,
+            project,
+            terminal_is_noop=True,
+        )
 
     # ------------------------------------------------------------------
     # Confirm / Cancel actions (card button callbacks)
@@ -7732,8 +7856,10 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
     ):
         """Build WorkflowEngineCallbacks that update the Feishu card."""
         from ...workflow_engine.engine import WorkflowEngineCallbacks
+        from .workflow_card_pages import WorkflowCardPageDelivery
 
-        card_message_id: list[str] = [message_id]  # Mutable ref for card updates
+        card_message_id: list[str | None] = [message_id]  # Mutable ref for card updates
+        page_delivery = WorkflowCardPageDelivery(card_message_id)
         terminal_sent: list[bool] = [False]
         delivery_lock = (
             lifecycle_owner.delivery_lock
@@ -7743,7 +7869,9 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
         project_id = getattr(project, "project_id", "") or ""
         origin_message_id = self._resolve_origin(message_id)
 
-        def on_progress(card_data: dict[str, Any]) -> None:
+        def on_progress(
+            card_data: dict[str, Any] | list[dict[str, Any]],
+        ) -> None:
             """Update the progress card in Feishu."""
             with delivery_lock:
                 if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
@@ -7753,23 +7881,26 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                     # Keep runtime progress cards aligned with the mixin
                     # implementation: users can stop active workflows from the card,
                     # but terminal completion cards are delivered separately.
-                    self._inject_workflow_stop_button(
+                    status_card = card_data[0] if isinstance(card_data, list) and card_data else card_data
+                    if isinstance(status_card, dict):
+                        self._inject_workflow_stop_button(
+                            status_card,
+                            chat_id,
+                            project_id,
+                            is_running=self._workflow_is_running_for_card(chat_id, project),
+                        )
+                    delivery_result = page_delivery.deliver(
                         card_data,
-                        chat_id,
-                        project_id,
-                    )
-                    new_id = self._replace_or_send_workflow_rendered_card(
-                        card_message_id=card_message_id[0],
+                        replace_or_send=self._replace_or_send_workflow_rendered_card,
                         chat_id=chat_id,
-                        card_data=card_data,
                         origin_message_id=origin_message_id,
                         # Heartbeats are periodic. Turning every PATCH failure
                         # into a new message creates an unbounded card stream
                         # during persistent transport or provenance failures.
-                        fallback_to_new=False,
+                        status_fallback_to_new=False,
                     )
-                    if new_id:
-                        card_message_id[0] = new_id
+                    if delivery_result.status_message_id:
+                        card_message_id[0] = delivery_result.status_message_id
                 except Exception:
                     logger.debug(
                         "Failed to update workflow progress card",
@@ -7800,15 +7931,16 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                         wf_project,
                         report_status=report_status,
                     )
-                    new_id = self._replace_or_send_workflow_rendered_card(
-                        card_message_id=card_message_id[0],
+                    delivery_result = page_delivery.deliver(
+                        card_data,
+                        replace_or_send=self._replace_or_send_workflow_rendered_card,
                         chat_id=chat_id,
-                        card_data=card_data,
                         origin_message_id=origin_message_id,
+                        terminal=True,
                     )
-                    if new_id:
-                        card_message_id[0] = new_id
-                    else:
+                    if delivery_result.status_message_id:
+                        card_message_id[0] = delivery_result.status_message_id
+                    if not delivery_result.status_delivered:
                         # Card delivery returned None — try text fallback
                         raise RuntimeError("Card delivery returned None")
                 except Exception:
@@ -7825,31 +7957,18 @@ class WorkflowHandler(WorkflowSelectionMixin, WorkflowScriptMixin, BaseEngineHan
                 if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
                     return
                 terminal_sent[0] = True
-                from ...workflow_engine.errors import (
-                    ErrorCategory,
-                    _strip_internal_details,
-                    categorize_error,
-                )
+                from ...workflow_engine.errors import _strip_internal_details
 
-                category = categorize_error(error_msg)
-                if category == ErrorCategory.TOOL_NOT_ALLOWED:
-                    workflow_category = "forbidden"
-                elif category == ErrorCategory.SCRIPT_VALIDATION:
-                    workflow_category = "invalid_argument"
-                elif category == ErrorCategory.RUNTIME_TIMEOUT:
-                    workflow_category = "runtime_timeout"
-                elif category in (
-                    ErrorCategory.AGENT_LIMIT,
-                    ErrorCategory.CANCELLED,
-                ):
-                    workflow_category = "invalid_state"
-                else:
-                    workflow_category = "internal_error"
-
-                self._reply_workflow_error(
-                    message_id,
+                workflow_category = self._workflow_error_card_category(error_msg)
+                card = self._build_error_card(
                     workflow_category,
                     detail=_strip_internal_details(error_msg or ""),
+                )
+                self._replace_or_send_workflow_card(
+                    card_message_id=card_message_id[0],
+                    chat_id=chat_id,
+                    card=card,
+                    origin_message_id=origin_message_id,
                 )
 
         def on_log(msg: str) -> None:

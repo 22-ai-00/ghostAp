@@ -924,7 +924,7 @@ class SlockTaskMixin:
         if engine.channel:
             channel_owner_id = getattr(engine.channel, "owner_id", "") or ""
 
-        return (
+        return bool(
             (operator_id and operator_id in admin_ids)
             or (operator_id and channel_owner_id and operator_id == channel_owner_id)
         )

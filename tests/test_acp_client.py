@@ -993,6 +993,481 @@ def test_prompt_drains_late_image_update_even_after_text(tmp_path: Path):
     ]
 
 
+def test_reconciliation_prompt_waits_for_late_terminal_child_update(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+
+    def child_event(status: str) -> ACPEvent:
+        return ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="list-agents",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": status},
+                ),
+            ),
+        )
+
+    class FakeConn:
+        async def prompt(self, **_kwargs):
+            session._dispatch_event(child_event("running"))
+            asyncio.get_running_loop().call_later(
+                0.2,
+                session._dispatch_event,
+                child_event("completed"),
+            )
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-child-quiescence"
+
+    result = asyncio.run(
+        session.prompt(
+            "reconcile children",
+            await_child_quiescence=True,
+        )
+    )
+
+    assert classify_prompt_result(result).outcome is PromptOutcome.COMPLETED
+
+
+def test_prompt_replays_terminal_child_update_received_between_turns(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    deferred_event = ACPEvent(
+        event_type=ACPEventType.TOOL_CALL_UPDATE,
+        tool_call=ToolCallInfo(
+            id="list-between-turns",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            collaboration_tool="list_agents",
+            subagent_states=(
+                {"source_id": "reviewer", "status": "completed"},
+            ),
+        ),
+    )
+    session._dispatch_event(deferred_event)
+
+    class FakeConn:
+        async def prompt(self, **_kwargs):
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-deferred-child"
+    events: list[ACPEvent] = []
+
+    result = asyncio.run(
+        session.prompt(
+            "collect deferred child state",
+            on_event=events.append,
+            await_child_quiescence=True,
+        )
+    )
+
+    assert result.tool_calls[0].subagent_states == (
+        {"source_id": "reviewer", "status": "completed"},
+    )
+    assert len(events) == 1
+    assert events[0] is deferred_event
+
+
+def test_ordinary_prompt_discards_deferred_child_state_from_previous_task(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    session._dispatch_event(ACPEvent(
+        event_type=ACPEventType.TOOL_CALL_UPDATE,
+        tool_call=ToolCallInfo(
+            id="previous-task-list-agents",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            collaboration_tool="list_agents",
+            subagent_states=(
+                {"source_id": "previous-reviewer", "status": "running"},
+            ),
+        ),
+    ))
+
+    class FakeConn:
+        async def prompt(self, **_kwargs):
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-new-user-task"
+    events: list[ACPEvent] = []
+
+    result = asyncio.run(
+        session.prompt(
+            "start an unrelated user task",
+            on_event=events.append,
+        )
+    )
+
+    assert result.tool_calls == []
+    assert events == []
+    assert classify_prompt_result(result).outcome is PromptOutcome.COMPLETED
+
+
+def test_ordinary_prompt_ignores_late_child_update_from_prior_prompt(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    stale_call = ToolCallInfo(
+        id="prior-prompt-list-agents",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "prior-reviewer", "status": "running"},
+        ),
+    )
+
+    class FakeConn:
+        calls = 0
+
+        async def prompt(self, **_kwargs):
+            self.calls += 1
+            session._dispatch_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=stale_call,
+            ))
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-prior-call-fence"
+
+    first_result = asyncio.run(session.prompt("previous task"))
+    second_events: list[ACPEvent] = []
+    second_result = asyncio.run(
+        session.prompt(
+            "new unrelated task",
+            on_event=second_events.append,
+        )
+    )
+
+    assert first_result.tool_calls == [stale_call]
+    assert second_result.tool_calls == []
+    assert second_events == []
+
+
+def test_deferred_child_call_id_fences_another_late_update(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+    stale_call = ToolCallInfo(
+        id="deferred-prior-call",
+        title="list_agents",
+        kind="other",
+        status="completed",
+        collaboration_tool="list_agents",
+        subagent_states=(
+            {"source_id": "prior-reviewer", "status": "running"},
+        ),
+    )
+    session._dispatch_event(ACPEvent(
+        event_type=ACPEventType.TOOL_CALL_UPDATE,
+        tool_call=stale_call,
+    ))
+
+    class FakeConn:
+        async def prompt(self, **_kwargs):
+            session._dispatch_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=stale_call,
+            ))
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-deferred-call-fence"
+
+    result = asyncio.run(session.prompt("new unrelated task"))
+
+    assert result.tool_calls == []
+
+
+def test_ordinary_prompt_filters_prior_child_source_under_new_call_id(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+
+    def child_snapshot(call_id: str) -> ACPEvent:
+        return ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id=call_id,
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                subagent_states=(
+                    {"source_id": "prior-reviewer", "status": "running"},
+                ),
+            ),
+        )
+
+    class FakeConn:
+        calls = 0
+
+        async def prompt(self, **_kwargs):
+            self.calls += 1
+            session._dispatch_event(child_snapshot(
+                "prior-list" if self.calls == 1 else "new-list-id"
+            ))
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-prior-source-fence"
+
+    first_result = asyncio.run(session.prompt("previous task"))
+    second_result = asyncio.run(session.prompt("new unrelated task"))
+
+    assert len(first_result.tool_calls) == 1
+    assert second_result.tool_calls == []
+
+
+def test_ordinary_prompt_filters_malformed_prior_child_snapshot(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+
+    class FakeConn:
+        calls = 0
+
+        async def prompt(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                tool_call = ToolCallInfo(
+                    id="prior-list",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    subagent_states=(
+                        {"source_id": "prior-reviewer", "status": "running"},
+                    ),
+                )
+            else:
+                tool_call = ToolCallInfo(
+                    id="malformed-late-list",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    collaboration_receivers="prior-reviewer",  # type: ignore[arg-type]
+                    child_metadata_malformed=True,
+                )
+            session._dispatch_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=tool_call,
+            ))
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-malformed-prior-source"
+
+    asyncio.run(session.prompt("previous task"))
+    second_result = asyncio.run(session.prompt("new unrelated task"))
+
+    assert second_result.tool_calls == []
+
+
+def test_prior_child_source_fence_survives_multiple_unrelated_prompts(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+
+    class FakeConn:
+        calls = 0
+
+        async def prompt(self, **_kwargs):
+            self.calls += 1
+            if self.calls in {1, 3}:
+                session._dispatch_event(ACPEvent(
+                    event_type=ACPEventType.TOOL_CALL_UPDATE,
+                    tool_call=ToolCallInfo(
+                        id=f"list-call-{self.calls}",
+                        title="list_agents",
+                        kind="other",
+                        status="completed",
+                        collaboration_tool="list_agents",
+                        subagent_states=(
+                            {
+                                "source_id": "very-late-reviewer",
+                                "status": "running",
+                            },
+                        ),
+                    ),
+                ))
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-persistent-source-fence"
+
+    first_result = asyncio.run(session.prompt("first task"))
+    second_result = asyncio.run(session.prompt("second unrelated task"))
+    third_result = asyncio.run(session.prompt("third unrelated task"))
+
+    assert len(first_result.tool_calls) == 1
+    assert second_result.tool_calls == []
+    assert third_result.tool_calls == []
+
+
+def test_ordinary_prompt_allows_explicit_followup_for_prior_child_source(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+
+    class FakeConn:
+        calls = 0
+
+        async def prompt(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                tool_call = ToolCallInfo(
+                    id="prior-list",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    subagent_states=(
+                        {
+                            "source_id": "shared-reviewer",
+                            "status": "completed",
+                        },
+                    ),
+                )
+            else:
+                tool_call = ToolCallInfo(
+                    id="new-followup",
+                    title="followup_task",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="followup_task",
+                    collaboration_receivers=("shared-reviewer",),
+                    subagent_states=(
+                        {
+                            "source_id": "shared-reviewer",
+                            "status": "running",
+                        },
+                    ),
+                )
+            session._dispatch_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=tool_call,
+            ))
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-explicit-followup"
+
+    asyncio.run(session.prompt("previous task"))
+    second_result = asyncio.run(session.prompt("new explicit followup"))
+
+    assert len(second_result.tool_calls) == 1
+    assert second_result.tool_calls[0].collaboration_tool == "followup_task"
+
+
+def test_ordinary_prompt_allows_reused_call_id_for_new_child_source(
+    tmp_path: Path,
+):
+    from types import SimpleNamespace
+
+    from src.acp.models import ACPEventType, ToolCallInfo
+    from src.acp.session import ACPSession
+
+    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
+
+    class FakeConn:
+        calls = 0
+
+        async def prompt(self, **_kwargs):
+            self.calls += 1
+            source_id = (
+                "first-reviewer"
+                if self.calls == 1
+                else "second-reviewer"
+            )
+            session._dispatch_event(ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=ToolCallInfo(
+                    id="provider-reused-list-id",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    subagent_states=(
+                        {"source_id": source_id, "status": "running"},
+                    ),
+                ),
+            ))
+            return SimpleNamespace(stop_reason="end_turn")
+
+    session._conn = FakeConn()
+    session._session_id = "session-reused-call-id"
+
+    asyncio.run(session.prompt("first task"))
+    second_result = asyncio.run(session.prompt("second task"))
+
+    assert len(second_result.tool_calls) == 1
+    assert second_result.tool_calls[0].subagent_states == (
+        {"source_id": "second-reviewer", "status": "running"},
+    )
+
+
 def test_prompt_preserves_empty_stop_reason_for_fail_closed_classification(
     tmp_path: Path,
 ):
@@ -1536,6 +2011,71 @@ class TestParseToolCall:
             {"source_id": "thread-b", "status": "completed", "message": "已核查 Deep 卡"},
         )
 
+    def test_codex_list_agents_without_namespaced_metadata_is_normalized(self):
+        update = MockToolCallProgress(
+            tool_call_id="list-agents-compatible",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            raw_input={
+                "agentsStates": {
+                    "thread-a": {"status": "completed", "message": "done"},
+                },
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.collaboration_tool == "list_agents"
+        assert tc.subagent_states == (
+            {"source_id": "thread-a", "status": "completed", "message": "done"},
+        )
+        assert classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        ).outcome is PromptOutcome.COMPLETED
+
+    def test_codex_collaboration_output_terminal_state_overrides_stale_input(self):
+        update = MockToolCallProgress(
+            tool_call_id="list-agents-output",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            raw_input={
+                "agentsStates": {
+                    "thread-a": {"status": "running", "message": "working"},
+                },
+            },
+            raw_output={
+                "agentsStates": {
+                    "thread-a": {"status": "completed", "message": "done"},
+                },
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.subagent_states == (
+            {"source_id": "thread-a", "status": "completed", "message": "done"},
+        )
+
+    def test_unknown_tool_cannot_claim_compatible_collaboration_state(self):
+        update = MockToolCallProgress(
+            tool_call_id="untrusted-compatible-shape",
+            title="unknown_tool",
+            kind="other",
+            status="completed",
+            raw_input={
+                "agentsStates": {
+                    "thread-a": {"status": "completed", "message": "done"},
+                },
+            },
+        )
+
+        tc = _parse_tool_call(update)
+
+        assert tc.collaboration_tool is None
+        assert tc.subagent_states == ()
+
     def test_codex_collaboration_rejects_scalar_receiver_ids(self):
         update = MockToolCallStart(
             tool_call_id="collaboration-call-private",
@@ -1943,7 +2483,7 @@ def test_permission_bridge_filter_exception_fails_closed_before_auto_approve():
     assert response.outcome.outcome == "cancelled"
 
 
-def test_permission_bridge_malformed_execute_command_remains_fail_closed():
+def test_permission_bridge_dangerous_argv_remains_fail_closed():
     client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
     option = PermissionOption(
         optionId="allow-once",
@@ -1963,6 +2503,77 @@ def test_permission_bridge_malformed_execute_command_remains_fail_closed():
     )
 
     assert response.outcome.outcome == "cancelled"
+
+
+def test_permission_bridge_accepts_safe_canonical_argv():
+    seen: list[tuple[str, dict]] = []
+    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
+    client.set_tool_filter(
+        lambda tool, args: seen.append((tool, args or {})) or tool == "git"
+    )
+    option = PermissionOption(
+        optionId="allow-once",
+        name="Allow once",
+        kind="allow_once",
+    )
+    argv = ["git", "status", "--short"]
+
+    response = asyncio.run(
+        client.request_permission(
+            options=[option],
+            session_id="s1",
+            tool_call=SimpleNamespace(
+                kind="execute",
+                raw_input={"command": argv},
+            ),
+        )
+    )
+
+    assert response.outcome.outcome == "selected"
+    assert seen == [
+        (
+            "git",
+            {
+                "command": "git status --short",
+                "argv": argv,
+                "cwd": client._root_dir,  # noqa: SLF001
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        [],
+        ["echo", 1],
+        [["echo"], "hello"],
+        {"program": "echo"},
+    ),
+)
+def test_permission_bridge_malformed_argv_remains_fail_closed(command):
+    seen: list[tuple[str, dict]] = []
+    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
+    client.set_tool_filter(lambda tool, args: seen.append((tool, args or {})) or True)
+    option = PermissionOption(
+        optionId="allow-once",
+        name="Allow once",
+        kind="allow_once",
+    )
+
+    response = asyncio.run(
+        client.request_permission(
+            options=[option],
+            session_id="s1",
+            tool_call=SimpleNamespace(
+                kind="execute",
+                raw_input={"command": command},
+            ),
+        )
+    )
+
+    assert response.outcome.outcome == "cancelled"
+    assert seen == []
 
 
 def test_permission_bridge_classifies_canonical_git_execute_as_git():
@@ -2015,6 +2626,7 @@ def test_permission_bridge_fails_closed_when_safety_check_raises():
     sandbox = MagicMock(spec=SandboxExecutor)
     sandbox.is_command_safe.side_effect = RuntimeError("safety backend unavailable")
     client = GhostAPClient(on_event=lambda e: None, auto_approve=True, sandbox=sandbox)
+    client._record = MagicMock()  # noqa: SLF001
 
     opt = MagicMock()
     opt.kind = "allow_once"
@@ -2028,6 +2640,17 @@ def test_permission_bridge_fails_closed_when_safety_check_raises():
         asyncio.set_event_loop(loop)
         resp = loop.run_until_complete(client.request_permission(options=[opt], session_id="s1", tool_call=tool_call))
         assert resp.outcome.outcome == "cancelled"
+        client._record.assert_called_once_with(  # noqa: SLF001
+            "s1",
+            "permission",
+            {
+                "outcome": "cancelled",
+                "reason": "permission_safety_check_failed",
+                "stage": "sandbox",
+                "kind": "execute",
+                "command_shape": "str",
+            },
+        )
     finally:
         loop.close()
 

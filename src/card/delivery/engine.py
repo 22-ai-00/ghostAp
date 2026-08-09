@@ -780,6 +780,13 @@ class CardDelivery:
                                 )
                         if page.card_id:
                             self._sequences.reset(page.card_id)
+                            release = getattr(
+                                self._client,
+                                "release_cardkit_entity",
+                                None,
+                            )
+                            if callable(release):
+                                release(page.card_id)
                 self._bindings.remove(session_id)
         finally:
             # The per-session lock is independent of binding cleanup.  Never

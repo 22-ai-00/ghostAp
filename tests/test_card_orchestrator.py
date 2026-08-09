@@ -274,7 +274,16 @@ class TestSubagentSession:
 
 
 class TestAgentTaskRouting:
-    def _tool_event(self, event_type, *, tool_id="agent_1", title="agent", content="", status="in_progress"):
+    def _tool_event(
+        self,
+        event_type,
+        *,
+        tool_id="agent_1",
+        title="agent",
+        kind="execute",
+        content="",
+        status="in_progress",
+    ):
         from src.acp.models import ACPEvent, ToolCallInfo
 
         return ACPEvent(
@@ -282,7 +291,7 @@ class TestAgentTaskRouting:
             tool_call=ToolCallInfo(
                 id=tool_id,
                 title=title,
-                kind="execute",
+                kind=kind,
                 status=status,
                 content=content,
             ),
@@ -311,6 +320,39 @@ class TestAgentTaskRouting:
         assert registry.count == 0
         assert orch.active_session_count == 0
         assert sessions == {}
+
+    @pytest.mark.parametrize(
+        ("kind", "content"),
+        [
+            pytest.param("agent", "provider payload", id="unknown-title-agent-kind"),
+            pytest.param(
+                "other",
+                "检查实现\n子代理：FutureProvider",
+                id="unknown-title-other-with-subagent-marker",
+            ),
+        ],
+    )
+    def test_unknown_title_agent_compatibility_routes_to_independent_card(
+        self,
+        kind,
+        content,
+    ):
+        from src.acp.models import ACPEventType
+
+        orch, registry, sessions = _make_orchestrator()
+        bridge = FakeStreamBridge()
+        event = self._tool_event(
+            ACPEventType.TOOL_CALL_START,
+            tool_id="future_agent_tool_1",
+            title="future_provider_tool",
+            kind=kind,
+            content=content,
+        )
+
+        assert orch.route_or_fallback(event, bridge) is True
+        assert registry.get("future_agent_tool_1") is not None
+        assert "future_agent_tool_1" in sessions
+        assert bridge.events == []
 
     def test_agent_tool_call_gets_independent_task_card_and_terminal_result(self):
         """Deep-style agent tool calls route to their own session, not only the parent task card."""
@@ -681,6 +723,361 @@ class TestAgentTaskRouting:
         failed = sessions["thread-b"].events_of_type(CardEventType.FAILED)
         assert failed[-1].payload["error"] == "B 校验失败"
 
+    def test_followup_task_reopens_completed_child_with_new_card_generation(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        created_sessions: dict[str, list[FakeSession]] = {}
+
+        def create_session(task_id: str):
+            generation = len(created_sessions.get(task_id, ())) + 1
+            session = FakeSession(
+                session_id=f"session_{task_id}_{generation}"
+            )
+            created_sessions.setdefault(task_id, []).append(session)
+            return session
+
+        orch, registry, _ = _make_orchestrator(
+            session_creator=create_session,
+        )
+        fallback = FakeStreamBridge()
+        source_id = "thread-followup-card-generation"
+
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="list-terminal-generation-one",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": "第一轮完成",
+                    },
+                ),
+            ),
+        ), fallback)
+
+        first_session = created_sessions[source_id][0]
+        assert registry.get(source_id).status == "completed"
+        assert first_session.events_of_type(CardEventType.COMPLETED)
+
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="followup-generation-two",
+                title="followup_task",
+                kind="other",
+                status="completed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "running",
+                        "message": "第二轮执行中",
+                    },
+                ),
+            ),
+        ), fallback)
+
+        assert len(created_sessions[source_id]) == 2
+        second_session = created_sessions[source_id][1]
+        assert registry.get(source_id).status == "in_progress"
+        progress = second_session.events_of_type(CardEventType.PROGRESS_UPDATED)
+        assert progress[-1].payload["label"] == "第二轮执行中"
+        assert not second_session.events_of_type(CardEventType.COMPLETED)
+        assert fallback.events == []
+
+    def test_followup_generation_create_failure_keeps_old_terminal_child(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        create_count = 0
+        first_session = FakeSession(session_id="session_generation_one")
+
+        def create_session(_task_id: str):
+            nonlocal create_count
+            create_count += 1
+            if create_count == 1:
+                return first_session
+            raise RuntimeError("card allocation failed")
+
+        orch, registry, _ = _make_orchestrator(
+            session_creator=create_session,
+        )
+        fallback = FakeStreamBridge()
+        source_id = "thread-followup-create-failure"
+
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="list-terminal-before-create-failure",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": "第一轮完成",
+                    },
+                ),
+            ),
+        ), fallback)
+
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="followup-create-failure",
+                title="followup_task",
+                kind="other",
+                status="completed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "running",
+                        "message": "第二轮执行中",
+                    },
+                ),
+            ),
+        ), fallback)
+
+        assert create_count == 2
+        assert registry.get(source_id).status == "completed"
+        assert first_session.events_of_type(CardEventType.COMPLETED)
+        assert fallback.events
+
+    def test_followup_generation_initial_dispatch_failure_keeps_old_terminal_child(
+        self,
+    ):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        create_count = 0
+        first_session = FakeSession(session_id="session_generation_one")
+
+        class FailingSession(FakeSession):
+            def dispatch(self, event: CardEvent) -> None:
+                raise RuntimeError("initial delivery failed")
+
+        def create_session(_task_id: str):
+            nonlocal create_count
+            create_count += 1
+            if create_count == 1:
+                return first_session
+            return FailingSession(session_id="session_generation_two")
+
+        orch, registry, _ = _make_orchestrator(
+            session_creator=create_session,
+        )
+        fallback = FakeStreamBridge()
+        source_id = "thread-followup-dispatch-failure"
+
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="list-terminal-before-dispatch-failure",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "completed",
+                        "message": "第一轮完成",
+                    },
+                ),
+            ),
+        ), fallback)
+
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="followup-dispatch-failure",
+                title="followup_task",
+                kind="other",
+                status="completed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=(source_id,),
+                subagent_states=(
+                    {
+                        "source_id": source_id,
+                        "status": "running",
+                        "message": "第二轮执行中",
+                    },
+                ),
+            ),
+        ), fallback)
+
+        assert create_count == 2
+        assert registry.get(source_id).status == "completed"
+        assert first_session.events_of_type(CardEventType.COMPLETED)
+        assert fallback.events
+
+    def test_concurrent_followup_generation_creates_only_one_new_child_card(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        create_count = 0
+        create_started = threading.Event()
+        release_create = threading.Event()
+
+        def create_session(task_id: str):
+            nonlocal create_count
+            create_count += 1
+            if create_count == 2:
+                create_started.set()
+                assert release_create.wait(timeout=2)
+            return FakeSession(
+                session_id=f"session_{task_id}_{create_count}"
+            )
+
+        orch, registry, _ = _make_orchestrator(
+            session_creator=create_session,
+        )
+        source_id = "thread-concurrent-followup"
+
+        def event(tool_id: str, status: str) -> ACPEvent:
+            return ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title=(
+                        "list_agents"
+                        if status == "completed"
+                        else "followup_task"
+                    ),
+                    kind="other",
+                    status="completed",
+                    collaboration_tool=(
+                        "list_agents"
+                        if status == "completed"
+                        else "followup_task"
+                    ),
+                    collaboration_receivers=(source_id,),
+                    subagent_states=(
+                        {
+                            "source_id": source_id,
+                            "status": status,
+                        },
+                    ),
+                ),
+            )
+
+        orch.route_acp_event(
+            event("terminal-before-concurrent-followup", "completed"),
+            FakeStreamBridge(),
+        )
+
+        first = threading.Thread(
+            target=orch.route_acp_event,
+            args=(
+                event("followup-concurrent-one", "running"),
+                FakeStreamBridge(),
+            ),
+        )
+        second = threading.Thread(
+            target=orch.route_acp_event,
+            args=(
+                event("followup-concurrent-two", "running"),
+                FakeStreamBridge(),
+            ),
+        )
+        first.start()
+        assert create_started.wait(timeout=2)
+        second.start()
+        time.sleep(0.05)
+        assert second.is_alive()
+        release_create.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert create_count == 2
+        assert registry.get(source_id).status == "in_progress"
+
+    def test_reset_rejects_inflight_followup_generation_card(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        create_count = 0
+        created_sessions: list[FakeSession] = []
+        create_started = threading.Event()
+        release_create = threading.Event()
+
+        def create_session(task_id: str):
+            nonlocal create_count
+            create_count += 1
+            if create_count == 2:
+                create_started.set()
+                assert release_create.wait(timeout=2)
+            session = FakeSession(
+                session_id=f"session_{task_id}_{create_count}"
+            )
+            created_sessions.append(session)
+            return session
+
+        orch, registry, _ = _make_orchestrator(
+            session_creator=create_session,
+        )
+        fallback = FakeStreamBridge()
+        source_id = "thread-reset-during-followup"
+
+        def event(tool_id: str, status: str) -> ACPEvent:
+            return ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id=tool_id,
+                    title=(
+                        "list_agents"
+                        if status == "completed"
+                        else "followup_task"
+                    ),
+                    kind="other",
+                    status="completed",
+                    collaboration_tool=(
+                        "list_agents"
+                        if status == "completed"
+                        else "followup_task"
+                    ),
+                    collaboration_receivers=(source_id,),
+                    subagent_states=(
+                        {
+                            "source_id": source_id,
+                            "status": status,
+                        },
+                    ),
+                ),
+            )
+
+        orch.route_acp_event(
+            event("terminal-before-reset", "completed"),
+            fallback,
+        )
+        followup_thread = threading.Thread(
+            target=orch.route_acp_event,
+            args=(event("followup-during-reset", "running"), fallback),
+        )
+        followup_thread.start()
+        assert create_started.wait(timeout=2)
+
+        orch.reset()
+        release_create.set()
+        followup_thread.join(timeout=2)
+
+        assert not followup_thread.is_alive()
+        assert orch.active_session_count == 0
+        assert registry.get(source_id).status == "completed"
+        assert created_sessions[1].dispatched_events == []
+        assert fallback.events
+
     def test_parent_completion_cancels_only_unfinished_subagents(self):
         from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 
@@ -777,6 +1174,71 @@ class TestAgentTaskRouting:
 
         assert physical.events_of_type(CardEventType.FAILED)
         assert not physical.events_of_type(CardEventType.COMPLETED)
+
+    def test_overflow_followup_reopens_finalized_shared_child_card(self):
+        from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
+
+        created_sessions: dict[str, list[FakeSession]] = {}
+
+        def create_session(task_id: str):
+            generation = len(created_sessions.get(task_id, ())) + 1
+            session = FakeSession(
+                session_id=f"session_{task_id}_{generation}"
+            )
+            created_sessions.setdefault(task_id, []).append(session)
+            return session
+
+        orch, registry, _ = _make_orchestrator(
+            session_creator=create_session,
+            max_task_cards=1,
+        )
+        fallback = FakeStreamBridge()
+
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_UPDATE,
+            tool_call=ToolCallInfo(
+                id="overflow-list",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=("thread-a", "thread-b"),
+                subagent_states=(
+                    {"source_id": "thread-a", "status": "completed"},
+                    {"source_id": "thread-b", "status": "completed"},
+                ),
+            ),
+        ), fallback)
+        assert registry.get("thread-a").status == "completed"
+        assert registry.get("thread-b").status == "completed"
+        assert len(created_sessions["thread-a"]) == 1
+
+        orch.route_acp_event(ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="overflow-followup",
+                title="followup_task",
+                kind="other",
+                status="completed",
+                collaboration_tool="followup_task",
+                collaboration_receivers=("thread-b",),
+                subagent_states=(
+                    {
+                        "source_id": "thread-b",
+                        "status": "running",
+                        "message": "B 第二轮执行中",
+                    },
+                ),
+            ),
+        ), fallback)
+
+        assert len(created_sessions["thread-a"]) == 2
+        assert registry.get("thread-a").status == "completed"
+        assert registry.get("thread-b").status == "in_progress"
+        second_card = created_sessions["thread-a"][1]
+        progress = second_card.events_of_type(CardEventType.PROGRESS_UPDATED)
+        assert progress[-1].payload["label"] == "B 第二轮执行中"
+        assert not second_card.events_of_type(CardEventType.COMPLETED)
 
     def test_agent_image_routes_to_its_bound_child_bridge(self):
         from src.acp.models import (

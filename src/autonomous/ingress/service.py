@@ -448,6 +448,12 @@ class EmployeeIngressService:
             self._ensure_open_unlocked()
             fresh = IngressProjectionState()
             anchor = self._writer.anchor.read()
+            cursor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
+            if getattr(self, "_projection_verified", False) and (
+                self._state.cursor_sequence,
+                self._state.cursor_hash,
+            ) == (anchor.sequence, cursor_hash):
+                return self._state
             anchored_frame_hash = GENESIS_HASH
             for frame in self._writer.replay():
                 if frame.sequence > anchor.sequence:
@@ -482,6 +488,7 @@ class EmployeeIngressService:
                     fresh.closed_employees.add(record.employee_key)
             self._replace_state_unlocked(fresh)
             self._quarantine_unreferenced_blobs_unlocked()
+            self._projection_verified = True
             return self._state
 
     def _ensure_open_unlocked(self) -> None:

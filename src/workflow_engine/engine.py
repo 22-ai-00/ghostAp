@@ -156,6 +156,15 @@ def _terminal_failure_from_project(project: WorkflowProject) -> str | None:
     return None
 
 
+def _agent_card_result_text(result: AgentCallResult) -> str:
+    """Return the sanitized, complete terminal text kept for card rendering."""
+    raw: Any = result.output
+    if (raw is None or raw == "") and result.parsed is not None:
+        raw = json.dumps(result.parsed, ensure_ascii=False, default=str)
+    text = _strip_internal_details(str(raw or ""))
+    return text.replace("\x00", "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Callbacks
 # ---------------------------------------------------------------------------
@@ -165,7 +174,7 @@ def _terminal_failure_from_project(project: WorkflowProject) -> str | None:
 class WorkflowEngineCallbacks:
     """Event callbacks for the Workflow Engine handler layer."""
 
-    on_progress: Optional[Callable[[dict[str, Any]], None]] = None
+    on_progress: Optional[Callable[[list[dict[str, Any]]], None]] = None
     on_done: Optional[Callable[[WorkflowProject], None]] = None
     on_error: Optional[Callable[[str], None]] = None
     on_log: Optional[Callable[[str], None]] = None
@@ -1271,6 +1280,7 @@ class WorkflowEngine(BaseEngine):
                             "token_usage": 0,
                             "duration_s": 0.0,
                             "cached": True,
+                            "result": _agent_card_result_text(cached_result),
                         },
                     )
                 self._fire_progress()
@@ -1309,7 +1319,11 @@ class WorkflowEngine(BaseEngine):
         # Update state
         if self._state_manager:
             if result.error:
-                self._state_manager.on_agent_failed(label, result.error)
+                self._state_manager.on_agent_failed(
+                    label,
+                    result.error,
+                    result=_agent_card_result_text(result),
+                )
             else:
                 self._state_manager.on_agent_done(
                     label,
@@ -1317,6 +1331,7 @@ class WorkflowEngine(BaseEngine):
                         "token_usage": result.token_usage,
                         "duration_s": result.duration_s,
                         "cached": False,
+                        "result": _agent_card_result_text(result),
                     },
                 )
 
@@ -1425,11 +1440,9 @@ class WorkflowEngine(BaseEngine):
         if not self._callbacks or not self._callbacks.on_progress:
             return
         try:
-            if self._state_manager:
-                snapshot = self._state_manager.snapshot()
-                card_data = self._renderer_wf.render_progress_card(snapshot)
-            else:
-                card_data = self._renderer_wf.render_progress_card()
+            card_data = self.get_progress_cards()
+            if not card_data:
+                return
             if self._progress_coalescer:
                 if immediate:
                     self._progress_coalescer.flush_immediate(card_data)
@@ -1439,6 +1452,14 @@ class WorkflowEngine(BaseEngine):
                 self._callbacks.on_progress(card_data)
         except Exception:
             logger.debug("on_progress callback failed", exc_info=True)
+
+    def get_progress_cards(self) -> list[dict[str, Any]]:
+        """Return the status card followed by immutable result-ledger pages."""
+        if not self._renderer_wf:
+            return []
+        if self._state_manager:
+            return self._renderer_wf.render_progress_cards(self._state_manager.snapshot())
+        return self._renderer_wf.render_progress_cards()
 
     # ------------------------------------------------------------------
     # Progress heartbeat

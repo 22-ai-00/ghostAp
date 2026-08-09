@@ -101,7 +101,7 @@ WORKFLOW_STATUS_ICONS: dict[WorkflowStatus, str] = {
 
 _PHASE_AGENT_DISPLAY_LIMIT = 20
 _PHASE_COMPLETED_TAIL = 5
-_CARD_MAX_BYTES = 28_000  # Feishu card payload limit with safety margin
+_CARD_MAX_BYTES = 27 * 1024  # Shared card payload budget with safety margin.
 _SUBAGENT_DISPLAY_LIMIT = 12
 
 _SUBAGENT_STATUS_META: dict[SubagentStatus, tuple[str, str]] = {
@@ -371,6 +371,11 @@ class WorkflowProgressRenderer:
                 self._project = saved
         return self._render_progress_card_impl()
 
+    def render_progress_cards(self, project: WorkflowProject | None = None) -> list[dict[str, Any]]:
+        """Render one mutable status page followed by append-only result pages."""
+        target = project or self._project
+        return [self.render_progress_card(target), *_render_result_ledger_cards(target)]
+
     def _render_progress_card_impl(self) -> dict[str, Any]:
         elements: list[dict[str, Any]] = []
 
@@ -412,8 +417,10 @@ class WorkflowProgressRenderer:
         # Find a running agent first; fall back to the most-recently changed
         # agent across all phases.
         running_agent: Any = None
+        running_phase: PhaseProgress | None = None
+        running_changed_at: float | None = None
         latest_agent: Any = None
-        latest_phase: PhaseProgress | None = None
+        latest_agent_phase: PhaseProgress | None = None
         latest_changed_at: float | None = None
         latest_phase_only: PhaseProgress | None = None
         latest_phase_changed_at: float | None = None
@@ -424,18 +431,33 @@ class WorkflowProgressRenderer:
                 latest_phase_only = phase
                 latest_phase_changed_at = phase_changed_at
             for agent in phase.agents:
-                if agent.status == AgentStatus.RUNNING and running_agent is None:
+                activity_changed_at = (
+                    getattr(agent, "activity_updated_at", None)
+                    or getattr(agent, "started_at", None)
+                    or 0.0
+                )
+                if agent.status == AgentStatus.RUNNING and (
+                    running_changed_at is None or activity_changed_at >= running_changed_at
+                ):
                     running_agent = agent
-                    latest_phase = phase
+                    running_phase = phase
+                    running_changed_at = activity_changed_at
                 # Track most recently changed agent
-                changed_at = getattr(agent, "finished_at", None) or getattr(agent, "started_at", None) or 0.0
+                changed_at = (
+                    getattr(agent, "finished_at", None)
+                    or getattr(agent, "activity_updated_at", None)
+                    or getattr(agent, "started_at", None)
+                    or 0.0
+                )
                 if latest_changed_at is None or changed_at > latest_changed_at:
                     latest_agent = agent
+                    latest_agent_phase = phase
                     latest_changed_at = changed_at
-                    if running_agent is None:
-                        latest_phase = phase
 
         active_agent = running_agent or latest_agent
+        latest_phase = running_phase if running_agent is not None else latest_agent_phase
+        if running_agent is not None:
+            latest_changed_at = running_changed_at
         if active_agent is None and latest_phase is None:
             latest_phase = latest_phase_only
             latest_changed_at = latest_phase_changed_at
@@ -482,7 +504,7 @@ class WorkflowProgressRenderer:
             if active_agent.task_summary:
                 lines.append(f"📋 **当前任务:** {_middle_ellipsis(active_agent.task_summary, 60)}")
             activity = getattr(active_agent, "current_activity", "") or ""
-            if activity:
+            if activity and not terminal and active_agent.status == AgentStatus.RUNNING:
                 lines.append(f"⚡ **正在:** {_middle_ellipsis(activity, 60)}")
         else:
             lines.append(f"🤖 **{agent_label_key}:** (无代理调用)")
@@ -671,10 +693,7 @@ class WorkflowProgressRenderer:
                 subagent_text = _render_subagent_lines(agent.subagents)
                 if agent.status == AgentStatus.RUNNING:
                     summary_text = ""
-                    activity_text = getattr(agent, "current_activity", "") or ""
-                    if activity_text:
-                        summary_text = f"\n    > {_middle_ellipsis(activity_text, 60)}"
-                    elif agent.task_summary:
+                    if agent.task_summary:
                         summary_text = f"\n    > {_middle_ellipsis(agent.task_summary, 60)}"
                     # Live elapsed suffix so a long-running agent's line keeps
                     # advancing (paired with the engine heartbeat re-render).
@@ -1192,6 +1211,205 @@ def render_completion_card(
         minimal_elements.append(_md_element(f"\u274c **错误**: {safe_project_err}"))
     _card_text_for_agent_output(minimal_elements, _AGENT_OUTPUT_FORBIDDEN_MARKERS)
     return {"header": header, "elements": minimal_elements}
+
+
+def render_completion_cards(
+    project: WorkflowProject,
+    *,
+    report_status: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Render one terminal status page followed by the complete result ledger."""
+    return [
+        render_completion_card(project, report_status=report_status),
+        *_render_result_ledger_cards(project),
+    ]
+
+
+def _result_ledger_entries(project: WorkflowProject) -> list[tuple[str, str, str]]:
+    terminal = {AgentStatus.DONE, AgentStatus.CACHED, AgentStatus.FAILED}
+    flattened = [agent for phase in project.phases for agent in phase.agents]
+    ordered_agents = [
+        agent
+        for _, agent in sorted(
+            enumerate(flattened),
+            key=lambda pair: (getattr(pair[1], "call_index", pair[0]), pair[0]),
+        )
+        if agent.status in terminal
+    ]
+    status_labels = {
+        AgentStatus.DONE: "已完成",
+        AgentStatus.CACHED: "缓存命中",
+        AgentStatus.FAILED: "失败",
+    }
+    entries: list[tuple[str, str, str]] = []
+    for ordinal, agent in enumerate(ordered_agents, start=1):
+        binding = agent.tool or "未指定工具"
+        if agent.model:
+            binding += f" / {agent.model}"
+        result_text = str(getattr(agent, "result", None) or "").strip()
+        error_text = _strip_internal_details(str(agent.error or "")).strip()
+        if result_text and error_text:
+            body = f"{result_text}\n\n错误: {error_text}"
+        elif result_text:
+            body = result_text
+        elif error_text:
+            body = f"错误: {error_text}"
+        else:
+            body = "（无结果）"
+        entries.append(
+            (
+                f"Agent 结果 {ordinal} · {_middle_ellipsis(agent.label or 'agent', 60)}",
+                f"状态: {status_labels[agent.status]} · 工具: {_middle_ellipsis(binding, 80)}",
+                body,
+            )
+        )
+
+    for ordinal, evidence in enumerate(project.reviewer_evidence, start=1):
+        output = str(evidence.output or "").strip()
+        error = _strip_internal_details(str(evidence.error or "")).strip()
+        if output and error:
+            body = f"{output}\n\n错误: {error}"
+        elif output:
+            body = output
+        elif error:
+            body = f"错误: {error}"
+        else:
+            body = "（无结果）"
+        display_name = evidence.display_name or f"Reviewer {ordinal}"
+        entries.append(
+            (
+                f"评审结果 {ordinal} · {_middle_ellipsis(display_name, 60)}",
+                f"状态: {evidence.status} · 工具: {_middle_ellipsis(evidence.tool, 80)}",
+                body,
+            )
+        )
+
+    workflow_terminal = project.status in (
+        WorkflowStatus.COMPLETED,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.CANCELLED,
+    )
+    if project.result is not None or workflow_terminal:
+        raw_result = str(project.result or "").strip()
+        if raw_result:
+            try:
+                decoded = json.loads(raw_result)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                body = raw_result
+            else:
+                body = (
+                    decoded
+                    if isinstance(decoded, str)
+                    else json.dumps(decoded, ensure_ascii=False, indent=2, default=str)
+                )
+        elif project.error:
+            body = f"错误: {_strip_internal_details(project.error)}"
+        else:
+            body = "（无结果）"
+        entries.append(("Workflow 最终结果", f"状态: {project.status.value}", body))
+    return entries
+
+
+def _result_ledger_card(project: WorkflowProject, elements: list[dict[str, Any]]) -> dict[str, Any]:
+    name = _middle_ellipsis(project.name or "Workflow", 32)
+    return {
+        "header": {
+            "title": {"tag": "plain_text", "content": f"📚 {name} · 结果账本"},
+            "template": "blue",
+        },
+        "elements": elements,
+    }
+
+
+def _result_card_fits(project: WorkflowProject, elements: list[dict[str, Any]]) -> bool:
+    card = _result_ledger_card(project, elements)
+    size = len(json.dumps(card, ensure_ascii=False).encode("utf-8", errors="surrogatepass"))
+    return size <= _CARD_MAX_BYTES
+
+
+def _ledger_markdown(title: str, metadata: str, body: str, *, continuation: bool = False) -> str:
+    suffix = "（续）" if continuation else ""
+    heading = f"**{_escape_md(title)}{suffix}**\n<font color='grey'>{_escape_md(metadata)}</font>"
+    return f"{heading}\n\n{_escape_md(body)}"
+
+
+def _largest_result_prefix(
+    project: WorkflowProject,
+    title: str,
+    metadata: str,
+    body: str,
+    *,
+    continuation: bool,
+) -> int:
+    low, high, best = 1, len(body), 0
+    while low <= high:
+        middle = (low + high) // 2
+        element = _md_element(
+            _ledger_markdown(
+                title,
+                metadata,
+                body[:middle],
+                continuation=continuation,
+            )
+        )
+        if _result_card_fits(project, [element]):
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _render_result_ledger_cards(project: WorkflowProject) -> list[dict[str, Any]]:
+    entries = _result_ledger_entries(project)
+    if not entries:
+        return []
+
+    page_elements: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for title, metadata, body in entries:
+        whole = _md_element(_ledger_markdown(title, metadata, body))
+        if _result_card_fits(project, [*current, whole]):
+            current.append(whole)
+            continue
+        if current and _result_card_fits(project, [whole]):
+            page_elements.append(current)
+            current = [whole]
+            continue
+        if current:
+            page_elements.append(current)
+            current = []
+
+        remaining = body
+        continuation = False
+        while remaining:
+            take = _largest_result_prefix(
+                project,
+                title,
+                metadata,
+                remaining,
+                continuation=continuation,
+            )
+            if take <= 0:
+                raise ValueError("Workflow result ledger entry exceeds card metadata budget")
+            fragment = _md_element(
+                _ledger_markdown(
+                    title,
+                    metadata,
+                    remaining[:take],
+                    continuation=continuation,
+                )
+            )
+            current.append(fragment)
+            remaining = remaining[take:]
+            continuation = True
+            if remaining:
+                page_elements.append(current)
+                current = []
+
+    if current:
+        page_elements.append(current)
+    return [_result_ledger_card(project, elements) for elements in page_elements]
 
 
 # ---------------------------------------------------------------------------

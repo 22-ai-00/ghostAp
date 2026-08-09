@@ -19,22 +19,20 @@ class TestRenderFooter:
         assert result[1]["text_size"] == "notation"
 
     def test_footer_tool_running(self):
-        """status=tool_running → 🔧 text"""
+        """Unified main-card execution flow hides duplicate tool footer text."""
         state = CardState(footer=FooterState(status="tool_running", status_text="🔧 执行中: bash"))
         result = render_footer(state)
-        assert result[1]["content"] == "🔧 执行中: bash"
+        assert result == []
 
     def test_footer_with_progress(self):
-        """Progress merged with status into one line"""
+        """Unified main-card execution flow keeps progress in the body."""
         state = CardState(footer=FooterState(
             status="tool_running",
             status_text="🔧 执行中: bash",
             progress="▰▰▰▱▱▱▱▱▱▱ 30%"
         ))
         result = render_footer(state)
-        assert len(result) == 2  # hr + merged status+progress
-        assert "🔧 执行中: bash" in result[1]["content"]
-        assert "▰▰▰▱▱▱▱▱▱▱ 30%" in result[1]["content"]
+        assert result == []
 
     def test_footer_none(self):
         """status=None → empty list"""
@@ -190,10 +188,8 @@ class TestFooterWarningAndProgressCoexist:
         # Footer should NOT contain any banner div (moved to body top)
         banner_divs = [e for e in elements if e.get("tag") == "div"]
         assert len(banner_divs) == 0
-        # Should still have hr + status + progress
-        all_content = str(elements)
-        assert "▰" in all_content
-        assert "步骤 3/6" in all_content
+        # Unified main cards render tool/progress state in the execution body.
+        assert elements == []
 
 # ---------------------------------------------------------------------------
 # Banner unified position tests (all levels in body top)

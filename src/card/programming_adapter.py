@@ -1109,6 +1109,26 @@ class ProgrammingCardSession:
         if tool_call is None or not getattr(tool_call, "collaboration_tool", None):
             return False
 
+        event_name = str(
+            getattr(getattr(acp_event, "event_type", None), "name", "") or ""
+        )
+        collaboration_tool = str(
+            getattr(tool_call, "collaboration_tool", "") or ""
+        ).strip().casefold()
+        outer_status = str(
+            getattr(tool_call, "status", "") or ""
+        ).strip().casefold()
+        authoritative_list_snapshot = (
+            event_name == "TOOL_CALL_DONE"
+            and collaboration_tool == "list_agents"
+            and outer_status == "completed"
+        )
+        starts_new_generation = (
+            event_name == "TOOL_CALL_DONE"
+            and collaboration_tool in {"spawn_agent", "followup_task"}
+            and outer_status == "completed"
+        )
+
         states_by_source = {
             str(item.get("source_id") or "").strip(): item
             for item in getattr(tool_call, "subagent_states", ())
@@ -1155,9 +1175,15 @@ class ProgrammingCardSession:
             ):
                 normalized_message = ""
             if existing_status in _TERMINAL_AGENT_STATUSES:
-                if incoming_status != existing_status:
-                    continue
-                if (
+                if starts_new_generation:
+                    pass
+                elif incoming_status != existing_status:
+                    if not (
+                        authoritative_list_snapshot
+                        and incoming_status in _TERMINAL_AGENT_STATUSES
+                    ):
+                        continue
+                elif (
                     not normalized_message
                     or normalized_message
                     == str(existing.get("progress") or "")
@@ -1177,6 +1203,8 @@ class ProgrammingCardSession:
                 "status": incoming_status,
                 "progress": progress,
             }
+            if incoming_status != "failed":
+                summary.pop("error", None)
             summary.setdefault(
                 "sequence",
                 f"{self._rotator.current.sequence}.{chr(ord('a') + len(self._agent_summaries))}",
@@ -1269,6 +1297,7 @@ class ProgrammingCardSession:
             "status": incoming_status,
             "progress": progress,
         }
+        summary.pop("error", None)
         summary.setdefault(
             "sequence",
             f"{self._rotator.current.sequence}.{chr(ord('a') + len(self._agent_summaries))}",

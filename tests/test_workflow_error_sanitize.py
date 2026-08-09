@@ -34,6 +34,7 @@ class TestErrorCategoryEnum(unittest.TestCase):
             "TOOL_NOT_ALLOWED",
             "SCRIPT_VALIDATION",
             "RUNTIME_TIMEOUT",
+            "REVIEW_FAILED",
             "INTERNAL_ERROR",
             "CANCELLED",
             # Deprecated: kept for backwards compatibility

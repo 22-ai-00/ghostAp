@@ -116,6 +116,7 @@ class TestEngineProjectAutoInit(unittest.TestCase):
         handler.update_card = MagicMock()
         handler.add_reaction = MagicMock()
         handler._submit_engine_task = MagicMock()
+        handler._schedule_generate_and_show_confirm_card = MagicMock()
         handler._ensure_topic_engine_context = MagicMock()
         handler._reply_workflow_error = MagicMock()
 
@@ -137,8 +138,10 @@ class TestEngineProjectAutoInit(unittest.TestCase):
         handler.start_workflow("msg_1", "chat_1", "test requirement", project)
 
         self.assertIsNotNone(engine.project)
-        self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_AGENT_SELECT)
+        self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
         self.assertIsNotNone(engine.project.pending)
+        self.assertTrue(engine.project.pending.auto_reviewer)
+        handler._schedule_generate_and_show_confirm_card.assert_called_once()
 
 
 class TestPendingNewestWins(unittest.TestCase):
@@ -164,6 +167,7 @@ class TestPendingNewestWins(unittest.TestCase):
         handler.update_card = MagicMock()
         handler.add_reaction = MagicMock()
         handler._submit_engine_task = MagicMock()
+        handler._schedule_generate_and_show_confirm_card = MagicMock()
         handler._ensure_topic_engine_context = MagicMock()
         handler._reply_workflow_error = MagicMock()
 
@@ -192,8 +196,10 @@ class TestPendingNewestWins(unittest.TestCase):
 
         # Should NOT have called _reply_workflow_error (stale state is auto-reset)
         handler._reply_workflow_error.assert_not_called()
-        # Should have sent the combined selection card
-        handler.send_card_to_chat.assert_called()
+        handler.send_card_to_chat.assert_not_called()
+        self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
+        self.assertTrue(engine.project.pending.auto_reviewer)
+        handler._schedule_generate_and_show_confirm_card.assert_called_once()
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     @patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True)
@@ -215,6 +221,7 @@ class TestPendingNewestWins(unittest.TestCase):
         handler.update_card = MagicMock()
         handler.add_reaction = MagicMock()
         handler._submit_engine_task = MagicMock()
+        handler._schedule_generate_and_show_confirm_card = MagicMock()
         handler._ensure_topic_engine_context = MagicMock()
         handler._reply_workflow_error = MagicMock()
 
@@ -241,7 +248,10 @@ class TestPendingNewestWins(unittest.TestCase):
         handler.start_workflow("msg_1", "chat_1", "new task", project)
 
         handler._reply_workflow_error.assert_not_called()
-        handler.send_card_to_chat.assert_called()
+        handler.send_card_to_chat.assert_not_called()
+        self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
+        self.assertTrue(engine.project.pending.auto_reviewer)
+        handler._schedule_generate_and_show_confirm_card.assert_called_once()
 
 
 if __name__ == "__main__":

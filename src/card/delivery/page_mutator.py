@@ -256,6 +256,15 @@ class PageMutator:
         self._bindings = bindings
         self._sequences = sequences
 
+    def _release_cardkit_entity(self, card_id: str) -> None:
+        release = getattr(self._client, "release_cardkit_entity", None)
+        if not callable(release):
+            return
+        try:
+            release(card_id)
+        except Exception:
+            logger.debug("Failed to release CardKit route %s", card_id, exc_info=True)
+
     def create_page(
         self,
         session_id: str,
@@ -318,7 +327,10 @@ class PageMutator:
                                     card_id,
                                     str(cleanup_exc),
                                 )
+                            self._release_cardkit_entity(card_id)
                         raise
+                    if card_id:
+                        self._release_cardkit_entity(card_id)
                     logger.debug("Streaming card creation failed, falling back to IM API")
                     message_id, card_id = self._client.create_card(
                         chat_id, card_payload, reply_to=reply_to, reply_in_thread=reply_in_thread, idempotency_key=idempotency_key
@@ -390,6 +402,7 @@ class PageMutator:
                     page.page_index,
                     streaming=False,
                 )
+                self._release_cardkit_entity(page.card_id)
             self._bindings.update_signature(session_id, page.page_index, card.structure_signature)
             if card.active_element:
                 self._bindings.update_text(session_id, page.page_index, _actual_active_text(card, card_payload))
@@ -398,6 +411,7 @@ class PageMutator:
             logger.warning("Card update timed out on %s; dropping binding to avoid stale late writes: %s", page.card_id, str(e))
             self._bindings.remove_page(session_id, page.page_index)
             self._sequences.reset(page.card_id)
+            self._release_cardkit_entity(page.card_id)
             return MutationOutcome(kind="reconcile", message="recreate:timeout")
         except SequenceConflictError as e:
             self._sequences.raise_floor(page.card_id, e.next_floor)
@@ -411,6 +425,7 @@ class PageMutator:
                 )
                 self._bindings.remove_page(session_id, page.page_index)
                 self._sequences.reset(page.card_id)
+                self._release_cardkit_entity(page.card_id)
                 return MutationOutcome(kind="reconcile", message=f"recreate:{e.code}")
             if e.is_content_invalid:
                 return self._replace_with_invalid_card_fallback(session_id, page, card, e)
@@ -457,6 +472,7 @@ class PageMutator:
                 )
                 self._bindings.remove_page(session_id, page.page_index)
                 self._sequences.reset(page.card_id)
+                self._release_cardkit_entity(page.card_id)
                 return MutationOutcome(kind="reconcile", message=f"recreate:{e.code}")
             logger.debug("Element update failed (%s), falling back to full update", str(e))
             return self.update_page(session_id, page, card)
@@ -464,6 +480,7 @@ class PageMutator:
             logger.warning("Element update timed out on %s; dropping binding to avoid stale late writes: %s", page.card_id, str(e))
             self._bindings.remove_page(session_id, page.page_index)
             self._sequences.reset(page.card_id)
+            self._release_cardkit_entity(page.card_id)
             return MutationOutcome(kind="reconcile", message="recreate:timeout")
         except Exception as e:
             logger.debug("Element update failed (%s), falling back to full update", str(e))
@@ -486,6 +503,7 @@ class PageMutator:
                 page.page_index,
                 streaming=False,
             )
+            self._release_cardkit_entity(page.card_id)
             return MutationOutcome(kind="applied", message=f"finished:{page.card_id}")
         except TimeoutError as exc:
             logger.warning(
@@ -501,6 +519,7 @@ class PageMutator:
             if exc.needs_recreate:
                 self._bindings.remove_page(session_id, page.page_index)
                 self._sequences.reset(page.card_id)
+                self._release_cardkit_entity(page.card_id)
                 return MutationOutcome(kind="reconcile", message=f"recreate:{exc.code}")
             logger.warning("Card stream finish failed on %s: %s", page.card_id, str(exc))
             return MutationOutcome(kind="reconcile", message=f"finish:{exc.code}")
@@ -512,6 +531,7 @@ class PageMutator:
         """Finalize a stale page."""
         if page.card_id:
             self._sequences.reset(page.card_id)
+            self._release_cardkit_entity(page.card_id)
         self._bindings.remove_page(session_id, page.page_index)
 
     def _replace_with_invalid_card_fallback(
@@ -549,6 +569,7 @@ class PageMutator:
             if fallback_err.needs_recreate:
                 self._bindings.remove_page(session_id, page.page_index)
                 self._sequences.reset(page.card_id)
+                self._release_cardkit_entity(page.card_id)
                 return MutationOutcome(kind="reconcile", message=f"recreate:{fallback_err.code}")
             logger.warning("Fallback card patch failed on %s: %s", page.card_id, str(fallback_err))
             return MutationOutcome(
@@ -627,6 +648,7 @@ class PageMutator:
             if fallback_err.needs_recreate:
                 self._bindings.remove_page(session_id, page.page_index)
                 self._sequences.reset(page.card_id)
+                self._release_cardkit_entity(page.card_id)
                 return MutationOutcome(kind="reconcile", message=f"recreate:{fallback_err.code}")
             logger.warning("Audit fallback card patch failed on %s: %s", page.card_id, str(fallback_err))
             return MutationOutcome(

@@ -116,7 +116,7 @@ class TestWorkflowUnknownCommandMessaging(unittest.TestCase):
 
 
 class TestWorkflowEntryCardButton(unittest.TestCase):
-    """Validate the entry-card start button launches the flow directly."""
+    """Validate the entry-card start button launches default generation."""
 
     def _make_handler(self):
         from src.feishu.handlers.workflow import WorkflowHandler
@@ -131,14 +131,16 @@ class TestWorkflowEntryCardButton(unittest.TestCase):
         handler.get_working_dir = MagicMock(return_value="/tmp")
         handler.get_engine_name = MagicMock(return_value="coco")
         handler.ensure_request_id = MagicMock(return_value="req_1")
+        handler._schedule_generate_and_show_confirm_card = MagicMock()
         return handler
 
     @patch("src.feishu.handlers.workflow.WorkflowHandler._show_agent_selection_card")
-    def test_start_button_launches_agent_selection(self, show_agent_select):
-        """Clicking "开始" with a task description should trigger _show_agent_selection_card."""
+    def test_start_button_launches_default_generation(self, show_agent_select):
+        """Clicking "开始" skips manual selection and schedules generation."""
         handler = self._make_handler()
 
         from src.workflow_engine import bridge as bridge_module
+        from src.workflow_engine.models import WorkflowProject, WorkflowStatus
 
         original = getattr(bridge_module.RuntimeBridge, "check_node_available", None)
         try:
@@ -146,6 +148,9 @@ class TestWorkflowEntryCardButton(unittest.TestCase):
 
             fake_manager = MagicMock()
             fake_manager.get.return_value = None
+            engine = MagicMock()
+            engine.project = WorkflowProject()
+            fake_manager.get_or_create.return_value = engine
             handler.ctx.workflow_engine_manager = fake_manager
 
             handler.handle_show_workflow_menu(
@@ -160,7 +165,13 @@ class TestWorkflowEntryCardButton(unittest.TestCase):
                 },
             )
 
-            show_agent_select.assert_called_once()
+            show_agent_select.assert_not_called()
+            self.assertEqual(
+                engine.project.status,
+                WorkflowStatus.GENERATING_SCRIPT,
+            )
+            self.assertTrue(engine.project.pending.auto_reviewer)
+            handler._schedule_generate_and_show_confirm_card.assert_called_once()
         finally:
             if original is not None:
                 bridge_module.RuntimeBridge.check_node_available = original

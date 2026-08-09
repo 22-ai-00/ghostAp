@@ -168,6 +168,9 @@ class AgentProgress(BaseModel):
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     current_activity: str = ""  # Live activity hint (e.g. "read_file src/...", "writing code...")
+    activity_updated_at: Optional[float] = None
+    result: Optional[str] = None  # Sanitized terminal result used by Workflow cards only.
+    call_index: int = 0
     subagents: list[SubagentProgress] = Field(default_factory=list)
 
 

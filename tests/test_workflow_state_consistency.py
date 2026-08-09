@@ -703,7 +703,12 @@ def test_new_workflow_supersedes_owned_incomplete_generation(tmp_path):
     assert engine._script_generation_owner is None
     assert not old_script.exists()
     handler._reply_workflow_error.assert_not_called()
-    handler._show_agent_selection_card.assert_called_once()
+    handler._show_agent_selection_card.assert_not_called()
+    assert engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+    assert engine.project.pending is not None
+    assert engine.project.pending.requirement == "new task"
+    assert engine.project.pending.auto_reviewer is True
+    assert engine.project.pending.orchestrator_agent
 
 
 def test_new_workflow_cancels_old_queued_start_before_it_can_claim_engine(tmp_path):
@@ -747,7 +752,11 @@ export default async function workflow() { return "old"; }
 
     assert old_owner.stop_event.is_set()
     assert engine._workflow_start_owner is None
-    handler._show_agent_selection_card.assert_called_once()
+    handler._show_agent_selection_card.assert_not_called()
+    assert engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+    assert engine.project.pending is not None
+    assert engine.project.pending.requirement == "new task"
+    assert engine.project.pending.auto_reviewer is True
 
     with patch(
         "src.workflow_engine.engine.RuntimeBridge.check_node_available",

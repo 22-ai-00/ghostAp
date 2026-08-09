@@ -951,22 +951,19 @@ class TestWorkflowHandlerConfirmFlow(unittest.TestCase):
     def test_workflow_callbacks_route_validation_error_to_workflow_error_card(self):
         """Execution-time validation failures should not be hidden behind the generic error card."""
         handler, _ctx = self._make_handler()
-        handler._reply_workflow_error = MagicMock()
         callbacks = handler._build_workflow_callbacks("progress_msg", "chat_1", None)
 
         callbacks.on_error("validation failed: Unbalanced parentheses")
 
-        handler._reply_workflow_error.assert_called_once_with(
-            "progress_msg",
-            "invalid_argument",
-            detail="validation failed: Unbalanced parentheses",
-        )
+        handler.update_card.assert_called_once()
+        error_card = handler.update_card.call_args.args[1]
+        self.assertEqual(error_card["header"]["title"]["content"], "参数错误")
+        self.assertNotIn("workflow_stop_running", str(error_card))
         handler.reply_error.assert_not_called()
 
     def test_workflow_callbacks_ignore_late_progress_after_error(self):
         """Late progress callbacks must not replace a terminal workflow error card."""
         handler, _ctx = self._make_handler()
-        handler._reply_workflow_error = MagicMock()
         callbacks = handler._build_workflow_callbacks("progress_msg", "chat_1", None)
         late_progress = {
             "header": {
@@ -977,24 +974,23 @@ class TestWorkflowHandlerConfirmFlow(unittest.TestCase):
         }
 
         callbacks.on_error("validation failed: Unbalanced parentheses")
+        calls_after_error = handler.update_card.call_count
         callbacks.on_progress(late_progress)
 
-        handler._reply_workflow_error.assert_called_once()
-        handler.update_card.assert_not_called()
+        self.assertEqual(handler.update_card.call_count, calls_after_error)
+        self.assertEqual(calls_after_error, 1)
 
     def test_workflow_callbacks_route_unknown_error_with_safe_detail(self):
         """Unknown runtime errors should keep a sanitized root-cause hint on the Workflow card."""
         handler, _ctx = self._make_handler()
-        handler._reply_workflow_error = MagicMock()
         callbacks = handler._build_workflow_callbacks("progress_msg", "chat_1", None)
 
         callbacks.on_error("TypeError: bad workflow state")
 
-        handler._reply_workflow_error.assert_called_once_with(
-            "progress_msg",
-            "internal_error",
-            detail="TypeError: bad workflow state",
-        )
+        handler.update_card.assert_called_once()
+        error_card = handler.update_card.call_args.args[1]
+        self.assertEqual(error_card["header"]["title"]["content"], "服务内部错误")
+        self.assertIn("TypeError: bad workflow state", str(error_card))
         handler.reply_error.assert_not_called()
 
     def test_show_workflow_status_replies_with_normalized_renderer_card(self):
@@ -1364,15 +1360,10 @@ class TestWorkflowToolSelectionFirstFlow(unittest.TestCase):
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     @patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True)
     @patch("src.workflow_engine.templates.discover_templates", return_value=[])
-    def test_start_workflow_shows_tool_selection_card(
+    def test_start_workflow_uses_default_auto_policy(
         self, mock_templates, mock_node, mock_sender
     ):
-        """Verify start_workflow() shows an orchestrator agent selection card (step 1 of 2-step flow).
-
-        In the new two-step selection flow, start_workflow() shows the orchestrator
-        tool selection card. It does NOT pre-set orchestrator_agent or selected_tools —
-        those are chosen by the user via subsequent selection steps.
-        """
+        """The default path skips manual selection and starts script generation."""
         handler, ctx = self._make_handler()
 
         project = MagicMock()
@@ -1389,20 +1380,21 @@ class TestWorkflowToolSelectionFirstFlow(unittest.TestCase):
 
         handler.start_workflow("msg_1", "chat_1", "do code review", project)
 
-        # Should send a card (orchestrator agent selection)
-        handler.send_card_to_chat.assert_called_once()
-        # update_card should NOT be called (no generating -> confirm transition)
+        # Generation runs in the scheduled worker; the entry path itself no
+        # longer sends an orchestrator selection card.
+        handler.send_card_to_chat.assert_not_called()
         handler.update_card.assert_not_called()
 
-        # Engine project should be AWAITING_AGENT_SELECT (step 1 of the new 2-step flow)
-        self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_AGENT_SELECT)
+        self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
         self.assertIsNotNone(engine.project.pending)
         self.assertIsNone(engine.project.pending.script_path)
         self.assertIsNone(engine.project.pending.meta)
-        # orchestrator_agent is NOT preset — user picks via selection controller
-        self.assertIsNone(engine.project.pending.orchestrator_agent)
-        # selected_tools is NOT preset in the new 2-step flow
-        # (it may be empty list or None depending on the exact implementation)
+        self.assertIsNotNone(engine.project.pending.orchestrator_agent)
+        self.assertTrue(engine.project.pending.auto_reviewer)
+        self.assertIn(
+            engine.project.pending.orchestrator_agent,
+            engine.project.pending.selected_tools,
+        )
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     @patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True)
@@ -1410,12 +1402,7 @@ class TestWorkflowToolSelectionFirstFlow(unittest.TestCase):
     def test_start_workflow_sets_pending_requirement(
         self, mock_templates, mock_node, mock_sender
     ):
-        """Verify start_workflow() stores requirement and session key (2-step selection flow).
-
-        In the new two-step selection flow, start_workflow() sets up the pending state
-        with requirement and session_key, but defers orchestrator_agent and selected_tools
-        to the Workflow selection controllers.
-        """
+        """Default generation retains requirement, ownership, and auto bindings."""
         handler, ctx = self._make_handler()
 
         project = MagicMock()
@@ -1436,10 +1423,11 @@ class TestWorkflowToolSelectionFirstFlow(unittest.TestCase):
         self.assertEqual(engine.project.pending.requirement if engine.project.pending else None, "do code review")
         # Session key should be set
         self.assertIsNotNone(engine.project.pending.engine_session_key if engine.project.pending else None)
-        # Status should be AWAITING_AGENT_SELECT (user is choosing orchestrator)
-        self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_AGENT_SELECT)
-        # orchestrator_agent is NOT preset in 2-step flow
-        self.assertIsNone(engine.project.pending.orchestrator_agent if engine.project.pending else "")
+        self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
+        self.assertIsNotNone(
+            engine.project.pending.orchestrator_agent if engine.project.pending else None
+        )
+        self.assertTrue(engine.project.pending.auto_reviewer if engine.project.pending else False)
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     @patch("src.feishu.handlers.workflow.WorkflowHandler._generate_script_via_ai")

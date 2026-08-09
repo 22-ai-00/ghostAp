@@ -47,6 +47,7 @@ class _FakeSession:
         self._results = list(results)
         self._on_send = on_send
         self.calls: list[_PromptCall] = []
+        self.continuation_calls: list[_PromptCall] = []
         self._force_dead = False
 
     def send_prompt(
@@ -64,6 +65,24 @@ class _FakeSession:
         if isinstance(result, BaseException):
             raise result
         return result
+
+    def send_continuation_prompt(
+        self,
+        text: str,
+        on_event: Callable[[ACPEvent], None] | None = None,
+        timeout: float | int | None = None,
+    ) -> PromptResult:
+        call = _PromptCall(
+            text=text,
+            on_event=on_event,
+            timeout=timeout,
+        )
+        self.continuation_calls.append(call)
+        return self.send_prompt(
+            text,
+            on_event=on_event,
+            timeout=timeout,
+        )
 
 
 def _pending_result(
@@ -189,6 +208,7 @@ def test_second_pending_plan_stops_after_one_continuation() -> None:
 
     assert len(session.calls) == 2
     assert continuation_starts == ["continuing"]
+    assert session.continuation_calls == [session.calls[1]]
     assert execution.automatic_continuations == 1
     assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
     assert execution.assessment.pending_plan_entries == 1
@@ -301,7 +321,44 @@ def test_pending_plan_with_active_tool_is_not_continued() -> None:
     assert execution.awaiting_user_input is False
 
 
-def test_unresolved_child_gets_one_bounded_reconciliation_turn() -> None:
+def test_explicit_user_confirmation_preempts_child_reconciliation() -> None:
+    runner = _runner()
+    session = _FakeSession(
+        PromptResult(
+            stop_reason="end_turn",
+            text=(
+                "检测到其他进程正在修改核心文件。请确认一种处理方式：\n"
+                "1. 由我接管\n2. 等其他进程完成"
+            ),
+            tool_calls=[
+                ToolCallInfo(
+                    id="list-before-confirmation",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    subagent_states=(
+                        {"source_id": "reviewer", "status": "running"},
+                    ),
+                )
+            ],
+        )
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 1
+    assert execution.automatic_continuations == 0
+    assert execution.awaiting_user_input is True
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+
+
+def test_unresolved_child_gets_a_bounded_reconciliation_turn() -> None:
     runner = _runner()
     first_result = PromptResult(
         stop_reason="end_turn",
@@ -350,6 +407,8 @@ def test_unresolved_child_gets_one_bounded_reconciliation_turn() -> None:
 
     assert len(session.calls) == 2
     assert "子代理状态对账指令" in session.calls[1].text
+    assert "MESSAGE 不代表子代理已进入终态" in session.calls[1].text
+    assert "wait_agent -> list_agents" in session.calls[1].text
     assert continuation_starts == ["reconciling"]
     assert execution.automatic_continuations == 1
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
@@ -357,7 +416,117 @@ def test_unresolved_child_gets_one_bounded_reconciliation_turn() -> None:
     assert execution.awaiting_user_input is False
 
 
-def test_unresolved_child_still_fails_closed_after_one_reconciliation() -> None:
+def test_child_reconciliation_applies_session_terminal_evidence_once() -> None:
+    runner = _runner()
+    running = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="list-running",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+
+    class EnrichingSession(_FakeSession):
+        def __init__(self) -> None:
+            super().__init__(running, running)
+            self.enrichment_calls = 0
+
+        def enrich_child_reconciliation_result(
+            self,
+            result: PromptResult,
+            *,
+            started_at: float,
+            ended_at: float,
+            on_event: Callable[[ACPEvent], None] | None = None,
+        ) -> PromptResult:
+            assert started_at > 0
+            assert ended_at >= started_at
+            assert on_event is None
+            self.enrichment_calls += 1
+            return PromptResult(
+                stop_reason=result.stop_reason,
+                text=result.text,
+                tool_calls=[
+                    *result.tool_calls,
+                    ToolCallInfo(
+                        id="rollout-list-agents",
+                        title="list_agents",
+                        kind="other",
+                        status="completed",
+                        collaboration_tool="list_agents",
+                        subagent_states=(
+                            {
+                                "source_id": "reviewer",
+                                "status": "completed",
+                            },
+                        ),
+                    ),
+                ],
+            )
+
+    session = EnrichingSession()
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert session.enrichment_calls == 1
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.assessment.unresolved_child_tool_calls == 0
+
+
+def test_unresolved_child_does_not_reconcile_again_after_stale_running_snapshot() -> None:
+    runner = _runner()
+
+    def snapshot(tool_id: str, status: str) -> PromptResult:
+        return PromptResult(
+            stop_reason="end_turn",
+            tool_calls=[
+                ToolCallInfo(
+                    id=tool_id,
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    subagent_states=(
+                        {"source_id": "reviewer", "status": status},
+                    ),
+                )
+            ],
+        )
+
+    session = _FakeSession(
+        snapshot("list-before-reconciliation", "running"),
+        snapshot("list-still-stale", "running"),
+        AssertionError("duplicate child reconciliation"),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.assessment.incomplete_tool_calls == 1
+    assert execution.assessment.unresolved_child_tool_calls == 1
+
+
+def test_unresolved_child_still_fails_closed_after_bounded_reconciliation() -> None:
     runner = _runner()
 
     def running_snapshot(tool_id: str) -> PromptResult:
@@ -379,6 +548,7 @@ def test_unresolved_child_still_fails_closed_after_one_reconciliation() -> None:
     session = _FakeSession(
         running_snapshot("list-before-reconciliation"),
         running_snapshot("list-after-reconciliation"),
+        AssertionError("duplicate child reconciliation"),
     )
 
     execution = runner(
@@ -393,6 +563,54 @@ def test_unresolved_child_still_fails_closed_after_one_reconciliation() -> None:
     assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
     assert execution.assessment.incomplete_tool_calls == 1
     assert execution.awaiting_user_input is False
+
+
+def test_completed_goal_allows_child_state_reconciliation() -> None:
+    runner = _runner()
+    completed_goal = ACPGoalInfo(objective="review", status="completed")
+    first_result = PromptResult(
+        stop_reason="end_turn",
+        goal=completed_goal,
+        tool_calls=[
+            ToolCallInfo(
+                id="list-before-final-answer",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            )
+        ],
+    )
+    reconciled_result = PromptResult(
+        stop_reason="end_turn",
+        goal=completed_goal,
+        tool_calls=[
+            ToolCallInfo(
+                id="list-after-final-answer",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "completed"},
+                ),
+            )
+        ],
+    )
+    session = _FakeSession(first_result, reconciled_result)
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.assessment.incomplete_tool_calls == 0
 
 
 def test_plan_then_child_reconciliation_each_get_one_bounded_turn() -> None:

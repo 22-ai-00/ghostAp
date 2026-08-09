@@ -77,9 +77,9 @@ def _status(value: Any) -> str:
     return str(getattr(value, "status", "") or "").strip().casefold()
 
 
-def _tool_incompleteness(
+def _tool_incompleteness_details(
     tool_calls: list[object],
-) -> tuple[list[object], int, int]:
+) -> tuple[list[object], int, int, bool]:
     """Fold child lifecycles while keeping malformed evidence fail-closed."""
     incomplete_outer = {
         index
@@ -256,20 +256,36 @@ def _tool_incompleteness(
             # generation unresolved until a later independent terminal snapshot.
             lifecycle_by_source[activity_source] = ("running", index)
 
+    transient_child_indexes = {
+        index
+        for status, index in lifecycle_by_source.values()
+        if status in TRANSIENT_CHILD_STATUSES
+    }
     unresolved_children = {
         *invalid_indexes,
-        *(
-            index
-            for status, index in lifecycle_by_source.values()
-            if status in TRANSIENT_CHILD_STATUSES
-        ),
+        *transient_child_indexes,
     }
     incomplete_indexes = incomplete_outer | unresolved_children
     return (
         [tool_calls[index] for index in sorted(incomplete_indexes)],
         len(incomplete_outer),
         len(unresolved_children),
+        bool(transient_child_indexes),
     )
+
+
+def _tool_incompleteness(
+    tool_calls: list[object],
+) -> tuple[list[object], int, int]:
+    incomplete, outer_count, child_count, _ = _tool_incompleteness_details(
+        tool_calls
+    )
+    return incomplete, outer_count, child_count
+
+
+def has_transient_child_lifecycle(tool_calls: Iterable[object]) -> bool:
+    """Whether a child is still pending/running after stable-source folding."""
+    return _tool_incompleteness_details(list(tool_calls))[3]
 
 
 def _allowlisted_token(
@@ -440,4 +456,5 @@ __all__ = [
     "PromptAssessment",
     "PromptOutcome",
     "classify_prompt_result",
+    "has_transient_child_lifecycle",
 ]

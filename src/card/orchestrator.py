@@ -83,6 +83,7 @@ _SUBAGENT_PROVIDER_PROGRESS = {
     "interrupted": "已中断",
 }
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_SUBAGENT_GENERATION_WAIT_S = 40.0
 _TRANSIENT_SUBAGENT_PROGRESS = frozenset({
     "准备中",
     "执行中",
@@ -233,6 +234,8 @@ class TaskOrchestrator:
         self._subagent_progress: dict[str, str] = {}
         self._terminal_task_ids: set[str] = set()
         self._terminal_task_summaries: dict[str, str] = {}
+        self._subagent_generation_claims: dict[str, threading.Event] = {}
+        self._lifecycle_epoch = 0
         # Physical card sessions that have received a lifecycle terminal event.
         # Logical overflow children are tracked separately so they cannot revive
         # or prematurely close a card shared with an active sibling.
@@ -322,6 +325,11 @@ class TaskOrchestrator:
         state to allow fresh plan detection. Used by Spec mode at cycle boundaries.
         """
         with self._lock:
+            self._lifecycle_epoch += 1
+            generation_claims = list(
+                self._subagent_generation_claims.values()
+            )
+            self._subagent_generation_claims.clear()
             had_plan = self._plan_received.is_set() and not self._fallback_mode
             sessions_to_close = list(self._sessions.values()) if had_plan else []
             self._sessions.clear()
@@ -346,6 +354,8 @@ class TaskOrchestrator:
             self._tool_task_bindings.clear()
             self._pending_broadcast_task_ids.clear()
 
+        for claim in generation_claims:
+            claim.set()
         # Archive sessions OUTSIDE lock (I/O)
         for session in sessions_to_close:
             try:
@@ -872,6 +882,16 @@ class TaskOrchestrator:
                 fallback_bridge.on_event(acp_event)
             return True
 
+        normalized_collaboration_tool = collaboration_tool.strip().casefold()
+        outer_status = str(
+            getattr(tool_call, "status", "") or ""
+        ).strip().casefold()
+        starts_new_generation = (
+            acp_event.event_type.name == "TOOL_CALL_DONE"
+            and normalized_collaboration_tool
+            in {"spawn_agent", "followup_task"}
+            and outer_status == "completed"
+        )
         label = self._extract_agent_task_label(tool_call)
         opaque_ids = collect_subagent_opaque_ids(tool_call)
         # Materialize every receiver before applying terminal snapshots. This
@@ -880,6 +900,11 @@ class TaskOrchestrator:
         # shared card before its running sibling is registered.
         running_status_changed = False
         for source_id in source_ids:
+            if starts_new_generation and not self._reopen_subagent_generation(
+                source_id,
+            ):
+                fallback_bridge.on_event(acp_event)
+                return True
             with self._lock:
                 if source_id in self._terminal_task_ids:
                     continue
@@ -934,6 +959,242 @@ class TaskOrchestrator:
                     running_status_changed = True
         if running_status_changed:
             self._broadcast_subagent_task_list()
+        return True
+
+    def _reopen_subagent_generation(self, task_id: str) -> bool:
+        """Open a fresh physical card when a stable child id starts new work."""
+        while True:
+            with self._lock:
+                if task_id not in self._subagent_task_ids:
+                    return True
+                resolved_id = self._overflow_target.get(task_id, task_id)
+                task_is_terminal = task_id in self._terminal_task_ids
+                physical_is_finalized = (
+                    resolved_id in self._finalized_task_ids
+                )
+                is_subagent_card = resolved_id in self._subagent_task_ids
+                if not task_is_terminal and not physical_is_finalized:
+                    return True
+                claim = self._subagent_generation_claims.get(resolved_id)
+                if claim is None:
+                    claim = threading.Event()
+                    self._subagent_generation_claims[resolved_id] = claim
+                    lifecycle_epoch = self._lifecycle_epoch
+                    owns_claim = True
+                else:
+                    lifecycle_epoch = self._lifecycle_epoch
+                    owns_claim = False
+
+            if not owns_claim:
+                if not claim.wait(timeout=_SUBAGENT_GENERATION_WAIT_S):
+                    logger.warning(
+                        "TaskOrchestrator: timed out waiting for subagent "
+                        "generation claim task_id=%s",
+                        task_id,
+                    )
+                    return False
+                with self._lock:
+                    if self._lifecycle_epoch != lifecycle_epoch:
+                        return False
+                continue
+
+            try:
+                return self._commit_reopened_subagent_generation(
+                    task_id=task_id,
+                    resolved_id=resolved_id,
+                    physical_is_finalized=physical_is_finalized,
+                    is_subagent_card=is_subagent_card,
+                    lifecycle_epoch=lifecycle_epoch,
+                )
+            finally:
+                with self._lock:
+                    current_claim = self._subagent_generation_claims.get(
+                        resolved_id
+                    )
+                    if current_claim is claim:
+                        self._subagent_generation_claims.pop(
+                            resolved_id,
+                            None,
+                        )
+                        claim.set()
+
+    def _commit_reopened_subagent_generation(
+        self,
+        *,
+        task_id: str,
+        resolved_id: str,
+        physical_is_finalized: bool,
+        is_subagent_card: bool,
+        lifecycle_epoch: int,
+    ) -> bool:
+        new_session = None
+        new_bridge = None
+        if physical_is_finalized:
+            try:
+                new_session = self._session_creator(resolved_id)
+                if is_subagent_card:
+                    self._apply_subagent_metadata(new_session, resolved_id)
+                if self._bridge_factory is not None:
+                    new_bridge = self._bridge_factory(new_session)
+                with self._lock:
+                    stale_before_delivery = (
+                        self._lifecycle_epoch != lifecycle_epoch
+                        or self._closed_event.is_set()
+                        or task_id not in self._subagent_task_ids
+                    )
+                if stale_before_delivery:
+                    if new_bridge is not None:
+                        try:
+                            new_bridge.close_open_blocks()
+                        except Exception:
+                            logger.debug(
+                                "TaskOrchestrator: failed to close stale "
+                                "generation bridge task_id=%s",
+                                task_id,
+                                exc_info=True,
+                            )
+                    return False
+                snapshot = self._registry.get_snapshot()
+                new_session.dispatch(CardEvent(
+                    type=CardEventType.TASK_LIST_UPDATED,
+                    payload={
+                        "tasks": [
+                            {
+                                "task_id": item.task_id,
+                                "name": item.name,
+                                "status": (
+                                    "in_progress"
+                                    if item.task_id == task_id
+                                    else item.status
+                                ),
+                            }
+                            for item in snapshot
+                        ],
+                        "current_task_id": task_id,
+                    },
+                ))
+                with self._lock:
+                    still_current = (
+                        self._lifecycle_epoch == lifecycle_epoch
+                        and not self._closed_event.is_set()
+                        and task_id in self._subagent_task_ids
+                    )
+                if not still_current:
+                    try:
+                        new_session.dispatch(
+                            CardEvent.archived(
+                                "stale_subagent_generation"
+                            )
+                        )
+                    except Exception:
+                        logger.debug(
+                            "TaskOrchestrator: failed to archive stale new "
+                            "generation task_id=%s",
+                            task_id,
+                            exc_info=True,
+                        )
+                    if new_bridge is not None:
+                        try:
+                            new_bridge.close_open_blocks()
+                        except Exception:
+                            logger.debug(
+                                "TaskOrchestrator: failed to close stale new "
+                                "generation bridge task_id=%s",
+                                task_id,
+                                exc_info=True,
+                            )
+                    return False
+            except Exception:
+                if new_bridge is not None:
+                    try:
+                        new_bridge.close_open_blocks()
+                    except Exception:
+                        logger.debug(
+                            "TaskOrchestrator: failed to close rejected new "
+                            "generation bridge task_id=%s",
+                            task_id,
+                            exc_info=True,
+                        )
+                logger.warning(
+                    "TaskOrchestrator: failed to open new subagent generation "
+                    "task_id=%s",
+                    task_id,
+                    exc_info=True,
+                )
+                return False
+
+        prior_item = self._registry.get(task_id)
+        prior_status = prior_item.status if prior_item is not None else None
+        self._registry.update_status(
+            task_id,
+            "in_progress",
+            notify=False,
+        )
+        old_bridge = None
+        stale_at_commit = False
+        with self._lock:
+            if (
+                self._lifecycle_epoch != lifecycle_epoch
+                or self._closed_event.is_set()
+                or task_id not in self._subagent_task_ids
+            ):
+                stale_at_commit = True
+            else:
+                self._terminal_task_ids.discard(task_id)
+                self._terminal_task_summaries.pop(task_id, None)
+                self._subagent_progress.pop(task_id, None)
+                if physical_is_finalized:
+                    self._finalized_task_ids.discard(resolved_id)
+                    old_bridge = self._bridges.get(resolved_id)
+                    if new_session is not None:
+                        self._sessions[resolved_id] = new_session
+                    if (
+                        self._bridge_factory is not None
+                        and new_bridge is not None
+                    ):
+                        self._bridges[resolved_id] = new_bridge
+
+        if stale_at_commit:
+            if prior_status is not None:
+                self._registry.update_status(
+                    task_id,
+                    prior_status,
+                    notify=False,
+                )
+            if new_session is not None:
+                try:
+                    new_session.dispatch(
+                        CardEvent.archived("stale_subagent_generation")
+                    )
+                except Exception:
+                    logger.debug(
+                        "TaskOrchestrator: failed to archive stale committed "
+                        "generation task_id=%s",
+                        task_id,
+                        exc_info=True,
+                    )
+            if new_bridge is not None:
+                try:
+                    new_bridge.close_open_blocks()
+                except Exception:
+                    logger.debug(
+                        "TaskOrchestrator: failed to close stale committed "
+                        "generation bridge task_id=%s",
+                        task_id,
+                        exc_info=True,
+                    )
+            return False
+        if old_bridge is not None:
+            try:
+                old_bridge.close_open_blocks()
+            except Exception:
+                logger.debug(
+                    "TaskOrchestrator: failed to close old generation bridge "
+                    "task_id=%s",
+                    task_id,
+                    exc_info=True,
+                )
+        self._broadcast_subagent_task_list()
         return True
 
     def _publish_subagent_progress(self, task_id: str, progress: str) -> bool:
@@ -1866,12 +2127,19 @@ class TaskOrchestrator:
         self._registry.unsubscribe(self._on_registry_status_change)
 
         with self._lock:
+            self._lifecycle_epoch += 1
+            generation_claims = list(
+                self._subagent_generation_claims.values()
+            )
+            self._subagent_generation_claims.clear()
             sessions = list(self._sessions.items())
             bridges = list(self._bridges.values())
             self._sessions.clear()
             self._bridges.clear()
             finalized = set(self._finalized_task_ids)
 
+        for claim in generation_claims:
+            claim.set()
         self._close_bridges(bridges)
 
         terminal_event = CardEvent.failed(summary) if failed else CardEvent.completed()
@@ -1958,12 +2226,19 @@ class TaskOrchestrator:
 
         # Close all task sessions and bridges
         with self._lock:
+            self._lifecycle_epoch += 1
+            generation_claims = list(
+                self._subagent_generation_claims.values()
+            )
+            self._subagent_generation_claims.clear()
             sessions = list(self._sessions.items())
             bridges = list(self._bridges.values())
             self._sessions.clear()
             self._bridges.clear()
             finalized = set(self._finalized_task_ids)
 
+        for claim in generation_claims:
+            claim.set()
         self._close_bridges(bridges)
 
         if terminal_status == "failed":

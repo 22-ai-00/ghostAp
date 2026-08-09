@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from src.workflow_engine.models import (
     AgentProgress,
     AgentStatus,
@@ -10,22 +12,37 @@ from src.workflow_engine.models import (
     WorkflowStatus,
 )
 from src.workflow_engine.renderer import (
-    _PHASE_COMPLETED_TAIL,
     WorkflowProgressRenderer,
     render_completion_card,
 )
 
 
 def _make_agent(
-    label: str, status: AgentStatus, *, tool: str = "coco", error: str | None = None, duration_s: float = 1.0
+    label: str,
+    status: AgentStatus,
+    *,
+    tool: str = "coco",
+    error: str | None = None,
+    duration_s: float = 1.0,
+    result: str | None = None,
+    current_activity: str = "",
+    activity_updated_at: float | None = None,
 ) -> AgentProgress:
-    return AgentProgress(
+    agent = AgentProgress(
         label=label,
         tool=tool,
         status=status,
         duration_s=duration_s,
         error=error,
+        current_activity=current_activity,
     )
+    # RED-contract fixture: production does not expose these result-ledger
+    # fields yet. Bypass Pydantic's unknown-field filtering so this test can
+    # describe the renderer's next public input contract without changing
+    # production code during the RED phase.
+    object.__setattr__(agent, "result", result)
+    object.__setattr__(agent, "activity_updated_at", activity_updated_at)
+    return agent
 
 
 def _make_project(phase_title: str, agents: list[AgentProgress]) -> WorkflowProject:
@@ -68,6 +85,25 @@ def _flatten_text(elements: list[dict]) -> str:
     return "\n".join(parts)
 
 
+def _markdown_blocks_containing(card: dict, needle: str) -> list[str]:
+    matches: list[str] = []
+    stack: list[object] = [card]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            content = node.get("content")
+            if node.get("tag") == "markdown" and isinstance(content, str) and needle in content:
+                matches.append(content)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return matches
+
+
+def _card_size_bytes(card: dict) -> int:
+    return len(json.dumps(card, ensure_ascii=False).encode("utf-8", errors="surrogatepass"))
+
+
 def test_phase_header_has_completed_summary_with_large_phase() -> None:
     """Large phase (25 agents) — 已完成 M/N appears near header."""
     agents: list[AgentProgress] = []
@@ -86,48 +122,106 @@ def test_phase_header_has_completed_summary_with_large_phase() -> None:
     assert "已完成 21/25" in text, f"Expected '已完成 21/25' in: {text[:800]}"
 
 
-def test_phase_pagination_truncates_done_and_cached() -> None:
-    """Ensure DONE/CACHED buckets truncated to _PHASE_COMPLETED_TAIL each."""
-    agents: list[AgentProgress] = []
-    agents += [_make_agent(f"done-{i}", AgentStatus.DONE) for i in range(20)]
-    agents += [_make_agent(f"cached-{i}", AgentStatus.CACHED) for i in range(5)]
-    agents.append(_make_agent("running-0", AgentStatus.RUNNING))
-
+def test_terminal_results_form_complete_ordered_ledger_across_cards() -> None:
+    """10+ terminal results remain reconstructable instead of being hidden."""
+    statuses = (AgentStatus.DONE, AgentStatus.CACHED, AgentStatus.FAILED)
+    markers = [f"RESULT{i:02d}SAFE" for i in range(15)]
+    agents = [
+        _make_agent(
+            f"agent-{i}",
+            statuses[i % len(statuses)],
+            error="agent failed" if statuses[i % len(statuses)] == AgentStatus.FAILED else None,
+            result=marker,
+        )
+        for i, marker in enumerate(markers)
+    ]
     project = _make_project("Big Phase", agents)
-    renderer = WorkflowProgressRenderer(project)
-    card = renderer.render_progress_card()
+    project.status = WorkflowStatus.RUNNING
 
-    text = _flatten_text(card["elements"])
+    cards = WorkflowProgressRenderer(project).render_progress_cards(project)
 
-    # Find "已完成 (N)" and "缓存 (M)" collapsible panel headers and verify N, M ≤ tail
-    done_panel_header_text: str | None = None
-    cached_panel_header_text: str | None = None
-    for el in card["elements"]:
-        if isinstance(el, dict) and el.get("tag") == "collapsible_panel":
-            header = el.get("header", {})
-            title_content = ""
-            if isinstance(header, dict):
-                title = header.get("title", {})
-                if isinstance(title, dict):
-                    title_content = str(title.get("content", ""))
-            elif isinstance(header, str):
-                title_content = header
-            if title_content.startswith("已完成 ("):
-                done_panel_header_text = title_content
-            elif title_content.startswith("缓存 ("):
-                cached_panel_header_text = title_content
+    assert len(cards) >= 2
+    assert all(isinstance(card, dict) and "header" in card and "elements" in card for card in cards)
+    status_text = _flatten_text(cards[0]["elements"])
+    ledger_texts = [_flatten_text(card["elements"]) for card in cards[1:]]
+    ledger_text = "\n".join(ledger_texts)
 
-    assert done_panel_header_text is not None, f"No 已完成 panel found. text: {text[:800]}"
-    assert cached_panel_header_text is not None, f"No 缓存 panel found. text: {text[:800]}"
+    assert "进度 " in status_text
+    assert all("进度 " not in text and "当前执行中" not in text for text in ledger_texts)
+    assert all(marker not in status_text for marker in markers)
+    assert all(ledger_text.count(marker) == 1 for marker in markers)
+    positions = [ledger_text.index(marker) for marker in markers]
+    assert positions == sorted(positions), "terminal results must retain agent call order"
 
-    # Parse the count N from "已完成 (N)"
-    done_shown = int(done_panel_header_text.split("(")[1].rstrip(")"))
-    cached_shown = int(cached_panel_header_text.split("(")[1].rstrip(")"))
-    assert done_shown <= _PHASE_COMPLETED_TAIL, f"Expected ≤ {_PHASE_COMPLETED_TAIL} done shown, got {done_shown}"
-    assert cached_shown <= _PHASE_COMPLETED_TAIL, f"Expected ≤ {_PHASE_COMPLETED_TAIL} cached shown, got {cached_shown}"
 
-    # A "共 X 条" counter line should exist for hidden entries
-    assert "共" in text and "条" in text and "已完成/缓存" in text, f"Expected counter line not found in: {text[:800]}"
+def test_single_oversized_result_splits_without_losing_content() -> None:
+    """One large terminal result spans result pages and every page stays bounded."""
+    chunks = [f"RESULTCHUNK{i:03d} " + ("x" * 700) for i in range(72)]
+    agent = _make_agent("large-result", AgentStatus.DONE, result="\n".join(chunks))
+    project = _make_project("Large Result", [agent])
+    project.status = WorkflowStatus.RUNNING
+
+    cards = WorkflowProgressRenderer(project).render_progress_cards(project)
+
+    assert len(cards[1:]) >= 2, "a single oversized result must span multiple ledger pages"
+    assert all(_card_size_bytes(card) <= 28_000 for card in cards)
+    ledger_text = "\n".join(_flatten_text(card["elements"]) for card in cards[1:])
+    markers = [f"RESULTCHUNK{i:03d}" for i in range(72)]
+    assert all(ledger_text.count(marker) == 1 for marker in markers)
+    assert [ledger_text.index(marker) for marker in markers] == sorted(
+        ledger_text.index(marker) for marker in markers
+    )
+
+
+def test_current_step_uses_most_recent_running_activity() -> None:
+    older = _make_agent(
+        "older-running",
+        AgentStatus.RUNNING,
+        current_activity="OLDERACTIVITY",
+        activity_updated_at=100.0,
+    )
+    newer = _make_agent(
+        "newer-running",
+        AgentStatus.RUNNING,
+        current_activity="NEWESTACTIVITY",
+        activity_updated_at=200.0,
+    )
+    project = _make_project("Concurrent", [older, newer])
+    project.status = WorkflowStatus.RUNNING
+
+    status_card = WorkflowProgressRenderer(project).render_progress_cards(project)[0]
+    summaries = _markdown_blocks_containing(status_card, "当前执行中")
+
+    assert len(summaries) == 1
+    assert "NEWESTACTIVITY" in summaries[0]
+    assert "OLDERACTIVITY" not in summaries[0]
+
+
+def test_terminal_status_page_never_labels_stale_activity_as_running() -> None:
+    agent = _make_agent(
+        "finished-agent",
+        AgentStatus.DONE,
+        result="FINISHEDRESULT",
+        current_activity="STALEACTIVITY",
+        activity_updated_at=200.0,
+    )
+    project = _make_project("Finished", [agent])
+    project.status = WorkflowStatus.COMPLETED
+
+    status_card = WorkflowProgressRenderer(project).render_progress_cards(project)[0]
+    status_text = _flatten_text(status_card["elements"])
+
+    assert "⚡ **正在:**" not in status_text
+    assert "STALEACTIVITY" not in status_text
+
+
+def test_singular_progress_renderer_api_remains_available() -> None:
+    project = _make_project("Compatible", [_make_agent("running", AgentStatus.RUNNING)])
+    card = WorkflowProgressRenderer(project).render_progress_card(project)
+
+    assert isinstance(card, dict)
+    assert isinstance(card.get("header"), dict)
+    assert isinstance(card.get("elements"), list)
 
 
 def test_small_phase_renders_everything() -> None:

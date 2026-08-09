@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.card.delivery.feishu_client import FeishuCardAPIClient
+from src.card.delivery.types import SequenceConflictError, TransportError
 
 
 class _FakeResponse:
@@ -47,6 +48,77 @@ class _FakeCardApi:
 
 def _client_for(message_api: _FakeMessageApi):
     return SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=message_api)))
+
+
+def _cardkit_client_for(message_api: _FakeMessageApi, card_api: _FakeCardApi):
+    return SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=message_api)),
+        cardkit=SimpleNamespace(v1=SimpleNamespace(card=card_api)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_error"),
+    (
+        (300317, SequenceConflictError),
+        (999999, TransportError),
+    ),
+)
+def test_cardkit_update_maps_platform_errors(code, expected_error) -> None:
+    message_api = _FakeMessageApi()
+    card_api = _FakeCardApi()
+    failed_response = SimpleNamespace(
+        code=code,
+        msg="card update failed",
+        success=lambda: False,
+    )
+    card_api.update = MagicMock(return_value=failed_response)
+    client = FeishuCardAPIClient(_cardkit_client_for(message_api, card_api))
+    client.send_card_reference("chat_1", "card_active")
+
+    with pytest.raises(expected_error) as exc_info:
+        client.update_card("card_active", {"body": {}}, sequence=7)
+
+    if code == 300317:
+        assert exc_info.value.next_floor == 8
+    else:
+        assert exc_info.value.code == code
+    card_api.update.assert_called_once()
+
+
+def test_cardkit_update_maps_sdk_transport_failure() -> None:
+    message_api = _FakeMessageApi()
+    card_api = _FakeCardApi()
+    client = FeishuCardAPIClient(_cardkit_client_for(message_api, card_api))
+    client.send_card_reference("chat_1", "card_active")
+    client._call_api = MagicMock(side_effect=OSError("connection reset"))
+
+    with pytest.raises(TransportError, match="CardKit update transport failed"):
+        client.update_card("card_active", {"body": {}}, sequence=7)
+
+
+def test_cardkit_route_capacity_preserves_active_routes_until_release() -> None:
+    message_api = _FakeMessageApi()
+    message_api.patch = MagicMock(
+        side_effect=AssertionError("active CardKit entity must not use IM PATCH")
+    )
+    card_api = _FakeCardApi()
+    client = FeishuCardAPIClient(
+        _cardkit_client_for(message_api, card_api),
+        cardkit_route_capacity=1,
+    )
+    client.send_card_reference("chat_1", "card_active")
+
+    with pytest.raises(TransportError, match="route capacity"):
+        client.send_card_reference("chat_1", "card_rejected")
+
+    client.update_card("card_active", {"body": {}}, sequence=1)
+    message_api.patch.assert_not_called()
+
+    client.release_cardkit_entity("card_active")
+    client.send_card_reference("chat_1", "card_replacement")
+    client.update_card("card_replacement", {"body": {}}, sequence=2)
+    message_api.patch.assert_not_called()
 
 
 def test_create_card_sets_feishu_uuid_for_direct_message() -> None:

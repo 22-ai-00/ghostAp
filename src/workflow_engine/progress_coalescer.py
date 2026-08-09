@@ -32,7 +32,7 @@ class ProgressCoalescer:
 
     def __init__(
         self,
-        on_progress: Callable[[dict[str, Any]], None],
+        on_progress: Callable[[Any], None],
         debounce_s: float = PROGRESS_DEBOUNCE_S,
     ) -> None:
         self._on_progress = on_progress
@@ -40,7 +40,7 @@ class ProgressCoalescer:
 
         # Thread safety
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-        self._latest_snapshot: Optional[dict[str, Any]] = None
+        self._latest_snapshot: Optional[Any] = None
         self._stop_event = threading.Event()
 
         # Daemon thread — dies with the main process
@@ -51,7 +51,7 @@ class ProgressCoalescer:
         )
         self._thread.start()
 
-    def enqueue(self, snapshot: dict[str, Any]) -> None:
+    def enqueue(self, snapshot: Any) -> None:
         """Submit a new progress snapshot. Fire-and-forget, non-blocking.
 
         Stores the snapshot; the daemon thread will pick it up on its next
@@ -64,7 +64,7 @@ class ProgressCoalescer:
         with self._lock:
             self._latest_snapshot = snapshot
 
-    def flush_immediate(self, snapshot: dict[str, Any]) -> None:
+    def flush_immediate(self, snapshot: Any) -> None:
         """Flush a snapshot immediately, bypassing the debounce timer.
 
         Used for abort events where the user needs to see cancelled agents

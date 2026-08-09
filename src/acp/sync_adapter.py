@@ -16,6 +16,7 @@ import subprocess
 import threading
 import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from ..config import get_settings
@@ -1346,6 +1347,8 @@ class SyncACPSession:
         timeout: Optional[int] = None,
         idle_timeout: Optional[float] = None,
         await_goal_quiescence: bool = True,
+        await_child_quiescence: bool = False,
+        replay_deferred_child_events: bool = False,
     ) -> PromptResult:
         """Send one prompt, rejecting concurrent callers on this wrapper."""
         prompt_lock = getattr(self, "_prompt_lock", None)
@@ -1361,6 +1364,8 @@ class SyncACPSession:
                 timeout=timeout,
                 idle_timeout=idle_timeout,
                 await_goal_quiescence=await_goal_quiescence,
+                await_child_quiescence=await_child_quiescence,
+                replay_deferred_child_events=replay_deferred_child_events,
             )
         finally:
             prompt_lock.release()
@@ -1377,7 +1382,101 @@ class SyncACPSession:
             on_event=on_event,
             timeout=timeout,
             await_goal_quiescence=False,
+            replay_deferred_child_events=True,
         )
+
+    def send_continuation_prompt(
+        self,
+        text: str,
+        on_event: Optional[Callable[[ACPEvent], None]] = None,
+        timeout: Optional[int] = None,
+    ) -> PromptResult:
+        """Continue the same logical task with deferred child evidence."""
+        return self.send_prompt(
+            text,
+            on_event=on_event,
+            timeout=timeout,
+            replay_deferred_child_events=True,
+        )
+
+    def send_reconciliation_prompt(
+        self,
+        text: str,
+        on_event: Optional[Callable[[ACPEvent], None]] = None,
+        timeout: Optional[int] = None,
+    ) -> PromptResult:
+        """Keep collecting until every observed transient child is terminal."""
+        return self.send_prompt(
+            text,
+            on_event=on_event,
+            timeout=timeout,
+            await_child_quiescence=not self._uses_official_codex_acp(),
+            replay_deferred_child_events=True,
+        )
+
+    def enrich_child_reconciliation_result(
+        self,
+        result: PromptResult,
+        *,
+        started_at: float,
+        ended_at: float,
+        on_event: Optional[Callable[[ACPEvent], None]] = None,
+    ) -> PromptResult:
+        """Recover strict list_agents evidence omitted by official Codex ACP."""
+        if not self._uses_official_codex_acp():
+            return result
+        from .codex_rollout_reconciliation import (
+            enrich_codex_reconciliation_result,
+        )
+        from .models import ACPEventType
+
+        acp_session = getattr(self, "_acp_session", None)
+        session_id = str(
+            getattr(self, "session_id", None)
+            or getattr(acp_session, "_session_id", None)
+            or ""
+        )
+        env_override = getattr(acp_session, "_env_override", None)
+        codex_home: str | None = None
+        if isinstance(env_override, dict):
+            raw_codex_home = str(
+                env_override.get("CODEX_HOME") or ""
+            ).strip()
+            if raw_codex_home:
+                codex_home = raw_codex_home
+            else:
+                raw_home = str(env_override.get("HOME") or "").strip()
+                if raw_home:
+                    codex_home = str(Path(raw_home).expanduser() / ".codex")
+        try:
+            enriched, evidence = enrich_codex_reconciliation_result(
+                result,
+                session_id=session_id,
+                cwd=self._cwd,
+                started_at=started_at,
+                ended_at=ended_at,
+                codex_home=codex_home,
+            )
+        except Exception:
+            logger.warning(
+                "[ACP:CODEX] rollout child reconciliation failed closed",
+                exc_info=True,
+            )
+            return result
+        if evidence is not None and on_event is not None:
+            try:
+                on_event(
+                    ACPEvent(
+                        event_type=ACPEventType.TOOL_CALL_DONE,
+                        tool_call=evidence,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "[ACP:CODEX] reconciled child event callback failed",
+                    exc_info=True,
+                )
+        return enriched
 
     def _send_prompt_once(
         self,
@@ -1386,6 +1485,8 @@ class SyncACPSession:
         timeout: Optional[int] = None,
         idle_timeout: Optional[float] = None,
         await_goal_quiescence: bool = True,
+        await_child_quiescence: bool = False,
+        replay_deferred_child_events: bool = False,
     ) -> PromptResult:
         """Send prompt synchronously, blocking until completion.
 
@@ -1424,6 +1525,8 @@ class SyncACPSession:
                 text,
                 on_event=event_cb,
                 await_goal_quiescence=await_goal_quiescence,
+                await_child_quiescence=await_child_quiescence,
+                replay_deferred_child_events=replay_deferred_child_events,
             ),
             self._loop,
         )

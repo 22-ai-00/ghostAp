@@ -9,10 +9,12 @@ Validates:
 - ``_inject_workflow_stop_button`` appends a danger stop button while running.
 """
 
+import threading
 import unittest
 from unittest.mock import MagicMock
 
 from src.card.actions.dispatch import WORKFLOW_STOP_RUNNING
+from src.workflow_engine.models import WorkflowProject, WorkflowStatus
 
 
 class TestWorkflowStopButtonConstant(unittest.TestCase):
@@ -42,7 +44,12 @@ class TestHandleWorkflowStopRunning(unittest.TestCase):
         )
 
         self.handler._resolve_project_from_id.assert_called_once_with("proj-1", "chat-1")
-        self.handler.stop_workflow.assert_called_once_with("msg-1", "chat-1", self.project)
+        self.handler.stop_workflow.assert_called_once_with(
+            "msg-1",
+            "chat-1",
+            self.project,
+            terminal_is_noop=True,
+        )
 
     def test_prefers_explicit_project_id_argument(self):
         """An explicit project_id argument wins over the button value."""
@@ -54,7 +61,37 @@ class TestHandleWorkflowStopRunning(unittest.TestCase):
         )
 
         self.handler._resolve_project_from_id.assert_called_once_with("explicit-proj", "chat-2")
-        self.handler.stop_workflow.assert_called_once_with("msg-2", "chat-2", self.project)
+        self.handler.stop_workflow.assert_called_once_with(
+            "msg-2",
+            "chat-2",
+            self.project,
+            terminal_is_noop=True,
+        )
+
+    def test_terminal_stop_button_is_an_idempotent_notice(self):
+        """A stale terminal card action must not surface an invalid-state error."""
+        self.handler.stop_workflow = self.handler.__class__.stop_workflow.__get__(self.handler)
+        engine = MagicMock()
+        engine._lock = threading.RLock()
+        engine.project = WorkflowProject(status=WorkflowStatus.FAILED)
+        engine.is_running = False
+        self.handler.ctx.workflow_engine_manager.get.return_value = engine
+        self.handler.ctx.settings.admin_user_ids = []
+        self.handler._reply_workflow_error = MagicMock()
+        self.handler.reply_text = MagicMock()
+
+        self.handler.stop_workflow(
+            "msg-terminal",
+            "chat-1",
+            self.project,
+            terminal_is_noop=True,
+        )
+
+        self.handler._reply_workflow_error.assert_not_called()
+        self.handler.reply_text.assert_called_once_with(
+            "msg-terminal",
+            "Workflow 任务已结束，当前状态：失败。",
+        )
 
 
 class TestInjectWorkflowStopButton(unittest.TestCase):
@@ -67,7 +104,12 @@ class TestInjectWorkflowStopButton(unittest.TestCase):
         """A danger stop button carrying the correct value is appended."""
         card_data = {"header": {}, "elements": [{"tag": "markdown", "content": "running"}]}
 
-        self.handler._inject_workflow_stop_button(card_data, "chat-1", "proj-1")
+        self.handler._inject_workflow_stop_button(
+            card_data,
+            "chat-1",
+            "proj-1",
+            is_running=True,
+        )
 
         elements = card_data["elements"]
         # Original element preserved, plus an hr and at least one button row.
@@ -86,8 +128,25 @@ class TestInjectWorkflowStopButton(unittest.TestCase):
     def test_no_elements_is_noop(self):
         """Missing/invalid elements list must not raise."""
         card_data = {"header": {}}  # no elements key
-        self.handler._inject_workflow_stop_button(card_data, "chat-1", "proj-1")
+        self.handler._inject_workflow_stop_button(
+            card_data,
+            "chat-1",
+            "proj-1",
+            is_running=True,
+        )
         self.assertNotIn("elements", card_data)
+
+    def test_terminal_progress_does_not_append_stop_button(self):
+        card_data = {"header": {}, "elements": [{"tag": "markdown", "content": "failed"}]}
+
+        self.handler._inject_workflow_stop_button(
+            card_data,
+            "chat-1",
+            "proj-1",
+            is_running=False,
+        )
+
+        self.assertIsNone(self._find_stop_button(card_data["elements"]))
 
     @staticmethod
     def _find_stop_button(elements):

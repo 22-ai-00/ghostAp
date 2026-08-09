@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workflow 消息卡片 Preview</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f2f4f7;
+      --card: #ffffff;
+      --surface: #f7f8fa;
+      --surface-blue: #f2f6ff;
+      --surface-green: #eef9f2;
+      --surface-red: #fff3f2;
+      --surface-amber: #fff8eb;
+      --text: #1f2329;
+      --muted: #646a73;
+      --quiet: #8f959e;
+      --line: #dfe3e8;
+      --line-soft: #edf0f3;
+      --blue: #245bdb;
+      --blue-deep: #173f9f;
+      --green: #18864b;
+      --red: #c9352b;
+      --amber: #a65d05;
+      --shadow: 0 8px 24px rgba(31, 35, 41, 0.07);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(180deg, #eef2f8 0, var(--page) 220px),
+        var(--page);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    button { font: inherit; }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 36px 0 64px;
+    }
+
+    .page-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 28px;
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--blue-deep);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 34px);
+      line-height: 1.2;
+      letter-spacing: -0.02em;
+    }
+
+    .page-intro {
+      max-width: 560px;
+      margin: 0;
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .preview-section { margin-top: 32px; }
+
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 20px;
+      margin: 0 0 10px;
+    }
+
+    .section-head h2 {
+      margin: 0;
+      font-size: 16px;
+      line-height: 1.35;
+    }
+
+    .section-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: right;
+    }
+
+    .card {
+      overflow: hidden;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 50px;
+      padding: 11px 16px;
+      color: #fff;
+      background: var(--blue-deep);
+    }
+
+    .card-header.success { background: #17683d; }
+    .card-header.failed { background: #922c25; }
+    .card-header.frozen { color: var(--text); background: #e9edf2; }
+
+    .title-wrap {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 9px;
+    }
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.18);
+    }
+
+    .header-title {
+      overflow: hidden;
+      font-size: 15px;
+      font-weight: 700;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .header-meta {
+      flex: 0 0 auto;
+      padding: 2px 8px;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      border-radius: 999px;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .frozen .header-meta { border-color: #b8bec7; }
+
+    .card-body { padding: 15px 16px; }
+
+    .task-summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: start;
+      padding-bottom: 13px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    .task-label,
+    .block-label {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--quiet);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+    }
+
+    .task-text { margin: 0; font-weight: 650; }
+
+    .summary-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(64px, 1fr));
+      gap: 6px;
+    }
+
+    .metric {
+      min-width: 66px;
+      padding: 7px 9px;
+      background: var(--surface);
+      border-radius: 6px;
+      text-align: center;
+    }
+
+    .metric strong { display: block; font-size: 13px; }
+    .metric span { color: var(--quiet); font-size: 10px; }
+
+    .block { margin-top: 14px; }
+
+    .block-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 7px;
+    }
+
+    .block-heading h3 {
+      margin: 0;
+      font-size: 13px;
+    }
+
+    .block-heading span { color: var(--quiet); font-size: 11px; }
+
+    .result-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      overflow: hidden;
+    }
+
+    .result-item {
+      display: grid;
+      grid-template-columns: 42px minmax(112px, 0.32fr) minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    .result-item:last-child { border-bottom: 0; }
+
+    .result-index {
+      color: var(--quiet);
+      font: 700 11px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .result-owner strong { display: block; font-size: 12px; }
+    .result-owner span { color: var(--quiet); font-size: 11px; }
+    .result-copy { margin: 0; color: #3b4048; font-size: 12px; }
+
+    .result-state {
+      display: inline-block;
+      margin-top: 4px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      color: var(--green);
+      background: var(--surface-green);
+      font-size: 10px;
+      font-weight: 700;
+    }
+
+    .result-state.error { color: var(--red); background: var(--surface-red); }
+
+    .current-step {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+      margin-top: 14px;
+      padding: 11px 12px;
+      border: 1px solid #adc5fa;
+      border-left: 4px solid var(--blue);
+      border-radius: 7px;
+      background: var(--surface-blue);
+    }
+
+    .current-marker {
+      width: 9px;
+      height: 9px;
+      margin-top: 5px;
+      border-radius: 50%;
+      background: var(--blue);
+    }
+
+    .current-step strong { display: block; font-size: 12px; }
+    .current-step p { margin: 2px 0 0; color: #35405a; font-size: 12px; }
+    .current-time { color: var(--blue-deep); font-size: 11px; white-space: nowrap; }
+
+    .slot-note {
+      margin: 6px 0 0;
+      color: var(--quiet);
+      font-size: 10px;
+    }
+
+    .card-actions {
+      display: flex;
+      justify-content: flex-end;
+      padding-top: 12px;
+    }
+
+    .stop-button {
+      min-height: 32px;
+      padding: 5px 12px;
+      color: var(--red);
+      background: #fff;
+      border: 1px solid #e3aaa5;
+      border-radius: 5px;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .continuation-grid,
+    .terminal-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      align-items: start;
+    }
+
+    .continuation-note {
+      margin-bottom: 10px;
+      padding: 8px 10px;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      font-size: 11px;
+    }
+
+    .continuation-note strong { color: var(--text); }
+    .frozen-card { box-shadow: none; }
+
+    .terminal-summary {
+      margin: 0 0 12px;
+      padding: 9px 11px;
+      border-left: 3px solid var(--green);
+      border-radius: 5px;
+      background: var(--surface-green);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .terminal-summary.error {
+      border-left-color: var(--red);
+      background: var(--surface-red);
+    }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .detail-block {
+      min-width: 0;
+      padding: 9px 10px;
+      background: var(--surface);
+      border-radius: 6px;
+    }
+
+    .detail-block.validation { background: var(--surface-green); }
+    .detail-block.validation.error { background: var(--surface-red); }
+    .detail-block h3 { margin: 0 0 5px; font-size: 11px; }
+    .detail-block p { margin: 0; color: #4b515a; font-size: 11px; }
+
+    .terminal-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line-soft);
+      color: var(--quiet);
+      font-size: 10px;
+    }
+
+    .terminal-footer strong { color: var(--muted); }
+
+    @media (max-width: 900px) {
+      .page-head { align-items: start; flex-direction: column; }
+      .page-intro { text-align: left; }
+      .continuation-grid,
+      .terminal-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 620px) {
+      .page { width: min(100% - 20px, 520px); padding-top: 20px; }
+      .section-head { align-items: start; flex-direction: column; gap: 3px; }
+      .section-head p { text-align: left; }
+      .task-summary { grid-template-columns: 1fr; }
+      .summary-metrics { grid-template-columns: repeat(3, 1fr); }
+      .result-item { grid-template-columns: 36px minmax(0, 1fr); }
+      .result-copy { grid-column: 2; }
+      .current-step { grid-template-columns: auto minmax(0, 1fr); }
+      .current-time { grid-column: 2; }
+      .detail-grid { grid-template-columns: 1fr; }
+      .terminal-footer { align-items: start; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <p class="eyebrow">GhostAP / Workflow</p>
+        <h1>消息卡片状态预览</h1>
+      </div>
+      <p class="page-intro">最终结果只追加并完整保留；过程信息始终写入唯一的“当前单步”槽位，避免长任务把卡片撑满。</p>
+    </header>
+
+    <section class="preview-section" aria-labelledby="running-title">
+      <div class="section-head">
+        <h2 id="running-title">1. 运行态</h2>
+        <p>已完成结果稳定累积，当前单步原位更新</p>
+      </div>
+      <article class="card" aria-label="Workflow 运行态卡片">
+        <header class="card-header">
+          <div class="title-wrap">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="header-title">Workflow 执行中</span>
+          </div>
+          <span class="header-meta">阶段 2 / 3</span>
+        </header>
+        <div class="card-body">
+          <div class="task-summary">
+            <div>
+              <span class="task-label">任务</span>
+              <p class="task-text">重构登录模块，并补齐认证回归测试</p>
+            </div>
+            <div class="summary-metrics" aria-label="执行摘要">
+              <div class="metric"><strong>3 / 6</strong><span>结果</span></div>
+              <div class="metric"><strong>08:42</strong><span>已运行</span></div>
+              <div class="metric"><strong>62%</strong><span>阶段进度</span></div>
+            </div>
+          </div>
+
+          <section class="block" aria-labelledby="completed-results-title">
+            <div class="block-heading">
+              <h3 id="completed-results-title">已完成结果</h3>
+              <span>按完成顺序只追加</span>
+            </div>
+            <ol class="result-list">
+              <li class="result-item" data-result-index="001">
+                <span class="result-index">#001</span>
+                <div class="result-owner"><strong>structure-agent</strong><span>Agent · Codex</span></div>
+                <p class="result-copy">确认认证入口集中在 auth/service.py，现有 session 写入存在两条重复路径。</p>
+              </li>
+              <li class="result-item" data-result-index="002">
+                <span class="result-index">#002</span>
+                <div class="result-owner"><strong>security-agent</strong><span>Agent · Traex</span></div>
+                <p class="result-copy">发现 OAuth state 缺少一次性消费校验，风险边界和兼容修复点已定位。</p>
+              </li>
+              <li class="result-item" data-result-index="003">
+                <span class="result-index">#003</span>
+                <div class="result-owner"><strong>design-review</strong><span>Reviewer · Claude</span></div>
+                <p class="result-copy">方案通过结构评审；要求保留旧 token 的单次迁移读取，避免存量会话失效。</p>
+              </li>
+            </ol>
+          </section>
+
+          <section class="current-step" id="current-step-slot" role="status" aria-live="polite" aria-label="唯一当前单步槽位">
+            <span class="current-marker" aria-hidden="true"></span>
+            <div>
+              <strong>当前单步 · implementation-agent</strong>
+              <p>正在合并 session 写入路径，并保持旧 token 的兼容读取。</p>
+              <p class="slot-note">此位置只替换当前一步，不累积思考过程。</p>
+            </div>
+            <span class="current-time">运行 01:18</span>
+          </section>
+
+          <div class="card-actions">
+            <button class="stop-button" type="button">停止 Workflow</button>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section class="preview-section" aria-labelledby="continuation-title">
+      <div class="section-head">
+        <h2 id="continuation-title">2. 容量续接态</h2>
+        <p>新卡可见后冻结前卡，结果编号跨卡连续且不省略</p>
+      </div>
+      <div class="continuation-grid">
+        <article class="card frozen-card" aria-label="Workflow 容量续接前卡">
+          <header class="card-header frozen">
+            <div class="title-wrap">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="header-title">Workflow 结果记录</span>
+            </div>
+            <span class="header-meta">第 1 / 2 卡 · 已冻结</span>
+          </header>
+          <div class="card-body">
+            <div class="continuation-note"><strong>前页已冻结。</strong> 后续更新只进入第 2 卡，本页结果保持原样。</div>
+            <ol class="result-list">
+              <li class="result-item" data-result-index="001">
+                <span class="result-index">#001</span>
+                <div class="result-owner"><strong>structure-agent</strong><span>Agent · Codex</span></div>
+                <p class="result-copy">完成认证目录和调用边界盘点，确认改动集中在服务层与两个路由入口。</p>
+              </li>
+              <li class="result-item" data-result-index="002">
+                <span class="result-index">#002</span>
+                <div class="result-owner"><strong>security-agent</strong><span>Agent · Traex</span></div>
+                <p class="result-copy">完成威胁检查，定位 OAuth state 重放和 session 重复写入两项问题。</p>
+              </li>
+              <li class="result-item" data-result-index="003">
+                <span class="result-index">#003</span>
+                <div class="result-owner"><strong>design-review</strong><span>Reviewer · Claude</span></div>
+                <p class="result-copy">批准实现方案，并明确旧 token 迁移读取和失败回滚要求。</p>
+              </li>
+            </ol>
+            <div class="terminal-footer">
+              <span>结果范围 #001–#003</span>
+              <strong>下一结果见第 2 卡</strong>
+            </div>
+          </div>
+        </article>
+
+        <article class="card" aria-label="Workflow 容量续接当前卡">
+          <header class="card-header">
+            <div class="title-wrap">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="header-title">Workflow 结果续接</span>
+            </div>
+            <span class="header-meta">第 2 / 2 卡 · 当前卡</span>
+          </header>
+          <div class="card-body">
+            <div class="continuation-note"><strong>从 #004 连续记录。</strong> 所有前序结果保留在第 1 卡，没有截断或合并。</div>
+            <ol class="result-list" start="4">
+              <li class="result-item" data-result-index="004">
+                <span class="result-index">#004</span>
+                <div class="result-owner"><strong>implementation-agent</strong><span>Agent · Codex</span></div>
+                <p class="result-copy">完成 session 单点写入和旧 token 兼容迁移，接口返回结构保持不变。</p>
+              </li>
+              <li class="result-item" data-result-index="005">
+                <span class="result-index">#005</span>
+                <div class="result-owner"><strong>test-agent</strong><span>Agent · Traex</span></div>
+                <p class="result-copy">新增 OAuth state、重复登录和存量 token 三组回归用例，共 18 项全部通过。</p>
+              </li>
+              <li class="result-item" data-result-index="006">
+                <span class="result-index">#006</span>
+                <div class="result-owner"><strong>final-review</strong><span>Reviewer · Claude</span></div>
+                <p class="result-copy">独立复核通过，未发现阻塞问题；建议上线后监控旧 token 迁移命中率。</p>
+              </li>
+            </ol>
+            <div class="terminal-footer">
+              <span>结果范围 #004–#006</span>
+              <strong>全量结果 #001–#006 均可见</strong>
+            </div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="preview-section" aria-labelledby="terminal-title">
+      <div class="section-head">
+        <h2 id="terminal-title">3. 成功 / 失败终态</h2>
+        <p>终态保留每个 Agent 与 Reviewer 结果，不再显示停止操作</p>
+      </div>
+      <div class="terminal-grid">
+        <article class="card" aria-label="Workflow 成功终态卡片">
+          <header class="card-header success">
+            <div class="title-wrap">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="header-title">Workflow 完成</span>
+            </div>
+            <span class="header-meta">6 / 6 成功</span>
+          </header>
+          <div class="card-body">
+            <p class="terminal-summary">登录模块重构完成，18 项定向测试通过，独立评审确认可进入发布流程。</p>
+            <div class="block-heading">
+              <h3>Agent / Reviewer 最终结果</h3>
+              <span>按完成顺序</span>
+            </div>
+            <ol class="result-list">
+              <li class="result-item" data-result-index="001">
+                <span class="result-index">#001</span>
+                <div class="result-owner"><strong>structure-agent</strong><span>Agent · Codex</span><em class="result-state">完成</em></div>
+                <p class="result-copy">完成认证边界盘点，确认服务层为唯一需要收敛的写入入口。</p>
+              </li>
+              <li class="result-item" data-result-index="002">
+                <span class="result-index">#002</span>
+                <div class="result-owner"><strong>implementation-agent</strong><span>Agent · Codex</span><em class="result-state">完成</em></div>
+                <p class="result-copy">合并 session 写入路径，补齐 OAuth state 校验并保留旧 token 迁移读取。</p>
+              </li>
+              <li class="result-item" data-result-index="003">
+                <span class="result-index">#003</span>
+                <div class="result-owner"><strong>test-agent</strong><span>Agent · Traex</span><em class="result-state">完成</em></div>
+                <p class="result-copy">新增 18 项回归测试，覆盖重放、重复登录、迁移读取和失败回滚，全部通过。</p>
+              </li>
+              <li class="result-item" data-result-index="004">
+                <span class="result-index">#004</span>
+                <div class="result-owner"><strong>final-review</strong><span>Reviewer · Claude</span><em class="result-state">通过</em></div>
+                <p class="result-copy">独立评审通过，接口兼容与失败回滚证据完整，无高风险遗留。</p>
+              </li>
+            </ol>
+            <div class="detail-grid">
+              <section class="detail-block validation">
+                <h3>验证</h3>
+                <p>18 项定向测试通过；配置检查通过。</p>
+              </section>
+              <section class="detail-block">
+                <h3>交付物</h3>
+                <p>3 个源码文件、2 个测试文件、1 份完整报告。</p>
+              </section>
+              <section class="detail-block">
+                <h3>下一步</h3>
+                <p>进入发布评审，并监控旧 token 迁移命中率。</p>
+              </section>
+            </div>
+            <footer class="terminal-footer">
+              <span>总耗时 12:26 · 终态已冻结</span>
+              <strong>完整报告已附在当前话题</strong>
+            </footer>
+          </div>
+        </article>
+
+        <article class="card" aria-label="Workflow 失败终态卡片">
+          <header class="card-header failed">
+            <div class="title-wrap">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="header-title">Workflow 未通过</span>
+            </div>
+            <span class="header-meta">3 成功 · 1 失败</span>
+          </header>
+          <div class="card-body">
+            <p class="terminal-summary error">实现与测试已完成，但独立安全评审发现 OAuth state 仍可重复消费，本次结果不可发布。</p>
+            <div class="block-heading">
+              <h3>Agent / Reviewer 最终结果</h3>
+              <span>失败结果同样完整保留</span>
+            </div>
+            <ol class="result-list">
+              <li class="result-item" data-result-index="001">
+                <span class="result-index">#001</span>
+                <div class="result-owner"><strong>structure-agent</strong><span>Agent · Codex</span><em class="result-state">完成</em></div>
+                <p class="result-copy">完成认证调用边界盘点，定位 session 写入与 OAuth 回调入口。</p>
+              </li>
+              <li class="result-item" data-result-index="002">
+                <span class="result-index">#002</span>
+                <div class="result-owner"><strong>implementation-agent</strong><span>Agent · Codex</span><em class="result-state">完成</em></div>
+                <p class="result-copy">完成 session 写入收敛，但 OAuth state 的消费标记未进入同一事务。</p>
+              </li>
+              <li class="result-item" data-result-index="003">
+                <span class="result-index">#003</span>
+                <div class="result-owner"><strong>test-agent</strong><span>Agent · Traex</span><em class="result-state">完成</em></div>
+                <p class="result-copy">17 项用例通过，新增的并发重放用例失败并稳定复现重复消费。</p>
+              </li>
+              <li class="result-item" data-result-index="004">
+                <span class="result-index">#004</span>
+                <div class="result-owner"><strong>security-review</strong><span>Reviewer · Claude</span><em class="result-state error">未通过</em></div>
+                <p class="result-copy">评审拒绝：OAuth state 校验与消费不是原子操作，并发请求仍可通过两次。</p>
+              </li>
+            </ol>
+            <div class="detail-grid">
+              <section class="detail-block validation error">
+                <h3>验证</h3>
+                <p>17 / 18 通过；并发重放用例失败。</p>
+              </section>
+              <section class="detail-block">
+                <h3>交付物</h3>
+                <p>当前补丁、失败复现用例、独立评审证据。</p>
+              </section>
+              <section class="detail-block">
+                <h3>下一步</h3>
+                <p>将校验与消费合并为原子写入后重新运行评审。</p>
+              </section>
+            </div>
+            <footer class="terminal-footer">
+              <span>总耗时 10:51 · 终态已冻结</span>
+              <strong>完整失败证据已附在当前话题</strong>
+            </footer>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

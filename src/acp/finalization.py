@@ -172,7 +172,8 @@ def _build_finalization_prompt(original_task: str, reserve_s: float | int) -> st
         "先且仅调用一次 list_agents 获取权威状态；只对 running/pending 子代理逐个"
         "调用 interrupt_agent；随后再调用一次 list_agents 确认终态，不要等待。\n"
         "请只做安全且有界的其余收尾："
-        "保存当前已完成成果；运行最必要的针对性验证；只执行原任务已明确授权的"
+        "保存当前已完成成果；整理已经取得的验证结果，不要启动新的验证；"
+        "只执行原任务已明确授权的"
         "提交、推送或其他外部动作；如仍有未完成项，必须如实列出，不能伪装成功。"
         "务必在本轮结束前给出完整最终答复。\n\n"
         "[原始用户任务（仅用于限定收尾范围）]\n"
@@ -191,14 +192,36 @@ def _send_runtime_finalization_prompt(
     timeout: float | int,
 ) -> PromptResult:
     """Use a single-turn collector when the concrete session supports it."""
-    method = getattr(type(session), "send_finalization_prompt", None)
+    method = getattr(session, "send_finalization_prompt", None)
     if callable(method):
         return method(
-            session,
             text,
             on_event=on_event,
             timeout=timeout,
         )
+    return session.send_prompt(
+        text,
+        on_event=on_event,
+        timeout=timeout,
+    )
+
+
+def _send_primary_prompt(
+    session: SessionT,
+    text: str,
+    *,
+    on_event: Callable[[ACPEvent], None] | None,
+    timeout: float | int,
+    replay_deferred_child_events: bool,
+) -> PromptResult:
+    if replay_deferred_child_events:
+        method = getattr(session, "send_continuation_prompt", None)
+        if callable(method):
+            return method(
+                text,
+                on_event=on_event,
+                timeout=timeout,
+            )
     return session.send_prompt(
         text,
         on_event=on_event,
@@ -217,6 +240,7 @@ def run_prompt_with_finalization(
     on_finalization_start: Callable[[], None] | None = None,
     replace_dead_session: Callable[[float], SessionT] | None = None,
     retire_finalization_session: Callable[[SessionT, float], None] | None = None,
+    replay_deferred_child_events: bool = False,
 ) -> PromptResult:
     """Run a prompt while reserving a second turn for bounded safe finalization."""
     started_at = _monotonic()
@@ -225,10 +249,12 @@ def run_prompt_with_finalization(
     if split is None:
         primary_timeout = _primary_timeout_with_cleanup_reserve(timeout_s)
         try:
-            result = session.send_prompt(
+            result = _send_primary_prompt(
+                session,
                 text,
                 on_event=on_event,
                 timeout=primary_timeout,
+                replay_deferred_child_events=replay_deferred_child_events,
             )
         except TimeoutError as exc:
             _notify_finalization_start(on_finalization_start)
@@ -252,10 +278,12 @@ def run_prompt_with_finalization(
     primary_timeout, reserve_timeout = split
     primary_error: TimeoutError | None = None
     try:
-        primary_result = session.send_prompt(
+        primary_result = _send_primary_prompt(
+            session,
             text,
             on_event=on_event,
             timeout=primary_timeout,
+            replay_deferred_child_events=replay_deferred_child_events,
         )
     except TimeoutError as exc:
         primary_error = exc

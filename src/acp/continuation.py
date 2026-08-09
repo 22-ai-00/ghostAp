@@ -23,9 +23,21 @@ from .outcome import (
 logger = logging.getLogger(__name__)
 
 MAX_ORDINARY_CONTINUATIONS = 1
+MAX_CHILD_RECONCILIATIONS = 1
 _monotonic = time.monotonic
 _PLAN_CONTINUATION = "plan"
 _CHILD_RECONCILIATION = "child_reconciliation"
+_USER_INPUT_MARKERS = (
+    "请确认",
+    "请选择",
+    "请回复",
+    "需要你确认",
+    "等待你的确认",
+    "please confirm",
+    "please choose",
+    "please reply",
+    "need your confirmation",
+)
 
 
 class _PromptSession(Protocol):
@@ -80,8 +92,12 @@ def _build_child_reconciliation_prompt(
         f"{unresolved_child_tool_calls} 个协作工具携带未终态子代理状态。"
         "这可能是异步 FINAL_ANSWER 已到达、而协作快照尚未刷新的竞态。\n"
         "请先调用 list_agents 获取权威最新状态；对仍为 running/pending "
-        "的子代理，使用 wait_agent 等待并接收其最终结果。不要仅凭已收到文本"
-        "或 end_turn 推断子代理完成，也不要重复已经完成的实现。\n"
+        "的子代理，使用 wait_agent 等待并接收其最终结果。wait_agent 可能被普通 "
+        "MESSAGE 提前唤醒，MESSAGE 不代表子代理已进入终态；每次 wait_agent 返回后"
+        "必须再次调用 list_agents。若仍有 running/pending 子代理，在本轮内继续执行 "
+        "wait_agent -> list_agents，直到权威状态全部为 completed/failed/cancelled，"
+        "或本轮达到工具期限。不要仅凭已收到文本或 end_turn 推断子代理完成，也不要"
+        "重复已经完成的实现。\n"
         "本指令不新增任何权限，不得扩大原任务范围，也不得中止或取消子代理。"
         "所有子代理进入 completed/failed/cancelled 终态后，整合现有结果并"
         "如实给出最终答复。"
@@ -96,6 +112,24 @@ def _notify_continuation_start(callback: Callable[[], None] | None) -> None:
         callback()
     except Exception:
         logger.warning("prompt continuation callback failed", exc_info=True)
+
+
+def _requests_explicit_user_input(result: PromptResult) -> bool:
+    text = str(result.text or "").strip().casefold()
+    return bool(text and any(marker in text for marker in _USER_INPUT_MARKERS))
+
+
+def _send_child_reconciliation_prompt(
+    session: SessionT,
+    text: str,
+    *,
+    on_event: Callable[[ACPEvent], None] | None,
+    timeout: float | int,
+) -> PromptResult:
+    method = getattr(session, "send_reconciliation_prompt", None)
+    if callable(method):
+        return method(text, on_event=on_event, timeout=timeout)
+    return session.send_prompt(text, on_event=on_event, timeout=timeout)
 
 
 def _retire_reconciliation_timeout(
@@ -163,17 +197,26 @@ def _continuation_kind(
 ) -> str | None:
     if (
         entered_finalization
-        or result.goal is not None
         or assessment.outcome is not PromptOutcome.INCOMPLETE
         or assessment.stop_reason != "end_turn"
+        or _requests_explicit_user_input(result)
     ):
         return None
+    goal = result.goal
+    goal_status = (
+        str(goal.status or "").strip().casefold()
+        if goal is not None
+        else ""
+    )
     if (
-        assessment.pending_plan_entries > 0
+        goal is None
+        and assessment.pending_plan_entries > 0
         and assessment.incomplete_tool_calls == 0
     ):
         return _PLAN_CONTINUATION
     if (
+        (goal is None or goal_status == "completed")
+        and
         assessment.pending_plan_entries == 0
         and assessment.incomplete_tool_calls > 0
         and assessment.incomplete_outer_tool_calls == 0
@@ -197,7 +240,7 @@ def run_prompt_with_continuation(
     replace_dead_session: Callable[[float], SessionT] | None = None,
     retire_finalization_session: Callable[[SessionT, float], None] | None = None,
 ) -> PromptContinuationResult:
-    """Run a prompt with one bounded plan turn and one child reconciliation.
+    """Run a prompt with bounded plan continuation and child reconciliation.
 
     ``on_continuation_start`` is a best-effort structural boundary hook for
     closing streamed blocks for either plan continuation or child-state
@@ -214,6 +257,8 @@ def run_prompt_with_continuation(
     def run_turn(
         prompt: str,
         turn_timeout_s: float | int,
+        *,
+        replay_deferred_child_events: bool = False,
     ) -> tuple[PromptResult, bool]:
         entered_finalization = False
 
@@ -233,6 +278,7 @@ def run_prompt_with_continuation(
             on_finalization_start=mark_finalization_start,
             replace_dead_session=replace_dead_session,
             retire_finalization_session=retire_finalization_session,
+            replay_deferred_child_events=replay_deferred_child_events,
         )
         return result, entered_finalization
 
@@ -255,7 +301,7 @@ def run_prompt_with_continuation(
             and plan_continuations >= MAX_ORDINARY_CONTINUATIONS
         ) or (
             continuation_kind == _CHILD_RECONCILIATION
-            and child_reconciliations >= MAX_ORDINARY_CONTINUATIONS
+            and child_reconciliations >= MAX_CHILD_RECONCILIATIONS
         ):
             break
         remaining_budget = deadline - _monotonic()
@@ -272,10 +318,13 @@ def run_prompt_with_continuation(
         remaining_budget = deadline - _monotonic()
         if remaining_budget <= 0:
             break
+        reconciliation_started_at: float | None = None
+        reconciliation_finished_at: float | None = None
         if continuation_kind == _PLAN_CONTINUATION:
             next_result, entered_finalization = run_turn(
                 continuation_prompt,
                 remaining_budget,
+                replay_deferred_child_events=True,
             )
             plan_continuations += 1
         else:
@@ -285,12 +334,15 @@ def run_prompt_with_continuation(
             reconciliation_timeout = _primary_timeout_with_cleanup_reserve(
                 remaining_budget
             )
+            reconciliation_started_at = time.time()
             try:
-                next_result = session.send_prompt(
+                next_result = _send_child_reconciliation_prompt(
+                    session,
                     continuation_prompt,
                     on_event=on_event,
                     timeout=reconciliation_timeout,
                 )
+                reconciliation_finished_at = time.time()
             except TimeoutError as timeout_error:
                 _retire_reconciliation_timeout(
                     session,
@@ -316,6 +368,30 @@ def run_prompt_with_continuation(
         )
         automatic_continuations += 1
         result = _merge_prompt_results(result, next_result)
+        if (
+            reconciliation_started_at is not None
+            and reconciliation_finished_at is not None
+        ):
+            enrich_result = getattr(
+                session,
+                "enrich_child_reconciliation_result",
+                None,
+            )
+            if callable(enrich_result):
+                try:
+                    enriched = enrich_result(
+                        result,
+                        started_at=reconciliation_started_at,
+                        ended_at=reconciliation_finished_at,
+                        on_event=on_event,
+                    )
+                    if isinstance(enriched, PromptResult):
+                        result = enriched
+                except Exception:
+                    logger.warning(
+                        "Codex child reconciliation evidence enrichment failed",
+                        exc_info=True,
+                    )
         assessment = classify_prompt_result(result)
         continuation_kind = _continuation_kind(
             result,
@@ -334,6 +410,10 @@ def run_prompt_with_continuation(
         and assessment.stop_reason == "end_turn"
         and (
             (
+                not ever_entered_finalization
+                and _requests_explicit_user_input(result)
+            )
+            or (
                 goal is not None
                 and not ever_entered_finalization
                 and assessment.incomplete_tool_calls == 0
@@ -357,6 +437,7 @@ def run_prompt_with_continuation(
 
 
 __all__ = [
+    "MAX_CHILD_RECONCILIATIONS",
     "MAX_ORDINARY_CONTINUATIONS",
     "PromptContinuationResult",
     "run_prompt_with_continuation",

@@ -37,6 +37,57 @@ def _sanitize_card_content(content: str) -> str:
         )
 
 
+class _CardKitEntityRoutes:
+    """Bound active CardKit routes without evicting live entities."""
+
+    def __init__(self, capacity: int) -> None:
+        if isinstance(capacity, bool) or capacity <= 0:
+            raise ValueError("CardKit route capacity must be a positive integer")
+        self._capacity = int(capacity)
+        self._entity_ids: set[str] = set()
+        self._reserved = 0
+        self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+
+    def contains(self, card_id: str) -> bool:
+        with self._lock:
+            return card_id in self._entity_ids
+
+    def register(self, card_id: str) -> bool:
+        with self._lock:
+            if card_id in self._entity_ids:
+                return False
+            self._ensure_capacity()
+            self._entity_ids.add(card_id)
+            return True
+
+    def reserve(self) -> None:
+        with self._lock:
+            self._ensure_capacity()
+            self._reserved += 1
+
+    def commit_reserved(self, card_id: str) -> None:
+        with self._lock:
+            if self._reserved <= 0:
+                raise RuntimeError("CardKit route reservation is missing")
+            self._reserved -= 1
+            self._entity_ids.add(card_id)
+
+    def cancel_reserved(self) -> None:
+        with self._lock:
+            if self._reserved > 0:
+                self._reserved -= 1
+
+    def release(self, card_id: str) -> None:
+        with self._lock:
+            self._entity_ids.discard(card_id)
+
+    def _ensure_capacity(self) -> None:
+        if len(self._entity_ids) + self._reserved >= self._capacity:
+            raise TransportError(
+                f"CardKit route capacity exhausted ({self._capacity})"
+            )
+
+
 class FeishuCardAPIClient:
     """Implements CardAPIClient protocol using lark_oapi SDK.
 
@@ -60,6 +111,7 @@ class FeishuCardAPIClient:
         outbound_audit_failure: Callable[[Exception], None] | None = None,
         tenant_key_resolver: Callable[[], str] | None = None,
         outbound_target_aliases: Callable[[str], tuple[str, ...]] | None = None,
+        cardkit_route_capacity: int = 4096,
     ) -> None:
         self._client = client
         self._settings = get_settings()
@@ -68,7 +120,9 @@ class FeishuCardAPIClient:
         self._tenant_key_resolver = tenant_key_resolver
         self._outbound_target_aliases = outbound_target_aliases
         self._audit_aliases_by_message: dict[str, tuple[str, ...]] = {}
-        self._cardkit_entity_ids: set[str] = set()
+        self._cardkit_entity_routes = _CardKitEntityRoutes(
+            cardkit_route_capacity
+        )
         self._audit_alias_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
     def _audit_outbound(self, operation: str, target: str) -> tuple[str, ...]:
@@ -250,8 +304,7 @@ class FeishuCardAPIClient:
         during entity creation/reference use ``card.update``.
         Sequence conflicts (code 300317) are raised as SequenceConflictError.
         """
-        with self._audit_alias_lock:
-            is_cardkit_entity = card_id in self._cardkit_entity_ids
+        is_cardkit_entity = self._cardkit_entity_routes.contains(card_id)
         if is_cardkit_entity:
             self._update_cardkit_entity(card_id, card_json, sequence=sequence)
             return
@@ -318,10 +371,17 @@ class FeishuCardAPIClient:
         )
 
         self._audit_outbound("patch", card_id)
-        response = self._call_api(
-            "cardkit.card.update",
-            lambda: self._client.cardkit.v1.card.update(request),
-        )
+        try:
+            response = self._call_api(
+                "cardkit.card.update",
+                lambda: self._client.cardkit.v1.card.update(request),
+            )
+        except (TimeoutError, TransportError):
+            raise
+        except Exception as exc:
+            raise TransportError(
+                f"CardKit update transport failed: {type(exc).__name__}"
+            ) from exc
         if not response.success():
             if response.code == 300317:
                 raise SequenceConflictError(next_floor=sequence + 1)
@@ -394,20 +454,26 @@ class FeishuCardAPIClient:
             .build()
         )
 
-        response = self._call_api(
-            "cardkit.card.create",
-            lambda: self._client.cardkit.v1.card.create(request),
-        )
-
-        if not response.success():
-            raise TransportError(
-                f"Streaming card create failed: code={response.code}, msg={response.msg}"
+        self._cardkit_entity_routes.reserve()
+        try:
+            response = self._call_api(
+                "cardkit.card.create",
+                lambda: self._client.cardkit.v1.card.create(request),
             )
+            if not response.success():
+                raise TransportError(
+                    f"Streaming card create failed: code={response.code}, msg={response.msg}"
+                )
+            card_id = response.data.card_id
+            self._cardkit_entity_routes.commit_reserved(card_id)
+            return card_id
+        except Exception:
+            self._cardkit_entity_routes.cancel_reserved()
+            raise
 
-        card_id = response.data.card_id
-        with self._audit_alias_lock:
-            self._cardkit_entity_ids.add(card_id)
-        return card_id
+    def release_cardkit_entity(self, card_id: str) -> None:
+        """Release routing state after the owning page lifecycle ends."""
+        self._cardkit_entity_routes.release(card_id)
 
     def send_card_reference(
         self,
@@ -418,7 +484,31 @@ class FeishuCardAPIClient:
         reply_in_thread: bool | None = None,
         idempotency_key: str | None = None,
     ) -> str:
-        """Send an IM message referencing a CardKit card entity.
+        """Send an IM message referencing a CardKit card entity."""
+        route_added = self._cardkit_entity_routes.register(card_id)
+        try:
+            return self._send_card_reference(
+                chat_id,
+                card_id,
+                reply_to=reply_to,
+                reply_in_thread=reply_in_thread,
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            if route_added:
+                self._cardkit_entity_routes.release(card_id)
+            raise
+
+    def _send_card_reference(
+        self,
+        chat_id: str,
+        card_id: str,
+        *,
+        reply_to: str | None = None,
+        reply_in_thread: bool | None = None,
+        idempotency_key: str | None = None,
+    ) -> str:
+        """Dispatch one already-registered CardKit entity reference.
 
         Returns the message_id of the sent message.
         """
@@ -483,6 +573,4 @@ class FeishuCardAPIClient:
         # separate message id.  Both targets represent the same recipient scope
         # and must survive provenance lookup failures after the initial send.
         self._remember_message_audit_aliases(card_id, audit_aliases)
-        with self._audit_alias_lock:
-            self._cardkit_entity_ids.add(card_id)
         return message_id

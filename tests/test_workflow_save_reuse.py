@@ -897,6 +897,7 @@ class TestWorkflowReuse(unittest.TestCase):
         handler.get_engine_name = MagicMock(return_value="coco")
         handler.ensure_request_id = MagicMock(return_value="req_123")
         handler._submit_engine_task = MagicMock()
+        handler._schedule_generate_and_show_confirm_card = MagicMock()
         handler._ensure_project = MagicMock()
         handler._resolve_project_from_id = MagicMock()
 
@@ -911,10 +912,8 @@ class TestWorkflowReuse(unittest.TestCase):
     def test_start_workflow_with_template_name(
         self, mock_node, mock_sender
     ):
-        """Verify that start_workflow() with a template name enters agent selection.
+        """Verify template invocation enters default background generation.
 
-        Templates now go through the standard three-step flow:
-            agent selection → tool selection → confirmation card.
         The full requirement (including the template name) is preserved in pending
         so downstream handlers can recognize and load the template.
         """
@@ -938,12 +937,10 @@ class TestWorkflowReuse(unittest.TestCase):
             ctx.workflow_engine_manager.get.return_value = engine
             ctx.workflow_engine_manager.get_or_create.return_value = engine
 
-            # Start workflow with a template name — goes to agent selection first
+            # Start workflow with a template name — default auto generation.
             handler.start_workflow("msg_1", "chat_1", "my-template", project)
 
-            # After start_workflow, status should be AWAITING_AGENT_SELECT
-            # (three-step flow: agent select → tool select → confirm)
-            self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_AGENT_SELECT)
+            self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
 
             # The requirement is preserved so downstream handlers can detect
             # this is a template invocation
@@ -952,8 +949,10 @@ class TestWorkflowReuse(unittest.TestCase):
                 "my-template",
             )
 
-            # An agent selection card must be sent (send_card_to_chat)
-            self.assertEqual(handler.send_card_to_chat.call_count, 1)
+            self.assertTrue(engine.project.pending.auto_reviewer)
+            self.assertIsNotNone(engine.project.pending.orchestrator_agent)
+            handler.send_card_to_chat.assert_not_called()
+            handler._schedule_generate_and_show_confirm_card.assert_called_once()
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     @patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True)
@@ -994,8 +993,7 @@ class TestWorkflowReuse(unittest.TestCase):
             meta = extract_meta_from_script(injected_content)
             self.assertEqual(meta["name"], "parametrized-workflow")
 
-            # Also test that the full flow preserves arguments through the steps
-            # (start_workflow -> agent select -> tool select -> confirm)
+            # Also test that the default generation flow preserves arguments.
             project = MagicMock()
             project.root_path = tmpdir
             project.project_id = "proj_1"
@@ -1016,8 +1014,7 @@ class TestWorkflowReuse(unittest.TestCase):
                 project
             )
 
-            # After start_workflow, status should be AWAITING_AGENT_SELECT
-            self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_AGENT_SELECT)
+            self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
 
             # The full requirement (with args) is preserved in pending so
             # downstream handlers can detect this is a template + args invocation
@@ -1026,22 +1023,14 @@ class TestWorkflowReuse(unittest.TestCase):
                 "param-template target=src/ focus=security count=3",
             )
 
-            # An agent selection card must be sent
-            self.assertEqual(handler.send_card_to_chat.call_count, 1)
+            self.assertTrue(engine.project.pending.auto_reviewer)
+            handler.send_card_to_chat.assert_not_called()
+            handler._schedule_generate_and_show_confirm_card.assert_called_once()
 
     @patch("src.thread.get_current_sender_id", return_value="user_123")
     @patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True)
     def test_template_skips_tool_selection(self, mock_node, mock_sender):
-        """Verify that both template and non-template flows start with agent selection.
-
-        Templates now go through the standard three-step flow (agent selection →
-        tool selection → confirmation). Previously templates skipped tool selection
-        entirely; now both templates and AI-generated scripts start with agent
-        selection, giving users a chance to pick the orchestrator agent.
-
-        This test verifies the start_workflow behavior consistently routes to
-        agent selection regardless of whether the requirement matches a template.
-        """
+        """Template and free-form requirements both use default generation."""
         with tempfile.TemporaryDirectory() as tmpdir:
             handler, ctx = self._make_handler(tmpdir)
 
@@ -1062,31 +1051,34 @@ class TestWorkflowReuse(unittest.TestCase):
             ctx.workflow_engine_manager.get.return_value = engine
             ctx.workflow_engine_manager.get_or_create.return_value = engine
 
-            # Non-template requirement: goes to agent selection
+            # Non-template requirement: starts default generation.
             handler.start_workflow("msg_1", "chat_1", "some random requirement", project)
-            self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_AGENT_SELECT)
+            self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
             self.assertEqual(
                 engine.project.pending.requirement if engine.project.pending else None,
                 "some random requirement",
             )
-            cards_sent_for_requirement = handler.send_card_to_chat.call_count
+            self.assertTrue(engine.project.pending.auto_reviewer)
+            schedules_for_requirement = (
+                handler._schedule_generate_and_show_confirm_card.call_count
+            )
 
             # Reset for template test
             engine.project = WorkflowProject()
             handler.send_card_to_chat.reset_mock()
+            handler._schedule_generate_and_show_confirm_card.reset_mock()
 
-            # Template name: ALSO goes to agent selection (three-step flow)
+            # Template name: also starts default generation.
             handler.start_workflow("msg_2", "chat_2", "quick-audit", project)
-            self.assertEqual(engine.project.status, WorkflowStatus.AWAITING_AGENT_SELECT)
+            self.assertEqual(engine.project.status, WorkflowStatus.GENERATING_SCRIPT)
             self.assertEqual(
                 engine.project.pending.requirement if engine.project.pending else None,
                 "quick-audit",
             )
-            # Both flows should produce a card (agent selection)
-            self.assertEqual(handler.send_card_to_chat.call_count, 1)
-
-            # Both flows should send exactly one card (agent selection card)
-            self.assertEqual(cards_sent_for_requirement, 1)
+            self.assertTrue(engine.project.pending.auto_reviewer)
+            handler.send_card_to_chat.assert_not_called()
+            self.assertEqual(schedules_for_requirement, 1)
+            handler._schedule_generate_and_show_confirm_card.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

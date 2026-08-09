@@ -52,7 +52,7 @@ def test_permission_uses_bootstrap_admin_and_owner_contract(
         patch("src.thread.manager.get_current_sender_id", return_value=operator_id),
         patch("src.config.get_settings", return_value=settings),
     ):
-        assert bool(handler._has_slock_permission(_engine(owner_id))) is expected
+        assert handler._has_slock_permission(_engine(owner_id)) is expected
 
 
 @pytest.mark.parametrize("reply_succeeds", [True, False])
