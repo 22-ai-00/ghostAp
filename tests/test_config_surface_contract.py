@@ -63,6 +63,7 @@ _GHOSTAP_ENV_PREFIXES = (
 
 _RETIRED_SETTINGS_FIELDS = frozenset(
     {
+        "employee_department_enabled",
         "engine_aux_prompt_timeout",
         "review_circuit_lint_fallback_enabled",
         "review_circuit_lint_timeout",
@@ -108,6 +109,10 @@ def test_env_example_has_no_ghostap_keys_ignored_by_the_schema() -> None:
         ".env.example contains active GhostAP keys that Settings silently ignores: "
         f"{sorted(ignored)}"
     )
+
+
+def test_env_example_does_not_expose_dead_employee_department_switch() -> None:
+    assert "EMPLOYEE_DEPARTMENT_ENABLED" not in _active_example_keys()
 
 
 def test_retired_internal_tuning_fields_are_not_public_settings() -> None:

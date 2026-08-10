@@ -49,6 +49,7 @@ class IntentType(Enum):
     SHOW_HELP = "show_help"
     SHOW_TOOLS = "show_tools"
     TOOLS_STATUS = "tools_status"
+    LIST_EMPLOYEES = "list_employees"
     UNKNOWN = "unknown"
 
 
@@ -161,6 +162,7 @@ class IntentRecognizer:
         "show_help": IntentType.SHOW_HELP,
         "show_tools": IntentType.SHOW_TOOLS,
         "tools_status": IntentType.TOOLS_STATUS,
+        "list_employees": IntentType.LIST_EMPLOYEES,
         "unknown": IntentType.UNKNOWN,
     }
 
@@ -206,6 +208,8 @@ class IntentRecognizer:
         "/帮助": (IntentType.SHOW_HELP, "显示帮助信息"),
         "/tools": (IntentType.SHOW_TOOLS, "查看所有可用工具"),
         "/tools_status": (IntentType.TOOLS_STATUS, "查看工具状态"),
+        "/employees": (IntentType.LIST_EMPLOYEES, "查看数字员工目录"),
+        "/roster": (IntentType.LIST_EMPLOYEES, "查看数字员工目录"),
     }
 
     SHELL_COMMANDS = {
@@ -383,6 +387,18 @@ class IntentRecognizer:
     DEEP_MODE_KEYWORDS = {"deep模式", "深度模式", "deep agent", "复杂任务", "大任务"}
 
     HELP_KEYWORDS = {"帮助", "help", "使用说明", "怎么用", "如何使用"}
+    EMPLOYEE_ROSTER_KEYWORDS = {
+        "员工列表",
+        "数字员工列表",
+        "员工目录",
+        "有哪些员工",
+        "都有哪些员工",
+        "有哪些数字员工",
+        "查看员工",
+        "查看数字员工",
+        "查看员工列表",
+        "列出所有员工",
+    }
 
     COMMAND_TYPO_MAP = {
         "/calude": "/claude",
@@ -407,6 +423,7 @@ class IntentRecognizer:
             ("command_typo", IntentRecognizer._match_command_typo),
             ("exact_command", IntentRecognizer._match_exact_command),
             ("coco_info", IntentRecognizer._match_coco_info),
+            ("employee_roster", IntentRecognizer._match_employee_roster_keyword),
             ("new_chat", IntentRecognizer._match_new_chat_command),
             ("new_project", IntentRecognizer._match_new_project_command),
             ("switch_project", IntentRecognizer._match_switch_project_command),
@@ -465,6 +482,23 @@ class IntentRecognizer:
                 description=desc,
             )
         return None
+
+    def _match_employee_roster_keyword(
+        self,
+        text: str,
+        current_mode: str,
+    ) -> Optional[IntentResult]:
+        del current_mode
+        normalized = self._lower(text).rstrip("。！？!?").strip()
+        if normalized not in self.EMPLOYEE_ROSTER_KEYWORDS:
+            return None
+        return IntentResult.single(
+            intent=IntentType.LIST_EMPLOYEES,
+            confidence=0.95,
+            original_text=text,
+            reasoning="精确匹配数字员工目录短语",
+            description="查看数字员工目录",
+        )
 
     def _match_coco_info(self, text: str, current_mode: str) -> Optional[IntentResult]:
         text_lower = self._lower(text)

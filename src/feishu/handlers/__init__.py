@@ -3,6 +3,7 @@
 from .base import BaseHandler
 from .deep import DeepHandler
 from .diagnostics import DiagnosticsHandler
+from .employee import EmployeeHandler
 from .programming import (
     AidenModeHandler,
     ClaudeModeHandler,
@@ -31,5 +32,6 @@ __all__ = [
     "ProjectHandler",
     "SystemHandler",
     "DiagnosticsHandler",
+    "EmployeeHandler",
     "WorkflowHandler",
 ]

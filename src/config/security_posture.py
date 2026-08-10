@@ -100,11 +100,16 @@ def evaluate_security_posture(
         ShellAccessMode,
         ShellAccessMode.DISABLED,
     )
-    employee_enabled = getattr(
+    visible_employee_limit = getattr(
         settings,
-        "employee_department_enabled",
-        False,
-    ) is True
+        "autonomous_visible_employee_limit",
+        0,
+    )
+    employee_enabled = (
+        isinstance(visible_employee_limit, int)
+        and not isinstance(visible_employee_limit, bool)
+        and visible_employee_limit > 0
+    )
     retention_days = getattr(
         settings,
         "employee_group_context_retention_days",

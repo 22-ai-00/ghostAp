@@ -4,7 +4,7 @@ import json
 import math
 import re
 from functools import lru_cache
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 from src.card.error_diagnostics import register_error_diagnostic
 from src.utils.errors import GhostAPError, get_error_detail
@@ -1069,6 +1069,184 @@ class SystemBuilder:
             UI_TEXT["system_acp_programming_failed_title"].format(tool=tool.capitalize()),
             "red",
             elements,
+        )
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def _employee_roster_text(
+        value: object,
+        *,
+        fallback: str,
+        limit: int = 100,
+    ) -> str:
+        """Return bounded Feishu-markdown text for a roster display field."""
+
+        text = " ".join(str(value or "").split()).strip() or fallback
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        for marker in ("\\", "`", "*", "_", "[", "]"):
+            text = text.replace(marker, f"\\{marker}")
+        return text[:limit].rstrip("\\") or fallback
+
+    @staticmethod
+    def build_employee_roster_card(
+        entries: Sequence[Mapping[str, object]],
+    ) -> tuple[str, str]:
+        """Build a deterministic, display-only card for visible employees."""
+
+        state_labels = {
+            "active": "🟢 在职",
+            "action_required": "🟠 需要处理",
+            "archived": "⚪ 已归档",
+            "retiring": "🟡 退役中",
+            "draft": "🔵 草稿",
+            "provisioning_app": "🔵 创建应用中",
+            "storing_credential": "🔵 保存凭据中",
+            "configuring": "🔵 配置中",
+            "validating": "🔵 验证中",
+            "ready_pending_verification": "🔵 待激活",
+        }
+        state_order = {
+            "active": 0,
+            "action_required": 1,
+            "draft": 2,
+            "provisioning_app": 2,
+            "storing_credential": 2,
+            "configuring": 2,
+            "validating": 2,
+            "ready_pending_verification": 2,
+            "retiring": 3,
+            "archived": 4,
+        }
+
+        normalized: list[dict[str, object]] = []
+        for entry in entries:
+            state = str(entry.get("state") or "").strip().lower()
+            raw_group_count = entry.get("group_count", 0)
+            group_count = (
+                raw_group_count
+                if type(raw_group_count) is int and raw_group_count >= 0
+                else 0
+            )
+            raw_created_at = entry.get("created_at", 0.0)
+            created_at = (
+                float(raw_created_at)
+                if isinstance(raw_created_at, (int, float))
+                and not isinstance(raw_created_at, bool)
+                else 0.0
+            )
+            normalized.append(
+                {
+                    "agent_id": SystemBuilder._employee_roster_text(
+                        entry.get("agent_id"),
+                        fallback="unknown",
+                        limit=96,
+                    ),
+                    "name": SystemBuilder._employee_roster_text(
+                        entry.get("name"),
+                        fallback="未命名员工",
+                        limit=80,
+                    ),
+                    "emoji": SystemBuilder._employee_roster_text(
+                        entry.get("emoji"),
+                        fallback="🤖",
+                        limit=8,
+                    ),
+                    "state": state,
+                    "state_label": state_labels.get(state, "🔵 状态处理中"),
+                    "role": SystemBuilder._employee_roster_text(
+                        entry.get("role"),
+                        fallback="未设置职责",
+                        limit=100,
+                    ),
+                    "tool": SystemBuilder._employee_roster_text(
+                        entry.get("tool"),
+                        fallback="未设置工具",
+                        limit=40,
+                    ),
+                    "model": SystemBuilder._employee_roster_text(
+                        entry.get("model"),
+                        fallback="默认模型",
+                        limit=80,
+                    ),
+                    "profile": SystemBuilder._employee_roster_text(
+                        entry.get("profile"),
+                        fallback="default",
+                        limit=40,
+                    ),
+                    "effort": SystemBuilder._employee_roster_text(
+                        entry.get("effort"),
+                        fallback="default",
+                        limit=40,
+                    ),
+                    "group_count": group_count,
+                    "created_at": created_at,
+                }
+            )
+
+        normalized.sort(
+            key=lambda item: (
+                state_order.get(str(item["state"]), 2),
+                str(item["name"]).casefold(),
+                float(item["created_at"]),
+                str(item["agent_id"]),
+            )
+        )
+        active_count = sum(item["state"] == "active" for item in normalized)
+        action_count = sum(
+            item["state"] == "action_required" for item in normalized
+        )
+        archived_count = sum(item["state"] == "archived" for item in normalized)
+        other_count = len(normalized) - active_count - action_count - archived_count
+
+        elements: list[dict] = [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**共 {len(normalized)}** · 在职 {active_count} · "
+                    f"需处理 {action_count} · 已归档 {archived_count} · "
+                    f"其他生命周期 {other_count}"
+                ),
+            }
+        ]
+        if not normalized:
+            elements.append(
+                CoreBuilder._build_banner_element(
+                    "暂无数字员工",
+                    type="info",
+                )
+            )
+        else:
+            elements.append({"tag": "hr"})
+            for index, item in enumerate(normalized):
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "content": (
+                            f"{item['emoji']} **{item['name']}** · {item['state_label']}\n"
+                            f"职责 {item['role']} · 后端 `{item['tool']}/{item['model']}`\n"
+                            f"配置 `{item['profile']}/{item['effort']}` · "
+                            f"协作群 {item['group_count']} · ID `{item['agent_id']}`"
+                        ),
+                    }
+                )
+                if index != len(normalized) - 1:
+                    elements.append({"tag": "hr"})
+
+        elements.extend(
+            [
+                {"tag": "hr"},
+                {
+                    "tag": "markdown",
+                    "text_size": "notation",
+                    "content": "生命周期状态来自 Journal 权威投影，不代表 Channel 在线状态。",
+                },
+            ]
+        )
+        card = CoreBuilder._wrap_card(
+            "👥 数字员工目录",
+            "blue",
+            elements,
+            subtitle=f"VISIBLE · {len(normalized)}",
         )
         return "interactive", json.dumps(card, ensure_ascii=False)
 

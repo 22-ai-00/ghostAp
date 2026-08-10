@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ..domain import EmployeeState
+from ..domain import EmployeeDefinition, EmployeeState, WorkerType
 from ..journal.frame import JournalEvent, TransactionFrame
 from ..journal.projections import (
     ProjectionError,
@@ -163,6 +163,29 @@ class ProductionEmployeeHireService:
         with self._mutex:
             self._synchronize_projection_to_journal_locked()
             return self._projection_state
+
+    def list_employee_roster(
+        self,
+        tenant_key: str,
+        include_archived: bool = True,
+    ) -> list[EmployeeDefinition]:
+        """List visible employees without granting them dispatch authority."""
+
+        projection = self.synchronize_projection()
+        employees = (
+            employee
+            for employee in projection.employees.values()
+            if employee.tenant_key == tenant_key
+            and employee.worker_type is WorkerType.VISIBLE
+            and (
+                include_archived
+                or employee.state is not EmployeeState.ARCHIVED
+            )
+        )
+        return sorted(
+            employees,
+            key=lambda employee: (employee.name.casefold(), employee.agent_id),
+        )
 
     def synchronize_projection_unlocked(self) -> ProjectionState:
         """Advance views while the caller owns ``employee_dispatch_guard``."""

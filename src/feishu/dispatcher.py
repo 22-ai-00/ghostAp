@@ -319,6 +319,12 @@ class MessageDispatcher:
             self.system.show_tools_list(message_id, chat_id, project)
         elif intent == IntentType.TOOLS_STATUS:
             self.system.show_tools_status(message_id, chat_id, project)
+        elif intent == IntentType.LIST_EMPLOYEES:
+            self.system.employee.list_employees_roster(
+                message_id,
+                chat_id,
+                project,
+            )
         # Project commands
         elif intent in self._PROJECT_INTENTS:
             self._dispatch_project(intent, data, message_id, chat_id, project)

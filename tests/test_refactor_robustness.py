@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from src.card.builders.system import SystemBuilder
 from src.feishu.handlers.system import SystemHandler
@@ -81,6 +81,30 @@ class TestRefactorRobustness(unittest.TestCase):
             mock_reply.assert_called_once()
             self.assertIn("未知命令", mock_reply.call_args.args[1])
             mock_help.assert_not_called()
+
+    def test_employee_roster_catalog_alias_routes_through_system_handler(self):
+        mock_ctx = MagicMock()
+        employee_mock = MagicMock()
+        handler = SystemHandler(mock_ctx)
+        handler.employee = employee_mock
+
+        for raw_command in ("/employees", "/roster"):
+            command_match = SlashCommandParser.parse(raw_command)
+
+            self.assertIsNotNone(command_match)
+            self.assertEqual(command_match.command, "/employees")
+            self.assertTrue(handler.is_interceptable_command_match(command_match))
+            handler.handle_intercepted_command(
+                "mid",
+                "cid",
+                raw_command,
+                command_match=command_match,
+            )
+
+        employee_mock.list_employees_roster.assert_has_calls(
+            [call("mid", "cid"), call("mid", "cid")]
+        )
+        self.assertEqual(employee_mock.list_employees_roster.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()

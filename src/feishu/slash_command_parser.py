@@ -68,6 +68,8 @@ class SlashCommandParser:
         canonical = (
             resolved.rewritten_command
             if resolved and resolved.rewritten_command
+            else resolved.action.command
+            if resolved
             else raw_cmd
         )
 

@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GhostAP 数字员工目录卡片</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #6d7688;
+      --paper: #fffdf8;
+      --line: #dde2ea;
+      --blue: #245bdb;
+      --blue-soft: #edf3ff;
+      --orange: #b84f12;
+      --orange-soft: #fff1df;
+      --archive: #667085;
+      --archive-soft: #f1f3f6;
+      --shadow: 0 26px 70px rgba(45, 55, 76, .16);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "MiSans", "HarmonyOS Sans SC", sans-serif;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(36, 91, 219, .12), transparent 31rem),
+        radial-gradient(circle at 88% 92%, rgba(184, 79, 18, .10), transparent 28rem),
+        linear-gradient(rgba(23, 32, 51, .035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(23, 32, 51, .035) 1px, transparent 1px),
+        #f4f2ec;
+      background-size: auto, auto, 28px 28px, 28px 28px, auto;
+      padding: 56px 20px;
+    }
+
+    .stage {
+      width: min(820px, 100%);
+      margin: 0 auto;
+    }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .18em;
+      text-transform: uppercase;
+    }
+
+    .context {
+      margin: 0 0 28px;
+      font-family: "Source Han Serif SC", "Noto Serif SC", serif;
+      font-size: clamp(26px, 4vw, 40px);
+      font-weight: 650;
+      letter-spacing: -.03em;
+    }
+
+    .card {
+      overflow: hidden;
+      border: 1px solid rgba(36, 91, 219, .20);
+      border-radius: 18px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    .header {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 22px 26px;
+      color: white;
+      background:
+        linear-gradient(115deg, rgba(255,255,255,.14), transparent 42%),
+        linear-gradient(135deg, #1f54ce, #2f6dea);
+    }
+
+    .header::after {
+      content: "";
+      position: absolute;
+      right: -34px;
+      top: -60px;
+      width: 180px;
+      height: 180px;
+      border: 1px solid rgba(255,255,255,.25);
+      border-radius: 50%;
+    }
+
+    .title {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 22px;
+      font-weight: 800;
+    }
+
+    .title-icon {
+      display: grid;
+      width: 38px;
+      height: 38px;
+      place-items: center;
+      border: 1px solid rgba(255,255,255,.3);
+      border-radius: 11px;
+      background: rgba(255,255,255,.14);
+    }
+
+    .total {
+      position: relative;
+      z-index: 1;
+      font-family: "IBM Plex Mono", "Fira Code", monospace;
+      font-size: 13px;
+      opacity: .9;
+    }
+
+    .content { padding: 24px 26px 22px; }
+
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-bottom: 26px;
+    }
+
+    .metric {
+      min-width: 0;
+      padding: 15px 16px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: #fff;
+    }
+
+    .metric strong {
+      display: block;
+      margin-bottom: 4px;
+      font-family: "IBM Plex Mono", "Fira Code", monospace;
+      font-size: 25px;
+      line-height: 1;
+    }
+
+    .metric span { color: var(--muted); font-size: 13px; }
+    .metric.attention { border-color: #f1c497; background: var(--orange-soft); }
+    .metric.attention strong { color: var(--orange); }
+    .metric.archive { background: var(--archive-soft); }
+
+    .section + .section { margin-top: 28px; }
+
+    .section-title {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin: 0 0 11px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .section-title::after {
+      content: "";
+      height: 1px;
+      flex: 1;
+      background: var(--line);
+    }
+
+    .employee-list {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }
+
+    .employee {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr) auto;
+      gap: 13px;
+      align-items: center;
+      padding: 15px 16px;
+    }
+
+    .employee + .employee { border-top: 1px solid var(--line); }
+
+    .avatar {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border-radius: 12px;
+      background: var(--blue-soft);
+      font-size: 20px;
+    }
+
+    .archive-row .avatar { background: var(--archive-soft); filter: grayscale(.8); }
+
+    .name-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      margin-bottom: 5px;
+    }
+
+    .name { font-weight: 800; }
+
+    .id {
+      overflow: hidden;
+      color: #98a0ae;
+      font-family: "IBM Plex Mono", "Fira Code", monospace;
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .meta {
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 13px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .badge {
+      padding: 5px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .badge.attention { color: var(--orange); background: var(--orange-soft); }
+    .badge.archived { color: var(--archive); background: var(--archive-soft); }
+
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      margin-top: 18px;
+      padding-top: 17px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    code {
+      color: var(--blue);
+      font-family: "IBM Plex Mono", "Fira Code", monospace;
+      font-size: 11px;
+    }
+
+    @media (max-width: 620px) {
+      body { padding: 28px 12px; }
+      .context { margin-bottom: 18px; }
+      .header, .content { padding-left: 18px; padding-right: 18px; }
+      .summary { grid-template-columns: 1fr; }
+      .metric { display: flex; align-items: baseline; gap: 10px; }
+      .metric strong { margin: 0; }
+      .employee { grid-template-columns: 38px minmax(0, 1fr); }
+      .avatar { width: 38px; height: 38px; }
+      .badge { grid-column: 2; justify-self: start; }
+      .footer { flex-direction: column; }
+      .total { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <p class="eyebrow">GhostAP / Employee Department</p>
+    <h1 class="context">数字员工不是一串配置，而是一支可追踪的团队。</h1>
+
+    <article class="card" aria-label="数字员工目录卡片预览">
+      <header class="header">
+        <div class="title"><span class="title-icon">👥</span>数字员工目录</div>
+        <div class="total">VISIBLE / 06</div>
+      </header>
+
+      <div class="content">
+        <section class="summary" aria-label="状态统计">
+          <div class="metric"><strong>0</strong><span>在职</span></div>
+          <div class="metric attention"><strong>2</strong><span>需要处理</span></div>
+          <div class="metric archive"><strong>4</strong><span>已归档</span></div>
+        </section>
+
+        <section class="section">
+          <h2 class="section-title">需要处理 · 2</h2>
+          <div class="employee-list">
+            <div class="employee">
+              <div class="avatar">🧰</div>
+              <div>
+                <div class="name-line"><span class="name">Ops</span><span class="id">agt_action_ops</span></div>
+                <div class="meta">平台工程师 · Claude / 默认 · standard / high · 1 个协作群</div>
+              </div>
+              <span class="badge attention">需要处理</span>
+            </div>
+            <div class="employee">
+              <div class="avatar">🛡️</div>
+              <div>
+                <div class="name-line"><span class="name">Security</span><span class="id">agt_action_security</span></div>
+                <div class="meta">安全审计 · Codex / gpt-5.6-sol · standard / high · 2 个协作群</div>
+              </div>
+              <span class="badge attention">需要处理</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <h2 class="section-title">已归档 · 4</h2>
+          <div class="employee-list">
+            <div class="employee archive-row">
+              <div class="avatar">📦</div>
+              <div><div class="name-line"><span class="name">Alpha</span><span class="id">agt_archived_alpha</span></div><div class="meta">前端工程师 · Coco / 默认</div></div>
+              <span class="badge archived">已归档</span>
+            </div>
+            <div class="employee archive-row">
+              <div class="avatar">📦</div>
+              <div><div class="name-line"><span class="name">Beta</span><span class="id">agt_archived_beta</span></div><div class="meta">后端工程师 · Aiden / 默认</div></div>
+              <span class="badge archived">已归档</span>
+            </div>
+            <div class="employee archive-row">
+              <div class="avatar">📦</div>
+              <div><div class="name-line"><span class="name">Gamma</span><span class="id">agt_archived_gamma</span></div><div class="meta">测试工程师 · Gemini / 默认</div></div>
+              <span class="badge archived">已归档</span>
+            </div>
+            <div class="employee archive-row">
+              <div class="avatar">📦</div>
+              <div><div class="name-line"><span class="name">Zulu</span><span class="id">agt_archived_zulu</span></div><div class="meta">发布工程师 · Traex / c_o_new_thinking</div></div>
+              <span class="badge archived">已归档</span>
+            </div>
+          </div>
+        </section>
+
+        <footer class="footer">
+          <span>生命周期状态来自 Journal 权威投影，不代表 Channel 在线状态</span>
+          <span><code>/employees</code> · <code>/roster</code></span>
+        </footer>
+      </div>
+    </article>
+  </main>
+</body>
+</html>

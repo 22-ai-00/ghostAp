@@ -111,12 +111,34 @@ def test_secure_defaults_are_enforced_and_shell_disabled() -> None:
     assert settings.admin_bootstrap_scope == "p2p_only"
     assert settings.shell_access_mode == "disabled"
     assert settings.shell_trusted_local_ack is False
-    assert settings.employee_department_enabled is False
+    assert "employee_department_enabled" not in Settings.model_fields
+    assert settings.autonomous_visible_employee_limit == 8
     assert settings.employee_group_context_retention_days == 30
 
     posture = evaluate_security_posture(settings)
+    assert posture.employee_department_enabled is True
+    assert posture.records_group_content is True
     assert posture.is_valid
     assert posture.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("visible_employee_limit", "expected_enabled"),
+    [(0, False), (1, True), (8, True)],
+)
+def test_employee_department_posture_tracks_real_composition_gate(
+    visible_employee_limit: int,
+    expected_enabled: bool,
+) -> None:
+    posture = evaluate_security_posture(
+        Settings(
+            _env_file=None,
+            autonomous_visible_employee_limit=visible_employee_limit,
+        )
+    )
+
+    assert posture.employee_department_enabled is expected_enabled
+    assert posture.records_group_content is expected_enabled
 
 
 def test_any_chat_bootstrap_is_distinguishable_from_secure_posture() -> None:
@@ -138,7 +160,7 @@ def test_employee_group_retention_missing_is_blocking() -> None:
         admin_bootstrap_scope="p2p_only",
         shell_access_mode="disabled",
         shell_trusted_local_ack=False,
-        employee_department_enabled=True,
+        autonomous_visible_employee_limit=8,
         employee_group_context_retention_days=0,
         admin_user_ids=frozenset(),
         allowed_user_ids=frozenset(),

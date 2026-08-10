@@ -31,6 +31,7 @@ from ..message_formatter import FeishuMessageFormatter as fmt
 from ..product_catalog import retired_command_tokens
 from ..slash_command_parser import CommandMatch, SlashCommandParser
 from .base import BaseHandler
+from .employee import EmployeeHandler
 from .lock_commands import LockCommandsMixin
 
 if TYPE_CHECKING:
@@ -63,6 +64,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
 
     def __init__(self, ctx: "HandlerContext") -> None:
         super().__init__(ctx)
+        self.employee = EmployeeHandler(ctx)
         self._init_command_registry()
         self.help_commands = _SystemSubcommands(self, ("show_help", "show_full_help", "handle_help_category", "handle_menu_command"))
         self.shell_commands = _SystemSubcommands(self, ("submit_shell_command", "execute_shell_and_reply", "change_directory"))
@@ -125,6 +127,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/unlock": lambda m, c, t, p: self._handle_lock_command(m, c, "unlock"),
             "/setadmin": lambda m, c, t, p: self._handle_setadmin_command(m, c, ""),
             "/access": lambda m, c, t, p: self._handle_access_command(m, c, ""),
+            "/employees": lambda m, c, t, p: self.employee.list_employees_roster(m, c),
         }
 
         # Prefix match handlers: prefix -> handler_func(message_id, chat_id, text, project)
@@ -342,6 +345,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/unlock",
             "/setadmin",
             "/access",
+            "/employees",
             "/btw",
             "/goals",
             "/runs",

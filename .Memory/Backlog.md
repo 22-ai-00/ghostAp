@@ -28,3 +28,5 @@
 
 - 2026-08-10 [中/安全契约] `create_engine_session(require_tool_filter=True)` 当前只强制 ACP transport，不在工厂入口验证/安装具体 filter；现役 Workflow/Employee 调用方会随后安装 filter，但 API 容易被新调用方误用。后续应改为类型化 lane permission profile 或将 `tool_filter` 作为必填参数并在首个 prompt 前 fail-closed。
 - 2026-08-10 [中/可靠性] `SPEC_EXECUTION_TIMEOUT` 当前被复用为各阶段 prompt timeout 与卡片 TTL，不是真正的 Spec 总运行 deadline；应增加 monotonic 总 SLA，并从其推导 phase timeout，避免自动任务无限循环或名称误导。
+
+- 2026-08-10 [高/产品闭环] Slock 退役还遗留 `/fire`、`/history`、`/employee-memory` 三个 catalog 孤儿命令；当前 Journal services 仍在，应迁移为独立 EmployeeHandler 并恢复 admin/tenant/audit fail-closed 门禁。`/hire` 还缺 3ed4bcec 删除的 durable admission/start_hire，必须重建幂等、容量、唯一性、anchor-before-submit 与全自动默认工具模型流程，不能只补路由或复活旧 Slock UI。

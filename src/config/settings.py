@@ -51,7 +51,6 @@ class Settings(BaseSettings):
         "disabled", "admin_dm", "allowlisted", "isolated", "trusted_local"
     ] = "disabled"
     shell_trusted_local_ack: bool = False
-    employee_department_enabled: bool = False
     employee_group_context_retention_days: int = Field(
         default=30,
         ge=1,
