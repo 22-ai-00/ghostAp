@@ -14,6 +14,18 @@ class ACPToolOption:
     is_default: bool = False
     emoji: str = "🤖"
 
+
+@dataclass(frozen=True)
+class ACPModelSelectionVariant:
+    """One exact model selection declared by a backend capability matrix."""
+
+    name: str
+    model: str
+    profile: str | None = None
+    effort: str | None = None
+    is_default: bool = False
+
+
 @dataclass
 class ACPModelOption:
     """Backend-declared model exposed by explicit configuration commands."""
@@ -21,3 +33,6 @@ class ACPModelOption:
     name: str
     description: str = ""
     is_default: bool = False
+    selection_variants: tuple[ACPModelSelectionVariant, ...] = ()
+    reasoning_efforts: tuple[str, ...] = ()
+    default_reasoning_effort: str | None = None

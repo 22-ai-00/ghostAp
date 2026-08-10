@@ -843,7 +843,12 @@ def _terminate_process_group(process: subprocess.Popen[bytes], *, grace: float) 
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
-        process.wait(timeout=max(grace, _MIN_PROCESS_GROUP_PHASE_SECONDS))
+        try:
+            process.wait(timeout=max(grace, _MIN_PROCESS_GROUP_PHASE_SECONDS))
+        except subprocess.TimeoutExpired as exc:
+            raise RestartGateTimeout(
+                "restart process did not exit before cleanup deadline"
+            ) from exc
         return
     parent_reaped = False
     try:
@@ -857,7 +862,12 @@ def _terminate_process_group(process: subprocess.Popen[bytes], *, grace: float) 
         return
     os.killpg(process.pid, signal.SIGKILL)
     if not parent_reaped:
-        process.wait(timeout=max(grace, _MIN_PROCESS_GROUP_PHASE_SECONDS))
+        try:
+            process.wait(timeout=max(grace, _MIN_PROCESS_GROUP_PHASE_SECONDS))
+        except subprocess.TimeoutExpired as exc:
+            raise RestartGateTimeout(
+                "restart process group did not exit before cleanup deadline"
+            ) from exc
 
 
 def run_restart_worker(

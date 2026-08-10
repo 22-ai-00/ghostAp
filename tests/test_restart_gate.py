@@ -130,6 +130,40 @@ def test_gate_keeps_lock_inodes_and_checkout_binding(tmp_path: Path) -> None:
         os.close(old_fd)
 
 
+@pytest.mark.parametrize("group_missing", [False, True])
+def test_terminate_process_group_translates_cleanup_wait_timeout(
+    monkeypatch,
+    group_missing,
+):
+    import signal
+    import subprocess
+
+    from src.utils import restart_gate
+
+    class TimedOutProcess:
+        pid = 1234
+
+        def wait(self, *, timeout):
+            raise subprocess.TimeoutExpired(cmd="restart", timeout=timeout)
+
+    sent_signals = []
+
+    def fake_killpg(pid, sig):
+        sent_signals.append((pid, sig))
+        if group_missing and sig == signal.SIGTERM:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(restart_gate.os, "killpg", fake_killpg)
+
+    with pytest.raises(restart_gate.RestartGateTimeout, match="cleanup deadline"):
+        restart_gate._terminate_process_group(TimedOutProcess(), grace=0.02)
+
+    expected_signals = [(1234, signal.SIGTERM)]
+    if not group_missing:
+        expected_signals.extend([(1234, 0), (1234, signal.SIGKILL)])
+    assert sent_signals == expected_signals
+
+
 @pytest.mark.skipif(
     sys.platform not in {"linux", "darwin"},
     reason="flock gate is POSIX-only",

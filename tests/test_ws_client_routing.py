@@ -18,7 +18,7 @@ from src.feishu.ws_client import (
 from src.mode import InteractionMode
 from src.project import ProjectContext
 from src.tasking import TaskPriority
-from src.thread import set_current_thread_id
+from src.thread import get_current_thread_id, set_current_thread_id
 
 
 @pytest.fixture
@@ -585,6 +585,126 @@ def test_topic_bound_spec_allows_spec_command(mock_ws_client: FeishuWSClient):
 
     reply_text.assert_not_called()
     dispatch.assert_called_once()
+
+
+def _direct_card_action_data(
+    *,
+    chat_id: str,
+    project_id: str,
+    thread_root_id: str | None = None,
+):
+    value = {"action": "observe_thread_context", "project_id": project_id}
+    if thread_root_id is not None:
+        value["thread_root_id"] = thread_root_id
+    return SimpleNamespace(
+        event=SimpleNamespace(
+            action=SimpleNamespace(
+                value=value,
+                behaviors=None,
+                option=None,
+                options=None,
+                form_value=None,
+                input_value=None,
+            ),
+            operator=SimpleNamespace(
+                open_id="ou_card_operator",
+                user_id=None,
+                union_id=None,
+            ),
+            context=SimpleNamespace(
+                open_message_id="om_card_callback",
+                open_chat_id=chat_id,
+                chat_type="group",
+            ),
+        )
+    )
+
+
+def _observe_card_thread_context(
+    mock_ws_client: FeishuWSClient,
+    data,
+) -> str | None:
+    observed: list[str | None] = []
+    mock_ws_client._resolve_effective_trust = MagicMock(return_value=None)
+    mock_ws_client._current_trust_can_dispatch = MagicMock(return_value=True)
+    mock_ws_client._chat_lock_gate.check_card_action = MagicMock(return_value=False)
+    mock_ws_client._action_handlers["observe_thread_context"] = (
+        lambda *_args: observed.append(get_current_thread_id())
+    )
+    mock_ws_client._process_card_action_async(data)
+    assert len(observed) == 1
+    return observed[0]
+
+
+def test_card_callback_clears_inherited_thread_without_payload(
+    mock_ws_client: FeishuWSClient,
+):
+    set_current_thread_id("om_stale_thread")
+    try:
+        observed = _observe_card_thread_context(
+            mock_ws_client,
+            _direct_card_action_data(chat_id="chat_456", project_id="proj_1"),
+        )
+    finally:
+        set_current_thread_id(None)
+
+    assert observed is None
+
+
+def test_card_callback_restores_canonical_matching_thread(
+    mock_ws_client: FeishuWSClient,
+):
+    mock_ws_client._thread_manager.register(
+        "om_canonical_root",
+        "chat_456",
+        "proj_1",
+        alias_keys=["om_callback_alias"],
+    )
+    try:
+        observed = _observe_card_thread_context(
+            mock_ws_client,
+            _direct_card_action_data(
+                chat_id="chat_456",
+                project_id="proj_1",
+                thread_root_id="om_callback_alias",
+            ),
+        )
+    finally:
+        mock_ws_client._thread_manager.remove("om_canonical_root")
+
+    assert observed == "om_canonical_root"
+
+
+@pytest.mark.parametrize(
+    ("callback_chat_id", "callback_project_id"),
+    [("chat_other", "proj_1"), ("chat_456", "proj_other")],
+)
+def test_card_callback_rejects_cross_coordinate_thread(
+    mock_ws_client: FeishuWSClient,
+    callback_chat_id: str,
+    callback_project_id: str,
+):
+    mock_ws_client._thread_manager.register(
+        "om_coordinate_root",
+        "chat_456",
+        "proj_1",
+        alias_keys=["om_coordinate_alias"],
+    )
+    set_current_thread_id("om_stale_thread")
+    try:
+        observed = _observe_card_thread_context(
+            mock_ws_client,
+            _direct_card_action_data(
+                chat_id=callback_chat_id,
+                project_id=callback_project_id,
+                thread_root_id="om_coordinate_alias",
+            ),
+        )
+    finally:
+        set_current_thread_id(None)
+        mock_ws_client._thread_manager.remove("om_coordinate_root")
+
+    assert observed is None
 
 
 def test_deep_start_binds_topic_context(mock_ws_client: FeishuWSClient):

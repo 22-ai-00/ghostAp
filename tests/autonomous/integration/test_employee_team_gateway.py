@@ -203,6 +203,110 @@ def _binding():
     )
 
 
+def _replay_gateway_binding_frame(tmp_path, binding_payload):
+    from src.autonomous.journal.anchor import FileAnchor
+    from src.autonomous.journal.frame import JournalEvent
+    from src.autonomous.journal.writer import JournalWriter
+
+    binding = _binding()
+    events = (
+        JournalEvent(
+            event_type="employee.ingress.router_dispatching",
+            aggregate_id=binding.ingress_aggregate_id,
+            payload={"acceptance_id": binding.acceptance_id},
+        ),
+        JournalEvent(
+            event_type="employee.execution_attempt.bound",
+            aggregate_id=binding.attempt_id,
+            payload={"binding": binding_payload},
+        ),
+        JournalEvent(
+            event_type="employee.execution_attempt.dispatch_committed",
+            aggregate_id=binding.attempt_id,
+            payload={
+                "attempt_id": binding.attempt_id,
+                "permit_id": binding.permit_id,
+            },
+        ),
+    )
+    base = tmp_path / "gateway-replay"
+    anchor_path = tmp_path / "gateway-replay.anchor"
+    writer = JournalWriter.open(
+        base,
+        anchor=FileAnchor(anchor_path),
+        hmac_key=b"gateway-replay-compatibility-key!!",
+    )
+    writer.commit(
+        events,
+        writer.get_aggregate_versions({event.aggregate_id for event in events}),
+    )
+    writer.close()
+    reopened = JournalWriter.open(
+        base,
+        anchor=FileAnchor(anchor_path),
+        hmac_key=b"gateway-replay-compatibility-key!!",
+    )
+    try:
+        return tuple(reopened.replay())
+    finally:
+        reopened.close()
+
+
+def _legacy_slock_binding_payload():
+    payload = _binding().to_dict()
+    payload["slock_chat_id"] = payload.pop("team_chat_id")
+    payload["slock_engine_identity"] = payload.pop("team_identity")
+    payload["slock_root_identity"] = payload.pop("team_root_identity")
+    return payload
+
+
+def test_gateway_replay_normalizes_exact_legacy_slock_binding(tmp_path) -> None:
+    from src.autonomous.gateway.models import DispatchBinding
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+
+    payload = _legacy_slock_binding_payload()
+    with pytest.raises(ValueError, match="exact schema"):
+        DispatchBinding.from_dict(payload)
+
+    state = GatewayProjectionState()
+    for frame in _replay_gateway_binding_frame(tmp_path, payload):
+        reduce_gateway_frame(state, frame)
+
+    binding = state.attempts[_binding().attempt_id].binding
+    assert binding.team_chat_id == "oc_team"
+    assert binding.team_identity == "8" * 64
+    assert binding.team_root_identity == "9" * 64
+
+
+@pytest.mark.parametrize("invalid_shape", ["mixed", "missing", "extra"])
+def test_gateway_replay_rejects_non_exact_legacy_binding(
+    tmp_path,
+    invalid_shape,
+) -> None:
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionError,
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+
+    payload = _legacy_slock_binding_payload()
+    if invalid_shape == "mixed":
+        payload["team_chat_id"] = payload.pop("slock_chat_id")
+    elif invalid_shape == "missing":
+        payload.pop("slock_root_identity")
+    else:
+        payload["unexpected"] = "value"
+
+    state = GatewayProjectionState()
+    frames = _replay_gateway_binding_frame(tmp_path, payload)
+    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
+        for frame in frames:
+            reduce_gateway_frame(state, frame)
+
+
 def _runtime_model(binding) -> str:
     from src.acp.employee_selection import compose_employee_model_selection
 

@@ -31,6 +31,15 @@ WORKFLOW_STOP_RUNNING = "workflow_stop_running"  # Stop a running workflow from 
 SHOW_WORKFLOW_MENU = "show_workflow_menu"  # Show Workflow usage from the global command menu
 
 # ---------------------------------------------------------------------------
+# Explicit ACP model selection actions
+# ---------------------------------------------------------------------------
+SELECT_ACP_MODEL = "select_acp_model"
+REFRESH_ACP_MODELS = "refresh_acp_models"
+SELECT_ACP_MODEL_GROUP = "select_acp_model_group"
+SELECT_ACP_MODEL_PROFILE = "select_acp_model_profile"
+SELECT_ACP_MODEL_EFFORT = "select_acp_model_effort"
+
+# ---------------------------------------------------------------------------
 # Global / status actions
 # ---------------------------------------------------------------------------
 SHOW_STATUS = "show_status"  # Show current session status card

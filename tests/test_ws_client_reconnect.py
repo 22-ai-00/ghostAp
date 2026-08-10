@@ -103,6 +103,7 @@ def test_connected_activity_marks_the_participating_instance_ready() -> None:
     client._ws_health_monitor = FakeHealthMonitor()
     client._restart_gate = FakeGate()
     client._employee_department_runtime = None
+    client._handler_ctx = type("HandlerContext", (), {"handlers": {"coco": object()}})()
 
     client._record_ws_activity("pong")
     client._record_ws_activity("connected")
@@ -114,7 +115,7 @@ def test_connected_activity_marks_the_participating_instance_ready() -> None:
     ]
 
 
-def test_connected_readiness_does_not_wait_for_employee_recovery() -> None:
+def test_connected_readiness_waits_for_required_reply_wiring() -> None:
     from src.feishu import ws_client as ws
 
     recovery_started = threading.Event()
@@ -136,6 +137,8 @@ def test_connected_readiness_does_not_wait_for_employee_recovery() -> None:
     def recover() -> None:
         recovery_started.set()
         release_recovery.wait(1.0)
+        client._handler_ctx.main_bot_outbound_audit = lambda *_args: None
+        client._handler_ctx.main_bot_outbound_audit_failure = lambda _error: None
 
     client = object.__new__(ws.FeishuWSClient)
     client._ws_health_monitor = FakeHealthMonitor()
@@ -147,13 +150,18 @@ def test_connected_readiness_does_not_wait_for_employee_recovery() -> None:
     client._employee_runtime_recovery_error = None
     client._employee_runtime_init_cleanup_done = False
     client._closed = False
+    client.settings = SimpleNamespace(autonomous_visible_employee_limit=1)
     _bind_reply_transport(client)
+    client._handler_ctx.main_bot_outbound_audit = None
+    client._handler_ctx.main_bot_outbound_audit_failure = None
 
     client._record_ws_activity("connected")
 
-    assert client._restart_gate.ready.is_set()
     assert recovery_started.wait(0.2)
+    assert not client._restart_gate.ready.is_set()
     release_recovery.set()
+    client._employee_runtime_recovery_thread.join(1.0)
+    assert client._restart_gate.ready.is_set()
 
 
 def _make_connected_recovery_client(*, recover=None):
@@ -199,20 +207,104 @@ def test_employee_recovery_worker_starts_once_across_reconnects() -> None:
     reconcile.assert_called_once_with()
 
 
-def test_employee_recovery_failure_keeps_main_ws_ready() -> None:
+def test_employee_recovery_failure_without_required_audit_keeps_restart_participating() -> None:
     from unittest.mock import MagicMock
 
     failure = RuntimeError("journal replay failed")
     client = _make_connected_recovery_client(
         recover=MagicMock(side_effect=failure)
     )
+    client.settings = SimpleNamespace(autonomous_visible_employee_limit=1)
+    client._handler_ctx.main_bot_outbound_audit = None
+    client._handler_ctx.main_bot_outbound_audit_failure = None
+
+    client._record_ws_activity("connected")
+    client._employee_runtime_recovery_thread.join(1.0)
+
+    client._restart_gate.mark_ready.assert_not_called()
+    assert client._employee_runtime_recovery_error is failure
+    client._employee_department_runtime.close.assert_not_called()
+
+
+def test_employee_recovery_failure_does_not_block_ready_reply_wiring() -> None:
+    from unittest.mock import MagicMock
+
+    failure = RuntimeError("journal replay failed")
+    client = _make_connected_recovery_client(
+        recover=MagicMock(side_effect=failure)
+    )
+    client.settings = SimpleNamespace(autonomous_visible_employee_limit=1)
+    client._handler_ctx.main_bot_outbound_audit = lambda *_args: None
+    client._handler_ctx.main_bot_outbound_audit_failure = lambda _error: None
 
     client._record_ws_activity("connected")
     client._employee_runtime_recovery_thread.join(1.0)
 
     client._restart_gate.mark_ready.assert_called_once_with(service_pid=os.getpid())
     assert client._employee_runtime_recovery_error is failure
-    client._employee_department_runtime.close.assert_not_called()
+
+
+def test_broken_required_audit_keeps_real_restart_gate_participating(
+    tmp_path,
+    caplog,
+) -> None:
+    from src.feishu import ws_client as ws
+    from src.utils.restart_gate import RestartGate, RestartGateError
+
+    class BrokenRuntime:
+        @property
+        def main_bot_outbound_audit(self):
+            raise LookupError("audit composition failed")
+
+    project = tmp_path / "project"
+    project.mkdir()
+    gate = RestartGate.for_project(project, override=tmp_path / "gate")
+    gate.publish_participation(service_pid=os.getpid())
+    with caplog.at_level("ERROR", logger="src.feishu.ws_client"):
+        audit, failure = ws._main_bot_outbound_wiring(
+            BrokenRuntime(),
+            required=True,
+        )
+
+    client = object.__new__(ws.FeishuWSClient)
+    client.settings = SimpleNamespace(autonomous_visible_employee_limit=1)
+    client._ws_health_monitor = SimpleNamespace(record_activity=lambda _kind: None)
+    client._restart_gate = gate
+    client._restart_generation = None
+    client._employee_department_runtime = None
+    client._closed = False
+    _bind_reply_transport(client)
+    client._handler_ctx.main_bot_outbound_audit = audit
+    client._handler_ctx.main_bot_outbound_audit_failure = failure
+
+    client._record_ws_activity("connected")
+
+    with pytest.raises(RestartGateError, match="not ready"):
+        gate.ready_generation(service_pid=os.getpid())
+    assert "LookupError" in caplog.text
+
+
+def test_employee_disabled_marks_real_restart_gate_ready(tmp_path) -> None:
+    from src.feishu import ws_client as ws
+    from src.utils.restart_gate import RestartGate
+
+    project = tmp_path / "project"
+    project.mkdir()
+    gate = RestartGate.for_project(project, override=tmp_path / "gate")
+    gate.publish_participation(service_pid=os.getpid())
+
+    client = object.__new__(ws.FeishuWSClient)
+    client.settings = SimpleNamespace(autonomous_visible_employee_limit=0)
+    client._ws_health_monitor = SimpleNamespace(record_activity=lambda _kind: None)
+    client._restart_gate = gate
+    client._restart_generation = None
+    client._employee_department_runtime = None
+    client._closed = False
+    _bind_reply_transport(client)
+
+    client._record_ws_activity("connected")
+
+    assert gate.ready_generation(service_pid=os.getpid()) == client._restart_generation
 
 
 def test_connected_activity_after_close_does_not_start_employee_recovery() -> None:

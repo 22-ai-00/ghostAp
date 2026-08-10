@@ -768,7 +768,7 @@ class EmployeeDepartmentRuntime:
 
     @property
     def main_bot_outbound_audit(self) -> MainBotSendAuditLog | None:
-        return self._main_bot_activation_audit
+        return self._owned_main_bot_send_audit
 
     def readiness(self) -> RuntimeReadiness:
         return self.hire_readiness()
@@ -784,7 +784,7 @@ class EmployeeDepartmentRuntime:
     def hire_readiness(self) -> RuntimeReadiness:
         if self._service is None:
             return RuntimeReadiness(False, self._blockers or ("not_composed",))
-        activation_audit = self._main_bot_activation_audit
+        activation_audit = self._owned_main_bot_send_audit
         if (
             activation_audit is None
             or activation_audit.activation_fence_ready is not True

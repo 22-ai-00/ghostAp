@@ -6,6 +6,7 @@ import dataclasses
 import logging
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 from acp.stdio import spawn_agent_process
@@ -14,8 +15,14 @@ from ..config import get_settings
 from ..utils.async_helpers import safe_wait_for
 from ..utils.text import get_acp_result_header_text
 from .client import GhostAPClient
-from .options import ACPModelOption, ACPToolOption
+from .model_selection import CODEX_REASONING_EFFORTS, compose_codex_model_selection
+from .options import ACPModelOption, ACPModelSelectionVariant, ACPToolOption
 from .providers import get_providers
+from .traex_selection import (
+    TraexModelMetadata,
+    compose_traex_model_selection,
+    load_traex_model_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +50,28 @@ def _mark_default(
 ) -> list[ACPModelOption]:
     copied = _copy(models)
     selected = str(current_model or "").strip()
-    if not selected or not any(model.name == selected for model in copied):
+    if not selected:
+        return copied
+    matched_model = next(
+        (
+            model.name
+            for model in copied
+            if any(variant.name == selected for variant in model.selection_variants)
+            or (not model.selection_variants and model.name == selected)
+        ),
+        None,
+    )
+    if matched_model is None:
         return copied
     return [
-        dataclasses.replace(model, is_default=model.name == selected)
+        dataclasses.replace(
+            model,
+            is_default=model.name == matched_model,
+            selection_variants=tuple(
+                dataclasses.replace(variant, is_default=variant.name == selected)
+                for variant in model.selection_variants
+            ),
+        )
         for model in copied
     ]
 
@@ -200,6 +225,161 @@ def _options(
     return models
 
 
+def _config_option(response: object, *identifiers: str) -> object | None:
+    expected = {str(value or "").strip() for value in identifiers if value}
+    for wrapped in getattr(response, "config_options", None) or ():
+        root = getattr(wrapped, "root", wrapped)
+        if {
+            str(getattr(root, "id", "") or "").strip(),
+            str(getattr(root, "category", "") or "").strip(),
+        } & expected:
+            return root
+    return None
+
+
+def _reasoning_effort_capability(response: object) -> tuple[tuple[str, ...], str | None]:
+    root = _config_option(response, "reasoning_effort", "thought_level")
+    if root is None:
+        return (), None
+    values: list[str] = []
+    for option in getattr(root, "options", None) or ():
+        effort = str(getattr(option, "value", "") or "").strip().lower()
+        if effort in CODEX_REASONING_EFFORTS and effort not in values:
+            values.append(effort)
+    current = str(getattr(root, "current_value", "") or "").strip().lower()
+    return tuple(values), current if current in values else None
+
+
+async def discover_codex_model_options(
+    connection: object,
+    response: object,
+) -> list[ACPModelOption]:
+    """Build a per-model Codex matrix from authoritative ACP update responses."""
+    model_root = _config_option(response, "model")
+    if model_root is None:
+        return []
+    current_model = str(getattr(model_root, "current_value", "") or "").strip()
+    live_models = _options(
+        list(getattr(model_root, "options", None) or ()),
+        current_model,
+        value_field="value",
+    )
+    session_id = str(getattr(response, "session_id", "") or "").strip()
+    discovered: list[ACPModelOption] = []
+    for live in live_models:
+        authority = response if live.name == current_model else None
+        if authority is None and session_id:
+            try:
+                authority = await connection.set_config_option(
+                    config_id="model",
+                    session_id=session_id,
+                    value=live.name,
+                )
+            except Exception as exc:
+                from ..utils.errors import get_error_detail
+
+                logger.warning(
+                    "[ACP] Codex model capability probe failed model=%s err=%s",
+                    live.name,
+                    get_error_detail(exc),
+                )
+        efforts, default_effort = _reasoning_effort_capability(authority)
+        variants = tuple(
+            ACPModelSelectionVariant(
+                name=compose_codex_model_selection(live.name, effort),
+                model=live.name,
+                effort=effort,
+                is_default=effort == default_effort,
+            )
+            for effort in efforts
+        )
+        if not variants:
+            variants = (
+                ACPModelSelectionVariant(
+                    name=live.name,
+                    model=live.name,
+                    is_default=True,
+                ),
+            )
+        discovered.append(
+            dataclasses.replace(
+                live,
+                is_default=live.name == current_model,
+                selection_variants=variants,
+                reasoning_efforts=efforts,
+                default_reasoning_effort=default_effort,
+            )
+        )
+    return discovered
+
+
+def build_traex_model_options(
+    live_models: Sequence[ACPModelOption],
+    metadata: Sequence[TraexModelMetadata],
+) -> list[ACPModelOption]:
+    """Intersect live Traex models with exact profile/Effort metadata."""
+    by_name = {
+        name: model
+        for model in metadata
+        for name in (model.config_name, model.slug)
+        if name
+    }
+    result: list[ACPModelOption] = []
+    for live in live_models:
+        model_metadata = by_name.get(live.name)
+        variants: list[ACPModelSelectionVariant] = []
+        default_effort: str | None = None
+        if model_metadata is not None:
+            for profile in model_metadata.profiles:
+                if profile.profile == "standard":
+                    default_effort = profile.default_effort
+                if profile.reasoning_efforts:
+                    variants.extend(
+                        ACPModelSelectionVariant(
+                            name=compose_traex_model_selection(
+                                live.name,
+                                profile.profile,
+                                effort,
+                            ),
+                            model=live.name,
+                            profile=profile.profile,
+                            effort=effort,
+                            is_default=effort == profile.default_effort,
+                        )
+                        for effort in profile.reasoning_efforts
+                    )
+                else:
+                    variants.append(
+                        ACPModelSelectionVariant(
+                            name=compose_traex_model_selection(
+                                live.name,
+                                profile.profile,
+                                None,
+                            ),
+                            model=live.name,
+                            profile=profile.profile,
+                            is_default=True,
+                        )
+                    )
+        if not variants:
+            variants.append(
+                ACPModelSelectionVariant(
+                    name=live.name,
+                    model=live.name,
+                    profile="standard",
+                    is_default=True,
+                )
+            )
+        result.append(
+            dataclasses.replace(
+                live,
+                selection_variants=tuple(variants),
+                default_reasoning_effort=default_effort,
+            )
+        )
+    return result
+
+
 def _response_models(
     response: object, current_model: str | None
 ) -> list[ACPModelOption]:
@@ -232,7 +412,15 @@ async def _probe_acp_models(
     ) as (connection, _process):
         await connection.initialize(protocol_version=1)
         response = await connection.new_session(cwd=cwd or str(Path.cwd()))
-        return _response_models(response, current_model)
+        if tool_name == "codex":
+            return await discover_codex_model_options(connection, response)
+        models = _response_models(response, None)
+        if tool_name == "traex":
+            return build_traex_model_options(
+                models,
+                load_traex_model_metadata(),
+            )
+        return models
 
 
 def _probe_blocking(

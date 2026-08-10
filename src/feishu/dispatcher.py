@@ -362,8 +362,14 @@ class MessageDispatcher:
         self.base.reply_text(message_id, "🤔 无法理解你的意图")
 
     def _handle_enter_coco(self, message_id: str, chat_id: str, project, *, pending_prompt: Optional[str] = None):
-        # Programming entry is automatic. Explicit /model and /acp only update
-        # saved project configuration and never interrupt a running task.
+        if pending_prompt is None:
+            self.system.show_explicit_acp_model_selection(
+                message_id,
+                chat_id,
+                "coco",
+                project,
+            )
+            return
         _pid = project.project_id if project else None
         if self.client._mode_manager.is_coco_mode(chat_id, project_id=_pid):
             if pending_prompt:
@@ -380,6 +386,14 @@ class MessageDispatcher:
             )
 
     def _handle_enter_acp_mode(self, mode: str, message_id: str, chat_id: str, project, *, pending_prompt: Optional[str] = None):
+        if pending_prompt is None:
+            self.system.show_explicit_acp_model_selection(
+                message_id,
+                chat_id,
+                mode,
+                project,
+            )
+            return
         _pid = project.project_id if project else None
         mode_checker = getattr(self.client._mode_manager, f"is_{mode}_mode", None)
         if callable(mode_checker) and mode_checker(chat_id, project_id=_pid):

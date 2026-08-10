@@ -152,6 +152,7 @@ _DISPATCH_REJECTION_REASONS = frozenset(
         "team_assignment_invalid",
     }
 )
+_LEGACY_REPLAY_TERMINAL_REASONS = frozenset({"control_consumed"})
 
 
 class RouterProjectionError(RuntimeError):
@@ -374,6 +375,7 @@ def _reduce_router_event(
     event: JournalEvent,
     *,
     sequence: int,
+    allow_legacy_replay: bool = False,
 ) -> None:
     payload = event.payload
     acceptance_id = payload.get("acceptance_id") if isinstance(payload, dict) else None
@@ -381,11 +383,17 @@ def _reduce_router_event(
     if record is None or event.aggregate_id != record.aggregate_id:
         raise RouterProjectionError("Router transition references unknown acceptance")
     if event.event_type == _ROUTER_PREFIX + "authorized":
-        if set(payload) != {
+        current_payload = {
             "acceptance_id",
             "authority",
             "source_requester_principal_id",
-        } or record.state != "accepted":
+        }
+        legacy_payload = {"acceptance_id", "authority"}
+        is_legacy_replay = allow_legacy_replay and set(payload) == legacy_payload
+        if (
+            set(payload) != current_payload
+            and not is_legacy_replay
+        ) or record.state != "accepted":
             raise RouterProjectionError("invalid Router authorized transition")
         try:
             authority = RouterAuthoritySnapshot.from_dict(payload["authority"])
@@ -410,9 +418,13 @@ def _reduce_router_event(
         team_matches = record.team_id == authority.team_id or (
             record.team_id == _remote_index(authority.team_id, "oc_")
         )
+        source_requester_principal_id = (
+            record.requester_principal_id
+            if is_legacy_replay
+            else payload["source_requester_principal_id"]
+        )
         requester_matches = (
-            payload["source_requester_principal_id"]
-            == record.requester_principal_id
+            source_requester_principal_id == record.requester_principal_id
         )
         if (
             authority_coordinates != accepted_coordinates
@@ -486,7 +498,10 @@ def _reduce_router_event(
         }:
             raise RouterProjectionError("invalid Router terminal transition")
         reason = payload["reason_code"]
-        if reason not in _TERMINAL_REASONS:
+        if reason not in _TERMINAL_REASONS and not (
+            allow_legacy_replay
+            and reason in _LEGACY_REPLAY_TERMINAL_REASONS
+        ):
             raise RouterProjectionError("invalid Router terminal reason")
         if (record.state == "dispatching") != (
             reason in _DISPATCH_TERMINAL_REASONS
@@ -739,7 +754,12 @@ class DurableEmployeeIngressRouter:
                             raise RouterProjectionError("duplicate Router acceptance")
                         fresh.by_acceptance_id[record.acceptance_id] = record
                     elif event.event_type in _ROUTER_EVENTS:
-                        _reduce_router_event(fresh, event, sequence=frame.sequence)
+                        _reduce_router_event(
+                            fresh,
+                            event,
+                            sequence=frame.sequence,
+                            allow_legacy_replay=True,
+                        )
                 fresh.cursor_sequence = frame.sequence
                 fresh.cursor_hash = frame.frame_hash
                 anchored_hash = frame.frame_hash

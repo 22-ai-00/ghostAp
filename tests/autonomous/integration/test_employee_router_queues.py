@@ -403,6 +403,77 @@ def test_invalid_router_transition_is_rejected_before_journal_commit(
     writer.close()
 
 
+def test_router_replay_accepts_legacy_control_terminal_but_preflight_rejects(
+    tmp_path: Path,
+) -> None:
+    module, writer, ingress, new_router = _stack(tmp_path)
+    router = new_router()
+    acceptance_id = _accept(ingress, 1)
+    router.rebuild_projection()
+    record = router.state.by_acceptance_id[acceptance_id]
+    event = JournalEvent(
+        event_type="employee.ingress.router_terminal",
+        aggregate_id=record.aggregate_id,
+        payload={
+            "acceptance_id": acceptance_id,
+            "reason_code": "control_consumed",
+        },
+    )
+    result = writer.commit(
+        (event,),
+        writer.get_aggregate_versions((event.aggregate_id,)),
+    )
+
+    with pytest.raises(module.RouterProjectionError, match="terminal reason"):
+        router.preflight_frame_unlocked(result.frame)
+
+    restarted = new_router()
+    replayed = restarted.state.by_acceptance_id[acceptance_id]
+    assert replayed.state == "terminal"
+    assert replayed.reason_code == "control_consumed"
+    ingress.close()
+    writer.close()
+
+
+def test_router_replay_backfills_legacy_authorized_requester_from_acceptance(
+    tmp_path: Path,
+) -> None:
+    module, writer, ingress, new_router = _stack(tmp_path)
+    router = new_router()
+    seed_acceptance = _accept(ingress, 1)
+    router.route(seed_acceptance)
+    authority = router.state.by_acceptance_id[seed_acceptance].authority
+    assert authority is not None
+    authority_payload = authority.to_dict()
+    authority_payload["requester_principal_id"] = "ou_resolved_requester"
+
+    legacy_acceptance = _accept(ingress, 2)
+    router.rebuild_projection()
+    record = router.state.by_acceptance_id[legacy_acceptance]
+    event = JournalEvent(
+        event_type="employee.ingress.router_authorized",
+        aggregate_id=record.aggregate_id,
+        payload={
+            "acceptance_id": legacy_acceptance,
+            "authority": authority_payload,
+        },
+    )
+    result = writer.commit(
+        (event,),
+        writer.get_aggregate_versions((event.aggregate_id,)),
+    )
+
+    with pytest.raises(module.RouterProjectionError, match="authorized transition"):
+        router.preflight_frame_unlocked(result.frame)
+
+    restarted = new_router()
+    replayed = restarted.state.by_acceptance_id[legacy_acceptance]
+    assert replayed.state == "authorized"
+    assert replayed.requester_principal_id == "ou_resolved_requester"
+    ingress.close()
+    writer.close()
+
+
 def test_durable_fifo_survives_router_restart(tmp_path: Path) -> None:
     _, writer, ingress, new_router = _stack(tmp_path)
     router = new_router()

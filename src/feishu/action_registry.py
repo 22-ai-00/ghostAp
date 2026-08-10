@@ -38,7 +38,16 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
     workflow = handlers["workflow"]
 
     for mode in ("coco", "claude", "aiden", "codex", "gemini", "traex"):
-        actions[f"enter_{mode}"] = handlers[mode].handle_card_enter
+        def _show_model_selector(mid, cid, pid, val, *, _mode=mode):
+            system.show_explicit_acp_model_selection(
+                mid,
+                cid,
+                _mode,
+                _resolve_project(client, pid, cid),
+                origin_message_id=mid,
+            )
+
+        actions[f"enter_{mode}"] = _show_model_selector
         actions[f"exit_{mode}"] = handlers[mode].handle_card_exit
 
     # Project
@@ -138,6 +147,14 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
             origin_message_id=mid,
         )
     )
+    actions[action_ids.SELECT_ACP_MODEL] = system.handle_select_acp_model
+    for action in (
+        action_ids.SELECT_ACP_MODEL_GROUP,
+        action_ids.SELECT_ACP_MODEL_PROFILE,
+        action_ids.SELECT_ACP_MODEL_EFFORT,
+    ):
+        actions[action] = system.handle_acp_model_cascade_select
+    actions[action_ids.REFRESH_ACP_MODELS] = system.handle_refresh_acp_models
 
     # Deep Engine
     actions[action_ids.SHOW_DEEP_STATUS] = (

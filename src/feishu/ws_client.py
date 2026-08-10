@@ -199,7 +199,11 @@ def _main_bot_outbound_wiring(
 
     try:
         audit = getattr(runtime, "main_bot_outbound_audit", None)
-    except Exception:
+    except Exception as exc:
+        logger.error(
+            "main Bot outbound audit lookup failed: %s",
+            type(exc).__name__,
+        )
         audit = None
     if audit is not None:
         record_attempt = getattr(audit, "record_attempt", None)
@@ -303,6 +307,9 @@ class FeishuWSClient:
         self._employee_runtime_recovery_thread: Optional[threading.Thread] = None
         self._employee_runtime_recovery_started = False
         self._employee_runtime_recovery_error: Exception | None = None
+        self._main_ws_connected = False
+        self._restart_readiness_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._restart_readiness_blocker: str | None = None
         self._channel_client_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
         # ACPSessionManager: IdleHealth 相关协作者统一通过 IdleHealthConfig 注入，
@@ -742,6 +749,7 @@ class FeishuWSClient:
             )
             return
         logger.info("Employee runtime background recovery complete")
+        self._try_publish_restart_readiness()
 
     def _start_employee_runtime_recovery(self) -> None:
         """Start at most one post-connection Employee recovery worker."""
@@ -2941,6 +2949,10 @@ class FeishuWSClient:
             set_current_thread_id,
         )
 
+        # Scheduler workers may retain a ContextVar copied from an earlier task.
+        # A card callback must start unscoped and restore only payload context
+        # that resolves to the callback's authoritative chat/project coordinates.
+        set_current_thread_id(None)
         try:
             start_time = time.perf_counter()
             action = data.event.action
@@ -3058,10 +3070,18 @@ class FeishuWSClient:
                 value["project_id"] = project_id
 
             card_thread_id = value.get("thread_root_id")
-            if card_thread_id and self.settings.thread_programming_enabled:
+            if (
+                isinstance(card_thread_id, str)
+                and card_thread_id
+                and self.settings.thread_programming_enabled
+            ):
                 thread_ctx = self._thread_manager.get(card_thread_id)
-                if thread_ctx:
-                    set_current_thread_id(card_thread_id)
+                if (
+                    thread_ctx is not None
+                    and thread_ctx.chat_id == open_chat_id
+                    and thread_ctx.project_id == project_id
+                ):
+                    set_current_thread_id(thread_ctx.thread_root_id)
 
             if task_ctx and project_id:
                 try:
@@ -3419,20 +3439,82 @@ class FeishuWSClient:
     # ==================================================================
     # WebSocket lifecycle
     # ==================================================================
+    def _main_bot_reply_chain_readiness(self) -> tuple[bool, str]:
+        """Return whether the connected main Bot can emit an audited reply."""
+
+        handler_ctx = getattr(self, "_handler_ctx", None)
+        handlers = getattr(handler_ctx, "handlers", None)
+        try:
+            reply_handler_ready = handlers is not None and "coco" in handlers
+        except Exception:
+            reply_handler_ready = False
+        if not reply_handler_ready:
+            return False, "main_bot_reply_handler"
+
+        if not _visible_employee_runtime_requires_outbound_audit(
+            getattr(self, "settings", None)
+        ):
+            return True, ""
+
+        audit = getattr(handler_ctx, "main_bot_outbound_audit", None)
+        audit_failure = getattr(
+            handler_ctx,
+            "main_bot_outbound_audit_failure",
+            None,
+        )
+        if audit is _unavailable_main_bot_outbound_audit or not callable(audit):
+            return False, "main_bot_outbound_audit"
+        if not callable(audit_failure):
+            return False, "main_bot_outbound_audit_failure"
+        return True, ""
+
+    def _try_publish_restart_readiness(self) -> bool:
+        """Publish restart readiness once transport and reply dependencies are live."""
+
+        if (
+            getattr(self, "_closed", False)
+            or not getattr(self, "_main_ws_connected", False)
+        ):
+            return False
+        ready, blocker = self._main_bot_reply_chain_readiness()
+        if not ready:
+            if getattr(self, "_restart_readiness_blocker", None) != blocker:
+                self._restart_readiness_blocker = blocker
+                logger.error(
+                    "GhostAP restart readiness withheld: blocker=%s",
+                    blocker,
+                )
+            return False
+
+        lock = getattr(self, "_restart_readiness_lock", None)
+        if lock is None:
+            lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+            self._restart_readiness_lock = lock
+        with lock:
+            if getattr(self, "_restart_generation", None) is not None:
+                return True
+            self._restart_generation = self._restart_gate.mark_ready(
+                service_pid=os.getpid()
+            )
+            self._restart_readiness_blocker = None
+            logger.info(
+                "GhostAP restart readiness published generation=%s",
+                self._restart_generation,
+            )
+        return True
+
     def _record_ws_activity(self, kind: str) -> None:
-        """Record transport health and publish readiness on a real connection."""
+        """Record transport health and publish only reply-capable readiness."""
 
         self._ws_health_monitor.record_activity(kind)
+        if kind == "disconnected":
+            self._main_ws_connected = False
+            return
         if kind != "connected":
             return
-        self._restart_generation = self._restart_gate.mark_ready(
-            service_pid=os.getpid()
-        )
-        logger.info(
-            "GhostAP restart readiness published generation=%s",
-            self._restart_generation,
-        )
+        self._main_ws_connected = True
         self._start_employee_runtime_recovery()
+        self._try_publish_restart_readiness()
 
     def _publish_restart_participation(self) -> str:
         """Bind restart identity only when the real service starts intake."""

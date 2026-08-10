@@ -7,6 +7,80 @@ import pytest
 from src.trust.models import ActorKind, TrustZone
 
 
+def test_hire_readiness_uses_owned_main_bot_send_audit(tmp_path) -> None:
+    from src.autonomous.acceptance.main_bot_audit import MainBotSendAuditLog
+    from src.autonomous.provisioning.composition import (
+        EmployeeDepartmentRuntime,
+        RuntimeReadiness,
+    )
+    from src.autonomous.provisioning.hire_service import HireReadiness
+
+    audit = MainBotSendAuditLog.open(
+        tmp_path / "main-bot-audit",
+        anchor_path=tmp_path / "main-bot-audit.anchor",
+        hmac_key=b"a" * 32,
+    )
+    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
+    runtime._owned_main_bot_send_audit = audit  # noqa: SLF001
+    runtime._service = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        readiness=lambda: HireReadiness(True, ())
+    )
+
+    try:
+        assert runtime.hire_readiness() == RuntimeReadiness(True, ())
+    finally:
+        audit.close()
+
+
+def test_dispatch_soft_failure_preserves_owned_main_bot_audit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.autonomous.provisioning.composition as composition
+    from src.autonomous.acceptance.main_bot_audit import MainBotSendAuditLog
+
+    audit = MainBotSendAuditLog.open(
+        tmp_path / "main-bot-audit",
+        anchor_path=tmp_path / "main-bot-audit.anchor",
+        hmac_key=b"a" * 32,
+    )
+    runtime = composition.EmployeeDepartmentRuntime(runtime_enabled=True)
+    runtime._owned_main_bot_send_audit = audit  # noqa: SLF001
+    runtime._service = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        synchronize_projection=lambda: SimpleNamespace(),
+    )
+    runtime._writer = object()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._ingress = object()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._data = SimpleNamespace(service=object())  # type: ignore[assignment]  # noqa: SLF001
+    runtime._channels = object()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._context_service = object()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._outbox = object()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._team_runtime = SimpleNamespace(employee_activation_guard=lambda: None)  # noqa: SLF001
+    runtime._environment_provider = lambda _authority: None  # noqa: SLF001
+    settings = SimpleNamespace(
+        autonomous_employee_storage_base=str(tmp_path),
+        autonomous_employee_queue_per_employee_limit=1,
+        autonomous_employee_queue_per_team_limit=1,
+        autonomous_employee_queue_global_limit=1,
+        autonomous_employee_system_prompt_token_reserve=1,
+        autonomous_context_retry_base_seconds=0.1,
+        autonomous_context_retry_max_seconds=1.0,
+    )
+
+    def fail_router(**_kwargs):
+        raise RuntimeError("projection broken")
+
+    monkeypatch.setattr(composition, "DurableEmployeeIngressRouter", fail_router)
+
+    try:
+        runtime._compose_dispatch(settings, membership_health=object())  # noqa: SLF001
+
+        assert runtime._execution_blockers == ("employee_gateway",)  # noqa: SLF001
+        assert runtime.main_bot_outbound_audit is audit
+    finally:
+        audit.close()
+
+
 def test_team_recovery_waits_for_shared_dispatch_projections() -> None:
     calls: list[str] = []
     empty_state = SimpleNamespace(by_acceptance_id={})

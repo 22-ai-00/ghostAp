@@ -670,6 +670,409 @@ class SystemBuilder:
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
+    def build_acp_model_cascade_card(
+        models: list,
+        tool_name: str,
+        project_id: Optional[str] = None,
+        current_model: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+        *,
+        pending_group: Optional[str] = None,
+        pending_profile: Optional[str] = None,
+        pending_effort: Optional[str] = None,
+        context_markdown: Optional[str] = None,
+        group_action: str = action_ids.SELECT_ACP_MODEL_GROUP,
+        profile_action: str = action_ids.SELECT_ACP_MODEL_PROFILE,
+        effort_action: str = action_ids.SELECT_ACP_MODEL_EFFORT,
+        select_action: str = action_ids.SELECT_ACP_MODEL,
+        refresh_action: str = action_ids.REFRESH_ACP_MODELS,
+        value_extra: Optional[dict] = None,
+    ) -> tuple[str, str]:
+        """Build the explicit model picker without activating a programming mode."""
+        from src.card.render.model_cascade import resolve_model_cascade
+
+        tool = str(tool_name or "").strip().lower()
+        state = resolve_model_cascade(
+            models,
+            current_model=current_model,
+            selected_model=pending_group,
+            selected_profile=pending_profile,
+            selected_effort=pending_effort,
+        )
+
+        def payload(action: str, **updates: object) -> dict:
+            value = dict(value_extra or {})
+            value.update(
+                {
+                    "action": action,
+                    "tool_name": tool,
+                    "project_id": project_id,
+                    "current_model": current_model,
+                    "model_group": state.selected_model,
+                    "model_profile": state.selected_profile,
+                    "model_effort": state.selected_effort,
+                }
+            )
+            if thread_root_id:
+                value["thread_root_id"] = thread_root_id
+            value.update(updates)
+            return value
+
+        def select_static(
+            *,
+            name: str,
+            placeholder: str,
+            values: tuple[str, ...],
+            selected: Optional[str],
+            action: str,
+        ) -> dict:
+            callback = payload(action)
+            element = {
+                "tag": "select_static",
+                "name": name,
+                "placeholder": {"tag": "plain_text", "content": placeholder},
+                "options": [
+                    {
+                        "text": {"tag": "plain_text", "content": value},
+                        "value": value,
+                    }
+                    for value in values
+                ],
+                "value": callback,
+                "behaviors": [{"type": "callback", "value": callback}],
+            }
+            if selected in values:
+                element["initial_option"] = selected
+            return element
+
+        elements: list[dict] = [
+            {
+                "tag": "markdown",
+                "content": UI_TEXT["system_acp_model_select_intro"],
+            }
+        ]
+        if context_markdown:
+            elements.append({"tag": "markdown", "content": str(context_markdown)})
+        elements.append({"tag": "hr"})
+
+        has_dimensions = bool(state.profiles or state.efforts)
+        if has_dimensions:
+            elements.extend(
+                [
+                    {
+                        "tag": "markdown",
+                        "content": UI_TEXT["system_acp_model_group_label"],
+                    },
+                    select_static(
+                        name="model_group",
+                        placeholder=UI_TEXT["system_acp_model_group_placeholder"],
+                        values=state.model_names,
+                        selected=state.selected_model,
+                        action=group_action,
+                    ),
+                ]
+            )
+            if state.profiles:
+                elements.extend(
+                    [
+                        {
+                            "tag": "markdown",
+                            "content": UI_TEXT["system_acp_model_profile_label"],
+                        },
+                        select_static(
+                            name="model_profile",
+                            placeholder=UI_TEXT["system_acp_model_profile_placeholder"],
+                            values=state.profiles,
+                            selected=state.selected_profile,
+                            action=profile_action,
+                        ),
+                    ]
+                )
+            if state.efforts:
+                elements.extend(
+                    [
+                        {
+                            "tag": "markdown",
+                            "content": UI_TEXT["system_acp_model_effort_label"],
+                        },
+                        select_static(
+                            name="model_effort",
+                            placeholder=UI_TEXT["system_acp_model_effort_placeholder"],
+                            values=state.efforts,
+                            selected=state.selected_effort,
+                            action=effort_action,
+                        ),
+                    ]
+                )
+
+            default_button = SystemBuilder._callback_button(
+                text=UI_TEXT["system_acp_default_model_option"],
+                action=payload(
+                    select_action,
+                    model_name=None,
+                    use_default_model=True,
+                ),
+            )
+            confirm_button = SystemBuilder._callback_button(
+                text=UI_TEXT["system_acp_confirm_model"].format(
+                    model=state.selection,
+                ),
+                action=payload(
+                    select_action,
+                    model_name=state.selection,
+                    use_default_model=False,
+                ),
+                button_type="primary",
+            )
+            elements.extend(build_responsive_layout([default_button, confirm_button], layout="mobile"))
+        else:
+            buttons = [
+                SystemBuilder._callback_button(
+                    text=UI_TEXT["system_acp_default_model_option"],
+                    action=payload(
+                        select_action,
+                        model_name=None,
+                        use_default_model=True,
+                    ),
+                    button_type="primary" if not current_model else "default",
+                )
+            ]
+            for model_name in state.model_names:
+                buttons.append(
+                    SystemBuilder._callback_button(
+                        text=model_name,
+                        action=payload(
+                            select_action,
+                            model_group=model_name,
+                            model_profile=None,
+                            model_effort=None,
+                            model_name=model_name,
+                            use_default_model=False,
+                        ),
+                        button_type="primary" if model_name == current_model else "default",
+                    )
+                )
+            elements.extend(build_responsive_layout(buttons, layout="mobile"))
+            if not state.model_names:
+                elements.append(
+                    {
+                        "tag": "markdown",
+                        "text_size": "notation",
+                        "content": UI_TEXT["system_acp_no_models_hint"],
+                    }
+                )
+
+        elements.append({"tag": "hr"})
+        elements.extend(
+            build_responsive_layout(
+                [
+                    SystemBuilder._callback_button(
+                        text=UI_TEXT["system_acp_refresh_models"],
+                        action=payload(refresh_action),
+                    )
+                ],
+                layout="mobile",
+            )
+        )
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_acp_model_select_title"].format(tool=tool.capitalize()),
+            "blue",
+            elements,
+        )
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_acp_model_loading_card(
+        tool_name: str,
+        project_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Build the in-place frame shown while official model data loads."""
+        del project_id, thread_root_id
+        tool = str(tool_name or "").strip().lower()
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_acp_model_loading_title"].format(tool=tool.capitalize()),
+            "blue",
+            [
+                {
+                    "tag": "markdown",
+                    "content": UI_TEXT["system_acp_model_loading_body"].format(tool=tool),
+                }
+            ],
+        )
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_acp_model_error_card(
+        tool_name: str,
+        project_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Build the retryable frame shown when official model discovery fails."""
+        tool = str(tool_name or "").strip().lower()
+        retry_value = {
+            "action": action_ids.REFRESH_ACP_MODELS,
+            "tool_name": tool,
+            "project_id": project_id,
+        }
+        if thread_root_id:
+            retry_value["thread_root_id"] = thread_root_id
+        elements = [
+            {
+                "tag": "markdown",
+                "content": UI_TEXT["system_acp_model_error_body"].format(tool=tool),
+            },
+            {"tag": "hr"},
+            *build_responsive_layout(
+                [
+                    SystemBuilder._callback_button(
+                        text=UI_TEXT["system_acp_refresh_models"],
+                        action=retry_value,
+                        button_type="primary",
+                    )
+                ],
+                layout="mobile",
+            ),
+        ]
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_acp_model_error_title"].format(tool=tool.capitalize()),
+            "red",
+            elements,
+        )
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_acp_programming_initializing_card(
+        tool_name: str,
+        model_name: Optional[str],
+        project_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Build the immediate frame while the selected ACP session starts."""
+        del project_id, thread_root_id
+        tool = str(tool_name or "").strip().lower()
+        model = str(model_name or UI_TEXT["system_acp_default_model_option"])
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_acp_programming_initializing_title"].format(tool=tool.capitalize()),
+            "blue",
+            [
+                {
+                    "tag": "markdown",
+                    "content": UI_TEXT["system_acp_programming_initializing_body"].format(model=model),
+                }
+            ],
+        )
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_acp_programming_ready_card(
+        tool_name: str,
+        model_name: Optional[str],
+        project_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Build the final frame after the selected ACP session is ready."""
+        tool = str(tool_name or "").strip().lower()
+        model = str(model_name or UI_TEXT["system_acp_default_model_option"])
+        switch_value = {
+            "action": action_ids.REFRESH_ACP_MODELS,
+            "tool_name": tool,
+            "project_id": project_id,
+            "current_model": model_name,
+        }
+        if thread_root_id:
+            switch_value["thread_root_id"] = thread_root_id
+        elements = [
+            {
+                "tag": "markdown",
+                "content": UI_TEXT["system_acp_programming_ready_body"].format(model=model),
+            },
+            {"tag": "hr"},
+            *build_responsive_layout(
+                [
+                    SystemBuilder._callback_button(
+                        text=UI_TEXT["system_acp_switch_model_btn"],
+                        action=switch_value,
+                    )
+                ],
+                layout="mobile",
+            ),
+        ]
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_acp_programming_ready_title"].format(tool=tool.capitalize()),
+            "green",
+            elements,
+        )
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_acp_programming_failed_card(
+        tool_name: str,
+        model_name: Optional[str],
+        reason: str,
+        project_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+        *,
+        model_group: Optional[str] = None,
+        model_profile: Optional[str] = None,
+        model_effort: Optional[str] = None,
+    ) -> tuple[str, str]:
+        """Build the retryable terminal frame after ACP startup fails."""
+        tool = str(tool_name or "").strip().lower()
+        model = str(model_name or UI_TEXT["system_acp_default_model_option"])
+        base = {"tool_name": tool, "project_id": project_id}
+        if thread_root_id:
+            base["thread_root_id"] = thread_root_id
+        retry_value = {
+            **base,
+            "action": action_ids.SELECT_ACP_MODEL,
+            "model_group": model_group,
+            "model_profile": model_profile,
+            "model_effort": model_effort,
+            "model_name": model_name,
+            "use_default_model": model_name is None,
+        }
+        back_value = {
+            **base,
+            "action": action_ids.REFRESH_ACP_MODELS,
+            "current_model": model_name,
+        }
+        safe_reason = SystemBuilder._sanitize_card_text(
+            reason,
+            fallback=UI_TEXT["system_acp_activation_failed_safe"],
+        )
+        elements = [
+            {
+                "tag": "markdown",
+                "content": UI_TEXT["system_acp_programming_failed_body"].format(
+                    model=model,
+                    reason=safe_reason,
+                ),
+            },
+            {"tag": "hr"},
+            *build_responsive_layout(
+                [
+                    SystemBuilder._callback_button(
+                        text=UI_TEXT["system_acp_retry_activation_btn"],
+                        action=retry_value,
+                        button_type="danger",
+                    ),
+                    SystemBuilder._callback_button(
+                        text=UI_TEXT["system_acp_back_to_models_btn"],
+                        action=back_value,
+                    ),
+                ],
+                layout="mobile",
+            ),
+        ]
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_acp_programming_failed_title"].format(tool=tool.capitalize()),
+            "red",
+            elements,
+        )
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
     def build_tools_list_card(
         tools: list[dict],
         project: Optional[ProjectContext] = None,

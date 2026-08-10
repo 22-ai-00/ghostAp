@@ -21,6 +21,16 @@ _GATEWAY_EVENTS = frozenset(
         ATTEMPT_TERMINAL,
     }
 )
+_CURRENT_TEAM_BINDING_FIELDS = frozenset(
+    {"team_chat_id", "team_identity", "team_root_identity"}
+)
+_LEGACY_SLOCK_BINDING_FIELDS = frozenset(
+    {"slock_chat_id", "slock_engine_identity", "slock_root_identity"}
+)
+_CURRENT_BINDING_FIELDS = frozenset(DispatchBinding.__dataclass_fields__)
+_LEGACY_BINDING_FIELDS = (
+    _CURRENT_BINDING_FIELDS - _CURRENT_TEAM_BINDING_FIELDS
+) | _LEGACY_SLOCK_BINDING_FIELDS
 
 
 class GatewayProjectionError(RuntimeError):
@@ -65,6 +75,18 @@ class GatewayProjectionState:
 
 def is_gateway_event(event_type: str) -> bool:
     return event_type in _GATEWAY_EVENTS
+
+
+def _dispatch_binding_from_journal(value: object) -> DispatchBinding:
+    """Normalize the one authenticated pre-team binding schema during replay."""
+
+    if isinstance(value, dict) and set(value) == _LEGACY_BINDING_FIELDS:
+        normalized = dict(value)
+        normalized["team_chat_id"] = normalized.pop("slock_chat_id")
+        normalized["team_identity"] = normalized.pop("slock_engine_identity")
+        normalized["team_root_identity"] = normalized.pop("slock_root_identity")
+        value = normalized
+    return DispatchBinding.from_dict(value)
 
 
 def _reduce_gateway_event(
@@ -148,7 +170,7 @@ def _validate_cross_domain_atomicity(
 ) -> None:
     for event in bound:
         try:
-            binding = DispatchBinding.from_dict(event.payload["binding"])
+            binding = _dispatch_binding_from_journal(event.payload["binding"])
         except (KeyError, TypeError, ValueError) as exc:
             raise GatewayProjectionError("invalid attempt binding") from exc
         router_dispatch = [
@@ -204,7 +226,7 @@ def _reduce_bound(
     if set(event.payload) != {"binding"}:
         raise GatewayProjectionError("attempt binding must use exact schema")
     try:
-        binding = DispatchBinding.from_dict(event.payload["binding"])
+        binding = _dispatch_binding_from_journal(event.payload["binding"])
     except (TypeError, ValueError) as exc:
         raise GatewayProjectionError("invalid attempt binding") from exc
     if binding.attempt_id != event.aggregate_id:
