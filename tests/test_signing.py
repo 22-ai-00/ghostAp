@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import time
-from datetime import date, timedelta
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,11 +16,9 @@ import pytest
 from src.utils.signing import (
     VerifyResult,
     _compute_command_sig,
-    _get_process_start_date,
     _get_signing_key,
     _is_v2_sig,
     _record_nonce,
-    _verify_legacy_sha256_fallback,
     sign_command,
     verify_command_sig,
 )
@@ -297,94 +295,36 @@ class TestVerifyCommandSigV1Compat:
             result = verify_command_sig("cmd", "deadbeef" * 8)
         assert result is VerifyResult.MISMATCH
 
-    def test_legacy_sha256_within_window(self):
-        """Plain SHA-256 accepted within compat window."""
+    @pytest.mark.parametrize(
+        ("deploy_date", "window_days"),
+        [
+            (date.today().isoformat(), 7),
+            ("", 7),
+            ("2000-01-01", 36500),
+        ],
+    )
+    def test_plain_sha256_is_always_rejected(
+        self,
+        deploy_date: str,
+        window_days: int,
+    ):
+        """Unkeyed signatures stay invalid across deploys and process restarts."""
         cmd = "/status"
         plain_sig = hashlib.sha256(cmd.encode()).hexdigest()
+        stale_settings = MagicMock(
+            app_secret=_TEST_KEY,
+            sig_compat_deploy_date=deploy_date,
+            sig_compat_window_days=window_days,
+        )
 
-        mock_settings = MagicMock()
-        mock_settings.sig_compat_deploy_date = date.today().isoformat()
-        mock_settings.sig_compat_window_days = 7
-        mock_settings.app_secret = _TEST_KEY
+        with patch("src.config.get_settings", return_value=stale_settings):
+            assert verify_command_sig(cmd, plain_sig) is VerifyResult.MISMATCH
 
-        with patch("src.config.get_settings", return_value=mock_settings):
-            result = verify_command_sig(cmd, plain_sig)
-            assert result is VerifyResult.OK
+    def test_plain_sha256_compatibility_window_is_not_configurable(self):
+        from src.config.settings import Settings
 
-    def test_legacy_sha256_outside_window(self):
-        """Plain SHA-256 rejected outside compat window → COMPAT_EXPIRED."""
-        cmd = "/test"
-        plain_sig = hashlib.sha256(cmd.encode()).hexdigest()
-
-        mock_settings = MagicMock()
-        past = date.today() - timedelta(days=30)
-        mock_settings.sig_compat_deploy_date = past.isoformat()
-        mock_settings.sig_compat_window_days = 7
-        mock_settings.app_secret = _TEST_KEY
-
-        with patch("src.config.get_settings", return_value=mock_settings):
-            result = verify_command_sig(cmd, plain_sig)
-            assert result is VerifyResult.COMPAT_EXPIRED
-
-
-# ---------------------------------------------------------------------------
-# _verify_legacy_sha256_fallback
-# ---------------------------------------------------------------------------
-
-
-class TestLegacySha256Fallback:
-
-    def test_accepted_within_window(self):
-        cmd = "/status"
-        plain_sig = hashlib.sha256(cmd.encode()).hexdigest()
-
-        mock_settings = MagicMock()
-        mock_settings.sig_compat_deploy_date = date.today().isoformat()
-        mock_settings.sig_compat_window_days = 7
-
-        with patch("src.config.get_settings", return_value=mock_settings):
-            assert _verify_legacy_sha256_fallback(cmd, plain_sig) is VerifyResult.OK
-
-    def test_rejected_outside_window(self):
-        cmd = "/status"
-        plain_sig = hashlib.sha256(cmd.encode()).hexdigest()
-
-        mock_settings = MagicMock()
-        past = date.today() - timedelta(days=30)
-        mock_settings.sig_compat_deploy_date = past.isoformat()
-        mock_settings.sig_compat_window_days = 7
-
-        with patch("src.config.get_settings", return_value=mock_settings):
-            result = _verify_legacy_sha256_fallback(cmd, plain_sig)
-            assert result is VerifyResult.COMPAT_EXPIRED
-
-    def test_rejected_on_settings_exception(self):
-        cmd = "/test"
-        plain_sig = hashlib.sha256(cmd.encode()).hexdigest()
-        with patch("src.config.get_settings", side_effect=RuntimeError("no settings")):
-            # Legacy matches but settings fail → window_open=False → COMPAT_EXPIRED
-            result = _verify_legacy_sha256_fallback(cmd, plain_sig)
-            assert result is VerifyResult.COMPAT_EXPIRED
-
-    def test_wrong_sig_returns_mismatch(self):
-        """When even legacy SHA-256 doesn't match, return MISMATCH."""
-        cmd = "/test"
-        with patch("src.config.get_settings", side_effect=RuntimeError("no settings")):
-            result = _verify_legacy_sha256_fallback(cmd, "not_a_valid_sig")
-            assert result is VerifyResult.MISMATCH
-
-    def test_empty_deploy_date_uses_process_start(self):
-        """When sig_compat_deploy_date is empty, _PROCESS_START_DATE is used."""
-        cmd = "/test"
-        plain_sig = hashlib.sha256(cmd.encode()).hexdigest()
-
-        mock_settings = MagicMock()
-        mock_settings.sig_compat_deploy_date = ""  # empty → fallback
-        mock_settings.sig_compat_window_days = 7
-
-        with patch("src.config.get_settings", return_value=mock_settings):
-            # _PROCESS_START_DATE is today at import time, so within 7-day window
-            assert _verify_legacy_sha256_fallback(cmd, plain_sig) is VerifyResult.OK
+        assert "sig_compat_deploy_date" not in Settings.model_fields
+        assert "sig_compat_window_days" not in Settings.model_fields
 
 
 # ---------------------------------------------------------------------------
@@ -430,39 +370,6 @@ class TestVerifyResult:
 
     def test_mismatch_is_falsy(self):
         assert bool(VerifyResult.MISMATCH) is False
-
-
-# ---------------------------------------------------------------------------
-# _get_process_start_date (lazy initialization)
-# ---------------------------------------------------------------------------
-
-
-class TestGetProcessStartDate:
-
-    def test_lazy_init_returns_date(self):
-        """_get_process_start_date returns a date object."""
-        import src.utils.signing as _mod
-        original = _mod._PROCESS_START_DATE
-        try:
-            _mod._PROCESS_START_DATE = None
-            result = _get_process_start_date()
-            assert isinstance(result, date)
-            assert result == date.today()
-        finally:
-            _mod._PROCESS_START_DATE = original
-
-    def test_lazy_init_caches(self):
-        """Second call returns the same cached value without re-computing."""
-        import src.utils.signing as _mod
-        original = _mod._PROCESS_START_DATE
-        try:
-            _mod._PROCESS_START_DATE = None
-            first = _get_process_start_date()
-            second = _get_process_start_date()
-            assert first is second
-            assert _mod._PROCESS_START_DATE is first
-        finally:
-            _mod._PROCESS_START_DATE = original
 
 
 # ---------------------------------------------------------------------------

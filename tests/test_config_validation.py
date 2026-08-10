@@ -141,63 +141,6 @@ class TestMainCatchesConfigurationError:
         assert exc_info.value.code == 1
 
 
-class TestSpecReviewConfigProperty:
-    """AC-T21: Settings.spec_review returns a SpecReviewConfig dataclass view."""
-
-    def test_spec_review_returns_dataclass(self):
-        from src.config import SpecReviewConfig
-        s = Settings()
-        cfg = s.spec_review
-        assert isinstance(cfg, SpecReviewConfig)
-
-    def test_spec_review_fields_match_settings(self):
-        s = Settings(
-            spec_review_timeout=200,
-            spec_review_min_timeout=50,
-            spec_review_hard_floor=25,
-            spec_review_max_parallel=5,
-            spec_review_strategy="adaptive_roles",
-            spec_review_dynamic_roles_enabled=False,
-            spec_review_dynamic_roles_max=2,
-            spec_review_total_roles_max=7,
-            spec_review_pass_streak_required=3,
-            spec_review_retry_max_delay=20,
-            spec_review_retry_max_attempts=1,
-            spec_review_failure_circuit_enabled=False,
-            spec_review_failure_max_consecutive=6,
-            spec_review_failure_cooldown_cycles=3,
-            spec_review_failure_max_cooldown_cycles=10,
-        )
-        cfg = s.spec_review
-        assert cfg.timeout == 200
-        assert cfg.min_timeout == 50
-        assert cfg.hard_floor == 25
-        assert cfg.max_parallel == 5
-        assert cfg.retry_max_delay == 20
-        assert cfg.retry_max_attempts == 1
-        assert cfg.failure_circuit_enabled is False
-        assert cfg.failure_max_consecutive == 6
-        assert cfg.failure_cooldown_cycles == 3
-        assert cfg.failure_max_cooldown_cycles == 10
-        assert cfg.strategy == "adaptive_roles"
-        assert cfg.dynamic_roles_enabled is False
-        assert cfg.dynamic_roles_max == 2
-        assert cfg.total_roles_max == 7
-        assert cfg.pass_streak_required == 3
-
-    def test_spec_review_from_env(self):
-        """SpecReviewConfig reflects environment variable overrides."""
-        env_override = {
-            "SPEC_REVIEW_TIMEOUT": "300",
-            "SPEC_REVIEW_MAX_PARALLEL": "7",
-        }
-        with patch.dict("os.environ", env_override, clear=False):
-            s = Settings()
-        cfg = s.spec_review
-        assert cfg.timeout == 300
-        assert cfg.max_parallel == 7
-
-
 class TestPostValidateWarnings:
     """_post_validate_warnings reports soft retry budget notes without startup warning noise."""
 
@@ -316,35 +259,6 @@ class TestLockBackendRemoved:
         with patch.dict("os.environ", {"LOCK_BACKEND": "memory"}, clear=False):
             s = Settings()
         assert not hasattr(s, "lock_backend")
-
-
-# ---------------------------------------------------------------------------
-# Step-03: spec_review_parse_failure_default validation
-# ---------------------------------------------------------------------------
-
-
-class TestSpecReviewParseFailureDefault:
-    """AC-R05: spec_review_parse_failure_default accepts 'pass'/'fail', rejects others."""
-
-    def test_default_is_fail(self):
-        s = Settings()
-        assert s.spec_review_parse_failure_default == "fail"
-
-    def test_pass_accepted(self):
-        s = Settings(spec_review_parse_failure_default="pass")
-        assert s.spec_review_parse_failure_default == "pass"
-
-    def test_fail_accepted(self):
-        s = Settings(spec_review_parse_failure_default="fail")
-        assert s.spec_review_parse_failure_default == "fail"
-
-    def test_invalid_value_raises(self):
-        with pytest.raises(Exception):
-            Settings(spec_review_parse_failure_default="maybe")
-
-    def test_spec_review_property_includes_parse_failure_default(self):
-        s = Settings(spec_review_parse_failure_default="pass")
-        assert s.spec_review.parse_failure_default == "pass"
 
 
 class TestWorkflowTimeoutSettings:

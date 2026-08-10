@@ -19,7 +19,6 @@ from .singleton import (
     _post_validate_warnings,
     get_settings,
 )
-from .spec import SpecReviewConfig
 
 __all__ = [
     "CardSessionConfig",
@@ -30,7 +29,6 @@ __all__ = [
     "SecuritySeverity",
     "Settings",
     "ShellAccessMode",
-    "SpecReviewConfig",
     "evaluate_security_posture",
     "get_settings",
     "_post_validate_warnings",

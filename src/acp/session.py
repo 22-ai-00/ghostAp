@@ -384,11 +384,19 @@ class ACPSession:
     This is an async class. For synchronous usage, see SyncACPSession.
     """
 
-    def __init__(self, agent_cmd: str, agent_args: list[str], cwd: str, env: Optional[dict[str, str]] = None):
+    def __init__(
+        self,
+        agent_cmd: str,
+        agent_args: list[str],
+        cwd: str,
+        env: Optional[dict[str, str]] = None,
+        auto_approve: bool | None = None,
+    ):
         self._agent_cmd = agent_cmd
         self._agent_args = agent_args
         self._cwd = cwd
         self._env_override = dict(env) if isinstance(env, dict) else None
+        self._auto_approve = auto_approve
         self._conn = None  # ClientSideConnection
         self._proc = None  # subprocess
         self._ctx_manager = None  # async context manager
@@ -634,9 +642,14 @@ class ACPSession:
             self._transport_epoch += 1
             self._load_epoch += 1
         settings = get_settings()
+        auto_approve = (
+            settings.acp_permission_auto_approve
+            if self._auto_approve is None
+            else self._auto_approve
+        )
         client = GhostAPClient(
             on_event=self._dispatch_event,
-            auto_approve=settings.acp_permission_auto_approve,
+            auto_approve=auto_approve,
             root_dir=self._cwd,
         )
         self._client = client

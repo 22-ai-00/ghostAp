@@ -12,7 +12,6 @@ import logging
 from src.utils.signing import (  # noqa: F401 — re-export for backward compatibility
     _compute_command_sig,
     _get_signing_key,
-    _verify_legacy_sha256_fallback,
     sign_command,
     verify_command_sig,
 )
@@ -26,7 +25,6 @@ __all__ = [
     "_build_p2p_multi_url",
     "_compute_command_sig",
     "_get_signing_key",
-    "_verify_legacy_sha256_fallback",
     "sign_command",
     "verify_command_sig",
     "format_elapsed_ago",

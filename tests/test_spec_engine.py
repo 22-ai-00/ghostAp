@@ -1052,10 +1052,6 @@ class TestSpecEngineCycleResilience:
             spec_review_timeout=60,
             spec_review_max_parallel=2,
             spec_review_failure_max_cooldown_cycles=12,
-            review_circuit_window_size=10,
-            review_circuit_success_rate_threshold=0.3,
-            review_circuit_lint_fallback_enabled=False,
-            review_circuit_lint_timeout=10,
         )
 
     def _make_mock_session(self, send_fn):

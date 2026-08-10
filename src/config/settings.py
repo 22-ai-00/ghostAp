@@ -20,7 +20,6 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .card import CardSessionConfig
-from .spec import SpecReviewConfig
 
 
 class Settings(BaseSettings):
@@ -118,13 +117,6 @@ class Settings(BaseSettings):
 
     # Engine eval prompt timeout (seconds) — used by Spec engine
     engine_eval_prompt_timeout: int = 60
-
-    # Engine auxiliary prompt timeout (seconds) — used by disposable ACP
-    # sub-sessions for non-critical tasks such as Spec criteria decomposition.
-    # Keep this aligned with SyncACPSession's default prompt timeout to avoid
-    # cold-start/model-selection latency causing noisy 60s timeout errors before
-    # the main Spec cycle even begins.
-    engine_aux_prompt_timeout: int = 600
 
     # ACP stdio stream buffer limit (bytes). Default asyncio limit is 64KB which
     # is too small for large agent responses (code generation, file contents).
@@ -226,7 +218,6 @@ class Settings(BaseSettings):
     spec_convergence_window: int = 2
     spec_min_cycles: int = 2
     spec_review_enabled: bool = True
-    spec_review_strategy: Literal["adaptive_roles", "multi_perspective", "none"] = "adaptive_roles"
     spec_review_timeout: int = 240
     spec_review_role_timeout_multipliers: dict[str, float] = {"architect": 1.5}
     spec_review_max_parallel: int = 3
@@ -250,61 +241,17 @@ class Settings(BaseSettings):
     spec_review_retry_max_delay: int = 30
     spec_review_retry_max_attempts: int = 2
     spec_review_retry_base_delay: float = 8.0
-    spec_review_retry_decay_factor: float = 1.5
 
     # 审查会话启动超时（秒），独立于全局 acp_startup_timeout
     spec_review_startup_timeout: int = 30
-
-    # 审查解析失败时的默认判定 ("fail" = 视为未通过, "pass" = 视为通过)
-    spec_review_parse_failure_default: Literal["pass", "fail"] = "fail"
 
     # ---- 完成度把控（Completion Control）----
     spec_objective_verify_enabled: bool = True
     spec_objective_verify_timeout: int = 300
     spec_completion_gate_enabled: bool = True
-    @property
-    def spec_review(self) -> "SpecReviewConfig":
-        """Structured view of spec review / retry / circuit-breaker settings."""
-        return SpecReviewConfig(
-            enabled=self.spec_review_enabled,
-            timeout=self.spec_review_timeout,
-            max_parallel=self.spec_review_max_parallel,
-            min_timeout=self.spec_review_min_timeout,
-            hard_floor=self.spec_review_hard_floor,
-            retry_max_delay=self.spec_review_retry_max_delay,
-            retry_max_attempts=self.spec_review_retry_max_attempts,
-            retry_base_delay=self.spec_review_retry_base_delay,
-            retry_decay_factor=self.spec_review_retry_decay_factor,
-            failure_circuit_enabled=self.spec_review_failure_circuit_enabled,
-            failure_max_consecutive=self.spec_review_failure_max_consecutive,
-            failure_cooldown_cycles=self.spec_review_failure_cooldown_cycles,
-            failure_max_cooldown_cycles=self.spec_review_failure_max_cooldown_cycles,
-            parse_failure_default=self.spec_review_parse_failure_default,
-            strategy=self.spec_review_strategy,
-            dynamic_roles_enabled=self.spec_review_dynamic_roles_enabled,
-            dynamic_roles_max=self.spec_review_dynamic_roles_max,
-            total_roles_max=self.spec_review_total_roles_max,
-            pass_streak_required=self.spec_review_pass_streak_required,
-        )
 
     # Card session / delivery / UI configuration (nested model)
     card: CardSessionConfig = CardSessionConfig()
-
-    # Review metrics exporter
-    # - "logger" (default): output via logging.info (original behaviour)
-    # - "jsonl": append JSON Lines to review_metrics_jsonl_path
-    review_metrics_exporter_type: str = "logger"
-    review_metrics_jsonl_path: str = "review_metrics.jsonl"
-
-    # Sliding window dynamic circuit breaker (used by Spec engine)
-    # - window_size: number of recent review outcomes to track (min 3)
-    # - success_rate_threshold: open circuit if success_rate < threshold
-    review_circuit_window_size: int = 10
-    review_circuit_success_rate_threshold: float = 0.3
-
-    # Review circuit-breaker lint fallback (run local lint when circuit is open)
-    review_circuit_lint_fallback_enabled: bool = True
-    review_circuit_lint_timeout: int = 10
 
     # Spec long-range persistence / monitoring
     # Empty = mirror project absolute paths under ~/.cache/ghostAp.
@@ -497,12 +444,6 @@ class Settings(BaseSettings):
 
     # SandboxExecutor 严格锁模式 — True 时检测到锁冲突 raise LockConflictError，False 仅 warning
     sandbox_strict_lock_mode: bool = False
-
-    # ------------------------------------------------------------------
-    # 签名回退兼容窗口 — 升级后旧按钮的 plain SHA-256 签名过渡期
-    # ------------------------------------------------------------------
-    sig_compat_deploy_date: str = ""  # ISO 格式部署日期，回退窗口起点；空值时以进程启动日期为起点
-    sig_compat_window_days: int = 7  # 回退兼容天数，超过后仅接受 HMAC 签名
 
     # ------------------------------------------------------------------
     # 管理员用户列表（用于群级锁权限判定）

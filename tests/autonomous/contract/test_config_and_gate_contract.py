@@ -106,17 +106,25 @@ def test_employee_thread_context_settings_reject_invalid_bounds(
         Settings(_env_file=None, **{field: value})
 
 
-def test_env_example_documents_employee_thread_context_settings() -> None:
-    env_example = Path(".env.example").read_text(encoding="utf-8")
-    for name in (
-        "AUTONOMOUS_THREAD_CONTEXT_MAX_MESSAGES",
-        "AUTONOMOUS_THREAD_CONTEXT_MAX_CHARS",
-        "AUTONOMOUS_GROUP_CONTEXT_MAX_MESSAGES",
-        "AUTONOMOUS_CONTEXT_MAX_TOKENS",
-        "AUTONOMOUS_THREAD_CONTEXT_PAGE_SIZE",
-        "AUTONOMOUS_GROUP_CONTEXT_PAGE_SIZE",
-        "AUTONOMOUS_CONTEXT_FETCH_TIMEOUT_SECONDS",
-        "AUTONOMOUS_FIRE_GRACE_SECONDS",
-        "AUTONOMOUS_CONTEXT_MAX_PAGES",
-    ):
-        assert f"{name}=" in env_example
+def test_env_example_hides_internal_context_tuning_but_keeps_safety_bounds() -> None:
+    active_keys = {
+        line.split("=", 1)[0]
+        for line in Path(".env.example").read_text(encoding="utf-8").splitlines()
+        if line and not line.startswith("#") and "=" in line
+    }
+    internal_fields = {
+        "autonomous_thread_context_max_messages",
+        "autonomous_thread_context_max_chars",
+        "autonomous_group_context_max_messages",
+        "autonomous_thread_context_page_size",
+        "autonomous_group_context_page_size",
+        "autonomous_context_fetch_timeout_seconds",
+        "autonomous_fire_grace_seconds",
+        "autonomous_context_max_pages",
+    }
+
+    assert {
+        name.upper() for name in internal_fields
+    }.isdisjoint(active_keys)
+    assert "AUTONOMOUS_CONTEXT_MAX_TOKENS" in active_keys
+    assert internal_fields <= Settings.model_fields.keys()

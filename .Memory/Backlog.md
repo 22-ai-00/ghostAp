@@ -25,3 +25,6 @@
 | B062 | 2026-08-09 | Workflow 进度测试仍保留实现前的 RED 注释和 `object.__setattr__` 绕过，分页交付合同标题也仍标记为 RED；生产模型现已正式暴露对应字段。需在独立测试治理批次改用正常模型构造并校准文案，避免掩盖未来 schema 回归。 | Low | “继续执行”续接点调查 | Open | — |
 
 > **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。强化多副本档的外部验收条件由 [employee runtime profiles ADR](../docs/adr-employee-runtime-profiles.md) 持续承载，不作为本地代码已证明能力。
+
+- 2026-08-10 [中/安全契约] `create_engine_session(require_tool_filter=True)` 当前只强制 ACP transport，不在工厂入口验证/安装具体 filter；现役 Workflow/Employee 调用方会随后安装 filter，但 API 容易被新调用方误用。后续应改为类型化 lane permission profile 或将 `tool_filter` 作为必填参数并在首个 prompt 前 fail-closed。
+- 2026-08-10 [中/可靠性] `SPEC_EXECUTION_TIMEOUT` 当前被复用为各阶段 prompt timeout 与卡片 TTL，不是真正的 Spec 总运行 deadline；应增加 monotonic 总 SLA，并从其推导 phase timeout，避免自动任务无限循环或名称误导。

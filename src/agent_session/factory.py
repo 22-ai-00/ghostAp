@@ -94,6 +94,7 @@ def _start_base_session(
     model_name: str | None,
     *,
     allow_cli: bool,
+    auto_approve: bool | None = None,
     employee_env: dict[str, str] | None = None,
     startup_timeout: float | None = None,
     startup_retries: int | None = None,
@@ -127,6 +128,7 @@ def _start_base_session(
             else startup_timeout
         ),
         model_name=model_name,
+        auto_approve=auto_approve,
         **kwargs,
     )
 
@@ -148,7 +150,7 @@ def create_engine_session(
     model_name: Optional[str] = None,
     *,
     thread_id: Optional[str] = None,
-    auto_approve: bool = False,
+    auto_approve: bool | None = None,
     require_tool_filter: bool = False,
     startup_timeout: Optional[float] = None,
     startup_retries: Optional[int] = None,
@@ -170,6 +172,7 @@ def create_engine_session(
         normalized_cwd,
         model,
         allow_cli=not require_tool_filter or employee_env is not None,
+        auto_approve=auto_approve,
         employee_env=employee_env,
         startup_timeout=startup_timeout,
         startup_retries=startup_retries,

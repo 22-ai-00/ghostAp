@@ -711,6 +711,7 @@ class TestCreateEngineSession:
             cwd="/tmp",
             startup_timeout=20,
             model_name=None,
+            auto_approve=None,  # No lane override: preserve the Settings fallback.
         )
 
 

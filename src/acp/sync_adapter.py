@@ -371,6 +371,7 @@ def start_session_with_retry(
     log_failures: bool = True,
     env: Optional[dict[str, str]] = None,
     retries: Optional[int] = None,
+    auto_approve: bool | None = None,
 ) -> SyncACPSession:
     """Start an ACP session with retry and progressive timeout.
 
@@ -394,10 +395,22 @@ def start_session_with_retry(
     if session_cls is None:
         session_cls = SyncACPSession
 
+    def construct_session(**kwargs: object) -> SyncACPSession:
+        try:
+            return session_cls(**kwargs, auto_approve=auto_approve)
+        except TypeError as exc:
+            if "auto_approve" not in str(exc):
+                raise
+            logger.debug(
+                "session_cls does not accept auto_approve, using legacy signature",
+                exc_info=True,
+            )
+            return session_cls(**kwargs)
+
     for attempt in range(1, retries + 1):
         try:
             if env is not None:
-                session = session_cls(
+                session = construct_session(
                     agent_type=agent_type,
                     cwd=cwd,
                     model_name=model_name,
@@ -424,12 +437,16 @@ def start_session_with_retry(
             # Backward-compatible construction: allow fakes/older signatures without model_name kw.
             if model_name:
                 try:
-                    session = session_cls(agent_type=agent_type, cwd=cwd, model_name=model_name)
+                    session = construct_session(
+                        agent_type=agent_type,
+                        cwd=cwd,
+                        model_name=model_name,
+                    )
                 except TypeError:
                     logger.debug("session_cls does not accept model_name, using minimal signature", exc_info=True)
-                    session = session_cls(agent_type=agent_type, cwd=cwd)
+                    session = construct_session(agent_type=agent_type, cwd=cwd)
             else:
-                session = session_cls(agent_type=agent_type, cwd=cwd)
+                session = construct_session(agent_type=agent_type, cwd=cwd)
             try:
                 setattr(session, "_log_failures", bool(log_failures))
             except (AttributeError, TypeError):
@@ -593,6 +610,7 @@ class SyncACPSession:
         agent_cmd: Optional[str] = None,
         model_name: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
+        auto_approve: bool | None = None,
     ):
         self._agent_type = agent_type
         self._cwd = cwd
@@ -605,6 +623,7 @@ class SyncACPSession:
             self._agent_args = agent_args or args
         self._model_name = (model_name or "").strip() or None
         self._explicit_env = dict(env) if env is not None else None
+        self._auto_approve = auto_approve
         self._log_failures = True
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -801,7 +820,11 @@ class SyncACPSession:
             env_override = None
 
         self._acp_session = ACPSession(
-            agent_cmd=self._agent_cmd, agent_args=self._agent_args, cwd=self._cwd, env=env_override
+            agent_cmd=self._agent_cmd,
+            agent_args=self._agent_args,
+            cwd=self._cwd,
+            env=env_override,
+            auto_approve=self._auto_approve,
         )
         session_id = await self._acp_session.start()
 

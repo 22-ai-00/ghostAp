@@ -5,7 +5,7 @@ payloads.  Extracted from ``card.builders.lock`` to keep cryptographic
 logic separate from UI card construction (Single Responsibility Principle).
 
 v2 adds nonce + expiry + chat_id binding to prevent replay attacks.
-The old HMAC-only format is supported within the compatibility window.
+The old keyed HMAC-only format remains supported for callers without chat context.
 """
 
 from __future__ import annotations
@@ -22,15 +22,9 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
-from datetime import date as _date
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-# Lazy-initialized on first use — avoids capturing a stale date at import time
-# when the module is loaded during early bootstrap (e.g. pre-fork workers).
-_PROCESS_START_DATE: Optional[_date] = None
 
 # Same-process nonce cache; durable state is maintained by _record_nonce().
 _USED_NONCES: OrderedDict[str, float] = OrderedDict()
@@ -38,22 +32,11 @@ _MAX_NONCES = 10000
 _NONCE_STORE_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
 
-def _get_process_start_date() -> _date:
-    """Return the process start date, initializing lazily on first call."""
-    global _PROCESS_START_DATE
-    if _PROCESS_START_DATE is None:
-        _PROCESS_START_DATE = _date.today()
-        logger.info("Signing compat window: _PROCESS_START_DATE initialized to %s", _PROCESS_START_DATE)
-    return _PROCESS_START_DATE
-
-
 class VerifyResult(enum.Enum):
     """Outcome of :func:`verify_command_sig`.
 
     * ``OK`` — signature valid (truthy).
     * ``MISMATCH`` — signature invalid, no special context (falsy).
-    * ``COMPAT_EXPIRED`` — the signature *would* have matched the legacy
-      SHA-256 scheme, but the compatibility window has closed (falsy).
     * ``EXPIRED`` — new-format signature has expired (falsy).
     * ``NONCE_REUSED`` — nonce was already consumed (replay attempt, falsy).
     * ``CHAT_MISMATCH`` — chat_id does not match the signed chat (falsy).
@@ -61,7 +44,6 @@ class VerifyResult(enum.Enum):
 
     OK = "ok"
     MISMATCH = "mismatch"
-    COMPAT_EXPIRED = "compat_expired"
     EXPIRED = "expired"
     NONCE_REUSED = "nonce_reused"
     CHAT_MISMATCH = "chat_mismatch"
@@ -100,7 +82,7 @@ def _compute_command_sig(command_text: str) -> str:
 
     .. deprecated::
         Use :func:`sign_command` for new code. This function is retained
-        for backward compatibility during the transition window.
+        for keyed legacy callers that genuinely lack chat context.
     """
     key = _get_signing_key()
     if not key:
@@ -343,12 +325,12 @@ def _verify_v2_sig(command_text: str, chat_id: str, sig_payload: str) -> VerifyR
 def verify_command_sig(command_text: str, sig: str, *, chat_id: str = "") -> VerifyResult:
     """Verify *sig* against the command text, with optional chat_id binding.
 
-    Supports both v2 (nonce+exp+chat_id) and v1 (HMAC-only) formats:
+    Supports v2 (nonce+exp+chat_id) and keyed v1 (HMAC-only) formats:
 
     1. If *sig* is in v2 format and *chat_id* is provided, verify as v2.
     2. If a callback supplies *chat_id*, reject every unbound legacy format.
-    3. Otherwise accept matching v1 HMAC-SHA256 during migration.
-    4. Fall back to legacy plain-SHA256 within its compatibility window.
+    3. Otherwise accept a matching keyed v1 HMAC-SHA256 signature.
+    4. Reject every unkeyed digest, including legacy plain SHA-256.
 
     Returns :attr:`VerifyResult.OK` when valid.  ``VerifyResult`` implements
     ``__bool__`` so that ``if verify_command_sig(...)`` continues to work
@@ -385,8 +367,7 @@ def verify_command_sig(command_text: str, sig: str, *, chat_id: str = "") -> Ver
     except ValueError:
         pass  # empty key — skip HMAC check
 
-    # --- Legacy plain SHA-256 fallback (time-limited) ---
-    return _verify_legacy_sha256_fallback(command_text, sig)
+    return VerifyResult.MISMATCH
 
 
 def _verify_v2_sig_without_chat_check(command_text: str, sig_payload: str) -> VerifyResult:
@@ -431,39 +412,3 @@ def _verify_v2_sig_without_chat_check(command_text: str, sig_payload: str) -> Ve
 
     return VerifyResult.OK
 
-
-def _verify_legacy_sha256_fallback(command_text: str, sig: str) -> VerifyResult:
-    """Check *sig* against plain SHA-256 if within the compatibility window.
-
-    The window is defined by ``sig_compat_deploy_date`` (ISO date string)
-    plus ``sig_compat_window_days``.  If the deploy date is empty, the
-    process start date (``_PROCESS_START_DATE``) is used as fallback so
-    that late deployers still get a valid compatibility window.
-
-    Returns ``VerifyResult.OK`` if within the window and sig matches,
-    ``VerifyResult.COMPAT_EXPIRED`` if sig matches legacy but window closed,
-    ``VerifyResult.MISMATCH`` otherwise (conservative).
-    """
-    # First check if the sig matches legacy SHA-256 at all.
-    plain_sig = hashlib.sha256(command_text.encode("utf-8")).hexdigest()
-    legacy_matches = hmac.compare_digest(sig, plain_sig)
-
-    # Then check the compat window.
-    try:
-        from datetime import date, timedelta
-
-        from src.config import get_settings
-        settings = get_settings()
-        deploy_str = settings.sig_compat_deploy_date.strip()
-        deploy = date.fromisoformat(deploy_str) if deploy_str else _get_process_start_date()
-        window = timedelta(days=settings.sig_compat_window_days)
-        window_open = date.today() <= deploy + window
-    except Exception:
-        # Unparseable date or unavailable settings → window closed (safe default)
-        window_open = False
-
-    if legacy_matches and window_open:
-        return VerifyResult.OK
-    if legacy_matches and not window_open:
-        return VerifyResult.COMPAT_EXPIRED
-    return VerifyResult.MISMATCH
