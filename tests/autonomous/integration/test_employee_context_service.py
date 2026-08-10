@@ -9,13 +9,16 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.autonomous.authorization import EmployeeAuthorizationScope
 from src.autonomous.context import (
     AuthorizedContextRequest,
     AuthorizedGroupMemoryReader,
+    ContextLayer,
     ContextPreparingExecutionPort,
     ContextUnavailableError,
     ContextUnavailableReason,
     EmployeeContextService,
+    MessagePage,
     ThreadContextConfig,
 )
 from src.autonomous.data.projection import JournalHead
@@ -31,6 +34,9 @@ from tests.autonomous.helpers import (
     FakeEmployeeMessageSource as _FakeSource,
 )
 from tests.autonomous.helpers import (
+    make_context_message as _message,
+)
+from tests.autonomous.helpers import (
     message_pages as _pages,
 )
 from tests.autonomous.helpers import (
@@ -38,8 +44,8 @@ from tests.autonomous.helpers import (
 )
 
 
-def _request() -> AuthorizedContextRequest:
-    return AuthorizedContextRequest(
+def _request(**changes) -> AuthorizedContextRequest:
+    values = dict(
         tenant_key="tenant_1",
         agent_id="agt_1",
         bot_principal_id="bot_1",
@@ -50,9 +56,13 @@ def _request() -> AuthorizedContextRequest:
         feishu_thread_id="omt_1",
         current_message_id="om_current",
         requester_principal_id="ou_1",
+        source_requester_principal_id="ou_user",
+        authorization_scope=EmployeeAuthorizationScope.MANAGED_GROUP,
         system_prompt_token_reserve=2,
         constraints_digest="a" * 64,
     )
+    values.update(changes)
+    return AuthorizedContextRequest(**values)
 
 
 def _state() -> ProjectionState:
@@ -255,6 +265,338 @@ def test_missing_l1_and_l2_are_legal_empty_layers() -> None:
     assert snapshot.l1_summary == ""
     assert snapshot.l2_summary == ""
     assert built.source_factory.close_calls == 1
+
+
+def test_owner_p2p_reads_only_thread_and_employee_l1() -> None:
+    state = _state()
+    state.employees["agt_1"] = replace(
+        state.employees["agt_1"],
+        owner_principal_id="ou_owner",
+        member_groups=(),
+    )
+    thread = _stable_thread()
+    pages = [
+        MessagePage(tuple(thread[:2]), True, "1"),
+        MessagePage(tuple(thread[2:]), False),
+    ]
+    source_factory = _SourceFactory()
+    source_factory.source = _FakeSource(
+        traversals=[list(pages), list(pages)],
+    )
+
+    class HostileLedger:
+        calls = 0
+
+        def assemble_partial(self, *_args, **_kwargs):
+            self.calls += 1
+            raise AssertionError("P2P must never read group ledger content")
+
+    ledger = HostileLedger()
+    built = _composition(
+        state=state,
+        backend=_GroupBackend("hostile group L2"),
+        source_factory=source_factory,
+        group_ledger=ledger,
+    )
+    request = _request(
+        requester_principal_id="ou_owner",
+        source_requester_principal_id="ou_user",
+        authorization_scope=EmployeeAuthorizationScope.OWNER_P2P,
+    )
+
+    snapshot = built.service.assemble(request)
+
+    assert [item.message_id for item in snapshot.thread_messages] == [
+        "om_root",
+        "om_before",
+        "om_current",
+    ]
+    assert snapshot.l1_summary == "L1"
+    assert snapshot.l2_summary == ""
+    assert snapshot.group_messages == ()
+    assert built.backend.calls == []
+    assert built.source_factory.source.chat_calls == 0
+    assert built.source_factory.source.reset_calls == 0
+    assert built.source_factory.source.thread_calls == 4
+    with pytest.raises(ContextUnavailableError) as raised:
+        built.service.assemble_canonical_partial(
+            request,
+            warning_reason=ContextUnavailableReason.ORDERING,
+        )
+    assert raised.value.reason is ContextUnavailableReason.ORDERING
+    assert ledger.calls == 0
+    scope, _principal = built.source_factory.calls[0]
+    assert scope.authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+
+
+def test_budget_preserves_full_topic_and_l1_before_recent_group() -> None:
+    thread = _stable_thread()
+    thread_pages = [
+        MessagePage(tuple(thread[:2]), True, "1"),
+        MessagePage(tuple(thread[2:]), False),
+    ]
+    group = _message("om_group", "G" * 10, create=1_500, position=10)
+
+    class Source(_FakeSource):
+        def list_chat_messages(self, *, page_token="", page_size=20):
+            del page_token, page_size
+            self.chat_calls += 1
+            return MessagePage((group,), False)
+
+    source = Source(traversals=[list(thread_pages), list(thread_pages)])
+    source_factory = _SourceFactory()
+    source_factory.source = source
+    built = _composition(
+        memory=_MemoryFacade("M" * 10),
+        backend=_GroupBackend("T" * 10),
+        source_factory=source_factory,
+        config=ThreadContextConfig(
+            max_context_chars=27,
+            max_context_tokens=100,
+            tokens_per_char=1.0,
+        ),
+    )
+
+    snapshot = built.service.assemble(_request())
+
+    assert [item.message_id for item in snapshot.thread_messages] == [
+        "om_root",
+        "om_before",
+        "om_current",
+    ]
+    assert snapshot.l1_summary == "M" * 10
+    assert snapshot.group_messages == ()
+    assert snapshot.l2_summary == ""
+    assert tuple(item.layer for item in snapshot.trimming_trace) == (
+        ContextLayer.L2_GROUP,
+        ContextLayer.GROUP_RECENT,
+    )
+    assert source.thread_calls == 4
+    assert source.chat_calls == 2
+    assert source.reset_calls == 2
+
+
+def test_topic_that_alone_exceeds_budget_fails_instead_of_partial_trim() -> None:
+    built = _composition(
+        memory=_MemoryFacade(""),
+        backend=_GroupBackend(""),
+        config=ThreadContextConfig(
+            max_context_chars=16,
+            max_context_tokens=100,
+            tokens_per_char=1.0,
+        ),
+    )
+    request = _request(
+        requester_principal_id="ou_owner",
+        authorization_scope=EmployeeAuthorizationScope.OWNER_P2P,
+    )
+
+    with pytest.raises(ContextUnavailableError) as raised:
+        built.service.assemble(request)
+
+    assert raised.value.reason is ContextUnavailableReason.BUDGET
+
+
+def test_group_partial_binds_current_sender_to_source_principal() -> None:
+    from src.autonomous.context.group_ledger import (
+        GroupContextLedger,
+        GroupEventPayload,
+    )
+
+    record = SimpleNamespace(
+        message_id="om_current",
+        chat_id="oc_1",
+        thread_id="omt_1",
+        payload_ref=object(),
+    )
+    payload = GroupEventPayload(
+        sender_id="ou_user",
+        sender_id_type="open_id",
+        sender_type="user",
+        sender_tenant_key="tenant_1",
+        text="current",
+        timestamp=1.0,
+    )
+    ledger = object.__new__(GroupContextLedger)
+    ledger._config = ThreadContextConfig()  # noqa: SLF001
+    ledger._blobs = SimpleNamespace(read=lambda _ref: payload.to_bytes())  # noqa: SLF001
+    ledger.window = lambda **_kwargs: SimpleNamespace(records=(record,))  # type: ignore[method-assign]
+    request = _request(
+        requester_principal_id="ou_canonical_owner",
+        source_requester_principal_id="ou_user",
+    )
+
+    snapshot = ledger.assemble_partial(
+        request,
+        warning_reason=ContextUnavailableReason.ORDERING,
+    )
+
+    assert snapshot.thread_messages[0].sender_id == "ou_user"
+
+
+def test_group_partial_budget_discards_l2_then_group_before_l1() -> None:
+    from src.autonomous.context.group_ledger import (
+        GroupContextLedger,
+        GroupEventPayload,
+    )
+
+    topic_ref = object()
+    group_ref = object()
+    current_ref = object()
+    records = (
+        SimpleNamespace(
+            message_id="om_before",
+            chat_id="oc_1",
+            thread_id="omt_1",
+            payload_ref=topic_ref,
+        ),
+        SimpleNamespace(
+            message_id="om_group",
+            chat_id="oc_1",
+            thread_id="",
+            payload_ref=group_ref,
+        ),
+        SimpleNamespace(
+            message_id="om_current",
+            chat_id="oc_1",
+            thread_id="omt_1",
+            payload_ref=current_ref,
+        ),
+    )
+    payloads = {
+        topic_ref: GroupEventPayload(
+            sender_id="ou_topic",
+            sender_id_type="open_id",
+            sender_type="user",
+            sender_tenant_key="tenant_1",
+            text="topic",
+            timestamp=0.5,
+        ).to_bytes(),
+        group_ref: GroupEventPayload(
+            sender_id="ou_group",
+            sender_id_type="open_id",
+            sender_type="user",
+            sender_tenant_key="tenant_1",
+            text="G" * 10,
+            timestamp=1.0,
+        ).to_bytes(),
+        current_ref: GroupEventPayload(
+            sender_id="ou_user",
+            sender_id_type="open_id",
+            sender_type="user",
+            sender_tenant_key="tenant_1",
+            text="current",
+            timestamp=2.0,
+        ).to_bytes(),
+    }
+    ledger = object.__new__(GroupContextLedger)
+    ledger._config = ThreadContextConfig(  # noqa: SLF001
+        max_context_chars=22,
+        max_context_tokens=100,
+        tokens_per_char=1.0,
+    )
+    ledger._blobs = SimpleNamespace(read=payloads.__getitem__)  # noqa: SLF001
+    ledger.window = lambda **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        records=records
+    )
+
+    snapshot = ledger.assemble_partial(
+        _request(),
+        warning_reason=ContextUnavailableReason.ORDERING,
+        l1_summary="M" * 10,
+        l2_summary="L" * 10,
+    )
+
+    assert [item.message_id for item in snapshot.thread_messages] == [
+        "om_before",
+        "om_current",
+    ]
+    assert snapshot.group_messages == ()
+    assert snapshot.l1_summary == "M" * 10
+    assert snapshot.l2_summary == ""
+    assert tuple(item.layer for item in snapshot.trimming_trace) == (
+        ContextLayer.L2_GROUP,
+        ContextLayer.GROUP_RECENT,
+    )
+
+
+def test_group_partial_preserves_topic_beyond_group_window_limit() -> None:
+    from src.autonomous.context.group_ledger import (
+        GroupContextLedger,
+        GroupEventPayload,
+    )
+
+    ledger = object.__new__(GroupContextLedger)
+    ledger._config = ThreadContextConfig(  # noqa: SLF001
+        max_group_messages=2,
+        max_context_chars=10_000,
+        max_context_tokens=10_000,
+    )
+    ledger._lock = threading.RLock()  # noqa: SLF001
+    payloads: dict[object, bytes] = {}
+    records = []
+
+    def add_record(
+        message_id: str,
+        *,
+        sequence: int,
+        thread_id: str,
+        sender_id: str = "ou_other",
+    ) -> None:
+        payload_ref = object()
+        payloads[payload_ref] = GroupEventPayload(
+            sender_id=sender_id,
+            sender_id_type="open_id",
+            sender_type="user",
+            sender_tenant_key="tenant_1",
+            text=message_id,
+            timestamp=float(sequence),
+        ).to_bytes()
+        records.append(
+            SimpleNamespace(
+                tenant_key="tenant_1",
+                chat_id="oc_1",
+                message_id=message_id,
+                thread_id=thread_id,
+                journal_sequence=sequence,
+                dedup_key=f"dedup-{sequence}",
+                causal_event_id="",
+                payload_ref=payload_ref,
+            )
+        )
+
+    add_record("om_group_1", sequence=1, thread_id="")
+    add_record("om_root", sequence=2, thread_id="omt_1")
+    add_record("om_topic_1", sequence=3, thread_id="omt_1")
+    add_record("om_group_2", sequence=4, thread_id="")
+    add_record("om_topic_2", sequence=5, thread_id="omt_1")
+    add_record("om_group_3", sequence=6, thread_id="")
+    add_record(
+        "om_current",
+        sequence=7,
+        thread_id="omt_1",
+        sender_id="ou_user",
+    )
+    ledger._records = {record.dedup_key: record for record in records}  # noqa: SLF001
+    ledger._blobs = SimpleNamespace(read=payloads.__getitem__)  # noqa: SLF001
+
+    snapshot = ledger.assemble_partial(
+        _request(),
+        warning_reason=ContextUnavailableReason.ORDERING,
+    )
+
+    assert [item.message_id for item in snapshot.thread_messages] == [
+        "om_root",
+        "om_topic_1",
+        "om_topic_2",
+        "om_current",
+    ]
+    assert [item.message_id for item in snapshot.group_messages] == [
+        "om_group_2",
+        "om_group_3",
+    ]
+    assert snapshot.watermark is not None
+    assert snapshot.watermark.message_count == 4
 
 
 def test_context_close_rejects_new_work_and_drains_admitted_assembly() -> None:

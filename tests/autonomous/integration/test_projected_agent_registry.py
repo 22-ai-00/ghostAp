@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.autonomous.authorization import EmployeeAuthorizationScope
 from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.workforce.registry import (
     ProjectedAgentRegistry,
@@ -127,6 +128,8 @@ def test_context_binding_requires_active_visible_membership_and_exact_principal(
         "bot_principal_id": "bot_1",
         "app_id": "cli_1",
         "chat_id": "oc_team",
+        "requester_principal_id": "ou_requester",
+        "authorization_scope": EmployeeAuthorizationScope.MANAGED_GROUP,
     }
 
     assert registry.context_binding(**arguments) is None
@@ -183,4 +186,44 @@ def test_context_binding_rejects_destroyed_credential(tmp_path) -> None:
             bot_principal_id="bot_1",
             app_id="cli_1",
             chat_id="oc_team",
+            requester_principal_id="ou_requester",
+            authorization_scope=EmployeeAuthorizationScope.MANAGED_GROUP,
         )
+
+
+def test_owner_p2p_binding_requires_projected_owner_not_group_membership(
+    tmp_path,
+) -> None:
+    writer, state = seed_workforce_state(tmp_path)
+    commit_events(
+        writer,
+        state,
+        JournalEvent(
+            event_type="employee.state_changed",
+            aggregate_id="agt_1",
+            payload={"state": "active"},
+        ),
+    )
+    registry = ProjectedAgentRegistry(state)
+
+    binding = registry.context_binding(
+        tenant_key="tenant_1",
+        agent_id="agt_1",
+        bot_principal_id="bot_1",
+        app_id="cli_1",
+        chat_id="oc_owner_p2p",
+        requester_principal_id="ou_admin",
+        authorization_scope=EmployeeAuthorizationScope.OWNER_P2P,
+    )
+
+    assert binding is not None
+    assert binding.authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+    assert registry.context_binding(
+        tenant_key="tenant_1",
+        agent_id="agt_1",
+        bot_principal_id="bot_1",
+        app_id="cli_1",
+        chat_id="oc_owner_p2p",
+        requester_principal_id="ou_not_owner",
+        authorization_scope=EmployeeAuthorizationScope.OWNER_P2P,
+    ) is None

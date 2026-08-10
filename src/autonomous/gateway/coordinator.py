@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+from ..authorization import EmployeeAuthorizationScope
 from ..context.models import ContextUnavailableError, ContextUnavailableReason
 from ..data.models import (
     DataKind,
@@ -345,6 +346,8 @@ class EmployeeDispatchCoordinator:
             bot_principal_id=grant.record.bot_principal_id,
             app_id=grant.record.app_id,
             chat_id=grant.request.chat_id,
+            requester_principal_id=grant.request.requester_principal_id,
+            authorization_scope=grant.request.authorization_scope,
         )
         if employee is None or agent is None or projected_binding is None:
             raise EmployeeDispatchError("employee authority is unavailable")
@@ -415,6 +418,10 @@ class EmployeeDispatchCoordinator:
                     bot_principal_id=grant.record.bot_principal_id,
                     app_id=grant.record.app_id,
                     chat_id=grant.request.chat_id,
+                    requester_principal_id=(
+                        grant.request.requester_principal_id
+                    ),
+                    authorization_scope=grant.request.authorization_scope,
                 )
                 if (
                     current != employee
@@ -434,6 +441,8 @@ class EmployeeDispatchCoordinator:
                     or ingress_metadata.tenant_key != grant.record.tenant_key
                     or ingress_metadata.agent_id != grant.record.agent_id
                     or ingress_metadata.message_id != grant.record.message_id
+                    or ingress_metadata.sender_principal_id
+                    != grant.request.source_requester_principal_id
                 ):
                     raise EmployeeDispatchError("employee ingress identity changed")
                 current_router = self._router.state.by_acceptance_id.get(grant.record.acceptance_id)
@@ -1140,6 +1149,11 @@ class EmployeeDispatchCoordinator:
             ),
         )
         for kind, source_id, content, content_type, scope in documents:
+            if (
+                binding.authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+                and kind is DataKind.MEMORY_SUMMARY
+            ):
+                continue
             sink.publish_document(
                 PublishEmployeeDocumentCommand(
                     **common,
@@ -1214,6 +1228,7 @@ class EmployeeDispatchCoordinator:
         assert authority is not None
         return DispatchBinding(
             schema_version=1,
+            authorization_scope=grant.request.authorization_scope,
             permit_id="prm_" + _stable_hash("permit", acceptance),
             attempt_id="att_" + _stable_hash("attempt", acceptance),
             acceptance_id=acceptance,
@@ -1230,6 +1245,9 @@ class EmployeeDispatchCoordinator:
             ingress_connection_id=authority.connection_id,
             authority_connection_id=authority_connection,
             requester_principal_id=grant.request.requester_principal_id,
+            source_requester_principal_id=(
+                grant.request.source_requester_principal_id
+            ),
             task_id="task_" + digest,
             run_id="run_" + digest,
             message_id=grant.request.current_message_id,
@@ -1314,8 +1332,20 @@ class EmployeeDispatchCoordinator:
             employee is None
             or employee.state is not EmployeeState.ACTIVE
             or employee.worker_type is not WorkerType.VISIBLE
-            or grant.request.chat_id not in employee.member_groups
+            or (
+                grant.request.authorization_scope
+                is EmployeeAuthorizationScope.MANAGED_GROUP
+                and grant.request.chat_id not in employee.member_groups
+            )
+            or (
+                grant.request.authorization_scope
+                is EmployeeAuthorizationScope.OWNER_P2P
+                and grant.request.requester_principal_id
+                != employee.owner_principal_id
+            )
             or authority is None
+            or authority.authorization_scope
+            is not grant.request.authorization_scope
             or employee.aggregate_version != authority.employee_version
             or (employee.tool, employee.model, employee.effort) != (authority.tool, authority.model, authority.effort)
         ):
@@ -1325,7 +1355,9 @@ class EmployeeDispatchCoordinator:
     def _validate_channel(status, grant) -> str:
         authority = grant.record.authority
         ready = getattr(status, "ready_metadata", None)
+        identity = getattr(status, "identity", None)
         connection = ready.get("connection_id") if isinstance(ready, Mapping) else None
+        identity_app = identity.get("app_id") if isinstance(identity, Mapping) else None
         if (
             authority is None
             or status is None
@@ -1335,8 +1367,8 @@ class EmployeeDispatchCoordinator:
             or status.tenant_key != authority.tenant_key
             or status.bot_principal_id != authority.bot_principal_id
             or status.generation != authority.channel_generation
-            or not isinstance(connection, str)
-            or not connection
+            or connection != authority.connection_id
+            or identity_app != authority.app_id
         ):
             raise EmployeeDispatchError("employee channel authority is stale")
         return connection

@@ -15,6 +15,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.autonomous.authorization import EmployeeAuthorizationScope
+
 
 def test_replay_dispatches_one_real_team_session(tmp_path, monkeypatch, caplog) -> None:
     from src.autonomous.gateway.team import DispatchPermitAuthorityError
@@ -85,6 +87,94 @@ def test_replay_dispatches_one_real_team_session(tmp_path, monkeypatch, caplog) 
     harness.close()
 
 
+def test_owner_p2p_dispatches_once_and_replay_preserves_scope(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    harness = _real_coordinator_harness(tmp_path, owner_p2p=True)
+    calls = []
+    monkeypatch.setattr(
+        harness.engine,
+        "_run_acp_session",
+        lambda *_args, **_kwargs: calls.append("executed") or "private result",
+    )
+
+    prepared = harness.coordinator.prepare_next()
+    assert prepared is not None
+    assert prepared.binding.authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+    assert prepared.binding.requester_principal_id == "ou_owner"
+    assert prepared.binding.source_requester_principal_id == "ou_employee_app_owner"
+
+    finalized = harness.coordinator.execute_prepared(prepared)
+    restarted = harness.restart()
+    restarted._synchronize_gateway_from_journal()  # noqa: SLF001
+
+    assert finalized.status.value == "completed"
+    assert calls == ["executed"]
+    assert restarted.state.attempts[
+        prepared.binding.attempt_id
+    ].binding.authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+    assert restarted.prepare_next() is None
+    harness.close()
+
+
+def test_owner_p2p_owner_drift_is_rejected_inside_dispatch_guard(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from contextlib import contextmanager
+
+    from src.autonomous.gateway.coordinator import EmployeeDispatchError
+
+    harness = _real_coordinator_harness(tmp_path, owner_p2p=True)
+    original_guard = harness.team_runtime.employee_activation_guard
+
+    @contextmanager
+    def drifting_guard(*, chat_id):
+        with original_guard(chat_id=chat_id) as binding:
+            harness.workforce.employees["agt_alpha"] = replace(
+                harness.workforce.employees["agt_alpha"],
+                owner_principal_id="ou_rotated_owner",
+            )
+            yield binding
+
+    monkeypatch.setattr(
+        harness.team_runtime,
+        "employee_activation_guard",
+        drifting_guard,
+    )
+
+    with pytest.raises(EmployeeDispatchError, match="authority changed"):
+        harness.coordinator.prepare_next()
+
+    assert harness.coordinator.state.attempts == {}
+    harness.close()
+
+
+@pytest.mark.parametrize("drift", ["connection", "identity_app"])
+def test_gateway_rejects_channel_drift_after_router_authorization(
+    tmp_path,
+    monkeypatch,
+    drift,
+) -> None:
+    from src.autonomous.gateway.coordinator import EmployeeDispatchError
+
+    harness = _real_coordinator_harness(tmp_path, owner_p2p=True)
+    current = harness.channels.status("agt_alpha")
+    changed = (
+        replace(current, ready_metadata={"connection_id": "conn_rotated"})
+        if drift == "connection"
+        else replace(current, identity={"app_id": "cli_rotated"})
+    )
+    monkeypatch.setattr(harness.channels, "status", lambda _agent_id: changed)
+
+    try:
+        with pytest.raises(EmployeeDispatchError, match="channel"):
+            harness.coordinator.prepare_next()
+    finally:
+        harness.close()
+
+
 def test_completed_gateway_publishes_scoped_memory_summary(tmp_path, monkeypatch) -> None:
     from src.autonomous.data.models import DataKind
 
@@ -132,6 +222,35 @@ def test_completed_gateway_publishes_scoped_memory_summary(tmp_path, monkeypatch
     harness.close()
 
 
+def test_owner_p2p_completion_never_publishes_group_memory_summary(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from src.autonomous.data.models import DataKind
+
+    harness = _real_coordinator_harness(tmp_path, owner_p2p=True)
+    sink = MagicMock()
+    harness.coordinator._data_sink = sink
+    monkeypatch.setattr(
+        harness.engine,
+        "_run_acp_session",
+        lambda *_args, **_kwargs: "private result",
+    )
+
+    prepared = harness.coordinator.prepare_next()
+    assert prepared is not None
+    harness.coordinator.execute_prepared(prepared)
+
+    commands = [call.args[0] for call in sink.publish_document.call_args_list]
+    assert {command.kind for command in commands} == {
+        DataKind.L1_MEMORY,
+        DataKind.SKILL_PROFILE,
+        DataKind.REASONING,
+    }
+    assert all(command.chat_id == "" for command in commands)
+    harness.close()
+
+
 def test_completed_gateway_fails_closed_without_canonical_document_sink(tmp_path) -> None:
     from src.autonomous.gateway.coordinator import EmployeeDispatchError
     from src.autonomous.gateway.models import (
@@ -162,6 +281,7 @@ def _binding():
 
     return DispatchBinding(
         schema_version=1,
+        authorization_scope=EmployeeAuthorizationScope.MANAGED_GROUP,
         permit_id="prm_" + "0" * 64,
         attempt_id="att_" + "1" * 64,
         acceptance_id="acc_" + "2" * 64,
@@ -178,6 +298,7 @@ def _binding():
         ingress_connection_id="conn_ingress",
         authority_connection_id="conn_current",
         requester_principal_id="ou_requester",
+        source_requester_principal_id="ou_requester",
         task_id="task_" + "6" * 64,
         run_id="run_" + "7" * 64,
         message_id="om_current",
@@ -281,6 +402,30 @@ def test_gateway_replay_normalizes_exact_legacy_slock_binding(tmp_path) -> None:
     assert binding.team_root_identity == "9" * 64
 
 
+def test_gateway_replay_defaults_pre_scope_binding_to_managed_group(
+    tmp_path,
+) -> None:
+    from src.autonomous.gateway.models import DispatchBinding
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+
+    payload = _binding().to_dict()
+    payload.pop("authorization_scope")
+    payload.pop("source_requester_principal_id")
+    with pytest.raises(ValueError, match="exact schema"):
+        DispatchBinding.from_dict(payload)
+
+    state = GatewayProjectionState()
+    for frame in _replay_gateway_binding_frame(tmp_path, payload):
+        reduce_gateway_frame(state, frame)
+
+    binding = state.attempts[_binding().attempt_id].binding
+    assert binding.authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
+    assert binding.source_requester_principal_id == binding.requester_principal_id
+
+
 @pytest.mark.parametrize("invalid_shape", ["mixed", "missing", "extra"])
 def test_gateway_replay_rejects_non_exact_legacy_binding(
     tmp_path,
@@ -344,6 +489,7 @@ def _real_coordinator_harness(
     team_deadline_at: str = "",
     team_content_overrides: dict[str, object] | None = None,
     expected_route_rejection: str = "",
+    owner_p2p: bool = False,
 ):
     import threading as local_threading
     from contextlib import contextmanager
@@ -467,6 +613,11 @@ def _real_coordinator_harness(
             return False
 
     router_channels = _RouterChannels()
+    chat_id = "oc_owner_p2p" if owner_p2p else "oc_team"
+    canonical_requester = "ou_owner" if owner_p2p else "ou_requester"
+    source_requester = (
+        "ou_employee_app_owner" if owner_p2p else "ou_requester"
+    )
     router_kwargs = dict(
         writer=writer,
         ingress_service=ingress,
@@ -476,11 +627,22 @@ def _real_coordinator_harness(
         ),
         channel_status_provider=router_channels,
         requester_acl=RuntimeRequesterChatAcl(
-            allowed_requesters=("ou_requester",),
+            allowed_requesters=(canonical_requester,),
             allowed_chats=("oc_team",),
         ),
         queue_limits=RouterQueueLimits(4, 8, 16),
         membership_health=_Membership(),
+        requester_principal_resolver=(
+            lambda **values: (
+                "ou_owner"
+                if owner_p2p
+                and values["sender_union_id"] == "on_owner"
+                and values["owner_principal_id"] == "ou_owner"
+                else (
+                    values["sender_principal_id"] if not owner_p2p else None
+                )
+            )
+        ),
         constraints_digest="c" * 64,
         system_prompt_token_reserve=128,
     )
@@ -488,9 +650,10 @@ def _real_coordinator_harness(
     content = {
         "type": "message",
         "message_type": "text",
-        "chat_type": "group",
+        "chat_type": "p2p" if owner_p2p else "group",
         "content": {"text": "run the employee task"},
-        "sender_id": "ou_requester",
+        "sender_id": source_requester,
+        "sender_union_id": "on_owner" if owner_p2p else "",
         "sender_id_type": "open_id",
         "sender_type": "user",
         "sender_tenant_key": "tenant_1",
@@ -543,9 +706,9 @@ def _real_coordinator_harness(
         action_identity=(
             "team:teamrun_inactive:analysis" if team_assignment else ""
         ),
-        chat_id="oc_team",
+        chat_id=chat_id,
         thread_root_message_id="om_root",
-        sender_principal_id="ou_requester",
+        sender_principal_id=source_requester,
         received_at="2026-07-14T00:00:00Z",
         semantic_digest=payload.payload_sha256,
         payload_sha256=payload.payload_sha256,
@@ -564,7 +727,13 @@ def _real_coordinator_harness(
         agent_id="agt_alpha",
         bot_principal_id="bot_alpha",
         app_id="cli_alpha",
-        chat_id="oc_team",
+        chat_id=chat_id,
+        authorization_scope=(
+            EmployeeAuthorizationScope.OWNER_P2P
+            if owner_p2p
+            else EmployeeAuthorizationScope.MANAGED_GROUP
+        ),
+        requester_principal_id=canonical_requester,
     )
     assert binding_probe is not None
     resolution, resolution_reason = router._resolve_authority(metadata, payload)  # noqa: SLF001
@@ -637,7 +806,7 @@ def _real_coordinator_harness(
         def assemble(self, request):
             message = ContextMessage(
                 message_id=request.current_message_id,
-                sender_id=request.requester_principal_id,
+                sender_id=request.source_requester_principal_id,
                 sender_type="user",
                 text="run the employee task",
                 timestamp=1.0,
@@ -1029,8 +1198,14 @@ def test_context_prompt_uses_only_budgeted_layers_in_strict_order() -> None:
 
     rendered = render_employee_context(snapshot)
     payload = json.loads(rendered.prompt.removeprefix("## UNTRUSTED_CONTEXT_JSON\n"))
-    assert list(payload) == ["thread", "recent_group", "l1_memory", "l2_group_memory"]
+    assert list(payload) == [
+        "thread",
+        "l1_memory",
+        "recent_group",
+        "l2_group_memory",
+    ]
     assert payload["thread"][0]["text"] == "thread body"
+    assert payload["l1_memory"] == "l1 body"
     assert payload["recent_group"][0]["text"] == "group body"
     assert rendered.render_contract_digest == RENDER_CONTRACT_DIGEST
     assert rendered.context_snapshot_hash == snapshot.snapshot_hash

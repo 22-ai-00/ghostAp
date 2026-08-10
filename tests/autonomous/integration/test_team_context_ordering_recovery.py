@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.autonomous.authorization import EmployeeAuthorizationScope
 from src.autonomous.context import (
     ContextMessage,
     ContextUnavailableError,
@@ -44,6 +45,8 @@ class _PositionCollisionLarkSource:
         chat_id="oc_team",
         thread_root_message_id="om_root",
         current_message_id="om_current",
+        source_requester_principal_id="ou_requester",
+        authorization_scope=EmployeeAuthorizationScope.MANAGED_GROUP,
         feishu_thread_id="omt_team",
     )
 

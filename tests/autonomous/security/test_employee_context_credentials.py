@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 import src.autonomous.context.lark_source as lark_source
+from src.autonomous.authorization import EmployeeAuthorizationScope
 from src.autonomous.context import (
     ContextUnavailableError,
     ContextUnavailableReason,
@@ -35,6 +36,8 @@ def _scope(n: int = 1, **overrides: str) -> EmployeeMessageScope:
         "chat_id": f"oc_{n}",
         "thread_root_message_id": f"om_root_{n}",
         "current_message_id": f"om_current_{n}",
+        "source_requester_principal_id": "ou_requester",
+        "authorization_scope": EmployeeAuthorizationScope.MANAGED_GROUP,
     }
     values.update(overrides)
     return EmployeeMessageScope(**values)

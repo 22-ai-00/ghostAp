@@ -275,8 +275,30 @@ class HireProjection:
         agent_intents: dict[str, str] = {}
         bot_intents: dict[str, str] = {}
         existing_app_intents: dict[str, str] = {}
+        phase_only_recovery_generations: dict[str, int] = {}
         for frame in frames:
             phase_only_recovery_intents: set[str] = set()
+            phase_only_recovery_frame = any(
+                event.event_type == "hire.channel.phase_only_recovery"
+                for event in frame.events
+            )
+            if phase_only_recovery_frame:
+                if len(frame.events) % 2:
+                    raise HireProjectionError(
+                        "invalid phase-only channel recovery frame"
+                    )
+                for marker_index in range(0, len(frame.events), 2):
+                    marker = frame.events[marker_index]
+                    companion = frame.events[marker_index + 1]
+                    if (
+                        marker.event_type != "hire.channel.phase_only_recovery"
+                        or companion.event_type != "employee.state_changed"
+                        or companion.payload
+                        != {"state": HirePhase.VALIDATING.value}
+                    ):
+                        raise HireProjectionError(
+                            "invalid phase-only channel recovery frame"
+                        )
             for event_index, event in enumerate(frame.events):
                 created = _created_state(event, frame.sequence)
                 if created is not None:
@@ -311,8 +333,9 @@ class HireProjection:
                 if event.event_type == "hire.channel.phase_only_recovery":
                     generation = event.payload.get("generation")
                     companion = (
-                        frame.events[1]
-                        if event_index == 0 and len(frame.events) == 2
+                        frame.events[event_index + 1]
+                        if phase_only_recovery_frame
+                        and event_index % 2 == 0
                         else None
                     )
                     if (
@@ -333,6 +356,7 @@ class HireProjection:
                             "invalid phase-only channel recovery marker"
                         )
                     phase_only_recovery_intents.add(intent_id)
+                    phase_only_recovery_generations[intent_id] = generation
                     continue
                 if event.event_type == "hire.requester_identity_bound":
                     if set(event.payload) != {"requester_union_id"}:
@@ -613,11 +637,22 @@ class HireProjection:
                         "activated_at",
                     }
                     activated_at = event.payload.get("activated_at")
+                    recovery_generation = phase_only_recovery_generations.get(
+                        intent_id
+                    )
+                    recovery_reactivation = (
+                        current.verification_consumed
+                        and recovery_generation is not None
+                        and current.channel_generation > recovery_generation
+                    )
                     if (
                         set(event.payload) != expected_keys
                         or event.aggregate_id != current.intent_id
                         or current.phase is not HirePhase.READY_PENDING_VERIFICATION
-                        or current.verification_consumed
+                        or (
+                            current.verification_consumed
+                            and not recovery_reactivation
+                        )
                         or event.payload["tenant_key"] != current.tenant_key
                         or event.payload["app_id"] != current.app_id
                         or event.payload["agent_id"] != current.agent_id
@@ -644,6 +679,7 @@ class HireProjection:
                         activation_verified_at=float(activated_at),
                         last_sequence=frame.sequence,
                     )
+                    phase_only_recovery_generations.pop(intent_id, None)
                     continue
                 next_effect = _EFFECT_EVENTS.get(event.event_type)
                 if next_effect is None:

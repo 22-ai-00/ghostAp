@@ -24,10 +24,15 @@ from ...trust.models import ActorKind, EffectiveTrust, TrustZone
 from ...trust.registry import ManagedGroupRegistry
 from ...trust.resolver import TrustZoneResolver
 from ..acceptance.main_bot_audit import MainBotSendAuditLog
+from ..authorization import EmployeeAuthorizationScope
 from ..context.group_ledger import GroupContextLedger, GroupEventPayload
 from ..context.group_memory import EmployeeGroupMemoryStore
 from ..context.lark_source import LarkEmployeeMessageSourceFactory
-from ..context.models import ContextUnavailableError, ThreadContextConfig
+from ..context.models import (
+    AuthorizedContextRequest,
+    ContextUnavailableError,
+    ThreadContextConfig,
+)
 from ..context.runtime import (
     RuntimeEmployeeGenerationAuthority,
     parse_requester_acl,
@@ -484,6 +489,14 @@ class RuntimeReadiness:
     blockers: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class EmployeeRecoverySummary:
+    eligible: int = 0
+    recovered: int = 0
+    skipped: int = 0
+    failed: int = 0
+
+
 class EmployeeDepartmentRuntime:
     """Own Journal, Vault, Saga, Channel children and the activity loop."""
 
@@ -536,6 +549,9 @@ class EmployeeDepartmentRuntime:
         self._futures: set[concurrent.futures.Future[Any]] = set()
         self._intent_futures: dict[str, concurrent.futures.Future[Any]] = {}
         self._future_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._recovery_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._recovery_future: concurrent.futures.Future[EmployeeRecoverySummary] | None = None
+        self._recovery_attempts = 0
         self._closing = False
         self._notification_status: Callable[[DurableHireState, str], object] | None = None
         self._owned_main_bot_send_audit: MainBotSendAuditLog | None = None
@@ -965,12 +981,60 @@ class EmployeeDepartmentRuntime:
         except Exception:
             return RuntimeReadiness(False, ("employee_context",))
 
-    def recover(self) -> None:
+    def recover(self) -> EmployeeRecoverySummary:
+        """Run startup recovery once and wait for its actual terminal result."""
+
+        with self._recovery_lock:
+            future = self._recovery_future
+            leader = future is None
+            if future is None:
+                future = concurrent.futures.Future()
+                self._recovery_future = future
+                self._recovery_attempts += 1
+                attempt_number = self._recovery_attempts
+        if not leader:
+            return future.result()
+        try:
+            summary = self._recover_once()
+        except BaseException as exc:
+            future.set_exception(exc)
+            with self._recovery_lock:
+                if (
+                    self._recovery_future is future
+                    and isinstance(exc, Exception)
+                    and attempt_number < 2
+                    and not self._closing
+                ):
+                    self._recovery_future = None
+            raise
+        future.set_result(summary)
+        return summary
+
+    def _recover_once(self) -> EmployeeRecoverySummary:
         """Replay durable state, dispose retired prompts, and resume automatically."""
         if self._service is None:
-            return
+            return EmployeeRecoverySummary()
         self._core_recovered = False
-        projection = self._service.recover()
+        self._service.recover()
+        repair = (
+            self._service.recover_replay_safe_action_required()
+            if self._runtime_enabled
+            else None
+        )
+        base_summary = EmployeeRecoverySummary(
+            eligible=0 if repair is None else repair.eligible,
+            recovered=0,
+            skipped=0 if repair is None else repair.skipped,
+            failed=0 if repair is None else repair.failed,
+        )
+        repaired_intents = set(
+            () if repair is None else repair.repaired_intent_ids
+        )
+        if repair is not None and repair.failed:
+            raise RuntimeError(
+                "durable ACTION_REQUIRED repair failed: "
+                f"{repair.failed}/{repair.eligible} intents"
+            )
         if self._membership is not None:
             self._membership.rebuild_projection()
             if self._runtime_enabled:
@@ -1068,9 +1132,13 @@ class EmployeeDepartmentRuntime:
         )
         if not self._runtime_enabled:
             self._service.mark_runtime_recovered()
-            return
+            return base_summary
         pending_intents: list[str] = []
-        for state in projection.states.values():
+        recovery_states = tuple(self._service.list_states())
+        for state in recovery_states:
+            if state.intent_id in repaired_intents:
+                pending_intents.append(state.intent_id)
+                continue
             if (
                 state.phase
                 in {
@@ -1098,20 +1166,27 @@ class EmployeeDepartmentRuntime:
             self._notification_status is not None
             and any(
                 self._terminal_notification_status(state)
-                for state in projection.states.values()
+                for state in recovery_states
             )
         )
         if pending_intents or recover_notifications:
-            self._submit_coroutine(
-                self._recover_runtime(list(dict.fromkeys(pending_intents))),
+            recovery_future = self._submit_coroutine(
+                self._recover_runtime(
+                    list(dict.fromkeys(pending_intents)),
+                    repaired_intents=repaired_intents,
+                    base_summary=base_summary,
+                ),
                 label="recovery",
             )
+            return recovery_future.result()
         else:
-            self._service.mark_runtime_recovered()
+            if not base_summary.failed:
+                self._service.mark_runtime_recovered()
             if self._loop is not None:
                 self._loop.call_soon_threadsafe(self._start_monitor_in_loop)
             if execution_recovered:
                 self._start_dispatch_worker()
+            return base_summary
 
 
 
@@ -1709,8 +1784,6 @@ class EmployeeDepartmentRuntime:
         )
         if any(not isinstance(value, str) for value in values):
             return None
-        if sender_principal_id == owner_principal_id and sender_principal_id:
-            return owner_principal_id
         if not sender_union_id:
             return None
         service = self._service
@@ -1732,6 +1805,96 @@ class EmployeeDepartmentRuntime:
         ):
             return None
         return owner_principal_id
+
+    def _owner_p2p_requester(
+        self,
+        record: Any,
+        payload: EmployeeIngressPayload,
+    ) -> str | None:
+        """Resolve one SDK P2P sender to the durable main-Bot owner."""
+
+        if len(payload.normalized_parts) != 1:
+            return None
+        part = payload.normalized_parts[0]
+        metadata = getattr(record, "metadata", None)
+        if not isinstance(metadata, EmployeeIngressMetadata):
+            return None
+        if (
+            not isinstance(part, Mapping)
+            or part.get("type") != "message"
+            or part.get("chat_type") != "p2p"
+            or part.get("sender_type") != "user"
+            or part.get("sender_id_type") != "open_id"
+            or part.get("sender_id") != metadata.sender_principal_id
+            or part.get("sender_tenant_key") != metadata.tenant_key
+            or not self._employee_ingress_transport_is_current(metadata)
+        ):
+            return None
+        sender_union_id = part.get("sender_union_id")
+        if not isinstance(sender_union_id, str) or not sender_union_id:
+            return None
+        service = self._service
+        if service is None:
+            return None
+        projection = service.synchronize_projection()
+        states = tuple(
+            state
+            for state in service.list_states()
+            if state.tenant_key == metadata.tenant_key
+            and state.agent_id == metadata.agent_id
+            and state.phase is HirePhase.ACTIVE
+        )
+        if len(states) != 1:
+            return None
+        state = states[0]
+        employee = projection.employees.get(metadata.agent_id)
+        if (
+            employee is None
+            or employee.agent_id != metadata.agent_id
+            or employee.tenant_key != metadata.tenant_key
+            or employee.owner_principal_id != state.requester_principal_id
+            or employee.state is not EmployeeState.ACTIVE
+            or employee.worker_type is not WorkerType.VISIBLE
+            or employee.bot_principal_id != metadata.bot_principal_id
+        ):
+            return None
+        owner_principal_id = employee.owner_principal_id
+        canonical = self._resolve_employee_requester_principal(
+            tenant_key=metadata.tenant_key,
+            agent_id=metadata.agent_id,
+            owner_principal_id=owner_principal_id,
+            sender_principal_id=metadata.sender_principal_id,
+            sender_union_id=sender_union_id,
+        )
+        coordinates = _bound_remote_coordinates(metadata, part)
+        thread_id = part.get("feishu_thread_id", "")
+        if (
+            canonical != owner_principal_id
+            or coordinates is None
+            or not isinstance(thread_id, str)
+            or self._context_acl is None
+        ):
+            return None
+        chat_id, message_id, root_id = coordinates
+        try:
+            request = AuthorizedContextRequest(
+                tenant_key=metadata.tenant_key,
+                agent_id=metadata.agent_id,
+                bot_principal_id=metadata.bot_principal_id,
+                app_id=metadata.app_id,
+                channel_generation=metadata.channel_generation,
+                chat_id=chat_id,
+                thread_root_message_id=root_id or message_id,
+                feishu_thread_id=thread_id,
+                current_message_id=message_id,
+                requester_principal_id=canonical,
+                source_requester_principal_id=metadata.sender_principal_id,
+                authorization_scope=EmployeeAuthorizationScope.OWNER_P2P,
+            )
+            authorized = self._context_acl.is_authorized(request)
+        except Exception:
+            return None
+        return canonical if authorized is True else None
 
     def _drain_employee_dispatch_once(self) -> bool:
         ingress = self._ingress
@@ -1761,6 +1924,16 @@ class EmployeeDepartmentRuntime:
                     ):
                         worked = True
                         continue
+                except Exception:
+                    payload = None
+                try:
+                    owner_p2p_requester = self._owner_p2p_requester(
+                        record,
+                        payload,
+                    )
+                except Exception:
+                    owner_p2p_requester = None
+                try:
                     trust = self._managed_employee_ingress_trust(
                         record,
                         payload,
@@ -1770,7 +1943,11 @@ class EmployeeDepartmentRuntime:
                 if self._handle_control_ingress(acceptance_id):
                     worked = True
                     continue
-                if trust is not None and trust.zone is not TrustZone.MANAGED_AGENT_GROUP:
+                if (
+                    owner_p2p_requester is None
+                    and trust is not None
+                    and trust.zone is not TrustZone.MANAGED_AGENT_GROUP
+                ):
                     try:
                         ingress.record_disposition(
                             acceptance_id,
@@ -1781,7 +1958,11 @@ class EmployeeDepartmentRuntime:
                         pass
                     worked = True
                     continue
-                if trust is not None and trust.actor is ActorKind.EMPLOYEE:
+                if (
+                    owner_p2p_requester is None
+                    and trust is not None
+                    and trust.actor is ActorKind.EMPLOYEE
+                ):
                     # Employee Channel SDK ingress has no authenticated causal
                     # envelope.  Only the main Bot reply path can correlate a
                     # server parent/root message to an anchored Outbox record.
@@ -1799,13 +1980,17 @@ class EmployeeDepartmentRuntime:
                 # owned by the main Bot.  Consume those after employee-specific
                 # controls so main-Bot slash commands cannot be routed
                 # into every employee mailbox as coding work.
-                if self._handle_main_bot_group_command_ingress(acceptance_id):
+                if (
+                    owner_p2p_requester is None
+                    and self._handle_main_bot_group_command_ingress(acceptance_id)
+                ):
                     worked = True
                     continue
                 # The ingress payload may be reclaimed as soon as dispatch reaches a
                 # terminal disposition.  Project shared group context on this same
                 # serialized path before routing so context assembly cannot race GC.
-                self._record_employee_ingress_group_event(acceptance_id)
+                if owner_p2p_requester is None:
+                    self._record_employee_ingress_group_event(acceptance_id)
                 routed = router.state.by_acceptance_id.get(acceptance_id)
                 if routed is None or routed.state not in {
                     "queued",
@@ -1873,6 +2058,52 @@ class EmployeeDepartmentRuntime:
             ):
                 result.add(open_id)
         return frozenset(result)
+
+    def _employee_ingress_transport_is_current(
+        self,
+        metadata: EmployeeIngressMetadata,
+    ) -> bool:
+        service = self._service
+        channels = self._channels
+        if service is None or channels is None:
+            return False
+        try:
+            projection = service.synchronize_projection()
+            employee = projection.employees.get(metadata.agent_id)
+            if employee is None:
+                return False
+            principal = projection.bot_principals.get(employee.bot_principal_id)
+            status = channels.status(metadata.agent_id)
+            identity = getattr(status, "identity", None)
+            ready_metadata = getattr(status, "ready_metadata", None)
+            return (
+                employee.state is EmployeeState.ACTIVE
+                and employee.worker_type is WorkerType.VISIBLE
+                and employee.tenant_key == metadata.tenant_key
+                and employee.bot_principal_id == metadata.bot_principal_id
+                and principal is not None
+                and principal.tenant_key == metadata.tenant_key
+                and principal.agent_id == metadata.agent_id
+                and principal.app_id == metadata.app_id
+                and bool(principal.credential_ref)
+                and isinstance(identity, Mapping)
+                and isinstance(ready_metadata, Mapping)
+                and getattr(status, "state", None)
+                is ChannelProcessState.READY
+                and getattr(status, "tenant_key", None)
+                == metadata.tenant_key
+                and getattr(status, "agent_id", None) == metadata.agent_id
+                and getattr(status, "bot_principal_id", None)
+                == metadata.bot_principal_id
+                and getattr(status, "app_id", None) == metadata.app_id
+                and getattr(status, "generation", None)
+                == metadata.channel_generation
+                and identity.get("app_id") == metadata.app_id
+                and ready_metadata.get("connection_id")
+                == metadata.connection_id
+            )
+        except Exception:
+            return False
 
 
     def _membership_event_transport_is_current(
@@ -2058,6 +2289,11 @@ class EmployeeDepartmentRuntime:
             isinstance(first, Mapping)
             and first.get("type") == "membership_event"
         )
+        owner_p2p_requester = (
+            None
+            if is_membership_event
+            else self._owner_p2p_requester(record, payload)
+        )
         if is_membership_event:
             remote_chat_id = first.get("remote_chat_id")
             if (
@@ -2074,11 +2310,16 @@ class EmployeeDepartmentRuntime:
             except Exception:
                 trust = self._unknown_employee_ingress_trust()
             if (
-                trust is not None
+                owner_p2p_requester is None
+                and trust is not None
                 and trust.zone is not TrustZone.MANAGED_AGENT_GROUP
             ):
                 return finish("ignored", "authority_denied")
-            if trust is not None and trust.actor is ActorKind.EMPLOYEE:
+            if (
+                owner_p2p_requester is None
+                and trust is not None
+                and trust.actor is ActorKind.EMPLOYEE
+            ):
                 return False
         if is_membership_event:
             if self._membership is None:
@@ -2125,6 +2366,10 @@ class EmployeeDepartmentRuntime:
                 command=data_control[0],
                 record=record,
                 payload=payload,
+                requester_principal_id=(
+                    owner_p2p_requester
+                    or record.metadata.sender_principal_id
+                ),
                 history_days=data_control[1],
             )
         if texts != ["/stop"]:
@@ -2141,7 +2386,9 @@ class EmployeeDepartmentRuntime:
         outcome = dispatch.request_cancel(
             agent_id=metadata.agent_id,
             chat_id=remote_chat_id,
-            requester_principal_id=metadata.sender_principal_id,
+            requester_principal_id=(
+                owner_p2p_requester or metadata.sender_principal_id
+            ),
             command_acceptance_id=acceptance_id,
         )
         lifecycle.command_response(
@@ -2226,6 +2473,7 @@ class EmployeeDepartmentRuntime:
         command: str,
         record: Any,
         payload: Any,
+        requester_principal_id: str,
         history_days: int = 7,
     ) -> bool:
         data = self._data
@@ -2253,7 +2501,7 @@ class EmployeeDepartmentRuntime:
         remote_chat_id, remote_message_id, remote_root_id = coordinates
         chat_type = first.get("chat_type", "") if isinstance(first, Mapping) else ""
         request = AuthenticatedDataRequest(
-            principal_id=metadata.sender_principal_id,
+            principal_id=requester_principal_id,
             tenant_key=metadata.tenant_key,
             receiving_bot_app_id=metadata.app_id,
             chat_id=remote_chat_id,
@@ -2785,7 +3033,7 @@ class EmployeeDepartmentRuntime:
         coroutine: Any,
         *,
         label: str,
-    ) -> None:
+    ) -> concurrent.futures.Future[Any]:
         if self._closing or self._loop is None:
             if hasattr(coroutine, "close"):
                 coroutine.close()
@@ -2810,8 +3058,31 @@ class EmployeeDepartmentRuntime:
                 )
 
         future.add_done_callback(complete)
+        return future
 
-    async def _recover_runtime(self, pending_intents: list[str]) -> None:
+    async def _recover_runtime(
+        self,
+        pending_intents: list[str],
+        *,
+        repaired_intents: set[str],
+        base_summary: EmployeeRecoverySummary,
+    ) -> EmployeeRecoverySummary:
+        def summarize_durable_outcomes() -> EmployeeRecoverySummary:
+            recovered = 0
+            for intent_id in repaired_intents:
+                try:
+                    state = self._require_service().get_state(intent_id)
+                except Exception:
+                    continue
+                if state is not None and state.phase is HirePhase.ACTIVE:
+                    recovered += 1
+            return EmployeeRecoverySummary(
+                eligible=base_summary.eligible,
+                recovered=recovered,
+                skipped=base_summary.skipped,
+                failed=base_summary.eligible - recovered,
+            )
+
         failed_intents: list[str] = []
         if pending_intents:
             results = await asyncio.gather(
@@ -2819,6 +3090,7 @@ class EmployeeDepartmentRuntime:
                     self._configure_intent(
                         intent_id,
                         force_slash_refresh=True,
+                        allow_action_required_refresh=intent_id in repaired_intents,
                     )
                     for intent_id in pending_intents
                 ),
@@ -2837,7 +3109,10 @@ class EmployeeDepartmentRuntime:
         if failed_intents:
             retry_results = await asyncio.gather(
                 *(
-                    self._retry_recovery_intent(intent_id)
+                    self._retry_recovery_intent(
+                        intent_id,
+                        allow_action_required_refresh=intent_id in repaired_intents,
+                    )
                     for intent_id in failed_intents
                 ),
                 return_exceptions=True,
@@ -2855,19 +3130,26 @@ class EmployeeDepartmentRuntime:
                     failures,
                 )
                 self._execution_blockers = ("hire_recovery",)
-                return
+                return summarize_durable_outcomes()
             if failures:
                 logger.error(
                     "employee recovery isolated %d exhausted intent(s) as action_required",
                     failures,
                 )
         await self._retry_terminal_notifications()
-        self._require_service().mark_runtime_recovered()
+        if not base_summary.failed:
+            self._require_service().mark_runtime_recovered()
         if not self._execution_blockers:
             self._start_dispatch_worker()
+        return summarize_durable_outcomes()
 
 
-    async def _retry_recovery_intent(self, intent_id: str) -> bool:
+    async def _retry_recovery_intent(
+        self,
+        intent_id: str,
+        *,
+        allow_action_required_refresh: bool = False,
+    ) -> bool:
         for delay in _RECOVERY_RETRY_DELAYS:
             if self._closing:
                 raise RuntimeError("employee runtime is closing")
@@ -2876,6 +3158,7 @@ class EmployeeDepartmentRuntime:
                 await self._configure_intent(
                     intent_id,
                     force_slash_refresh=True,
+                    allow_action_required_refresh=allow_action_required_refresh,
                 )
                 return True
             except Exception as exc:
@@ -3011,6 +3294,7 @@ class EmployeeDepartmentRuntime:
         intent_id: str,
         *,
         force_slash_refresh: bool = False,
+        allow_action_required_refresh: bool = False,
     ) -> None:
         service = self._require_service()
         state = service.get_state(intent_id)
@@ -3030,6 +3314,7 @@ class EmployeeDepartmentRuntime:
                 state,
                 generation=generation,
                 force_refresh=force_slash_refresh,
+                allow_action_required_refresh=allow_action_required_refresh,
             )
             state = service.get_state(intent_id) or state
             try:
@@ -3038,6 +3323,7 @@ class EmployeeDepartmentRuntime:
                 if launch_attempt == 0:
                     continue
                 raise
+            service.prepare_automatic_activation(state.intent_id)
             service.commit_automatic_activation(
                 state.intent_id,
                 activated_at=time.time(),
@@ -3052,12 +3338,14 @@ class EmployeeDepartmentRuntime:
         *,
         generation: int,
         force_refresh: bool,
+        allow_action_required_refresh: bool,
     ) -> VerifiedSlashState:
         service = self._require_service()
         effect_id = service.select_slash_reconcile_effect(
             state.intent_id,
             generation=generation,
             force_refresh=force_refresh,
+            allow_action_required_refresh=allow_action_required_refresh,
         )
         current = service.get_state(state.intent_id) or state
         effect_state = current.effect_state(effect_id)
@@ -3284,6 +3572,7 @@ class EmployeeDepartmentRuntime:
         if (
             not isinstance(sender_id, str)
             or not sender_id
+            or sender_id != record.metadata.sender_principal_id
             or not isinstance(sender_union_id, str)
             or service is None
         ):
@@ -3315,7 +3604,7 @@ class EmployeeDepartmentRuntime:
             transport_principal_id=record.metadata.bot_principal_id,
             transport_event_id=record.metadata.event_id,
             payload=GroupEventPayload(
-                sender_id=canonical_sender_id,
+                sender_id=record.metadata.sender_principal_id,
                 sender_id_type=str(part.get("sender_id_type", "")),
                 sender_type=str(part.get("sender_type", "")),
                 sender_tenant_key=str(part.get("sender_tenant_key", "")),

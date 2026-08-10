@@ -189,6 +189,89 @@ class TestFullComposition:
         l1 = composition.memory_facade.read_l1("agt_alpha", "tenant_1")
         assert l1 == "# Memory content"
 
+    def test_l1_survives_close_reopen_replay_with_private_binding(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from src.autonomous.data.facades import MemoryAccessError
+
+        settings = _FakeSettings(tmp_path)
+        anchor = _InMemoryAnchor()
+        hmac_key = secrets.token_bytes(32)
+        journal_root = tmp_path / "restart-journal"
+        agents_root = tmp_path / "restart-agents"
+        writer_one = JournalWriter.open(
+            journal_root,
+            anchor=anchor,
+            hmac_key=hmac_key,
+            writer_epoch=1,
+        )
+        first = build_employee_data_composition(
+            settings=settings,
+            writer=writer_one,
+            admin_principal_ids=frozenset({"admin_1"}),
+            main_bot_app_id="main_bot",
+            agents_root=agents_root,
+        )
+        try:
+            first.publish_document(
+                PublishEmployeeDocumentCommand(
+                    agent_id="agt_alpha",
+                    tenant_key="tenant_1",
+                    owner_principal_id="principal_owner",
+                    kind=DataKind.L1_MEMORY,
+                    source_id="l1_memory",
+                    content=b"# Durable private memory",
+                    content_type="text/markdown",
+                    idempotency_key="l1-restart-1",
+                )
+            )
+        finally:
+            first.service._blob_store.close()  # noqa: SLF001
+            writer_one.close()
+
+        (agents_root / "agt_alpha" / "memory" / "MEMORY.md").unlink()
+        writer_two = JournalWriter.open(
+            journal_root,
+            anchor=anchor,
+            hmac_key=hmac_key,
+            writer_epoch=2,
+        )
+        reopened = build_employee_data_composition(
+            settings=settings,
+            writer=writer_two,
+            admin_principal_ids=frozenset({"admin_1"}),
+            main_bot_app_id="main_bot",
+            agents_root=agents_root,
+        )
+        try:
+            reopened.rebuild_all()
+
+            document = next(iter(reopened.state.employee_documents.values()))
+            assert (
+                document.tenant_key,
+                document.agent_id,
+                document.owner_principal_id,
+                document.kind,
+                document.source_id,
+            ) == (
+                "tenant_1",
+                "agt_alpha",
+                "principal_owner",
+                DataKind.L1_MEMORY,
+                "l1_memory",
+            )
+            assert reopened.memory_facade.read_l1(
+                "agt_alpha",
+                "tenant_1",
+            ) == "# Durable private memory"
+            with pytest.raises(MemoryAccessError):
+                reopened.memory_facade.read_l1("agt_alpha", "tenant_other")
+            assert reopened.memory_facade.read_l1("agt_other", "tenant_1") is None
+        finally:
+            reopened.service._blob_store.close()  # noqa: SLF001
+            writer_two.close()
+
     def test_unanchored_attempt_raises(
         self, composition: EmployeeDataComposition
     ) -> None:

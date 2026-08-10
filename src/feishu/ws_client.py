@@ -688,16 +688,16 @@ class FeishuWSClient:
         self,
         *,
         close_on_failure: bool = True,
-    ) -> None:
+    ) -> object | None:
         """Start durable recovery only after the main-Bot reply path exists."""
 
         runtime = self._employee_department_runtime
         if runtime is None:
-            return
+            return None
         try:
             if "coco" not in self._handler_ctx.handlers:
                 raise RuntimeError("main Bot reply transport is not bound")
-            runtime.recover()
+            return runtime.recover()
         except Exception:
             if close_on_failure:
                 self._close_employee_runtime_after_initialization_failure()
@@ -707,9 +707,22 @@ class FeishuWSClient:
         """Recover Employee state after main WS readiness without weakening admission."""
 
         try:
-            self._recover_employee_runtime_after_handler_binding(
-                close_on_failure=False
-            )
+            for recovery_attempt in range(2):
+                try:
+                    recovery_summary = (
+                        self._recover_employee_runtime_after_handler_binding(
+                            close_on_failure=False
+                        )
+                    )
+                    break
+                except Exception:
+                    if recovery_attempt:
+                        raise
+                    logger.warning(
+                        "Employee runtime background recovery failed once; "
+                        "retrying once",
+                        exc_info=True,
+                    )
             runtime = self._employee_department_runtime
             membership = (
                 getattr(runtime, "membership_service", None)
@@ -748,7 +761,14 @@ class FeishuWSClient:
                 "main Bot remains available and Employee admission stays closed"
             )
             return
-        logger.info("Employee runtime background recovery complete")
+        logger.info(
+            "Employee runtime background recovery complete "
+            "eligible=%d recovered=%d skipped=%d failed=%d",
+            int(getattr(recovery_summary, "eligible", 0) or 0),
+            int(getattr(recovery_summary, "recovered", 0) or 0),
+            int(getattr(recovery_summary, "skipped", 0) or 0),
+            int(getattr(recovery_summary, "failed", 0) or 0),
+        )
         self._try_publish_restart_readiness()
 
     def _start_employee_runtime_recovery(self) -> None:

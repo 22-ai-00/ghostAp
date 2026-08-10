@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Protocol
 
+from ..authorization import EmployeeAuthorizationScope
 from ..data.facades import MemoryAccessError, MemoryIntegrityError
 from ..workforce.registry import (
     ProjectedBindingError,
@@ -91,6 +92,11 @@ class AuthorizedGroupMemoryReader:
     def read(self, request: AuthorizedContextRequest) -> str:
         if not isinstance(request, AuthorizedContextRequest):
             raise TypeError("request must be AuthorizedContextRequest")
+        if (
+            request.authorization_scope
+            is not EmployeeAuthorizationScope.MANAGED_GROUP
+        ):
+            raise ContextUnavailableError(ContextUnavailableReason.SCOPE)
         failure_reason: ContextUnavailableReason | None = None
         try:
             binding = _resolve_binding(self._registry_provider, request)
@@ -205,7 +211,12 @@ class EmployeeContextService:
             request.agent_id,
             request.tenant_key,
         )
-        l2 = self._group_memory.read(request)
+        l2 = (
+            self._group_memory.read(request)
+            if request.authorization_scope
+            is EmployeeAuthorizationScope.MANAGED_GROUP
+            else ""
+        )
         if l1 is not None and not isinstance(l1, str):
             raise ContextUnavailableError(ContextUnavailableReason.MEMORY)
         if not isinstance(l2, str):
@@ -279,6 +290,11 @@ class EmployeeContextService:
             ContextUnavailableReason.DEADLINE,
             ContextUnavailableReason.SOURCE,
         }:
+            raise ContextUnavailableError(warning_reason)
+        if (
+            request.authorization_scope
+            is EmployeeAuthorizationScope.OWNER_P2P
+        ):
             raise ContextUnavailableError(warning_reason)
         if self._ledger is None:
             raise ContextUnavailableError(warning_reason)
@@ -393,6 +409,8 @@ def _resolve_binding(
         bot_principal_id=request.bot_principal_id,
         app_id=request.app_id,
         chat_id=request.chat_id,
+        requester_principal_id=request.requester_principal_id,
+        authorization_scope=request.authorization_scope,
     )
 
 

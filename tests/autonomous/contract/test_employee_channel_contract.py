@@ -38,6 +38,59 @@ from src.autonomous.provisioning.channel_worker import (
 from src.autonomous.supervisor.employee_channels import EmployeeChannelSupervisor
 
 
+def test_sdk_p2p_message_preserves_transport_chat_type_and_union_identity() -> None:
+    from types import SimpleNamespace
+
+    event = SimpleNamespace(
+        header=SimpleNamespace(
+            event_id="evt_owner_p2p",
+            event_type="im.message.receive_v1",
+            tenant_key="tenant_1",
+            app_id="cli_alpha",
+            create_time="1783987200000",
+        ),
+        event=SimpleNamespace(
+            message=SimpleNamespace(
+                message_id="om_owner_p2p",
+                chat_id="oc_owner_p2p",
+                root_id="",
+                parent_id="",
+                content='{"text":"run it"}',
+                mentions=(),
+                message_type="text",
+                chat_type="p2p",
+                thread_id="",
+            ),
+            sender=SimpleNamespace(
+                sender_id=SimpleNamespace(
+                    open_id="ou_employee_app_owner",
+                    union_id="on_owner",
+                ),
+                sender_type="user",
+                tenant_key="tenant_1",
+            ),
+        ),
+    )
+
+    metadata, payload, _correlation = _normalize_sdk_ingress(
+        event,
+        kind="message",
+        agent_id="agt_alpha",
+        app_id="cli_alpha",
+        generation=3,
+        connection_id="conn_alpha",
+        tenant_key="tenant_1",
+        bot_principal_id="bot_alpha",
+    )
+
+    part = payload.normalized_parts[0]
+    assert part["chat_type"] == "p2p"
+    assert part["sender_union_id"] == "on_owner"
+    assert part["sender_id"] == "ou_employee_app_owner"
+    assert metadata.sender_principal_id == "ou_employee_app_owner"
+    assert metadata.chat_id != "oc_owner_p2p"
+
+
 @pytest.mark.parametrize(
     "payload",
     (

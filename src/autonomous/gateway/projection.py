@@ -6,6 +6,7 @@ import copy
 import re
 from dataclasses import dataclass, field
 
+from ..authorization import EmployeeAuthorizationScope
 from ..journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
 from .models import DispatchBinding, GatewayExecutionStatus
 
@@ -28,8 +29,17 @@ _LEGACY_SLOCK_BINDING_FIELDS = frozenset(
     {"slock_chat_id", "slock_engine_identity", "slock_root_identity"}
 )
 _CURRENT_BINDING_FIELDS = frozenset(DispatchBinding.__dataclass_fields__)
-_LEGACY_BINDING_FIELDS = (
+_CURRENT_SLOCK_BINDING_FIELDS = (
     _CURRENT_BINDING_FIELDS - _CURRENT_TEAM_BINDING_FIELDS
+) | _LEGACY_SLOCK_BINDING_FIELDS
+_SCOPE_BINDING_FIELDS = frozenset(
+    {"authorization_scope", "source_requester_principal_id"}
+)
+_LEGACY_TEAM_BINDING_FIELDS = (
+    _CURRENT_BINDING_FIELDS - _SCOPE_BINDING_FIELDS
+)
+_LEGACY_SLOCK_BINDING_FIELDS_EXACT = (
+    _LEGACY_TEAM_BINDING_FIELDS - _CURRENT_TEAM_BINDING_FIELDS
 ) | _LEGACY_SLOCK_BINDING_FIELDS
 
 
@@ -80,11 +90,23 @@ def is_gateway_event(event_type: str) -> bool:
 def _dispatch_binding_from_journal(value: object) -> DispatchBinding:
     """Normalize the one authenticated pre-team binding schema during replay."""
 
-    if isinstance(value, dict) and set(value) == _LEGACY_BINDING_FIELDS:
+    if isinstance(value, dict) and set(value) in {
+        _CURRENT_SLOCK_BINDING_FIELDS,
+        _LEGACY_SLOCK_BINDING_FIELDS_EXACT,
+    }:
         normalized = dict(value)
         normalized["team_chat_id"] = normalized.pop("slock_chat_id")
         normalized["team_identity"] = normalized.pop("slock_engine_identity")
         normalized["team_root_identity"] = normalized.pop("slock_root_identity")
+        value = normalized
+    if isinstance(value, dict) and set(value) == _LEGACY_TEAM_BINDING_FIELDS:
+        normalized = dict(value)
+        normalized["authorization_scope"] = (
+            EmployeeAuthorizationScope.MANAGED_GROUP.value
+        )
+        normalized["source_requester_principal_id"] = normalized[
+            "requester_principal_id"
+        ]
         value = normalized
     return DispatchBinding.from_dict(value)
 

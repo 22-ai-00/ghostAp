@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 
 from ..context.models import AssembledContext, ContextMessage
 
-_RENDER_CONTRACT = "ghostap.employee-context-prompt.v2:canonical-json"
+_RENDER_CONTRACT = "ghostap.employee-context-prompt.v3:canonical-json"
 RENDER_CONTRACT_DIGEST = hashlib.sha256(_RENDER_CONTRACT.encode()).hexdigest()
 
 
@@ -35,8 +35,8 @@ def render_employee_context(
         raise ValueError("context snapshot must carry its assembler hash")
     untrusted_payload = {
         "thread": _message_payload(snapshot.thread_messages),
-        "recent_group": _message_payload(snapshot.group_messages),
         "l1_memory": snapshot.l1_summary,
+        "recent_group": _message_payload(snapshot.group_messages),
         "l2_group_memory": snapshot.l2_summary,
     }
     if not any(untrusted_payload.values()):

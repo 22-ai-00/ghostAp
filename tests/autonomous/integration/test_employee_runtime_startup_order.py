@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -315,6 +316,79 @@ def test_production_dispatch_projects_group_context_before_routing_and_gc(
     ]
 
 
+def test_production_dispatch_routes_owner_p2p_without_group_control(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    acceptance_id = "acc_owner_p2p"
+    pending = SimpleNamespace(disposition=None)
+
+    class _Ingress:
+        state = SimpleNamespace(by_acceptance_id={acceptance_id: pending})
+
+        def rebuild_projection(self):
+            return None
+
+        def get_payload(self, _acceptance_id: str):
+            return SimpleNamespace(normalized_parts=({"type": "message"},))
+
+        def gc_terminal_payloads(self):
+            calls.append("gc_payload")
+            return 0
+
+    class _Router:
+        state = SimpleNamespace(by_acceptance_id={})
+
+        def rebuild_projection(self):
+            return None
+
+        def route(self, _acceptance_id: str):
+            calls.append("route")
+
+    class _Dispatch:
+        employee_runtime = None
+
+        def dispatch_next(self):
+            calls.append("dispatch")
+            return None
+
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = _Ingress()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._router = _Router()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._dispatch = _Dispatch()  # type: ignore[assignment]  # noqa: SLF001
+    monkeypatch.setattr(
+        runtime,
+        "_owner_p2p_requester",
+        lambda _record, _payload: "ou_owner",
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_managed_employee_ingress_trust",
+        lambda _record, _payload: runtime._unknown_employee_ingress_trust(),  # noqa: SLF001
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_handle_control_ingress",
+        lambda _acceptance_id: calls.append("handle_control") or False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_handle_main_bot_group_command_ingress",
+        lambda _acceptance_id: calls.append("command_gate") or False,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_record_employee_ingress_group_event",
+        lambda _acceptance_id: calls.append("project_group_context"),
+    )
+
+    runtime._drain_employee_dispatch_once()  # noqa: SLF001
+
+    assert calls == ["handle_control", "route", "dispatch", "gc_payload"]
+
+
 def test_production_dispatch_ignores_main_bot_group_command_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -395,9 +469,15 @@ def test_production_dispatch_ignores_main_bot_group_command_observation(
     assert pending.disposition.reason_code == "main_bot_group_command"
 
 
-def test_employee_group_projection_maps_app_open_id_to_owner_principal() -> None:
+def test_employee_group_projection_preserves_source_open_id_for_partial_context() -> None:
+    from src.autonomous.context import (
+        ContextUnavailableReason,
+        ThreadContextConfig,
+    )
+    from src.autonomous.context.group_ledger import GroupContextLedger
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
     from src.autonomous.provisioning.hire_state import HirePhase
+    from tests.autonomous.integration.test_employee_context_service import _request
 
     acceptance_id = "acc_app_scoped_sender"
     metadata = SimpleNamespace(
@@ -449,8 +529,137 @@ def test_employee_group_projection_maps_app_open_id_to_owner_principal() -> None
 
     assert runtime._record_employee_ingress_group_event(acceptance_id) is True  # noqa: SLF001
     payload = published[0]["payload"]  # type: ignore[index]
-    assert payload.sender_id == "ou_main_app_owner"
+    assert payload.sender_id == "ou_employee_app"
     assert payload.sender_id_type == "open_id"
+    record = SimpleNamespace(
+        message_id="om_message",
+        chat_id="oc_team",
+        thread_id="",
+        payload_ref=object(),
+    )
+    partial_ledger = object.__new__(GroupContextLedger)
+    partial_ledger._config = ThreadContextConfig()  # noqa: SLF001
+    partial_ledger._blobs = SimpleNamespace(  # noqa: SLF001
+        read=lambda _ref: payload.to_bytes()
+    )
+    partial_ledger.window = lambda **_kwargs: SimpleNamespace(  # type: ignore[method-assign]
+        records=(record,)
+    )
+
+    snapshot = partial_ledger.assemble_partial(
+        _request(
+            agent_id="agt_alpha",
+            chat_id="oc_team",
+            thread_root_message_id="om_message",
+            feishu_thread_id="",
+            current_message_id="om_message",
+            requester_principal_id="ou_main_app_owner",
+            source_requester_principal_id="ou_employee_app",
+        ),
+        warning_reason=ContextUnavailableReason.ORDERING,
+    )
+
+    assert snapshot.thread_messages[0].sender_id == "ou_employee_app"
+
+
+def test_owner_p2p_rejects_hire_owner_after_projected_owner_drift() -> None:
+    from src.autonomous.context.runtime import RuntimeRequesterChatAcl
+    from src.autonomous.domain import (
+        BotPrincipal,
+        EmployeeDefinition,
+        EmployeeState,
+        WorkerType,
+    )
+    from src.autonomous.ingress.models import (
+        EmployeeIngressMetadata,
+        EmployeeIngressPayload,
+    )
+    from src.autonomous.journal.projections import ProjectionState
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+    from src.autonomous.provisioning.hire_state import HirePhase
+
+    payload = EmployeeIngressPayload(
+        schema_version=1,
+        envelope_id="ing_" + "1" * 64,
+        normalized_parts=(
+            {
+                "type": "message",
+                "message_type": "text",
+                "chat_type": "p2p",
+                "content": {"text": "/stop"},
+                "sender_id": "ou_employee_app_owner",
+                "sender_union_id": "on_owner",
+                "sender_id_type": "open_id",
+                "sender_type": "user",
+                "sender_tenant_key": "tenant_1",
+                "feishu_thread_id": "",
+            },
+        ),
+        attachment_descriptors=(),
+    )
+    metadata = EmployeeIngressMetadata(
+        schema_version=1,
+        envelope_id=payload.envelope_id,
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        bot_principal_id="bot_alpha",
+        app_id="cli_alpha",
+        channel_generation=3,
+        connection_id="conn_alpha",
+        event_id="evt_owner_drift",
+        message_id="om_owner_drift",
+        event_type="im.message.receive_v1",
+        action_identity="",
+        chat_id="oc_owner_p2p",
+        thread_root_message_id="",
+        sender_principal_id="ou_employee_app_owner",
+        received_at="2026-08-10T00:00:00Z",
+        semantic_digest=payload.payload_sha256,
+        payload_sha256=payload.payload_sha256,
+        payload_size_bytes=payload.canonical_size_bytes,
+        attachment_count=0,
+        attachment_total_bytes=0,
+    )
+    projection = ProjectionState()
+    projection.employees["agt_alpha"] = EmployeeDefinition(
+        agent_id="agt_alpha",
+        tenant_key="tenant_1",
+        owner_principal_id="ou_rotated_owner",
+        worker_type=WorkerType.VISIBLE,
+        state=EmployeeState.ACTIVE,
+        bot_principal_id="bot_alpha",
+    )
+    projection.bot_principals["bot_alpha"] = BotPrincipal(
+        bot_principal_id="bot_alpha",
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        app_id="cli_alpha",
+        credential_ref="cred_alpha",
+    )
+    hire_state = SimpleNamespace(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        phase=HirePhase.ACTIVE,
+        requester_principal_id="ou_original_owner",
+        requester_union_id="on_owner",
+    )
+    service = SimpleNamespace(
+        synchronize_projection=lambda: projection,
+        list_states=lambda: (hire_state,),
+    )
+    runtime = EmployeeDepartmentRuntime()
+    runtime._service = service  # type: ignore[assignment]  # noqa: SLF001
+    runtime._context_acl = RuntimeRequesterChatAcl(  # noqa: SLF001
+        allowed_requesters=("ou_original_owner",),
+    )
+    runtime._employee_ingress_transport_is_current = MagicMock(  # noqa: SLF001
+        return_value=True
+    )
+
+    assert runtime._owner_p2p_requester(  # noqa: SLF001
+        SimpleNamespace(metadata=metadata),
+        payload,
+    ) is None
 
 
 @pytest.mark.asyncio

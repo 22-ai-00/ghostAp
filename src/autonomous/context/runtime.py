@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from ..authorization import EmployeeAuthorizationScope
 from ..provisioning.hire_state import HirePhase
 from .models import AuthorizedContextRequest
 
@@ -29,7 +30,12 @@ class RuntimeRequesterChatAcl:
         return (
             isinstance(request, AuthorizedContextRequest)
             and request.requester_principal_id in self._requesters
-            and (not self._chats or request.chat_id in self._chats)
+            and (
+                request.authorization_scope
+                is EmployeeAuthorizationScope.OWNER_P2P
+                or not self._chats
+                or request.chat_id in self._chats
+            )
         )
 
 
@@ -59,6 +65,12 @@ class RuntimeEmployeeGenerationAuthority:
                 or state.bot_principal_id != request.bot_principal_id
                 or state.app_id != request.app_id
                 or state.channel_generation != request.channel_generation
+                or (
+                    request.authorization_scope
+                    is EmployeeAuthorizationScope.OWNER_P2P
+                    and state.requester_principal_id
+                    != request.requester_principal_id
+                )
             ):
                 return False
             status = self._channels.status(request.agent_id)

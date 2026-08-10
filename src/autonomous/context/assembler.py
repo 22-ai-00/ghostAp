@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import time
 from dataclasses import replace
 from typing import Callable
 
+from ..authorization import EmployeeAuthorizationScope
+from .budget import apply_context_budget
 from .models import (
     AssembledContext,
     ContextLayer,
@@ -21,7 +22,6 @@ from .models import (
     MessageRevision,
     ThreadContextConfig,
     ThreadWatermark,
-    TrimmingRecord,
 )
 from .source import EmployeeScopedMessageSource, MessagePage, ResolvedThread
 
@@ -65,20 +65,27 @@ class EmployeeThreadContext:
             resolved = self._checked_call(self._source.resolve_thread, deadline)
             self._validate_binding(scope, resolved)
             stable_thread = self._stable_thread(scope, resolved, deadline)
-            first_group = self._fetch_group_window(
-                scope,
-                stable_thread,
-                deadline,
-            )
-            second_group = self._fetch_group_window(
-                scope,
-                stable_thread,
-                deadline,
-            )
-            if self._revision_digest(first_group) != self._revision_digest(
-                second_group
+            second_group: list[ContextMessage] = []
+            if (
+                scope.authorization_scope
+                is EmployeeAuthorizationScope.MANAGED_GROUP
             ):
-                raise ContextUnavailableError(ContextUnavailableReason.REVISION)
+                first_group = self._fetch_group_window(
+                    scope,
+                    stable_thread,
+                    deadline,
+                )
+                second_group = self._fetch_group_window(
+                    scope,
+                    stable_thread,
+                    deadline,
+                )
+                if self._revision_digest(first_group) != self._revision_digest(
+                    second_group
+                ):
+                    raise ContextUnavailableError(
+                        ContextUnavailableReason.REVISION
+                    )
             thread, group = self._reconcile_layers(
                 scope,
                 stable_thread,
@@ -205,6 +212,12 @@ class EmployeeThreadContext:
         if current.deleted or current.is_system or current.msg_type == "system":
             raise ContextUnavailableError(ContextUnavailableReason.CURRENT_MESSAGE)
         if current.sender_tenant_key != scope.tenant_key:
+            raise ContextUnavailableError(ContextUnavailableReason.SCOPE)
+        if (
+            current.sender_id != scope.source_requester_principal_id
+            or current.sender_id_type != "open_id"
+            or current.sender_type != "user"
+        ):
             raise ContextUnavailableError(ContextUnavailableReason.SCOPE)
         prefix = messages[: current_indexes[0] + 1]
         if len(prefix) > self._config.max_thread_messages:
@@ -500,58 +513,19 @@ class EmployeeThreadContext:
         source_group = tuple(group)
         source_l1 = l1_summary
         source_l2 = l2_summary
-        trace: list[TrimmingRecord] = []
-
-        def over_budget() -> bool:
-            chars = _content_chars(thread, group, l1_summary, l2_summary)
-            tokens = math.ceil(chars * self._config.tokens_per_char) + reserve
-            return (
-                chars > self._config.max_context_chars
-                or tokens > self._config.max_context_tokens
-            )
-
-        while over_budget():
-            if l2_summary:
-                removed = len(l2_summary)
-                l2_summary = ""
-                _record_trim(trace, ContextLayer.L2_GROUP, 0, removed)
-                continue
-            if l1_summary:
-                removed = len(l1_summary)
-                l1_summary = ""
-                _record_trim(trace, ContextLayer.L1_MEMORY, 0, removed)
-                continue
-            if group:
-                removed = group.pop(0)
-                _record_trim(
-                    trace,
-                    ContextLayer.GROUP_RECENT,
-                    1,
-                    len(removed.text),
-                )
-                continue
-            removable = next(
-                (index for index, message in enumerate(thread) if not message.is_current),
-                None,
-            )
-            if removable is not None:
-                removed = thread.pop(removable)
-                _record_trim(
-                    trace,
-                    ContextLayer.THREAD_FULL,
-                    1,
-                    len(removed.text),
-                )
-                continue
-            raise ContextUnavailableError(ContextUnavailableReason.BUDGET)
-
-        total_chars = _content_chars(thread, group, l1_summary, l2_summary)
-        total_tokens = math.ceil(total_chars * self._config.tokens_per_char) + reserve
-        if (
-            total_chars > self._config.max_context_chars
-            or total_tokens > self._config.max_context_tokens
-        ):
-            raise ContextUnavailableError(ContextUnavailableReason.BUDGET)
+        budgeted = apply_context_budget(
+            config=self._config,
+            thread=thread,
+            group=group,
+            l1_summary=l1_summary,
+            l2_summary=l2_summary,
+            reserve=reserve,
+        )
+        l1_summary = budgeted.l1_summary
+        l2_summary = budgeted.l2_summary
+        total_chars = budgeted.total_chars
+        total_tokens = budgeted.total_tokens
+        trace = budgeted.trimming_trace
         layers_used = tuple(
             layer
             for layer, present in (
@@ -579,6 +553,10 @@ class EmployeeThreadContext:
                     "root_id": scope.thread_root_message_id,
                     "current_id": scope.current_message_id,
                     "feishu_thread_id": watermark.feishu_thread_id,
+                    "source_requester_principal_id": (
+                        scope.source_requester_principal_id
+                    ),
+                    "authorization_scope": scope.authorization_scope.value,
                 },
                 "watermark": watermark.revision_digest,
                 "thread": [
@@ -626,20 +604,6 @@ def _digest(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _content_chars(
-    thread: list[ContextMessage],
-    group: list[ContextMessage],
-    l1_summary: str,
-    l2_summary: str,
-) -> int:
-    return (
-        sum(len(message.text) for message in thread)
-        + sum(len(message.text) for message in group)
-        + len(l1_summary)
-        + len(l2_summary)
-    )
-
-
 def _group_order_key(message: ContextMessage) -> tuple[int, int, str]:
     """Order chat history without treating Thread-local position as global."""
     return (
@@ -672,23 +636,6 @@ def _same_message_identity(
             "thread_message_position",
         )
     )
-
-
-def _record_trim(
-    trace: list[TrimmingRecord],
-    layer: ContextLayer,
-    removed_messages: int,
-    removed_chars: int,
-) -> None:
-    if trace and trace[-1].layer is layer:
-        previous = trace[-1]
-        trace[-1] = TrimmingRecord(
-            layer,
-            previous.removed_messages + removed_messages,
-            previous.removed_chars + removed_chars,
-        )
-        return
-    trace.append(TrimmingRecord(layer, removed_messages, removed_chars))
 
 
 def _message_metrics(

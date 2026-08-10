@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from src.acp.employee_selection import compose_employee_model_selection
 from src.autonomous.workforce.identity import AgentIdentity, default_employee_storage_base
 
+from ..authorization import EmployeeAuthorizationScope
 from ..domain import BotPrincipal, EmployeeDefinition, EmployeeState, WorkerType
 from .projection import workforce_projection_guard
 
@@ -34,6 +35,8 @@ class ProjectedContextBinding:
     principal: BotPrincipal
     projection_sequence: int
     projection_hash: str
+    authorization_scope: EmployeeAuthorizationScope
+    requester_principal_id: str
 
 
 class ProjectedAgentRegistry:
@@ -149,6 +152,8 @@ class ProjectedAgentRegistry:
         bot_principal_id: str,
         app_id: str,
         chat_id: str,
+        requester_principal_id: str,
+        authorization_scope: EmployeeAuthorizationScope,
     ) -> ProjectedContextBinding | None:
         """Atomically resolve one ACTIVE visible employee execution binding."""
         self._require_tenant(tenant_key)
@@ -159,7 +164,21 @@ class ProjectedAgentRegistry:
                 or employee.tenant_key != tenant_key
                 or employee.state is not EmployeeState.ACTIVE
                 or employee.worker_type is not WorkerType.VISIBLE
-                or chat_id not in employee.member_groups
+                or not isinstance(
+                    authorization_scope,
+                    EmployeeAuthorizationScope,
+                )
+                or (
+                    authorization_scope
+                    is EmployeeAuthorizationScope.MANAGED_GROUP
+                    and chat_id not in employee.member_groups
+                )
+                or (
+                    authorization_scope
+                    is EmployeeAuthorizationScope.OWNER_P2P
+                    and requester_principal_id
+                    != employee.owner_principal_id
+                )
             ):
                 return None
             if employee.bot_principal_id != bot_principal_id:
@@ -185,6 +204,8 @@ class ProjectedAgentRegistry:
                 principal=principal,
                 projection_sequence=getattr(self._state, "cursor_sequence", 0),
                 projection_hash=getattr(self._state, "cursor_hash", ""),
+                authorization_scope=authorization_scope,
+                requester_principal_id=requester_principal_id,
             )
 
     @staticmethod

@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from ..authorization import EmployeeAuthorizationScope
+
 
 class ContextUnavailableReason(str, Enum):
     """Stable, non-secret reasons that prohibit employee task execution."""
@@ -98,6 +100,8 @@ class EmployeeMessageScope:
     chat_id: str
     thread_root_message_id: str
     current_message_id: str
+    source_requester_principal_id: str
+    authorization_scope: EmployeeAuthorizationScope
     feishu_thread_id: str = ""
 
     def __post_init__(self) -> None:
@@ -113,6 +117,18 @@ class EmployeeMessageScope:
             "om_",
         )
         _require_prefix(self.current_message_id, "current_message_id", "om_")
+        if (
+            not isinstance(self.source_requester_principal_id, str)
+            or not self.source_requester_principal_id.strip()
+            or self.source_requester_principal_id
+            != self.source_requester_principal_id.strip()
+        ):
+            raise ValueError("source_requester_principal_id is required")
+        if not isinstance(
+            self.authorization_scope,
+            EmployeeAuthorizationScope,
+        ):
+            raise TypeError("authorization_scope must be EmployeeAuthorizationScope")
         if self.feishu_thread_id:
             _require_prefix(self.feishu_thread_id, "feishu_thread_id", "omt_")
 
@@ -483,6 +499,8 @@ class AuthorizedContextRequest:
     feishu_thread_id: str
     current_message_id: str
     requester_principal_id: str
+    source_requester_principal_id: str
+    authorization_scope: EmployeeAuthorizationScope
     system_prompt_token_reserve: int = 0
     constraints_digest: str = ""
 
@@ -524,6 +542,18 @@ class AuthorizedContextRequest:
         ):
             raise ValueError("requester_principal_id is required")
         if (
+            not isinstance(self.source_requester_principal_id, str)
+            or not self.source_requester_principal_id.strip()
+            or self.source_requester_principal_id
+            != self.source_requester_principal_id.strip()
+        ):
+            raise ValueError("source_requester_principal_id is required")
+        if not isinstance(
+            self.authorization_scope,
+            EmployeeAuthorizationScope,
+        ):
+            raise TypeError("authorization_scope must be EmployeeAuthorizationScope")
+        if (
             isinstance(self.channel_generation, bool)
             or not isinstance(self.channel_generation, int)
             or self.channel_generation <= 0
@@ -554,6 +584,10 @@ class AuthorizedContextRequest:
             chat_id=self.chat_id,
             thread_root_message_id=self.thread_root_message_id,
             current_message_id=self.current_message_id,
+            source_requester_principal_id=(
+                self.source_requester_principal_id
+            ),
+            authorization_scope=self.authorization_scope,
             feishu_thread_id=self.feishu_thread_id,
         )
 
@@ -601,7 +635,8 @@ class EmployeeExecutionInput:
             raise ValueError("context current message mismatch")
         current_message = current[0]
         if (
-            current_message.sender_id != self.request.requester_principal_id
+            current_message.sender_id
+            != self.request.source_requester_principal_id
             or current_message.sender_id_type != "open_id"
             or current_message.sender_tenant_key != self.request.tenant_key
         ):

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import threading
 from collections.abc import Callable
@@ -13,6 +12,7 @@ from dataclasses import dataclass
 from ..journal.blob_store import BlobRef, BlobStore
 from ..journal.frame import GENESIS_HASH, JournalEvent
 from ..journal.writer import CommitState, JournalWriter
+from .budget import apply_context_budget
 from .models import (
     AssembledContext,
     AuthorizedContextRequest,
@@ -248,6 +248,8 @@ class GroupContextLedger:
         tenant_key: str,
         chat_id: str,
         current_message_id: str,
+        thread_root_message_id: str = "",
+        feishu_thread_id: str = "",
         causal_event_id: str = "",
     ) -> CanonicalGroupContext:
         with self._lock:
@@ -270,11 +272,32 @@ class GroupContextLedger:
         )
         if current is None:
             raise ContextUnavailableError(ContextUnavailableReason.CURRENT_MESSAGE)
-        records = tuple(
+        eligible = tuple(
             item
             for item in candidates
             if item.journal_sequence <= current.journal_sequence
+        )
+        topic = tuple(
+            item
+            for item in eligible
+            if item is current
+            or item.message_id == thread_root_message_id
+            or (
+                bool(thread_root_message_id)
+                and item.thread_id == thread_root_message_id
+            )
+            or (bool(feishu_thread_id) and item.thread_id == feishu_thread_id)
+        )
+        topic_keys = {item.dedup_key for item in topic}
+        group = tuple(
+            item for item in eligible if item.dedup_key not in topic_keys
         )[-self._config.max_group_messages :]
+        records = tuple(
+            sorted(
+                (*topic, *group),
+                key=lambda item: (item.journal_sequence, item.dedup_key),
+            )
+        )
         return CanonicalGroupContext(
             records=records,
             quality=ContextQuality.CANONICAL_PARTIAL,
@@ -294,6 +317,8 @@ class GroupContextLedger:
             tenant_key=request.tenant_key,
             chat_id=request.chat_id,
             current_message_id=request.current_message_id,
+            thread_root_message_id=request.thread_root_message_id,
+            feishu_thread_id=request.feishu_thread_id,
             causal_event_id=causal_event_id,
         )
         messages: list[ContextMessage] = []
@@ -352,28 +377,43 @@ class GroupContextLedger:
         current = messages[-1]
         if (
             current.message_id != request.current_message_id
-            or current.sender_id != request.requester_principal_id
+            or current.sender_id != request.source_requester_principal_id
             or current.sender_id_type != "open_id"
         ):
             raise ContextUnavailableError(ContextUnavailableReason.CURRENT_MESSAGE)
+        thread = [
+            message
+            for message in messages
+            if message.is_current
+            or message.message_id == request.thread_root_message_id
+            or (
+                bool(request.feishu_thread_id)
+                and message.thread_id == request.feishu_thread_id
+            )
+        ]
+        thread_ids = {message.message_id for message in thread}
+        group = [message for message in messages if message.message_id not in thread_ids]
         revision_digest = hashlib.sha256(
-            "".join(MessageRevision.from_message(item).digest for item in messages).encode()
+            "".join(MessageRevision.from_message(item).digest for item in thread).encode()
         ).hexdigest()
         watermark = ThreadWatermark(
             thread_root_id=request.thread_root_message_id,
             last_message_id=current.message_id,
             last_timestamp=current.timestamp,
-            message_count=1,
+            message_count=len(thread),
             tenant_key=request.tenant_key,
             chat_id=request.chat_id,
             feishu_thread_id=request.feishu_thread_id,
             revision_digest=revision_digest,
         )
-        group = messages[:-1]
-        chars = sum(len(item.text) for item in messages) + len(l1_summary) + len(l2_summary)
-        tokens = math.ceil(chars * self._config.tokens_per_char) + request.system_prompt_token_reserve
-        if chars > self._config.max_context_chars or tokens > self._config.max_context_tokens:
-            raise ContextUnavailableError(ContextUnavailableReason.BUDGET)
+        budgeted = apply_context_budget(
+            config=self._config,
+            thread=thread,
+            group=group,
+            l1_summary=l1_summary,
+            l2_summary=l2_summary,
+            reserve=request.system_prompt_token_reserve,
+        )
         warning_code = (
             "order_unavailable"
             if warning_reason is ContextUnavailableReason.ORDERING
@@ -392,14 +432,25 @@ class GroupContextLedger:
             ).encode()
         ).hexdigest()
         return AssembledContext(
-            thread_messages=(current,),
+            thread_messages=tuple(thread),
             group_messages=tuple(group),
-            l1_summary=l1_summary,
-            l2_summary=l2_summary,
-            total_tokens_estimate=tokens,
+            l1_summary=budgeted.l1_summary,
+            l2_summary=budgeted.l2_summary,
+            total_tokens_estimate=budgeted.total_tokens,
             watermark=watermark,
-            layers_used=(ContextLayer.THREAD_FULL, ContextLayer.GROUP_RECENT),
-            total_chars=chars,
+            layers_used=tuple(
+                layer
+                for layer, present in (
+                    (ContextLayer.THREAD_FULL, bool(thread)),
+                    (ContextLayer.GROUP_RECENT, bool(group)),
+                    (ContextLayer.L1_MEMORY, bool(budgeted.l1_summary)),
+                    (ContextLayer.L2_GROUP, bool(budgeted.l2_summary)),
+                )
+                if present
+            ),
+            truncated=bool(budgeted.trimming_trace),
+            total_chars=budgeted.total_chars,
+            trimming_trace=budgeted.trimming_trace,
             snapshot_hash=snapshot_hash,
             system_prompt_tokens_reserved=request.system_prompt_token_reserve,
             constraints_digest=request.constraints_digest,

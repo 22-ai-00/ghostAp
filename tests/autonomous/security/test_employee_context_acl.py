@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from src.autonomous.authorization import EmployeeAuthorizationScope
 from src.autonomous.context import (
     AuthorizedContextRequest,
     AuthorizedGroupMemoryReader,
@@ -223,6 +224,8 @@ def _request(**changes) -> AuthorizedContextRequest:
         "feishu_thread_id": "omt_1",
         "current_message_id": "om_current",
         "requester_principal_id": "ou_requester",
+        "source_requester_principal_id": "ou_requester",
+        "authorization_scope": EmployeeAuthorizationScope.MANAGED_GROUP,
     }
     values.update(changes)
     return AuthorizedContextRequest(**values)
@@ -342,6 +345,24 @@ def test_l2_reads_only_authorized_chat_and_sanitizes_backend_failure() -> None:
     assert "sensitive" not in str(raised.value)
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
+
+
+def test_owner_p2p_can_never_read_managed_group_l2() -> None:
+    state = _workforce_state()
+    backend = _Backend()
+    reader = _group_reader(state, allowed=True, backend=backend)
+
+    with pytest.raises(ContextUnavailableError) as raised:
+        reader.read(
+            _request(
+                requester_principal_id="ou_owner",
+                source_requester_principal_id="ou_employee_app_owner",
+                authorization_scope=EmployeeAuthorizationScope.OWNER_P2P,
+            )
+        )
+
+    assert raised.value.reason is ContextUnavailableReason.SCOPE
+    assert backend.calls == []
 
 
 def test_l2_adapter_reads_existing_employee_group_memory(tmp_path: Path) -> None:

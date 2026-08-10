@@ -11,6 +11,7 @@ from threading import Barrier
 
 import pytest
 
+from src.autonomous.authorization import EmployeeAuthorizationScope
 from src.autonomous.context.runtime import RuntimeRequesterChatAcl
 from src.autonomous.domain import BotPrincipal, EmployeeDefinition, EmployeeState, WorkerType
 from src.autonomous.ingress.models import EmployeeIngressMetadata, EmployeeIngressPayload
@@ -36,14 +37,17 @@ def _payload(
     index: int,
     *,
     sender: str = "ou_requester",
+    chat_type: str = "group",
+    sender_union_id: str = "",
     attachment_descriptors: tuple[dict[str, object], ...] = (),
 ) -> EmployeeIngressPayload:
     part = {
         "type": "message",
         "message_type": "text",
-        "chat_type": "group",
+        "chat_type": chat_type,
         "content": {"text": f"task {index}"},
         "sender_id": sender,
+        "sender_union_id": sender_union_id,
         "sender_id_type": "open_id",
         "sender_type": "user",
         "sender_tenant_key": "tenant_1",
@@ -226,6 +230,9 @@ def _stack(
     inactive_agent_ids: tuple[str, ...] = (),
     anchor: MemoryAnchor | None = None,
     attachment_staging: object | None = None,
+    requester_acl: object | None = None,
+    membership_health: object | None = None,
+    requester_principal_resolver=None,
 ):
     module = _module()
     writer = JournalWriter.open(
@@ -281,15 +288,17 @@ def _stack(
             ingress_service=ingress,
             registry_provider=lambda: ProjectedAgentRegistry(workforce),
             channel_status_provider=channels,
-            requester_acl=RuntimeRequesterChatAcl(
+            requester_acl=requester_acl
+            or RuntimeRequesterChatAcl(
                 allowed_requesters=("ou_requester",),
                 allowed_chats=("oc_team", "oc_other"),
             ),
             queue_limits=module.RouterQueueLimits(
                 per_employee=limits[0], per_team=limits[1], global_limit=limits[2]
             ),
-            membership_health=_HealthyMembership(),
+            membership_health=membership_health or _HealthyMembership(),
             attachment_staging=attachment_staging,
+            requester_principal_resolver=requester_principal_resolver,
         )
 
     return module, writer, ingress, new_router
@@ -302,11 +311,15 @@ def _accept(
     *,
     sender: str = "ou_requester",
     chat_id: str = "oc_team",
+    chat_type: str = "group",
+    sender_union_id: str = "",
     attachment_descriptors: tuple[dict[str, object], ...] = (),
 ) -> str:
     payload = _payload(
         index,
         sender=sender,
+        chat_type=chat_type,
+        sender_union_id=sender_union_id,
         attachment_descriptors=attachment_descriptors,
     )
     metadata = _metadata(payload, index, agent_id, chat_id=chat_id)
@@ -317,6 +330,124 @@ def _accept(
         request_id=f"req_{agent_id.removeprefix('agt_')}_{index}",
     )
     return ack.acceptance.acceptance_id
+
+
+def test_owner_p2p_routes_with_union_owner_without_group_membership(
+    tmp_path: Path,
+) -> None:
+    class DenyIfConsulted:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def is_degraded(self, _agent_id: str, _chat_id: str) -> bool:
+            self.calls += 1
+            raise AssertionError("OWNER_P2P must not consult membership health")
+
+    membership = DenyIfConsulted()
+
+    def resolve_owner(**values):
+        if (
+            values["owner_principal_id"] == "ou_owner"
+            and values["sender_union_id"] == "on_owner"
+        ):
+            return "ou_owner"
+        return None
+
+    _, writer, ingress, new_router = _stack(
+        tmp_path,
+        requester_acl=RuntimeRequesterChatAcl(
+            allowed_requesters=("ou_owner",),
+            allowed_chats=("oc_team",),
+        ),
+        membership_health=membership,
+        requester_principal_resolver=resolve_owner,
+    )
+    router = new_router()
+    acceptance_id = _accept(
+        ingress,
+        91,
+        sender="ou_employee_app_owner",
+        chat_id="oc_owner_p2p",
+        chat_type="p2p",
+        sender_union_id="on_owner",
+    )
+
+    queued = router.route(acceptance_id)
+    grant = router.peek_dispatch_candidate()
+
+    assert queued.state == "queued"
+    assert queued.authority is not None
+    assert queued.authority.authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+    assert queued.authority.requester_principal_id == "ou_owner"
+    assert grant is not None
+    assert grant.request.authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+    assert grant.request.source_requester_principal_id == "ou_employee_app_owner"
+    assert membership.calls == 0
+    ingress.close()
+    writer.close()
+
+
+@pytest.mark.parametrize("sender_union_id", ["", "on_other"])
+def test_owner_p2p_missing_or_non_owner_union_fails_closed(
+    tmp_path: Path,
+    sender_union_id: str,
+) -> None:
+    _, writer, ingress, new_router = _stack(
+        tmp_path,
+        requester_acl=RuntimeRequesterChatAcl(
+            allowed_requesters=("ou_owner",),
+            allowed_chats=(),
+        ),
+        requester_principal_resolver=(
+            lambda **values: (
+                "ou_owner" if values["sender_union_id"] == "on_owner" else None
+            )
+        ),
+    )
+    router = new_router()
+    acceptance_id = _accept(
+        ingress,
+        92,
+        sender="ou_employee_app_owner",
+        chat_id="oc_owner_p2p",
+        chat_type="p2p",
+        sender_union_id=sender_union_id,
+    )
+
+    rejected = router.route(acceptance_id)
+
+    assert rejected.state == "terminal"
+    assert rejected.reason_code in {"requester_denied", "sender_invalid"}
+    ingress.close()
+    writer.close()
+
+
+def test_owner_p2p_without_explicit_union_resolver_fails_closed(
+    tmp_path: Path,
+) -> None:
+    _, writer, ingress, new_router = _stack(
+        tmp_path,
+        requester_acl=RuntimeRequesterChatAcl(
+            allowed_requesters=("ou_owner",),
+            allowed_chats=(),
+        ),
+    )
+    router = new_router()
+    acceptance_id = _accept(
+        ingress,
+        93,
+        sender="ou_owner",
+        chat_id="oc_owner_p2p",
+        chat_type="p2p",
+        sender_union_id="on_owner",
+    )
+
+    rejected = router.route(acceptance_id)
+
+    assert rejected.state == "terminal"
+    assert rejected.reason_code == "requester_denied"
+    ingress.close()
+    writer.close()
 
 
 def _commit_dispatch(router, writer, acceptance_id: str):
@@ -445,6 +576,7 @@ def test_router_replay_backfills_legacy_authorized_requester_from_acceptance(
     authority = router.state.by_acceptance_id[seed_acceptance].authority
     assert authority is not None
     authority_payload = authority.to_dict()
+    authority_payload.pop("authorization_scope")
     authority_payload["requester_principal_id"] = "ou_resolved_requester"
 
     legacy_acceptance = _accept(ingress, 2)
@@ -470,6 +602,11 @@ def test_router_replay_backfills_legacy_authorized_requester_from_acceptance(
     replayed = restarted.state.by_acceptance_id[legacy_acceptance]
     assert replayed.state == "authorized"
     assert replayed.requester_principal_id == "ou_resolved_requester"
+    assert replayed.authority is not None
+    assert (
+        replayed.authority.authorization_scope
+        is EmployeeAuthorizationScope.MANAGED_GROUP
+    )
     ingress.close()
     writer.close()
 

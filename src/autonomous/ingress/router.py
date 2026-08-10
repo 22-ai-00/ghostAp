@@ -19,6 +19,7 @@ from typing import Any, Callable, Mapping, Protocol
 from ...trust.models import TrustZone
 from ...trust.registry import ManagedGroupRegistry
 from ...trust.resolver import TrustZoneResolver
+from ..authorization import EmployeeAuthorizationScope
 from ..context.models import AuthorizedContextRequest
 from ..domain import EmployeeState, WorkerType
 from ..journal.blob_store import BlobRef
@@ -201,6 +202,7 @@ class RouterAuthoritySnapshot:
     app_id: str
     channel_generation: int
     connection_id: str
+    authorization_scope: EmployeeAuthorizationScope
     team_id: str
     requester_principal_id: str
     projection_sequence: int
@@ -220,6 +222,7 @@ class RouterAuthoritySnapshot:
             "app_id",
             "channel_generation",
             "connection_id",
+            "authorization_scope",
             "team_id",
             "requester_principal_id",
             "projection_sequence",
@@ -248,6 +251,11 @@ class RouterAuthoritySnapshot:
         )
         if not all(isinstance(value, str) and value for value in required):
             raise ValueError("Router authority snapshot contains blank identity")
+        if not isinstance(
+            self.authorization_scope,
+            EmployeeAuthorizationScope,
+        ):
+            raise TypeError("invalid Router authorization scope")
         integers = (
             self.channel_generation,
             self.projection_sequence,
@@ -272,13 +280,34 @@ class RouterAuthoritySnapshot:
             raise ValueError("Router reserve requires constraints digest")
 
     def to_dict(self) -> dict[str, object]:
-        return {name: getattr(self, name) for name in sorted(self._FIELDS)}
+        result = {name: getattr(self, name) for name in sorted(self._FIELDS)}
+        result["authorization_scope"] = self.authorization_scope.value
+        return result
 
     @classmethod
-    def from_dict(cls, value: object) -> RouterAuthoritySnapshot:
-        if not isinstance(value, dict) or set(value) != cls._FIELDS:
+    def from_dict(
+        cls,
+        value: object,
+        *,
+        allow_legacy_replay: bool = False,
+    ) -> RouterAuthoritySnapshot:
+        if not isinstance(value, dict):
             raise ValueError("Router authority snapshot must use exact schema")
-        return cls(**value)
+        normalized = dict(value)
+        legacy_fields = cls._FIELDS - {"authorization_scope"}
+        if allow_legacy_replay and set(normalized) == legacy_fields:
+            normalized["authorization_scope"] = (
+                EmployeeAuthorizationScope.MANAGED_GROUP.value
+            )
+        if set(normalized) != cls._FIELDS:
+            raise ValueError("Router authority snapshot must use exact schema")
+        try:
+            normalized["authorization_scope"] = EmployeeAuthorizationScope(
+                normalized["authorization_scope"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid Router authorization scope") from exc
+        return cls(**normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,7 +425,10 @@ def _reduce_router_event(
         ) or record.state != "accepted":
             raise RouterProjectionError("invalid Router authorized transition")
         try:
-            authority = RouterAuthoritySnapshot.from_dict(payload["authority"])
+            authority = RouterAuthoritySnapshot.from_dict(
+                payload["authority"],
+                allow_legacy_replay=allow_legacy_replay,
+            )
         except (TypeError, ValueError) as exc:
             raise RouterProjectionError("invalid Router authority snapshot") from exc
         accepted_coordinates = (
@@ -447,7 +479,10 @@ def _reduce_router_event(
         if set(payload) != {"acceptance_id", "authority", "queue_position"} or record.state != "staging":
             raise RouterProjectionError("invalid Router queued transition")
         try:
-            authority = RouterAuthoritySnapshot.from_dict(payload["authority"])
+            authority = RouterAuthoritySnapshot.from_dict(
+                payload["authority"],
+                allow_legacy_replay=allow_legacy_replay,
+            )
         except (TypeError, ValueError) as exc:
             raise RouterProjectionError("invalid queued Router authority") from exc
         position = payload["queue_position"]
@@ -584,9 +619,7 @@ class DurableEmployeeIngressRouter:
         self._registry_provider = registry_provider
         self._channels = channel_status_provider
         self._requester_acl = requester_acl
-        self._requester_principal_resolver = (
-            requester_principal_resolver or _same_app_requester_principal
-        )
+        self._requester_principal_resolver = requester_principal_resolver
         self._managed_group_registry_provider = managed_group_registry_provider
         self._managed_group_owner_id = managed_group_owner_id
         self._employee_bot_ids_provider = employee_bot_ids_provider
@@ -1337,7 +1370,19 @@ class DurableEmployeeIngressRouter:
         )
         if not remote_chat_id:
             return None, "sender_invalid"
-        if self._managed_group_registry_provider is not None:
+        chat_type = part.get("chat_type")
+        if metadata.event_type == "ghostap.team.assignment.v1":
+            authorization_scope = EmployeeAuthorizationScope.MANAGED_GROUP
+        elif chat_type == "group":
+            authorization_scope = EmployeeAuthorizationScope.MANAGED_GROUP
+        elif chat_type == "p2p":
+            authorization_scope = EmployeeAuthorizationScope.OWNER_P2P
+        else:
+            return None, "sender_invalid"
+        if (
+            authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
+            and self._managed_group_registry_provider is not None
+        ):
             try:
                 managed_registry = self._managed_group_registry_provider()
                 if type(managed_registry) is not ManagedGroupRegistry:
@@ -1367,7 +1412,7 @@ class DurableEmployeeIngressRouter:
                 ).resolve(
                     sender_id=sender_id,
                     chat_id=remote_chat_id,
-                    chat_type=str(part.get("chat_type") or "group"),
+                    chat_type=str(chat_type),
                 )
                 if trust.zone is not TrustZone.MANAGED_AGENT_GROUP:
                     return None, "authority_denied"
@@ -1377,12 +1422,53 @@ class DurableEmployeeIngressRouter:
             registry = self._registry_provider()
             if type(registry) is not ProjectedAgentRegistry:
                 return None, "authority_denied"
+            employee = registry.get(metadata.tenant_key, metadata.agent_id)
+            if (
+                employee is None
+                or employee.state is not EmployeeState.ACTIVE
+                or employee.worker_type is not WorkerType.VISIBLE
+                or employee.bot_principal_id != metadata.bot_principal_id
+            ):
+                return None, "authority_denied"
+            sender_union_id = part.get("sender_union_id", "")
+            if not isinstance(sender_union_id, str):
+                return None, "sender_invalid"
+            if (
+                authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+                and not sender_union_id
+            ):
+                return None, "sender_invalid"
+            if metadata.event_type == "ghostap.team.assignment.v1":
+                requester_principal_id = metadata.sender_principal_id
+            else:
+                requester_principal_resolver = self._requester_principal_resolver
+                if requester_principal_resolver is None:
+                    if authorization_scope is EmployeeAuthorizationScope.OWNER_P2P:
+                        return None, "requester_denied"
+                    requester_principal_resolver = _same_app_requester_principal
+                try:
+                    requester_principal_id = requester_principal_resolver(
+                        tenant_key=metadata.tenant_key,
+                        agent_id=metadata.agent_id,
+                        owner_principal_id=employee.owner_principal_id,
+                        sender_principal_id=metadata.sender_principal_id,
+                        sender_union_id=sender_union_id,
+                    )
+                except Exception:
+                    return None, "requester_denied"
+            if (
+                not isinstance(requester_principal_id, str)
+                or not requester_principal_id
+            ):
+                return None, "requester_denied"
             binding = registry.context_binding(
                 tenant_key=metadata.tenant_key,
                 agent_id=metadata.agent_id,
                 bot_principal_id=metadata.bot_principal_id,
                 app_id=metadata.app_id,
                 chat_id=remote_chat_id,
+                requester_principal_id=requester_principal_id,
+                authorization_scope=authorization_scope,
             )
             if type(binding) is not ProjectedContextBinding:
                 return None, "authority_denied"
@@ -1394,7 +1480,17 @@ class DurableEmployeeIngressRouter:
                 or employee.tenant_key != metadata.tenant_key
                 or employee.agent_id != metadata.agent_id
                 or employee.bot_principal_id != metadata.bot_principal_id
-                or remote_chat_id not in employee.member_groups
+                or (
+                    authorization_scope
+                    is EmployeeAuthorizationScope.MANAGED_GROUP
+                    and remote_chat_id not in employee.member_groups
+                )
+                or (
+                    authorization_scope
+                    is EmployeeAuthorizationScope.OWNER_P2P
+                    and requester_principal_id
+                    != employee.owner_principal_id
+                )
                 or principal.bot_principal_id != metadata.bot_principal_id
                 or principal.tenant_key != metadata.tenant_key
                 or principal.agent_id != metadata.agent_id
@@ -1450,30 +1546,19 @@ class DurableEmployeeIngressRouter:
                 or connection_id != metadata.connection_id
             ):
                 return None, "authority_denied"
-            try:
-                membership_degraded = self._membership_health.is_degraded(
-                    metadata.agent_id,
-                    remote_chat_id,
-                )
-            except Exception:
-                return None, "membership_degraded"
-            if type(membership_degraded) is not bool or membership_degraded is not False:
-                return None, "membership_degraded"
-            sender_union_id = part.get("sender_union_id", "")
-            if not isinstance(sender_union_id, str):
-                return None, "sender_invalid"
-            try:
-                requester_principal_id = self._requester_principal_resolver(
-                    tenant_key=metadata.tenant_key,
-                    agent_id=metadata.agent_id,
-                    owner_principal_id=employee.owner_principal_id,
-                    sender_principal_id=metadata.sender_principal_id,
-                    sender_union_id=sender_union_id,
-                )
-            except Exception:
-                return None, "requester_denied"
-            if not isinstance(requester_principal_id, str) or not requester_principal_id:
-                return None, "requester_denied"
+            if authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP:
+                try:
+                    membership_degraded = self._membership_health.is_degraded(
+                        metadata.agent_id,
+                        remote_chat_id,
+                    )
+                except Exception:
+                    return None, "membership_degraded"
+                if (
+                    type(membership_degraded) is not bool
+                    or membership_degraded is not False
+                ):
+                    return None, "membership_degraded"
             snapshot = RouterAuthoritySnapshot(
                 tenant_key=metadata.tenant_key,
                 agent_id=employee.agent_id,
@@ -1481,6 +1566,7 @@ class DurableEmployeeIngressRouter:
                 app_id=principal.app_id,
                 channel_generation=metadata.channel_generation,
                 connection_id=metadata.connection_id,
+                authorization_scope=authorization_scope,
                 team_id=remote_chat_id,
                 requester_principal_id=requester_principal_id,
                 projection_sequence=binding.projection_sequence,
@@ -1560,6 +1646,15 @@ class DurableEmployeeIngressRouter:
             not isinstance(part.get("team_instruction"), str)
             or not part.get("team_instruction")
             or len(part.get("team_instruction")) > 14_000
+        ):
+            return None, "sender_invalid"
+        chat_type = part.get("chat_type")
+        if (
+            expected_type == "team_assignment"
+            and chat_type != "group"
+        ) or (
+            expected_type == "message"
+            and chat_type not in {"group", "p2p"}
         ):
             return None, "sender_invalid"
         sender_id = part.get("sender_id")
@@ -1642,6 +1737,8 @@ class DurableEmployeeIngressRouter:
             feishu_thread_id=thread_id,
             current_message_id=remote_message_id,
             requester_principal_id=authority.requester_principal_id,
+            source_requester_principal_id=metadata.sender_principal_id,
+            authorization_scope=authority.authorization_scope,
             system_prompt_token_reserve=authority.system_prompt_token_reserve,
             constraints_digest=authority.constraints_digest,
         )

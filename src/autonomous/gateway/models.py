@@ -9,6 +9,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from ..authorization import EmployeeAuthorizationScope
+
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _RFC3339_UTC_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)\Z"
@@ -62,6 +64,7 @@ class DispatchBinding:
     """Full replay authority anchored before any external ACP side effect."""
 
     schema_version: int
+    authorization_scope: EmployeeAuthorizationScope
     permit_id: str
     attempt_id: str
     acceptance_id: str
@@ -78,6 +81,7 @@ class DispatchBinding:
     ingress_connection_id: str
     authority_connection_id: str
     requester_principal_id: str
+    source_requester_principal_id: str
     task_id: str
     run_id: str
     message_id: str
@@ -104,6 +108,11 @@ class DispatchBinding:
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported dispatch binding schema")
+        if not isinstance(
+            self.authorization_scope,
+            EmployeeAuthorizationScope,
+        ):
+            raise TypeError("invalid dispatch authorization scope")
         if type(self.employee_version) is not int or self.employee_version < 0:
             raise ValueError("employee_version must be a non-negative integer")
         for name in ("channel_generation",):
@@ -124,6 +133,7 @@ class DispatchBinding:
             "ingress_connection_id",
             "authority_connection_id",
             "requester_principal_id",
+            "source_requester_principal_id",
             "task_id",
             "run_id",
             "message_id",
@@ -207,6 +217,7 @@ class DispatchBinding:
 
     def to_dict(self) -> dict[str, object]:
         result = {name: getattr(self, name) for name in self.__dataclass_fields__}
+        result["authorization_scope"] = self.authorization_scope.value
         result["permissions"] = list(self.permissions)
         result["capabilities"] = list(self.capabilities)
         return dict(sorted(result.items()))
@@ -223,7 +234,14 @@ class DispatchBinding:
             list,
         ):
             raise ValueError("dispatch authority collections must be JSON arrays")
-        return cls(**value)
+        normalized = dict(value)
+        try:
+            normalized["authorization_scope"] = EmployeeAuthorizationScope(
+                normalized["authorization_scope"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid dispatch authorization scope") from exc
+        return cls(**normalized)
 
 
 @dataclass(slots=True)

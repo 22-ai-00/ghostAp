@@ -477,6 +477,53 @@ def test_runtime_consumes_exact_stop_before_router_admission() -> None:
     )
 
 
+def test_owner_p2p_stop_uses_union_canonical_owner() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_owner_p2p_stop"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        chat_id="oc_owner_p2p",
+        message_id="om_current",
+        sender_principal_id="ou_employee_app_owner",
+        tenant_key="tenant_1",
+        thread_root_message_id="",
+    )
+    record = SimpleNamespace(disposition=None, metadata=metadata)
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(by_acceptance_id={acceptance_id: record})
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "p2p",
+                "content": {"text": "/stop"},
+            },
+        ),
+    )
+    ingress.get_payload.return_value = payload
+    dispatch = MagicMock()
+    dispatch.request_cancel.return_value = SimpleNamespace(
+        status="cancel_requested"
+    )
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = ingress
+    runtime._dispatch = dispatch
+    runtime._outbox_lifecycle = MagicMock()
+    runtime._drain_employee_outbox_once = MagicMock(return_value=True)
+    runtime._owner_p2p_requester = MagicMock(return_value="ou_owner")
+
+    assert runtime._handle_control_ingress(acceptance_id) is True
+
+    runtime._owner_p2p_requester.assert_called_once_with(record, payload)
+    dispatch.request_cancel.assert_called_once_with(
+        agent_id="agt_alpha",
+        chat_id="oc_owner_p2p",
+        requester_principal_id="ou_owner",
+        command_acceptance_id=acceptance_id,
+    )
+
+
 def test_runtime_does_not_consume_non_control_text() -> None:
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 
