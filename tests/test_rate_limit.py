@@ -134,7 +134,7 @@ class TestModelFailoverHelpers:
 
 
 def test_apply_compaction_once_rebuilds_session_with_same_cmd_args(monkeypatch):
-    """compaction 动作：应在关闭旧 session 后，使用相同 cmd/args 重建并 start 新 session。"""
+    """compaction builder 只重建 candidate；旧 session 由 wrapper 事务关闭。"""
     created = []
 
     class _Old:
@@ -169,7 +169,7 @@ def test_apply_compaction_once_rebuilds_session_with_same_cmd_args(monkeypatch):
 
     old = _Old()
     new = _apply_compaction_once(session=old, session_builder=lambda **kw: _New(**kw), startup_timeout_s=1.0)
-    assert old.closed is True
+    assert old.closed is False
     assert new is not None
     assert created and created[-1]["agent_cmd"] == "coco"
     assert "model.name=gpt-5.2" in " ".join(created[-1]["agent_args"])

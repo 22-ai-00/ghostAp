@@ -15,6 +15,7 @@ from src.workflow_engine.models import (
     AgentCallParams,
     AgentCallResult,
     ReviewAgentBinding,
+    WorkflowAgentBinding,
     WorkflowStatus,
 )
 from src.workflow_engine.run_spec import WorkflowRunSpec
@@ -54,6 +55,26 @@ def _run_spec(*, auto_reviewer: bool = False) -> WorkflowRunSpec:
     reviewers = () if auto_reviewer else (
         _binding("claude", "selected-claude-model", selection_key="claude:selected"),
     )
+    agent_pool = (
+        WorkflowAgentBinding(
+            agent_id="coco-selected",
+            tool_name="coco",
+            model_name="selected-coco-model",
+            display_name="Coco selected",
+        ),
+        *(
+            ()
+            if auto_reviewer
+            else (
+                WorkflowAgentBinding(
+                    agent_id="claude-selected",
+                    tool_name="claude",
+                    model_name="selected-claude-model",
+                    display_name="Claude selected",
+                ),
+            )
+        ),
+    )
     return WorkflowRunSpec(
         orchestrator=orchestrator,
         reviewers=reviewers,
@@ -69,6 +90,8 @@ def _run_spec(*, auto_reviewer: bool = False) -> WorkflowRunSpec:
         auto_reviewer=auto_reviewer,
         initiator_user_id="user-1",
         allowed_tools=("coco",) if auto_reviewer else ("coco", "claude"),
+        agent_pool=agent_pool,
+        orchestrator_agent_id="coco-selected",
     )
 
 
@@ -83,22 +106,27 @@ def test_workflow_run_spec_is_deeply_frozen() -> None:
     assert spec.reviewers[0].model_name == "selected-claude-model"
     assert spec.to_dict()["auto_reviewer"] is False
 
-    with pytest.raises(ValueError, match="model"):
-        WorkflowRunSpec(
-            orchestrator=spec.orchestrator,
-            reviewers=spec.reviewers,
-            tool_model_map={
-                "coco": "different-from-confirmed-selection",
-                "claude": "selected-claude-model",
-            },
-            task=spec.task,
-            chat_id=spec.chat_id,
-            topic_id=spec.topic_id,
-            budget=spec.budget,
-            deadline=spec.deadline,
-            auto_reviewer=spec.auto_reviewer,
-            allowed_tools=spec.allowed_tools,
-        )
+    rebuilt = WorkflowRunSpec(
+        orchestrator=spec.orchestrator,
+        reviewers=spec.reviewers,
+        tool_model_map={
+            "coco": "different-from-confirmed-selection",
+            "claude": "selected-claude-model",
+        },
+        task=spec.task,
+        chat_id=spec.chat_id,
+        topic_id=spec.topic_id,
+        budget=spec.budget,
+        deadline=spec.deadline,
+        auto_reviewer=spec.auto_reviewer,
+        allowed_tools=spec.allowed_tools,
+        agent_pool=spec.agent_pool,
+        orchestrator_agent_id=spec.orchestrator_agent_id,
+    )
+    assert dict(rebuilt.tool_model_map) == {
+        "coco": "selected-coco-model",
+        "claude": "selected-claude-model",
+    }
 
 
 def test_selected_model_map_reaches_every_agent_call(tmp_path) -> None:
@@ -122,6 +150,7 @@ def test_selected_model_map_reaches_every_agent_call(tmp_path) -> None:
             first = self.on_agent_call(
                 AgentCallParams(
                     prompt="first task",
+                    agent_id="coco-selected",
                     tool="coco",
                     model="script-invented-model",
                     label="first",
@@ -130,6 +159,7 @@ def test_selected_model_map_reaches_every_agent_call(tmp_path) -> None:
             second = self.on_agent_call(
                 AgentCallParams(
                     prompt="second task",
+                    agent_id="claude-selected",
                     tool="claude",
                     model=None,
                     label="second",
@@ -192,10 +222,10 @@ def test_run_spec_budget_and_deadline_reach_the_execution_gate(tmp_path) -> None
 
         def run(self) -> str:
             bridge_results["first"] = self.on_agent_call(
-                AgentCallParams(prompt="first", tool="coco")
+                AgentCallParams(prompt="first", agent_id="coco-selected", tool="coco")
             )
             bridge_results["second"] = self.on_agent_call(
-                AgentCallParams(prompt="second", tool="coco")
+                AgentCallParams(prompt="second", agent_id="coco-selected", tool="coco")
             )
             return json.dumps({"output": bridge_results["first"].output})
 
@@ -244,7 +274,7 @@ def test_expired_run_spec_deadline_fails_closed_before_backend_call(tmp_path) ->
 
         def run(self) -> str:
             result = self.on_agent_call(
-                AgentCallParams(prompt="too late", tool="coco")
+                AgentCallParams(prompt="too late", agent_id="coco-selected", tool="coco")
             )
             return json.dumps({"error": result.error})
 

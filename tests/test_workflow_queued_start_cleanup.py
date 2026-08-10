@@ -12,6 +12,7 @@ from src.feishu.handlers.workflow import (
     WorkflowHandler,
     _WorkflowLifecycleOwner,
 )
+from src.workflow_engine.agent_pool import WorkflowAgentBinding
 from src.workflow_engine.engine import WorkflowEngine, WorkflowEngineCallbacks
 from src.workflow_engine.manager import WorkflowEngineManager
 from src.workflow_engine.models import (
@@ -41,10 +42,11 @@ def test_cleanup_waits_for_started_preclaim_closure_and_fences_repo_lock(
         "  description: 'queued start cleanup regression',\n"
         "  phases: [{ title: 'Run', detail: 'Do work' }],\n"
         "  tools: ['coco'],\n"
+        "  agentPlan: [{ node: 'work', role: 'worker', agentId: 'A-1' }],\n"
         "};\n"
         "export default async function main() {\n"
-        "  const result = await agent('do work', {\n"
-        "    tool: 'coco', label: 'work', timeout: 120\n"
+        "  const result = await agent({\n"
+        "    prompt: 'do work', agentId: 'A-1', label: 'work', timeout: 120\n"
         "  });\n"
         "  if (result && result.error) return result;\n"
         "  return result;\n"
@@ -62,7 +64,17 @@ def test_cleanup_waits_for_started_preclaim_closure_and_fences_repo_lock(
             meta={"name": "preclaim-cleanup", "tools": ["coco"]},
             initiator_user_id="user_1",
             engine_session_key="session_1",
+            project_id="project_1",
             selected_tools=["coco"],
+            agent_pool=(
+                WorkflowAgentBinding(
+                    agent_id="A-1",
+                    tool_name="coco",
+                    model_name=None,
+                    display_name="Coco",
+                ),
+            ),
+            orchestrator_agent_id="A-1",
             orchestrator_agent="coco",
             orchestrator_binding=ReviewAgentBinding(
                 provider="cli",
@@ -102,7 +114,13 @@ def test_cleanup_waits_for_started_preclaim_closure_and_fences_repo_lock(
         )
     )
 
-    generation_owner = _WorkflowLifecycleOwner("session_1")
+    generation_owner = _WorkflowLifecycleOwner(
+        "session_1",
+        "user_1",
+        chat_id="chat_1",
+        project_id="project_1",
+        root_path=str(tmp_path),
+    )
     engine._script_generation_owner = generation_owner
     handler._queue_generated_workflow(
         message_id="generation_1",
@@ -233,3 +251,114 @@ def test_repeated_manager_cleanup_retains_preclaim_tombstone_until_done(
     owner.done_event.set()
     remove_with_expired_deadline()
     assert manager.get("chat_1", str(tmp_path)) is None
+
+
+def test_repeated_abandoned_starts_release_retired_owner_tombstones(tmp_path) -> None:
+    script_path = tmp_path / "generated-workflow.js"
+    script_text = (
+        "export const meta = {\n"
+        "  name: 'abandon-cleanup',\n"
+        "  description: 'owner release regression',\n"
+        "  phases: [{ title: 'Run', detail: 'Do work' }],\n"
+        "  tools: ['coco'],\n"
+        "  agentPlan: [{ node: 'work', role: 'worker', agentId: 'A-1' }],\n"
+        "};\n"
+        "export default async function main() {\n"
+        "  const result = await agent({\n"
+        "    prompt: 'work', agentId: 'A-1', label: 'work', timeout: 120\n"
+        "  });\n"
+        "  if (result && result.error) return result;\n"
+        "  return result;\n"
+        "}\n"
+    )
+    script_path.write_text(script_text, encoding="utf-8")
+    script_hash = hashlib.sha256(script_text.encode("utf-8")).hexdigest()
+    project = SimpleNamespace(
+        project_id="project_1",
+        project_name="project",
+        root_path=str(tmp_path),
+    )
+
+    for failure_mode in ("scheduler_rejected", "worker_not_admitted"):
+        engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
+        handler = WorkflowHandler.__new__(WorkflowHandler)
+        handler.ctx = MagicMock(progress_reporter=MagicMock())
+        handler._reply_workflow_error = MagicMock()
+        handler._resolve_origin = MagicMock(return_value="origin_1")
+        handler._show_initial_workflow_progress_card = MagicMock(
+            return_value="progress_1"
+        )
+        handler.get_engine_name = MagicMock(return_value="coco")
+        handler._build_error_card = MagicMock(return_value={"error": True})
+        handler._replace_or_send_workflow_card = MagicMock()
+        handler._remove_owned_workflow_artifact = MagicMock()
+
+        def submit(run_fn, *_args, **_kwargs):
+            if failure_mode == "scheduler_rejected":
+                raise RuntimeError("scheduler unavailable")
+            engine._closing = True
+            try:
+                run_fn()
+            finally:
+                engine._closing = False
+
+        handler._submit_engine_task = MagicMock(side_effect=submit)
+
+        for index in range(24):
+            session_key = f"generation-{failure_mode}-{index}"
+            generation_owner = _WorkflowLifecycleOwner(
+                session_key,
+                "user_1",
+                chat_id="chat_1",
+                project_id="project_1",
+                root_path=str(tmp_path),
+            )
+            engine._project = WorkflowProject(
+                status=WorkflowStatus.GENERATING_SCRIPT,
+                pending=PendingWorkflow(
+                    script_path=str(script_path),
+                    requirement="do work",
+                    meta={"name": "abandon-cleanup", "tools": ["coco"]},
+                    initiator_user_id="user_1",
+                    engine_session_key=session_key,
+                    project_id="project_1",
+                    selected_tools=["coco"],
+                    agent_pool=(
+                        WorkflowAgentBinding(
+                            agent_id="A-1",
+                            tool_name="coco",
+                            model_name=None,
+                            display_name="Coco",
+                        ),
+                    ),
+                    orchestrator_agent_id="A-1",
+                    orchestrator_agent="coco",
+                    orchestrator_binding=ReviewAgentBinding(
+                        provider="cli",
+                        tool_name="coco",
+                        display_name="Coco",
+                        agent_type="coco",
+                        model_name=None,
+                        model_display_name=None,
+                        selection_key="coco:default",
+                        use_default_model=True,
+                    ),
+                    script_hash=script_hash,
+                ),
+            )
+            engine._script_generation_owner = generation_owner
+
+            handler._queue_generated_workflow(
+                message_id=f"generation_{index}",
+                chat_id="chat_1",
+                project=project,
+                root_path=str(tmp_path),
+                engine=engine,
+                generation_owner=generation_owner,
+            )
+
+            assert handler._submit_engine_task.call_count == index + 1
+            generation_owner.done_event.set()
+            engine.release_lifecycle_owner(generation_owner)
+            assert engine._workflow_start_owner is None
+            assert engine._retired_lifecycle_owners == []

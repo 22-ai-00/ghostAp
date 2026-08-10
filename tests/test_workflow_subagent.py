@@ -131,7 +131,10 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
     """Test that generate_simple_script includes SUBAGENT_ENCOURAGEMENT in agent prompts."""
 
     def test_generate_simple_script_returns_card_summary_envelope(self):
-        script = generate_simple_script("Implement and verify a focused change")
+        script = generate_simple_script(
+            "Implement and verify a focused change",
+            legacy_replay=True,
+        )
 
         self.assertIn("function completionEnvelope", script)
         self.assertIn("card_summary", script)
@@ -139,18 +142,25 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
         self.assertIn("任务已完成，完整结果见报告。", script)
 
     def test_script_has_valid_structure(self):
-        script = generate_simple_script("Test requirement")
+        script = generate_simple_script("Test requirement", legacy_replay=True)
         self.assertIn("export const meta", script)
         self.assertIn("export default async function", script)
         self.assertIn("agent(", script)
 
     def test_script_avoids_slow_static_analysis_agent(self):
-        script = generate_simple_script("Fix workflow state mismatch")
+        script = generate_simple_script(
+            "Fix workflow state mismatch",
+            legacy_replay=True,
+        )
         self.assertNotIn('label: "task-analysis"', script)
         self.assertNotIn("Analyze this task and determine the best execution strategy", script)
 
     def test_script_bounds_agent_calls_and_handles_errors(self):
-        script = generate_simple_script("Fix workflow state mismatch", selected_tools=["coco", "codex"])
+        script = generate_simple_script(
+            "Fix workflow state mismatch",
+            selected_tools=["coco", "codex"],
+            legacy_replay=True,
+        )
         self.assertIn("timeout:", script)
         self.assertIn(".error", script)
         self.assertIn("fallback", script.lower())
@@ -162,6 +172,7 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
         script = generate_simple_script(
             "分析 spec 模式目标完成度如何把控，先不要动手改代码",
             selected_tools=["traex", "codex", "coco"],
+            legacy_replay=True,
         )
 
         self.assertNotIn("race(", script)
@@ -177,6 +188,7 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
         script = generate_simple_script(
             "分析 spec 模式目标完成度如何把控，先不要动手改代码",
             selected_tools=["traex", "codex"],
+            legacy_replay=True,
         )
 
         self.assertIn("If the user asks for analysis only", script)

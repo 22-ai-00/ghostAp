@@ -391,6 +391,7 @@ class BaseEngineHandler(BaseHandler):
                 "link_task失败(%s_%s): message_id=%s, run_id=%s, err=%s",
                 task_type, name_suffix, message_id, handle.run_id, e,
             )
+        return handle
 
     def _safe_lifecycle_action(
         self,

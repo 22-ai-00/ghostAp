@@ -88,6 +88,7 @@ class WorkflowStateManager:
         task_summary: str = "",
         model: str | None = None,
         role: str | None = None,
+        agent_id: str | None = None,
     ) -> str:
         """Add an agent entry to the current (or matching) phase.
 
@@ -106,6 +107,7 @@ class WorkflowStateManager:
             self._next_agent_call_index += 1
             agent = AgentProgress(
                 label=effective_label,
+                agent_id=agent_id,
                 tool=tool,
                 model=model,
                 role=role,
@@ -442,6 +444,7 @@ class WorkflowStateManager:
                     agents=[
                         AgentProgress.model_construct(
                             label=agent.label,
+                            agent_id=agent.agent_id,
                             tool=agent.tool,
                             model=agent.model,
                             role=agent.role,

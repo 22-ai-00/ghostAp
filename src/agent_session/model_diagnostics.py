@@ -225,13 +225,6 @@ def _apply_compaction_once(
         # 不是 ACP backend 或缺少启动信息
         return None
 
-    # 关闭旧会话
-    try:
-        session.close()
-    except Exception:
-        # close 失败也继续尝试重建（best-effort）
-        logger.debug("_apply_compaction_once: session close failed", exc_info=True)
-
     # 重建新会话（仅 ACP 后端），保持相同 cmd/args（即保持同模型）。
     try:
         timeout_s = float(startup_timeout_s or getattr(get_settings(), "acp_startup_timeout", 20) or 20)

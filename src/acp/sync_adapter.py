@@ -919,6 +919,7 @@ class SyncACPSession:
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         timeout: Optional[int] = None,
         idle_timeout: Optional[float] = None,
+        activity_predicate: Optional[Callable[[ACPEvent], bool]] = None,
         await_goal_quiescence: bool = True,
         await_child_quiescence: bool = False,
         replay_deferred_child_events: bool = False,
@@ -936,6 +937,7 @@ class SyncACPSession:
                 on_event=on_event,
                 timeout=timeout,
                 idle_timeout=idle_timeout,
+                activity_predicate=activity_predicate,
                 await_goal_quiescence=await_goal_quiescence,
                 await_child_quiescence=await_child_quiescence,
                 replay_deferred_child_events=replay_deferred_child_events,
@@ -1059,6 +1061,7 @@ class SyncACPSession:
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         timeout: Optional[int] = None,
         idle_timeout: Optional[float] = None,
+        activity_predicate: Optional[Callable[[ACPEvent], bool]] = None,
         await_goal_quiescence: bool = True,
         await_child_quiescence: bool = False,
         replay_deferred_child_events: bool = False,
@@ -1088,7 +1091,15 @@ class SyncACPSession:
         last_activity_ts = [time.time()]
 
         def _activity_on_event(ev: ACPEvent) -> None:
-            last_activity_ts[0] = time.time()
+            counts_as_activity = True
+            if activity_predicate is not None:
+                try:
+                    counts_as_activity = bool(activity_predicate(ev))
+                except Exception:
+                    counts_as_activity = False
+                    logger.warning("ACP activity predicate failed closed", exc_info=True)
+            if counts_as_activity:
+                last_activity_ts[0] = time.time()
             if on_event:
                 on_event(ev)
 

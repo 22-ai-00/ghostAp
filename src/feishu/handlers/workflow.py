@@ -30,6 +30,9 @@ class _WorkflowLifecycleOwner:
 
     session_key: str
     initiator_user_id: str = ""
+    chat_id: str = ""
+    project_id: str = ""
+    root_path: str = ""
     stop_event: threading.Event = field(default_factory=threading.Event)
     heartbeat_stop_event: threading.Event = field(default_factory=threading.Event)
     delivery_lock: Any = field(default_factory=threading.RLock)
@@ -40,7 +43,14 @@ class _WorkflowLifecycleOwner:
     worker_started_event: threading.Event = field(
         default_factory=threading.Event,
     )
+    worker_exited_event: threading.Event = field(
+        default_factory=threading.Event,
+    )
     worker_thread_id: int | None = field(
+        default=None,
+        compare=False,
+    )
+    active_generation_session: Any = field(
         default=None,
         compare=False,
     )
@@ -50,11 +60,16 @@ class _WorkflowGenerationCancelled(RuntimeError):
     """Internal control flow: a superseded generator must not write fallback."""
 
 
+class _WorkflowGenerationCloseUncertain(RuntimeError):
+    """The prior binding may still be live, so fallback is unsafe."""
+
+
 def _workflow_pending_statuses():
     """States that own a pending Workflow card/session rather than a runtime run."""
     from ...workflow_engine.models import WorkflowStatus
 
     return {
+        WorkflowStatus.SELECTING_AGENTS,
         WorkflowStatus.GENERATING_SCRIPT,
     }
 
@@ -253,8 +268,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             project=project,
         )
 
-        # Auto-run with defaults: skip manual orchestrator/reviewer selection by default.
-        self._start_workflow_with_defaults(
+        self._start_workflow_agent_selection(
             message_id=message_id,
             chat_id=chat_id,
             requirement=requirement,
@@ -457,6 +471,600 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             logger.debug("Failed to show initial workflow progress card", exc_info=True)
             return card_message_id
 
+    @staticmethod
+    def _workflow_selected_option(value: dict[str, Any]) -> str | None:
+        option = value.get("_option")
+        if isinstance(option, dict):
+            option = option.get("value")
+        selected = str(option or "").strip()
+        return selected or None
+
+    @staticmethod
+    def _workflow_selection_model_state(
+        *,
+        tool_name: str,
+        root_path: str,
+        pending: Any,
+        selected_model: str | None = None,
+        selected_profile: str | None = None,
+        selected_effort: str | None = None,
+    ) -> tuple[list[Any], Any]:
+        from ...acp.helper import fetch_acp_models
+        from ...card.render.model_cascade import resolve_model_cascade
+
+        models = fetch_acp_models(
+            tool_name,
+            cwd=root_path,
+            current_model=None,
+        )
+        state = resolve_model_cascade(
+            models,
+            selected_model=(
+                pending.draft_model_name
+                if selected_model is None
+                else selected_model
+            ),
+            selected_profile=(
+                pending.draft_profile
+                if selected_profile is None
+                else selected_profile
+            ),
+            selected_effort=(
+                pending.draft_effort
+                if selected_effort is None
+                else selected_effort
+            ),
+        )
+        return models, state
+
+    @classmethod
+    def _validated_workflow_draft_binding(
+        cls,
+        *,
+        pending: Any,
+        root_path: str,
+        available_tools: dict[str, str],
+    ) -> tuple[str | None, str | None, str | None]:
+        from ...card.render.model_cascade import (
+            available_model_efforts,
+            available_model_names,
+            available_model_profiles,
+            compose_model_selection,
+        )
+
+        tool_name = str(pending.draft_tool_name or "").strip().lower()
+        if tool_name not in available_tools:
+            raise ValueError("所选工具当前不可用，请重新选择。")
+        if not pending.draft_model_name:
+            if pending.draft_profile or pending.draft_effort:
+                raise ValueError("Backend default 模型不能携带 Profile 或 Effort。")
+            return None, None, None
+
+        models, _state = cls._workflow_selection_model_state(
+            tool_name=tool_name,
+            root_path=root_path,
+            pending=pending,
+        )
+        model_name = str(pending.draft_model_name).strip()
+        names = available_model_names(models)
+        if model_name not in names:
+            raise ValueError("所选模型已不可用，请重新选择。")
+        profiles = available_model_profiles(models, model_name)
+        profile = str(pending.draft_profile or "").strip().lower() or None
+        if profiles and profile not in profiles:
+            raise ValueError("所选 Profile 不属于当前模型能力。")
+        if not profiles and profile is not None:
+            raise ValueError("当前模型不支持 Profile。")
+        efforts = available_model_efforts(models, model_name, profile)
+        effort = str(pending.draft_effort or "").strip().lower() or None
+        if efforts and effort not in efforts:
+            raise ValueError("所选 Effort 不属于当前模型能力。")
+        if not efforts and effort is not None:
+            raise ValueError("当前模型不支持 Effort。")
+        selection = compose_model_selection(
+            models,
+            model=model_name,
+            profile=profile,
+            effort=effort,
+        )
+        if selection is None:
+            raise ValueError("所选模型组合不是后端声明的有效能力。")
+        return selection, profile, effort
+
+    @classmethod
+    def _validate_workflow_pool_capabilities(
+        cls,
+        *,
+        pending: Any,
+        root_path: str,
+        available_tools: dict[str, str],
+    ) -> None:
+        from ...acp.helper import fetch_acp_models
+        from ...card.render.model_cascade import parse_model_selection
+
+        for binding in pending.agent_pool:
+            if binding.tool_name not in available_tools:
+                raise ValueError(f"{binding.agent_id} 的工具已不可用。")
+            if binding.model_name is None:
+                if binding.profile or binding.effort:
+                    raise ValueError(f"{binding.agent_id} 的默认模型组合无效。")
+                continue
+            models = fetch_acp_models(
+                binding.tool_name,
+                cwd=root_path,
+                current_model=None,
+            )
+            selection = parse_model_selection(models, binding.model_name)
+            if selection is None:
+                raise ValueError(f"{binding.agent_id} 的模型已不可用。")
+            if selection.profile != binding.profile or selection.effort != binding.effort:
+                raise ValueError(f"{binding.agent_id} 的模型能力组合已变更。")
+
+    @classmethod
+    def _workflow_selection_card_data(
+        cls,
+        *,
+        pending: Any,
+        project_id: str,
+        root_path: str,
+        available_tools: dict[str, str],
+    ) -> dict[str, Any]:
+        from ...workflow_engine.renderer import WorkflowAgentSelectionRenderer
+
+        model_state = None
+        tool_name = str(pending.draft_tool_name or "").strip().lower()
+        if tool_name in available_tools:
+            _models, model_state = cls._workflow_selection_model_state(
+                tool_name=tool_name,
+                root_path=root_path,
+                pending=pending,
+            )
+        return WorkflowAgentSelectionRenderer(
+            pending,
+            project_id=project_id,
+            tool_options=available_tools,
+            model_state=model_state,
+        ).render()
+
+    def _start_workflow_agent_selection(
+        self,
+        message_id: str,
+        chat_id: str,
+        requirement: str,
+        project: "ProjectContext" | None,
+        root_path: str,
+        admission_owner: _WorkflowLifecycleOwner | None,
+    ) -> None:
+        """Publish an owner-bound Agent Pool card without opening an ACP session."""
+        from ...thread import get_current_sender_id
+        from ...workflow_engine.models import PendingWorkflow, WorkflowProject, WorkflowStatus
+        from ...workflow_engine.tool_registry import get_available_tools
+
+        available_tools = get_available_tools(require_available=True)
+        if not available_tools:
+            self._reply_workflow_error(
+                message_id,
+                "invalid_state",
+                detail="当前环境未检测到可执行的 Workflow 工具。",
+            )
+            return
+
+        engine = self.ctx.workflow_engine_manager.get_or_create(
+            chat_id,
+            root_path,
+            engine_name=self.get_engine_name(
+                chat_id,
+                project_id=(project.project_id if project else None),
+            ),
+        )
+        project_id = getattr(project, "project_id", "") or ""
+        recommendation_order = ("traex", "claude", "codex", "aiden", "gemini", "coco")
+        recommendation_names = [
+            name for name in recommendation_order if name in available_tools
+        ] or list(available_tools)[:3]
+        recommendations = [
+            {
+                "tool_name": name,
+                "model_name": None,
+                "display_name": str(available_tools[name] or name),
+            }
+            for name in recommendation_names
+        ]
+
+        with engine._lock:
+            if not engine.project:
+                engine._project = WorkflowProject()
+            if admission_owner is None:
+                admission_owner = _WorkflowLifecycleOwner(
+                    session_key=uuid.uuid4().hex,
+                    initiator_user_id=get_current_sender_id() or "",
+                    chat_id=chat_id,
+                    project_id=project_id,
+                    root_path=root_path,
+                )
+                engine._workflow_selection_owner = admission_owner
+            elif (
+                vars(engine).get("_workflow_selection_owner") is not admission_owner
+                or admission_owner.stop_event.is_set()
+            ):
+                return
+            else:
+                object.__setattr__(admission_owner, "chat_id", chat_id)
+                object.__setattr__(admission_owner, "project_id", project_id)
+                object.__setattr__(admission_owner, "root_path", root_path)
+
+            pending = PendingWorkflow(
+                requirement=requirement,
+                initiator_user_id=(
+                    admission_owner.initiator_user_id or get_current_sender_id() or ""
+                ),
+                selection_session_key=admission_owner.session_key,
+                project_id=project_id,
+                recommended_agents=recommendations,
+                draft_tool_name=recommendation_names[0],
+            )
+            engine.project.pending = pending
+            engine.project.status = WorkflowStatus.SELECTING_AGENTS
+            engine.project.requirement = requirement
+            engine.project.error = None
+            engine.project.finished_at = None
+
+        card_data = self._workflow_selection_card_data(
+            pending=pending,
+            project_id=project_id,
+            root_path=root_path,
+            available_tools=available_tools,
+        )
+        self.send_card_to_chat(
+            chat_id,
+            self._build_workflow_card_from_renderer_data(card_data),
+            origin_message_id=message_id,
+        )
+
+    def handle_workflow_agent_action(
+        self,
+        message_id: str,
+        chat_id: str,
+        project_id: str,
+        value: dict[str, Any],
+    ) -> None:
+        """Apply one Agent Pool selection action with owner/session/project CAS."""
+        from ...spec_engine.models import ReviewAgentBinding
+        from ...thread import get_current_sender_id
+        from ...workflow_engine.agent_pool import (
+            WorkflowAgentBinding,
+            select_auto_orchestrator,
+        )
+        from ...workflow_engine.constants import MAX_WORKFLOW_AGENT_POOL_SIZE
+        from ...workflow_engine.models import WorkflowStatus
+        from ...workflow_engine.tool_registry import get_available_tools
+
+        payload_project_id = str(value.get("project_id") or project_id or "")
+        if not project_id or payload_project_id != project_id:
+            self._reply_workflow_error(message_id, "session_expired")
+            return
+        project = self._resolve_project_from_id(project_id, chat_id)
+        if project is None:
+            self._reply_workflow_error(message_id, "session_expired")
+            return
+        root_path = self._get_root_path(chat_id, project)
+        engine = self.ctx.workflow_engine_manager.get(chat_id, root_path)
+        if engine is None:
+            self._reply_workflow_error(message_id, "session_expired")
+            return
+
+        action = str(value.get("action") or "")
+        selected_option = self._workflow_selected_option(value)
+        session_key = str(value.get("selection_session_key") or "")
+        current_user = get_current_sender_id() or ""
+        available_tools = get_available_tools(require_available=True)
+        error: tuple[str, str] | None = None
+        generation: tuple[Any, _WorkflowLifecycleOwner, str] | None = None
+        pending = None
+        owner_valid = False
+        authorized = False
+
+        with engine._lock:
+            owner = vars(engine).get("_workflow_selection_owner")
+            wf_project = engine.project
+            pending = wf_project.pending if wf_project else None
+            owner_valid = bool(
+                isinstance(owner, _WorkflowLifecycleOwner)
+                and not owner.stop_event.is_set()
+                and owner.session_key == session_key
+                and owner.chat_id == chat_id
+                and owner.project_id == project_id
+                and owner.root_path == root_path
+                and wf_project is not None
+                and wf_project.status == WorkflowStatus.SELECTING_AGENTS
+                and pending is not None
+                and pending.selection_session_key == session_key
+                and pending.project_id == project_id
+            )
+            if not owner_valid:
+                error = ("session_expired", "该 Agent 选择卡已失效，请重新发送 `/wf`。")
+            elif not current_user or current_user != (pending.initiator_user_id or ""):
+                error = ("forbidden", "只有本次 Workflow 发起者可以修改 Agent Pool。")
+            else:
+                authorized = True
+                pending.selection_error = None
+
+            if authorized and action == "workflow_select_tool":
+                tool_name = str(selected_option or "").lower()
+                if tool_name not in available_tools:
+                    error = ("invalid_argument", "所选工具当前不可用。")
+                else:
+                    pending.draft_tool_name = tool_name
+                    pending.draft_model_name = None
+                    pending.draft_profile = None
+                    pending.draft_effort = None
+            elif authorized and action == "workflow_select_model":
+                model_name = str(selected_option or "").strip()
+                if model_name == "default":
+                    pending.draft_model_name = None
+                    pending.draft_profile = None
+                    pending.draft_effort = None
+                else:
+                    from ...card.render.model_cascade import available_model_names
+
+                    _models, state = self._workflow_selection_model_state(
+                        tool_name=pending.draft_tool_name or "",
+                        root_path=root_path,
+                        pending=pending,
+                        selected_model=model_name,
+                        selected_profile="",
+                        selected_effort="",
+                    )
+                    if model_name not in available_model_names(_models):
+                        error = ("invalid_argument", "所选模型当前不可用。")
+                    else:
+                        pending.draft_model_name = state.selected_model
+                        pending.draft_profile = state.selected_profile
+                        pending.draft_effort = state.selected_effort
+            elif authorized and action == "workflow_select_profile":
+                profile = str(selected_option or "").strip().lower()
+                _models, state = self._workflow_selection_model_state(
+                    tool_name=pending.draft_tool_name or "",
+                    root_path=root_path,
+                    pending=pending,
+                    selected_profile=profile,
+                    selected_effort="",
+                )
+                if not pending.draft_model_name or profile not in state.profiles:
+                    error = ("invalid_argument", "所选 Profile 不属于当前模型能力。")
+                else:
+                    pending.draft_profile = state.selected_profile
+                    pending.draft_effort = state.selected_effort
+            elif authorized and action == "workflow_select_effort":
+                effort = str(selected_option or "").strip().lower()
+                _models, state = self._workflow_selection_model_state(
+                    tool_name=pending.draft_tool_name or "",
+                    root_path=root_path,
+                    pending=pending,
+                    selected_effort=effort,
+                )
+                if not pending.draft_model_name or effort not in state.efforts:
+                    error = ("invalid_argument", "所选 Effort 不属于当前模型能力。")
+                else:
+                    pending.draft_effort = state.selected_effort
+            elif authorized and action == "workflow_add_agent":
+                tool_name = str(pending.draft_tool_name or "").lower()
+                if tool_name not in available_tools:
+                    error = ("invalid_argument", "请先选择当前可用的工具。")
+                elif len(pending.agent_pool) >= MAX_WORKFLOW_AGENT_POOL_SIZE:
+                    error = (
+                        "invalid_argument",
+                        f"并发 Agent Pool 最多允许 {MAX_WORKFLOW_AGENT_POOL_SIZE} 个 Agent。",
+                    )
+                else:
+                    try:
+                        model_name, profile, effort = self._validated_workflow_draft_binding(
+                            pending=pending,
+                            root_path=root_path,
+                            available_tools=available_tools,
+                        )
+                    except ValueError as exc:
+                        error = ("invalid_argument", str(exc))
+                    else:
+                        if any(
+                            binding.tool_name == tool_name
+                            and binding.model_name == model_name
+                            for binding in pending.agent_pool
+                        ):
+                            error = (
+                                "invalid_argument",
+                                "相同工具和模型的 Agent 已在并发池中。",
+                            )
+                        else:
+                            binding = WorkflowAgentBinding(
+                                agent_id=f"A{pending.next_agent_sequence}",
+                                tool_name=tool_name,
+                                model_name=model_name,
+                                display_name=str(available_tools[tool_name] or tool_name),
+                                profile=profile,
+                                effort=effort,
+                            )
+                            pending.agent_pool = (*pending.agent_pool, binding)
+                            pending.next_agent_sequence += 1
+            elif authorized and action == "workflow_add_recommended_pool":
+                pool = list(pending.agent_pool)
+                sequence = pending.next_agent_sequence
+                seen = {binding.tool_model_key for binding in pool}
+                for recommendation in pending.recommended_agents:
+                    if len(pool) >= MAX_WORKFLOW_AGENT_POOL_SIZE:
+                        break
+                    tool_name = str(recommendation.get("tool_name") or "").lower()
+                    model_name = recommendation.get("model_name") or None
+                    if tool_name not in available_tools or (tool_name, model_name) in seen:
+                        continue
+                    profile = None
+                    effort = None
+                    if model_name is not None:
+                        from ...acp.helper import fetch_acp_models
+                        from ...card.render.model_cascade import parse_model_selection
+
+                        selection = parse_model_selection(
+                            fetch_acp_models(tool_name, cwd=root_path, current_model=None),
+                            model_name,
+                        )
+                        if selection is None:
+                            continue
+                        profile = selection.profile
+                        effort = selection.effort
+                    pool.append(
+                        WorkflowAgentBinding(
+                            agent_id=f"A{sequence}",
+                            tool_name=tool_name,
+                            model_name=model_name,
+                            display_name=str(
+                                recommendation.get("display_name")
+                                or available_tools[tool_name]
+                                or tool_name
+                            ),
+                            profile=profile,
+                            effort=effort,
+                        )
+                    )
+                    seen.add((tool_name, model_name))
+                    sequence += 1
+                pending.agent_pool = tuple(pool)
+                pending.next_agent_sequence = sequence
+            elif authorized and action == "workflow_remove_agent":
+                agent_id = str(value.get("agent_id") or "")
+                if not any(binding.agent_id == agent_id for binding in pending.agent_pool):
+                    error = ("invalid_argument", "目标 Agent 不在当前并发池中。")
+                else:
+                    pending.agent_pool = tuple(
+                        binding for binding in pending.agent_pool if binding.agent_id != agent_id
+                    )
+                    if pending.orchestrator_agent_id == agent_id:
+                        pending.orchestrator_agent_id = None
+            elif authorized and action == "workflow_clear_agents":
+                pending.agent_pool = ()
+                pending.orchestrator_agent_id = None
+            elif authorized and action == "workflow_set_orchestrator":
+                agent_id = str(value.get("agent_id") or "")
+                if agent_id.lower() == "auto":
+                    pending.orchestrator_agent_id = None
+                    pending.orchestrator_was_auto = True
+                elif not any(binding.agent_id == agent_id for binding in pending.agent_pool):
+                    error = ("invalid_argument", "主编排 Agent 必须来自当前并发池。")
+                else:
+                    pending.orchestrator_agent_id = agent_id
+                    pending.orchestrator_was_auto = False
+            elif authorized and action == "workflow_confirm_agents":
+                if not pending.agent_pool:
+                    error = ("invalid_argument", "请至少添加一个 Agent 后再执行。")
+                else:
+                    try:
+                        self._validate_workflow_pool_capabilities(
+                            pending=pending,
+                            root_path=root_path,
+                            available_tools=available_tools,
+                        )
+                    except ValueError as exc:
+                        error = ("invalid_argument", str(exc))
+                if error is None:
+                    was_auto = pending.orchestrator_agent_id is None
+                    orchestrator = (
+                        select_auto_orchestrator(
+                            pending.agent_pool,
+                            recommendations=pending.recommended_agents or (),
+                        )
+                        if was_auto
+                        else next(
+                            binding
+                            for binding in pending.agent_pool
+                            if binding.agent_id == pending.orchestrator_agent_id
+                        )
+                    )
+                    resolved_id = orchestrator.agent_id
+                    generation_key = uuid.uuid4().hex
+                    generation_owner = _WorkflowLifecycleOwner(
+                        session_key=generation_key,
+                        initiator_user_id=pending.initiator_user_id or "",
+                        chat_id=chat_id,
+                        project_id=project_id,
+                        root_path=root_path,
+                        source_script_path=self._new_workflow_script_path(root_path),
+                    )
+                    pending.engine_session_key = generation_key
+                    pending.orchestrator_agent_id = resolved_id
+                    pending.orchestrator_was_auto = was_auto
+                    pending.orchestrator_agent = orchestrator.tool_name
+                    pending.orchestrator_binding = ReviewAgentBinding(
+                        provider="workflow",
+                        tool_name=orchestrator.tool_name,
+                        display_name=orchestrator.display_name,
+                        agent_type=orchestrator.tool_name,
+                        model_name=orchestrator.model_name,
+                        model_display_name=orchestrator.model_name,
+                        use_default_model=orchestrator.model_name is None,
+                    )
+                    pending.selected_tools = list(
+                        dict.fromkeys(binding.tool_name for binding in pending.agent_pool)
+                    )
+                    wf_project.status = WorkflowStatus.GENERATING_SCRIPT
+                    wf_project.error = None
+                    wf_project.finished_at = None
+                    owner.stop_event.set()
+                    owner.heartbeat_stop_event.set()
+                    owner.done_event.set()
+                    self._retire_workflow_owner(engine, owner)
+                    engine._workflow_selection_owner = None
+                    engine._script_generation_owner = generation_owner
+                    generation = (engine, generation_owner, generation_key)
+            elif authorized:
+                error = ("invalid_argument", "未知的 Workflow Agent 操作。")
+
+        if error is not None:
+            if authorized and pending is not None:
+                pending.selection_error = error[1]
+                card_data = self._workflow_selection_card_data(
+                    pending=pending,
+                    project_id=project_id,
+                    root_path=root_path,
+                    available_tools=available_tools,
+                )
+                self._replace_or_send_workflow_rendered_card(
+                    card_message_id=message_id,
+                    chat_id=chat_id,
+                    card_data=card_data,
+                    fallback_to_new=False,
+                )
+            else:
+                self._reply_workflow_error(message_id, error[0], detail=error[1])
+            return
+        if generation is not None:
+            _, generation_owner, generation_key = generation
+            release_owner = getattr(engine, "release_lifecycle_owner", None)
+            if callable(release_owner):
+                release_owner(owner)
+            self._schedule_generate_and_start_workflow(
+                message_id=message_id,
+                chat_id=chat_id,
+                requirement=pending.requirement or "",
+                project=project,
+                root_path=root_path,
+                selected_tools=list(pending.selected_tools or []),
+                expected_session_key=generation_key,
+                engine=engine,
+            )
+            return
+
+        card_data = self._workflow_selection_card_data(
+            pending=pending,
+            project_id=project_id,
+            root_path=root_path,
+            available_tools=available_tools,
+        )
+        self._replace_or_send_workflow_rendered_card(
+            card_message_id=message_id,
+            chat_id=chat_id,
+            card_data=card_data,
+            fallback_to_new=False,
+        )
+
     def _start_workflow_with_defaults(
         self,
         message_id: str,
@@ -585,10 +1193,14 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
     ) -> bool:
         """CAS a verified generated workflow into the owned generation session."""
         with engine._lock:
+            current_pending = engine.project.pending if engine.project else None
             if (
                 vars(engine).get("_script_generation_owner") is not owner
                 or owner.stop_event.is_set()
                 or not cls._is_current_generation_session(engine, owner.session_key)
+                or current_pending is None
+                or current_pending.project_id != owner.project_id
+                or pending.project_id != owner.project_id
             ):
                 return False
             engine.project.pending = pending
@@ -639,12 +1251,9 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 current_owner = vars(engine).get("_script_generation_owner")
                 if isinstance(current_owner, _WorkflowLifecycleOwner) and not current_owner.stop_event.is_set():
                     if current_owner.session_key == expected_session_key:
-                        logger.info(
-                            "[workflow] Dropping duplicate script generation (session=%s)",
-                            expected_session_key[:8],
-                        )
-                        return
-                    previous_owner = current_owner
+                        owner = current_owner
+                    else:
+                        previous_owner = current_owner
                 current_selection_owner = vars(engine).get("_workflow_selection_owner")
                 if isinstance(
                     current_selection_owner,
@@ -660,6 +1269,9 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         )
                         return
                     selection_owner = current_selection_owner
+                    current_selection_owner.stop_event.set()
+                    current_selection_owner.heartbeat_stop_event.set()
+                    current_selection_owner.done_event.set()
                     self._retire_workflow_owner(
                         engine,
                         current_selection_owner,
@@ -701,6 +1313,36 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         if existing_pending is not None
                         else None
                     ),
+                    "agent_pool": (
+                        tuple(existing_pending.agent_pool)
+                        if existing_pending is not None
+                        else ()
+                    ),
+                    "orchestrator_agent_id": (
+                        existing_pending.orchestrator_agent_id
+                        if existing_pending is not None
+                        else None
+                    ),
+                    "orchestrator_was_auto": (
+                        existing_pending.orchestrator_was_auto
+                        if existing_pending is not None
+                        else False
+                    ),
+                    "selection_session_key": (
+                        existing_pending.selection_session_key
+                        if existing_pending is not None
+                        else None
+                    ),
+                    "project_id": (
+                        existing_pending.project_id
+                        if existing_pending is not None
+                        else None
+                    ),
+                    "recommended_agents": (
+                        list(existing_pending.recommended_agents)
+                        if existing_pending is not None
+                        else []
+                    ),
                 }
 
             if previous_owner is not None:
@@ -709,11 +1351,11 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 with previous_owner.delivery_lock:
                     pass
             if selection_owner is not None:
-                selection_owner.stop_event.set()
-                selection_owner.heartbeat_stop_event.set()
                 with selection_owner.delivery_lock:
                     pass
-                selection_owner.done_event.set()
+                release_owner = getattr(engine, "release_lifecycle_owner", None)
+                if callable(release_owner):
+                    release_owner(selection_owner)
 
             heartbeat_thread: threading.Thread | None = None
             try:
@@ -810,17 +1452,17 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 )
                 _stop_heartbeat()
 
-                from ...workflow_engine.tool_registry import get_available_tools
-
-                registered_tools = get_available_tools(require_available=True)
                 script_tools = list(dict.fromkeys((meta or {}).get("tools", [])))
-                unsupported = [tool for tool in script_tools if tool not in registered_tools]
+                confirmed_pool = tuple(generation_context["agent_pool"])
+                confirmed_tools = list(
+                    dict.fromkeys(binding.tool_name for binding in confirmed_pool)
+                )
+                unsupported = [tool for tool in script_tools if tool not in confirmed_tools]
                 if unsupported:
-                    raise RuntimeError("脚本引用未注册工具: " + ", ".join(unsupported))
-                selected = [tool for tool in (selected_tools or []) if tool in registered_tools]
-                selected = list(dict.fromkeys([*selected, *script_tools]))
-                if not selected:
-                    raise RuntimeError("生成脚本没有可执行的已注册工具")
+                    raise RuntimeError("脚本引用未确认工具: " + ", ".join(unsupported))
+                selected = confirmed_tools
+                if not confirmed_pool:
+                    raise RuntimeError("Workflow generation lost its confirmed Agent Pool")
                 script_hash = None
                 if script_path:
                     try:
@@ -843,6 +1485,12 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     review_agents=generation_context["review_agents"] or [],
                     auto_reviewer=True,
                     script_hash=script_hash,
+                    agent_pool=confirmed_pool,
+                    orchestrator_agent_id=generation_context["orchestrator_agent_id"],
+                    orchestrator_was_auto=generation_context["orchestrator_was_auto"],
+                    selection_session_key=generation_context["selection_session_key"],
+                    project_id=generation_context["project_id"],
+                    recommended_agents=generation_context["recommended_agents"],
                 )
                 if not self._commit_generated_workflow_if_current(
                     engine,
@@ -869,12 +1517,22 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 )
                 if not started and _owner_can_deliver():
                     raise RuntimeError("Workflow 自动启动失败")
+            except _WorkflowGenerationCancelled as exc:
+                with owner.delivery_lock:
+                    if _owner_can_deliver():
+                        with engine._lock:
+                            if not self._is_current_generation_session(engine, owner.session_key):
+                                return
+                            engine.project.status = WorkflowStatus.CANCELLED
+                            engine.project.error = self._sanitize_generation_error(exc)
+                            engine.project.finished_at = time.time()
             except Exception as exc:
                 logger.error(
                     "Workflow script generation failed: %s",
                     exc,
                     exc_info=True,
                 )
+                safe_error = self._sanitize_generation_error(exc)
                 with owner.delivery_lock:
                     if _owner_can_deliver():
                         with engine._lock:
@@ -883,12 +1541,13 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                                 owner.session_key,
                             ):
                                 return
-                            engine.project.status = WorkflowStatus.IDLE
-                            engine.project.pending = None
+                            engine.project.status = WorkflowStatus.FAILED
+                            engine.project.error = safe_error
+                            engine.project.finished_at = time.time()
                         if gen_msg_id:
                             error_card = self._build_error_card(
                                 "internal_error",
-                                detail=f"脚本生成失败: {exc}",
+                                detail=f"脚本生成失败: {safe_error}",
                             )
                             self._replace_or_send_workflow_card(
                                 card_message_id=gen_msg_id,
@@ -900,14 +1559,19 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             self._reply_workflow_error(
                                 message_id,
                                 "internal_error",
-                                detail=f"脚本生成失败: {exc}",
+                                detail=f"脚本生成失败: {safe_error}",
                             )
             finally:
                 _stop_heartbeat()
+                owner.worker_exited_event.set()
                 with engine._lock:
+                    session_uncertain = owner.active_generation_session is not None
                     if vars(engine).get("_script_generation_owner") is owner:
                         self._retire_workflow_owner(engine, owner)
-                        engine._script_generation_owner = None
+                        if not session_uncertain:
+                            engine._script_generation_owner = None
+                    elif session_uncertain:
+                        self._retire_workflow_owner(engine, owner)
                     current_project = engine.project
                     current_pending = current_project.pending if current_project is not None else None
                     retained_paths = {
@@ -919,9 +1583,13 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         owner.source_script_path,
                         root_path=root_path,
                     )
-                owner.done_event.set()
+                if not session_uncertain:
+                    owner.done_event.set()
+                    release_owner = getattr(engine, "release_lifecycle_owner", None)
+                    if callable(release_owner):
+                        release_owner(owner)
 
-    def _schedule_generate_and_start_workflow(
+    def _schedule_generate_and_start_workflow_legacy(
             self,
             *,
             message_id: str,
@@ -1047,6 +1715,194 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     next_status=WorkflowStatus.IDLE,
                     detail_prefix="脚本生成任务提交失败",
                 )
+
+    @staticmethod
+    def _sanitize_generation_error(exc: BaseException | str) -> str:
+        """Return a bounded terminal reason without credentials or internals."""
+        import re
+
+        text = " ".join(str(exc or "Workflow generation failed").split())
+        text = re.sub(
+            r"(?i)\b(token|secret|password|api[_-]?key|access[_-]?key)\s*[=:]\s*[^\s,;]+",
+            r"\1=<redacted>",
+            text,
+        )
+        return text[:500] or "Workflow generation failed"
+
+    def _schedule_generate_and_start_workflow(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        requirement: str,
+        project: Optional["ProjectContext"],
+        root_path: str,
+        selected_tools: list[str] | None,
+        expected_session_key: str,
+        engine: Any | None = None,
+    ) -> Any:
+        """Submit generation and reconcile pre-callback scheduler failures."""
+        from ...tasking.scheduler import TaskStatus
+        from ...workflow_engine.models import WorkflowStatus
+
+        if not expected_session_key or engine is None:
+            logger.error("[workflow] Refusing to schedule generation without a session owner")
+            return None
+        with engine._lock:
+            pending = engine.project.pending if engine.project else None
+            if (
+                engine.project is None
+                or engine.project.status != WorkflowStatus.GENERATING_SCRIPT
+                or pending is None
+                or pending.engine_session_key != expected_session_key
+            ):
+                logger.info(
+                    "[workflow] Refusing stale generation schedule (expected_session=%s)",
+                    expected_session_key[:8],
+                )
+                return None
+            lifecycle_owner = vars(engine).get("_script_generation_owner")
+        if not isinstance(lifecycle_owner, _WorkflowLifecycleOwner):
+            logger.error("[workflow] Refusing generation schedule without lifecycle owner")
+            return None
+
+        def fail_once(exc: BaseException | str) -> bool:
+            safe_error = self._sanitize_generation_error(exc)
+            with lifecycle_owner.delivery_lock:
+                with engine._lock:
+                    current_pending = engine.project.pending if engine.project else None
+                    should_report = bool(
+                        vars(engine).get("_script_generation_owner") is lifecycle_owner
+                        and not lifecycle_owner.stop_event.is_set()
+                        and engine.project is not None
+                        and engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+                        and current_pending is not None
+                        and current_pending.engine_session_key == expected_session_key
+                    )
+                    if not should_report:
+                        return False
+                    engine.project.status = WorkflowStatus.FAILED
+                    engine.project.error = safe_error
+                    engine.project.finished_at = time.time()
+                    object.__setattr__(lifecycle_owner, "active_generation_session", None)
+                    self._retire_workflow_owner(engine, lifecycle_owner)
+                    engine._script_generation_owner = None
+                self._reply_workflow_error(
+                    message_id,
+                    "internal_error",
+                    detail=f"脚本生成失败: {safe_error}",
+                )
+            lifecycle_owner.done_event.set()
+            release_owner = getattr(engine, "release_lifecycle_owner", None)
+            if callable(release_owner):
+                release_owner(lifecycle_owner)
+            return True
+
+        def run_generate() -> None:
+            try:
+                task_engine = self.ctx.workflow_engine_manager.get(chat_id, root_path)
+                if not self._is_current_generation_session(
+                    task_engine,
+                    expected_session_key,
+                ):
+                    return
+                self._generate_and_start_workflow(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    requirement=requirement,
+                    project=project,
+                    root_path=root_path,
+                    selected_tools=selected_tools,
+                    expected_session_key=expected_session_key,
+                )
+            except _WorkflowGenerationCancelled as exc:
+                with lifecycle_owner.delivery_lock:
+                    with engine._lock:
+                        current_pending = engine.project.pending if engine.project else None
+                        if (
+                            vars(engine).get("_script_generation_owner") is lifecycle_owner
+                            and engine.project is not None
+                            and engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+                            and current_pending is not None
+                            and current_pending.engine_session_key == expected_session_key
+                        ):
+                            engine.project.status = WorkflowStatus.CANCELLED
+                            engine.project.error = self._sanitize_generation_error(exc)
+                            engine.project.finished_at = time.time()
+                            engine._script_generation_owner = None
+            except Exception as exc:
+                logger.error("Workflow script generation task failed: %s", exc, exc_info=True)
+                fail_once(exc)
+
+        project_name = (
+            (getattr(project, "project_name", "") if project else "")
+            or os.path.basename(root_path)
+        )
+        task_id = generate_task_id(project_name or "workflow")
+        try:
+            handle = self._submit_engine_task(
+                run_generate,
+                chat_id,
+                message_id,
+                project,
+                request_id=None,
+                task_id=task_id,
+                name_suffix="generate_script",
+            )
+        except Exception as exc:
+            logger.error("Workflow script generation task submission failed: %s", exc, exc_info=True)
+            fail_once(exc)
+            return None
+
+        run_id = getattr(handle, "run_id", None)
+        scheduler = getattr(self.ctx, "scheduler", None)
+        if not run_id or scheduler is None:
+            return handle
+
+        def scheduler_state() -> Any:
+            try:
+                return scheduler.get_state(run_id)
+            except Exception:
+                logger.debug("Unable to reconcile Workflow generation scheduler state", exc_info=True)
+                return None
+
+        state = scheduler_state()
+        if state is not None and getattr(state, "status", None) in {
+            TaskStatus.FAILED,
+            TaskStatus.CANCELED,
+        }:
+            fail_once(getattr(state, "error", None) or "generation scheduler rejected the task")
+            return handle
+
+        if state is not None and getattr(state, "status", None) == TaskStatus.QUEUED:
+            def reconcile_queued() -> None:
+                deadline = time.monotonic() + 600.0
+                while time.monotonic() < deadline and not lifecycle_owner.stop_event.wait(1.0):
+                    queued_state = scheduler_state()
+                    if queued_state is None:
+                        continue
+                    status = getattr(queued_state, "status", None)
+                    if status in {TaskStatus.RUNNING, TaskStatus.SUCCEEDED}:
+                        return
+                    if status in {TaskStatus.FAILED, TaskStatus.CANCELED}:
+                        fail_once(
+                            getattr(queued_state, "error", None)
+                            or "generation scheduler rejected the queued task"
+                        )
+                        return
+                if not lifecycle_owner.stop_event.is_set():
+                    try:
+                        handle.cancel()
+                    except Exception:
+                        logger.debug("Unable to cancel unreconciled generation task", exc_info=True)
+                    fail_once("generation scheduler queue reconciliation timed out")
+
+            threading.Thread(
+                target=reconcile_queued,
+                daemon=True,
+                name=f"workflow-generation-reconcile-{expected_session_key[:8]}",
+            ).start()
+        return handle
 
     # ------------------------------------------------------------------
     # Stop workflow
@@ -1202,6 +2058,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         admin_ids: list[str] = getattr(self.ctx.settings, "admin_user_ids", []) or []
         error: tuple[str, str] | None = None
         delivery_owners: list[_WorkflowLifecycleOwner] = []
+        sessions_to_close: list[tuple[_WorkflowLifecycleOwner, Any]] = []
         artifacts_to_remove: list[str] = []
         runtime_active = False
         terminal_notice: WorkflowStatus | None = None
@@ -1290,6 +2147,12 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     )
                     if lifecycle_owner not in delivery_owners:
                         delivery_owners.append(lifecycle_owner)
+                    active_session = lifecycle_owner.active_generation_session
+                    if active_session is not None and not any(
+                        existing_session is active_session
+                        for _existing_owner, existing_session in sessions_to_close
+                    ):
+                        sessions_to_close.append((lifecycle_owner, active_session))
                     for artifact in (
                         lifecycle_owner.source_script_path,
                         lifecycle_owner.execution_script_path,
@@ -1298,7 +2161,10 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             artifacts_to_remove.append(artifact)
                 if live_selection_owner is not None:
                     engine._workflow_selection_owner = None
-                if live_generation_owner is not None:
+                if (
+                    live_generation_owner is not None
+                    and live_generation_owner.active_generation_session is None
+                ):
                     engine._script_generation_owner = None
                 if live_start_owner is not None and not runtime_active:
                     engine._workflow_start_owner = None
@@ -1310,8 +2176,9 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 if runtime_active:
                     engine.stop()
                 elif wf_project is not None:
-                    wf_project.status = WorkflowStatus.IDLE
-                    wf_project.pending = None
+                    wf_project.status = WorkflowStatus.CANCELLED
+                    wf_project.error = "Workflow cancelled by user"
+                    wf_project.finished_at = time.time()
                     wf_project.script_path = None
 
         if terminal_notice is not None:
@@ -1334,6 +2201,53 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             )
             return
 
+        uncertain_sessions: list[tuple[_WorkflowLifecycleOwner, Any, str]] = []
+        for session_owner, session in sessions_to_close:
+            cancel_confirmed = True
+            close_confirmed = True
+            details: list[str] = []
+            try:
+                cancelled = session.cancel(wait=True, timeout=2.0)
+                if cancelled is False:
+                    cancel_confirmed = False
+                    details.append("cancel was not confirmed")
+            except Exception as exc:
+                cancel_confirmed = False
+                details.append(f"cancel failed: {exc}")
+                logger.warning("Failed to cancel active Workflow generation session", exc_info=True)
+            try:
+                session.close()
+            except Exception as exc:
+                close_confirmed = False
+                details.append(f"close failed: {exc}")
+                logger.warning("Failed to close active Workflow generation session", exc_info=True)
+            if cancel_confirmed and close_confirmed:
+                object.__setattr__(session_owner, "active_generation_session", None)
+                with engine._lock:
+                    if vars(engine).get("_script_generation_owner") is session_owner:
+                        engine._script_generation_owner = None
+            else:
+                uncertain_sessions.append(
+                    (session_owner, session, "; ".join(details) or "stop was not confirmed")
+                )
+
+        if uncertain_sessions:
+            safe_error = "Workflow 停止未确认；为避免重叠会话，当前项目保持封锁。"
+            with engine._lock:
+                if engine.project is not None:
+                    engine.project.status = WorkflowStatus.FAILED
+                    engine.project.error = safe_error
+                    engine.project.finished_at = time.time()
+                for session_owner, _session, _detail in uncertain_sessions:
+                    engine._script_generation_owner = session_owner
+                    self._retire_workflow_owner(engine, session_owner)
+            self._reply_workflow_error(
+                message_id,
+                "internal_error",
+                detail=safe_error,
+            )
+            return
+
         # A delivery that had already passed its ownership check may finish,
         # but it must do so before the stop acknowledgement is sent.
         for lifecycle_owner in delivery_owners:
@@ -1345,6 +2259,9 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 and not lifecycle_owner.worker_started_event.is_set()
             ):
                 lifecycle_owner.done_event.set()
+            release_owner = getattr(engine, "release_lifecycle_owner", None)
+            if callable(release_owner):
+                release_owner(lifecycle_owner)
 
         for artifact in dict.fromkeys(artifacts_to_remove):
             self._remove_owned_workflow_artifact(
@@ -1469,7 +2386,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             # Retrieve pending state
             script_path = pending.script_path
             requirement = pending.requirement or ""
-            selected_tools = list(pending.selected_tools or [])
             expected_script_hash = pending.script_hash
 
             if not script_path:
@@ -1507,7 +2423,10 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             # Structural + security validation (mirrors the generation path).
             from ...workflow_engine.script_gen import extract_meta_from_script, validate_generated_script
 
-            is_valid, validation_errors = validate_generated_script(script_text)
+            is_valid, validation_errors = validate_generated_script(
+                script_text,
+                agent_pool=pending.agent_pool,
+            )
             if not is_valid:
                 _reply_start_error(
                     "internal_error",
@@ -1516,21 +2435,18 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 return
             fresh_meta = extract_meta_from_script(script_text) or {}
 
-            # Adopt every tool declared by the verified script when it is still
-            # registered and executable. Unsupported names fail closed.
-            from ...workflow_engine.tool_registry import get_available_tools
-
-            registered_tools = get_available_tools(require_available=True)
             fresh_script_tools = list(dict.fromkeys(fresh_meta.get("tools", [])))
-            unsupported = [tool for tool in fresh_script_tools if tool not in registered_tools]
+            confirmed_tools = list(
+                dict.fromkeys(binding.tool_name for binding in pending.agent_pool)
+            )
+            unsupported = [tool for tool in fresh_script_tools if tool not in confirmed_tools]
             if unsupported:
                 _reply_start_error(
                     "invalid_state",
-                    detail="脚本引用未注册工具: " + ", ".join(unsupported),
+                    detail="脚本引用未确认工具: " + ", ".join(unsupported),
                 )
                 return
-            selected_tools = list(dict.fromkeys([*selected_tools, *fresh_script_tools]))
-            pending.selected_tools = selected_tools
+            pending.selected_tools = confirmed_tools
 
             # --- Immutable copy for execution ---
             # Copy the verified content into a fresh /tmp file for each
@@ -1567,6 +2483,10 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
 
             start_owner = _WorkflowLifecycleOwner(
                 session_key=stored_session_key,
+                initiator_user_id=stored_initiator,
+                chat_id=chat_id,
+                project_id=pending.project_id or "",
+                root_path=root_path,
                 stop_event=generation_owner.stop_event,
                 heartbeat_stop_event=generation_owner.heartbeat_stop_event,
                 delivery_lock=generation_owner.delivery_lock,
@@ -1597,6 +2517,9 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             engine.project.status = WorkflowStatus.IDLE
                             engine.project.script_path = None
                 start_owner.done_event.set()
+                release_owner = getattr(engine, "release_lifecycle_owner", None)
+                if callable(release_owner):
+                    release_owner(start_owner)
 
             # Linearize the generated-session handoff against /stop_wf. All
             # expensive validation above is speculative; this is the authoritative
@@ -1993,6 +2916,10 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         """
         from ...workflow_engine.models import WorkflowProject, WorkflowStatus
 
+        has_uncertain_session = getattr(engine, "has_uncertain_lifecycle_session", None)
+        if callable(has_uncertain_session) and has_uncertain_session():
+            return False, "invalid_state", None
+
         admission_owner = _WorkflowLifecycleOwner(
             session_key=uuid.uuid4().hex,
             initiator_user_id=current_user,
@@ -2000,6 +2927,8 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         owners: list[_WorkflowLifecycleOwner] = []
         artifacts: list[str] = []
         with engine._lock:
+            if callable(has_uncertain_session) and has_uncertain_session():
+                return False, "invalid_state", None
             if getattr(engine, "_closing", False) is True:
                 return False, "running", None
             if engine.is_running is True:
@@ -2009,6 +2938,8 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             if wf_project is None:
                 wf_project = WorkflowProject()
                 engine._project = wf_project
+            if wf_project.status == WorkflowStatus.GENERATING_SCRIPT:
+                return False, "invalid_state", None
             pending = wf_project.pending
             selection_owner = vars(engine).get("_workflow_selection_owner")
             generation_owner = vars(engine).get("_script_generation_owner")
@@ -2045,6 +2976,8 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         continue
                     owner.stop_event.set()
                     owner.heartbeat_stop_event.set()
+                    if owner is selection_owner:
+                        owner.done_event.set()
                     self._retire_workflow_owner(engine, owner)
                     owners.append(owner)
                     for artifact in (
@@ -2078,6 +3011,9 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 pass
             if not owner.claimed_event.is_set() and not owner.worker_started_event.is_set():
                 owner.done_event.set()
+            release_owner = getattr(engine, "release_lifecycle_owner", None)
+            if callable(release_owner):
+                release_owner(owner)
         for artifact in dict.fromkeys(artifacts):
             self._remove_owned_workflow_artifact(
                 artifact,
@@ -2085,7 +3021,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             )
         return True, None, admission_owner
 
-    def _generate_script_via_ai(
+    def _generate_script_via_ai_legacy(
         self,
         requirement: str,
         root_path: str,
@@ -2237,6 +3173,424 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             f"脚本生成在 {_SCRIPT_GENERATION_MAX_ATTEMPTS} 次尝试后仍未通过验证：{last_error}"
         )
 
+    def _generate_script_via_ai(
+        self,
+        requirement: str,
+        root_path: str,
+        selected_tools: list[str] | None = None,
+        engine: Any = None,
+        progress_callback: Any = None,
+        *,
+        output_path: str,
+        cancel_event: threading.Event | None = None,
+        artifact_lock: Any = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Generate through the confirmed pool with strict attempt fencing."""
+        del selected_tools
+        from ...agent_session import create_engine_session
+        from ...workflow_engine.models import WorkflowStatus
+        from ...workflow_engine.script_gen import (
+            build_script_gen_prompt,
+            extract_meta_from_script,
+            validate_generated_script,
+        )
+        from ...workflow_engine.tool_registry import get_available_tools
+
+        if engine is None or engine.project is None or engine.project.pending is None:
+            raise RuntimeError("Workflow generation session is missing")
+        pending = engine.project.pending
+        pool = tuple(pending.agent_pool or ())
+        if not pool:
+            raise RuntimeError("Workflow generation requires a confirmed Agent Pool")
+        orchestrator_agent_id = pending.orchestrator_agent_id or pool[0].agent_id
+        orchestrator = next(
+            (item for item in pool if item.agent_id == orchestrator_agent_id),
+            None,
+        )
+        if orchestrator is None:
+            raise RuntimeError("Workflow orchestrator is outside the confirmed Agent Pool")
+
+        registered_tools = get_available_tools(require_available=True)
+        unavailable = sorted({item.tool_name for item in pool} - set(registered_tools))
+        if unavailable:
+            raise RuntimeError("Confirmed Workflow tool is unavailable: " + ", ".join(unavailable))
+        prompt_tools = {
+            item.tool_name: str(registered_tools[item.tool_name])
+            for item in pool
+        }
+        base_prompt = build_script_gen_prompt(
+            requirement=requirement,
+            available_tools=prompt_tools,
+            orchestrator_agent=orchestrator.tool_name,
+            orchestrator_binding=orchestrator.to_dict(),
+            review_agents=[],
+            auto_reviewer=True,
+            agent_pool=pool,
+            orchestrator_agent_id=orchestrator_agent_id,
+        )
+
+        script_dir = os.path.join(root_path, ".ghostap", "workflow_scripts")
+        os.makedirs(script_dir, exist_ok=True)
+        if (
+            os.path.realpath(os.path.dirname(output_path)) != os.path.realpath(script_dir)
+            or not os.path.basename(output_path).endswith(".js")
+        ):
+            raise ValueError("Workflow generation output must stay in the script staging directory")
+
+        captured_session_key = pending.engine_session_key
+        started_at = time.monotonic()
+        hard_deadline = started_at + 600.0
+        ordered_pool = (
+            orchestrator,
+            *(item for item in pool if item.agent_id != orchestrator.agent_id),
+        )
+        mutating_tools = frozenset(
+            {
+                "execute_command", "create_terminal", "run_terminal", "run_shell", "shell",
+                "bash", "write_file", "write_text_file", "delete_file", "remove_file",
+                "mkdir", "patch_file", "apply_diff", "edit_file", "write_to_file",
+                "http_request", "http_get", "http_post", "fetch", "download", "upload",
+                "network_request", "url_open", "send_message", "send_email", "create_issue",
+            }
+        )
+
+        def tool_filter(tool_name: str, _params: dict | None) -> bool:
+            if not isinstance(tool_name, str):
+                return False
+            normalized = tool_name.lower().strip()
+            if normalized in mutating_tools:
+                return False
+            return not any(
+                token in normalized
+                for token in (
+                    "write", "delete", "remove", "exec", "run", "patch", "post",
+                    "upload", "send", "create",
+                )
+            )
+
+        def ensure_current() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _WorkflowGenerationCancelled("Workflow generation cancelled")
+            with engine._lock:
+                current_project = engine.project
+                current_pending = current_project.pending if current_project else None
+                if (
+                    current_project is None
+                    or current_project.status != WorkflowStatus.GENERATING_SCRIPT
+                    or current_pending is not pending
+                    or current_pending.engine_session_key != captured_session_key
+                ):
+                    raise RuntimeError("stale Workflow generation session was superseded")
+
+        def _owner_is_current_locked(owner: _WorkflowLifecycleOwner) -> bool:
+            current_project = engine.project
+            current_pending = current_project.pending if current_project else None
+            return bool(
+                vars(engine).get("_script_generation_owner") is owner
+                and not owner.stop_event.is_set()
+                and (cancel_event is None or not cancel_event.is_set())
+                and owner.session_key == captured_session_key
+                and current_project is not None
+                and current_project.status == WorkflowStatus.GENERATING_SCRIPT
+                and current_pending is pending
+                and current_pending.engine_session_key == captured_session_key
+            )
+
+        def current_generation_owner() -> _WorkflowLifecycleOwner | None:
+            with engine._lock:
+                owner = vars(engine).get("_script_generation_owner")
+                if (
+                    isinstance(owner, _WorkflowLifecycleOwner)
+                    and _owner_is_current_locked(owner)
+                ):
+                    return owner
+                return None
+
+        def bind_active_session(
+            owner: _WorkflowLifecycleOwner,
+            session: Any,
+        ) -> bool:
+            with engine._lock:
+                if not _owner_is_current_locked(owner):
+                    return False
+                active_session = owner.active_generation_session
+                if active_session is not None and active_session is not session:
+                    return False
+                object.__setattr__(owner, "active_generation_session", session)
+                return True
+
+        def active_session_is_current(
+            owner: _WorkflowLifecycleOwner,
+            session: Any,
+        ) -> bool:
+            with engine._lock:
+                return bool(
+                    _owner_is_current_locked(owner)
+                    and owner.active_generation_session is session
+                )
+
+        def anchor_session_for_cleanup(
+            owner: _WorkflowLifecycleOwner,
+            session: Any,
+        ) -> None:
+            with engine._lock:
+                self._retire_workflow_owner(engine, owner)
+                active_session = owner.active_generation_session
+                if active_session is None or active_session is session:
+                    object.__setattr__(owner, "active_generation_session", session)
+
+        def unbind_active_session(
+            owner: _WorkflowLifecycleOwner,
+            session: Any,
+        ) -> None:
+            with engine._lock:
+                if owner.active_generation_session is session:
+                    object.__setattr__(owner, "active_generation_session", None)
+
+        session_owner: _WorkflowLifecycleOwner | None = None
+
+        def close_strict(session: Any, *, cancel: bool) -> None:
+            cancel_confirmed = True
+            close_confirmed = True
+            details: list[str] = []
+            if cancel:
+                try:
+                    cancelled = session.cancel(wait=True, timeout=2.0)
+                    if cancelled is False:
+                        cancel_confirmed = False
+                        details.append("generation session cancellation was not confirmed")
+                except Exception as exc:
+                    cancel_confirmed = False
+                    details.append(f"generation session cancellation failed: {exc}")
+            try:
+                session.close()
+            except Exception as exc:
+                close_confirmed = False
+                details.append(f"generation session close uncertain: {exc}")
+            if cancel_confirmed and close_confirmed:
+                if session_owner is not None:
+                    unbind_active_session(session_owner, session)
+                    release_owner = getattr(engine, "release_lifecycle_owner", None)
+                    if callable(release_owner):
+                        release_owner(session_owner)
+                return
+            raise _WorkflowGenerationCloseUncertain("; ".join(details))
+
+        def transport_failure(exc: BaseException) -> bool:
+            text = f"{type(exc).__name__}: {exc}".lower()
+            return isinstance(exc, (TimeoutError, ConnectionError, OSError)) or any(
+                token in text
+                for token in (
+                    "timeout", "timed out", "transport", "disconnect", "connection",
+                    "rate limit", "ratelimit", "too many requests", "429",
+                )
+            )
+
+        def permission_or_unsafe(exc: BaseException | str) -> bool:
+            text = str(exc).lower()
+            return any(
+                token in text
+                for token in ("permission", "forbidden", "unauthorized", "unsafe", "policy")
+            )
+
+        last_error = "模型未返回有效脚本"
+        for binding in ordered_pool:
+            for repair_attempt in range(1, _SCRIPT_GENERATION_MAX_ATTEMPTS + 1):
+                ensure_current()
+                remaining = hard_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("Workflow generation total timeout exceeded")
+                if progress_callback:
+                    progress_callback(
+                        f"{binding.agent_id} 正在生成编排脚本（修复 {repair_attempt}/"
+                        f"{_SCRIPT_GENERATION_MAX_ATTEMPTS}）"
+                    )
+
+                retry_note = ""
+                if repair_attempt > 1:
+                    retry_note = (
+                        "\n\nBounded repair attempt "
+                        f"{repair_attempt}: the previous output failed validation: {last_error}. "
+                        "Return one complete corrected JavaScript module."
+                    )
+                session = None
+                should_fallback = False
+                try:
+                    session_owner = current_generation_owner()
+                    if session_owner is None:
+                        raise RuntimeError(
+                            "stale Workflow generation owner before session creation"
+                        )
+                    session = create_engine_session(
+                        agent_type=binding.tool_name,
+                        cwd=root_path,
+                        thread_id=(
+                            f"workflow_script_gen_{captured_session_key}_{binding.agent_id}_"
+                            f"{repair_attempt}"
+                        ),
+                        auto_approve=False,
+                        require_tool_filter=True,
+                        model_name=binding.model_name,
+                        cancel_event=cancel_event,
+                    )
+                    if session is None:
+                        last_error = f"{binding.agent_id}: unable to create generation session"
+                        should_fallback = True
+                        break
+                    if not bind_active_session(session_owner, session):
+                        anchor_session_for_cleanup(session_owner, session)
+                        close_strict(session, cancel=True)
+                        session = None
+                        raise RuntimeError(
+                            "stale Workflow generation owner before session bind"
+                        )
+                    session.set_tool_filter(tool_filter)
+                    if not active_session_is_current(session_owner, session):
+                        close_strict(session, cancel=True)
+                        session = None
+                        raise RuntimeError(
+                            "stale Workflow generation owner before prompt send"
+                        )
+
+                    def on_event(event: Any) -> None:
+                        text = str(getattr(event, "text", "") or "").strip()
+                        event_type = getattr(event, "event_type", None)
+                        event_name = str(getattr(event_type, "value", event_type) or "").lower()
+                        meaningful = self._workflow_generation_event_is_meaningful(event)
+                        if meaningful and progress_callback:
+                            summary = text or event_name.replace("_", " ")
+                            progress_callback(
+                                f"{binding.agent_id} last activity: {summary[:180]}"
+                            )
+
+                    result = session.send_prompt(
+                        base_prompt + retry_note,
+                        timeout=max(0.001, min(600.0, remaining)),
+                        idle_timeout=max(0.001, min(120.0, remaining)),
+                        on_event=on_event,
+                        activity_predicate=self._workflow_generation_event_is_meaningful,
+                    )
+                    try:
+                        ensure_current()
+                    except Exception:
+                        close_strict(session, cancel=True)
+                        session = None
+                        raise
+
+                    stop_reason = str(getattr(result, "stop_reason", "") or "").strip().lower()
+                    if stop_reason in {"cancelled", "canceled"}:
+                        close_strict(session, cancel=True)
+                        session = None
+                        raise _WorkflowGenerationCancelled(
+                            f"Workflow generation cancelled by {binding.agent_id}"
+                        )
+                    if stop_reason in {"timeout", "timed_out", "error", "failed", "failure"}:
+                        last_error = f"{binding.agent_id} terminal stop_reason={stop_reason}"
+                        close_strict(session, cancel=True)
+                        session = None
+                        should_fallback = True
+                        break
+                    if stop_reason not in {
+                        "end_turn", "completed", "complete", "success", "done",
+                    }:
+                        last_error = f"{binding.agent_id} terminal stop_reason={stop_reason}"
+                        close_strict(session, cancel=True)
+                        session = None
+                        should_fallback = True
+                        break
+                    text = str(getattr(result, "text", "") or "").strip()
+                    if not text:
+                        last_error = f"{binding.agent_id}: model returned an empty script"
+                        close_strict(session, cancel=False)
+                        session = None
+                        continue
+                    script_content = self._strip_markdown_fences(text)
+                    is_valid, errors = validate_generated_script(
+                        script_content,
+                        review_agents=[],
+                        agent_pool=pool,
+                    )
+                    if not is_valid:
+                        last_error = "; ".join(errors[:3]) or "script validation failed"
+                        close_strict(session, cancel=False)
+                        session = None
+                        if permission_or_unsafe(last_error) or "[capability]" in last_error.lower():
+                            raise RuntimeError(last_error)
+                        continue
+                    meta = extract_meta_from_script(script_content) or {}
+                    unsupported = sorted(
+                        set(meta.get("tools", [])) - {item.tool_name for item in pool}
+                    )
+                    if unsupported:
+                        last_error = "脚本引用未确认工具: " + ", ".join(unsupported)
+                        close_strict(session, cancel=False)
+                        session = None
+                        continue
+
+                    close_strict(session, cancel=False)
+                    session = None
+                    ensure_current()
+                    lock_context = artifact_lock if artifact_lock is not None else nullcontext()
+                    with lock_context:
+                        ensure_current()
+                        with open(output_path, "w", encoding="utf-8") as file:
+                            file.write(script_content)
+                    return output_path, meta
+                except _WorkflowGenerationCloseUncertain:
+                    raise
+                except _WorkflowGenerationCancelled:
+                    if session is not None:
+                        close_strict(session, cancel=True)
+                    raise
+                except Exception as exc:
+                    if session is not None:
+                        if permission_or_unsafe(exc):
+                            close_strict(session, cancel=True)
+                            raise
+                        if transport_failure(exc):
+                            close_strict(session, cancel=True)
+                            session = None
+                            last_error = f"{type(exc).__name__}: {exc}"
+                            should_fallback = True
+                            break
+                        close_strict(session, cancel=True)
+                    if "stale" in str(exc).lower() or "superseded" in str(exc).lower():
+                        raise
+                    if permission_or_unsafe(exc):
+                        raise
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    logger.warning(
+                        "Workflow generation %s repair %s failed: %s",
+                        binding.agent_id,
+                        repair_attempt,
+                        exc,
+                    )
+                    continue
+                if should_fallback:
+                    break
+            if hard_deadline - time.monotonic() <= 0:
+                raise RuntimeError("Workflow generation total timeout exceeded")
+
+        raise RuntimeError(f"Workflow generation failed: {last_error}")
+
+    @staticmethod
+    def _workflow_generation_event_is_meaningful(event: Any) -> bool:
+        text = str(getattr(event, "text", "") or "").strip()
+        if text:
+            return True
+        event_type = getattr(event, "event_type", None)
+        event_name = str(getattr(event_type, "value", event_type) or "").lower()
+        return any(
+            token in event_name
+            for token in (
+                "tool_call_start",
+                "tool_call_update",
+                "tool_call_done",
+                "plan_update",
+                "image_chunk",
+            )
+        )
+
     @staticmethod
     def _strip_markdown_fences(content: str) -> str:
         """Remove markdown code fences and natural language preamble from AI output.
@@ -2320,24 +3674,35 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         topic_id: str | None,
     ):
         """Freeze the automatic tool binding into one execution contract."""
+        from ...spec_engine.models import ReviewAgentBinding
         from ...workflow_engine.constants import (
             MAX_TOTAL_AGENTS,
             WORKFLOW_TOTAL_TIMEOUT_S,
         )
         from ...workflow_engine.run_spec import WorkflowRunSpec
 
-        orchestrator = pending.orchestrator_binding
-        if orchestrator is None:
-            raise ValueError("automatic Workflow is missing its orchestrator binding")
-
-        allowed_tools = list(dict.fromkeys(pending.selected_tools or []))
-        if orchestrator.tool_name not in allowed_tools:
-            allowed_tools.append(orchestrator.tool_name)
-        tool_model_map: dict[str, str | None] = {
-            tool: None for tool in allowed_tools
-        }
-        tool_model_map[orchestrator.tool_name] = (
-            None if orchestrator.use_default_model else orchestrator.model_name
+        agent_pool = tuple(pending.agent_pool or ())
+        if not agent_pool:
+            raise ValueError("Workflow execution is missing its confirmed Agent Pool")
+        orchestrator_agent_id = pending.orchestrator_agent_id or agent_pool[0].agent_id
+        orchestrator_agent = next(
+            (binding for binding in agent_pool if binding.agent_id == orchestrator_agent_id),
+            None,
+        )
+        if orchestrator_agent is None:
+            raise ValueError("Workflow orchestrator is outside its confirmed Agent Pool")
+        orchestrator = ReviewAgentBinding(
+            provider="workflow",
+            tool_name=orchestrator_agent.tool_name,
+            display_name=orchestrator_agent.display_name,
+            agent_type=orchestrator_agent.tool_name,
+            model_name=orchestrator_agent.model_name,
+            model_display_name=orchestrator_agent.model_name,
+            selection_key=orchestrator_agent.agent_id,
+            use_default_model=orchestrator_agent.model_name is None,
+        )
+        allowed_tools = list(
+            dict.fromkeys(binding.tool_name for binding in agent_pool)
         )
 
         settings = getattr(engine, "settings", None)
@@ -2355,7 +3720,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         return WorkflowRunSpec(
             orchestrator=orchestrator,
             reviewers=(),
-            tool_model_map=tool_model_map,
+            tool_model_map={},
             task=task,
             chat_id=chat_id,
             topic_id=topic_id,
@@ -2364,6 +3729,8 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             auto_reviewer=True,
             initiator_user_id=pending.initiator_user_id or None,
             allowed_tools=tuple(allowed_tools),
+            agent_pool=agent_pool,
+            orchestrator_agent_id=orchestrator_agent_id,
         )
 
     def _build_workflow_callbacks(

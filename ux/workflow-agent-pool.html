@@ -1,0 +1,1117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Workflow Agent Pool - UX Preview</title>
+  <style>
+    :root {
+      --canvas: #edf3f1;
+      --canvas-deep: #dfeae7;
+      --card: #ffffff;
+      --ink: #12302e;
+      --ink-soft: #375654;
+      --muted: #6d8381;
+      --line: #dce7e4;
+      --line-strong: #c7d7d3;
+      --teal: #087f73;
+      --teal-dark: #05665d;
+      --teal-soft: #e8f6f3;
+      --blue: #245fa8;
+      --blue-soft: #edf4fc;
+      --amber: #a55f09;
+      --amber-soft: #fff5df;
+      --danger: #b84b43;
+      --danger-soft: #fff0ee;
+      --shadow: 0 24px 70px rgba(27, 72, 66, 0.13);
+      --radius-lg: 24px;
+      --radius-md: 15px;
+      --radius-sm: 10px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 12% 4%, rgba(34, 132, 119, 0.13), transparent 30rem),
+        radial-gradient(circle at 92% 92%, rgba(36, 95, 168, 0.1), transparent 32rem),
+        linear-gradient(145deg, var(--canvas), #f7faf9 55%, var(--canvas-deep));
+      font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    button,
+    select {
+      font: inherit;
+    }
+
+    button {
+      color: inherit;
+    }
+
+    .stage {
+      width: min(100%, 880px);
+      margin: 0 auto;
+      padding: 44px 24px 72px;
+    }
+
+    .preview-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 0 6px 14px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .preview-label span:last-child {
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    .workflow-card {
+      overflow: hidden;
+      border: 1px solid rgba(180, 207, 201, 0.75);
+      border-radius: var(--radius-lg);
+      background: var(--card);
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      position: relative;
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 25px 28px 23px;
+      color: white;
+      background:
+        linear-gradient(120deg, rgba(255, 255, 255, 0.08), transparent 45%),
+        linear-gradient(135deg, #075f59, #0b8879 58%, #127264);
+    }
+
+    .hero::after {
+      position: absolute;
+      right: -50px;
+      bottom: -92px;
+      width: 220px;
+      height: 220px;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 50%;
+      content: "";
+    }
+
+    .hero-mark {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      width: 56px;
+      height: 56px;
+      place-items: center;
+      border: 1px solid rgba(255, 255, 255, 0.28);
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.13);
+      box-shadow: inset 0 1px rgba(255, 255, 255, 0.16);
+      font-size: 22px;
+      font-weight: 800;
+    }
+
+    .hero-copy {
+      position: relative;
+      z-index: 1;
+      min-width: 0;
+    }
+
+    .eyebrow {
+      margin: 0 0 4px;
+      color: rgba(255, 255, 255, 0.72);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(21px, 4vw, 28px);
+      line-height: 1.24;
+      letter-spacing: -0.025em;
+    }
+
+    .hero-copy p {
+      max-width: 560px;
+      margin: 6px 0 0;
+      color: rgba(255, 255, 255, 0.78);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .flow-pill {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 8px 11px;
+      border: 1px solid rgba(255, 255, 255, 0.23);
+      border-radius: 999px;
+      background: rgba(4, 59, 55, 0.34);
+      color: rgba(255, 255, 255, 0.9);
+      font-size: 11px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .flow-pill i {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #85ead7;
+      box-shadow: 0 0 0 4px rgba(133, 234, 215, 0.14);
+    }
+
+    .content {
+      padding: 0 28px 28px;
+    }
+
+    .task-strip {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      margin: 22px 0 20px;
+      padding: 13px 15px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: #f8fbfa;
+    }
+
+    .task-kicker {
+      color: var(--teal);
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: 0.1em;
+    }
+
+    .task-text {
+      overflow: hidden;
+      color: var(--ink-soft);
+      font-size: 13px;
+      font-weight: 650;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .automation-note {
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .section {
+      margin-top: 18px;
+    }
+
+    .section-heading {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 10px;
+    }
+
+    .section-title {
+      display: flex;
+      gap: 9px;
+      align-items: center;
+      margin: 0;
+      font-size: 14px;
+      font-weight: 850;
+      letter-spacing: -0.01em;
+    }
+
+    .section-index {
+      display: grid;
+      width: 23px;
+      height: 23px;
+      place-items: center;
+      border-radius: 8px;
+      background: var(--teal-soft);
+      color: var(--teal-dark);
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .section-help {
+      margin: 4px 0 0 32px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .count-badge {
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-size: 11px;
+      font-weight: 850;
+      white-space: nowrap;
+    }
+
+    .builder {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background:
+        linear-gradient(135deg, rgba(8, 127, 115, 0.04), transparent 48%),
+        #fbfdfc;
+    }
+
+    .field-label {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+    }
+
+    .tool-tabs {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .tool-tab {
+      min-width: 0;
+      padding: 9px 7px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: white;
+      color: var(--ink-soft);
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 800;
+      transition: border-color 150ms ease, background 150ms ease, transform 150ms ease;
+    }
+
+    .tool-tab:hover {
+      border-color: #9dc6bf;
+      transform: translateY(-1px);
+    }
+
+    .tool-tab[aria-pressed="true"] {
+      border-color: var(--teal);
+      background: var(--teal-soft);
+      color: var(--teal-dark);
+      box-shadow: inset 0 0 0 1px rgba(8, 127, 115, 0.08);
+    }
+
+    .compose-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      margin-top: 13px;
+    }
+
+    .model-select,
+    .member-select {
+      width: 100%;
+      height: 42px;
+      border: 1px solid var(--line-strong);
+      border-radius: 10px;
+      outline: none;
+      background: white;
+      color: var(--ink);
+      padding: 0 36px 0 12px;
+      cursor: pointer;
+      transition: border-color 150ms ease, box-shadow 150ms ease;
+    }
+
+    .model-select:focus,
+    .member-select:focus {
+      border-color: var(--teal);
+      box-shadow: 0 0 0 3px rgba(8, 127, 115, 0.12);
+    }
+
+    .secondary-add {
+      min-width: 126px;
+      height: 42px;
+      border: 1px solid #80b6ae;
+      border-radius: 10px;
+      background: white;
+      color: var(--teal-dark);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 850;
+      transition: background 150ms ease, transform 150ms ease;
+    }
+
+    .secondary-add:hover {
+      background: var(--teal-soft);
+      transform: translateY(-1px);
+    }
+
+    .secondary-add:disabled {
+      border-color: var(--line);
+      background: #f0f4f3;
+      color: #91a29f;
+      cursor: not-allowed;
+      opacity: 0.72;
+      transform: none;
+    }
+
+    .inline-alert {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      padding: 9px 11px;
+      border-radius: 9px;
+      background: var(--amber-soft);
+      color: var(--amber);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .inline-alert.visible {
+      display: flex;
+    }
+
+    .pool-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 14px 1px 8px;
+    }
+
+    .pool-toolbar strong {
+      font-size: 12px;
+    }
+
+    .text-action {
+      padding: 5px 2px;
+      border: 0;
+      background: transparent;
+      color: var(--danger);
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .text-action:disabled {
+      color: #aebdbb;
+      cursor: not-allowed;
+    }
+
+    .pool-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .pool-empty {
+      display: none;
+      padding: 22px 14px;
+      border: 1px dashed var(--line-strong);
+      border-radius: 12px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .pool-empty.visible {
+      display: block;
+    }
+
+    .agent-row {
+      display: grid;
+      grid-template-columns: 46px minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      min-height: 66px;
+      padding: 10px 11px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: white;
+      animation: row-in 260ms ease both;
+    }
+
+    .agent-id {
+      display: grid;
+      width: 42px;
+      height: 42px;
+      place-items: center;
+      border: 1px solid #9ed0c7;
+      border-radius: 12px;
+      background: var(--teal-soft);
+      color: var(--teal-dark);
+      font-size: 12px;
+      font-weight: 950;
+      letter-spacing: 0.02em;
+    }
+
+    .agent-copy {
+      min-width: 0;
+    }
+
+    .agent-name {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin: 0;
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .ready-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #22a06b;
+    }
+
+    .agent-model {
+      overflow: hidden;
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-family: "SFMono-Regular", "Cascadia Code", monospace;
+      font-size: 11px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .remove-agent {
+      padding: 7px 9px;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--danger);
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 800;
+      transition: background 150ms ease, border-color 150ms ease;
+    }
+
+    .remove-agent:hover {
+      border-color: #f1c6c1;
+      background: var(--danger-soft);
+    }
+
+    .orchestrator-panel {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: #fbfdfc;
+    }
+
+    .choice {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      padding: 10px;
+      border: 1px solid transparent;
+      border-radius: 11px;
+      cursor: pointer;
+    }
+
+    .choice:has(input:checked) {
+      border-color: #9ccbc3;
+      background: var(--teal-soft);
+    }
+
+    .choice input {
+      width: 16px;
+      height: 16px;
+      margin: 2px 0 0;
+      accent-color: var(--teal);
+    }
+
+    .choice strong {
+      display: block;
+      font-size: 12px;
+    }
+
+    .choice span {
+      display: block;
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
+    .fixed-control {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      margin: 4px 10px 8px 36px;
+    }
+
+    .fixed-control label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+    }
+
+    .member-select {
+      height: 38px;
+      font-size: 11px;
+    }
+
+    .member-select:disabled {
+      background: #f0f4f3;
+      color: #96a7a4;
+      cursor: not-allowed;
+    }
+
+    .footer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: center;
+      margin-top: 22px;
+      padding-top: 19px;
+      border-top: 1px solid var(--line);
+    }
+
+    .footer-note {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.55;
+    }
+
+    .footer-note strong {
+      display: block;
+      margin-bottom: 2px;
+      color: var(--ink-soft);
+      font-size: 12px;
+    }
+
+    .primary-action {
+      min-width: 194px;
+      height: 46px;
+      border: 0;
+      border-radius: 12px;
+      background: linear-gradient(135deg, var(--teal), var(--teal-dark));
+      box-shadow: 0 10px 22px rgba(8, 127, 115, 0.24);
+      color: white;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 900;
+      transition: transform 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
+    }
+
+    .primary-action:hover:not(:disabled) {
+      box-shadow: 0 13px 28px rgba(8, 127, 115, 0.3);
+      transform: translateY(-1px);
+    }
+
+    .primary-action:disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+      box-shadow: none;
+    }
+
+    .run-state {
+      display: none;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      margin-top: 13px;
+      padding: 11px 13px;
+      border: 1px solid #a4c9e8;
+      border-radius: 11px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-size: 11px;
+      font-weight: 750;
+    }
+
+    .run-state.visible {
+      display: grid;
+    }
+
+    .spinner {
+      width: 17px;
+      height: 17px;
+      border: 2px solid rgba(36, 95, 168, 0.2);
+      border-top-color: var(--blue);
+      border-radius: 50%;
+      animation: spin 800ms linear infinite;
+    }
+
+    @keyframes row-in {
+      from {
+        opacity: 0;
+        transform: translateY(5px);
+      }
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
+
+    @media (max-width: 680px) {
+      .stage {
+        padding: 14px 10px 36px;
+      }
+
+      .preview-label {
+        margin: 0 4px 9px;
+      }
+
+      .workflow-card {
+        border-radius: 18px;
+      }
+
+      .hero {
+        grid-template-columns: 45px minmax(0, 1fr);
+        gap: 12px;
+        padding: 19px 17px;
+      }
+
+      .hero-mark {
+        width: 45px;
+        height: 45px;
+        border-radius: 14px;
+        font-size: 18px;
+      }
+
+      .flow-pill {
+        grid-column: 1 / -1;
+        justify-self: start;
+        margin-left: 57px;
+      }
+
+      .content {
+        padding: 0 16px 20px;
+      }
+
+      .task-strip {
+        grid-template-columns: auto minmax(0, 1fr);
+      }
+
+      .automation-note {
+        display: none;
+      }
+
+      .tool-tabs {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .compose-row {
+        grid-template-columns: 1fr;
+      }
+
+      .secondary-add {
+        width: 100%;
+      }
+
+      .fixed-control {
+        grid-template-columns: 1fr;
+        margin-left: 36px;
+      }
+
+      .footer {
+        grid-template-columns: 1fr;
+      }
+
+      .primary-action {
+        width: 100%;
+      }
+    }
+
+    @media (max-width: 420px) {
+      .section-heading {
+        align-items: center;
+      }
+
+      .section-help {
+        margin-left: 0;
+      }
+
+      .agent-row {
+        grid-template-columns: 40px minmax(0, 1fr) auto;
+        gap: 9px;
+      }
+
+      .agent-id {
+        width: 38px;
+        height: 38px;
+      }
+
+      .remove-agent {
+        width: 34px;
+        overflow: hidden;
+        padding: 7px;
+        color: transparent;
+      }
+
+      .remove-agent::after {
+        color: var(--danger);
+        content: "×";
+        font-size: 18px;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *,
+      *::before,
+      *::after {
+        scroll-behavior: auto !important;
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <div class="preview-label">
+      <span>GhostAP · Workflow UX</span>
+      <span>Agent pool selection</span>
+    </div>
+
+    <article class="workflow-card" aria-labelledby="page-title">
+      <header class="hero">
+        <div class="hero-mark" aria-hidden="true">WF</div>
+        <div class="hero-copy">
+          <p class="eyebrow">Workflow setup</p>
+          <h1 id="page-title">为这次编排组建 Agent 池</h1>
+          <p>池内 Agent 会按节点能力动态分工。确认一次后，脚本生成、验证与执行全自动完成。</p>
+        </div>
+        <div class="flow-pill"><i></i> 1 次确认 · 后续全自动</div>
+      </header>
+
+      <div class="content">
+        <div class="task-strip">
+          <span class="task-kicker">任务</span>
+          <span class="task-text">实现 Workflow 动态 Agent 池，并保持所有运行阶段可追踪</span>
+          <span class="automation-note">生成 → 验证 → 执行</span>
+        </div>
+
+        <section class="section" aria-labelledby="add-title">
+          <div class="section-heading">
+            <div>
+              <h2 class="section-title" id="add-title"><span class="section-index">1</span> 添加 tool + model</h2>
+              <p class="section-help">同一工具可添加不同模型；完全相同的组合不会重复进入池。</p>
+            </div>
+          </div>
+
+          <div class="builder">
+            <span class="field-label">选择工具</span>
+            <div class="tool-tabs" id="toolTabs" role="group" aria-label="选择工具"></div>
+            <div class="compose-row">
+              <label>
+                <span class="field-label">选择模型</span>
+                <select class="model-select" id="modelSelect" aria-label="选择模型"></select>
+              </label>
+              <button class="secondary-add" id="addAgent" type="button">＋ 添加到池</button>
+            </div>
+            <div class="inline-alert" id="duplicateAlert" role="status">该 tool + model 已在池中，请选择其他模型。</div>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="pool-title">
+          <div class="section-heading">
+            <div>
+              <h2 class="section-title" id="pool-title"><span class="section-index">2</span> 已选 Agent</h2>
+              <p class="section-help">最多 8 个 Agent；编号采用 A1、A2 格式，并在本次 Workflow 中保持稳定。</p>
+            </div>
+            <span class="count-badge" id="poolCount">3 个 Agent</span>
+          </div>
+
+          <div class="pool-toolbar">
+            <strong>动态池</strong>
+            <button class="text-action" id="clearPool" type="button">清空全部</button>
+          </div>
+          <div class="pool-list" id="poolList"></div>
+          <div class="pool-empty" id="poolEmpty">Agent 池为空。至少添加一个 tool + model 才能开始编排。</div>
+        </section>
+
+        <section class="section" aria-labelledby="orchestrator-title">
+          <div class="section-heading">
+            <div>
+              <h2 class="section-title" id="orchestrator-title"><span class="section-index">3</span> 编排器</h2>
+              <p class="section-help">编排器负责生成工作流，执行节点仍可分配给池内任意合适成员。</p>
+            </div>
+            <span class="count-badge" id="orchestratorBadge">自动择优</span>
+          </div>
+
+          <div class="orchestrator-panel">
+            <label class="choice">
+              <input type="radio" name="orchestratorMode" value="auto" checked>
+              <span>
+                <strong>自动从池中择优</strong>
+                <span>根据任务、模型能力与可用性选择主编排器。推荐默认。</span>
+              </span>
+            </label>
+            <label class="choice">
+              <input type="radio" name="orchestratorMode" value="fixed">
+              <span>
+                <strong>指定池成员</strong>
+                <span>固定由某个 A-id 生成脚本，其他成员继续参与节点执行。</span>
+              </span>
+            </label>
+            <div class="fixed-control">
+              <label for="memberSelect">指定成员</label>
+              <select class="member-select" id="memberSelect" disabled></select>
+            </div>
+          </div>
+        </section>
+
+        <div class="run-state" id="runState" role="status">
+          <span class="spinner" aria-hidden="true"></span>
+          <span>Agent 池已锁定。正在自动生成并验证 Workflow，无需第二次确认。</span>
+        </div>
+
+        <footer class="footer">
+          <div class="footer-note">
+            <strong id="footerSummary">将以 3 个 Agent、自动编排器开始</strong>
+            此确认只锁定 Agent 池；之后持续更新同一张进度卡。
+          </div>
+          <button class="primary-action" id="startWorkflow" type="button">使用此池开始编排</button>
+        </footer>
+      </div>
+    </article>
+  </main>
+
+  <script>
+    (function () {
+      var catalog = [
+        { key: "codex", label: "Codex", models: ["gpt-5.2-codex", "gpt-5.1-codex-mini", "default"] },
+        { key: "claude", label: "Claude", models: ["claude-sonnet-4-5", "claude-opus-4-1", "default"] },
+        { key: "gemini", label: "Gemini", models: ["gemini-2.5-pro", "gemini-2.5-flash", "default"] },
+        { key: "coco", label: "Coco", models: ["default", "glm-4.5"] },
+        { key: "aiden", label: "Aiden", models: ["default", "qwen3-coder"] },
+        { key: "traex", label: "Traex", models: ["default", "deepseek-v3.1"] }
+      ];
+
+      var pool = [
+        { id: "A1", tool: "codex", toolLabel: "Codex", model: "gpt-5.2-codex" },
+        { id: "A2", tool: "codex", toolLabel: "Codex", model: "gpt-5.1-codex-mini" },
+        { id: "A3", tool: "claude", toolLabel: "Claude", model: "claude-sonnet-4-5" }
+      ];
+      var selectedTool = "codex";
+      var nextId = 4;
+
+      var toolTabs = document.getElementById("toolTabs");
+      var modelSelect = document.getElementById("modelSelect");
+      var poolList = document.getElementById("poolList");
+      var poolEmpty = document.getElementById("poolEmpty");
+      var poolCount = document.getElementById("poolCount");
+      var clearPool = document.getElementById("clearPool");
+      var duplicateAlert = document.getElementById("duplicateAlert");
+      var addAgentButton = document.getElementById("addAgent");
+      var memberSelect = document.getElementById("memberSelect");
+      var orchestratorBadge = document.getElementById("orchestratorBadge");
+      var footerSummary = document.getElementById("footerSummary");
+      var startWorkflow = document.getElementById("startWorkflow");
+      var runState = document.getElementById("runState");
+
+      function getTool(key) {
+        return catalog.filter(function (tool) { return tool.key === key; })[0];
+      }
+
+      function renderTools() {
+        toolTabs.innerHTML = "";
+        catalog.forEach(function (tool) {
+          var button = document.createElement("button");
+          button.type = "button";
+          button.className = "tool-tab";
+          button.textContent = tool.label;
+          button.setAttribute("aria-pressed", String(tool.key === selectedTool));
+          button.addEventListener("click", function () {
+            selectedTool = tool.key;
+            duplicateAlert.classList.remove("visible");
+            renderTools();
+            renderModels();
+          });
+          toolTabs.appendChild(button);
+        });
+      }
+
+      function renderModels() {
+        var tool = getTool(selectedTool);
+        modelSelect.innerHTML = "";
+        tool.models.forEach(function (model) {
+          var option = document.createElement("option");
+          option.value = model;
+          option.textContent = model === "default" ? "后端默认模型" : model;
+          modelSelect.appendChild(option);
+        });
+      }
+
+      function removeAgent(id) {
+        pool = pool.filter(function (agent) { return agent.id !== id; });
+        renderPool();
+      }
+
+      function renderPool() {
+        poolList.innerHTML = "";
+        pool.forEach(function (agent) {
+          var row = document.createElement("div");
+          row.className = "agent-row";
+
+          var id = document.createElement("span");
+          id.className = "agent-id";
+          id.textContent = agent.id;
+
+          var copy = document.createElement("div");
+          copy.className = "agent-copy";
+          var name = document.createElement("p");
+          name.className = "agent-name";
+          name.innerHTML = '<span class="ready-dot"></span>' + agent.toolLabel;
+          var model = document.createElement("p");
+          model.className = "agent-model";
+          model.textContent = agent.model === "default" ? "后端默认模型" : agent.model;
+          copy.appendChild(name);
+          copy.appendChild(model);
+
+          var remove = document.createElement("button");
+          remove.type = "button";
+          remove.className = "remove-agent";
+          remove.textContent = "移除";
+          remove.setAttribute("aria-label", "移除 " + agent.id + " " + agent.toolLabel);
+          remove.addEventListener("click", function () { removeAgent(agent.id); });
+
+          row.appendChild(id);
+          row.appendChild(copy);
+          row.appendChild(remove);
+          poolList.appendChild(row);
+        });
+
+        var isEmpty = pool.length === 0;
+        var isAtCapacity = pool.length >= 8;
+        poolEmpty.classList.toggle("visible", isEmpty);
+        poolCount.textContent = pool.length + " 个 Agent";
+        clearPool.disabled = isEmpty;
+        addAgentButton.disabled = isAtCapacity;
+        startWorkflow.disabled = isEmpty;
+        if (isAtCapacity) {
+          duplicateAlert.dataset.reason = "capacity";
+          duplicateAlert.textContent = "并发 Agent Pool 最多允许 8 个 Agent。";
+          duplicateAlert.classList.add("visible");
+        } else if (duplicateAlert.dataset.reason === "capacity") {
+          duplicateAlert.classList.remove("visible");
+          delete duplicateAlert.dataset.reason;
+        }
+        renderMemberSelect();
+        updateSummary();
+      }
+
+      function renderMemberSelect() {
+        var previous = memberSelect.value;
+        memberSelect.innerHTML = "";
+        pool.forEach(function (agent) {
+          var option = document.createElement("option");
+          option.value = agent.id;
+          option.textContent = agent.id + " · " + agent.toolLabel + " · " + agent.model;
+          memberSelect.appendChild(option);
+        });
+        if (pool.some(function (agent) { return agent.id === previous; })) {
+          memberSelect.value = previous;
+        }
+        if (!pool.length) {
+          var empty = document.createElement("option");
+          empty.textContent = "暂无可指定成员";
+          memberSelect.appendChild(empty);
+        }
+      }
+
+      function currentMode() {
+        var selected = document.querySelector('input[name="orchestratorMode"]:checked');
+        return selected ? selected.value : "auto";
+      }
+
+      function updateSummary() {
+        var mode = currentMode();
+        var selectedAgent = pool.filter(function (agent) { return agent.id === memberSelect.value; })[0];
+        var modeText = mode === "auto" ? "自动编排器" : (selectedAgent ? selectedAgent.id + " 固定编排器" : "指定编排器");
+        orchestratorBadge.textContent = mode === "auto" ? "自动择优" : (selectedAgent ? selectedAgent.id + " 指定" : "待指定");
+        footerSummary.textContent = pool.length
+          ? "将以 " + pool.length + " 个 Agent、" + modeText + "开始"
+          : "至少需要 1 个 Agent";
+      }
+
+      document.getElementById("addAgent").addEventListener("click", function () {
+        if (pool.length >= 8) {
+          duplicateAlert.dataset.reason = "capacity";
+          duplicateAlert.textContent = "并发 Agent Pool 最多允许 8 个 Agent。";
+          duplicateAlert.classList.add("visible");
+          addAgentButton.disabled = true;
+          return;
+        }
+        var tool = getTool(selectedTool);
+        var model = modelSelect.value;
+        var duplicate = pool.some(function (agent) {
+          return agent.tool === selectedTool && agent.model === model;
+        });
+        if (duplicate) {
+          duplicateAlert.dataset.reason = "duplicate";
+          duplicateAlert.textContent = "该 tool + model 已在池中，请选择其他模型。";
+          duplicateAlert.classList.add("visible");
+          return;
+        }
+        duplicateAlert.classList.remove("visible");
+        delete duplicateAlert.dataset.reason;
+        pool.push({
+          id: "A" + nextId,
+          tool: selectedTool,
+          toolLabel: tool.label,
+          model: model
+        });
+        nextId += 1;
+        renderPool();
+      });
+
+      clearPool.addEventListener("click", function () {
+        pool = [];
+        duplicateAlert.classList.remove("visible");
+        renderPool();
+      });
+
+      document.querySelectorAll('input[name="orchestratorMode"]').forEach(function (radio) {
+        radio.addEventListener("change", function () {
+          memberSelect.disabled = currentMode() !== "fixed" || pool.length === 0;
+          updateSummary();
+        });
+      });
+
+      memberSelect.addEventListener("change", updateSummary);
+
+      startWorkflow.addEventListener("click", function () {
+        if (!pool.length) {
+          return;
+        }
+        runState.classList.add("visible");
+        startWorkflow.textContent = "Agent 池已锁定";
+        startWorkflow.disabled = true;
+        document.querySelectorAll("button, select, input").forEach(function (control) {
+          if (control !== startWorkflow) {
+            control.disabled = true;
+          }
+        });
+      });
+
+      renderTools();
+      renderModels();
+      renderPool();
+    }());
+  </script>
+</body>
+</html>

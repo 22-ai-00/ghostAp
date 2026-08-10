@@ -28,6 +28,7 @@ AGENT_UNLIMITED_BACKSTOP_S: int = 30 * 24 * 3600  # 30 days
 DEFAULT_MAX_CONCURRENT: int = 10  # Default parallel agent slots
 HARD_MAX_CONCURRENT: int = 16  # Absolute ceiling regardless of config
 MAX_TOTAL_AGENTS: int = 200  # Max agent() calls per workflow run (safety fuse)
+MAX_WORKFLOW_AGENT_POOL_SIZE: int = 8  # User-confirmed bindings per Workflow
 
 # --- Nesting ---
 

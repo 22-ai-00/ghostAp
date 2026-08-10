@@ -29,6 +29,31 @@ MODE_COMPACT = "mode_compact"  # Switch card to compact (minimal) view mode
 # ---------------------------------------------------------------------------
 WORKFLOW_STOP_RUNNING = "workflow_stop_running"  # Stop a running workflow from the progress card
 SHOW_WORKFLOW_MENU = "show_workflow_menu"  # Show Workflow usage from the global command menu
+WORKFLOW_SELECT_TOOL = "workflow_select_tool"
+WORKFLOW_SELECT_MODEL = "workflow_select_model"
+WORKFLOW_SELECT_PROFILE = "workflow_select_profile"
+WORKFLOW_SELECT_EFFORT = "workflow_select_effort"
+WORKFLOW_ADD_AGENT = "workflow_add_agent"
+WORKFLOW_ADD_RECOMMENDED_POOL = "workflow_add_recommended_pool"
+WORKFLOW_REMOVE_AGENT = "workflow_remove_agent"
+WORKFLOW_CLEAR_AGENTS = "workflow_clear_agents"
+WORKFLOW_SET_ORCHESTRATOR = "workflow_set_orchestrator"
+WORKFLOW_CONFIRM_AGENTS = "workflow_confirm_agents"
+
+WORKFLOW_AGENT_SELECTION_ACTIONS = frozenset(
+    {
+        WORKFLOW_SELECT_TOOL,
+        WORKFLOW_SELECT_MODEL,
+        WORKFLOW_SELECT_PROFILE,
+        WORKFLOW_SELECT_EFFORT,
+        WORKFLOW_ADD_AGENT,
+        WORKFLOW_ADD_RECOMMENDED_POOL,
+        WORKFLOW_REMOVE_AGENT,
+        WORKFLOW_CLEAR_AGENTS,
+        WORKFLOW_SET_ORCHESTRATOR,
+        WORKFLOW_CONFIRM_AGENTS,
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Explicit ACP model selection actions

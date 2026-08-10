@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from src.spec_engine.models import ReviewAgentBinding
 
+from .agent_pool import WorkflowAgentBinding
 from .constants import (
     AGENT_CALL_TIMEOUT_S,
     DEFAULT_MAX_CONCURRENT,
@@ -25,6 +26,7 @@ class WorkflowStatus(str, Enum):
     """Lifecycle states of a WorkflowProject."""
 
     IDLE = "idle"
+    SELECTING_AGENTS = "selecting_agents"
     GENERATING_SCRIPT = "generating_script"
     RUNNING = "running"
     COMPLETED = "completed"
@@ -64,6 +66,18 @@ class PhaseMeta(BaseModel):
     detail: str = ""
 
 
+class AgentPlanEntry(BaseModel):
+    """Displayable static or runtime-selected Agent assignment."""
+
+    node: str
+    role: str = ""
+    agent_id: Optional[str] = Field(default=None, alias="agentId")
+    runtime: bool = False
+    candidate_agent_ids: list[str] = Field(default_factory=list, alias="candidateAgentIds")
+
+    model_config = {"populate_by_name": True}
+
+
 class WorkflowMeta(BaseModel):
     """Metadata exported from a workflow script's `export const meta = {...}`."""
 
@@ -72,6 +86,8 @@ class WorkflowMeta(BaseModel):
     phases: list[PhaseMeta] = Field(default_factory=list)
     max_concurrent: int = Field(default=DEFAULT_MAX_CONCURRENT, alias="maxConcurrent")
     tools: list[str] = Field(default_factory=list)
+    patterns: list[str] = Field(default_factory=list)
+    agent_plan: list[AgentPlanEntry] = Field(default_factory=list, alias="agentPlan")
 
     model_config = {"populate_by_name": True}
 
@@ -85,6 +101,7 @@ class AgentCallParams(BaseModel):
     """Parameters for a single agent() invocation from the JS runtime."""
 
     prompt: str
+    agent_id: Optional[str] = None
     tool: str = ""
     model: Optional[str] = None
     role: Optional[str] = None
@@ -106,6 +123,7 @@ class AgentCallResult(BaseModel):
     duration_s: float = 0.0
     error: Optional[str] = None
     cached: bool = False
+    agent_id: Optional[str] = None
     tool: str = ""
     model: Optional[str] = None
 
@@ -158,6 +176,7 @@ class AgentProgress(BaseModel):
     """Runtime state of a single agent() call."""
 
     label: str = ""
+    agent_id: Optional[str] = None
     tool: str = ""
     model: Optional[str] = None
     role: Optional[str] = None
@@ -232,6 +251,18 @@ class PendingWorkflow(BaseModel):
     orchestrator_binding: Optional[ReviewAgentBinding] = None
     review_agents: list[ReviewAgentBinding] = Field(default_factory=list)
     auto_reviewer: bool = True
+    agent_pool: tuple[WorkflowAgentBinding, ...] = ()
+    orchestrator_agent_id: Optional[str] = None
+    orchestrator_was_auto: bool = False
+    selection_session_key: Optional[str] = None
+    project_id: Optional[str] = None
+    next_agent_sequence: int = 1
+    recommended_agents: list[dict[str, Any]] = Field(default_factory=list)
+    draft_tool_name: Optional[str] = None
+    draft_model_name: Optional[str] = None
+    draft_profile: Optional[str] = None
+    draft_effort: Optional[str] = None
+    selection_error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

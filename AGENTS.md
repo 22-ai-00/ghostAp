@@ -262,3 +262,44 @@ Workflow 引擎提供 6+2 个高阶编排原语，作为 JS 运行时全局函�
 Workflow 使用 `src/workflow_engine/runtime/runtime.js` 提供的 `classify`、`fanout`、`verify`、`generate`、`tournament`、`loop`、`sequence`、`race` 原语动态生成任务专用 JS。运行时负责确定性控制流，Agent 负责语义工作；简单任务保持单 Agent，复杂度增长时再组合原语。
 
 Workflow 飞书卡片显示任务摘要、阶段统计和所有直接 `agent()` 调用的调度状态；每个 Agent 只显示一条最新操作，终态通过分页或附件完整交付结果。ACP 内部嵌套 Agent 在协议缺少权威列表时只能标记为观测信息，不得从陈旧快照推断终态。
+## Workflow 模式 (`/wf`)
+
+`WorkflowHandler` 负责自然语言 Workflow。当前交互和执行契约如下：
+
+1. `/wf <需求>` 先显示 owner-bound Agent Pool 选择卡；只有发起者可在同一 chat/project/session 中修改。
+2. 池必须包含 1–8 个 `tool+model` Agent，并使用稳定 `A1`、`A2` 标识。同一 tool 可选择不同 model；完全相同的 tool/model 组合拒绝。
+3. 编排器默认由系统从已确认池中择优，也可指定池内成员。
+4. 用户只确认一次 **“使用此池开始编排”**。确认后池和编排器冻结，脚本生成、验证与执行全自动完成，不再显示脚本确认或继续批准。
+
+脚本生成和运行遵循同一池边界：
+
+- Prompt、fallback 和 `WorkflowRunSpec` 只使用已确认池；不得吸收 registry 中未选择的工具。
+- 每个直接或动态 Agent 调用都用 `agentId` 引用池内成员；tool/model 由冻结绑定决定，脚本值不能覆盖。
+- `meta.agentPlan` 用 `agentId` 表示静态节点，用 `runtime: true` 与 `candidateAgentIds` 表示运行时候选。
+- 进度卡展示编排器、完整池、静态计划、动态候选和实际 `A-id/tool/model/current operation/result`；实际运行绑定是权威事实。
+- 运行时原语为 `classify`、`fanout`、`verify`、`generate`、`tournament`、`loop`、`sequence`、`race`。简单任务保持少量调用；`generate`、`loop` 上限 50，`MAX_TOTAL_AGENTS` 上限 200。
+
+生成和终态规则：
+
+- 生成期间或执行中再次发送 `/wf` 会被拒绝；使用 `/stop_wf` 停止，或等待当前 Workflow 终态。
+- 脚本生成使用 120 秒 activity-idle timeout，并共享 600 秒 hard deadline；池内 fallback 每个唯一成员最多尝试一次，切换成员不重置 hard deadline。
+- 生成、验证或执行耗尽后进入 `FAILED`；用户停止进入 `CANCELLED`。两者都是明确终态，不进入等待确认。
+
+命令速查：
+
+| 命令 | 用途 |
+| --- | --- |
+| `/wf <需求描述>` | 选择 Agent Pool 并启动 Workflow |
+| `/stop_wf` | 中止当前 Workflow |
+| `/wf_status` | 查看池、计划和执行进度 |
+| `/wf_help` | 查看 Workflow 帮助 |
+
+## 全自动执行契约
+
+普通编程、Deep、Spec 在收到任务后自动推进；Workflow 在 Agent Pool 单次确认后自动推进。所有模式都必须到达成功或明确失败终态：
+
+- 使用项目已保存配置；缺失时采用可用的推荐工具和后端默认模型。
+- 普通、安全、可逆的选择采用推荐项；高风险且未经原始请求精确授权的操作拒绝或跳过，并继续安全部分。
+- Agent 提问、Review 不确定、格式修复和暂时性失败使用有界自动恢复；耗尽后明确失败。
+- 除 Workflow 的单次池确认外，不增加 Agent 选择、脚本确认、继续批准或手动恢复门。
+- ACP 权限保持 fail-closed，只允许明确的一次性安全授权。

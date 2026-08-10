@@ -7,6 +7,8 @@ import logging
 import re
 from typing import Any, Optional
 
+from .agent_pool import WorkflowAgentBinding, freeze_agent_pool
+
 logger = logging.getLogger(__name__)
 
 SUBAGENT_ENCOURAGEMENT = (
@@ -85,7 +87,7 @@ _SCRIPT_GEN_PROMPT_TEMPLATE = """# Workflow Script Generation Task
 
 ## Available Resources
 
-**Tools (AI agents you can dispatch):**
+<<AGENT_RESOURCE_HEADING>>
 <<TOOLS>>
 
 **Roles (specialized perspectives for agents):**
@@ -129,8 +131,7 @@ _SCRIPT_GEN_PROMPT_TEMPLATE = """# Workflow Script Generation Task
 ```javascript
 const result = await agent({
   prompt: "one focused task",
-  tool: "one available tool",
-  model: "optional bound model",
+  agentId: "one-confirmed-agent-id",
   role: "task-specific role",
   label: "unique-observable-label",
   schema: { summary: "", findings: [{ severity: "", text: "" }] },
@@ -143,7 +144,8 @@ if (result && result.error) return { error: result.error, stage: "named-stage" }
 - 为每个 agent() 显式设置短超时：路由 60-90s，普通任务 120-180s，确需长推理才使用 300s。
 - 检查 result.error 并提供 fallback；并行结果逐项过滤错误，全部失败时返回结构化失败。
 - 跨节点数据使用紧凑递归 `schema`；shape 失配不得继续传给下游。
-- 角色和工具按任务动态分配，但只能使用上方可用工具与运行时绑定。
+- 每个直接 agent()、descriptor worker 和原语内部 Agent 角色必须指定池内 agentId；不得写 tool/model 覆盖绑定。
+- 静态节点在 meta.agentPlan 写 agentId；运行时选择节点写 candidateAgentIds，且全部来自确认池。
 - 总 Agent 调用（含原语内部调用）不得超过 200；并发必须有上限。
 - 慢操作前和阶段里程碑调用 `log()`；不要记录完整 prompt、完整结果或敏感信息。
 
@@ -159,6 +161,7 @@ export const meta = {
   maxConcurrent: 6,
   tools: ["only-available-tools"],
   patterns: ["used-primitives"],
+  agentPlan: [{ node: "scope", role: "scout", agentId: "confirmed-agent-id" }],
 };
 
 export default async function main() {
@@ -214,9 +217,29 @@ def build_script_gen_prompt(
     orchestrator_binding: Optional[dict] = None,
     review_agents: Optional[list[dict]] = None,
     auto_reviewer: bool | None = None,
+    agent_pool: tuple[WorkflowAgentBinding, ...] | list[WorkflowAgentBinding] | None = None,
+    orchestrator_agent_id: str | None = None,
 ) -> str:
     """Build the compact, fully automatic Dynamic Workflow generation contract."""
-    if isinstance(available_tools, dict):
+    frozen_pool = freeze_agent_pool(agent_pool or (), require_nonempty=False)
+    if frozen_pool:
+        tools = "\n".join(
+            "- "
+            f"agentId=`{binding.agent_id}`; tool=`{binding.tool_name}`; "
+            f"model=`{binding.model_name or 'backend-default'}`; "
+            f"display=`{binding.display_name}`"
+            for binding in frozen_pool
+        )
+        resolved_orchestrator_id = orchestrator_agent_id or frozen_pool[0].agent_id
+        orchestrator_pool_binding = next(
+            (binding for binding in frozen_pool if binding.agent_id == resolved_orchestrator_id),
+            None,
+        )
+        if orchestrator_pool_binding is None:
+            raise ValueError("orchestrator_agent_id is outside confirmed agent_pool")
+        orchestrator_agent = orchestrator_pool_binding.tool_name
+        orchestrator_binding = orchestrator_pool_binding.to_dict()
+    elif isinstance(available_tools, dict):
         tools = "\n".join(f"- `{name}` - {desc}" for name, desc in available_tools.items())
     else:
         tools = "\n".join(f"- `{name}`" for name in available_tools)
@@ -242,6 +265,11 @@ def build_script_gen_prompt(
     replacements = {
         "<<REQUIREMENT>>": requirement.strip(),
         "<<TOOLS>>": tools or "- (none registered)",
+        "<<AGENT_RESOURCE_HEADING>>": (
+            "**Confirmed Agent Pool (the only AI agents you can dispatch):**"
+            if frozen_pool
+            else "**Tools (AI agents you can dispatch):**"
+        ),
         "<<RUNTIME_BINDING>>": "\n".join(runtime),
         "<<ENCOURAGEMENT>>": get_subagent_encouragement(),
     }
@@ -314,6 +342,7 @@ def _iter_js_call_sources(script_content: str, function_name: str) -> list[str]:
 def validate_generated_script(
     script_content: str,
     review_agents: Optional[list[dict]] = None,
+    agent_pool: tuple[WorkflowAgentBinding, ...] | list[WorkflowAgentBinding] | None = None,
 ) -> tuple[bool, list[str]]:
     """Fail closed on malformed, inert, unbounded, or unsafe workflow source."""
     del review_agents  # Review evidence is enforced by the engine, never inferred here.
@@ -321,6 +350,9 @@ def validate_generated_script(
         return False, ["Script content is empty"]
 
     errors: list[str] = []
+    frozen_pool = freeze_agent_pool(agent_pool or (), require_nonempty=False)
+    pool_ids = {binding.agent_id for binding in frozen_pool}
+    pool_tools = {binding.tool_name for binding in frozen_pool}
     first = script_content.lstrip()
     if not re.match(r'''^(export|/[/*]|const |let |var |"use strict"|'use strict')''', first):
         errors.append("Script starts with non-JavaScript text")
@@ -357,11 +389,67 @@ def validate_generated_script(
     if duplicates:
         errors.append("Duplicate agent label(s): " + ", ".join(duplicates))
     for index, call in enumerate(agent_calls, 1):
+        if frozen_pool:
+            present, agent_id = _static_top_level_string_property(call, "agentId")
+            if not present or agent_id is None:
+                errors.append(
+                    f"Direct agent call `{index}` requires one static top-level "
+                    "`agentId:`"
+                )
         if not re.search(r"\btimeout\s*:", call):
             match = re.search(r'''\blabel\s*:\s*(["'])(.*?)\1''', call)
             errors.append(f"Direct agent call `{match.group(2) if match else index}` lacks `timeout:`")
     if agent_calls and not re.search(r"(\.\s*error\b|\bcatch\s*\(|\btry\s*\{)", executable):
         errors.append("Direct agent calls must handle `result.error` or use try/catch")
+
+    if frozen_pool:
+        agent_id_properties = _static_string_property_occurrences(
+            script_content,
+            "agentId",
+        )
+        if any(agent_id is None for agent_id in agent_id_properties):
+            errors.append("All agentId properties must use static string literals")
+        referenced_ids = [
+            agent_id for agent_id in agent_id_properties if agent_id is not None
+        ]
+        outside_ids = sorted({agent_id for agent_id in referenced_ids if agent_id not in pool_ids})
+        if outside_ids:
+            errors.append("Agent ID(s) outside confirmed agent_pool: " + ", ".join(outside_ids))
+
+        for descriptor in _prompt_agent_descriptors(script_content):
+            present, agent_id = _static_top_level_string_property(
+                descriptor,
+                "agentId",
+            )
+            if not present or agent_id is None:
+                errors.append(
+                    "Dynamic primitive worker descriptor requires one static "
+                    "top-level `agentId:`"
+                )
+
+        meta = extract_meta_from_script(script_content)
+        if meta is None:
+            errors.append("Unable to validate meta.agentPlan against agent_pool")
+        else:
+            raw_tools = meta.get("tools")
+            if (
+                not isinstance(raw_tools, list)
+                or not raw_tools
+                or any(
+                    not isinstance(tool, str) or not tool.strip()
+                    for tool in raw_tools
+                )
+            ):
+                errors.append("meta.tools must be a non-empty array of tool names")
+            else:
+                declared_tools = {tool.strip() for tool in raw_tools}
+                outside_tools = sorted(declared_tools - pool_tools)
+                if outside_tools:
+                    errors.append(
+                        "Meta tools outside confirmed agent_pool: "
+                        + ", ".join(outside_tools)
+                    )
+            errors.extend(_validate_agent_plan(meta.get("agentPlan"), pool_ids))
 
     delimiters = (("{", "}", "braces"), ("[", "]", "brackets"), ("(", ")", "parentheses"))
     for opening, closing, name in delimiters:
@@ -376,6 +464,223 @@ def validate_generated_script(
     if errors:
         logger.warning("Script validation failed with %d error(s): %s", len(errors), "; ".join(errors))
     return not errors, errors
+
+
+def _prompt_agent_descriptors(script_content: str) -> list[str]:
+    """Return innermost object literals containing a static prompt property."""
+
+    masked = _strip_js_strings_and_comments(script_content)
+    pairs: list[tuple[int, int]] = []
+    stack: list[int] = []
+    for index, char in enumerate(masked):
+        if char == "{":
+            stack.append(index)
+        elif char == "}" and stack:
+            pairs.append((stack.pop(), index))
+    descriptors: list[str] = []
+    for match in re.finditer(r"\bprompt\s*:", masked):
+        containing = [pair for pair in pairs if pair[0] < match.start() < pair[1]]
+        if not containing:
+            continue
+        start, end = min(containing, key=lambda pair: pair[1] - pair[0])
+        descriptor = script_content[start : end + 1]
+        if descriptor not in descriptors:
+            descriptors.append(descriptor)
+    return descriptors
+
+
+def _skip_js_trivia(source: str, index: int) -> int:
+    """Skip whitespace and comments without interpreting JavaScript."""
+
+    length = len(source)
+    while index < length:
+        if source[index].isspace():
+            index += 1
+            continue
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            return length if newline < 0 else _skip_js_trivia(source, newline + 1)
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            return length if end < 0 else _skip_js_trivia(source, end + 2)
+        break
+    return index
+
+
+def _read_static_js_string(source: str, index: int) -> tuple[str | None, int]:
+    """Read an unescaped single/double quoted literal; reject dynamic escapes."""
+
+    if index >= len(source) or source[index] not in {"'", '"'}:
+        return None, index
+    quote = source[index]
+    cursor = index + 1
+    value: list[str] = []
+    escaped = False
+    while cursor < len(source):
+        char = source[cursor]
+        if char == "\\":
+            escaped = True
+            cursor += 2
+            continue
+        if char == quote:
+            return (None if escaped else "".join(value)), cursor + 1
+        value.append(char)
+        cursor += 1
+    return None, len(source)
+
+
+def _static_string_property_occurrences(
+    source: str,
+    property_name: str,
+    *,
+    brace_depth: int | None = None,
+) -> list[str | None]:
+    """Find object properties outside nested text, optionally at one depth."""
+
+    occurrences: list[str | None] = []
+    cursor = 0
+    depth = 0
+    while cursor < len(source):
+        cursor = _skip_js_trivia(source, cursor)
+        if cursor >= len(source):
+            break
+        char = source[cursor]
+        if char in {"'", '"', "`"}:
+            if char == "`":
+                quote = char
+                cursor += 1
+                while cursor < len(source):
+                    if source[cursor] == "\\":
+                        cursor += 2
+                    elif source[cursor] == quote:
+                        cursor += 1
+                        break
+                    else:
+                        cursor += 1
+            else:
+                _, cursor = _read_static_js_string(source, cursor)
+            continue
+        if char == "{":
+            depth += 1
+            cursor += 1
+            continue
+        if char == "}":
+            depth = max(0, depth - 1)
+            cursor += 1
+            continue
+        if char.isalpha() or char in {"_", "$"}:
+            end = cursor + 1
+            while end < len(source) and (
+                source[end].isalnum() or source[end] in {"_", "$"}
+            ):
+                end += 1
+            identifier = source[cursor:end]
+            after_name = _skip_js_trivia(source, end)
+            if (
+                identifier == property_name
+                and (brace_depth is None or depth == brace_depth)
+                and after_name < len(source)
+                and source[after_name] == ":"
+            ):
+                value_start = _skip_js_trivia(source, after_name + 1)
+                value, value_end = _read_static_js_string(source, value_start)
+                occurrences.append(value)
+                cursor = max(value_end, value_start + 1)
+                continue
+            cursor = end
+            continue
+        cursor += 1
+    return occurrences
+
+
+def _static_top_level_string_property(
+    object_source: str,
+    property_name: str,
+) -> tuple[bool, str | None]:
+    """Resolve one static depth-one object property, rejecting ambiguity."""
+
+    occurrences = _static_string_property_occurrences(
+        object_source,
+        property_name,
+        brace_depth=1,
+    )
+    if not occurrences:
+        return False, None
+    if len(occurrences) != 1 or occurrences[0] is None:
+        return True, None
+    return True, occurrences[0]
+
+
+def _validate_agent_plan(agent_plan: Any, pool_ids: set[str]) -> list[str]:
+    if not isinstance(agent_plan, list) or not agent_plan:
+        return ["meta.agentPlan must be a non-empty array"]
+    errors: list[str] = []
+    for index, entry in enumerate(agent_plan):
+        prefix = f"meta.agentPlan[{index}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+
+        node = entry.get("node")
+        role = entry.get("role")
+        if not isinstance(node, str) or not node.strip():
+            errors.append(f"{prefix} requires non-empty node")
+        if not isinstance(role, str) or not role.strip():
+            errors.append(f"{prefix} requires non-empty role")
+
+        runtime = entry.get("runtime")
+        if runtime is not None and type(runtime) is not bool:
+            errors.append(f"{prefix}.runtime must be boolean")
+            continue
+
+        has_static = "agentId" in entry
+        has_dynamic = "candidateAgentIds" in entry
+        if has_static == has_dynamic:
+            errors.append(
+                f"{prefix} must declare exactly one of agentId or candidateAgentIds"
+            )
+            continue
+
+        if has_static:
+            if runtime is True:
+                errors.append(f"{prefix} runtime node cannot declare agentId")
+                continue
+            agent_id = entry.get("agentId")
+            if not isinstance(agent_id, str) or not agent_id.strip():
+                errors.append(f"{prefix} requires non-empty string agentId")
+            elif agent_id not in pool_ids:
+                errors.append(
+                    f"{prefix} references Agent ID outside pool: {agent_id}"
+                )
+            continue
+
+        if runtime is not True:
+            errors.append(
+                f"{prefix} dynamic node requires runtime=true with candidateAgentIds"
+            )
+            continue
+        candidate_ids = entry.get("candidateAgentIds")
+        if (
+            not isinstance(candidate_ids, list)
+            or not candidate_ids
+            or any(
+                not isinstance(agent_id, str) or not agent_id.strip()
+                for agent_id in candidate_ids
+            )
+        ):
+            errors.append(
+                f"{prefix} dynamic node requires non-empty string candidateAgentIds"
+            )
+            continue
+        if len(candidate_ids) != len(set(candidate_ids)):
+            errors.append(f"{prefix} candidateAgentIds must be unique")
+        outside = sorted(set(candidate_ids) - pool_ids)
+        if outside:
+            errors.append(
+                f"{prefix} references Agent ID(s) outside pool: "
+                + ", ".join(outside)
+            )
+    return errors
 
 
 def _matching_brace(source: str, start: int) -> int | None:
@@ -465,12 +770,58 @@ def _replace_js_quote(source: str, quote: str) -> str:
 def generate_simple_script(
     requirement: str,
     selected_tools: list[str] | None = None,
-    tool_model_map: dict[str, str] | None = None,
+    tool_model_map: dict[str, str | None] | None = None,
+    *,
+    agent_pool: tuple[WorkflowAgentBinding, ...]
+    | list[WorkflowAgentBinding]
+    | None = None,
+    orchestrator_agent_id: str | None = None,
+    legacy_replay: bool = False,
 ) -> str:
     """Return the one-Agent automatic path used by lightweight callers/tests."""
-    tools = [tool for tool in (selected_tools or ["coco"]) if tool] or ["coco"]
-    primary = tools[0]
-    model = (tool_model_map or {}).get(primary)
+    frozen_pool = freeze_agent_pool(agent_pool or (), require_nonempty=False)
+    agent_plan = ""
+    if frozen_pool:
+        if legacy_replay:
+            raise ValueError("legacy_replay cannot be combined with agent_pool")
+        if selected_tools is not None or tool_model_map is not None:
+            raise ValueError(
+                "Strict simple scripts derive tool/model only from agent_pool"
+            )
+        selected_id = str(orchestrator_agent_id or "").strip() or frozen_pool[0].agent_id
+        binding = next(
+            (item for item in frozen_pool if item.agent_id == selected_id),
+            None,
+        )
+        if binding is None:
+            raise ValueError(
+                "orchestrator_agent_id is outside confirmed agent_pool: "
+                + selected_id
+            )
+        tools = [binding.tool_name]
+        binding_arguments = f"    agentId: {json.dumps(binding.agent_id)},\n"
+        agent_plan = f'''  agentPlan: [{{
+    node: "execute-focused-task",
+    role: "focused-executor",
+    agentId: {json.dumps(binding.agent_id)},
+  }}],
+'''
+    else:
+        if not legacy_replay:
+            raise ValueError(
+                "agent_pool is required; use legacy_replay=True only at replay boundaries"
+            )
+        if orchestrator_agent_id is not None:
+            raise ValueError(
+                "Legacy simple scripts cannot declare orchestrator_agent_id"
+            )
+        tools = [tool for tool in (selected_tools or ["coco"]) if tool] or ["coco"]
+        primary = tools[0]
+        model = (tool_model_map or {}).get(primary)
+        binding_arguments = (
+            f"    tool: {json.dumps(primary)},\n"
+            f"    model: {json.dumps(model)},\n"
+        )
     prompt = f"""Fulfill the user's request exactly and self-check the result before returning.
 
 Requirement:
@@ -488,16 +839,14 @@ For implementation, return the complete production result. On a blocker, return 
   maxConcurrent: 1,
   tools: {json.dumps(tools)},
   patterns: [],
-}};
+{agent_plan}}};
 
 export default async function main() {{
   phase("Execution");
   log("Executing one focused task");
   const result = await agent({{
     prompt: {json.dumps(prompt, ensure_ascii=False)},
-    tool: {json.dumps(primary)},
-    model: {json.dumps(model)},
-    role: "focused-executor",
+{binding_arguments}    role: "focused-executor",
     label: "execute-focused-task",
     timeout: 180,
   }});

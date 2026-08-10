@@ -101,6 +101,8 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
         lambda mid, cid, pid, val: workflow.show_workflow_help(mid)
     )
     actions[action_ids.WORKFLOW_STOP_RUNNING] = workflow.handle_workflow_stop_running
+    for action in action_ids.WORKFLOW_AGENT_SELECTION_ACTIONS:
+        actions[action] = workflow.handle_workflow_agent_action
 
     # System
     actions[action_ids.SHOW_HELP_MENU] = (

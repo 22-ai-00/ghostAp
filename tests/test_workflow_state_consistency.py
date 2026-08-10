@@ -15,6 +15,7 @@ from src.workflow_engine.engine import WorkflowEngine, WorkflowEngineCallbacks
 from src.workflow_engine.models import (
     PendingWorkflow,
     ReviewAgentBinding,
+    WorkflowAgentBinding,
     WorkflowProject,
     WorkflowStatus,
 )
@@ -51,6 +52,15 @@ def _run_spec(task: str) -> WorkflowRunSpec:
         auto_reviewer=True,
         initiator_user_id="user_1",
         allowed_tools=("coco",),
+        agent_pool=(
+            WorkflowAgentBinding(
+                agent_id="coco-default",
+                tool_name="coco",
+                model_name=None,
+                display_name="Coco",
+            ),
+        ),
+        orchestrator_agent_id="coco-default",
     )
 
 
@@ -212,6 +222,10 @@ def test_old_script_generation_task_does_not_apply_after_session_changes(tmp_pat
     )
     handler._generate_and_start_workflow = MagicMock()
     handler._reply_workflow_error = MagicMock()
+    engine._script_generation_owner = _WorkflowLifecycleOwner(
+        "old_session",
+        "user_1",
+    )
 
     handler._schedule_generate_and_start_workflow(
         message_id="old_card",
@@ -411,8 +425,9 @@ def test_generation_result_cas_cannot_commit_after_stop_acknowledgement(tmp_path
 
     assert not commit_thread.is_alive()
     assert result["value"] is False
-    assert engine.project.status == WorkflowStatus.IDLE
-    assert engine.project.pending is None
+    assert engine.project.status == WorkflowStatus.CANCELLED
+    assert engine.project.pending is not None
+    assert engine.project.finished_at is not None
     handler.reply_text.assert_called_once_with("stop_msg", "Workflow 任务已停止。")
 
 
@@ -531,8 +546,9 @@ def test_stop_workflow_clears_generating_script_state(tmp_path):
         handler.stop_workflow("msg_1", "chat_1", project)
 
     assert generation_owner.stop_event.is_set()
-    assert engine.project.status == WorkflowStatus.IDLE
-    assert engine.project.pending is None
+    assert engine.project.status == WorkflowStatus.CANCELLED
+    assert engine.project.pending is not None
+    assert engine.project.finished_at is not None
     handler.reply_text.assert_called_once()
     handler._reply_workflow_error.assert_not_called()
 
@@ -900,16 +916,37 @@ def test_cancelled_generator_does_not_recreate_owned_script(tmp_path):
         "generation_session",
         source_script_path=str(script_path),
     )
+    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
+    engine._project = WorkflowProject(
+        status=WorkflowStatus.GENERATING_SCRIPT,
+        pending=PendingWorkflow(
+            requirement="generate a cancellable workflow",
+            initiator_user_id="user_1",
+            engine_session_key="generation_session",
+            agent_pool=(
+                WorkflowAgentBinding(
+                    agent_id="A-1",
+                    tool_name="coco",
+                    model_name=None,
+                    display_name="Coco",
+                ),
+            ),
+            orchestrator_agent_id="A-1",
+        ),
+    )
+    engine._script_generation_owner = owner
 
     class FakeSession:
         def set_tool_filter(self, _tool_filter):
             return None
 
-        def send_prompt(self, _prompt, *, timeout):
+        def send_prompt(self, _prompt, **kwargs):
+            timeout = kwargs["timeout"]
             assert timeout > 0
             prompt_started.set()
             assert release_prompt.wait(timeout=2)
             result = MagicMock()
+            result.stop_reason = "end_turn"
             result.text = """
 export const meta = { name: "late", phases: [], tools: ["coco"] };
 export default async function workflow() {
@@ -917,6 +954,9 @@ export default async function workflow() {
 }
 """
             return result
+
+        def cancel(self, wait=False, timeout=2.0):
+            return True
 
         def close(self):
             return None
@@ -932,6 +972,7 @@ export default async function workflow() {
                 "generate a cancellable workflow",
                 str(tmp_path),
                 ["coco"],
+                engine,
                 output_path=str(script_path),
                 cancel_event=owner.stop_event,
                 artifact_lock=owner.delivery_lock,

@@ -490,6 +490,8 @@ async function agent(promptOrOpts, opts = {}) {
     prompt = promptOrOpts;
   }
 
+  const agentId = typeof opts.agentId === 'string' ? opts.agentId.trim() : '';
+
   if (totalAgentCalls >= maxTotalAgents) {
     return {
       error: `Agent call limit exceeded (${maxTotalAgents})`,
@@ -507,6 +509,7 @@ async function agent(promptOrOpts, opts = {}) {
 
   const params = {
     prompt,
+    ...(agentId && { agent_id: agentId }),
     ...(opts.tool && { tool: opts.tool }),
     ...(opts.model && { model: opts.model }),
     ...(opts.role && { role: opts.role }),
@@ -784,6 +787,7 @@ async function classify(input, categories, opts = {}) {
     `Classify the input into exactly one category.\n\n${categoryDescriptions}\n\nInput:\n${input}\n\nReturn JSON only: { "category": "one exact category name" }.`;
 
   const classification = await agent(classifierPrompt, {
+    agentId: opts.classifierAgentId || opts.agentId,
     tool: opts.classifierTool || opts.tool,
     model: opts.classifierModel || opts.model,
     role: 'classifier',
@@ -851,6 +855,7 @@ async function fanout(input, workers, opts = {}) {
       : (worker.prompt || '').replace('${input}', inputStr);
     return {
       prompt,
+      agentId: worker.agentId || opts.workerAgentId || opts.agentId,
       tool: worker.tool || opts.defaultTool,
       model: worker.model,
       role: worker.role || `worker-${idx}`,
@@ -889,6 +894,7 @@ async function fanout(input, workers, opts = {}) {
     `You are a synthesizer. Combine and reconcile these parallel results into a unified, coherent output.\n\nOriginal input: ${inputStr}\n\nParallel results:\n${resultSummary}\n\nProvide a synthesized result that captures the best insights from all workers. Resolve any conflicts by choosing the most well-supported conclusion.`;
 
   const synthesized = await agent(synthPrompt, {
+    agentId: opts.synthesizerAgentId || opts.agentId || workers[0]?.agentId,
     tool: opts.synthesizerTool || opts.tool,
     model: opts.synthesizerModel || opts.model,
     role: opts.synthesizerRole || 'synthesizer',
@@ -952,7 +958,7 @@ async function verify(output, opts = {}) {
   const criteria = opts.criteria || 'correctness, completeness, security, quality';
   const verifiers = (opts.verifiers && opts.verifiers.length
     ? opts.verifiers
-    : [{ tool: opts.tool, role: 'adversarial_verifier', focus: 'Find concrete correctness and safety issues' }]
+    : [{ agentId: opts.verifierAgentId || opts.agentId, tool: opts.tool, role: 'adversarial_verifier', focus: 'Find concrete correctness and safety issues' }]
   ).slice(0, 8);
 
   let currentOutput = output;
@@ -969,6 +975,7 @@ async function verify(output, opts = {}) {
     const reviews = await parallel(
       verifiers.map((v, idx) => ({
         prompt: `You are an adversarial verifier. Your job is to FIND PROBLEMS.\n\nCriteria: ${criteria}\nFocus: ${v.focus || criteria}\n\nOutput to verify:\n${outputStr}\n\nRules:\n- Only report REAL issues with concrete evidence\n- Rate severity: critical / major / minor\n- Be thorough but fair\n\nRespond with JSON:\n{ "issues": [{ "severity": "critical|major|minor", "description": "", "evidence": "" }], "approve": true/false }`,
+        agentId: v.agentId || opts.verifierAgentId || opts.agentId,
         tool: v.tool,
         role: v.role || `verifier-${idx}`,
         label: `verify-r${round}-${idx}`,
@@ -1047,6 +1054,7 @@ async function verify(output, opts = {}) {
       const revised = await agent(
         `Revise this output to address the following issues:\n\nCurrent output:\n${outputStr}\n\nIssues found:\n${lastFeedback}\n\nProvide a revised version that addresses ALL critical and major issues.`,
         {
+          agentId: opts.reviserAgentId || opts.agentId || verifiers[0]?.agentId,
           tool: opts.reviseTool || opts.tool,
           role: 'reviser',
           label: `revise-r${round}`,
@@ -1103,14 +1111,14 @@ async function generate(count, generatorFn, filterFn, opts = {}) {
     if (typeof generatorFn === 'function') {
       const descriptor = generatorFn(i);
       if (typeof descriptor === 'string') {
-        tasks.push({ prompt: descriptor, label: `gen-${i}`, timeout: opts.generatorTimeout || opts.timeout });
+        tasks.push({ prompt: descriptor, agentId: opts.generatorAgentId || opts.agentId, label: `gen-${i}`, timeout: opts.generatorTimeout || opts.timeout });
       } else if (typeof descriptor === 'object' && descriptor !== null) {
-        tasks.push({ ...descriptor, label: descriptor.label || `gen-${i}`, timeout: descriptor.timeout || opts.generatorTimeout || opts.timeout });
+        tasks.push({ ...descriptor, agentId: descriptor.agentId || opts.generatorAgentId || opts.agentId, label: descriptor.label || `gen-${i}`, timeout: descriptor.timeout || opts.generatorTimeout || opts.timeout });
       } else {
         throw new TypeError(`generate() generatorFn must return a string or object, got ${typeof descriptor}`);
       }
     } else if (typeof generatorFn === 'object' && generatorFn !== null && generatorFn.prompt) {
-      tasks.push({ ...generatorFn, label: `gen-${i}`, timeout: generatorFn.timeout || opts.generatorTimeout || opts.timeout });
+      tasks.push({ ...generatorFn, agentId: generatorFn.agentId || opts.generatorAgentId || opts.agentId, label: `gen-${i}`, timeout: generatorFn.timeout || opts.generatorTimeout || opts.timeout });
     } else {
       throw new TypeError('generate() generatorFn must be a function or object with .prompt');
     }
@@ -1136,6 +1144,7 @@ async function generate(count, generatorFn, filterFn, opts = {}) {
     `You are a quality filter. From the following ${count} candidates, select the top ${topK} best ones.\n\nCriteria: ${opts.criteria || 'quality, originality, correctness'}\n\nCandidates:\n${candidatesSummary}\n\nRespond with JSON: { "ranked": [0, 2, 1], "reasoning": "..." } where "ranked" is the candidate indices in order of quality.`;
 
   const filterResult = await agent(filterPrompt, {
+    agentId: opts.filterAgentId || opts.agentId || tasks[0]?.agentId,
     tool: opts.filterTool || opts.tool,
     role: 'filter',
     label: 'filter-rank',
@@ -1233,6 +1242,7 @@ async function tournament(contestants, judgeFn, opts = {}) {
         const criteria = opts.criteria || 'correctness, quality, completeness';
         return {
           prompt: `You are a judge in a tournament. Compare these two solutions for ${task}.\n\nCriteria: ${criteria}\n\n[Solution A - ${a.label}]:\n${aStr}\n\n[Solution B - ${b.label}]:\n${bStr}\n\nWhich is better? Respond with JSON: { "winner": "A" or "B", "reasoning": "brief explanation" }`,
+          agentId: opts.judgeAgentId || opts.agentId || contestants[0]?.agentId,
           tool: opts.judgeTool || opts.tool || 'claude',
           role: 'tournament_judge',
           label: `judge-r${roundNum}-m${mIdx}`,

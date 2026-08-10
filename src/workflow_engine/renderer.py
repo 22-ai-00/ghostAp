@@ -336,6 +336,243 @@ def _unicode_progress_bar(ratio: float, *, length: int = 20) -> str:
 # ---------------------------------------------------------------------------
 
 
+class WorkflowAgentSelectionRenderer:
+    """Render the owner-bound Agent Pool selection control surface."""
+
+    def __init__(
+        self,
+        pending: Any,
+        *,
+        project_id: str,
+        tool_options: dict[str, str] | None = None,
+        model_state: Any = None,
+    ) -> None:
+        self.pending = pending
+        self.project_id = project_id
+        self.tool_options = dict(tool_options or {})
+        self.model_state = model_state
+
+    def _value(self, action: str, **extra: Any) -> dict[str, Any]:
+        return {
+            "action": action,
+            "project_id": self.project_id,
+            "selection_session_key": self.pending.selection_session_key or "",
+            **extra,
+        }
+
+    @staticmethod
+    def _button(text: str, value: dict[str, Any], *, kind: str = "default") -> dict[str, Any]:
+        return {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": text},
+            "type": kind,
+            "value": value,
+            "behaviors": [{"type": "callback", "value": value}],
+        }
+
+    def _select_static(
+        self,
+        *,
+        name: str,
+        placeholder: str,
+        options: list[tuple[str, str]],
+        selected: str | None,
+        action: str,
+    ) -> dict[str, Any]:
+        callback = self._value(action)
+        element: dict[str, Any] = {
+            "tag": "select_static",
+            "name": name,
+            "placeholder": {"tag": "plain_text", "content": placeholder},
+            "options": [
+                {
+                    "text": {"tag": "plain_text", "content": label},
+                    "value": value,
+                }
+                for value, label in options
+            ],
+            "value": callback,
+            "behaviors": [{"type": "callback", "value": callback}],
+        }
+        option_values = {value for value, _label in options}
+        if selected in option_values:
+            element["initial_option"] = selected
+        return element
+
+    def render(self) -> dict[str, Any]:
+        from ..card.shared import build_responsive_layout
+        from .agent_pool import select_auto_orchestrator
+
+        pool = tuple(self.pending.agent_pool or ())
+        draft_tool = self.pending.draft_tool_name or next(iter(self.tool_options), "")
+        draft_model = self.pending.draft_model_name
+        auto_binding = None
+        if pool:
+            auto_binding = select_auto_orchestrator(
+                pool,
+                recommendations=self.pending.recommended_agents or (),
+            )
+        if self.pending.orchestrator_was_auto and self.pending.orchestrator_agent_id:
+            orchestrator = f"Auto → {self.pending.orchestrator_agent_id}"
+        elif self.pending.orchestrator_agent_id:
+            orchestrator = self.pending.orchestrator_agent_id
+        elif auto_binding is not None:
+            orchestrator = f"Auto → {auto_binding.agent_id}"
+        else:
+            orchestrator = "Auto"
+        elements: list[dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**需求**\n{self.pending.requirement or ''}\n\n"
+                    f"**主编排 Agent**: {orchestrator}\n\n"
+                    f"**并发 Agent Pool**: {len(pool)}/8（最多 8 个）"
+                ),
+            },
+        ]
+        if self.pending.selection_error:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": f"❌ **无法应用选择**\n{self.pending.selection_error}",
+                }
+            )
+
+        elements.extend(
+            [
+                self._select_static(
+                    name="tool_name",
+                    placeholder="选择工具",
+                    options=list(self.tool_options.items()),
+                    selected=draft_tool,
+                    action="workflow_select_tool",
+                ),
+            ]
+        )
+        model_options = [("default", "Backend default")]
+        if self.model_state is not None:
+            model_options.extend((name, name) for name in self.model_state.model_names)
+        elements.append(
+            self._select_static(
+                name="model_name",
+                placeholder="选择模型",
+                options=model_options,
+                selected=draft_model or "default",
+                action="workflow_select_model",
+            )
+        )
+        if draft_model and self.model_state is not None and self.model_state.profiles:
+            elements.append(
+                self._select_static(
+                    name="model_profile",
+                    placeholder="选择 Profile",
+                    options=[(value, value) for value in self.model_state.profiles],
+                    selected=self.pending.draft_profile,
+                    action="workflow_select_profile",
+                )
+            )
+        if draft_model and self.model_state is not None and self.model_state.efforts:
+            elements.append(
+                self._select_static(
+                    name="model_effort",
+                    placeholder="选择 Effort",
+                    options=[(value, value) for value in self.model_state.efforts],
+                    selected=self.pending.draft_effort,
+                    action="workflow_select_effort",
+                )
+            )
+
+        elements.extend(
+            build_responsive_layout(
+                [
+                    self._button("+ 添加 Agent", self._value("workflow_add_agent")),
+                    self._button("使用推荐池", self._value("workflow_add_recommended_pool")),
+                    self._button("清空", self._value("workflow_clear_agents")),
+                ],
+                layout="mobile",
+            )
+        )
+        if not pool:
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "尚未添加 Agent。先选择工具和模型，再加入并发池。",
+                }
+            )
+        for binding in pool:
+            qualifiers = [binding.model_name or "default"]
+            if binding.profile:
+                qualifiers.append(binding.profile)
+            if binding.effort:
+                qualifiers.append(binding.effort)
+            elements.append(
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**{binding.agent_id}** · {binding.display_name}\n"
+                        f"`{binding.tool_name}` / `{' / '.join(qualifiers)}`"
+                    ),
+                }
+            )
+            elements.extend(
+                build_responsive_layout(
+                    [
+                        self._button(
+                            f"设为主编排 {binding.agent_id}",
+                            self._value(
+                                "workflow_set_orchestrator",
+                                agent_id=binding.agent_id,
+                            ),
+                        ),
+                        self._button(
+                            f"移除 {binding.agent_id}",
+                            self._value(
+                                "workflow_remove_agent",
+                                agent_id=binding.agent_id,
+                            ),
+                        ),
+                    ]
+                )
+            )
+
+        elements.extend(
+            build_responsive_layout(
+                [
+                    self._button(
+                        "Auto 分配主编排",
+                        self._value("workflow_set_orchestrator", agent_id="auto"),
+                    ),
+                    self._button(
+                        "使用此池开始编排",
+                        self._value("workflow_confirm_agents"),
+                        kind="primary",
+                    ),
+                ],
+                layout="mobile",
+            )
+        )
+        recommendations = list(self.pending.recommended_agents or [])
+        if recommendations:
+            elements.insert(
+                1,
+                {
+                    "tag": "markdown",
+                    "content": "**推荐池（仅点击后加入）**\n"
+                    + "\n".join(
+                        f"- {item.get('display_name') or item.get('tool_name')}"
+                        for item in recommendations
+                    ),
+                },
+            )
+        return {
+            "header": {
+                "title": {"tag": "plain_text", "content": "Workflow · 选择 Agent Pool"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+
+
 class WorkflowProgressRenderer:
     """Renders workflow execution state into Feishu card-compatible JSON.
 
@@ -393,6 +630,11 @@ class WorkflowProgressRenderer:
             elements.append(summary)
             elements.append(_hr_element())
 
+        agent_pool = self._render_agent_pool_section()
+        if agent_pool is not None:
+            elements.append(agent_pool)
+            elements.append(_hr_element())
+
         # -- Progress bar section --
         elements.append(self._render_progress_bar_section())
         elements.append(_hr_element())
@@ -413,6 +655,95 @@ class WorkflowProgressRenderer:
         _card_text_for_agent_output(elements, _AGENT_OUTPUT_FORBIDDEN_MARKERS)
 
         return _paginate_progress_cards(self._render_header(), elements)
+
+    def _render_agent_pool_section(self) -> dict[str, Any] | None:
+        """Render the immutable A-id bindings and script-declared plan."""
+        pending = self._project.pending
+        raw_pool: list[Any] = []
+        orchestrator_agent_id: str | None = None
+        orchestrator_was_auto = False
+        raw_plan: list[Any] = []
+
+        if pending is not None:
+            raw_pool = list(pending.agent_pool)
+            orchestrator_agent_id = pending.orchestrator_agent_id
+            orchestrator_was_auto = pending.orchestrator_was_auto
+            pending_meta = pending.meta or {}
+            raw_plan = list(
+                pending_meta.get("agentPlan") or pending_meta.get("agent_plan") or []
+            )
+        elif self._project.run_spec is not None:
+            run_spec = self._project.run_spec
+            if isinstance(run_spec, dict):
+                raw_pool = list(run_spec.get("agent_pool") or [])
+                orchestrator_agent_id = run_spec.get("orchestrator_agent_id")
+            else:
+                raw_pool = list(run_spec.agent_pool)
+                orchestrator_agent_id = run_spec.orchestrator_agent_id
+
+        if not raw_plan and self._project.meta is not None:
+            raw_plan = list(self._project.meta.agent_plan)
+
+        if not raw_pool and not raw_plan:
+            return None
+
+        lines = ["**Agent pool**"]
+        if orchestrator_agent_id:
+            orchestrator_label = (
+                f"Auto → {orchestrator_agent_id}"
+                if orchestrator_was_auto
+                else orchestrator_agent_id
+            )
+            lines.append(f"- 主编排: {orchestrator_label}")
+        for binding in raw_pool:
+            if isinstance(binding, dict):
+                agent_id = str(binding.get("agentId") or binding.get("agent_id") or "?")
+                tool_name = str(binding.get("toolName") or binding.get("tool_name") or "?")
+                model = (
+                    binding.get("model_name")
+                    or binding.get("modelName")
+                    or binding.get("model")
+                    or "default"
+                )
+                profile = binding.get("profile")
+                effort = binding.get("effort")
+            else:
+                agent_id = binding.agent_id
+                tool_name = binding.tool_name
+                model = binding.model_name or "default"
+                profile = binding.profile
+                effort = binding.effort
+            suffix = " (orchestrator)" if agent_id == orchestrator_agent_id else ""
+            qualifiers = [str(model)]
+            if profile:
+                qualifiers.append(str(profile))
+            if effort:
+                qualifiers.append(str(effort))
+            lines.append(f"- `{agent_id}` · {tool_name} · {' / '.join(qualifiers)}{suffix}")
+
+        if raw_plan:
+            lines.append("\n**Agent plan**")
+            for raw_node in raw_plan:
+                if not isinstance(raw_node, dict):
+                    raw_node = raw_node.model_dump(by_alias=True)
+                node_id = (
+                    raw_node.get("nodeId")
+                    or raw_node.get("node_id")
+                    or raw_node.get("node")
+                    or "?"
+                )
+                role = raw_node.get("role") or "worker"
+                static_id = raw_node.get("agentId") or raw_node.get("agent_id")
+                candidates = raw_node.get("candidateAgentIds") or raw_node.get(
+                    "candidate_agent_ids"
+                )
+                if raw_node.get("runtime") is True:
+                    binding = "运行时分配 → 候选 [" + ", ".join(candidates or []) + "]"
+                else:
+                    binding = f"静态分配 → {static_id}" if static_id else "未绑定"
+                lines.append(f"- `{node_id}` · {role} · {binding}")
+
+        return _md_element("\n".join(lines))
 
     def _render_summary_section(self) -> dict[str, Any] | None:
         """Render a compact current/latest activity summary block."""
@@ -1221,9 +1552,16 @@ def _result_ledger_entries(project: WorkflowProject) -> list[tuple[str, str, str
     }
     entries: list[tuple[str, str, str]] = []
     for ordinal, agent in enumerate(ordered_agents, start=1):
+        agent_id = str(getattr(agent, "agent_id", None) or "unbound")
         binding = agent.tool or "未指定工具"
         if agent.model:
             binding += f" / {agent.model}"
+        operation = str(
+            getattr(agent, "current_activity", None)
+            or getattr(agent, "task_summary", None)
+            or agent.label
+            or "agent"
+        ).strip()
         result_text = str(getattr(agent, "result", None) or "").strip()
         error_text = _strip_internal_details(str(agent.error or "")).strip()
         if result_text and error_text:
@@ -1236,8 +1574,12 @@ def _result_ledger_entries(project: WorkflowProject) -> list[tuple[str, str, str
             body = "（无结果）"
         entries.append(
             (
-                f"Agent 结果 {ordinal} · {_middle_ellipsis(agent.label or 'agent', 60)}",
-                f"状态: {status_labels[agent.status]} · 工具: {_middle_ellipsis(binding, 80)}",
+                f"Agent 结果 {ordinal} · `{agent_id}` · {_middle_ellipsis(agent.label or 'agent', 60)}",
+                (
+                    f"状态: {status_labels[agent.status]} · "
+                    f"工具: {_middle_ellipsis(binding, 80)} · "
+                    f"操作: {_middle_ellipsis(operation, 80)}"
+                ),
                 body,
             )
         )

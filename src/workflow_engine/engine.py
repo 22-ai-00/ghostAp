@@ -320,6 +320,53 @@ class WorkflowEngine(BaseEngine):
         with self._lock:
             self._retire_lifecycle_owner_locked(owner)
 
+    def release_lifecycle_owner(self, owner: Any) -> bool:
+        """Release a quiesced owner; uncertain sessions remain cleanup roots."""
+        if owner is None:
+            return False
+        with self._lock:
+            if getattr(owner, "active_generation_session", None) is not None:
+                return False
+            done_event = getattr(owner, "done_event", None)
+            if done_event is not None and not done_event.is_set():
+                return False
+            tracked = any(
+                candidate is owner
+                for candidate in (
+                    self._workflow_selection_owner,
+                    self._script_generation_owner,
+                    self._workflow_start_owner,
+                    *self._retired_lifecycle_owners,
+                )
+            )
+            if self._workflow_selection_owner is owner:
+                self._workflow_selection_owner = None
+            if self._script_generation_owner is owner:
+                self._script_generation_owner = None
+            if self._workflow_start_owner is owner:
+                self._workflow_start_owner = None
+            self._retired_lifecycle_owners = [
+                candidate
+                for candidate in self._retired_lifecycle_owners
+                if candidate is not owner
+            ]
+            return tracked
+
+    def has_uncertain_lifecycle_session(self) -> bool:
+        """Return whether reuse could overlap an unconfirmed ACP session."""
+        with self._lock:
+            owners = (
+                self._workflow_selection_owner,
+                self._script_generation_owner,
+                self._workflow_start_owner,
+                *self._retired_lifecycle_owners,
+            )
+            return any(
+                owner is not None
+                and getattr(owner, "active_generation_session", None) is not None
+                for owner in owners
+            )
+
     def cleanup(self):
         """Override to remove orphaned pending script files and release
         thread-pool resources (executor + bridge). Safe to call more than
@@ -369,6 +416,28 @@ class WorkflowEngine(BaseEngine):
                 if project.pending and project.pending.script_path:
                     artifact_paths.append(project.pending.script_path)
         for owner in lifecycle_owners:
+            active_session = getattr(owner, "active_generation_session", None)
+            session_quiesced = active_session is None
+            if active_session is not None:
+                session_quiesced = True
+                try:
+                    if active_session.cancel(wait=True, timeout=2.0) is False:
+                        session_quiesced = False
+                except Exception:
+                    session_quiesced = False
+                    logger.debug("Workflow generation cancel retry failed", exc_info=True)
+                try:
+                    active_session.close()
+                except Exception:
+                    session_quiesced = False
+                    logger.debug("Workflow generation close retry failed", exc_info=True)
+                if session_quiesced:
+                    try:
+                        object.__setattr__(owner, "active_generation_session", None)
+                    except Exception:
+                        session_quiesced = False
+                if not session_quiesced:
+                    quiesced = False
             delivery_lock = getattr(owner, "delivery_lock", None)
             if delivery_lock is not None:
                 remaining = max(0.0, deadline - time.monotonic())
@@ -384,10 +453,27 @@ class WorkflowEngine(BaseEngine):
                 "worker_started_event",
                 None,
             )
+            worker_exited_event = getattr(
+                owner,
+                "worker_exited_event",
+                None,
+            )
             if (
                 done_event is not None
-                and (claimed_event is None or not claimed_event.is_set())
-                and (worker_started_event is None or not worker_started_event.is_set())
+                and session_quiesced
+                and (
+                    (
+                        (claimed_event is None or not claimed_event.is_set())
+                        and (
+                            worker_started_event is None
+                            or not worker_started_event.is_set()
+                        )
+                    )
+                    or (
+                        worker_exited_event is not None
+                        and worker_exited_event.is_set()
+                    )
+                )
             ):
                 done_event.set()
 
@@ -943,6 +1029,8 @@ class WorkflowEngine(BaseEngine):
             done_event = getattr(start_owner, "done_event", None)
             if done_event is not None:
                 done_event.set()
+            if bridge_quiesced and start_owner is not None:
+                self.release_lifecycle_owner(start_owner)
             if not bridge_quiesced and start_owner is not None:
                 stop_event = getattr(start_owner, "stop_event", None)
                 if stop_event is not None:
@@ -1086,17 +1174,69 @@ class WorkflowEngine(BaseEngine):
         # Work on a private copy: the bridge/test caller may retain its params,
         # but the confirmed run binding is authoritative for execution.
         params = params.model_copy(deep=True)
+        with self._lock:
+            self._agent_call_count += 1
+            count = self._agent_call_count
+        label = params.label or f"agent-{count}"
         run_spec = getattr(self, "_run_spec", None)
         if forced_binding is not None:
+            if run_spec is not None and not run_spec.legacy_replay:
+                forced_model = (
+                    None if forced_binding.use_default_model else forced_binding.model_name
+                )
+                matching = [
+                    binding
+                    for binding in run_spec.agent_pool
+                    if binding.tool_model_key
+                    == (forced_binding.tool_name, forced_model)
+                ]
+                if len(matching) != 1:
+                    return AgentCallResult(
+                        error="Workflow reviewer binding is outside confirmed agent_pool",
+                        tool=forced_binding.tool_name,
+                        model=forced_model,
+                    )
+                params.agent_id = matching[0].agent_id
             params.tool = forced_binding.tool_name
-            params.model = None if forced_binding.use_default_model else forced_binding.model_name
-        elif run_spec is not None:
-            params.tool = params.tool or run_spec.orchestrator.tool_name
-            if params.tool in run_spec.tool_model_map:
-                # Assign even when the confirmed value is None. None means the
-                # user explicitly chose that tool's default model and an
-                # invented model in generated JS must not override it.
+            if run_spec is not None and run_spec.legacy_replay:
+                if params.tool not in run_spec.tool_model_map:
+                    return AgentCallResult(
+                        error=(
+                            f"Tool '{params.tool}' is outside frozen legacy "
+                            "replay bindings"
+                        ),
+                        tool=params.tool,
+                    )
                 params.model = run_spec.tool_model_map[params.tool]
+            else:
+                params.model = (
+                    None if forced_binding.use_default_model else forced_binding.model_name
+                )
+        elif run_spec is not None:
+            if run_spec.legacy_replay:
+                params.tool = params.tool or run_spec.orchestrator.tool_name
+                if params.tool not in run_spec.tool_model_map:
+                    return AgentCallResult(
+                        error=(
+                            f"Tool '{params.tool}' is outside frozen legacy "
+                            "replay bindings"
+                        ),
+                        tool=params.tool,
+                    )
+                params.model = run_spec.tool_model_map[params.tool]
+            else:
+                try:
+                    binding = run_spec.agent_binding(params.agent_id)
+                except ValueError as exc:
+                    return AgentCallResult(
+                        error=str(exc),
+                        agent_id=params.agent_id,
+                        tool=params.tool,
+                        model=params.model,
+                    )
+                params.agent_id = binding.agent_id
+                params.tool = binding.tool_name
+                params.model = binding.model_name
 
         effective_deadline = deadline_monotonic
         if run_spec is not None and run_spec.deadline is not None:
@@ -1105,11 +1245,6 @@ class WorkflowEngine(BaseEngine):
                 if effective_deadline is not None
                 else run_spec.deadline
             )
-
-        with self._lock:
-            self._agent_call_count += 1
-            count = self._agent_call_count
-        label = params.label or f"agent-{count}"
 
         # Legacy direct callers still resolve from the complete adapted project.
         if run_spec is None and not params.model and params.tool and self._project:
@@ -1120,11 +1255,21 @@ class WorkflowEngine(BaseEngine):
         if count > call_budget:
             error_msg = f"Agent call limit exceeded ({call_budget})"
             logger.warning("[WorkflowEngine] %s", error_msg)
-            return AgentCallResult(error=error_msg, tool=params.tool, model=params.model)
+            return AgentCallResult(
+                error=error_msg,
+                agent_id=params.agent_id,
+                tool=params.tool,
+                model=params.model,
+            )
         if effective_deadline is not None and time.monotonic() >= effective_deadline:
             error_msg = "Workflow deadline exhausted before agent execution"
             logger.warning("[WorkflowEngine] %s", error_msg)
-            return AgentCallResult(error=error_msg, tool=params.tool, model=params.model)
+            return AgentCallResult(
+                error=error_msg,
+                agent_id=params.agent_id,
+                tool=params.tool,
+                model=params.model,
+            )
 
         # Extract a short task summary from the prompt (first meaningful line, max 60 chars)
         task_summary = ""
@@ -1146,6 +1291,7 @@ class WorkflowEngine(BaseEngine):
                 task_summary=task_summary,
                 model=params.model,
                 role=params.role,
+                agent_id=params.agent_id,
             )
             # Event callbacks originate inside AgentExecutor and only carry
             # params.label. Use the disambiguated UI label so activity from a
@@ -1173,7 +1319,12 @@ class WorkflowEngine(BaseEngine):
                 logger.warning("[WorkflowEngine] %s", error_msg)
                 if self._state_manager:
                     self._state_manager.on_agent_failed(label, error_msg)
-                return AgentCallResult(error=error_msg, tool=params.tool, model=params.model)
+                return AgentCallResult(
+                    error=error_msg,
+                    agent_id=params.agent_id,
+                    tool=params.tool,
+                    model=params.model,
+                )
 
         # Fire agent start callbacks
         if self._callbacks and self._callbacks.on_agent_start:
@@ -1192,6 +1343,7 @@ class WorkflowEngine(BaseEngine):
                     token_usage=0,  # No tokens consumed on cache hit
                     duration_s=0.0,
                     cached=True,
+                    agent_id=params.agent_id,
                     tool=params.tool,
                     model=params.model,
                 )
@@ -1213,6 +1365,13 @@ class WorkflowEngine(BaseEngine):
             params,
             cancel_event=cancel_event,
             deadline_monotonic=effective_deadline,
+        )
+        result = result.model_copy(
+            update={
+                "agent_id": params.agent_id,
+                "tool": params.tool,
+                "model": params.model,
+            }
         )
 
         # A selected Reviewer is a completion promise, not merely a backend
@@ -1266,6 +1425,7 @@ class WorkflowEngine(BaseEngine):
             # agent context.
             payload = {
                 "label": label,
+                "agent_id": params.agent_id,
                 "tool": params.tool,
                 "model": result.model if result else None,
                 "token_usage": result.token_usage if result else 0,
@@ -1315,15 +1475,20 @@ class WorkflowEngine(BaseEngine):
         set by the bridge's _handle_abort_request.
 
         Uses request_id for authoritative lookup (avoids label mismatch when
-        state_manager disambiguates duplicate labels), falling back to raw
-        label for backward compatibility.
+        state_manager disambiguates duplicate labels). Raw-label routing is
+        only available to legacy notifications that omit request_id.
         """
         effective_label = label
         if request_id is not None:
             with self._request_to_label_lock:
                 mapped = self._request_to_label.get(request_id)
-            if mapped:
-                effective_label = mapped
+            if mapped is None:
+                logger.warning(
+                    "Ignoring agent abort for unknown request_id=%s",
+                    request_id,
+                )
+                return
+            effective_label = mapped
         logger.info(
             "[WorkflowEngine] Agent aborted: %s (reason=%s, request_id=%s)",
             effective_label,

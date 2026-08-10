@@ -995,6 +995,9 @@ class RuntimeBridge:
                 if result.error:
                     response_data["error"] = result.error
 
+                response_data["agent_id"] = result.agent_id
+                response_data["tool"] = result.tool
+                response_data["model"] = result.model
                 response_data["token_usage"] = result.token_usage
                 response_data["duration_s"] = result.duration_s
 
