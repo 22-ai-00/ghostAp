@@ -34,3 +34,9 @@
 ## 员工 ACTION_REQUIRED 恢复入口（2026-08-10）
 
 - 当前 `ACTION_REQUIRED` 员工的原因为 Slash Command reconciliation `recovery_exhausted`，现有控制面没有明确的重试/修复/重新授权转移路径。应补充可审计的恢复工作流，并恢复或替代当前孤立的 `/hire`、`/fire` 操作入口；职责标签更新不能替代生命周期恢复。
+
+## Codex 子代理对账扩展（2026-08-10）
+
+- 当前修复可从根父 rollout 补齐缺 path 的 direct child；若 ACP 同时缺失 nested child path，仍会安全地保持 incomplete。后续应使用已知 parent thread 的有界 rollout 闭包支持嵌套身份发现，并保持 parent/session/cwd/generation 一致性校验。
+- `_rollout_candidates()` 仍按精确 session ID 在 `CODEX_HOME/sessions` 下执行目录遍历；真实事故三次定位约 39 ms，但历史持续增长后可能成为同步延迟。应引入 UUIDv7 日期分区定位或可信 session 索引，禁止退化为读取全历史 rollout 内容。
+- 卡片 projector 与 ACP outcome 仍使用不同粒度的生命周期归并。后续应抽取共享、带 provenance/generation/malformed 语义的 reducer；在此之前不要让 outer `TOOL_CALL_DONE` 作为 child 权威终态进入最终 outcome。

@@ -13,7 +13,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +32,15 @@ CODEX_CHILD_LIFECYCLE_POLL_INTERVAL_S = 0.1
 _CHILD_TURN_BOUNDARY_SLACK_S = 1.0
 _MAX_TRACKED_CHILDREN = 200
 _ROOT_AGENT_PATH = "/root"
+_DIRECT_AGENT_PATH_RE = re.compile(
+    r"/root/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}"
+)
+_AGENT_PATH_RE = re.compile(
+    r"/root(?:/[A-Za-z0-9][A-Za-z0-9_.-]{0,127}){1,8}"
+)
+_SUBAGENT_ACTIVITY_KINDS = frozenset(
+    {"started", "interacted", "interrupted"}
+)
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _STATUS_MAP = {
     "pending": "pending",
@@ -59,7 +68,11 @@ def _event_timestamp(value: object) -> float | None:
         return None
 
 
-def _read_bounded_lines(path: Path, *, tail: bool) -> list[bytes]:
+def _read_bounded_lines(
+    path: Path,
+    *,
+    tail: bool,
+) -> tuple[list[bytes], bool]:
     limit = _MAX_TAIL_BYTES if tail else _MAX_HEAD_BYTES
     try:
         with path.open("rb") as handle:
@@ -72,12 +85,13 @@ def _read_bounded_lines(path: Path, *, tail: bool) -> list[bytes]:
                 if start:
                     _, separator, data = data.partition(b"\n")
                     if not separator:
-                        return []
+                        return [], False
             else:
                 data = handle.read(limit)
     except OSError:
-        return []
-    return data.splitlines()
+        return [], False
+    complete = not tail or not data or data.endswith(b"\n")
+    return data.splitlines(), complete
 
 
 def _decode_line(raw_line: bytes) -> Mapping[str, Any] | None:
@@ -89,7 +103,8 @@ def _decode_line(raw_line: bytes) -> Mapping[str, Any] | None:
 
 
 def _session_meta_payload(path: Path) -> Mapping[str, Any] | None:
-    for raw_line in _read_bounded_lines(path, tail=False):
+    lines, _ = _read_bounded_lines(path, tail=False)
+    for raw_line in lines:
         event = _decode_line(raw_line)
         if event is None or event.get("type") != "session_meta":
             continue
@@ -185,13 +200,16 @@ def _latest_list_agents_output(
 ) -> tuple[str, list[Mapping[str, Any]]] | None:
     if ended_at < started_at:
         return None
-    calls: list[tuple[float, int, object]] = []
+    calls: list[tuple[float, int, object, object]] = []
     outputs: list[tuple[float, int, str, object]] = []
-    for line_index, raw_line in enumerate(
-        _read_bounded_lines(path, tail=True)
-    ):
+    lines, complete = _read_bounded_lines(path, tail=True)
+    if not complete:
+        return None
+    for line_index, raw_line in enumerate(lines):
         event = _decode_line(raw_line)
-        if event is None or event.get("type") != "response_item":
+        if event is None:
+            return None
+        if event.get("type") != "response_item":
             continue
         payload = event.get("payload")
         if not isinstance(payload, Mapping):
@@ -207,7 +225,12 @@ def _latest_list_agents_output(
                 return None
             if started_at <= timestamp <= ended_at:
                 calls.append(
-                    (timestamp, line_index, payload.get("call_id"))
+                    (
+                        timestamp,
+                        line_index,
+                        payload.get("call_id"),
+                        payload.get("arguments"),
+                    )
                 )
             continue
         if payload_type != "function_call_output":
@@ -226,11 +249,16 @@ def _latest_list_agents_output(
 
     if not calls:
         return None
-    call_timestamp, call_index, raw_call_id = max(
-        calls,
-        key=lambda item: (item[0], item[1]),
-    )
+    call_timestamp, call_index, raw_call_id, raw_arguments = calls[-1]
     if not isinstance(raw_call_id, str) or not raw_call_id.strip():
+        return None
+    if not isinstance(raw_arguments, str):
+        return None
+    try:
+        arguments = json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(arguments, Mapping) or arguments:
         return None
     call_id = raw_call_id.strip()
     matching_outputs = [
@@ -261,6 +289,120 @@ def _latest_list_agents_output(
     if len(agents) != len(raw_agents):
         return None
     return call_id, agents
+
+
+def _result_child_sources(
+    result: PromptResult,
+) -> tuple[frozenset[str], bool]:
+    """Collect stable child ids already represented by the ACP result."""
+    sources: set[str] = set()
+    malformed = False
+
+    def add(raw_source: object) -> None:
+        nonlocal malformed
+        if not isinstance(raw_source, str):
+            malformed = True
+            return
+        source = raw_source.strip()
+        if not source:
+            malformed = True
+            return
+        sources.add(source)
+
+    for tool_call in result.tool_calls:
+        raw_source = getattr(tool_call, "subagent_source_id", None)
+        if raw_source not in (None, ""):
+            add(raw_source)
+        for raw_container in (
+            getattr(tool_call, "collaboration_receivers", ()),
+            getattr(tool_call, "subagent_states", ()),
+        ):
+            if raw_container is None:
+                continue
+            if isinstance(
+                raw_container,
+                (str, bytes, bytearray, Mapping),
+            ) or not isinstance(raw_container, Iterable):
+                malformed = True
+                continue
+            for item in raw_container:
+                if isinstance(item, Mapping):
+                    add(item.get("source_id"))
+                else:
+                    add(item)
+    return frozenset(sources), malformed
+
+
+def _parent_activity_paths(
+    path: Path,
+    *,
+    target_sources: frozenset[str],
+    started_at: float,
+    ended_at: float,
+) -> tuple[dict[str, str], bool, bool]:
+    """Read unique direct-child identities from one bounded parent tail."""
+    if ended_at < started_at:
+        return {}, True, False
+    source_to_path: dict[str, str] = {}
+    path_to_source: dict[str, str] = {}
+    saw_target = False
+    lines, complete = _read_bounded_lines(path, tail=True)
+    if not complete:
+        return {}, False, True
+    for raw_line in lines:
+        event = _decode_line(raw_line)
+        if event is None:
+            return {}, False, True
+        if event.get("type") != "event_msg":
+            continue
+        payload = event.get("payload")
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("type") != "sub_agent_activity"
+        ):
+            continue
+        timestamp = _event_timestamp(event.get("timestamp"))
+        if timestamp is None:
+            return {}, True, False
+        if timestamp < started_at or timestamp > ended_at:
+            continue
+        raw_occurred_at_ms = payload.get("occurred_at_ms")
+        if (
+            not isinstance(raw_occurred_at_ms, int)
+            or isinstance(raw_occurred_at_ms, bool)
+            or abs(raw_occurred_at_ms / 1000.0 - timestamp) > 1.0
+        ):
+            return {}, True, False
+        raw_source = payload.get("agent_thread_id")
+        raw_agent_path = payload.get("agent_path")
+        raw_kind = payload.get("kind")
+        if (
+            not isinstance(raw_source, str)
+            or _SESSION_ID_RE.fullmatch(raw_source.strip()) is None
+            or not isinstance(raw_agent_path, str)
+            or _DIRECT_AGENT_PATH_RE.fullmatch(raw_agent_path.strip()) is None
+            or not isinstance(raw_kind, str)
+            or raw_kind.strip().casefold() not in _SUBAGENT_ACTIVITY_KINDS
+        ):
+            return {}, True, False
+        source = raw_source.strip()
+        agent_path = raw_agent_path.strip()
+        if source not in target_sources:
+            return {}, True, False
+        saw_target = True
+        if (
+            source in source_to_path
+            and source_to_path[source] != agent_path
+        ) or (
+            agent_path in path_to_source
+            and path_to_source[agent_path] != source
+        ):
+            return {}, True, False
+        source_to_path[source] = agent_path
+        path_to_source[agent_path] = source
+    if saw_target and set(source_to_path) != set(target_sources):
+        return {}, True, False
+    return source_to_path, False, False
 
 
 def _path_to_source(result: PromptResult) -> dict[str, str] | None:
@@ -305,7 +447,7 @@ def _child_identity_matches(
     child_thread_id: str,
     cwd: str,
     expected_agent_path: str,
-    known_thread_ids: frozenset[str],
+    known_thread_paths: Mapping[str, str],
 ) -> bool:
     payload = _session_meta_payload(path)
     if payload is None:
@@ -320,16 +462,16 @@ def _child_identity_matches(
     ):
         return False
     parent_thread_id = payload.get("parent_thread_id")
+    expected_parent_path = expected_agent_path.rpartition("/")[0]
     if (
         not isinstance(parent_thread_id, str)
-        or parent_thread_id not in known_thread_ids
+        or known_thread_paths.get(parent_thread_id) != expected_parent_path
     ):
         return False
     recorded_path = payload.get("agent_path")
-    return not (
+    return bool(
         isinstance(recorded_path, str)
-        and recorded_path.strip()
-        and recorded_path.strip() != expected_agent_path
+        and recorded_path.strip() == expected_agent_path
     )
 
 
@@ -349,9 +491,15 @@ def _latest_child_turn_observation(
     active_generation = ""
     active_started_at: float | None = None
     active_status = ""
-    for line_index, raw_line in enumerate(_read_bounded_lines(path, tail=True)):
+    active_has_turn_id = False
+    lines, complete = _read_bounded_lines(path, tail=True)
+    if not complete:
+        return None
+    for line_index, raw_line in enumerate(lines):
         event = _decode_line(raw_line)
-        if event is None or event.get("type") != "event_msg":
+        if event is None:
+            return None
+        if event.get("type") != "event_msg":
             continue
         payload = event.get("payload")
         if not isinstance(payload, Mapping):
@@ -385,8 +533,11 @@ def _latest_child_turn_observation(
             active_generation = turn_id or f"{timestamp:.6f}:{line_index}"
             active_started_at = timestamp
             active_status = "running"
+            active_has_turn_id = bool(turn_id)
             continue
         if active_started_at is None or timestamp < active_started_at:
+            continue
+        if active_has_turn_id and not turn_id:
             continue
         if turn_id and turn_id != active_generation:
             continue
@@ -416,6 +567,7 @@ class CodexChildLifecycleMonitor:
         self._logical_task_started_at = logical_task_started_at
         self._codex_home = codex_home
         self._source_to_path: dict[str, str] = {}
+        self._path_to_source: dict[str, str] = {}
         self._rollout_by_source: dict[str, Path] = {}
         self._invalid_sources: set[str] = set()
         self._next_lookup_at: dict[str, float] = {}
@@ -430,14 +582,31 @@ class CodexChildLifecycleMonitor:
     def observe_tool_call(self, tool_call: object) -> None:
         raw_source = getattr(tool_call, "subagent_source_id", None)
         raw_path = getattr(tool_call, "subagent_path", None)
-        if not isinstance(raw_source, str) or not raw_source.strip():
+        if raw_source in (None, "") and raw_path in (None, ""):
             return
-        if not isinstance(raw_path, str) or not raw_path.strip():
+        if (
+            not isinstance(raw_source, str)
+            or _SESSION_ID_RE.fullmatch(raw_source.strip()) is None
+        ):
+            self._identity_ambiguous = True
             return
         source = raw_source.strip()
+        if raw_path in (None, ""):
+            return
+        if (
+            not isinstance(raw_path, str)
+            or _AGENT_PATH_RE.fullmatch(raw_path.strip()) is None
+            or source == self._parent_session_id
+        ):
+            self._identity_ambiguous = True
+            return
         agent_path = raw_path.strip()
         existing = self._source_to_path.get(source)
         if existing is not None and existing != agent_path:
+            self._identity_ambiguous = True
+            return
+        existing_source = self._path_to_source.get(agent_path)
+        if existing_source is not None and existing_source != source:
             self._identity_ambiguous = True
             return
         if (
@@ -447,15 +616,17 @@ class CodexChildLifecycleMonitor:
             self._identity_ambiguous = True
             return
         self._source_to_path[source] = agent_path
+        self._path_to_source[agent_path] = source
 
     def observe_result(self, result: PromptResult) -> None:
         for tool_call in result.tool_calls:
             self.observe_tool_call(tool_call)
 
     def _locate_rollouts(self) -> None:
-        known_thread_ids = frozenset(
-            {self._parent_session_id, *self._source_to_path}
-        )
+        known_thread_paths = {
+            self._parent_session_id: _ROOT_AGENT_PATH,
+            **self._source_to_path,
+        }
         now = time.monotonic()
         for source_id, agent_path in self._source_to_path.items():
             if (
@@ -482,7 +653,7 @@ class CodexChildLifecycleMonitor:
                 child_thread_id=source_id,
                 cwd=self._cwd,
                 expected_agent_path=agent_path,
-                known_thread_ids=known_thread_ids,
+                known_thread_paths=known_thread_paths,
             ):
                 self._invalid_sources.add(source_id)
                 continue
@@ -561,6 +732,7 @@ def _build_evidence(
         return None
     observed: dict[str, str] = {}
     seen_names: set[str] = set()
+    root_count = 0
     for agent in agents:
         raw_name = agent.get("agent_name")
         if not isinstance(raw_name, str) or not raw_name.strip():
@@ -573,12 +745,15 @@ def _build_evidence(
         if status is None:
             return None
         if name == _ROOT_AGENT_PATH:
+            root_count += 1
             continue
         if name in path_to_source:
             if status not in _TERMINAL_STATUSES:
                 return None
             observed[name] = status
             continue
+        return None
+    if root_count != 1:
         return None
     if set(observed) != set(path_to_source):
         return None
@@ -625,6 +800,50 @@ def enrich_codex_reconciliation_result(
         codex_home=codex_home,
     )
     monitor.observe_result(result)
+    rollout = _find_rollout(
+        session_id=session_id,
+        cwd=cwd,
+        codex_home=codex_home,
+    )
+    if rollout is not None:
+        target_sources, malformed_sources = _result_child_sources(result)
+        if malformed_sources:
+            return result, None
+        identity_deadline = time.monotonic() + _ROLLOUT_SETTLE_TIMEOUT_S
+        while True:
+            (
+                source_to_path,
+                identity_ambiguous,
+                retryable_identity_read,
+            ) = _parent_activity_paths(
+                rollout,
+                target_sources=target_sources,
+                started_at=(
+                    started_at
+                    if logical_task_started_at is None
+                    else logical_task_started_at
+                ),
+                ended_at=ended_at,
+            )
+            if not retryable_identity_read:
+                break
+            if time.monotonic() >= identity_deadline:
+                return result, None
+            time.sleep(_ROLLOUT_SETTLE_INTERVAL_S)
+        if identity_ambiguous:
+            return result, None
+        for source, agent_path in source_to_path.items():
+            monitor.observe_tool_call(
+                ToolCallInfo(
+                    id=f"rollout-parent-activity:{source}",
+                    title="sub_agent_activity",
+                    kind="other",
+                    status="completed",
+                    subagent_source_id=source,
+                    subagent_path=agent_path,
+                    subagent_activity="interacted",
+                )
+            )
     settle_deadline = time.monotonic() + _ROLLOUT_SETTLE_TIMEOUT_S
     while True:
         child_evidence = monitor.poll(
@@ -647,12 +866,6 @@ def enrich_codex_reconciliation_result(
         time.sleep(_ROLLOUT_SETTLE_INTERVAL_S)
     if monitor.saw_rollout_candidate:
         return result, None
-
-    rollout = _find_rollout(
-        session_id=session_id,
-        cwd=cwd,
-        codex_home=codex_home,
-    )
     if rollout is None:
         return result, None
     settle_deadline = time.monotonic() + _ROLLOUT_SETTLE_TIMEOUT_S
