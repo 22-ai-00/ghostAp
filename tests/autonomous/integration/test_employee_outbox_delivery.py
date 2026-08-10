@@ -361,17 +361,20 @@ def test_gateway_lifecycle_renders_one_monotonic_card_for_all_terminal_states(
     status,
     expected,
 ) -> None:
-    from src.autonomous.ingress import dispatch as gateway
+    from src.autonomous.gateway.models import (
+        GatewayExecutionResult,
+        GatewayExecutionStatus,
+    )
     from tests.autonomous.integration.test_employee_team_gateway import _binding
 
     service, writer, _anchor = _runtime(tmp_path)
     lifecycle = EmployeeOutboxLifecycle(service)
-    binding = _binding(gateway)
+    binding = _binding()
     try:
         queued = lifecycle.queued(binding)
         running = lifecycle.running(binding)
-        result = gateway.GatewayExecutionResult(
-            status=gateway.GatewayExecutionStatus(status),
+        result = GatewayExecutionResult(
+            status=GatewayExecutionStatus(status),
             output="done" if status == "completed" else "",
             safe_error_code="safe_failure" if status != "completed" else "",
         )

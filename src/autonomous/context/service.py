@@ -6,7 +6,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Protocol
 
-from ..data.facades import MemoryAccessError, MemoryConflictError, MemoryIntegrityError
+from ..data.facades import MemoryAccessError, MemoryIntegrityError
 from ..workforce.registry import (
     ProjectedBindingError,
     ProjectedContextBinding,
@@ -189,11 +189,7 @@ class EmployeeContextService:
                 failure_reason = ContextUnavailableReason.CREDENTIALS
             except ProjectedBindingError:
                 failure_reason = ContextUnavailableReason.SCOPE
-            except (
-                MemoryAccessError,
-                MemoryConflictError,
-                MemoryIntegrityError,
-            ):
+            except (MemoryAccessError, MemoryIntegrityError):
                 failure_reason = ContextUnavailableReason.MEMORY
             except Exception:
                 failure_reason = ContextUnavailableReason.SOURCE
@@ -208,7 +204,6 @@ class EmployeeContextService:
         l1 = self._data.memory_facade.read_l1(
             request.agent_id,
             request.tenant_key,
-            allow_unscoped_legacy=False,
         )
         l2 = self._group_memory.read(request)
         if l1 is not None and not isinstance(l1, str):
@@ -298,7 +293,6 @@ class EmployeeContextService:
             l1 = self._data.memory_facade.read_l1(
                 request.agent_id,
                 request.tenant_key,
-                allow_unscoped_legacy=False,
             ) or ""
             l2 = self._group_memory.read(request)
         except Exception:

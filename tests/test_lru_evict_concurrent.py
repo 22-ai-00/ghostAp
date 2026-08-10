@@ -47,7 +47,12 @@ class TestLruEvictConcurrent(unittest.TestCase):
             t.join()
 
         self.assertEqual(len(errors), 0)
-        self.assertLessEqual(len(s), 100)
+        present = sum(
+            f"k_{thread_index * 100}_{item_index}" in s
+            for thread_index in range(4)
+            for item_index in range(50)
+        )
+        self.assertLessEqual(present, 100)
 
     def test_concurrent_add_and_purge(self):
         """Concurrent add + purge does not corrupt internal state."""
@@ -90,8 +95,8 @@ class TestLruEvictConcurrent(unittest.TestCase):
         purge_thread.join()
 
         self.assertEqual(len(errors), 0)
-        # Internal state should be consistent
-        self.assertGreaterEqual(len(s), 0)
+        # The public purge contract remains usable after concurrent mutation.
+        self.assertGreaterEqual(s.purge(), 0)
 
     def test_concurrent_contains_during_eviction(self):
         """__contains__ remains safe during concurrent adds exceeding max_size."""
@@ -172,7 +177,12 @@ class TestLruEvictConcurrent(unittest.TestCase):
             t.join()
 
         self.assertEqual(len(errors), 0)
-        self.assertEqual(len(s), 1)
+        present = sum(
+            f"t{thread_index}_{item_index}" in s
+            for thread_index in range(3)
+            for item_index in range(50)
+        )
+        self.assertEqual(present, 1)
 
 
 class TestTwoPhaseEvictionConcurrent(unittest.TestCase):

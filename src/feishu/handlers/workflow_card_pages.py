@@ -18,6 +18,18 @@ class WorkflowPageDeliveryResult:
     status_message_id: str | None
     status_delivered: bool
     failed_page_indexes: tuple[int, ...] = ()
+    delivered_page_indexes: tuple[int, ...] = ()
+    page_count: int = 0
+
+    @property
+    def fully_delivered(self) -> bool:
+        """Whether every requested page was proven delivered."""
+        return bool(
+            self.page_count > 0
+            and self.status_delivered
+            and not self.failed_page_indexes
+            and len(self.delivered_page_indexes) == self.page_count
+        )
 
 
 class WorkflowCardPageDelivery:
@@ -56,6 +68,7 @@ class WorkflowCardPageDelivery:
         with self._lock:
             pages = self._pages_for_delivery(incoming_pages, terminal=terminal)
             failed: list[int] = []
+            delivered: list[int] = []
             status_delivered = False
             creation_blocked = False
 
@@ -82,10 +95,7 @@ class WorkflowCardPageDelivery:
                 }
                 if origin_message_id is not None:
                     call_kwargs["origin_message_id"] = origin_message_id
-                # True is the existing method's default. Omit it to retain the
-                # legacy WorkflowScriptMixin call shape.
-                if not fallback_to_new:
-                    call_kwargs["fallback_to_new"] = False
+                call_kwargs["fallback_to_new"] = fallback_to_new
 
                 try:
                     delivered_message_id = replace_or_send(**call_kwargs)
@@ -102,6 +112,7 @@ class WorkflowCardPageDelivery:
                     continue
 
                 self._page_message_ids[page_index] = delivered_message_id
+                delivered.append(page_index)
                 if page_index == 0:
                     status_delivered = True
 
@@ -109,6 +120,8 @@ class WorkflowCardPageDelivery:
                 status_message_id=self._page_message_ids[0],
                 status_delivered=status_delivered,
                 failed_page_indexes=tuple(failed),
+                delivered_page_indexes=tuple(delivered),
+                page_count=len(pages),
             )
 
     def _pages_for_delivery(

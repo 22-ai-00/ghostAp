@@ -93,13 +93,7 @@ def reduce_criteria(state: CardState, event: CardEvent) -> CardState:
             if status in ("waiting", "executing"):
                 buttons = (
                     ButtonSpec(text=UI_TEXT["card_btn_stop"], action_id=ButtonIntent.SPEC_STOP, type="default"),
-                    ButtonSpec(text=UI_TEXT["card_btn_skip_retry"], action_id=ButtonIntent.SPEC_SKIP_RETRY),
                 )
-            elif status == "exhausted":
-                buttons = (
-                    ButtonSpec(text=UI_TEXT["card_btn_restart"], action_id=ButtonIntent.SPEC_RESUME, type="primary"),
-                )
-
             return replace(state, footer=footer, buttons=buttons)
 
     return state

@@ -25,141 +25,21 @@ from ..utils.errors import get_error_detail, sanitize_futures_msg
 from .client import ACPHistoryStore
 from .diagnostics import (
     DEFAULT_DIAGNOSTICS_SNIPPET_LIMIT,
-    DEFAULT_DIAGNOSTICS_TOTAL_LIMIT,
     get_diagnostics_config,
     normalize_startup_diagnostics,
-    redact_text,
-    safe_extract,
     safe_str,
     truncate_text,
 )
+from .diagnostics import (
+    format_startup_diagnostics_summary as format_startup_diagnostics,
+)
 from .models import ACPEvent, PromptResult
 from .session import ACPResumeRejected, ACPSession, ACPStartupError
-from .startup_utils import initial_startup_diagnostics, safe_float_or_none
+from .startup_utils import initial_startup_diagnostics
 
 logger = logging.getLogger(__name__)
 
 _PROMPT_CANCEL_DRAIN_TIMEOUT_S = 5.0
-
-def _resolve_startup_snippet_limit(snippet_limit: int) -> int:
-    """Resolve effective startup diagnostics snippet limit from config with compat fallback."""
-    cfg = get_diagnostics_config(get_settings_fn=get_settings)
-    try:
-        snippet_limit_eff = int(cfg.snippet_limit or 0)
-    except Exception:
-        logger.debug("build_startup_diagnostics: snippet_limit config conversion failed", exc_info=True)
-        snippet_limit_eff = 0
-    if snippet_limit_eff <= 0:
-        try:
-            snippet_limit_eff = int(snippet_limit or DEFAULT_DIAGNOSTICS_SNIPPET_LIMIT)
-        except Exception:
-            logger.debug("build_startup_diagnostics: snippet_limit argument conversion failed", exc_info=True)
-            snippet_limit_eff = DEFAULT_DIAGNOSTICS_SNIPPET_LIMIT
-    return snippet_limit_eff
-
-
-def _initial_startup_diagnostics(
-    *,
-    agent_type: str,
-    cwd: str,
-    model_name: Optional[str],
-    error: Exception,
-    attempt: Optional[int],
-    retries: Optional[int],
-    timeout_s: Optional[float],
-) -> dict:
-    """Create the stable startup diagnostics container before best-effort enrichment."""
-    return initial_startup_diagnostics(
-        agent_type=agent_type,
-        cwd=cwd,
-        model_name=model_name,
-        error=error,
-        attempt=attempt,
-        retries=retries,
-        timeout_s=timeout_s,
-    )
-
-
-def classify_startup_fail_phase(*, error: Exception, error_blob: str) -> str:
-    """Best-effort classify startup failure phase.
-
-    Contract:
-    - Never raises
-    - Returns one of: invalid_model | stdin_not_tty | timeout | start_failed
-
-    """
-    try:
-        # Timeout variants
-        try:
-            if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
-                return "timeout"
-        except Exception:
-            logger.debug("classify_startup_fail_phase: timeout check failed", exc_info=True)
-
-        blob = str(error_blob or "")
-        lower = blob.lower()
-
-        # Minimal string classification fallbacks.
-        if "stdin is not a terminal" in lower or "stdin-not-tty" in lower:
-            return "stdin_not_tty"
-        if (
-            "invalid model" in lower
-            or "model must be one of" in lower
-            or "unknown model" in lower
-            or ("invalid value" in lower and "--model" in lower)
-        ):
-            return "invalid_model"
-
-        return "start_failed"
-    except Exception:
-        logger.debug("classify_startup_fail_phase: unexpected error", exc_info=True)
-        return "start_failed"
-
-
-class StartupDiagnosticsBuilder:
-    """Builder for stable startup failure diagnostics.
-
-    ``build_startup_diagnostics`` remains the public compatibility function;
-    this class owns the construction path so future enrichment can be split
-    into focused methods without growing the compatibility wrapper.
-    """
-
-    def __init__(
-        self,
-        *,
-        agent_type: str,
-        cwd: str,
-        model_name: Optional[str],
-        error: Exception,
-        session: object = None,
-        attempt: Optional[int] = None,
-        retries: Optional[int] = None,
-        timeout_s: Optional[float] = None,
-        snippet_limit: int = DEFAULT_DIAGNOSTICS_SNIPPET_LIMIT,
-    ) -> None:
-        self.agent_type = agent_type
-        self.cwd = cwd
-        self.model_name = model_name
-        self.session = session
-        self.error = error
-        self.attempt = attempt
-        self.retries = retries
-        self.timeout_s = timeout_s
-        self.snippet_limit = snippet_limit
-
-    def build(self) -> dict:
-        return _build_startup_diagnostics_impl(
-            agent_type=self.agent_type,
-            cwd=self.cwd,
-            model_name=self.model_name,
-            session=self.session,
-            error=self.error,
-            attempt=self.attempt,
-            retries=self.retries,
-            timeout_s=self.timeout_s,
-            snippet_limit=self.snippet_limit,
-        )
-
 
 def build_startup_diagnostics(
     *,
@@ -173,45 +53,8 @@ def build_startup_diagnostics(
     timeout_s: Optional[float] = None,
     snippet_limit: int = DEFAULT_DIAGNOSTICS_SNIPPET_LIMIT,
 ) -> dict:
-    """Compatibility entrypoint for startup diagnostics construction."""
-    return StartupDiagnosticsBuilder(
-        agent_type=agent_type,
-        cwd=cwd,
-        model_name=model_name,
-        session=session,
-        error=error,
-        attempt=attempt,
-        retries=retries,
-        timeout_s=timeout_s,
-        snippet_limit=snippet_limit,
-    ).build()
-
-
-def _build_startup_diagnostics_impl(
-    *,
-    agent_type: str,
-    cwd: str,
-    model_name: Optional[str],
-    session: object = None,
-    error: Exception,
-    attempt: Optional[int] = None,
-    retries: Optional[int] = None,
-    timeout_s: Optional[float] = None,
-    snippet_limit: int = DEFAULT_DIAGNOSTICS_SNIPPET_LIMIT,
-) -> dict:
-    """构造稳定可序列化的启动失败诊断信息。
-
-    目标：无论错误对象/会话对象携带的信息是否完整，最终日志字段都稳定存在，
-    便于定位“启动失败但日志为空/极少”的问题。
-
-    必含字段：cmd/args/rc/stdout_snippet/stderr_snippet。
-    """
-    # NOTE: `build_startup_diagnostics` is a compat entry.
-    # New SSOT for non-empty fallbacks/redaction/truncation is
-    # `src.acp.diagnostics.normalize_startup_diagnostics`.
-    snippet_limit_eff = _resolve_startup_snippet_limit(snippet_limit)
-
-    diag: dict = _initial_startup_diagnostics(
+    """Collect startup evidence; normalization is owned by diagnostics.py."""
+    diag = initial_startup_diagnostics(
         agent_type=agent_type,
         cwd=cwd,
         model_name=model_name,
@@ -220,320 +63,94 @@ def _build_startup_diagnostics_impl(
         retries=retries,
         timeout_s=timeout_s,
     )
-
-    # error_repr (best-effort; later redaction+truncation handled by normalize_startup_diagnostics)
-    diag["error_repr"] = safe_extract(
-        lambda: truncate_text(repr(error) if error is not None else "", DEFAULT_DIAGNOSTICS_SNIPPET_LIMIT),
-        default="",
-        log_msg="build_startup_diagnostics: error_repr extraction failed",
-    )
-
-    # cmd/args: prefer session then error (标准协议优先：ACPStartupError.agent_cmd/agent_args)
     try:
-        cmd = safe_str(getattr(session, "_agent_cmd", "") or "") if session is not None else ""
-        args = list(getattr(session, "_agent_args", []) or []) if session is not None else []
-        if cmd or args:
-            diag["cmd"] = cmd
-            diag["args"] = [str(x) for x in args]
-    except Exception:
-        logger.debug("build_startup_diagnostics: cmd/args from session failed", exc_info=True)
+        cfg_limit = int(
+            get_diagnostics_config(get_settings_fn=get_settings).snippet_limit or 0
+        )
+    except (TypeError, ValueError):
+        cfg_limit = 0
+    limit = cfg_limit or int(snippet_limit or DEFAULT_DIAGNOSTICS_SNIPPET_LIMIT)
 
-    if not diag.get("cmd") and not diag.get("args"):
+    def _args(value: object) -> list[str]:
+        if isinstance(value, (str, bytes, bytearray)):
+            return [safe_str(value)] if value else []
         try:
-            diag["cmd"] = safe_str(getattr(error, "agent_cmd", "") or "")
-            diag["args"] = [str(x) for x in (getattr(error, "agent_args", []) or [])]
-        except Exception:
-            logger.debug("build_startup_diagnostics: cmd/args from error failed", exc_info=True)
+            return [safe_str(item) for item in (value or [])]
+        except (TypeError, ValueError):
+            return []
 
-    # 迁移期兜底（可删除条件：全链路启动失败仅抛 ACPStartupError/其子类，并稳定设置 agent_cmd/agent_args）。
-    # Extra compatibility: some errors may use `cmd/args` instead of `agent_cmd/agent_args`.
-    if (not diag.get("cmd")) and (not (diag.get("args") or [])):
+    session_cmd = getattr(session, "_agent_cmd", "") if session is not None else ""
+    session_args = getattr(session, "_agent_args", ()) if session is not None else ()
+    diag["cmd"] = safe_str(session_cmd or getattr(error, "agent_cmd", ""))
+    diag["args"] = _args(session_args or getattr(error, "agent_args", ()))
+    if not diag["cmd"] and not diag["args"]:
         try:
-            diag["cmd"] = safe_str(getattr(error, "cmd", "") or "")
-            diag["args"] = [str(x) for x in (getattr(error, "args", []) or [])]
-        except Exception:
-            logger.debug("build_startup_diagnostics: cmd/args compat extraction failed", exc_info=True)
+            command, arguments = resolve_agent_spec(agent_type, model_name=model_name)
+            diag["cmd"], diag["args"] = safe_str(command), _args(arguments)
+        except (AgentSpecResolveError, OSError, RuntimeError, ValueError):
+            diag["cmd"] = safe_str(agent_type)
 
-    # return code
+    returncode = getattr(error, "returncode", None)
+    if returncode is None and session is not None:
+        acp_session = getattr(session, "_acp_session", None)
+        returncode = getattr(getattr(acp_session, "_proc", None), "returncode", None)
     try:
-        rc = getattr(error, "returncode", None)
-        if rc is not None:
-            diag["rc"] = int(rc)
-    except Exception:
-        logger.debug("build_startup_diagnostics: returncode extraction failed", exc_info=True)
+        diag["rc"] = int(returncode) if returncode is not None else None
+    except (TypeError, ValueError):
+        diag["rc"] = None
 
-    # 迁移期兜底（可删除条件同上）：部分历史错误用 `.rc` 表示 returncode。
-    # Extra compatibility: some subprocess-like errors may use `.rc`.
-    if diag.get("rc") is None:
-        try:
-            rc = getattr(error, "rc", None)
-            if rc is not None:
-                diag["rc"] = int(rc)
-        except Exception:
-            logger.debug("build_startup_diagnostics: rc compat extraction failed", exc_info=True)
+    stdout = getattr(error, "stdout_snippet", "") or getattr(error, "stdout", "")
+    stderr = getattr(error, "stderr_snippet", "") or getattr(error, "stderr", "")
+    diag["stdout_snippet"] = truncate_text(safe_str(stdout), limit)
+    diag["stderr_snippet"] = truncate_text(safe_str(stderr), limit)
 
-    # Optional: fail_phase from ACPStartupError (for log aggregation)
-    try:
-        phase = safe_str(getattr(error, "fail_phase", "") or "")
-        if phase:
-            diag["fail_phase"] = truncate_text(phase, 80)
-    except Exception:
-        logger.debug("build_startup_diagnostics: fail_phase extraction failed", exc_info=True)
-
-    if diag.get("rc") is None:
-        try:
-            # best-effort: if process exists and has returncode
-            acp_session = getattr(session, "_acp_session", None) if session is not None else None
-            proc = getattr(acp_session, "_proc", None) if acp_session is not None else None
-            rc = getattr(proc, "returncode", None)
-            if rc is not None:
-                diag["rc"] = int(rc)
-        except Exception:
-            logger.debug("build_startup_diagnostics: rc from process extraction failed", exc_info=True)
-
-    # stdout/stderr snippets: prefer explicit snippet fields
-    try:
-        out = safe_str(getattr(error, "stdout_snippet", "") or "")
-        err = safe_str(getattr(error, "stderr_snippet", "") or "")
-        if out:
-            diag["stdout_snippet"] = truncate_text(out, snippet_limit_eff)
-        if err:
-            diag["stderr_snippet"] = truncate_text(err, snippet_limit_eff)
-    except Exception:
-        logger.debug("build_startup_diagnostics: stdout/stderr snippet extraction failed", exc_info=True)
-
-    # fallback to stdout/stderr raw
-    if not diag.get("stdout_snippet"):
-        try:
-            out = safe_str(getattr(error, "stdout", "") or "")
-            if out:
-                diag["stdout_snippet"] = truncate_text(out, snippet_limit_eff)
-        except Exception:
-            logger.debug("build_startup_diagnostics: stdout fallback extraction failed", exc_info=True)
-    if not diag.get("stderr_snippet"):
-        try:
-            err = safe_str(getattr(error, "stderr", "") or "")
-            if err:
-                diag["stderr_snippet"] = truncate_text(err, snippet_limit_eff)
-        except Exception:
-            logger.debug("build_startup_diagnostics: stderr fallback extraction failed", exc_info=True)
-
-    # 规范化兜底（SSOT 在 diagnostics.normalize_startup_diagnostics）：
-    # 此处仅做最小采集，不在这里重复实现“非空兜底/脱敏/截断”。
-
-    # cmd/args 兜底：若 session/error 都未提供命令信息，best-effort 通过 resolve_agent_spec 推断。
-    try:
-        if not safe_str(diag.get("cmd") or "").strip() and not list(diag.get("args") or []):
-            try:
-                cmd2, args2 = resolve_agent_spec(agent_type, model_name=model_name)
-                diag["cmd"] = safe_str(cmd2 or "")
-                diag["args"] = [str(x) for x in (args2 or [])]
-            except Exception:
-                logger.debug("build_startup_diagnostics: resolve_agent_spec fallback failed", exc_info=True)
-    except Exception:
-        logger.debug("build_startup_diagnostics: cmd/args fallback check failed", exc_info=True)
-
-    # Best-effort fail_phase inference when upstream does not provide one.
-    # Run it after snippets are filled so classification has more context.
-    if not diag.get("fail_phase"):
-        try:
-            err_blob = "\n".join(
-                [
-                    safe_str(diag.get("error") or ""),
-                    safe_str(diag.get("stdout_snippet") or ""),
-                    safe_str(diag.get("stderr_snippet") or ""),
-                ]
-            )
-        except Exception:
-            logger.debug("build_startup_diagnostics: err_blob construction failed", exc_info=True)
-            err_blob = ""
-        try:
-            phase_guess = classify_startup_fail_phase(error=error, error_blob=err_blob)
-            diag["fail_phase"] = truncate_text(safe_str(phase_guess or ""), 80)
-        except Exception:
-            logger.debug("build_startup_diagnostics: fail_phase inference failed", exc_info=True)
-            # ultimate fallback
-            diag["fail_phase"] = "start_failed"
-
-    # fail_reason 采集：上游若提供则保留；最终兜底由 normalize 统一处理
-    try:
-        diag["fail_reason"] = truncate_text(safe_str(getattr(error, "fail_reason", "") or ""), 80)
-    except Exception:
-        logger.debug("build_startup_diagnostics: fail_reason extraction failed", exc_info=True)
-        diag["fail_reason"] = ""
-
-    # human-readable spec (best-effort)
-    try:
-        if session is not None and hasattr(session, "describe_agent"):
-            diag["spec"] = truncate_text(safe_str(session.describe_agent()), 400)
-    except Exception:
-        logger.debug("build_startup_diagnostics: spec extraction failed", exc_info=True)
-
-    # Keep alias for compatibility
-    if diag.get("spec") and not diag.get("agent_spec"):
-        diag["agent_spec"] = diag.get("spec")
-
-    # If cmd/args missing but spec looks like `cmd=... args=...`, parse it best-effort.
-    if (not diag.get("cmd")) and (not (diag.get("args") or [])) and diag.get("spec"):
-        try:
-            s = str(diag.get("spec") or "")
-            # very simple parser: cmd=<...> args=<...> cwd=<...>
-            if "cmd=" in s:
-                cmd_part = s.split("cmd=", 1)[1]
-                cmd = cmd_part.split(" ", 1)[0].strip()
-                if cmd:
-                    diag["cmd"] = cmd
-            if "args=" in s:
-                args_part = s.split("args=", 1)[1]
-                args_txt = args_part.split(" cwd=", 1)[0].strip()
-                if args_txt:
-                    diag["args"] = [x for x in args_txt.split() if x]
-        except Exception:
-            logger.debug("build_startup_diagnostics: spec parsing failed", exc_info=True)
-
-    # Ensure required fields exist and are serializable.
-    if diag.get("args") is None:
-        diag["args"] = []
-    if not isinstance(diag.get("args"), list):
-        try:
-            diag["args"] = list(diag.get("args") or [])
-        except Exception:
-            logger.debug("build_startup_diagnostics: args list conversion failed", exc_info=True)
-            diag["args"] = []
-    diag["args"] = [str(x) for x in (diag.get("args") or [])]
-    diag["cmd"] = safe_str(diag.get("cmd") or "")
-    diag["stdout_snippet"] = safe_str(diag.get("stdout_snippet") or "")
-    diag["stderr_snippet"] = safe_str(diag.get("stderr_snippet") or "")
-    diag["agent_spec"] = safe_str(diag.get("agent_spec") or "")
-    # Re-assert timeout_s contract: None | float
-    diag["timeout_s"] = safe_float_or_none(diag.get("timeout_s"))
-
-    # Normalize error_text (some exceptions have empty __str__).
-    # Compose from: str(error) -> stderr/stdout snippets -> cause/context -> repr(error) -> type fallback.
-    try:
-        msg = ""
-        try:
-            msg = safe_str(error) if error is not None else ""
-        except Exception:
-            logger.debug("build_startup_diagnostics: error str conversion failed", exc_info=True)
-            msg = ""
-
-        # If message is too generic/empty, prefer stderr/stdout snippets.
-        stderr_snip = safe_str(diag.get("stderr_snippet") or "")
-        stdout_snip = safe_str(diag.get("stdout_snippet") or "")
-        if not (msg or "").strip() or (msg or "").strip() in ("(empty)", "None"):
-            msg = (stderr_snip or "").strip() or (stdout_snip or "").strip()
-
-        # Add 1-level cause/context if still empty or extremely short.
-        if (not (msg or "").strip()) or len((msg or "").strip()) < 8:
-            try:
-                cause = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
-            except Exception:
-                logger.debug("build_startup_diagnostics: cause extraction failed", exc_info=True)
-                cause = None
-            if cause is not None and cause is not error:
-                try:
-                    c_msg = safe_str(cause)
-                except Exception:
-                    logger.debug("build_startup_diagnostics: cause str conversion failed", exc_info=True)
-                    c_msg = ""
-                if not (c_msg or "").strip():
-                    try:
-                        c_msg = repr(cause)
-                    except Exception:
-                        logger.debug("build_startup_diagnostics: cause repr failed", exc_info=True)
-                        c_msg = ""
-                c_msg = (c_msg or "").strip()
-                if c_msg:
-                    msg = (msg or "").strip()
-                    msg = (msg + "\n" if msg else "") + f"cause={type(cause).__name__}: {c_msg}"
-
-        # Final fallback: repr(error) or <Type>.
-        if not (msg or "").strip():
-            msg = (safe_str(diag.get("error_repr") or "") or "").strip()
-        if not (msg or "").strip():
-            et = safe_str(diag.get("error_type") or "Exception") or "Exception"
-            msg = f"<{et}> (empty output)"
-
-        # Include key structured hints if available.
-        hints: list[str] = []
-        try:
-            rc = diag.get("rc")
-            if rc is not None:
-                hints.append(f"rc={int(rc)}")
-        except Exception:
-            logger.debug("build_startup_diagnostics: rc hint failed", exc_info=True)
-        try:
-            ph = safe_str(diag.get("fail_phase") or "").strip()
-            if ph:
-                hints.append(f"phase={truncate_text(ph, 40)}")
-        except Exception:
-            logger.debug("build_startup_diagnostics: phase hint failed", exc_info=True)
-        if hints:
-            msg = (msg or "").strip()
-            msg = (msg + "\n" if msg else "") + " ".join(hints)
-
-        # Bound size before normalize to avoid giant intermediate strings.
-        msg = truncate_text(msg, 400) or "(empty)"
-        diag["error_text"] = msg
-        diag["error"] = msg
-    except Exception:
-        logger.debug("build_startup_diagnostics: error_text normalization failed", exc_info=True)
-        diag["error_text"] = "<Exception> (empty output)"
-        diag["error"] = diag["error_text"]
-
-    # Final SSOT normalize: non-empty fallbacks + redaction + truncation
-    return normalize_startup_diagnostics(diag, get_settings_fn=get_settings)
-
-
-def format_startup_diagnostics(diag: object, *, total_limit: int = DEFAULT_DIAGNOSTICS_TOTAL_LIMIT) -> str:
-    """将 diagnostics 格式化为稳定的单行字符串（JSON），避免日志为空/难 grep。"""
-    base = {
-        "cmd": "",
-        "args": [],
-        "rc": None,
-        "stdout_snippet": "",
-        "stderr_snippet": "",
-    }
-    try:
-        if isinstance(diag, dict):
-            base.update(diag)
+    phase = safe_str(getattr(error, "fail_phase", "")).strip()
+    if not phase:
+        blob = "\n".join(
+            (safe_str(error), diag["stdout_snippet"], diag["stderr_snippet"])
+        ).casefold()
+        if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+            phase = "timeout"
+        elif "stdin is not a terminal" in blob or "stdin-not-tty" in blob:
+            phase = "stdin_not_tty"
+        elif any(
+            marker in blob
+            for marker in ("invalid model", "model must be one of", "unknown model")
+        ) or ("invalid value" in blob and "--model" in blob):
+            phase = "invalid_model"
         else:
-            base["error"] = truncate_text(safe_str(diag), 400)
-    except Exception:
-        logger.debug("format_startup_diagnostics: base construction failed", exc_info=True)
-        base["error"] = "format_error"
+            phase = "start_failed"
+    diag["fail_phase"] = phase
+    diag["fail_reason"] = safe_str(
+        getattr(error, "fail_reason", "") or phase
+    )
 
-    # Redaction + truncation ordering: redact first (on JSON string), then truncate.
-    try:
-        # NOTE: pass get_settings() explicitly to allow tests to monkeypatch
-        # src.acp.sync_adapter.get_settings without touching global config.
-        cfg = get_diagnostics_config(get_settings_fn=get_settings)
-        enabled = bool(cfg.redact_enabled)
-        patterns = list(cfg.redact_patterns or [])
-        repl = str(cfg.redact_replacement or "***REDACTED***")
-        if int(cfg.total_limit or 0) > 0:
-            total_limit = int(cfg.total_limit)
-    except Exception:
-        logger.debug("format_startup_diagnostics: config loading failed", exc_info=True)
-        enabled, patterns, repl = True, [], "***REDACTED***"
-
-    try:
-        s = json.dumps(base, ensure_ascii=False, sort_keys=True)
-    except Exception:
-        logger.debug("format_startup_diagnostics: json.dumps failed", exc_info=True)
+    if session is not None:
         try:
-            s = safe_str(base)
-        except Exception:
-            logger.debug("format_startup_diagnostics: safe_str fallback failed", exc_info=True)
-            s = '{"error":"diagnostics_unavailable"}'
+            diag["spec"] = truncate_text(safe_str(session.describe_agent()), 400)
+        except (AttributeError, TypeError, ValueError):
+            pass
+    diag["agent_spec"] = diag["spec"]
 
-    if enabled:
-        try:
-            s = redact_text(s, patterns, repl)
-        except Exception:
-            logger.debug("format_startup_diagnostics: redaction failed", exc_info=True)
-    return truncate_text(s, int(total_limit or DEFAULT_DIAGNOSTICS_TOTAL_LIMIT))
+    message = safe_str(error).strip()
+    if not message or message in {"(empty)", "None"}:
+        message = diag["stderr_snippet"] or diag["stdout_snippet"]
+    cause = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+    if len(message) < 8 and cause is not None and cause is not error:
+        cause_text = safe_str(cause).strip()
+        if cause_text:
+            message = f"{message}\n" if message else ""
+            message += f"cause={type(cause).__name__}: {cause_text}"
+    if not message:
+        message = f"<{type(error).__name__}> (empty output)"
+    hints = [f"phase={phase}"]
+    if diag["rc"] is not None:
+        hints.insert(0, f"rc={diag['rc']}")
+    diag["error_text"] = truncate_text(
+        f"{message}\n{' '.join(hints)}", 400
+    )
+    diag["error"] = diag["error_text"]
+    return normalize_startup_diagnostics(diag, get_settings_fn=get_settings)
 
 
 class AgentSpecResolveError(ACPStartupError):
@@ -959,73 +576,6 @@ def start_session_with_retry(
         fail_phase="retry_exhausted",
         cause=last_err,
     ) from last_err
-
-
-def start_agent_session_with_diagnostics(
-    *,
-    agent_type: str,
-    cwd: str,
-    startup_timeout: float = 60,
-    model_name: Optional[str] = None,
-    session_cls: Optional[type["SyncACPSession"]] = None,
-    log_failures: bool = True,
-) -> tuple["SyncACPSession", str, dict]:
-    """通用 ACP 启动器封装：成功返回 (session, session_id, diagnostics)。
-
-    设计目的：
-    - 作为上层（ACPSessionManager / engines）的“可注入启动器”候选实现
-    - 统一失败诊断载体：在异常上附加 `.diagnostics`（dict，含非空 error_text）
-
-    约定：
-    - 成功：`session_id` 必须为非空字符串
-    - 失败：抛出异常（优先 ACPStartupError），且 `getattr(exc, 'diagnostics', None)` 可读
-    """
-    try:
-        s = start_session_with_retry(
-            agent_type=agent_type,
-            cwd=cwd,
-            startup_timeout=startup_timeout,
-            model_name=model_name,
-            session_cls=session_cls,
-            log_failures=bool(log_failures),
-        )
-        sid = str(getattr(s, "session_id", "") or "").strip()
-        if not sid:
-            # 极端兜底：不允许“成功但无 session_id”，避免上层误判。
-            raise ACPStartupError(
-                "ACP session started but session_id is empty",
-                agent_cmd=safe_str(getattr(s, "_agent_cmd", "") or ""),
-                agent_args=[str(x) for x in (getattr(s, "_agent_args", None) or [])],
-                cwd=cwd,
-                returncode=None,
-                stdout_snippet="",
-                stderr_snippet="",
-                fail_phase="missing_session_id",
-                cause=None,
-            )
-        return (s, sid, {"attempts": [{"phase": "start", "ok": True}]})
-    except Exception as e:
-        # 统一构造 diagnostics（SSOT=build_startup_diagnostics/normalize_startup_diagnostics）
-        try:
-            d = build_startup_diagnostics(
-                agent_type=agent_type,
-                cwd=cwd,
-                model_name=model_name,
-                session=None,
-                error=e,
-                attempt=1,
-                retries=max(1, int(getattr(get_settings(), "acp_startup_retries", 1) or 1)),
-                timeout_s=float(startup_timeout or 0),
-            )
-            d = normalize_startup_diagnostics(d, get_settings_fn=get_settings)
-        except Exception:
-            logger.debug("start_agent_session_with_diagnostics: diagnostics construction failed", exc_info=True)
-            d = {"error_text": get_error_detail(e), "fail_reason": "start_failed"}
-        try:
-            e.diagnostics = d
-        except Exception:
-            logger.debug("start_agent_session_with_diagnostics: attaching diagnostics failed", exc_info=True)
-        raise
 
 
 class SyncACPSession:

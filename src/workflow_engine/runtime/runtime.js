@@ -2,7 +2,7 @@
  * GhostAP Workflow Runtime Harness
  *
  * Communicates with the Python host via JSON-RPC 2.0 over stdin/stdout (NDJSON).
- * Exposes orchestration primitives (agent, parallel, pipeline, phase, log, workflow)
+ * Exposes orchestration primitives (agent, parallel, pipeline, phase, log)
  * as globals to user workflow scripts.
  */
 
@@ -10,6 +10,7 @@ import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import vm from 'node:vm';
 
 // ---------------------------------------------------------------------------
@@ -32,6 +33,9 @@ function sanitizePath(msg) {
 let requestId = 0;
 const pendingRequests = new Map(); // id -> { resolve, reject }
 let cancelled = false;
+const DEFAULT_MAX_TOTAL_AGENTS = 200;
+let maxTotalAgents = DEFAULT_MAX_TOTAL_AGENTS;
+let totalAgentCalls = 0;
 
 // Concurrency cap for parallel(). Matches the Python ThreadPoolExecutor
 // size so both sides of the bridge agree on the upper bound. A falsy
@@ -67,6 +71,7 @@ const MAX_SAFE_TIMER_MS = 2147483647;
 // agent_call so multiple nested primitives can track their own request IDs
 // concurrently without overwriting each other.
 const requestInterceptors = [];
+const raceContext = new AsyncLocalStorage();
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -291,7 +296,7 @@ function handleMessage(line) {
 
     if (msg.error) {
       // Preserve JSON-RPC error code/data so the JS orchestration layer
-      // (workflow(), agent(), etc.) can respond to structured failure
+      // Runtime primitives such as agent() can respond to structured failure
       // payloads such as `{ kind: "missing_tools", ... }` produced by the
       // Python bridge. Falling back to `new Error(msg.error.message)`
       // would silently drop these attachments.
@@ -438,12 +443,42 @@ function matchesSchema(value, schema) {
   return false;
 }
 
+function isFailedResult(value) {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && typeof value.error === 'string'
+    && value.error.trim(),
+  );
+}
+
+function partitionResults(results) {
+  const successes = [];
+  const failures = [];
+  results.forEach((value, index) => {
+    if (isFailedResult(value)) {
+      failures.push({
+        index,
+        error: sanitizePath(value.error),
+        stage: value.stage || 'agent_call',
+      });
+    } else {
+      successes.push({ index, value });
+    }
+  });
+  return { successes, failures };
+}
+
 // ---------------------------------------------------------------------------
 // Primitives
 // ---------------------------------------------------------------------------
 
 async function agent(promptOrOpts, opts = {}) {
   if (cancelled) throw new CancelledError();
+  const activeRace = raceContext.getStore();
+  if (activeRace && activeRace.cancelled) {
+    return { error: activeRace.timeoutMessage, stage: 'race_timeout' };
+  }
 
   // Support both agent("prompt", {opts}) and agent({prompt, ...opts})
   let prompt;
@@ -455,11 +490,19 @@ async function agent(promptOrOpts, opts = {}) {
     prompt = promptOrOpts;
   }
 
+  if (totalAgentCalls >= maxTotalAgents) {
+    return {
+      error: `Agent call limit exceeded (${maxTotalAgents})`,
+      stage: 'agent_limit',
+    };
+  }
+  totalAgentCalls += 1;
+
   let effectiveTimeout;
   try {
     effectiveTimeout = capTimeoutToDeadline(opts.timeout);
   } catch (err) {
-    return { error: err && err.message ? err.message : String(err) };
+    return { error: err && err.message ? err.message : String(err), stage: 'deadline' };
   }
 
   const params = {
@@ -504,20 +547,20 @@ async function agent(promptOrOpts, opts = {}) {
     result = await callWithBackpressureRetry();
   } catch (err) {
     if (err instanceof CancelledError) throw err;
-    return { error: err.message };
+    return { error: sanitizePath(err.message), stage: 'agent_call' };
   }
 
   // AgentExecutor owns structured-output retries. Repeating agent_call here
   // would multiply its attempts (formerly up to 3×3 calls). The runtime only
   // propagates the authoritative error and performs one defense-in-depth check.
   if (typeof result === 'object' && result !== null && result.error) {
-    return { error: sanitizePath(String(result.error)) };
+    return { error: sanitizePath(String(result.error)), stage: result.stage || 'agent_call' };
   }
   const payload = typeof result === 'object' && result !== null && 'data' in result
     ? result.data
     : result;
   if (opts.schema && !matchesSchema(payload, opts.schema)) {
-    return { error: 'Structured output schema validation failed at runtime boundary' };
+    return { error: 'Structured output schema validation failed at runtime boundary', stage: 'schema' };
   }
   return payload;
 }
@@ -738,40 +781,35 @@ async function classify(input, categories, opts = {}) {
     .join('\n');
 
   const classifierPrompt = opts.classifierPrompt ||
-    `Classify the following input into exactly ONE of these categories:\n\n${categoryDescriptions}\n\nInput:\n${input}\n\nRespond with ONLY the category name (one of: ${categoryNames.join(', ')}). Nothing else.`;
+    `Classify the input into exactly one category.\n\n${categoryDescriptions}\n\nInput:\n${input}\n\nReturn JSON only: { "category": "one exact category name" }.`;
 
   const classification = await agent(classifierPrompt, {
     tool: opts.classifierTool || opts.tool,
     model: opts.classifierModel || opts.model,
     role: 'classifier',
     label: opts.label ? `${opts.label}-classify` : 'classify',
-    schema: opts.schema,
+    schema: opts.schema || { category: '' },
     timeout: opts.classifierTimeout || opts.timeout,
   });
 
-  const classResult = (typeof classification === 'string' ? classification : '').trim().toLowerCase();
-
-  // Match strategy: exact match first, then longest-substring-first to avoid
-  // short category names matching unrelated LLM output.
-  let matched = categoryNames.find(name => classResult === name.toLowerCase());
-  if (!matched) {
-    const sortedByLength = [...categoryNames].sort((a, b) => b.length - a.length);
-    matched = sortedByLength.find(name => {
-      const escaped = name.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      return new RegExp(`\\b${escaped}\\b`).test(classResult);
-    });
+  const rawCategory = typeof classification === 'string'
+    ? classification
+    : classification && classification.category;
+  const normalizedCategory = String(rawCategory || '').trim().toLowerCase();
+  const matched = categoryNames.find(name => name.toLowerCase() === normalizedCategory);
+  const fallbackCategory = categoryNames.includes(opts.defaultCategory)
+    ? opts.defaultCategory
+    : null;
+  const selectedCategory = matched || fallbackCategory;
+  if (!selectedCategory) {
+    return {
+      error: isFailedResult(classification)
+        ? classification.error
+        : 'Classifier returned no exact category',
+      stage: 'classify',
+      categories: categoryNames,
+    };
   }
-  if (!matched) {
-    matched = categoryNames.find(name => classResult.includes(name.toLowerCase()));
-  }
-
-  if (!matched && classification && classification.error) {
-    debugLog(`[runtime] classify() classifier agent failed: ${classification.error}`);
-  } else if (!matched) {
-    debugLog(`[runtime] classify() could not match "${classResult}" to any category, defaulting to "${categoryNames[0]}"`);
-  }
-
-  const selectedCategory = matched || opts.defaultCategory || categoryNames[0];
   const handler = categories[selectedCategory].handler;
 
   if (typeof handler === 'function') {
@@ -829,9 +867,16 @@ async function fanout(input, workers, opts = {}) {
     return results;
   }
 
+  const { successes, failures } = partitionResults(results);
+  if (successes.length === 0) {
+    return { error: 'fanout(): all workers failed', stage: 'fanout', failures };
+  }
+
   const MAX_RESULT_LEN = 2000;
-  const resultSummary = results
-    .map((r, i) => {
+  const resultSummary = successes
+    .map(({ index, value }) => {
+      const r = value;
+      const i = index;
       const text = typeof r === 'string' ? r : JSON.stringify(r);
       const truncated = text.length > MAX_RESULT_LEN
         ? text.slice(0, MAX_RESULT_LEN) + `\n... [truncated ${text.length - MAX_RESULT_LEN} chars]`
@@ -852,7 +897,17 @@ async function fanout(input, workers, opts = {}) {
     timeout: opts.synthesizerTimeout || opts.timeout,
   });
 
-  return synthesized;
+  if (isFailedResult(synthesized)) {
+    return {
+      error: synthesized.error,
+      stage: 'fanout_synthesis',
+      partialResults: successes.map(item => item.value),
+      failures,
+    };
+  }
+  return failures.length > 0
+    ? { output: synthesized, partialFailures: failures }
+    : synthesized;
 }
 
 /**
@@ -865,19 +920,47 @@ async function fanout(input, workers, opts = {}) {
  * @param {Object} opts - Options: { criteria, verifiers, judgeTool, maxRounds, onReject }
  * @returns {{ accepted: boolean, output: *, feedback: string, rounds: number }}
  */
+function normalizeVerificationReview(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (typeof value.approve !== 'boolean' || !Array.isArray(value.issues)) return null;
+
+  const requiredIssueKeys = ['description', 'evidence', 'severity'];
+  const issues = [];
+  for (const issue of value.issues) {
+    if (!issue || typeof issue !== 'object' || Array.isArray(issue)) return null;
+    const keys = Object.keys(issue).sort();
+    if (keys.length !== requiredIssueKeys.length ||
+        keys.some((key, index) => key !== requiredIssueKeys[index])) {
+      return null;
+    }
+    const severity = typeof issue.severity === 'string' ? issue.severity.trim().toLowerCase() : '';
+    const description = typeof issue.description === 'string' ? issue.description.trim() : '';
+    const evidence = typeof issue.evidence === 'string' ? issue.evidence.trim() : '';
+    if (!['critical', 'major', 'minor'].includes(severity) || !description || !evidence) {
+      return null;
+    }
+    issues.push({ severity, description, evidence });
+  }
+  if (!value.approve && issues.length === 0) return null;
+  return { approve: value.approve, issues };
+}
+
 async function verify(output, opts = {}) {
   if (cancelled) throw new CancelledError();
 
-  const maxRounds = opts.maxRounds || 2;
+  const maxRounds = Math.min(Math.max(Number(opts.maxRounds) || 2, 1), 5);
   const criteria = opts.criteria || 'correctness, completeness, security, quality';
-  const verifiers = opts.verifiers || [
-    { tool: 'claude', role: 'adversarial_verifier', focus: 'Find logical errors, edge cases, incorrect assumptions' },
-    { tool: 'aiden', role: 'security_verifier', focus: 'Find security issues, data leaks, injection points' },
-  ];
+  const verifiers = (opts.verifiers && opts.verifiers.length
+    ? opts.verifiers
+    : [{ tool: opts.tool, role: 'adversarial_verifier', focus: 'Find concrete correctness and safety issues' }]
+  ).slice(0, 8);
 
   let currentOutput = output;
   let round = 0;
   let lastFeedback = '';
+  const verifierFailures = [];
+  const reviewLedger = [];
+  const evidenceLedger = [];
 
   while (round < maxRounds) {
     round++;
@@ -889,7 +972,10 @@ async function verify(output, opts = {}) {
         tool: v.tool,
         role: v.role || `verifier-${idx}`,
         label: `verify-r${round}-${idx}`,
-        schema: { issues: [], approve: false },
+        schema: {
+          issues: [{ severity: '', description: '', evidence: '' }],
+          approve: false,
+        },
         timeout: v.timeout || opts.verifierTimeout || opts.timeout,
       }))
     );
@@ -897,30 +983,60 @@ async function verify(output, opts = {}) {
     const allIssues = [];
     let approvals = 0;
     let validReviews = 0;
-    for (const r of reviews) {
-      if (r && typeof r === 'object' && !r.error && ('approve' in r || 'issues' in r)) {
-        validReviews++;
-        if (r.approve) approvals++;
-        if (r.issues) allIssues.push(...r.issues);
+    for (const [index, r] of reviews.entries()) {
+      if (isFailedResult(r)) {
+        verifierFailures.push({ round, verifier: index, error: r.error, stage: r.stage || 'verify' });
+        continue;
+      }
+      const normalized = normalizeVerificationReview(r);
+      if (!normalized) {
+        verifierFailures.push({
+          round,
+          verifier: index,
+          error: 'Verifier returned an invalid review shape or empty evidence',
+          stage: 'verify_schema',
+        });
+        continue;
+      }
+      const verifier = verifiers[index] || {};
+      const verifierName = verifier.role || verifier.tool || `verifier-${index}`;
+      validReviews++;
+      if (normalized.approve) approvals++;
+      allIssues.push(...normalized.issues);
+      reviewLedger.push({
+        round,
+        verifier: verifierName,
+        approve: normalized.approve,
+        issues: normalized.issues,
+      });
+      for (const issue of normalized.issues) {
+        evidenceLedger.push({ round, verifier: verifierName, ...issue });
       }
     }
 
-    // If all verifiers failed to produce valid reviews, do not auto-accept
+    // Verification is a barrier: no valid evidence can never mean approval.
     if (validReviews === 0) {
       lastFeedback = 'All verifiers failed to produce a valid review';
-      if (round >= maxRounds) break;
-      continue;
+      break;
     }
 
     const criticals = allIssues.filter(i => i.severity === 'critical').length;
     const majors = allIssues.filter(i => i.severity === 'major').length;
-    if (approvals === validReviews || (criticals === 0 && majors === 0)) {
-      return { accepted: true, output: currentOutput, feedback: '', rounds: round };
+    if (approvals === validReviews && criticals === 0 && majors === 0) {
+      return {
+        accepted: true,
+        output: currentOutput,
+        feedback: '',
+        rounds: round,
+        failures: verifierFailures,
+        reviews: reviewLedger,
+        evidence: evidenceLedger,
+      };
     }
 
     lastFeedback = allIssues
       .filter(i => i.severity !== 'minor')
-      .map(i => `[${i.severity}] ${i.description}`)
+      .map(i => `[${i.severity}] ${i.description}\nEvidence: ${i.evidence}`)
       .join('\n');
 
     if (round >= maxRounds) break;
@@ -937,11 +1053,24 @@ async function verify(output, opts = {}) {
           timeout: opts.reviseTimeout || opts.timeout,
         }
       );
+      if (isFailedResult(revised)) {
+        verifierFailures.push({ round, error: revised.error, stage: 'revision' });
+        lastFeedback = `${lastFeedback}\nRevision failed: ${revised.error}`.trim();
+        break;
+      }
       currentOutput = revised;
     }
   }
 
-  return { accepted: false, output: currentOutput, feedback: lastFeedback, rounds: round };
+  return {
+    accepted: false,
+    output: currentOutput,
+    feedback: lastFeedback,
+    rounds: round,
+    failures: verifierFailures,
+    reviews: reviewLedger,
+    evidence: evidenceLedger,
+  };
 }
 
 /**
@@ -964,6 +1093,10 @@ async function generate(count, generatorFn, filterFn, opts = {}) {
   if (count > 50) {
     throw new RangeError('generate() count must be <= 50');
   }
+  const reservedCalls = typeof filterFn === 'function' ? 0 : 1;
+  if (count + reservedCalls > maxTotalAgents - totalAgentCalls) {
+    throw new RangeError('generate() exceeds remaining agent call capacity');
+  }
 
   const tasks = [];
   for (let i = 0; i < count; i++) {
@@ -984,13 +1117,18 @@ async function generate(count, generatorFn, filterFn, opts = {}) {
   }
 
   const candidates = await parallel(tasks);
-
-  if (typeof filterFn === 'function') {
-    return filterFn(candidates);
+  const { successes, failures } = partitionResults(candidates);
+  const successfulCandidates = successes.map(item => item.value);
+  if (successfulCandidates.length === 0) {
+    return { candidates: [], failures, error: 'generate(): all candidates failed' };
   }
 
-  const topK = opts.topK || 3;
-  const candidatesSummary = candidates
+  if (typeof filterFn === 'function') {
+    return { candidates: await filterFn(successfulCandidates), failures };
+  }
+
+  const topK = Math.min(Math.max(Number(opts.topK) || 3, 1), successfulCandidates.length);
+  const candidatesSummary = successfulCandidates
     .map((c, i) => `[Candidate ${i}]: ${typeof c === 'string' ? c.slice(0, 500) : JSON.stringify(c).slice(0, 500)}`)
     .join('\n\n');
 
@@ -1008,13 +1146,19 @@ async function generate(count, generatorFn, filterFn, opts = {}) {
   if (filterResult && filterResult.ranked) {
     const seen = new Set();
     const ranked = filterResult.ranked
-      .filter(idx => typeof idx === 'number' && idx >= 0 && idx < candidates.length && !seen.has(idx) && seen.add(idx))
+      .filter(idx => typeof idx === 'number' && idx >= 0 && idx < successfulCandidates.length && !seen.has(idx) && seen.add(idx))
       .slice(0, topK)
-      .map(idx => candidates[idx]);
-    return ranked.length > 0 ? ranked : candidates.slice(0, topK);
+      .map(idx => successfulCandidates[idx]);
+    return {
+      candidates: ranked.length > 0 ? ranked : successfulCandidates.slice(0, topK),
+      failures,
+    };
   }
 
-  return candidates.slice(0, topK);
+  if (isFailedResult(filterResult)) {
+    failures.push({ index: -1, error: filterResult.error, stage: 'filter' });
+  }
+  return { candidates: successfulCandidates.slice(0, topK), failures };
 }
 
 /**
@@ -1042,9 +1186,25 @@ async function tournament(contestants, judgeFn, opts = {}) {
     })
   );
 
-  let remaining = solutions.map((sol, idx) => ({ solution: sol, index: idx, label: contestants[idx].label || `contestant-${idx}` }));
+  const partitioned = partitionResults(solutions);
+  let remaining = partitioned.successes.map(({ index, value }) => ({
+    solution: value,
+    index,
+    label: contestants[index]?.label || `contestant-${index}`,
+  }));
   const bracket = [];
+  const unresolved = [];
   let roundNum = 0;
+
+  if (remaining.length === 0) {
+    return {
+      winner: null,
+      bracket,
+      rounds: 0,
+      failures: partitioned.failures,
+      error: 'tournament(): all contestants failed',
+    };
+  }
 
   while (remaining.length > 1) {
     if (cancelled) throw new CancelledError();
@@ -1085,7 +1245,7 @@ async function tournament(contestants, judgeFn, opts = {}) {
     for (let i = 0; i < matchups.length; i++) {
       const [a, b] = matchups[i];
       const result = judgeResults[i];
-      let winnerIsA;
+      let winnerIsA = null;
       if (typeof result === 'string') {
         const trimmed = result.trim();
         const firstLine = trimmed.split(/[.\n]/)[0].trim();
@@ -1093,9 +1253,19 @@ async function tournament(contestants, judgeFn, opts = {}) {
         const hasB = /\bB\b/.test(firstLine);
         if (hasA && !hasB) winnerIsA = true;
         else if (!hasA && hasB) winnerIsA = false;
-        else winnerIsA = true; // ambiguous or neither — default to first contestant
+        else winnerIsA = null;
       } else {
-        winnerIsA = result && result.winner && result.winner.toUpperCase() === 'A';
+        const winner = result && typeof result.winner === 'string'
+          ? result.winner.toUpperCase()
+          : '';
+        if (winner === 'A') winnerIsA = true;
+        if (winner === 'B') winnerIsA = false;
+      }
+      if (winnerIsA === null) {
+        unresolved.push({ round: roundNum, a: a.label, b: b.label, error: 'judge returned no valid winner' });
+        // Continue deterministically only to drain the bracket; do not expose
+        // this provisional choice as a verified winner below.
+        winnerIsA = (roundNum + i) % 2 === 0;
       }
       const winner = winnerIsA ? a : b;
       const loser = winnerIsA ? b : a;
@@ -1106,7 +1276,16 @@ async function tournament(contestants, judgeFn, opts = {}) {
     remaining = nextRound;
   }
 
-  return { winner: remaining[0].solution, winnerLabel: remaining[0].label, bracket, rounds: roundNum };
+  return {
+    winner: unresolved.length > 0 ? null : remaining[0].solution,
+    winnerLabel: unresolved.length > 0 ? null : remaining[0].label,
+    provisionalWinner: unresolved.length > 0 ? remaining[0].solution : null,
+    bracket,
+    rounds: roundNum,
+    failures: partitioned.failures,
+    unresolved,
+    ...(unresolved.length > 0 && { error: 'tournament(): one or more judge decisions were invalid' }),
+  };
 }
 
 /**
@@ -1127,7 +1306,7 @@ async function loop(taskFn, opts = {}) {
   }
 
   const MAX_LOOP_ITERATIONS = 50;
-  const maxIterations = Math.min(opts.maxIterations || 10, MAX_LOOP_ITERATIONS);
+  const maxIterations = Math.min(Math.max(Number(opts.maxIterations) || 5, 1), MAX_LOOP_ITERATIONS);
   const results = [];
   let previousResult = null;
   let stoppedBy = 'max_iterations';
@@ -1137,6 +1316,11 @@ async function loop(taskFn, opts = {}) {
 
     const result = await taskFn(i, previousResult, results);
     results.push(result);
+
+    if (isFailedResult(result)) {
+      stoppedBy = 'error';
+      break;
+    }
 
     if (typeof opts.onIteration === 'function') {
       opts.onIteration(i, result);
@@ -1168,7 +1352,12 @@ async function loop(taskFn, opts = {}) {
     previousResult = result;
   }
 
-  return { results, iterations: results.length, stoppedBy };
+  return {
+    results,
+    iterations: results.length,
+    stoppedBy,
+    ...(stoppedBy === 'error' && { error: results[results.length - 1].error }),
+  };
 }
 
 /**
@@ -1180,7 +1369,7 @@ async function loop(taskFn, opts = {}) {
  * @param {Array} steps - Array of functions: (previousResult) => result
  * @returns {*} Final step's result
  */
-async function sequence(steps) {
+async function sequence(steps, opts = {}) {
   if (cancelled) throw new CancelledError();
   if (!Array.isArray(steps)) {
     throw new TypeError('sequence() expects an array of steps');
@@ -1190,12 +1379,21 @@ async function sequence(steps) {
   for (let i = 0; i < steps.length; i++) {
     if (cancelled) throw new CancelledError();
     const step = steps[i];
-    if (typeof step === 'function') {
-      result = await step(result);
-    } else if (typeof step === 'object' && step !== null && step.prompt) {
-      result = await agent(step);
-    } else {
-      throw new TypeError(`sequence() step ${i} must be a function or agent descriptor`);
+    try {
+      if (typeof step === 'function') {
+        result = await step(result);
+      } else if (typeof step === 'object' && step !== null && step.prompt) {
+        result = await agent(step);
+      } else {
+        throw new TypeError(`sequence() step ${i} must be a function or agent descriptor`);
+      }
+    } catch (err) {
+      if (err instanceof CancelledError) throw err;
+      if (opts.throwOnFailure) throw err;
+      return { error: sanitizePath(err.message || String(err)), failedAtStep: i };
+    }
+    if (isFailedResult(result) && !opts.continueOnFailure) {
+      return { ...result, failedAtStep: i };
     }
   }
   return result;
@@ -1222,6 +1420,82 @@ function abortRequest(request_id) {
 }
 
 async function race(contestants, opts = {}) {
+  if (!Array.isArray(contestants) || contestants.length === 0) {
+    throw new TypeError('race() requires a non-empty array');
+  }
+
+  const requestedTimeout = Number(opts.timeout);
+  const normalizedContestants = contestants.map((contestant) => {
+    if (contestant && typeof contestant === 'object' && !Array.isArray(contestant)) {
+      return {
+        ...contestant,
+        timeout: contestant.timeout || (requestedTimeout > 0 ? requestedTimeout : undefined),
+      };
+    }
+    return contestant;
+  });
+  if (!Number.isFinite(requestedTimeout) || requestedTimeout <= 0) {
+    return raceCore(normalizedContestants, opts);
+  }
+
+  const tracker = { ids: new Set(), labels: new Map() };
+  const timeoutMessage = `race() timed out after ${requestedTimeout}s`;
+  const scope = { cancelled: false, timeoutMessage, failures: [] };
+  requestInterceptors.push(tracker);
+  const remainingMs = remainingWorkflowMs();
+  const requestedMs = Math.max(1, Math.ceil(requestedTimeout * 1000));
+  const boundedTimeoutMs = Number.isFinite(remainingMs)
+    ? Math.max(1, Math.min(requestedMs, remainingMs))
+    : requestedMs;
+  const timeoutMs = Math.min(MAX_SAFE_TIMER_MS, boundedTimeoutMs);
+  const timeoutSentinel = Symbol('race-timeout');
+  let timer = null;
+
+  try {
+    const racePromise = Promise.resolve().then(() => raceCore(normalizedContestants, opts, scope));
+    const deadlinePromise = new Promise((resolveDeadline) => {
+      timer = setTimeout(() => resolveDeadline(timeoutSentinel), timeoutMs);
+    });
+    const outcome = await Promise.race([racePromise, deadlinePromise]);
+    if (outcome !== timeoutSentinel) return outcome;
+
+    scope.cancelled = true;
+    const timeoutFailures = [];
+    for (const requestId of tracker.ids) {
+      const entry = pendingRequests.get(requestId);
+      if (!entry || entry.aborted) continue;
+      const label = tracker.labels.get(requestId) || `race-request-${requestId}`;
+      clearPendingTimer(entry);
+      entry.aborted = true;
+      pendingRequests.delete(requestId);
+      sendNotification('abort_request', { request_id: requestId });
+      sendNotification('agent_aborted', {
+        label,
+        reason: 'race_timeout',
+        request_id: requestId,
+      });
+      entry.reject(new JsonRpcError({ code: -32002, message: timeoutMessage }));
+      timeoutFailures.push({
+        request_id: requestId,
+        label,
+        error: timeoutMessage,
+        stage: 'race_timeout',
+      });
+    }
+    return {
+      error: timeoutMessage,
+      stage: 'race_timeout',
+      timeout: true,
+      failures: [...scope.failures, ...timeoutFailures],
+    };
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    const trackerIndex = requestInterceptors.lastIndexOf(tracker);
+    if (trackerIndex >= 0) requestInterceptors.splice(trackerIndex, 1);
+  }
+}
+
+async function raceCore(contestants, opts = {}, scope = null) {
   if (cancelled) throw new CancelledError();
   if (!Array.isArray(contestants) || contestants.length === 0) {
     throw new TypeError('race() requires a non-empty array');
@@ -1232,8 +1506,7 @@ async function race(contestants, opts = {}) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let completed = 0;
-    let firstResult = null;
-    let firstError = null;
+    const failures = scope ? scope.failures : [];
 
     // Track all agent_call request IDs created by this race, plus their
     // labels, so we can abort losers and report which agent was aborted.
@@ -1267,39 +1540,32 @@ async function race(contestants, opts = {}) {
     }
 
     contestants.forEach((c, idx) => {
-      const p = typeof c === 'function' ? c() : agent(c);
+      const invoke = () => (typeof c === 'function' ? c() : agent(c));
+      const p = scope ? raceContext.run(scope, invoke) : invoke();
       Promise.resolve(p).then(result => {
         if (settled) return;
         completed++;
-        if (firstResult === null) firstResult = result;
         if (validate(result)) {
           abortLosers();
           finish(resolve, result);
         } else if (completed === contestants.length) {
-          finish(resolve, firstResult);
+          failures.push({ index: idx, error: isFailedResult(result) ? result.error : 'validation rejected result' });
+          finish(resolve, { error: 'race(): no contestant produced a valid result', failures });
+        } else {
+          failures.push({ index: idx, error: isFailedResult(result) ? result.error : 'validation rejected result' });
         }
       }).catch(err => {
         if (settled) return;
         if (err instanceof CancelledError) {
-          // A contestant was aborted (e.g. race loser) — don't count as failure
-          completed++;
-          if (completed === contestants.length) {
-            if (firstResult !== null) {
-              finish(resolve, firstResult);
-            } else {
-              finish(reject, err);
-            }
-          }
+          // A winner settles before loser aborts are observed. Reaching this
+          // branch while unsettled therefore means host cancellation.
+          finish(reject, err);
           return;
         }
         completed++;
-        if (firstError === null) firstError = err;
+        failures.push({ index: idx, error: sanitizePath(err.message || String(err)) });
         if (completed === contestants.length) {
-          if (firstResult !== null) {
-            finish(resolve, firstResult);
-          } else {
-            finish(reject, new Error(`race(): all ${contestants.length} contestants failed: ${firstError && firstError.message}`));
-          }
+          finish(resolve, { error: `race(): all ${contestants.length} contestants failed`, failures });
         }
       });
     });
@@ -1315,48 +1581,9 @@ function phase(title) {
 }
 
 function log(msg) {
-  sendNotification('log', { message: String(msg) });
-}
-
-async function workflow(nameOrOpts, args = {}) {
-  if (cancelled) throw new CancelledError();
-
-  // NOTE: Only `name` (template identifier) is accepted. Direct script_path
-  // is rejected on the Python side for security — all sub-workflow resolution
-  // must go through the templates module validate_template_name +
-  // resolve_template_path to enforce scoping (user/project/allowlisted global
-  // /builtin) and prevent path traversal.
-  let name;
-  if (typeof nameOrOpts === 'object' && nameOrOpts !== null) {
-    if ('script_path' in nameOrOpts || 'scriptPath' in nameOrOpts) {
-      throw new Error(
-        'workflow(): script_path / scriptPath is not allowed. ' +
-        "Use workflow('<template_name>') or workflow({ name: '<template_name>' })."
-      );
-    }
-    name = nameOrOpts.name;
-    args = nameOrOpts.args || args;
-  } else {
-    name = nameOrOpts;
-  }
-
-  let result;
-  try {
-    result = await sendRequest('workflow_call', { name, args });
-  } catch (err) {
-    // Propagate JsonRpcError (with code/data) untouched so callers can
-    // inspect err.code / err.data.kind (e.g. "missing_tools") and decide
-    // whether to fail-fast, skip, or surface to the confirmation card.
-    if (err instanceof JsonRpcError) throw err;
-    // Otherwise, re-wrap as a plain JsonRpcError so callers can distinguish
-    // bridge-produced errors from programming errors in the script.
-    throw new JsonRpcError({ code: -32000, message: err.message });
-  }
-
-  if (typeof result === 'object' && result !== null && 'data' in result) {
-    return result.data;
-  }
-  return result;
+  const milestone = String(msg).replace(/\s+/g, ' ').trim();
+  const bounded = milestone.length > 240 ? `${milestone.slice(0, 237)}...` : milestone;
+  sendNotification('log', { message: bounded });
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,7 +1596,6 @@ function installGlobals() {
   globalThis.pipeline = pipeline;
   globalThis.phase = phase;
   globalThis.log = log;
-  globalThis.workflow = workflow;
   globalThis.classify = classify;
   globalThis.fanout = fanout;
   globalThis.verify = verify;
@@ -1416,6 +1642,10 @@ async function main() {
   const initParams = await waitForInit();
   maxConcurrent = Number(initParams.max_concurrent) || 0;
   if (maxConcurrent < 0) maxConcurrent = 0;
+  const hostAgentLimit = Number(initParams.max_total_agents);
+  if (Number.isInteger(hostAgentLimit) && hostAgentLimit > 0) {
+    maxTotalAgents = Math.min(DEFAULT_MAX_TOTAL_AGENTS, hostAgentLimit);
+  }
   workflowStartedMs = Number(initParams.started_unix_ms) || Date.now();
   workflowDeadlineMs = Number(initParams.deadline_unix_ms) || 0;
   workflowTotalTimeoutMs = Number(initParams.total_timeout_s) > 0
@@ -1456,7 +1686,6 @@ async function main() {
     pipeline: sandboxWrapHostFn(pipeline),
     phase: sandboxWrapHostFn(phase),
     log: sandboxWrapHostFn(log),
-    workflow: sandboxWrapHostFn(workflow),
     // Dynamic Workflow pattern primitives
     classify: sandboxWrapHostFn(classify),
     fanout: sandboxWrapHostFn(fanout),

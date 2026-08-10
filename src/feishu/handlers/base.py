@@ -158,7 +158,7 @@ class BaseHandler:
         retry_action: Optional[dict] = None,
     ):
         """Send a structured error card (schema 2.0) with QuickActions if available."""
-        from ...card import CardBuilder
+        from ...card.builders.system import SystemBuilder
 
         if not title:
             title = UI_TEXT["system_error_title"]
@@ -173,7 +173,7 @@ class BaseHandler:
                     "title": title,
                     "summary": get_error_detail(exc),
                 }
-            _, card_json_str = CardBuilder.build_error_card(
+            _, card_json_str = SystemBuilder.build_error_card(
                 exc,
                 title=title,
                 details=details or f"错误上下文：chat={chat_id}，message={origin_message_id or '未绑定原消息'}",
@@ -703,10 +703,10 @@ class BaseHandler:
     # ------------------------------------------------------------------
     def _dispatch_standard_card_action(self, ctx: CardActionContext) -> bool:
         """
-        Dispatch standard card actions (pause, resume, stop, expand, collapse, mode_full, mode_compact).
+        Dispatch stop, detail, and view card actions.
         Returns True if action was handled, False otherwise.
         """
-        # 1. Lifecycle actions (pause, resume, stop)
+        # 1. Explicit lifecycle actions (currently stop)
         if ctx.action_type in ctx.action_map:
             ctx.action_map[ctx.action_type](ctx.open_message_id, ctx.open_chat_id, project=ctx.project)
             return True
@@ -898,16 +898,19 @@ class BaseHandler:
         request_id: Optional[str] = None,
     ):
         """Create a reusable _on_rate_limit callback for any engine handler."""
-        from ...card import CardBuilder
+        from ...card.builders.deep import DeepBuilder
+        from ...card.models import EngineCardState
 
         def _on_rate_limit(wait_seconds: int):
             try:
-                msg_type, card_content = CardBuilder.build_info_card(
-                    project=project,
-                    title=UI_TEXT["system_rate_limit_title"],
-                    content=UI_TEXT["system_rate_limit_content"].format(wait_seconds=wait_seconds),
-                    engine_name=engine_name,
-                    show_buttons=False,
+                msg_type, card_content = DeepBuilder.build_info_card(
+                    project,
+                    EngineCardState(
+                        title=UI_TEXT["system_rate_limit_title"],
+                        content=UI_TEXT["system_rate_limit_content"].format(wait_seconds=wait_seconds),
+                        engine_name=engine_name,
+                        show_buttons=False,
+                    ),
                 )
                 self.send_card_to_chat(chat_id, card_content, origin_message_id=message_id, request_id=request_id)
             except Exception as e:

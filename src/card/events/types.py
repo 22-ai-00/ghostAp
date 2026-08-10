@@ -32,8 +32,6 @@ class CardEventType(str, Enum):
     # Meta
     TOOL_MODEL_CHANGED = "tool_model_changed"
     PROGRESS_UPDATED = "progress_updated"
-    APPROVAL_REQUESTED = "approval_requested"
-    APPROVAL_RESOLVED = "approval_resolved"
     # Engine lifecycle (Spec)
     CYCLE_STARTED = "cycle_started"
     CYCLE_DONE = "cycle_done"
@@ -45,14 +43,6 @@ class CardEventType(str, Enum):
     REVIEW_RETRY = "review_retry"
     CRITERIA_UPDATED = "criteria_updated"
     WARNING_UPDATED = "warning_updated"
-    # Workflow engine
-    WORKFLOW_PROGRESS = "workflow_progress"
-    WORKFLOW_CONFIRM = "workflow_confirm"
-    WORKFLOW_PHASE = "workflow_phase"
-    WORKFLOW_AGENT_STARTED = "workflow_agent_started"
-    WORKFLOW_AGENT_DONE = "workflow_agent_done"
-    WORKFLOW_AGENT_FAILED = "workflow_agent_failed"
-    WORKFLOW_LOG = "workflow_log"
     # UI control
     MODE_TOGGLED = "mode_toggled"
     STOP_ESCALATED = "stop_escalated"

@@ -15,7 +15,8 @@ from src.feishu.handlers.workflow import (
 from src.workflow_engine.engine import WorkflowEngine, WorkflowEngineCallbacks
 from src.workflow_engine.manager import WorkflowEngineManager
 from src.workflow_engine.models import (
-    PendingConfirmation,
+    PendingWorkflow,
+    ReviewAgentBinding,
     WorkflowProject,
     WorkflowStatus,
 )
@@ -41,7 +42,7 @@ def test_cleanup_waits_for_started_preclaim_closure_and_fences_repo_lock(
         "  phases: [{ title: 'Run', detail: 'Do work' }],\n"
         "  tools: ['coco'],\n"
         "};\n"
-        "export default async function workflow() {\n"
+        "export default async function main() {\n"
         "  const result = await agent('do work', {\n"
         "    tool: 'coco', label: 'work', timeout: 120\n"
         "  });\n"
@@ -54,30 +55,38 @@ def test_cleanup_waits_for_started_preclaim_closure_and_fences_repo_lock(
 
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
     engine._project = WorkflowProject(
-        status=WorkflowStatus.AWAITING_CONFIRM,
-        pending=PendingConfirmation(
+        status=WorkflowStatus.GENERATING_SCRIPT,
+        pending=PendingWorkflow(
             script_path=str(script_path),
             requirement="do work",
             meta={"name": "preclaim-cleanup", "tools": ["coco"]},
             initiator_user_id="user_1",
             engine_session_key="session_1",
             selected_tools=["coco"],
+            orchestrator_agent="coco",
+            orchestrator_binding=ReviewAgentBinding(
+                provider="cli",
+                tool_name="coco",
+                display_name="Coco",
+                agent_type="coco",
+                model_name=None,
+                model_display_name=None,
+                selection_key="coco:default",
+                use_default_model=True,
+            ),
             script_hash=script_hash,
         ),
     )
 
     ctx = MagicMock()
-    ctx.workflow_engine_manager.get.return_value = engine
     ctx.progress_reporter = MagicMock()
 
     handler = WorkflowHandler.__new__(WorkflowHandler)
     handler.ctx = ctx
-    handler._resolve_project_from_id = MagicMock(
-        return_value=SimpleNamespace(
-            project_id="project_1",
-            project_name="project",
-            root_path=str(tmp_path),
-        )
+    project = SimpleNamespace(
+        project_id="project_1",
+        project_name="project",
+        root_path=str(tmp_path),
     )
     handler._reply_workflow_error = MagicMock()
     handler._resolve_origin = MagicMock(return_value="origin_1")
@@ -93,16 +102,16 @@ def test_cleanup_waits_for_started_preclaim_closure_and_fences_repo_lock(
         )
     )
 
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        handler.handle_workflow_confirm_start(
-            "confirm_1",
-            "chat_1",
-            "project_1",
-            {
-                "action": "workflow_confirm_start",
-                "engine_session_key": "session_1",
-            },
-        )
+    generation_owner = _WorkflowLifecycleOwner("session_1")
+    engine._script_generation_owner = generation_owner
+    handler._queue_generated_workflow(
+        message_id="generation_1",
+        chat_id="chat_1",
+        project=project,
+        root_path=str(tmp_path),
+        engine=engine,
+        generation_owner=generation_owner,
+    )
 
     assert "run" in queued
     owner = engine._workflow_start_owner

@@ -225,7 +225,7 @@ class DeepStreamProcessor(BaseStreamProcessor):
                 completed=completed,
                 total=len(tasks),
             )
-            if deep_project.status == DeepProjectStatus.PAUSED:
+            if deep_project.status == DeepProjectStatus.CANCELLED:
                 self._cancel_unfinished_subagent_tasks()
                 self._rotator.dispatch(CardEvent.cancelled(reason=failure))
             else:

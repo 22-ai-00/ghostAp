@@ -7,7 +7,7 @@ Verifies that safe_wait_for is correctly wired in at:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -45,32 +45,5 @@ class TestReadStreamTimeout:
 # ---------------------------------------------------------------------------
 # ACPSession._health_check_session integration
 # ---------------------------------------------------------------------------
-
-
-class TestHealthCheckTimeout:
-    """Verify that _health_check_session uses safe_wait_for with action label."""
-
-    @pytest.mark.asyncio
-    async def test_health_check_timeout_produces_non_empty_message(self):
-        """When load_session hangs, safe_wait_for produces non-empty TimeoutError."""
-        from src.utils.async_helpers import safe_wait_for
-
-        async def _hang_load(**kwargs):
-            await asyncio.sleep(100)
-
-        conn = AsyncMock()
-        conn.load_session = _hang_load
-
-        with pytest.raises(TimeoutError) as exc_info:
-            await safe_wait_for(
-                conn.load_session(cwd="/tmp", session_id="test-session"),
-                timeout=0.01,
-                action="ACP 健康检查",
-            )
-
-        msg = str(exc_info.value)
-        assert msg.strip() != ""
-        assert "ACP 健康检查" in msg
-        assert "0.01" in msg
 
 

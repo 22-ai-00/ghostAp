@@ -70,7 +70,13 @@ class WorkflowStateManager:
     def on_phase_changed(self, title: str) -> None:
         """Record a new phase start."""
         with self._write_locked():
-            phase = PhaseProgress(title=title, started_at=time.time())
+            now = time.time()
+            if self._project.phases:
+                previous = self._project.phases[-1]
+                if previous.finished_at is None:
+                    previous.finished_at = now
+                    self._project.metrics.phases_completed += 1
+            phase = PhaseProgress(title=title, started_at=now)
             self._project.phases.append(phase)
             self._project.status = WorkflowStatus.RUNNING
 
@@ -164,7 +170,15 @@ class WorkflowStateManager:
             self._project.metrics.total_tokens += token_usage
             self._project.metrics.total_duration_s += duration_s
 
-    def on_agent_failed(self, label: str, error: str, result: str | None = None) -> None:
+    def on_agent_failed(
+        self,
+        label: str,
+        error: str,
+        result: str | None = None,
+        *,
+        token_usage: int = 0,
+        duration_s: float = 0.0,
+    ) -> None:
         """Update agent status to FAILED."""
         with self._write_locked():
             agent = self._label_to_agent.get(label)
@@ -183,12 +197,16 @@ class WorkflowStateManager:
             agent.status = AgentStatus.FAILED
             agent.error = error
             agent.result = str(result) if result is not None else None
+            agent.token_usage = max(0, int(token_usage or 0))
+            agent.duration_s = max(0.0, float(duration_s or 0.0))
             agent.current_activity = ""
             agent.finished_at = now
             if agent.duration_s <= 0 and agent.started_at:
                 agent.duration_s = max(0.0, now - agent.started_at)
             self._project.metrics.failed_agents += 1
             self._project.metrics.completed_agents += 1
+            self._project.metrics.total_tokens += agent.token_usage
+            self._project.metrics.total_duration_s += agent.duration_s
 
     def update_agent_activity(self, label: str, activity: str) -> None:
         """Update the live activity hint for a running agent (non-blocking)."""
@@ -199,6 +217,15 @@ class WorkflowStateManager:
             if self._is_terminal_agent(agent):
                 return
             agent.current_activity = activity
+            agent.activity_updated_at = time.time()
+
+    def update_agent_attempt(self, label: str, attempt: int) -> None:
+        """Record the executor's current one-based attempt for a running agent."""
+        with self._write_locked():
+            agent = self._label_to_agent.get(label)
+            if agent is None or self._is_terminal_agent(agent):
+                return
+            agent.attempt = max(1, int(attempt))
             agent.activity_updated_at = time.time()
 
     def update_agent_subagents(
@@ -427,6 +454,7 @@ class WorkflowStateManager:
                             finished_at=agent.finished_at,
                             current_activity=agent.current_activity,
                             activity_updated_at=agent.activity_updated_at,
+                            attempt=agent.attempt,
                             result=agent.result,
                             call_index=agent.call_index,
                             subagents=[
@@ -466,8 +494,6 @@ class WorkflowStateManager:
                     evidence.model_copy(deep=True)
                     for evidence in self._project.reviewer_evidence
                 ],
-                orchestrator_selection_state=copy.deepcopy(self._project.orchestrator_selection_state),
-                review_selection_state=copy.deepcopy(self._project.review_selection_state),
             )
 
     @property

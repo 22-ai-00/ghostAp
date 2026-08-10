@@ -9,7 +9,7 @@ with review-driven iteration cycles.
 # spec_engine → engine_base, never the reverse).
 # ---------------------------------------------------------------------------
 from ..engine_base import ReviewPerspective as _ReviewPerspective
-from .constants import SPEC_UI_TEXT as _SPEC_UI_TEXT
+from ..utils.ui_text import SPEC_UI_TEXT as _SPEC_UI_TEXT
 from .engine import SpecEngine, SpecEngineCallbacks
 from .manager import SpecEngineManager
 from .models import (
@@ -21,15 +21,6 @@ from .models import (
     SpecTaskStatus,
 )
 from .reporter import SpecReporter
-from .task_persistence import (
-    SPEC_TASKS_DIR,
-    SpecTaskState,
-    delete_task_state,
-    generate_task_id,
-    list_pending_tasks,
-    load_task_state,
-    save_task_state,
-)
 from .tracker import PhaseTracker
 
 _ReviewPerspective.register_display_names(
@@ -53,12 +44,4 @@ __all__ = [
     "PhaseTracker",
     # Reporter
     "SpecReporter",
-    # Task Persistence
-    "SPEC_TASKS_DIR",
-    "SpecTaskState",
-    "generate_task_id",
-    "save_task_state",
-    "load_task_state",
-    "delete_task_state",
-    "list_pending_tasks",
 ]

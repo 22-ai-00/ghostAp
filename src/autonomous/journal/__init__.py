@@ -22,12 +22,12 @@ from .frame import (
     JournalIntegrityError,
     TransactionFrame,
 )
-from .journal import JournalEntry, JournalWriter
 from .writer import (
     AnchorMismatchError,
     CommitResult,
     CommitState,
     JournalClosedError,
+    JournalWriter,
     WriterLockError,
 )
 
@@ -51,7 +51,6 @@ __all__ = [
     "IncompleteFrameError",
     "InvalidEncryptionKeyError",
     "JournalClosedError",
-    "JournalEntry",
     "JournalEvent",
     "JournalIntegrityError",
     "JournalWriter",

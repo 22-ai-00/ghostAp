@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import json
-import os
 import types
 
 from src.spec_engine.review_artifacts import (
     ReviewArtifacts,
     collect_review_artifacts,
-    persist_review_artifacts,
 )
 
 
@@ -74,20 +71,8 @@ def test_roundtrip():
     assert b.build_output == "b"
 
 
-def test_persist(tmp_path):
-    a = ReviewArtifacts(cycle_number=7, requirement="r", cwd=str(tmp_path))
-    path = persist_review_artifacts(a, str(tmp_path))
-    assert path is not None
-    assert os.path.exists(path)
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    assert data["cycle_number"] == 7
 
 
-def test_persist_bad_dir(monkeypatch):
-    a = ReviewArtifacts(cycle_number=1, requirement="r", cwd="/")
-    path = persist_review_artifacts(a, "/nonexistent_fs_location/that/should/fail/deeply/\x00")
-    assert path is None
 
 
 def test_git_diff_nongit(tmp_path):

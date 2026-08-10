@@ -23,7 +23,6 @@ class FakeSession:
         self.last_active: float = time.time()
         self.message_count: int = 0
         self.last_query: str = ""
-        self.is_resumed: bool = False
         self._agent_type = agent_type
         self._cwd = cwd
 
@@ -35,9 +34,6 @@ class FakeSession:
         self.session_id = "s_fake"
         return self.session_id
 
-    def load_session(self, session_id: str, timeout: float = 60) -> None:
-        del timeout
-        self.session_id = session_id
 
     def load_local_history(self, *a, **kw):
         return []

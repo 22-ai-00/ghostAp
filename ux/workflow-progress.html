@@ -3,145 +3,648 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Workflow 进度卡片 Preview</title>
+  <title>Workflow 自动执行进度卡 Preview</title>
   <style>
+    :root {
+      color-scheme: light;
+      --page: #eef2f6;
+      --card: #ffffff;
+      --surface: #f7f8fa;
+      --surface-blue: #f1f5ff;
+      --surface-green: #eef9f2;
+      --surface-amber: #fff8ea;
+      --text: #1f2329;
+      --muted: #646a73;
+      --quiet: #8f959e;
+      --line: #dfe3e8;
+      --line-soft: #edf0f3;
+      --blue: #245bdb;
+      --blue-deep: #173f9f;
+      --green: #18864b;
+      --amber: #a65d05;
+      --red: #c9352b;
+      --shadow: 0 10px 30px rgba(31, 35, 41, 0.08);
+    }
+
     * { box-sizing: border-box; }
+
     body {
-      margin: 0; min-height: 100vh;
-      background: #f5f6f7; color: #1f2329;
-      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-      display: flex; justify-content: center; padding: 40px 20px;
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 12% 0%, rgba(36, 91, 219, 0.10), transparent 28rem),
+        linear-gradient(180deg, #f7f9fc 0, var(--page) 28rem);
+      font-family: "Noto Sans SC", "Source Han Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
     }
+
+    button { font: inherit; }
+
+    .page {
+      width: min(1160px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 38px 0 64px;
+    }
+
+    .page-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 28px;
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      color: var(--blue-deep);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(25px, 4vw, 36px);
+      line-height: 1.18;
+      letter-spacing: -0.025em;
+    }
+
+    .page-note {
+      max-width: 510px;
+      margin: 0;
+      color: var(--muted);
+      text-align: right;
+    }
+
+    .preview-section { margin-top: 32px; }
+
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 10px;
+    }
+
+    .section-head h2 { margin: 0; font-size: 16px; }
+    .section-head p { margin: 0; color: var(--quiet); font-size: 12px; }
+
     .card {
-      width: min(100%, 440px);
-      background: #fff; border-radius: 8px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.08); overflow: hidden;
+      overflow: hidden;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      animation: card-in 360ms ease-out both;
     }
-    .header {
-      background: #3370ff; color: #fff; padding: 14px 20px;
-      font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px;
+
+    @keyframes card-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
     }
-    .header .badge {
-      margin-left: auto; background: rgba(255,255,255,0.2); padding: 2px 8px;
-      border-radius: 10px; font-size: 11px; font-weight: 400;
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      min-height: 52px;
+      padding: 11px 16px;
+      color: #fff;
+      background: var(--blue-deep);
     }
-    .body { padding: 16px 20px; }
-    .budget-bar-wrap { margin-bottom: 14px; }
-    .budget-label { display: flex; justify-content: space-between; font-size: 12px; color: #646a73; margin-bottom: 4px; }
-    .budget-bar { height: 6px; background: #e8eaed; border-radius: 3px; overflow: hidden; }
-    .budget-bar-fill { height: 100%; background: #3370ff; border-radius: 3px; transition: width .3s; }
-    .budget-bar-fill.warn { background: #ff9800; }
-    .budget-bar-fill.danger { background: #f54a45; }
-    .phase { margin-bottom: 12px; }
-    .phase-header {
-      display: flex; align-items: center; gap: 8px; margin-bottom: 6px;
-      font-size: 13px; font-weight: 500;
+
+    .card-header.complete { background: #17683d; }
+    .card-header.frozen { color: var(--text); background: #e9edf2; }
+
+    .title-wrap {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 9px;
     }
-    .phase-icon { font-size: 14px; }
-    .phase-status { margin-left: auto; font-size: 11px; color: #8f959e; }
-    .agent-row {
-      display: flex; align-items: center; gap: 8px; padding: 5px 10px;
-      margin: 3px 0; border-radius: 4px; font-size: 12px; background: #f9fafb;
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.18);
     }
-    .agent-row .dot {
-      width: 8px; height: 8px; border-radius: 50%;
+
+    .running .status-dot { animation: pulse 1.7s ease-in-out infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.72); }
     }
-    .dot-done { background: #34c724; }
-    .dot-running { background: #3370ff; animation: blink 1.2s infinite; }
-    .dot-pending { background: #d0d5dd; }
-    .dot-failed { background: #f54a45; }
-    @keyframes blink { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
-    .agent-row .tool { color: #8f959e; margin-left: auto; }
-    .agent-row .dur { color: #8f959e; font-size: 11px; }
+
+    .header-title {
+      overflow: hidden;
+      font-size: 15px;
+      font-weight: 750;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .header-meta {
+      flex: 0 0 auto;
+      padding: 2px 8px;
+      border: 1px solid rgba(255, 255, 255, 0.30);
+      border-radius: 999px;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .frozen .header-meta { border-color: #b8bec7; }
+    .card-body { padding: 16px; }
+
+    .auto-strip {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 13px;
+      padding: 8px 10px;
+      color: #29416f;
+      background: var(--surface-blue);
+      border: 1px solid #cbd8f7;
+      border-radius: 6px;
+      font-size: 11px;
+    }
+
+    .auto-strip strong { color: var(--blue-deep); }
+    .auto-mark { font-weight: 850; color: var(--blue); }
+
+    .task-summary {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: start;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    .label {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--quiet);
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: 0.055em;
+      text-transform: uppercase;
+    }
+
+    .task-text { margin: 0; font-size: 14px; font-weight: 700; }
+    .task-detail { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+
     .metrics {
-      display: flex; gap: 16px; padding-top: 10px; border-top: 1px solid #eee;
-      margin-top: 12px; font-size: 12px; color: #646a73;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(68px, 1fr));
+      gap: 6px;
     }
-    .metrics span { display: flex; align-items: center; gap: 4px; }
+
+    .metric {
+      min-width: 72px;
+      padding: 7px 9px;
+      background: var(--surface);
+      border-radius: 6px;
+      text-align: center;
+    }
+
+    .metric strong { display: block; font-size: 13px; }
+    .metric span { color: var(--quiet); font-size: 10px; }
+
+    .block { margin-top: 15px; }
+
+    .block-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+
+    .block-head h3 { margin: 0; font-size: 13px; }
+    .block-head span { color: var(--quiet); font-size: 10px; }
+
+    .phase-track {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .phase {
+      position: relative;
+      min-width: 0;
+      padding: 9px 10px 10px;
+      background: var(--surface);
+      border: 1px solid var(--line-soft);
+      border-radius: 7px;
+    }
+
+    .phase.done { background: var(--surface-green); border-color: #c8e7d3; }
+    .phase.active { background: var(--surface-blue); border-color: #adc5fa; }
+
+    .phase-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      color: var(--quiet);
+      font-size: 9px;
+      font-weight: 750;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .phase-state { color: var(--muted); }
+    .phase.done .phase-state { color: var(--green); }
+    .phase.active .phase-state { color: var(--blue); }
+    .phase strong { display: block; margin-top: 4px; font-size: 11px; }
+    .phase p { overflow: hidden; margin: 2px 0 0; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
+    .agent-table {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+    }
+
+    .agent-row {
+      display: grid;
+      grid-template-columns: minmax(150px, 0.85fr) 84px 76px minmax(180px, 1.3fr);
+      gap: 10px;
+      align-items: center;
+      min-height: 48px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    .agent-row:last-child { border-bottom: 0; }
+    .agent-row.header { min-height: 30px; padding-block: 5px; color: var(--quiet); background: var(--surface); font-size: 9px; font-weight: 750; letter-spacing: 0.04em; text-transform: uppercase; }
+    .agent-task { min-width: 0; }
+    .agent-task strong { display: block; overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-task span { display: block; overflow: hidden; color: var(--quiet); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+
+    .status {
+      display: inline-flex;
+      width: fit-content;
+      align-items: center;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .status::before { width: 7px; height: 7px; content: ""; border-radius: 50%; background: #b8bec7; }
+    .status.done { color: var(--green); }
+    .status.done::before { background: var(--green); }
+    .status.running { color: var(--blue); }
+    .status.running::before { background: var(--blue); animation: pulse 1.7s ease-in-out infinite; }
+    .status.waiting { color: var(--amber); }
+    .status.waiting::before { background: #d89532; }
+
+    .attempt { color: #4c5260; font: 650 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+    .operation {
+      overflow: hidden;
+      color: #3b4048;
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .operation code {
+      padding: 1px 4px;
+      color: #29416f;
+      background: #eef2f9;
+      border-radius: 3px;
+      font: 600 9px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line-soft);
+    }
+
+    .actions-note { color: var(--quiet); font-size: 10px; }
+
+    .stop-button {
+      min-height: 32px;
+      padding: 5px 13px;
+      color: var(--red);
+      background: #fff;
+      border: 1px solid #e3aaa5;
+      border-radius: 5px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .continuation-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      align-items: start;
+    }
+
+    .continuation-card:nth-child(2) { animation-delay: 80ms; }
+
+    .continuation-note {
+      margin-bottom: 11px;
+      padding: 8px 10px;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      font-size: 10px;
+    }
+
+    .continuation-note strong { color: var(--text); }
+
+    .result-summary {
+      margin: 0 0 12px;
+      padding: 10px 11px;
+      background: var(--surface-green);
+      border-left: 3px solid var(--green);
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .result-section {
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr);
+      gap: 9px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    .result-section:last-of-type { border-bottom: 0; }
+    .result-index { color: var(--quiet); font: 750 10px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .result-copy h3 { margin: 0 0 3px; font-size: 11px; }
+    .result-copy p { margin: 0; color: #434952; font-size: 10px; }
+    .result-copy p + p { margin-top: 5px; }
+
+    .evidence-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 7px;
+      margin-top: 11px;
+    }
+
+    .evidence {
+      padding: 8px 9px;
+      background: var(--surface);
+      border-radius: 6px;
+    }
+
+    .evidence strong { display: block; font-size: 10px; }
+    .evidence span { color: var(--muted); font-size: 9px; }
+
+    .result-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 11px;
+      padding-top: 10px;
+      color: var(--quiet);
+      border-top: 1px solid var(--line-soft);
+      font-size: 9px;
+    }
+
+    .result-footer strong { color: var(--muted); }
+
+    @media (max-width: 860px) {
+      .page-head { align-items: start; flex-direction: column; }
+      .page-note { text-align: left; }
+      .continuation-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 680px) {
+      .page { width: min(100% - 20px, 560px); padding-top: 22px; }
+      .section-head { align-items: start; flex-direction: column; gap: 3px; }
+      .task-summary { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: repeat(3, 1fr); }
+      .phase-track { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .agent-row { grid-template-columns: minmax(0, 1fr) 70px; gap: 5px 10px; }
+      .agent-row.header { display: none; }
+      .attempt { grid-column: 2; grid-row: 2; text-align: right; }
+      .operation { grid-column: 1; grid-row: 2; }
+      .actions { align-items: end; }
+    }
   </style>
 </head>
 <body>
-  <div class="card">
-    <div class="header">
-      <span>⚡ Workflow 执行中</span>
-      <span class="badge">2/3 阶段</span>
-    </div>
-    <div class="body">
-      <!-- Budget bar -->
-      <div class="budget-bar-wrap">
-        <div class="budget-label">
-          <span>Token 预算</span>
-          <span>320K / 1M (32%)</span>
-        </div>
-        <div class="budget-bar">
-          <div class="budget-bar-fill" style="width: 32%"></div>
-        </div>
+  <main class="page">
+    <header class="page-head">
+      <div>
+        <p class="eyebrow">GhostAP / Workflow</p>
+        <h1>全自动执行进度卡</h1>
+      </div>
+      <p class="page-note">从任务进入到脚本生成、调度、验证和汇总全部自动推进。运行中只提供停止操作，最终结果按容量完整分页。</p>
+    </header>
+
+    <section class="preview-section" aria-labelledby="running-title">
+      <div class="section-head">
+        <h2 id="running-title">1. 自动运行态</h2>
+        <p>任务、Phase 与子 Agent 调度在一张主卡内实时更新</p>
       </div>
 
-      <!-- Phase 1: Done -->
-      <div class="phase">
-        <div class="phase-header">
-          <span class="phase-icon">✅</span>
-          <span>Phase 1: 代码分析</span>
-          <span class="phase-status">45s</span>
+      <article class="card running" aria-label="Workflow 自动执行进度卡">
+        <header class="card-header">
+          <div class="title-wrap">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="header-title">Workflow 自动执行中</span>
+          </div>
+          <span class="header-meta">Phase 3 / 4</span>
+        </header>
+
+        <div class="card-body">
+          <div class="auto-strip">
+            <span class="auto-mark">AUTO</span>
+            <span><strong>脚本已自动生成并通过安全校验。</strong> 后续 Phase 将按依赖连续执行，无需人工确认。</span>
+          </div>
+
+          <div class="task-summary">
+            <div>
+              <span class="label">任务摘要</span>
+              <p class="task-text">修复 OAuth state 并发重放问题，补齐兼容迁移与回归证据</p>
+              <p class="task-detail">目标：原子消费 state，保持存量 token 可读取，并由独立 Reviewer 验证。</p>
+            </div>
+            <div class="metrics" aria-label="执行指标">
+              <div class="metric"><strong>7 / 11</strong><span>任务完成</span></div>
+              <div class="metric"><strong>06:42</strong><span>已运行</span></div>
+              <div class="metric"><strong>2</strong><span>活动 Agent</span></div>
+            </div>
+          </div>
+
+          <section class="block" aria-labelledby="phase-title">
+            <div class="block-head">
+              <h3 id="phase-title">Phase 概览</h3>
+              <span>当前：验证与对抗复核</span>
+            </div>
+            <div class="phase-track">
+              <article class="phase done">
+                <div class="phase-top"><span>Phase 1</span><span class="phase-state">完成</span></div>
+                <strong>分析</strong>
+                <p>边界与风险已定位</p>
+              </article>
+              <article class="phase done">
+                <div class="phase-top"><span>Phase 2</span><span class="phase-state">完成</span></div>
+                <strong>实现</strong>
+                <p>原子写入已落地</p>
+              </article>
+              <article class="phase active">
+                <div class="phase-top"><span>Phase 3</span><span class="phase-state">执行中</span></div>
+                <strong>验证</strong>
+                <p>回归与并发复核</p>
+              </article>
+              <article class="phase">
+                <div class="phase-top"><span>Phase 4</span><span class="phase-state">等待</span></div>
+                <strong>汇总</strong>
+                <p>生成完整交付报告</p>
+              </article>
+            </div>
+          </section>
+
+          <section class="block" aria-labelledby="agents-title">
+            <div class="block-head">
+              <h3 id="agents-title">子 Agent 调度</h3>
+              <span>4 个任务 · 当前操作每项仅保留一条</span>
+            </div>
+            <div class="agent-table" role="table" aria-label="子 Agent 调度列表">
+              <div class="agent-row header" role="row">
+                <span>任务 / Agent</span><span>状态</span><span>Attempt</span><span>当前操作</span>
+              </div>
+              <div class="agent-row" role="row">
+                <div class="agent-task"><strong>定位认证竞态</strong><span>race-audit · Codex</span></div>
+                <span class="status done">已完成</span>
+                <span class="attempt">1 / 2</span>
+                <span class="operation">已返回 12 个风险点与调用边界</span>
+              </div>
+              <div class="agent-row" role="row">
+                <div class="agent-task"><strong>实现原子消费</strong><span>state-fix · Claude</span></div>
+                <span class="status done">已完成</span>
+                <span class="attempt">2 / 3</span>
+                <span class="operation">已修改 <code>auth/state_store.py</code></span>
+              </div>
+              <div class="agent-row" role="row">
+                <div class="agent-task"><strong>并发回归测试</strong><span>regression · Traex</span></div>
+                <span class="status running">执行中</span>
+                <span class="attempt">1 / 2</span>
+                <span class="operation">运行 32 路并发 state 消费测试</span>
+              </div>
+              <div class="agent-row" role="row">
+                <div class="agent-task"><strong>独立安全复核</strong><span>security-review · Gemini</span></div>
+                <span class="status waiting">等待中</span>
+                <span class="attempt">0 / 2</span>
+                <span class="operation">等待 regression 提交验证证据</span>
+              </div>
+            </div>
+          </section>
+
+          <div class="actions">
+            <span class="actions-note">自动续做已开启 · 无确认或继续按钮</span>
+            <button class="stop-button" type="button">停止 Workflow</button>
+          </div>
         </div>
-        <div class="agent-row">
-          <span class="dot dot-done"></span>
-          <span>analyze_structure</span>
-          <span class="tool">coco</span>
-          <span class="dur">12s</span>
-        </div>
-        <div class="agent-row">
-          <span class="dot dot-done"></span>
-          <span>find_patterns</span>
-          <span class="tool">claude</span>
-          <span class="dur">33s</span>
-        </div>
+      </article>
+    </section>
+
+    <section class="preview-section" aria-labelledby="result-title">
+      <div class="section-head">
+        <h2 id="result-title">2. 最终完整结果分页 / 续接</h2>
+        <p>先发布续接页，再冻结前页；正文连续且不做摘要替换</p>
       </div>
 
-      <!-- Phase 2: Running -->
-      <div class="phase">
-        <div class="phase-header">
-          <span class="phase-icon">🔄</span>
-          <span>Phase 2: 实现</span>
-          <span class="phase-status">running...</span>
-        </div>
-        <div class="agent-row">
-          <span class="dot dot-done"></span>
-          <span>write_auth_module</span>
-          <span class="tool">coco</span>
-          <span class="dur">28s</span>
-        </div>
-        <div class="agent-row">
-          <span class="dot dot-running"></span>
-          <span>write_oauth_handler</span>
-          <span class="tool">claude</span>
-          <span class="dur">15s...</span>
-        </div>
-        <div class="agent-row">
-          <span class="dot dot-pending"></span>
-          <span>integrate_routes</span>
-          <span class="tool">coco</span>
-          <span class="dur">—</span>
-        </div>
-      </div>
+      <div class="continuation-grid">
+        <article class="card continuation-card" aria-label="Workflow 最终结果第一页">
+          <header class="card-header frozen">
+            <div class="title-wrap">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="header-title">Workflow 完整结果</span>
+            </div>
+            <span class="header-meta">第 1 / 2 页 · 已冻结</span>
+          </header>
+          <div class="card-body">
+            <div class="continuation-note"><strong>正文 #001 起始。</strong> 本页冻结后不再修改，下一段从第 2 页 #003 连续展示。</div>
+            <p class="result-summary">OAuth state 已改为单事务校验与消费，兼容迁移保持原有接口，全部验证通过。</p>
 
-      <!-- Phase 3: Pending -->
-      <div class="phase">
-        <div class="phase-header">
-          <span class="phase-icon">⏳</span>
-          <span>Phase 3: 测试</span>
-          <span class="phase-status">pending</span>
-        </div>
-      </div>
+            <section class="result-section">
+              <span class="result-index">#001</span>
+              <div class="result-copy">
+                <h3>根因与决策</h3>
+                <p>旧实现将有效性查询和消费标记拆成两次存储操作，并发请求可能同时读到有效状态。修复采用带版本条件的原子消费，不再依赖进程内锁。</p>
+              </div>
+            </section>
+            <section class="result-section">
+              <span class="result-index">#002</span>
+              <div class="result-copy">
+                <h3>实现内容</h3>
+                <p>统一 state 写入入口，消费成功后记录稳定审计 ID；重复、过期和租户不匹配请求都返回同一安全失败边界。</p>
+                <p>存量 token 仍允许一次迁移读取，迁移成功后立即写入新格式，不改变公开响应结构。</p>
+              </div>
+            </section>
 
-      <!-- Metrics -->
-      <div class="metrics">
-        <span>🤖 Agent: 4/6</span>
-        <span>⏱️ 1m23s</span>
-        <span>📊 320K Token</span>
+            <footer class="result-footer">
+              <span>正文范围 #001 - #002</span>
+              <strong>下一页从 #003 续接</strong>
+            </footer>
+          </div>
+        </article>
+
+        <article class="card continuation-card" aria-label="Workflow 最终结果第二页">
+          <header class="card-header complete">
+            <div class="title-wrap">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span class="header-title">Workflow 完成 · 结果续接</span>
+            </div>
+            <span class="header-meta">第 2 / 2 页 · 终页</span>
+          </header>
+          <div class="card-body">
+            <div class="continuation-note"><strong>承接第 1 页 #002。</strong> 结果编号、验证证据和交付物保持完整，不折叠为“详见日志”。</div>
+
+            <section class="result-section">
+              <span class="result-index">#003</span>
+              <div class="result-copy">
+                <h3>验证结果</h3>
+                <p>单元与集成回归 184 项通过；32 路并发消费只产生 1 次成功；进程重启后重复请求仍被拒绝。独立安全 Reviewer 未发现阻塞问题。</p>
+              </div>
+            </section>
+            <section class="result-section">
+              <span class="result-index">#004</span>
+              <div class="result-copy">
+                <h3>交付与后续</h3>
+                <p>交付 3 个源码变更、2 个测试文件和 1 份迁移说明。发布后观察迁移命中率与重复消费拒绝计数，达到稳定窗口后再移除旧格式读取。</p>
+              </div>
+            </section>
+
+            <div class="evidence-grid" aria-label="最终证据摘要">
+              <div class="evidence"><strong>测试</strong><span>184 passed · 并发 32 / 32</span></div>
+              <div class="evidence"><strong>评审</strong><span>security-review · 通过</span></div>
+              <div class="evidence"><strong>修改</strong><span>3 source · 2 tests</span></div>
+              <div class="evidence"><strong>耗时</strong><span>总计 11:28 · 已冻结</span></div>
+            </div>
+
+            <footer class="result-footer">
+              <span>正文范围 #003 - #004 · 全文结束</span>
+              <strong>完整结果共 2 页，均可回读</strong>
+            </footer>
+          </div>
+        </article>
       </div>
-    </div>
-  </div>
+    </section>
+  </main>
 </body>
 </html>

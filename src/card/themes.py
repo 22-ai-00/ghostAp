@@ -114,7 +114,6 @@ TERMINAL_TEMPLATES: dict[str, str] = {
     "cancelled": "grey",
     "archived": "grey",
     "paused": "orange",
-    "awaiting_approval": "indigo",
     "blocked": "red",
     "denied": "red",
     "continued": "green",

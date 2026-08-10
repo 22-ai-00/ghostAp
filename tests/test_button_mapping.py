@@ -36,10 +36,10 @@ class TestResolveActionIdFallback:
         from src.card.render.buttons import _resolve_action_id
         from src.card.state.models import ButtonSpec
 
-        spec = ButtonSpec(text="停止", action_id=ButtonIntent.DEEP_STOP.value)
+        spec = ButtonSpec(text="停止", action_id=ButtonIntent.SPEC_STOP.value)
         resolved = _resolve_action_id(spec)
         assert resolved is not None
-        assert resolved == INTENT_TO_ACTION_ID[ButtonIntent.DEEP_STOP.value]
+        assert resolved == INTENT_TO_ACTION_ID[ButtonIntent.SPEC_STOP.value]
 
     def test_unknown_intent_returns_none(self):
         """Unknown ButtonIntent (starts with 'intent.') returns None."""

@@ -553,13 +553,6 @@ class ACPSession:
             return True
         return self._thread_status_known and self._thread_status == "active"
 
-    def _goal_requires_prompt_wait(self) -> tuple[bool, int]:
-        with self._handler_lock:
-            return (
-                self._goal_requires_prompt_wait_locked(),
-                self._lifecycle_revision,
-            )
-
     async def has_active_goal(self) -> bool:
         with self._handler_lock:
             if self._uses_official_codex_acp() and not self._goal_known:
@@ -737,10 +730,6 @@ class ACPSession:
         self._tool_filter = filter_fn
         if self._client is not None:
             self._client.set_tool_filter(filter_fn)
-
-    def get_tool_filter(self) -> Optional[Callable[[str, dict | None], bool]]:
-        """Return the currently installed ACP callback tool filter."""
-        return self._tool_filter
 
     async def load_session(self, session_id: str) -> None:
         """Load an existing session by ID (for resume)."""

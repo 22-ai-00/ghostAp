@@ -4,23 +4,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 
-class TestSettingsReset:
-    def test_reset_produces_new_instance(self):
-        from src.config import _reset_settings_for_testing, get_settings
-
-        with patch("src.config.Settings") as MockSettings:
-            MockSettings.return_value = MagicMock(name="settings_a")
-            a = get_settings()
-            # Same instance on repeated call
-            assert get_settings() is a
-
-            _reset_settings_for_testing()
-
-            MockSettings.return_value = MagicMock(name="settings_b")
-            b = get_settings()
-            assert b is not a
-
-
 class TestCocoModelManagerReset:
     def test_reset_produces_new_instance(self):
         from src.coco_model.manager import (
@@ -37,25 +20,6 @@ class TestCocoModelManagerReset:
 
             MockCls.return_value = MagicMock(name="mgr_b")
             b = get_coco_model_manager()
-            assert b is not a
-
-
-class TestThreadManagerReset:
-    def test_reset_produces_new_instance(self):
-        from src.thread.manager import (
-            _reset_thread_manager_for_testing,
-            get_thread_manager,
-        )
-
-        with patch("src.thread.manager.ThreadContextManager") as MockCls:
-            MockCls.return_value = MagicMock(name="mgr_a")
-            a = get_thread_manager()
-            assert get_thread_manager() is a
-
-            _reset_thread_manager_for_testing()
-
-            MockCls.return_value = MagicMock(name="mgr_b")
-            b = get_thread_manager()
             assert b is not a
 
 

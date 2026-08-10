@@ -5,11 +5,9 @@ from __future__ import annotations
 import hashlib
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from src.autonomous.domain import EmployeeState
 from src.autonomous.workspace import (
     EmployeeWorkspaceProjector,
     EmployeeWorkspaceSource,
@@ -114,41 +112,3 @@ def test_projector_rejects_symlinked_employee_directory(tmp_path: Path) -> None:
         EmployeeWorkspaceProjector(agents).project(_source())
 
     assert not (outside / "workspace").exists()
-
-
-def test_rebuild_all_does_not_recreate_archived_employee_workspace(tmp_path: Path) -> None:
-    def employee(agent_id: str, name: str, state: EmployeeState):
-        return SimpleNamespace(
-            tenant_key="tenant_1",
-            agent_id=agent_id,
-            name=name,
-            role="coder",
-            persona="careful",
-            personality_traits=(),
-            capabilities=("file_read",),
-            permissions=("file_read",),
-            tool="codex",
-            model="gpt-5",
-            aggregate_version=1,
-            state=state,
-        )
-
-    state = SimpleNamespace(
-        employees={
-            "agt_active": employee("agt_active", "Active", EmployeeState.ACTIVE),
-            "agt_archived": employee(
-                "agt_archived", "Archived", EmployeeState.ARCHIVED
-            ),
-        },
-        cursor_sequence=3,
-        cursor_hash="b" * 64,
-    )
-    root = tmp_path / "agents"
-    snapshots = EmployeeWorkspaceProjector(
-        root,
-        state_provider=lambda: state,
-    ).rebuild_all()
-
-    assert [snapshot.agent_id for snapshot in snapshots] == ["agt_active"]
-    assert (root / "agt_active/workspace/AGENTS.md").is_file()
-    assert not (root / "agt_archived").exists()

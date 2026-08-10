@@ -17,7 +17,7 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -52,16 +52,11 @@ _INTENT_KEYS = {
     "receiving_bot_ref",
     "remote_chat_id",
 }
-_LEGACY_INTENT_KEYS = _INTENT_KEYS - {
+_INTENT_RETRY_KEYS = _INTENT_KEYS - {
     "create_dispatched_at",
     "create_state",
-    "operation_uuid",
+    "created_at",
     "remote_chat_id",
-}
-_V1_INTENT_KEYS = _INTENT_KEYS - {
-    "create_dispatched_at",
-    "create_state",
-    "operation_uuid",
 }
 _ENTRY_KEYS = {"grant", "record"}
 _RECORD_KEYS = {
@@ -88,7 +83,6 @@ _GRANT_KEYS = {
 }
 _REVOKE_KEYS = {"requested_at"}
 _MIGRATION_KEYS = {"project_id", "reported", "status"}
-_LEGACY_MIGRATION_KEYS = _MIGRATION_KEYS - {"reported"}
 
 
 class ManagedGroupRegistryError(RuntimeError):
@@ -113,6 +107,12 @@ class ManagedGroupConflictError(ManagedGroupRegistryError):
 
 class ManagedGroupValidationError(ManagedGroupRegistryError):
     """External migration/adoption validation did not establish provenance."""
+
+
+class _AtomicReplaceError(OSError):
+    def __init__(self, cause: OSError, *, committed: bool) -> None:
+        super().__init__(str(cause))
+        self.committed = committed
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,58 +187,45 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _record_to_dict(record: ManagedGroupRecord) -> dict[str, Any]:
-    return {
-        "canonical_root_ref": record.canonical_root_ref,
-        "chat_id": record.chat_id,
-        "created_at": record.created_at.isoformat(),
-        "origin": record.origin.value,
-        "owner_id": record.owner_id,
-        "project_grant_id": record.project_grant_id,
-        "project_id": record.project_id,
-        "receiving_bot_ref": record.receiving_bot_ref,
-        "revision": record.revision,
-        "status": record.status.value,
-    }
+    data = asdict(record)
+    data.update(
+        created_at=record.created_at.isoformat(),
+        origin=record.origin.value,
+        status=record.status.value,
+    )
+    return data
 
 
 def _grant_to_dict(grant: ProjectGrant) -> dict[str, Any]:
-    return {
-        "backend_binding_ids": list(grant.backend_binding_ids),
-        "canonical_root_ref": grant.canonical_root_ref,
-        "connected_target_refs": list(grant.connected_target_refs),
-        "grant_id": grant.grant_id,
-        "managed_group_id": grant.managed_group_id,
-        "owner_id": grant.owner_id,
-        "project_id": grant.project_id,
-        "revision": grant.revision,
-    }
+    data = asdict(grant)
+    data["backend_binding_ids"] = list(grant.backend_binding_ids)
+    data["connected_target_refs"] = list(grant.connected_target_refs)
+    return data
 
 
 def _record_from_dict(value: Any) -> ManagedGroupRecord:
-    data = _require_dict(value, _RECORD_KEYS, "managed group record")
+    data = dict(_require_dict(value, _RECORD_KEYS, "managed group record"))
     try:
-        status = ManagedGroupStatus(_require_string(data["status"], "record status"))
-        origin = ManagedGroupOrigin(_require_string(data["origin"], "record origin"))
+        data["status"] = ManagedGroupStatus(
+            _require_string(data["status"], "record status")
+        )
+        data["origin"] = ManagedGroupOrigin(
+            _require_string(data["origin"], "record origin")
+        )
     except ValueError as exc:
         raise RegistryCorruptionError("invalid managed group enum") from exc
-    return ManagedGroupRecord(
-        chat_id=_require_string(data["chat_id"], "record chat_id"),
-        revision=_require_revision(data["revision"], "record revision"),
-        status=status,
-        owner_id=_require_string(data["owner_id"], "record owner_id"),
-        project_id=_require_string(data["project_id"], "record project_id"),
-        canonical_root_ref=_require_string(
-            data["canonical_root_ref"], "record canonical_root_ref"
-        ),
-        origin=origin,
-        receiving_bot_ref=_require_string(
-            data["receiving_bot_ref"], "record receiving_bot_ref"
-        ),
-        project_grant_id=_require_string(
-            data["project_grant_id"], "record project_grant_id"
-        ),
-        created_at=_parse_datetime(data["created_at"], "record created_at"),
-    )
+    for field in (
+        "canonical_root_ref",
+        "chat_id",
+        "owner_id",
+        "project_grant_id",
+        "project_id",
+        "receiving_bot_ref",
+    ):
+        data[field] = _require_string(data[field], f"record {field}")
+    data["revision"] = _require_revision(data["revision"], "record revision")
+    data["created_at"] = _parse_datetime(data["created_at"], "record created_at")
+    return ManagedGroupRecord(**data)
 
 
 def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
@@ -253,25 +240,19 @@ def _string_tuple(value: Any, label: str) -> tuple[str, ...]:
 
 
 def _grant_from_dict(value: Any) -> ProjectGrant:
-    data = _require_dict(value, _GRANT_KEYS, "project grant")
-    return ProjectGrant(
-        grant_id=_require_string(data["grant_id"], "grant grant_id"),
-        revision=_require_revision(data["revision"], "grant revision"),
-        owner_id=_require_string(data["owner_id"], "grant owner_id"),
-        managed_group_id=_require_string(
-            data["managed_group_id"], "grant managed_group_id"
-        ),
-        project_id=_require_string(data["project_id"], "grant project_id"),
-        canonical_root_ref=_require_string(
-            data["canonical_root_ref"], "grant canonical_root_ref"
-        ),
-        backend_binding_ids=_string_tuple(
-            data["backend_binding_ids"], "grant backend_binding_ids"
-        ),
-        connected_target_refs=_string_tuple(
-            data["connected_target_refs"], "grant connected_target_refs"
-        ),
-    )
+    data = dict(_require_dict(value, _GRANT_KEYS, "project grant"))
+    for field in (
+        "canonical_root_ref",
+        "grant_id",
+        "managed_group_id",
+        "owner_id",
+        "project_id",
+    ):
+        data[field] = _require_string(data[field], f"grant {field}")
+    data["revision"] = _require_revision(data["revision"], "grant revision")
+    for field in ("backend_binding_ids", "connected_target_refs"):
+        data[field] = _string_tuple(data[field], f"grant {field}")
+    return ProjectGrant(**data)
 
 
 class ManagedGroupRegistry:
@@ -302,10 +283,6 @@ class ManagedGroupRegistry:
             pass
 
     @property
-    def storage_path(self) -> Path:
-        return self._path
-
-    @property
     def revision(self) -> int:
         with self._disk_transaction():
             return self._revision
@@ -334,26 +311,23 @@ class ManagedGroupRegistry:
         with self._disk_transaction():
             return self._records.get(chat_id)
 
+    def _active_pair_locked(
+        self, chat_id: str
+    ) -> tuple[ManagedGroupRecord | None, ProjectGrant | None]:
+        if self._commit_uncertain or chat_id in self._revokes:
+            return None, None
+        record = self._records.get(chat_id)
+        if record is None or record.status is not ManagedGroupStatus.ACTIVE:
+            return None, None
+        return record, self._grants.get(record.project_grant_id)
+
     def active_record(self, chat_id: str) -> ManagedGroupRecord | None:
         with self._disk_transaction():
-            if self._commit_uncertain or chat_id in self._revokes:
-                return None
-            record = self._records.get(chat_id)
-            if record is None or record.status is not ManagedGroupStatus.ACTIVE:
-                return None
-            return record
+            return self._active_pair_locked(chat_id)[0]
 
     def grant_for_chat(self, chat_id: str) -> ProjectGrant | None:
         with self._disk_transaction():
-            record = self._records.get(chat_id)
-            if (
-                record is None
-                or record.status is not ManagedGroupStatus.ACTIVE
-                or chat_id in self._revokes
-                or self._commit_uncertain
-            ):
-                return None
-            return self._grants.get(record.project_grant_id)
+            return self._active_pair_locked(chat_id)[1]
 
     def trust_snapshot(
         self,
@@ -362,12 +336,7 @@ class ManagedGroupRegistry:
         """Read one current group/grant pair in a single disk transaction."""
 
         with self._disk_transaction():
-            if self._commit_uncertain or chat_id in self._revokes:
-                return None, None
-            record = self._records.get(chat_id)
-            if record is None or record.status is not ManagedGroupStatus.ACTIVE:
-                return None, None
-            return record, self._grants.get(record.project_grant_id)
+            return self._active_pair_locked(chat_id)
 
     def begin_provision(
         self,
@@ -402,35 +371,12 @@ class ManagedGroupRegistry:
         with self._disk_transaction():
             existing = self._intents.get(key)
             if existing is not None:
-                stable_existing = {
-                    name: value
-                    for name, value in existing.items()
-                    if name not in {
-                        "create_dispatched_at",
-                        "create_state",
-                        "created_at",
-                        "remote_chat_id",
-                    }
-                }
-                stable_retry = {
-                    name: value
-                    for name, value in facts.items()
-                    if name not in {
-                        "create_dispatched_at",
-                        "create_state",
-                        "created_at",
-                        "remote_chat_id",
-                    }
-                }
-                if stable_existing != stable_retry:
+                if any(existing[name] != facts[name] for name in _INTENT_RETRY_KEYS):
                     raise ManagedGroupConflictError("provision retry changed facts")
                 return key
+            checkpoint = self._checkpoint_locked()
             self._intents[key] = facts
-            try:
-                self._persist_locked()
-            except BaseException:
-                self._intents.pop(key, None)
-                raise
+            self._commit_locked(checkpoint)
             return key
 
     def provision_chat_id(self, provision_id: str) -> str | None:
@@ -464,12 +410,6 @@ class ManagedGroupRegistry:
                 receiving_bot_ref=intent["receiving_bot_ref"],
             )
 
-    def provision_create_state(self, provision_id: str) -> str | None:
-        key = self._runtime_string(provision_id, "provision_id")
-        with self._disk_transaction():
-            intent = self._intents.get(key)
-            return None if intent is None else intent["create_state"]
-
     def prepare_create_dispatch(
         self,
         provision_id: str,
@@ -487,10 +427,11 @@ class ManagedGroupRegistry:
                 first = datetime.fromisoformat(first_raw)
                 if now - first >= timedelta(hours=10):
                     return False
-            else:
+            checkpoint = self._checkpoint_locked()
+            if not isinstance(first_raw, str):
                 intent["create_dispatched_at"] = now.isoformat()
             intent["create_state"] = "dispatched"
-            self._persist_locked()
+            self._commit_locked(checkpoint)
             return True
 
     def mark_create_outcome_unknown(self, provision_id: str) -> None:
@@ -499,8 +440,9 @@ class ManagedGroupRegistry:
             intent = self._intents.get(key)
             if intent is None or intent.get("remote_chat_id") is not None:
                 raise ManagedGroupConflictError("unknown or bound provision intent")
+            checkpoint = self._checkpoint_locked()
             intent["create_state"] = "outcome_unknown"
-            self._persist_locked()
+            self._commit_locked(checkpoint)
 
     def bind_provision_chat(self, provision_id: str, chat_id: str) -> str:
         key = self._runtime_string(provision_id, "provision_id")
@@ -516,21 +458,19 @@ class ManagedGroupRegistry:
                 raise ManagedGroupConflictError(
                     "provision intent is bound to a different chat"
                 )
+            checkpoint = self._checkpoint_locked()
             intent["remote_chat_id"] = chat
             intent["create_state"] = "bound"
-            self._persist_locked()
+            self._commit_locked(checkpoint)
             return chat
 
     def abandon_provision(self, provision_id: str) -> bool:
         with self._disk_transaction():
-            previous = self._intents.pop(provision_id, None)
-            if previous is None:
+            if provision_id not in self._intents:
                 return False
-            try:
-                self._persist_locked()
-            except BaseException:
-                self._intents[provision_id] = previous
-                raise
+            checkpoint = self._checkpoint_locked()
+            self._intents.pop(provision_id)
+            self._commit_locked(checkpoint)
             return True
 
     def activate(
@@ -598,17 +538,13 @@ class ManagedGroupRegistry:
                 )
                 if actual != expected:
                     raise ManagedGroupConflictError("chat already has a different grant")
-                old_intent = self._intents.pop(provision_id)
-                old_disposition = self._migration_dispositions.pop(chat, None)
-                try:
-                    self._persist_locked()
-                except BaseException:
-                    self._intents[provision_id] = old_intent
-                    if old_disposition is not None:
-                        self._migration_dispositions[chat] = old_disposition
-                    raise
+                checkpoint = self._checkpoint_locked()
+                self._intents.pop(provision_id)
+                self._migration_dispositions.pop(chat, None)
+                self._commit_locked(checkpoint)
                 return existing, grant
 
+            checkpoint = self._checkpoint_locked()
             revision = self._next_revision_locked()
             grant_id = f"managed-group:{chat}"
             record = ManagedGroupRecord(
@@ -633,21 +569,11 @@ class ManagedGroupRegistry:
                 backend_binding_ids=backends,
                 connected_target_refs=targets,
             )
-            old_revision = self._revision
             self._records[chat] = record
             self._grants[grant_id] = grant
-            old_intent = self._intents.pop(provision_id)
-            old_disposition = self._migration_dispositions.pop(chat, None)
-            try:
-                self._persist_locked()
-            except BaseException:
-                self._records.pop(chat, None)
-                self._grants.pop(grant_id, None)
-                self._intents[provision_id] = old_intent
-                if old_disposition is not None:
-                    self._migration_dispositions[chat] = old_disposition
-                self._revision = old_revision
-                raise
+            self._intents.pop(provision_id)
+            self._migration_dispositions.pop(chat, None)
+            self._commit_locked(checkpoint)
             return record, grant
 
     def register(
@@ -679,41 +605,6 @@ class ManagedGroupRegistry:
             chat_id=chat_id,
             project_id=project_id,
             canonical_root_ref=canonical_root_ref,
-            backend_binding_ids=backend_binding_ids,
-            connected_target_refs=connected_target_refs,
-        )
-
-    def adopt_existing(
-        self,
-        *,
-        chat_id: str,
-        owner_id: str,
-        receiving_bot_ref: str,
-        project_id: str,
-        canonical_root_ref: str,
-        created_at: datetime,
-        validator: Callable[[Mapping[str, Any]], bool],
-        backend_binding_ids: tuple[str, ...] = (),
-        connected_target_refs: tuple[str, ...] = (),
-    ) -> tuple[ManagedGroupRecord, ProjectGrant]:
-        facts = {
-            "canonical_root_ref": canonical_root_ref,
-            "chat_id": chat_id,
-            "created_at": created_at,
-            "owner_id": owner_id,
-            "project_id": project_id,
-            "receiving_bot_ref": receiving_bot_ref,
-        }
-        if not validator(facts):
-            raise ManagedGroupValidationError("group membership/bot validation failed")
-        return self.register(
-            chat_id=chat_id,
-            owner_id=owner_id,
-            origin=ManagedGroupOrigin.OWNER_ADOPTED,
-            receiving_bot_ref=receiving_bot_ref,
-            project_id=project_id,
-            canonical_root_ref=canonical_root_ref,
-            created_at=created_at,
             backend_binding_ids=backend_binding_ids,
             connected_target_refs=connected_target_refs,
         )
@@ -790,7 +681,7 @@ class ManagedGroupRegistry:
                 return record
             if record.receiving_bot_ref != expected_bot_ref:
                 raise ManagedGroupConflictError("receiving bot rotation is stale")
-            old_revision = self._revision
+            checkpoint = self._checkpoint_locked()
             revision = self._next_revision_locked()
             updated = replace(
                 record,
@@ -798,41 +689,7 @@ class ManagedGroupRegistry:
                 receiving_bot_ref=new_ref,
             )
             self._records[chat_id] = updated
-            try:
-                self._persist_locked()
-            except BaseException:
-                self._records[chat_id] = record
-                self._revision = old_revision
-                raise
-            return updated
-
-    def tombstone(self, chat_id: str) -> ManagedGroupRecord:
-        with self._disk_transaction():
-            record = self._records.get(chat_id)
-            if record is None:
-                raise ManagedGroupConflictError("unknown managed group")
-            if record.status is ManagedGroupStatus.TOMBSTONED:
-                return record
-            old_revision = self._revision
-            revision = self._next_revision_locked()
-            updated = replace(
-                record,
-                revision=revision,
-                status=ManagedGroupStatus.TOMBSTONED,
-            )
-            grant = self._grants.pop(record.project_grant_id, None)
-            revoke = self._revokes.pop(chat_id, None)
-            self._records[chat_id] = updated
-            try:
-                self._persist_locked()
-            except BaseException:
-                self._records[chat_id] = record
-                if grant is not None:
-                    self._grants[grant.grant_id] = grant
-                if revoke is not None:
-                    self._revokes[chat_id] = revoke
-                self._revision = old_revision
-                raise
+            self._commit_locked(checkpoint)
             return updated
 
     def begin_revoke(self, chat_id: str, *, requested_at: datetime) -> str:
@@ -844,18 +701,10 @@ class ManagedGroupRegistry:
                 raise ManagedGroupConflictError("chat is not active")
             if chat in self._revokes:
                 return chat
+            checkpoint = self._checkpoint_locked()
             self._revokes[chat] = {"requested_at": timestamp}
-            self._persist_locked()
+            self._commit_locked(checkpoint)
             return chat
-
-    def cancel_revoke(self, chat_id: str) -> bool:
-        chat = self._runtime_string(chat_id, "chat_id")
-        with self._disk_transaction():
-            previous = self._revokes.pop(chat, None)
-            if previous is None:
-                return False
-            self._persist_locked()
-            return True
 
     def pending_revokes(self) -> tuple[str, ...]:
         with self._disk_transaction():
@@ -879,8 +728,9 @@ class ManagedGroupRegistry:
                 existing["project_id"], existing["status"]
             ) == (project, status):
                 return
+            checkpoint = self._checkpoint_locked()
             self._migration_dispositions[chat] = value
-            self._persist_locked()
+            self._commit_locked(checkpoint)
 
     def migration_dispositions(self) -> tuple[tuple[str, str, str], ...]:
         with self._disk_transaction():
@@ -907,12 +757,9 @@ class ManagedGroupRegistry:
             value = self._migration_dispositions.get(chat)
             if value is None or value["reported"] is True:
                 return False
+            checkpoint = self._checkpoint_locked()
             value["reported"] = True
-            try:
-                self._persist_locked()
-            except BaseException:
-                value["reported"] = False
-                raise
+            self._commit_locked(checkpoint)
             return True
 
     def complete_revoke(self, chat_id: str) -> ManagedGroupRecord:
@@ -924,29 +771,49 @@ class ManagedGroupRegistry:
             if record is None:
                 raise ManagedGroupConflictError("unknown managed group")
             if record.status is ManagedGroupStatus.TOMBSTONED:
+                checkpoint = self._checkpoint_locked()
                 self._revokes.pop(chat, None)
-                self._persist_locked()
+                self._commit_locked(checkpoint)
                 return record
-            old_revision = self._revision
+            checkpoint = self._checkpoint_locked()
             revision = self._next_revision_locked()
             updated = replace(
                 record,
                 revision=revision,
                 status=ManagedGroupStatus.TOMBSTONED,
             )
-            grant = self._grants.pop(record.project_grant_id, None)
-            revoke = self._revokes.pop(chat)
+            self._grants.pop(record.project_grant_id, None)
+            self._revokes.pop(chat)
             self._records[chat] = updated
-            try:
-                self._persist_locked()
-            except BaseException:
-                self._records[chat] = record
-                if grant is not None:
-                    self._grants[grant.grant_id] = grant
-                self._revokes[chat] = revoke
-                self._revision = old_revision
-                raise
+            self._commit_locked(checkpoint)
             return updated
+
+    def _checkpoint_locked(self) -> tuple[Any, ...]:
+        return (
+            self._revision,
+            {key: dict(value) for key, value in self._intents.items()},
+            dict(self._records),
+            dict(self._grants),
+            {key: dict(value) for key, value in self._revokes.items()},
+            {
+                key: dict(value)
+                for key, value in self._migration_dispositions.items()
+            },
+        )
+
+    def _commit_locked(self, checkpoint: tuple[Any, ...]) -> None:
+        try:
+            self._persist_locked()
+        except BaseException:
+            (
+                self._revision,
+                self._intents,
+                self._records,
+                self._grants,
+                self._revokes,
+                self._migration_dispositions,
+            ) = checkpoint
+            raise
 
     def _next_revision_locked(self) -> int:
         self._revision += 1
@@ -992,16 +859,7 @@ class ManagedGroupRegistry:
         try:
             with self._path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
-            legacy_optional = {"revoke_intents", "migration_dispositions"}
-            if isinstance(payload, dict) and frozenset(payload) in {
-                frozenset(_TOP_LEVEL_KEYS - legacy_optional),
-                frozenset(_TOP_LEVEL_KEYS - {"migration_dispositions"}),
-            }:
-                data = dict(payload)
-                data.setdefault("revoke_intents", {})
-                data.setdefault("migration_dispositions", {})
-            else:
-                data = _require_dict(payload, _TOP_LEVEL_KEYS, "registry")
+            data = _require_dict(payload, _TOP_LEVEL_KEYS, "registry")
             if (
                 data["schema"] != _SCHEMA
                 or isinstance(data["version"], bool)
@@ -1031,23 +889,9 @@ class ManagedGroupRegistry:
             migrations: dict[str, dict[str, Any]] = {}
             for provision_id, raw_intent in intents_raw.items():
                 _require_string(provision_id, "provision id")
-                if not isinstance(raw_intent, dict) or frozenset(raw_intent) not in {
-                    frozenset(_INTENT_KEYS),
-                    frozenset(_LEGACY_INTENT_KEYS),
-                    frozenset(_V1_INTENT_KEYS),
-                }:
-                    raise RegistryCorruptionError("invalid provision intent schema")
-                intent = dict(raw_intent)
-                intent.setdefault("create_dispatched_at", None)
-                intent.setdefault(
-                    "create_state",
-                    "bound" if intent.get("remote_chat_id") else "prepared",
+                intent = dict(
+                    _require_dict(raw_intent, _INTENT_KEYS, "provision intent")
                 )
-                intent.setdefault(
-                    "operation_uuid",
-                    str(uuid.uuid5(uuid.NAMESPACE_URL, provision_id)),
-                )
-                intent.setdefault("remote_chat_id", None)
                 _parse_datetime(intent["created_at"], "intent created_at")
                 try:
                     ManagedGroupOrigin(intent["origin"])
@@ -1110,15 +954,13 @@ class ManagedGroupRegistry:
                 revokes[chat_id] = dict(revoke)
             for chat_id, raw_disposition in migrations_raw.items():
                 _require_string(chat_id, "migration chat_id")
-                if not isinstance(raw_disposition, dict) or frozenset(
-                    raw_disposition
-                ) not in {
-                    frozenset(_MIGRATION_KEYS),
-                    frozenset(_LEGACY_MIGRATION_KEYS),
-                }:
-                    raise RegistryCorruptionError("invalid migration disposition schema")
-                disposition = dict(raw_disposition)
-                disposition.setdefault("reported", False)
+                disposition = dict(
+                    _require_dict(
+                        raw_disposition,
+                        _MIGRATION_KEYS,
+                        "migration disposition",
+                    )
+                )
                 _require_string(disposition["project_id"], "migration project_id")
                 if type(disposition["reported"]) is not bool:
                     raise RegistryCorruptionError("invalid migration reported flag")
@@ -1197,29 +1039,10 @@ class ManagedGroupRegistry:
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         previous_raw = self._path.read_bytes() if self._path.exists() else None
         self._anchor_uncertain_locked(raw, previous_raw)
-        temp_path = parent / f".{self._path.name}.{secrets.token_hex(12)}.tmp"
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = -1
-        replaced = False
         try:
-            fd = os.open(temp_path, flags, 0o600)
-            with os.fdopen(fd, "wb", closefd=True) as handle:
-                fd = -1
-                handle.write(raw)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, self._path)
-            replaced = True
-            directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-            self._clear_uncertain_locked()
-        except OSError as exc:
-            if replaced:
+            self._atomic_replace_locked(self._path, raw)
+        except _AtomicReplaceError as exc:
+            if exc.committed:
                 self._commit_uncertain = True
                 raise RegistryCommitUncertainError(
                     "registry replace committed but durability is uncertain",
@@ -1227,13 +1050,14 @@ class ManagedGroupRegistry:
                 ) from exc
             self._clear_uncertain_best_effort_locked()
             raise
-        finally:
-            if fd >= 0:
-                os.close(fd)
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
+        try:
+            self._clear_uncertain_locked()
+        except OSError as exc:
+            self._commit_uncertain = True
+            raise RegistryCommitUncertainError(
+                "registry replace committed but durability is uncertain",
+                committed=True,
+            ) from exc
 
     def _anchor_uncertain_locked(
         self,
@@ -1255,24 +1079,31 @@ class ManagedGroupRegistry:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        temp_path = self._path.parent / (
-            f".{self._uncertain_path.name}.{secrets.token_hex(12)}.tmp"
-        )
+        try:
+            self._atomic_replace_locked(self._uncertain_path, raw)
+        except OSError:
+            self._clear_uncertain_best_effort_locked()
+            raise
+
+    def _atomic_replace_locked(self, target: Path, raw: bytes) -> None:
+        temp_path = target.parent / f".{target.name}.{secrets.token_hex(12)}.tmp"
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        fd = os.open(temp_path, flags, 0o600)
+        fd = -1
+        replaced = False
         try:
+            fd = os.open(temp_path, flags, 0o600)
             with os.fdopen(fd, "wb", closefd=True) as handle:
                 fd = -1
                 handle.write(raw)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, self._uncertain_path)
+            os.replace(temp_path, target)
+            replaced = True
             self._fsync_parent_locked()
-        except OSError:
-            self._clear_uncertain_best_effort_locked()
-            raise
+        except OSError as exc:
+            raise _AtomicReplaceError(exc, committed=replaced) from exc
         finally:
             if fd >= 0:
                 os.close(fd)

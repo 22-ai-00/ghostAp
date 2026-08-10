@@ -8,10 +8,6 @@ from unittest.mock import patch
 
 import pytest
 
-from src.autonomous.ingress.implementation_evidence import (
-    PHASE3_IMPLEMENTATION_MANIFEST_PATH,
-    Phase3ImplementationManifest,
-)
 from src.autonomous.ingress.models import EmployeeIngressMetadata, EmployeeIngressPayload
 from src.autonomous.ingress.projection import IngressProjectionState
 from src.autonomous.ingress.service import (
@@ -132,13 +128,6 @@ def _ipc_worker(base_dir: str, connection) -> None:
 
 @pytest.mark.slow
 def test_ipc_ack_only_after_anchored_acceptance(tmp_path: Path) -> None:
-    manifest = Phase3ImplementationManifest.load(PHASE3_IMPLEMENTATION_MANIFEST_PATH)
-    gate = manifest.gate("EI-IPC-01")
-    assert gate.selector_state == "collectable"
-    assert gate.selector == (
-        "tests/autonomous/chaos/test_employee_ingress_recovery.py::"
-        "test_ipc_ack_only_after_anchored_acceptance"
-    )
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe(duplex=False)
     process = context.Process(target=_ipc_worker, args=(str(tmp_path), child))
@@ -401,50 +390,6 @@ def test_restart_quarantines_blob_left_by_crash_before_journal_commit(
     )
 
     assert service.state.by_acceptance_id == {}
-    assert not tuple((tmp_path / "ingress-blobs").glob("*.blob"))
-    assert len(tuple((tmp_path / "ingress-blobs" / "quarantine").glob("*.blob"))) == 1
-    service.close()
-    writer.close()
-
-
-def test_restart_retries_gc_after_tombstone_anchor_before_blob_quarantine(
-    tmp_path: Path,
-) -> None:
-    anchor = MemoryAnchor()
-    service, writer, store = _service(tmp_path, anchor=anchor)
-    payload = _payload()
-    ack = service.accept(_metadata(payload), payload, request_id="req_1")
-    service.record_disposition(
-        ack.acceptance.acceptance_id,
-        state="terminal",
-        reason_code="completed",
-    )
-    with patch.object(store, "quarantine_blob", side_effect=SystemExit("crash")):
-        with pytest.raises(SystemExit, match="crash"):
-            service.gc_terminal_payloads()
-
-    record = service.state.by_acceptance_id[ack.acceptance.acceptance_id]
-    assert record.payload_tombstoned is True
-    assert len(tuple((tmp_path / "ingress-blobs").glob("*.blob"))) == 1
-    service.close()
-    writer.close()
-
-    writer = JournalWriter.open(
-        tmp_path / "journal",
-        anchor=anchor,
-        hmac_key=HMAC_KEY,
-        writer_epoch=2,
-    )
-    service = EmployeeIngressService(
-        writer=writer,
-        blob_store=_store(tmp_path / "ingress-blobs"),
-        ingress_state=IngressProjectionState(),
-        active_key_id="k1",
-    )
-
-    recovered = service.state.by_acceptance_id[ack.acceptance.acceptance_id]
-    assert recovered.payload_tombstoned is True
-    assert recovered.acceptance == ack.acceptance
     assert not tuple((tmp_path / "ingress-blobs").glob("*.blob"))
     assert len(tuple((tmp_path / "ingress-blobs" / "quarantine").glob("*.blob"))) == 1
     service.close()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,42 @@ from .ports import AuthenticatedExecutionTerminal, PublishEmployeeDocumentComman
 from .projection import DataProjectionState
 from .query import EmployeeDataRequestContextFactory, EmployeeMemoryQuery, HistoryRangeQuery
 from .service import EmployeeDataService
+
+
+class LegacyEmployeeDataUnsupportedError(RuntimeError):
+    """Unmigrated filesystem data requires an explicit offline migration."""
+
+
+def _contains_unmigrated_employee_data(agents_root: str | Path) -> bool:
+    root = Path(agents_root).expanduser()
+    try:
+        root_mode = root.lstat().st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISDIR(root_mode):
+        raise LegacyEmployeeDataUnsupportedError(
+            "employee agents root is not a trusted directory"
+        )
+    leaves = (
+        "execution_history.jsonl",
+        "MEMORY.md",
+        "memory/MEMORY.md",
+        "skill_profile.json",
+        "reasoning",
+    )
+    for entry in root.iterdir():
+        try:
+            if not stat.S_ISDIR(entry.lstat().st_mode):
+                continue
+        except FileNotFoundError:
+            continue
+        for relative in leaves:
+            try:
+                (entry / relative).lstat()
+            except FileNotFoundError:
+                continue
+            return True
+    return False
 
 
 @dataclass
@@ -235,9 +272,7 @@ def build_employee_data_composition(
     admin_principal_ids: frozenset[str],
     main_bot_app_id: str,
     agents_root: str | Path,
-    legacy_base: str | Path | None = None,
     subject_resolver: Any = None,
-    auto_cutover: bool = True,
 ) -> EmployeeDataComposition:
     """Factory that constructs the full wired data-plane from settings."""
     storage = build_employee_data_storage(settings, keyring=keyring)
@@ -251,14 +286,24 @@ def build_employee_data_composition(
         authority_required=True,
     )
     service.replay_into(state)
-    if auto_cutover:
+    if state.data_authority.mode == "legacy":
+        if _contains_unmigrated_employee_data(agents_root):
+            service.close()
+            raise LegacyEmployeeDataUnsupportedError(
+                "unmigrated employee data is unsupported; run an offline migration "
+                "with a prior release before starting GhostAP"
+            )
         service.cutover_to_canonical()
+    elif state.data_authority.mode != "canonical":
+        service.close()
+        raise LegacyEmployeeDataUnsupportedError(
+            "unknown employee data authority is unsupported"
+        )
     history_mat = DailyHistoryMaterializer(agents_root)
     doc_mat = EmployeeDocumentMaterializer(agents_root)
     memory_facade = EmployeeMemoryFacade(
         materializer=doc_mat,
         state=state,
-        legacy_base_path=legacy_base,
         projection_guard=service.read_guard,
     )
     context_factory = EmployeeDataRequestContextFactory(

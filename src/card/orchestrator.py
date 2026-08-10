@@ -1,13 +1,4 @@
-"""TaskOrchestrator: manages task-level card sessions for multi-task execution.
-
-Responsibilities:
-- Parse plan info to identify tasks
-- Create independent CardSession (wrapped in SessionRotator) per task
-- Route ACP events to the correct task's session
-- Broadcast task status changes to all active sessions
-- Handle fallback to single-session mode when plan parsing fails
-- Resolve which task_id an ACP event belongs to (TaskIdResolver)
-"""
+"""Task-level card routing for programming sessions."""
 
 from __future__ import annotations
 
@@ -15,23 +6,23 @@ import concurrent.futures
 import logging
 import threading
 import time
-import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from src.card.events import CardEvent, CardEventType
-from src.card.hooks import BackfillHook
-from src.card.nav_link import format_task_continuation_link
-from src.card.task_registry import TaskRegistry, TaskStatus
-from src.card.tool_display import (
-    collect_subagent_opaque_ids,
-    extract_agent_tool_name,
-    extract_tool_call_label,
-    is_unhelpful_display_label,
-    sanitize_subagent_display_text,
-    summarize_tool_call_content,
+from src.card.events.projector import (
+    TERMINAL_AGENT_STATUSES,
+    attribute_subagent_image,
+    extract_agent_task_label,
+    is_agent_task,
+    is_generic_task_label,
+    is_task_tool,
+    project_activity,
+    project_collaboration,
 )
+from src.card.task_registry import TaskRegistry, TaskStatus
+from src.card.tool_display import summarize_tool_call_content
 from src.card.ui_text import UI_TEXT
 
 if TYPE_CHECKING:
@@ -50,71 +41,17 @@ _BROADCAST_DEBOUNCE_MS = 800
 
 # Minimum number of tasks for multi-card split
 _MIN_TASKS_FOR_MULTI_CARD = 2
-_AGENT_TOOL_TITLES = {"agent", "subagent", "task"}
-_GENERIC_TASK_LABELS = {"", "agent", "subagent", "task", "子任务"}
-_FINAL_SUMMARY_TASK_ID = "__final_summary__"
 UNCONFIRMED_SUBAGENT_SUMMARY = "父任务已结束，子任务终态未确认"
-_SUBAGENT_PROVIDER_STATUS: dict[str, TaskStatus] = {
-    "pendinginit": "in_progress",
-    "pending_init": "in_progress",
-    "pending": "in_progress",
-    "running": "in_progress",
-    "completed": "completed",
-    "cancelled": "cancelled",
-    "shutdown": "completed",
-    "errored": "failed",
-    "failed": "failed",
-    "notfound": "failed",
-    "not_found": "failed",
-    "interrupted": "cancelled",
-}
-_SUBAGENT_PROVIDER_PROGRESS = {
-    "pendinginit": "准备中",
-    "pending_init": "准备中",
-    "pending": "准备中",
-    "running": "执行中",
-    "completed": "已完成",
-    "cancelled": "已取消",
-    "shutdown": "已完成并停止",
-    "errored": "执行失败",
-    "failed": "执行失败",
-    "notfound": "状态不可用",
-    "not_found": "状态不可用",
-    "interrupted": "已中断",
-}
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "cancelled"})
 _SUBAGENT_GENERATION_WAIT_S = 40.0
-_TRANSIENT_SUBAGENT_PROGRESS = frozenset({
-    "准备中",
-    "执行中",
-    "已启动",
-    "正在启动",
-    "启动未完成",
-    "已与主 Agent 交互",
-    "正在与主 Agent 交互",
-    "交互未完成",
-    "正在中断",
-    "中断未完成",
-    "动态已更新",
-})
 
 
 class TaskIdResolver:
-    """Resolves which task_id an ACP event belongs to.
-
-    Strategy:
-    1. Track active plan step indices based on PLAN_UPDATE status transitions
-    2. Support multiple concurrently active tasks (subagent scenarios)
-    3. When resolving, prefer the most recently activated task
-    4. Fall back to the most recently active task_id if inference fails
-
-    Thread-safe: mutable state protected by a lock.
-    """
+    """Thread-safe resolver for the most recently active plan task."""
 
     def __init__(self, task_ids: list[str]) -> None:
         self._task_ids = list(task_ids)
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-        self._active_index: int = 0  # primary active index
         self._last_active_id: str = task_ids[0] if task_ids else ""
         self._active_task_ids: set[str] = set()  # tracks all currently in_progress tasks
         self._last_activated_time: dict[str, float] = {}  # task_id → monotonic timestamp
@@ -140,29 +77,19 @@ class TaskIdResolver:
         """Internal advance without lock — caller must hold self._lock."""
         if 0 <= index < len(self._task_ids):
             task_id = self._task_ids[index]
-            self._active_index = index
             self._last_active_id = task_id
             self._active_task_ids.add(task_id)
             self._last_activated_time[task_id] = time.monotonic()
 
     def resolve(self, acp_event: ACPEvent | None = None) -> str:
-        """Resolve the task_id for a given ACP event.
-
-        Uses plan step status transitions to infer which task is currently active.
-        If the event contains a PLAN_UPDATE, uses the first in_progress entry index.
-        When multiple tasks are active, returns the most recently activated one.
-
-        Falls back to last known active task_id.
-        """
+        """Resolve an event to the latest active task."""
         with self._lock:
             if acp_event is not None:
                 from src.acp.models import ACPEventType
                 if acp_event.event_type == ACPEventType.PLAN_UPDATE and acp_event.plan:
-                    # Find all in_progress entries and advance to the latest one
                     for idx, entry in enumerate(acp_event.plan.entries):
                         if entry.status == "in_progress":
                             self._advance_to_unlocked(idx)
-                            # Don't break — track all active entries
 
             return self._last_active_id
 
@@ -171,7 +98,6 @@ class TaskIdResolver:
         with self._lock:
             if task_id in self._task_ids:
                 self._last_active_id = task_id
-                self._active_index = self._task_ids.index(task_id)
                 self._active_task_ids.add(task_id)
                 self._last_activated_time[task_id] = time.monotonic()
 
@@ -192,18 +118,10 @@ class TaskIdResolver:
                         key=lambda tid: self._last_activated_time.get(tid, 0),
                     )
                     self._last_active_id = best
-                    if best in self._task_ids:
-                        self._active_index = self._task_ids.index(best)
-                elif self._task_ids:
-                    # No active tasks — keep last known index
-                    pass
 
 
 class TaskOrchestrator:
-    """Orchestrates task-level card sessions for a single engine execution.
-
-    Not a singleton — one instance per engine execution (e.g., per Deep/Spec run).
-    """
+    """Own task cards and route one programming execution's events."""
 
     def __init__(
         self,
@@ -230,7 +148,6 @@ class TaskOrchestrator:
         self._fallback_session: CardSession | None = None
         self._resolver: TaskIdResolver | None = None
         self._subagent_task_ids: set[str] = set()
-        self._subagent_summaries: dict[str, dict] = {}
         self._subagent_progress: dict[str, str] = {}
         self._terminal_task_ids: set[str] = set()
         self._terminal_task_summaries: dict[str, str] = {}
@@ -244,7 +161,6 @@ class TaskOrchestrator:
 
         # Debounce state for broadcast
         self._last_broadcast_time: float = 0
-        self._pending_broadcast: bool = False
         self._pending_broadcast_task_ids: set[str] = set()
         self._broadcast_timer: threading.Timer | None = None
 
@@ -254,12 +170,8 @@ class TaskOrchestrator:
 
         # Registered plan tasks. Visible plan tasks get their own card as soon as
         # the plan is known; overflow tasks are folded into the final visible card.
-        self._plan_tasks_pending: list[dict] = []  # ordered list of {task_id,name,status} not yet built
         self._plan_visible_task_ids: list[str] = []  # first N (max_task_cards) task_ids that may build cards
         self._thinking_finalized: bool = False  # whether thinking session was archived already
-
-        # Task-level rotation counters (protected by self._lock)
-        self._rotation_counts: dict[str, int] = {}
 
         # Subscribe to registry changes for auto-broadcast
         self._registry.subscribe(self._on_registry_status_change)
@@ -273,18 +185,7 @@ class TaskOrchestrator:
         *,
         bridge_class: type[StreamBridge] | None = None,
     ) -> TaskOrchestrator:
-        """Factory: create an orchestrator from project settings.
-
-        Reads `card.task_level_cards_enabled` and `card.max_task_cards` from settings,
-        constructs the bridge_factory conditionally, and wires up the thinking session.
-
-        Args:
-            chat_id: The chat ID for this execution.
-            session_creator: Callable that creates a CardSession given a task_id.
-            thinking_session: The pre-plan session (or rotator) to use.
-            bridge_class: Optional bridge class to use as factory. If None and
-                         task_level_cards_enabled, no per-task bridges are created.
-        """
+        """Create an orchestrator from card settings."""
         from src.config import get_settings
 
         settings = get_settings()
@@ -336,8 +237,6 @@ class TaskOrchestrator:
             self._bridges.clear()
             self._overflow_target.clear()
             self._overflow_separator_sent.clear()
-            self._rotation_counts.clear()
-            self._plan_tasks_pending.clear()
             self._plan_visible_task_ids.clear()
             self._thinking_finalized = False
             # Reset shared flags under lock to prevent TOCTOU with dispatch_to_task
@@ -346,7 +245,6 @@ class TaskOrchestrator:
             self._fallback_session = None
             self._resolver = None
             self._subagent_task_ids.clear()
-            self._subagent_summaries.clear()
             self._subagent_progress.clear()
             self._terminal_task_ids.clear()
             self._terminal_task_summaries.clear()
@@ -374,11 +272,6 @@ class TaskOrchestrator:
         with self._lock:
             return len(self._sessions)
 
-    def get_bridge(self, task_id: str) -> StreamBridge | None:
-        """Get the stream bridge for a specific task (if bridge_factory was set)."""
-        with self._lock:
-            return self._bridges.get(task_id)
-
     def set_thinking_session(self, session: CardSession) -> None:
         """Set the thinking-phase session for pre-plan event routing.
 
@@ -387,32 +280,77 @@ class TaskOrchestrator:
         """
         self._thinking_session = session
 
-    def dispatch_to_thinking(self, event: CardEvent) -> None:
-        """Route an event to the thinking-phase session.
+    def _task_list_event(
+        self,
+        current_task_id: str,
+        *,
+        force_running: str = "",
+    ) -> CardEvent:
+        tasks = [
+            {
+                "task_id": item.task_id,
+                "name": item.name,
+                "status": "in_progress" if item.task_id == force_running else item.status,
+            }
+            for item in self._registry.get_snapshot()
+        ]
+        return CardEvent(
+            type=CardEventType.TASK_LIST_UPDATED,
+            payload={"tasks": tasks, "current_task_id": current_task_id},
+        )
 
-        Used before on_plan_received() is called. After plan reception,
-        callers should use dispatch_to_task() instead.
-        """
-        if self._closed_event.is_set():
+    @staticmethod
+    def _terminal_event(status: TaskStatus, summary: str = "") -> CardEvent:
+        if status == "failed":
+            return CardEvent.failed(summary)
+        if status == "cancelled":
+            return CardEvent.cancelled(reason=summary or None)
+        return CardEvent.completed(summary=summary)
+
+    @staticmethod
+    def _dispatch_text(session: CardSession, block_id: str, text: str) -> None:
+        session.dispatch(CardEvent.text_started(block_id))
+        session.dispatch(CardEvent.text_delta(block_id, text))
+        session.dispatch(CardEvent.text_done(block_id))
+
+    @staticmethod
+    def _close_bridge_quietly(bridge: StreamBridge | None, context: str) -> None:
+        if bridge is None:
             return
-        if self._thinking_session is not None:
-            self._thinking_session.dispatch(event)
+        try:
+            bridge.close_open_blocks()
+        except Exception:
+            logger.debug("TaskOrchestrator: failed to close %s bridge", context, exc_info=True)
+
+    def _generation_is_current(self, task_id: str, lifecycle_epoch: int) -> bool:
+        with self._lock:
+            return (
+                self._lifecycle_epoch == lifecycle_epoch
+                and not self._closed_event.is_set()
+                and task_id in self._subagent_task_ids
+            )
+
+    def _discard_generation(
+        self,
+        session: CardSession | None,
+        bridge: StreamBridge | None,
+        task_id: str,
+        *,
+        archive: bool,
+    ) -> None:
+        if archive and session is not None:
+            try:
+                session.dispatch(CardEvent.archived("stale_subagent_generation"))
+            except Exception:
+                logger.debug(
+                    "TaskOrchestrator: failed to archive stale generation task_id=%s",
+                    task_id,
+                    exc_info=True,
+                )
+        self._close_bridge_quietly(bridge, f"generation {task_id}")
 
     def on_plan_received(self, plan_tasks: list[dict]) -> None:
-        """Handle plan reception — register tasks and create per-task cards.
-
-        Plan tasks are first-class execution cards: as soon as the agent exposes
-        a multi-task plan, every visible plan item gets a Feishu message card.
-        Later ``task`` tool calls are bound back to these plan cards when their
-        label matches, instead of requiring a separate subagent identity.
-
-        Falls back to single-session mode if plan is empty/invalid — in that case,
-        the thinking session becomes the fallback session.
-
-        Args:
-            plan_tasks: List of dicts with at least 'task_id' and 'name' keys.
-                       Falls back to single-session mode if empty or invalid.
-        """
+        """Register a plan and eagerly create its visible task cards."""
         if self._closed_event.is_set():
             return
 
@@ -452,7 +390,6 @@ class TaskOrchestrator:
         visible_ids = task_ids[:max_cards]
         overflow_target_id = visible_ids[-1] if visible_ids else None
         with self._lock:
-            self._plan_tasks_pending = list(valid_tasks)
             self._plan_visible_task_ids = list(visible_ids)
             if overflow_target_id is not None:
                 for t in valid_tasks[max_cards:]:
@@ -523,22 +460,20 @@ class TaskOrchestrator:
                 msg = UI_TEXT["orch_flood_merged"].format(task_name=ot_name)
                 block_id = f"_flood_{ot_id}"
                 try:
-                    target_session.dispatch(CardEvent.text_started(block_id))
-                    target_session.dispatch(CardEvent.text_delta(block_id, msg))
-                    target_session.dispatch(CardEvent.text_done(block_id))
+                    self._dispatch_text(target_session, block_id, msg)
                 except Exception:
                     logger.debug("Error dispatching flood notice for %s", ot_id)
 
         # First task session created → archive thinking session with plan summary.
         if should_finalize_thinking:
+            snapshot = self._registry.get_snapshot()
             with self._lock:
                 if self._thinking_finalized:
                     return True  # someone beat us to it
                 self._thinking_finalized = True
-                pending = list(self._plan_tasks_pending)
                 visible_count = len(self._plan_visible_task_ids)
-                overflow_count = max(0, len(pending) - visible_count)
-            task_names = [t["name"] for t in pending]
+                overflow_count = max(0, len(snapshot) - visible_count)
+            task_names = [task.name for task in snapshot]
             self._finalize_thinking_session(task_names, overflow_count=overflow_count)
 
         return True
@@ -634,9 +569,7 @@ class TaskOrchestrator:
                     collapsed_msg = UI_TEXT["orch_overflow_collapsed"].format(count=remaining)
                     collapsed_block_id = "_sep_collapsed"
                     try:
-                        session.dispatch(CardEvent.text_started(collapsed_block_id))
-                        session.dispatch(CardEvent.text_delta(collapsed_block_id, collapsed_msg))
-                        session.dispatch(CardEvent.text_done(collapsed_block_id))
+                        self._dispatch_text(session, collapsed_block_id, collapsed_msg)
                     except Exception:
                         logger.debug("TaskOrchestrator: error dispatching collapsed notice")
 
@@ -712,10 +645,8 @@ class TaskOrchestrator:
                     resolved_id = self._overflow_target.get(entry_task_id, entry_task_id)
                     self._ensure_task_session(resolved_id)
                     self.broadcast_status_change(entry_task_id, "in_progress")
-                elif entry.status == "completed":
-                    self._finalize_task_session(entry_task_id, "completed")
-                elif entry.status == "failed":
-                    self._finalize_task_session(entry_task_id, "failed")
+                elif entry.status in {"completed", "failed"}:
+                    self._finalize_task_session(entry_task_id, entry.status)
 
     def route_acp_event(self, acp_event: ACPEvent, fallback_bridge: StreamBridge) -> None:
         """Unified ACP event routing — resolve task_id and dispatch to the correct bridge.
@@ -835,13 +766,7 @@ class TaskOrchestrator:
         label = str(getattr(task, "name", "") or task_id).strip()
         image = getattr(acp_event, "image", None)
         if image is not None and label:
-            name = image.name
-            if label not in name:
-                name = f"{label} · {name}"
-            acp_event = replace(
-                acp_event,
-                image=replace(image, name=name[:120]),
-            )
+            acp_event = attribute_subagent_image(acp_event, label)
         fallback_bridge.on_event(acp_event)
         return True
 
@@ -851,102 +776,51 @@ class TaskOrchestrator:
         fallback_bridge: StreamBridge,
     ) -> bool:
         """Project Codex collaboration snapshots onto stable child cards."""
-        tool_call = getattr(acp_event, "tool_call", None)
-        collaboration_tool = getattr(tool_call, "collaboration_tool", "")
-        if (
-            tool_call is None
-            or not isinstance(collaboration_tool, str)
-            or not collaboration_tool.strip()
-        ):
+        projection = project_collaboration(acp_event)
+        if projection is None:
             return False
-
-        states_by_source = {
-            str(item.get("source_id") or "").strip(): item
-            for item in getattr(tool_call, "subagent_states", ())
-            if isinstance(item, Mapping)
-            and str(item.get("source_id") or "").strip()
-        }
-        source_ids = [
-            str(source_id or "").strip()
-            for source_id in getattr(tool_call, "collaboration_receivers", ())
-            if str(source_id or "").strip()
-        ]
-        source_ids.extend(
-            source_id
-            for source_id in states_by_source
-            if source_id not in source_ids
-        )
-
-        if not source_ids:
-            if str(getattr(tool_call, "status", "") or "").lower() == "failed":
+        if not projection.agents:
+            if projection.failed_without_receiver:
                 fallback_bridge.on_event(acp_event)
             return True
-
-        normalized_collaboration_tool = collaboration_tool.strip().casefold()
-        outer_status = str(
-            getattr(tool_call, "status", "") or ""
-        ).strip().casefold()
-        starts_new_generation = (
-            acp_event.event_type.name == "TOOL_CALL_DONE"
-            and normalized_collaboration_tool
-            in {"spawn_agent", "followup_task"}
-            and outer_status == "completed"
-        )
-        label = self._extract_agent_task_label(tool_call)
-        opaque_ids = collect_subagent_opaque_ids(tool_call)
         # Materialize every receiver before applying terminal snapshots. This
         # is required when the card cap folds later receivers into the first
         # physical child card: an early completed receiver must not close that
         # shared card before its running sibling is registered.
         running_status_changed = False
-        for source_id in source_ids:
-            if starts_new_generation and not self._reopen_subagent_generation(
-                source_id,
+        for agent in projection.agents:
+            if projection.starts_new_generation and not self._reopen_subagent_generation(
+                agent.source_id,
             ):
                 fallback_bridge.on_event(acp_event)
                 return True
             with self._lock:
-                if source_id in self._terminal_task_ids:
+                if agent.source_id in self._terminal_task_ids:
                     continue
-                known_subagent = source_id in self._subagent_task_ids
+                known_subagent = agent.source_id in self._subagent_task_ids
             if not known_subagent:
-                self.create_subagent_session(source_id, label)
+                self.create_subagent_session(agent.source_id, agent.label)
             with self._lock:
-                known_subagent = source_id in self._subagent_task_ids
+                known_subagent = agent.source_id in self._subagent_task_ids
             if not known_subagent:
                 fallback_bridge.on_event(acp_event)
                 return True
 
-        for source_id in source_ids:
+        for agent in projection.agents:
+            source_id = agent.source_id
             with self._lock:
                 if source_id in self._terminal_task_ids:
                     continue
-            self._rename_task_from_tool_label(source_id, tool_call)
-            state = states_by_source.get(source_id, {})
-            raw_status = str(state.get("status") or "running").strip().lower()
-            status = _SUBAGENT_PROVIDER_STATUS.get(raw_status, "in_progress")
-            message = sanitize_subagent_display_text(
-                state.get("message"),
-                fallback="",
-                max_chars=180,
-                opaque_ids=opaque_ids,
-            )
-            default_progress = _SUBAGENT_PROVIDER_PROGRESS.get(
-                raw_status,
-                "执行中",
-            )
-            progress = message or default_progress
-            if (
-                status in _TERMINAL_TASK_STATUSES
-                and progress in _TRANSIENT_SUBAGENT_PROGRESS
-            ):
-                progress = default_progress
-            self._publish_subagent_progress(source_id, progress)
-            if status in _TERMINAL_TASK_STATUSES:
+            self._rename_task(source_id, agent.label)
+            status: TaskStatus = (
+                "in_progress" if agent.status == "running" else agent.status
+            )  # type: ignore[assignment]
+            self._publish_subagent_progress(source_id, agent.progress)
+            if agent.status in TERMINAL_AGENT_STATUSES:
                 self._finalize_task_session(
                     source_id,
                     status,
-                    summary=progress,
+                    summary=agent.progress,
                 )
             else:
                 item = self._registry.get(source_id)
@@ -1036,85 +910,21 @@ class TaskOrchestrator:
                     self._apply_subagent_metadata(new_session, resolved_id)
                 if self._bridge_factory is not None:
                     new_bridge = self._bridge_factory(new_session)
-                with self._lock:
-                    stale_before_delivery = (
-                        self._lifecycle_epoch != lifecycle_epoch
-                        or self._closed_event.is_set()
-                        or task_id not in self._subagent_task_ids
+                if not self._generation_is_current(task_id, lifecycle_epoch):
+                    self._discard_generation(
+                        new_session, new_bridge, task_id, archive=False
                     )
-                if stale_before_delivery:
-                    if new_bridge is not None:
-                        try:
-                            new_bridge.close_open_blocks()
-                        except Exception:
-                            logger.debug(
-                                "TaskOrchestrator: failed to close stale "
-                                "generation bridge task_id=%s",
-                                task_id,
-                                exc_info=True,
-                            )
                     return False
-                snapshot = self._registry.get_snapshot()
-                new_session.dispatch(CardEvent(
-                    type=CardEventType.TASK_LIST_UPDATED,
-                    payload={
-                        "tasks": [
-                            {
-                                "task_id": item.task_id,
-                                "name": item.name,
-                                "status": (
-                                    "in_progress"
-                                    if item.task_id == task_id
-                                    else item.status
-                                ),
-                            }
-                            for item in snapshot
-                        ],
-                        "current_task_id": task_id,
-                    },
-                ))
-                with self._lock:
-                    still_current = (
-                        self._lifecycle_epoch == lifecycle_epoch
-                        and not self._closed_event.is_set()
-                        and task_id in self._subagent_task_ids
+                new_session.dispatch(
+                    self._task_list_event(task_id, force_running=task_id)
+                )
+                if not self._generation_is_current(task_id, lifecycle_epoch):
+                    self._discard_generation(
+                        new_session, new_bridge, task_id, archive=True
                     )
-                if not still_current:
-                    try:
-                        new_session.dispatch(
-                            CardEvent.archived(
-                                "stale_subagent_generation"
-                            )
-                        )
-                    except Exception:
-                        logger.debug(
-                            "TaskOrchestrator: failed to archive stale new "
-                            "generation task_id=%s",
-                            task_id,
-                            exc_info=True,
-                        )
-                    if new_bridge is not None:
-                        try:
-                            new_bridge.close_open_blocks()
-                        except Exception:
-                            logger.debug(
-                                "TaskOrchestrator: failed to close stale new "
-                                "generation bridge task_id=%s",
-                                task_id,
-                                exc_info=True,
-                            )
                     return False
             except Exception:
-                if new_bridge is not None:
-                    try:
-                        new_bridge.close_open_blocks()
-                    except Exception:
-                        logger.debug(
-                            "TaskOrchestrator: failed to close rejected new "
-                            "generation bridge task_id=%s",
-                            task_id,
-                            exc_info=True,
-                        )
+                self._close_bridge_quietly(new_bridge, f"rejected generation {task_id}")
                 logger.warning(
                     "TaskOrchestrator: failed to open new subagent generation "
                     "task_id=%s",
@@ -1161,39 +971,11 @@ class TaskOrchestrator:
                     prior_status,
                     notify=False,
                 )
-            if new_session is not None:
-                try:
-                    new_session.dispatch(
-                        CardEvent.archived("stale_subagent_generation")
-                    )
-                except Exception:
-                    logger.debug(
-                        "TaskOrchestrator: failed to archive stale committed "
-                        "generation task_id=%s",
-                        task_id,
-                        exc_info=True,
-                    )
-            if new_bridge is not None:
-                try:
-                    new_bridge.close_open_blocks()
-                except Exception:
-                    logger.debug(
-                        "TaskOrchestrator: failed to close stale committed "
-                        "generation bridge task_id=%s",
-                        task_id,
-                        exc_info=True,
-                    )
+            self._discard_generation(
+                new_session, new_bridge, task_id, archive=True
+            )
             return False
-        if old_bridge is not None:
-            try:
-                old_bridge.close_open_blocks()
-            except Exception:
-                logger.debug(
-                    "TaskOrchestrator: failed to close old generation bridge "
-                    "task_id=%s",
-                    task_id,
-                    exc_info=True,
-                )
+        self._close_bridge_quietly(old_bridge, f"old generation {task_id}")
         self._broadcast_subagent_task_list()
         return True
 
@@ -1223,25 +1005,6 @@ class TaskOrchestrator:
                 )
         return True
 
-    def route_or_fallback(self, acp_event: ACPEvent, fallback_bridge: StreamBridge) -> bool:
-        """Unified routing predicate + dispatch for renderers.
-
-        Encapsulates the repeated condition:
-            if has_plan and not is_fallback_mode: route_acp_event(...)
-            else: fallback_bridge.on_event(...)
-
-        Returns:
-            True if event was routed through the orchestrator (multi-card path).
-            False if event was sent to fallback_bridge (single-card path).
-        """
-        if self.is_agent_task_event(acp_event):
-            self.route_acp_event(acp_event, fallback_bridge)
-            return True
-        if self._plan_received.is_set() and not self._fallback_mode:
-            self.route_acp_event(acp_event, fallback_bridge)
-            return True
-        fallback_bridge.on_event(acp_event)
-        return False
 
     def _on_registry_status_change(self, task_id: str, new_status: TaskStatus) -> None:
         """Callback from TaskRegistry when status changes — triggers targeted refresh."""
@@ -1294,22 +1057,12 @@ class TaskOrchestrator:
             if not sessions:
                 return
 
-        snapshot = self._registry.get_snapshot()
-        tasks_payload = [
-            {"task_id": s.task_id, "name": s.name, "status": s.status}
-            for s in snapshot
-        ]
-
         for task_id, session in sessions:
             with self._lock:
                 if task_id in self._finalized_task_ids:
                     continue
-            event: CardEvent = CardEvent(
-                type=CardEventType.TASK_LIST_UPDATED,
-                payload={"tasks": tasks_payload, "current_task_id": task_id},
-            )
             try:
-                session.dispatch(event)
+                session.dispatch(self._task_list_event(task_id))
             except Exception:
                 logger.debug("Broadcast to task_id=%s failed", task_id, exc_info=True)
 
@@ -1325,181 +1078,8 @@ class TaskOrchestrator:
             if self._bridge_factory is not None:
                 self._bridges[task_id] = self._bridge_factory(session)
 
-        # Dispatch initial TASK_LIST_UPDATED so the card renders the task list header
-        snapshot = self._registry.get_snapshot()
-        tasks_payload = [
-            {"task_id": s.task_id, "name": s.name, "status": s.status}
-            for s in snapshot
-        ]
-        event: CardEvent = CardEvent(
-            type=CardEventType.TASK_LIST_UPDATED,
-            payload={"tasks": tasks_payload, "current_task_id": task_id},
-        )
-        session.dispatch(event)
+        session.dispatch(self._task_list_event(task_id))
 
-    def rotate_task_session(self, task_id: str) -> bool:
-        """Trigger continuation card for a task (when content exceeds byte_budget).
-
-        Freezes the current task session (dispatches ARCHIVED), creates a new continuation
-        session, and re-dispatches TASK_LIST_UPDATED to the new session.
-
-        Returns True if rotation succeeded, False if task_id not found or already closed.
-        """
-        if self._closed_event.is_set():
-            return False
-
-        with self._lock:
-            session = self._sessions.get(task_id)
-            old_bridge = self._bridges.get(task_id)
-        if session is None:
-            return False
-
-        # Freeze old bridge
-        if old_bridge is not None:
-            try:
-                old_bridge.close_open_blocks()
-            except Exception:
-                logger.debug("Error closing bridge during rotation for task %s", task_id)
-
-        task_item = self._registry.get(task_id)
-        task_name = task_item.name if task_item else task_id
-
-        # Phase 1: Create new session (I/O, outside lock)
-        new_session = self._create_continuation_session(task_id, task_name, session)
-        if new_session is None:
-            return False
-
-        # Register backfill callback BEFORE swap (eliminates TOCTOU window)
-        rotation_count = self._rotation_counts.get(task_id, 0) + 1
-        self._register_backfill_callback(session, new_session, task_name, rotation_count)
-
-        # Phase 2: Atomic swap (inside lock, NO I/O)
-        with self._lock:
-            self._rotation_counts[task_id] = rotation_count
-            self._sessions[task_id] = new_session
-            if self._bridge_factory is not None:
-                self._bridges[task_id] = self._bridge_factory(new_session)
-
-        # Phase 3: Archive old + initialize new (I/O, outside lock)
-        self._archive_old_session(session, task_name, rotation_count)
-        self._initialize_continuation_card(new_session, task_id, session, rotation_count)
-
-        logger.info("TaskOrchestrator: rotated task session for task_id=%s (续 %d)", task_id, rotation_count)
-        return True
-
-    def _create_continuation_session(
-        self,
-        task_id: str,
-        task_name: str,
-        old_session: SessionRotator | CardSession,
-    ) -> CardSession | None:
-        """Phase 1: Create a new continuation session. Returns None on failure."""
-        try:
-            new_session = self._session_creator(task_id)
-            old_meta = getattr(old_session, "_metadata", None)
-            if old_meta is not None:
-                seq = self._rotation_counts.get(task_id, 0) + 2
-                from dataclasses import replace
-                new_session._metadata = replace(
-                    new_session._metadata,
-                    continuation_seq=seq - 1,
-                    card_sequence=seq,
-                    session_started_at=getattr(old_session, "session_started_at", new_session.session_started_at),
-                    bridge_phrase="续接：",
-                    is_subagent=old_meta.is_subagent,
-                    parent_card_seq=old_meta.parent_card_seq,
-                )
-            return new_session
-        except Exception:
-            logger.warning(
-                "TaskOrchestrator: session_creator failed for task_id=%s, rotation aborted",
-                task_id, exc_info=True,
-            )
-            # Dispatch degradation notice on old session
-            try:
-                degrade_msg = UI_TEXT["orch_rotation_failed_notice"]
-                old_session.dispatch(CardEvent.text_started("_rotation_failed"))
-                old_session.dispatch(CardEvent.text_delta("_rotation_failed", degrade_msg))
-                old_session.dispatch(CardEvent.text_done("_rotation_failed"))
-            except Exception:
-                logger.warning(
-                    "TaskOrchestrator: failed to dispatch rotation degradation for task_id=%s",
-                    task_id,
-                )
-            return None
-
-    def _archive_old_session(
-        self,
-        old_session: SessionRotator | CardSession,
-        task_name: str,
-        rotation_count: int,
-    ) -> None:
-        """Phase 3: Archive old session with continuation navigation text."""
-        msg = format_task_continuation_link(
-            task_name=task_name,
-            rotation_count=rotation_count,
-            new_msg_id=None,
-        )
-        try:
-            old_session.dispatch(CardEvent.text_started("_continuation"))
-            old_session.dispatch(CardEvent.text_delta("_continuation", msg))
-            old_session.dispatch(CardEvent.text_done("_continuation"))
-            old_session.dispatch(CardEvent.archived(bridge_phrase=f"续接 #{rotation_count + 1} ↓"))
-        except Exception:
-            logger.debug("Error archiving task session for rotation, task_id=%s (name=%s)", task_name, task_name, exc_info=True)
-
-    def _register_backfill_callback(
-        self,
-        old_session: SessionRotator | CardSession,
-        new_session: CardSession,
-        task_name: str,
-        rotation_count: int,
-    ) -> None:
-        """Inject a BackfillHook on new_session to backfill deep-link on old card.
-
-        Must be called BEFORE Phase 2 swap so the hook is registered while
-        new_session is not yet exposed to concurrent dispatch (eliminates TOCTOU).
-        """
-        hook = BackfillHook(
-            old_session_ref=weakref.ref(old_session),
-            task_name=task_name,
-            rotation_count=rotation_count,
-        )
-        new_session.add_hook(hook)
-
-    def _initialize_continuation_card(
-        self,
-        new_session: CardSession,
-        task_id: str,
-        old_session: SessionRotator | CardSession,
-        rotation_count: int,
-    ) -> None:
-        """Dispatch TASK_LIST_UPDATED and continuation hint to the new card."""
-        # Task list header
-        snapshot = self._registry.get_snapshot()
-        tasks_payload = [
-            {"task_id": s.task_id, "name": s.name, "status": s.status}
-            for s in snapshot
-        ]
-        event: CardEvent = CardEvent(
-            type=CardEventType.TASK_LIST_UPDATED,
-            payload={"tasks": tasks_payload, "current_task_id": task_id},
-        )
-        new_session.dispatch(event)
-
-        # Back-link hint
-        page = rotation_count + 1
-        old_msg_id = getattr(old_session, "delivered_message_id", "") or ""
-        if old_msg_id:
-            hint_msg = UI_TEXT["orch_back_link"].format(msg_id=old_msg_id)
-        else:
-            hint_msg = UI_TEXT["orch_continuation_hint"].format(page=page)
-        try:
-            new_session.dispatch(CardEvent.text_started("_continuation_hint"))
-            new_session.dispatch(CardEvent.text_delta("_continuation_hint", hint_msg))
-            new_session.dispatch(CardEvent.text_done("_continuation_hint"))
-        except Exception:
-            logger.debug("Error dispatching continuation hint for task_id=%s", task_id, exc_info=True)
 
     def _enter_fallback_mode(self) -> None:
         """Enter single-session fallback mode (no multi-card).
@@ -1515,11 +1095,11 @@ class TaskOrchestrator:
         if self._fallback_session is not None:
             try:
                 warn_id = "_fallback_warn"
-                self._fallback_session.dispatch(CardEvent.text_started(warn_id))
-                self._fallback_session.dispatch(
-                    CardEvent.text_delta(warn_id, UI_TEXT["orch_fallback_warning"])
+                self._dispatch_text(
+                    self._fallback_session,
+                    warn_id,
+                    UI_TEXT["orch_fallback_warning"],
                 )
-                self._fallback_session.dispatch(CardEvent.text_done(warn_id))
             except Exception:
                 logger.debug("Error dispatching fallback warning", exc_info=True)
         logger.info("TaskOrchestrator: fallback mode — using single session")
@@ -1533,16 +1113,8 @@ class TaskOrchestrator:
         if self._thinking_session is None:
             return
         try:
-            snapshot = self._registry.get_snapshot()
-            tasks_payload = [
-                {"task_id": s.task_id, "name": s.name, "status": s.status}
-                for s in snapshot
-            ]
-            if tasks_payload:
-                self._thinking_session.dispatch(CardEvent(
-                    type=CardEventType.TASK_LIST_UPDATED,
-                    payload={"tasks": tasks_payload, "current_task_id": ""},
-                ))
+            if self._registry.count:
+                self._thinking_session.dispatch(self._task_list_event(""))
             task_count = len(task_names)
             # Fold task list when >5 items to save card space
             if task_count > 5:
@@ -1563,17 +1135,14 @@ class TaskOrchestrator:
             else:
                 transition = "\n" + UI_TEXT["orch_plan_transition_hint_no_link"]
             block_id = "_plan_summary"
-            self._thinking_session.dispatch(CardEvent.text_started(block_id))
-            self._thinking_session.dispatch(CardEvent.text_delta(block_id, summary + transition))
-            self._thinking_session.dispatch(CardEvent.text_done(block_id))
+            self._dispatch_text(
+                self._thinking_session, block_id, summary + transition
+            )
             self._thinking_session.dispatch(CardEvent.archived())
         except Exception:
             logger.debug("Error finalizing thinking session", exc_info=True)
         self._thinking_session = None
 
-    def set_fallback_session(self, session: CardSession) -> None:
-        """Set the fallback session for single-session mode."""
-        self._fallback_session = session
 
     def _route_agent_task_event(self, acp_event: ACPEvent) -> bool:
         """Route agent/subagent tool calls into an independent task card."""
@@ -1591,13 +1160,8 @@ class TaskOrchestrator:
         if tool_call is None:
             return False
 
-        activity_source_id = str(
-            getattr(tool_call, "subagent_source_id", "") or ""
-        ).strip()
-        activity = str(
-            getattr(tool_call, "subagent_activity", "") or ""
-        ).strip().lower()
-        tool_id = activity_source_id or str(
+        activity = project_activity(acp_event)
+        tool_id = (activity.source_id if activity else "") or str(
             getattr(tool_call, "id", "") or ""
         ).strip()
         if not tool_id:
@@ -1606,7 +1170,7 @@ class TaskOrchestrator:
         with self._lock:
             known_subagent = tool_id in self._subagent_task_ids
             finalized = tool_id in self._terminal_task_ids
-        if not known_subagent and not self._is_agent_task(tool_call):
+        if not known_subagent and not is_agent_task(tool_call):
             return False
         if finalized:
             return True
@@ -1614,23 +1178,23 @@ class TaskOrchestrator:
         if (
             not known_subagent
             and self._plan_received.is_set()
-            and self._is_task_tool(tool_call)
-            and self._is_generic_task_label(self._extract_agent_task_label(tool_call))
+            and is_task_tool(tool_call)
+            and is_generic_task_label(extract_agent_task_label(tool_call))
         ):
             return False
 
         if not known_subagent:
-            self.create_subagent_session(tool_id, self._extract_agent_task_label(tool_call))
+            self.create_subagent_session(tool_id, extract_agent_task_label(tool_call))
             with self._lock:
                 known_subagent = tool_id in self._subagent_task_ids
             if not known_subagent:
                 return False
 
-        if activity_source_id:
+        if activity is not None:
             self._route_subagent_activity(
                 task_id=tool_id,
-                activity=activity,
-                acp_event=acp_event,
+                projection=activity,
+                tool_call=tool_call,
             )
             return True
 
@@ -1642,70 +1206,33 @@ class TaskOrchestrator:
         if acp_event.event_type == ACPEventType.TOOL_CALL_DONE:
             status = str(getattr(tool_call, "status", "") or "").strip().lower()
             content = str(getattr(tool_call, "content", "") or "").strip()
-            if status == "failed":
-                self._finalize_task_session(
-                    tool_id,
-                    "failed",
-                    summary=summarize_tool_call_content(content, fallback=self._extract_agent_task_label(tool_call)),
-                )
-                self._publish_subagent_summary(tool_call, status="failed")
-            else:
-                self._finalize_task_session(
-                    tool_id,
-                    "completed",
-                    summary=summarize_tool_call_content(content),
-                )
-                self._publish_subagent_summary(tool_call, status="completed")
-        else:
-            self._publish_subagent_summary(tool_call, status="running")
+            terminal_status: TaskStatus = (
+                "failed" if status == "failed" else "completed"
+            )
+            fallback = (
+                extract_agent_task_label(tool_call)
+                if terminal_status == "failed"
+                else ""
+            )
+            self._finalize_task_session(
+                tool_id,
+                terminal_status,
+                summary=summarize_tool_call_content(content, fallback=fallback),
+            )
         return True
 
     def _route_subagent_activity(
         self,
         *,
         task_id: str,
-        activity: str,
-        acp_event: ACPEvent,
+        projection,
+        tool_call,
     ) -> None:
         """Render a child lifecycle operation without closing the child task."""
-        tool_call = acp_event.tool_call
-        if tool_call is None:
-            return
-        self._rename_task_from_tool_label(task_id, tool_call)
+        self._rename_task(task_id, projection.label)
+        self._publish_subagent_progress(task_id, projection.progress)
 
-        provider_status = str(getattr(tool_call, "status", "") or "").lower()
-
-        if activity == "started":
-            progress = (
-                "已启动"
-                if provider_status == "completed"
-                else ("启动未完成" if provider_status == "failed" else "正在启动")
-            )
-        elif activity == "interacted":
-            progress = (
-                "已与主 Agent 交互"
-                if provider_status == "completed"
-                else (
-                    "交互未完成"
-                    if provider_status == "failed"
-                    else "正在与主 Agent 交互"
-                )
-            )
-        elif activity == "interrupted":
-            progress = (
-                "已中断"
-                if provider_status == "completed"
-                else (
-                    "中断未完成"
-                    if provider_status == "failed"
-                    else "正在中断"
-                )
-            )
-        else:
-            progress = "动态已更新"
-        self._publish_subagent_progress(task_id, progress)
-
-        if activity == "interrupted" and provider_status == "completed":
+        if projection.interrupted:
             self._finalize_task_session(
                 task_id,
                 "cancelled",
@@ -1753,14 +1280,16 @@ class TaskOrchestrator:
 
     def _rename_task_from_tool_label(self, task_id: str, tool_call) -> bool:
         """Update a task card label when a later tool event reveals the real description."""
-        label = self._extract_agent_task_label(tool_call)
-        if self._is_generic_task_label(label):
+        return self._rename_task(task_id, extract_agent_task_label(tool_call))
+
+    def _rename_task(self, task_id: str, label: str) -> bool:
+        if is_generic_task_label(label):
             return False
 
         current = self._registry.get(task_id)
         if current is None or current.name == label:
             return False
-        if not self._is_generic_task_label(current.name):
+        if not is_generic_task_label(current.name):
             return False
 
         updated = self._registry.update_name(task_id, label)
@@ -1787,11 +1316,6 @@ class TaskOrchestrator:
         New parallel task cards should see the growing task list, but parent plan
         task cards must remain frozen from subtask progress.
         """
-        snapshot = self._registry.get_snapshot()
-        tasks_payload = [
-            {"task_id": s.task_id, "name": s.name, "status": s.status}
-            for s in snapshot
-        ]
         with self._lock:
             sessions = [
                 (task_id, self._sessions[task_id])
@@ -1801,10 +1325,7 @@ class TaskOrchestrator:
 
         for task_id, session in sessions:
             try:
-                session.dispatch(CardEvent(
-                    type=CardEventType.TASK_LIST_UPDATED,
-                    payload={"tasks": tasks_payload, "current_task_id": task_id},
-                ))
+                session.dispatch(self._task_list_event(task_id))
             except Exception:
                 logger.debug("Broadcast to subagent task_id=%s failed", task_id, exc_info=True)
 
@@ -1827,7 +1348,7 @@ class TaskOrchestrator:
         with self._lock:
             bound_task_id = self._tool_task_bindings.get(tool_id)
 
-        if not bound_task_id and self._is_task_tool(tool_call):
+        if not bound_task_id and is_task_tool(tool_call):
             bound_task_id = self._match_plan_task_for_tool(tool_call)
             if bound_task_id:
                 with self._lock:
@@ -1860,7 +1381,7 @@ class TaskOrchestrator:
         """Best-effort bind a ``task`` tool call to an existing plan item."""
         if not self._plan_received.is_set() or self._fallback_mode:
             return ""
-        label = self._extract_agent_task_label(tool_call)
+        label = extract_agent_task_label(tool_call)
         normalized_label = self._normalize_task_label(label)
         if not normalized_label:
             return ""
@@ -1894,7 +1415,6 @@ class TaskOrchestrator:
         metadata = getattr(session, "_metadata", None)
         if metadata is None:
             return
-        from dataclasses import replace
         with self._lock:
             subagent_count = len([s for s in self._sessions.values() if getattr(s, "is_subagent", False)])
         branch_id = chr(ord("a") + subagent_count)
@@ -1911,95 +1431,11 @@ class TaskOrchestrator:
             bridge_phrase=None,
         )
 
-    def _publish_subagent_summary(self, tool_call, *, status: str) -> None:
-        task_id = str(getattr(tool_call, "id", "") or "").strip()
-        if not task_id:
-            return
-
-        with self._lock:
-            session = self._sessions.get(task_id)
-        metadata = getattr(session, "_metadata", None)
-        existing = self._subagent_summaries.get(task_id, {})
-        label = self._extract_agent_task_label(tool_call)
-        tool = self._extract_agent_tool_name(tool_call)
-        if existing:
-            existing_label = str(existing.get("label") or "").strip()
-            if (
-                existing_label
-                and not self._is_generic_task_label(existing_label)
-                and not is_unhelpful_display_label(existing_label)
-            ):
-                label = existing_label
-            if tool in {"subagent", "子代理"}:
-                tool = str(existing.get("tool") or tool)
-        summary = {
-            **existing,
-            "label": label,
-            "tool": tool,
-            "status": status,
-        }
-        if metadata is not None:
-            summary["sequence"] = metadata.card_sequence
-            if metadata.model_name:
-                summary["model"] = metadata.model_name
-        self._subagent_summaries[task_id] = summary
-
-    @staticmethod
-    def _is_agent_task(tool_call) -> bool:
-        title = str(getattr(tool_call, "title", "") or "").strip().lower()
-        kind = str(getattr(tool_call, "kind", "") or "").strip().lower()
-        content = str(getattr(tool_call, "content", "") or "").strip()
-        source_id = getattr(tool_call, "subagent_source_id", "")
-        if isinstance(source_id, str) and source_id.strip():
-            return True
-        collaboration_tool = getattr(tool_call, "collaboration_tool", "")
-        if isinstance(collaboration_tool, str) and collaboration_tool.strip():
-            return True
-        if kind == "agent" or title in _AGENT_TOOL_TITLES:
-            return True
-        return kind == "other" and "子代理：" in content
-
-    @staticmethod
-    def _is_task_tool(tool_call) -> bool:
-        return str(getattr(tool_call, "title", "") or "").strip().lower() == "task"
-
-    @staticmethod
-    def _extract_agent_task_label(tool_call) -> str:
-        opaque_ids = collect_subagent_opaque_ids(tool_call)
-        path = str(getattr(tool_call, "subagent_path", "") or "").strip()
-        if path:
-            label = path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-            if label:
-                return sanitize_subagent_display_text(
-                    label,
-                    opaque_ids=opaque_ids,
-                    max_chars=60,
-                    fallback="子任务",
-                )
-        return sanitize_subagent_display_text(
-            extract_tool_call_label(
-                tool_call,
-                generic_labels=_GENERIC_TASK_LABELS,
-                fallback="子任务",
-                max_chars=240,
-            ),
-            fallback="子任务",
-            max_chars=60,
-            opaque_ids=opaque_ids,
-        )
-
-    @staticmethod
-    def _is_generic_task_label(value: str) -> bool:
-        return str(value or "").strip().lower() in _GENERIC_TASK_LABELS
-
-    @staticmethod
-    def _extract_agent_tool_name(tool_call) -> str:
-        return extract_agent_tool_name(tool_call)
 
     @classmethod
     def is_agent_task_event(cls, acp_event: ACPEvent) -> bool:
         tool_call = getattr(acp_event, "tool_call", None)
-        return tool_call is not None and cls._is_agent_task(tool_call)
+        return tool_call is not None and is_agent_task(tool_call)
 
     def _finalize_task_session(
         self,
@@ -2078,16 +1514,12 @@ class TaskOrchestrator:
             session = self._sessions.get(resolved_id)
 
         if session is not None:
-            if terminal_status == "failed":
-                event = CardEvent.failed(terminal_summary)
-            elif terminal_status == "cancelled":
-                event = CardEvent.cancelled(
-                    reason=terminal_summary or "subagent_interrupted"
-                )
-            else:
-                event = CardEvent.completed(summary=terminal_summary)
+            if terminal_status == "cancelled" and not terminal_summary:
+                terminal_summary = "subagent_interrupted"
             try:
-                session.dispatch(event)
+                session.dispatch(
+                    self._terminal_event(terminal_status, terminal_summary)
+                )
             except Exception:
                 logger.debug("TaskOrchestrator: failed to finalize task_id=%s", task_id, exc_info=True)
 
@@ -2117,46 +1549,6 @@ class TaskOrchestrator:
             self._finalize_task_session(task_id, status, summary=summary)
         return unfinished
 
-    def finish_with_summary(self, summary: str, *, failed: bool = False) -> None:
-        """Close task cards, then create one fresh final summary card."""
-        if self._closed_event.is_set():
-            return
-        self._closed_event.set()
-
-        self._cancel_broadcast_timer()
-        self._registry.unsubscribe(self._on_registry_status_change)
-
-        with self._lock:
-            self._lifecycle_epoch += 1
-            generation_claims = list(
-                self._subagent_generation_claims.values()
-            )
-            self._subagent_generation_claims.clear()
-            sessions = list(self._sessions.items())
-            bridges = list(self._bridges.values())
-            self._sessions.clear()
-            self._bridges.clear()
-            finalized = set(self._finalized_task_ids)
-
-        for claim in generation_claims:
-            claim.set()
-        self._close_bridges(bridges)
-
-        terminal_event = CardEvent.failed(summary) if failed else CardEvent.completed()
-        for task_id, session in sessions:
-            if task_id in finalized:
-                continue
-            try:
-                self._run_with_timeout(
-                    lambda s=session, e=terminal_event: s.dispatch(e),  # type: ignore[misc]
-                    timeout=5.0,
-                )
-            except Exception:
-                logger.debug("Error closing task session", exc_info=True)
-
-        self._create_final_summary_session(summary, failed=failed)
-        self._fallback_session = None
-        logger.info("TaskOrchestrator: finished with summary for chat_id=%s", self._chat_id)
 
     def _cancel_broadcast_timer(self) -> None:
         with self._lock:
@@ -2172,36 +1564,6 @@ class TaskOrchestrator:
             except Exception:
                 logger.debug("Error closing bridge", exc_info=True)
 
-    def _create_final_summary_session(self, summary: str, *, failed: bool) -> None:
-        if not summary:
-            return
-
-        self._registry.register(
-            task_id=_FINAL_SUMMARY_TASK_ID,
-            name=UI_TEXT["orch_final_summary_task_name"],
-            status="in_progress",
-        )
-        try:
-            session = self._session_creator(_FINAL_SUMMARY_TASK_ID)
-        except Exception:
-            logger.debug("TaskOrchestrator: failed to create final summary session", exc_info=True)
-            return
-
-        snapshot = self._registry.get_snapshot()
-        tasks_payload = [
-            {"task_id": s.task_id, "name": s.name, "status": s.status}
-            for s in snapshot
-        ]
-        session.dispatch(CardEvent.started())
-        session.dispatch(CardEvent(
-            type=CardEventType.TASK_LIST_UPDATED,
-            payload={"tasks": tasks_payload, "current_task_id": _FINAL_SUMMARY_TASK_ID},
-        ))
-        block_id = "_final_summary"
-        session.dispatch(CardEvent.text_started(block_id))
-        session.dispatch(CardEvent.text_delta(block_id, summary))
-        session.dispatch(CardEvent.text_done(block_id))
-        session.dispatch(CardEvent.failed(summary) if failed else CardEvent.completed(summary=summary))
 
     def close(
         self,
@@ -2241,12 +1603,7 @@ class TaskOrchestrator:
             claim.set()
         self._close_bridges(bridges)
 
-        if terminal_status == "failed":
-            terminal_event = CardEvent.failed(summary)
-        elif terminal_status == "cancelled":
-            terminal_event = CardEvent.cancelled(reason=summary or None)
-        else:
-            terminal_event = CardEvent.completed(summary=summary)
+        terminal_event = self._terminal_event(terminal_status, summary)
         for task_id, session in sessions:
             if task_id in finalized:
                 continue

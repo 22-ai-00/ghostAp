@@ -21,9 +21,9 @@ from ..acp.client import (
 from ..acp.models import ACPEvent, ACPEventType, PromptResult
 from ..config import get_settings
 from ..utils.errors import get_error_detail
-from ..utils.retry import RetryPolicy, prompt_with_retry
 from .employee_cli_sandbox import EmployeeCLISandbox
 from .process_cleanup import terminate_and_reap_process_tree
+from .protocol import _PromptRetryMixin
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class ClaudeCLIConfig:
     bypass_permissions: Optional[bool] = None  # None → use config.claude_cli_skip_permissions
 
 
-class SyncClaudeCLISession:
+class SyncClaudeCLISession(_PromptRetryMixin):
     """Claude Code CLI backend.
 
     - Uses `claude -p` (print and exit) per prompt.
@@ -93,11 +93,7 @@ class SyncClaudeCLISession:
         self.is_resumed: bool = False
 
     def describe_agent(self) -> str:
-        try:
-            return f"cmd={self._cfg.command} cwd={self._cwd} backend=cli"
-        except Exception:
-            logger.debug("SyncClaudeCLISession.describe_agent: failed", exc_info=True)
-            return "agent=claude backend=cli"
+        return f"cmd={self._cfg.command} cwd={self._cwd} backend=cli"
 
     def start(self, startup_timeout: float = 60) -> str:
         # No long-running server here; just validate executable and mint a session id.
@@ -150,10 +146,16 @@ class SyncClaudeCLISession:
         )
 
     def _resolve_bypass_permissions(self) -> bool:
-        """Resolve whether to skip Claude permissions (config > explicit)."""
+        """Allow permission bypass only inside the managed employee sandbox."""
         if self._cfg.bypass_permissions is not None:
-            return self._cfg.bypass_permissions
-        return get_settings().claude_cli_skip_permissions
+            requested = self._cfg.bypass_permissions
+        else:
+            requested = get_settings().claude_cli_skip_permissions
+        if requested and self._employee_sandbox is None:
+            raise RuntimeError(
+                "Claude 权限绕过仅允许在受控员工沙箱中使用"
+            )
+        return requested
 
     def send_prompt(
         self,
@@ -344,22 +346,9 @@ class SyncClaudeCLISession:
                     self._proc = proc
                     self._proc_group_id = proc_group_id
 
-        def _is_missing_conversation(err_text: str, out_text: str) -> bool:
-            blob = (err_text or "") + "\n" + (out_text or "")
-            return "No conversation found with session ID" in blob
-
         try:
-            # First try: follow the normal resume/session-id flow
             rc, out, err, state = _run_once(resumed=self.is_resumed)
             media_references.extend((out, err))
-
-            # If resume failed because local conversation doesn't exist, fall back to a fresh session once.
-            if state == "ok" and self.is_resumed and rc != 0 and _is_missing_conversation(err, out):
-                logger.info("[ClaudeCLI] resume failed (missing conversation), fallback to new session")
-                self.session_id = str(uuid.uuid4())
-                self.is_resumed = False
-                rc, out, err, state = _run_once(resumed=False)
-                media_references.extend((out, err))
 
             if state == "cancelled":
                 self.is_resumed = True
@@ -396,23 +385,6 @@ class SyncClaudeCLISession:
                         "[ClaudeCLI] local image artifact discovery failed",
                         exc_info=True,
                     )
-
-    def send_prompt_with_retry(
-        self,
-        text: str,
-        on_event: Optional[Callable[[ACPEvent], None]] = None,
-        timeout: Optional[int] = None,
-        retry_policy: Optional[RetryPolicy] = None,
-        before_retry: Optional[Callable[[int, Exception], None]] = None,
-        total_timeout: Optional[float] = None,
-    ) -> PromptResult:
-        return prompt_with_retry(
-            lambda: self.send_prompt(text, on_event=on_event, timeout=timeout),
-            self._cancel_event,
-            retry_policy=retry_policy,
-            before_retry=before_retry,
-            total_timeout=total_timeout,
-        )
 
     def cancel(self, wait: bool = False, timeout: float = 2.0) -> None:
         """Signal cancellation — the streaming loop will terminate the process."""

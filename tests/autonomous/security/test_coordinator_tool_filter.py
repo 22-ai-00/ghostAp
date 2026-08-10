@@ -7,7 +7,7 @@ import pytest
 from acp.schema import PermissionOption
 
 from src.acp.client import GhostAPClient
-from src.autonomous.team import SessionCoordinatorDecisionProvider
+from src.autonomous.team.coordinator import SessionCoordinatorDecisionProvider
 
 
 class _FilterableDecisionSession:

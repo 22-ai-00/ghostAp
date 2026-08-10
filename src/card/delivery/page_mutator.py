@@ -155,24 +155,11 @@ def _find_element_content(payload: dict, element_id: str | None) -> tuple[bool, 
     return found is not None, found or ""
 
 
-def _has_rendered_body_elements(payload: dict) -> bool:
-    body = payload.get("body") if isinstance(payload, dict) else None
-    elements = body.get("elements") if isinstance(body, dict) else None
-    return isinstance(elements, list) and bool(elements)
-
-
 def _actual_active_text(card: RenderedCard, payload: dict) -> str:
     if card.active_element is None:
         return ""
     found, text = _find_element_content(payload, card.active_element.element_id)
-    if found:
-        return text
-    # Some tests and legacy callers pass skeletal RenderedCard payloads. Real
-    # renderer output has body.elements; only fall back when there is no payload
-    # body to inspect. Guard fallback/truncation cards must not poison last_text.
-    if not _has_rendered_body_elements(payload):
-        return card.active_element.text
-    return ""
+    return text if found else ""
 
 
 def _fallback_invalid_card(reason: str) -> dict:
@@ -274,6 +261,7 @@ class PageMutator:
         reply_to: str | None = None,
         reply_in_thread: bool | None = None,
         source_page_index: int | None = None,
+        finish_streaming: bool = False,
     ) -> "MutationOutcome":
         """Create a new card page via API."""
 
@@ -352,6 +340,16 @@ class PageMutator:
                 is_streaming=stream_open,
                 supports_element_update=stream_open,
             )
+            if stream_open and finish_streaming:
+                binding = self._bindings.get(session_id)
+                page = binding.pages.get(card.page_index) if binding is not None else None
+                if page is not None:
+                    return self.update_page(
+                        session_id,
+                        page,
+                        card,
+                        force_finish_streaming=True,
+                    )
             return MutationOutcome(kind="applied", message=f"created:{message_id}")
         except TransportError as e:
             if e.is_audit_rejected:
@@ -526,13 +524,6 @@ class PageMutator:
         except Exception as exc:
             logger.warning("Card stream finish failed on %s: %s", page.card_id, str(exc))
             return MutationOutcome(kind="reconcile", message="finish:error")
-
-    def finalize_page(self, session_id: str, page: PageBinding) -> None:
-        """Finalize a stale page."""
-        if page.card_id:
-            self._sequences.reset(page.card_id)
-            self._release_cardkit_entity(page.card_id)
-        self._bindings.remove_page(session_id, page.page_index)
 
     def _replace_with_invalid_card_fallback(
         self,

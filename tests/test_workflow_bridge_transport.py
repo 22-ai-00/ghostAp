@@ -11,7 +11,7 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 import pytest
@@ -81,41 +81,6 @@ def test_broken_pipe_sets_done(tmp_path):
         bridge.stop()
 
 
-def test_broken_pipe_run_loop_exits_promptly(tmp_path):
-    """After a BrokenPipeError flags _done, run() should exit promptly
-    rather than blocking for the total timeout."""
-    bridge = _make_bridge(tmp_path)
-    try:
-        proc = _attach_mock_process(bridge)
-        # Provide an executor so that run() doesn't crash on unexpected paths;
-        # we don't actually submit anything.
-        bridge._executor = MagicMock()
-        bridge._executor.shutdown = MagicMock()
-
-        # Arrange: first poll returns None (alive), then _send via some path
-        # triggers BrokenPipeError.  We simulate by directly pre-setting _done
-        # through the _send path — then calling run() which should return/raise
-        # quickly because _done is already True.
-        proc.stdin.write.side_effect = BrokenPipeError("pipe broken")
-        # Trigger broken pipe via _send (as if some writer did this concurrently)
-        bridge._send({"jsonrpc": "2.0", "method": "cancel"})
-
-        assert bridge._done is True
-
-        # run() sees _done True on the first iteration check — wait, actually
-        # while not self._done will exit immediately.  Let's just verify by
-        # calling run() and timing it.
-        start = time.monotonic()
-        with pytest.raises(RuntimeError, match="runtime error"):
-            bridge.run()
-        elapsed = time.monotonic() - start
-        assert elapsed < 2.0, (
-            f"run() should exit promptly after broken pipe (took {elapsed:.2f}s)"
-        )
-    finally:
-        bridge.stop()
-
-
 # ---------------------------------------------------------------------------
 # 2. stop() kills process BEFORE executor.shutdown
 # ---------------------------------------------------------------------------
@@ -129,7 +94,6 @@ def test_stop_kills_process_before_shutdown(tmp_path):
 
     # Use a real ThreadPoolExecutor so we can spy on shutdown ordering
     bridge._executor = ThreadPoolExecutor(max_workers=2)
-    bridge._workflow_executor = ThreadPoolExecutor(max_workers=2)
 
     call_order: list[str] = []
 
@@ -191,7 +155,7 @@ def test_start_sends_deadline_budget_in_init(tmp_path, monkeypatch):
         def readline(self):
             return ""
 
-        def read(self):
+        def read(self, _size=-1):
             return ""
 
         def close(self):
@@ -251,143 +215,6 @@ def test_agent_call_timeout_is_capped_by_remaining_workflow_budget(tmp_path, mon
     assert params["timeout"] == 300
 
 
-def test_ensure_deadline_uses_settings_total_timeout(tmp_path, monkeypatch):
-    """A larger workflow_total_timeout_s from Settings yields a larger deadline."""
-    # Simulate an .env override of 7200s (2h) for complex tasks.
-    monkeypatch.setattr(
-        bridge_mod,
-        "_settings_int",
-        lambda field, fallback: 7200 if field == "workflow_total_timeout_s" else fallback,
-    )
-    monkeypatch.setattr(bridge_mod.time, "monotonic", lambda: 1000.0)
-
-    bridge = _make_bridge(tmp_path)
-    bridge._ensure_workflow_deadline()
-
-    assert bridge._workflow_total_timeout_s == 7200
-    # deadline = started_monotonic (1000) + total_timeout (7200)
-    assert bridge._workflow_deadline_monotonic == 1000.0 + 7200
-    assert (
-        bridge._workflow_deadline_unix_ms - bridge._workflow_started_unix_ms
-        == 7200 * 1000
-    )
-
-
-def test_cap_agent_timeout_uses_settings_fallback_when_unset(tmp_path, monkeypatch):
-    """When JS omits per-call timeout, the Settings default (larger) is used."""
-    monkeypatch.setattr(
-        bridge_mod,
-        "_settings_int",
-        lambda field, fallback: 1200 if field == "workflow_agent_call_timeout_s" else fallback,
-    )
-    monkeypatch.setattr(bridge_mod.time, "monotonic", lambda: 100.0)
-    bridge = _make_bridge(tmp_path)
-    # Plenty of budget so the cap does not clamp the requested value.
-    bridge._workflow_deadline_monotonic = 100.0 + 10_000
-
-    # No explicit "timeout" in params → falls back to settings value (1200).
-    capped = bridge._cap_agent_timeout_to_remaining_budget({"prompt": "x", "tool": "coco"})
-    assert capped["timeout"] == 1200
-
-
-def test_cap_agent_timeout_small_script_value_raised_to_floor(tmp_path, monkeypatch):
-    """A small script-baked per-agent timeout must be raised to the configured
-    floor, not honored verbatim — this is the fix for long agent() calls being
-    killed at the script's tiny timeout."""
-    monkeypatch.setattr(
-        bridge_mod,
-        "_settings_int",
-        lambda field, fallback: 600 if field == "workflow_agent_call_timeout_s" else fallback,
-    )
-    monkeypatch.setattr(bridge_mod.time, "monotonic", lambda: 100.0)
-    bridge = _make_bridge(tmp_path)
-    # Plenty of budget so the cap does not clamp the floor.
-    bridge._workflow_deadline_monotonic = 100.0 + 10_000
-
-    capped = bridge._cap_agent_timeout_to_remaining_budget(
-        {"prompt": "x", "tool": "coco", "timeout": 180}
-    )
-    assert capped["timeout"] == 600, f"expected floor 600, got {capped['timeout']}"
-
-
-def test_cap_agent_timeout_zero_floor_is_unlimited_backstop(tmp_path, monkeypatch):
-    """A configured floor of 0 (unlimited) resolves to the finite backstop when
-    no total deadline caps it."""
-    from src.workflow_engine.constants import AGENT_UNLIMITED_BACKSTOP_S
-
-    monkeypatch.setattr(
-        bridge_mod,
-        "_settings_int",
-        lambda field, fallback: 0 if field == "workflow_agent_call_timeout_s" else fallback,
-    )
-    bridge = _make_bridge(tmp_path)
-    # Unlimited total deadline (remaining budget is None).
-    bridge._workflow_deadline_monotonic = None
-
-    capped = bridge._cap_agent_timeout_to_remaining_budget(
-        {"prompt": "x", "tool": "coco", "timeout": 180}
-    )
-    assert capped["timeout"] == AGENT_UNLIMITED_BACKSTOP_S
-
-
-def test_start_sends_agent_call_timeout_floor_in_init(tmp_path, monkeypatch):
-    """The JS runtime must receive the per-agent timeout floor so its watchdog
-    matches the Python executor instead of the script's small baked value."""
-    monkeypatch.setattr(
-        bridge_mod,
-        "_settings_int",
-        lambda field, fallback: 900 if field == "workflow_agent_call_timeout_s" else fallback,
-    )
-    bridge = _make_bridge(tmp_path)
-    sent_messages: list[dict] = []
-
-    class FakeStream:
-        def __iter__(self):
-            return iter([])
-
-        def readline(self):
-            return ""
-
-        def read(self):
-            return ""
-
-        def close(self):
-            pass
-
-    class FakeProcess:
-        def __init__(self):
-            self.stdin = MagicMock()
-            self.stdout = FakeStream()
-            self.stderr = FakeStream()
-            self.returncode = 0
-
-        def poll(self):
-            return None
-
-        def terminate(self):
-            pass
-
-        def wait(self, timeout=None):
-            return 0
-
-    monkeypatch.setattr(bridge_mod.shutil, "which", lambda name: "/usr/bin/node")
-    monkeypatch.setattr(bridge_mod.subprocess, "Popen", lambda *a, **k: FakeProcess())
-    monkeypatch.setattr(
-        bridge,
-        "_wait_for_notification",
-        lambda method, timeout=30.0: {"jsonrpc": "2.0", "method": "ready"},
-    )
-    monkeypatch.setattr(bridge, "_send", lambda msg: sent_messages.append(msg))
-
-    try:
-        bridge.start()
-    finally:
-        bridge.stop()
-
-    init_msg = next(msg for msg in sent_messages if msg.get("method") == "init")
-    assert init_msg["params"]["agent_call_timeout_s"] == 900
-
-
 def test_ensure_deadline_unlimited_when_total_timeout_zero(tmp_path, monkeypatch):
     """workflow_total_timeout_s <= 0 → no total deadline (unlimited mode).
 
@@ -409,100 +236,8 @@ def test_ensure_deadline_unlimited_when_total_timeout_zero(tmp_path, monkeypatch
     assert bridge._workflow_deadline_unix_ms == 0
     assert bridge._workflow_started_monotonic is not None
     assert bridge._workflow_started_unix_ms is not None
-    # No deadline → remaining budget is None and no rejection happens.
+    # No deadline means per-call timeout resolution is not workflow-capped.
     assert bridge._remaining_workflow_budget_s() is None
-    bridge._send_error_response = MagicMock()
-    assert bridge._reject_if_workflow_budget_exhausted("req-1") is False
-    bridge._send_error_response.assert_not_called()
-
-
-def test_agent_call_rejected_when_no_workflow_budget_remains(tmp_path, monkeypatch):
-    bridge = _make_bridge(tmp_path)
-    monkeypatch.setattr(bridge_mod.time, "monotonic", lambda: 100.0)
-    bridge._workflow_deadline_monotonic = 100.0
-    bridge._send_error_response = MagicMock()
-
-    assert bridge._reject_if_workflow_budget_exhausted("req-1") is True
-    bridge._send_error_response.assert_called_once()
-    assert "deadline" in bridge._send_error_response.call_args.kwargs["message"].lower()
-
-
-def test_handle_agent_call_passes_capped_timeout_to_callback(tmp_path, monkeypatch):
-    seen_timeouts: list[int] = []
-    called = threading.Event()
-
-    def on_agent_call(params, **_kwargs):
-        seen_timeouts.append(params.timeout)
-        called.set()
-        return AgentCallResult(output="ok", tool=params.tool)
-
-    bridge = _make_bridge(tmp_path, max_concurrent=1, on_agent_call=on_agent_call)
-    try:
-        _attach_mock_process(bridge)
-        bridge._executor = ThreadPoolExecutor(max_workers=1)
-        monkeypatch.setattr(bridge_mod.time, "monotonic", lambda: 100.0)
-        bridge._workflow_deadline_monotonic = 160.0
-
-        bridge._handle_agent_call(
-            {"prompt": "late call", "tool": "coco", "timeout": 300},
-            request_id="req-capped",
-        )
-
-        assert called.wait(timeout=2.0)
-        assert seen_timeouts == [int(60.0 - WORKFLOW_TIMEOUT_HEADROOM_S)]
-    finally:
-        bridge.stop()
-
-
-# ---------------------------------------------------------------------------
-# 3. abort_request cancels the corresponding future
-# ---------------------------------------------------------------------------
-
-
-def test_abort_request_cancels_future(tmp_path):
-    """When an 'abort_request' notification arrives from JS, the future
-    registered under that request_id must be cancelled."""
-    bridge = _make_bridge(tmp_path)
-    try:
-        _attach_mock_process(bridge)
-
-        # Register a pending future (not yet running, so cancel() will succeed)
-        fut: Future = Future()
-        req_id = "req-abc-123"
-        with bridge._request_futures_lock:
-            bridge._request_futures[req_id] = fut
-
-        # Dispatch the abort notification like the JS runtime would send it
-        bridge._dispatch_message({
-            "jsonrpc": "2.0",
-            "method": "abort_request",
-            "params": {"request_id": req_id},
-        })
-
-        assert fut.cancelled(), "Future should be cancelled after abort_request"
-        with bridge._request_futures_lock:
-            assert req_id not in bridge._request_futures, (
-                "aborted request_id should be removed from the map"
-            )
-    finally:
-        bridge.stop()
-
-
-def test_abort_request_unknown_id_is_noop(tmp_path):
-    """An abort_request for an unknown request_id must not raise."""
-    bridge = _make_bridge(tmp_path)
-    try:
-        _attach_mock_process(bridge)
-
-        # No future registered for "does-not-exist" — should be a no-op
-        bridge._dispatch_message({
-            "jsonrpc": "2.0",
-            "method": "abort_request",
-            "params": {"request_id": "does-not-exist"},
-        })
-        # No exception => pass
-    finally:
-        bridge.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +412,6 @@ def test_stop_is_idempotent(tmp_path):
     bridge = _make_bridge(tmp_path)
     _attach_mock_process(bridge)
     bridge._executor = ThreadPoolExecutor(max_workers=2)
-    bridge._workflow_executor = ThreadPoolExecutor(max_workers=2)
 
     # First stop
     bridge.stop()
@@ -693,45 +427,6 @@ def test_stop_is_idempotent(tmp_path):
     assert bridge._shutdown_done is True
 
 
-def test_wait_for_workers_drains_futures_after_nonblocking_stop(tmp_path):
-    """The execution owner can turn stop() into a true quiescence barrier."""
-    bridge = _make_bridge(tmp_path)
-    bridge._executor = ThreadPoolExecutor(max_workers=1)
-    bridge._workflow_executor = ThreadPoolExecutor(max_workers=1)
-    worker_started = threading.Event()
-    release_worker = threading.Event()
-    wait_started = threading.Event()
-    wait_done = threading.Event()
-
-    def blocking_worker():
-        worker_started.set()
-        assert release_worker.wait(timeout=2)
-
-    future = bridge._executor.submit(blocking_worker)
-    with bridge._futures_lock:
-        bridge._active_futures.add(future)
-    future.add_done_callback(bridge._discard_future)
-    assert worker_started.wait(timeout=1)
-
-    bridge.stop()
-
-    def wait_for_workers():
-        wait_started.set()
-        bridge.wait_for_workers()
-        wait_done.set()
-
-    waiter = threading.Thread(target=wait_for_workers)
-    waiter.start()
-    assert wait_started.wait(timeout=1)
-    assert not wait_done.wait(timeout=0.05)
-
-    release_worker.set()
-    waiter.join(timeout=1)
-
-    assert not waiter.is_alive()
-    assert wait_done.is_set()
-
-
 def test_start_after_stop_never_spawns_node(tmp_path, monkeypatch):
     """A pre-stopped child bridge must fail before subprocess creation."""
     bridge = _make_bridge(tmp_path)
@@ -745,437 +440,6 @@ def test_start_after_stop_never_spawns_node(tmp_path, monkeypatch):
         bridge.start()
 
     popen.assert_not_called()
-
-
-def test_parent_drain_waits_for_failed_subworkflow_cleanup(
-    tmp_path,
-    monkeypatch,
-):
-    """A child exception cannot let the parent release its run boundary."""
-    template_dir = tmp_path / ".ghostap" / "workflows"
-    template_dir.mkdir(parents=True)
-    (template_dir / "failing-child.js").write_text(
-        'export const meta = {"tools": []};\n',
-        encoding="utf-8",
-    )
-    parent = _make_bridge(tmp_path)
-    parent._workflow_executor = ThreadPoolExecutor(max_workers=1)
-    child_wait_started = threading.Event()
-    release_child = threading.Event()
-    parent_wait_done = threading.Event()
-    child = None
-
-    class FailingChild:
-        def __init__(self, *args, **kwargs):
-            nonlocal child
-            child = self
-            self.stop_called = False
-
-        def start(self):
-            return None
-
-        def run(self):
-            raise RuntimeError("child exploded")
-
-        def stop(self):
-            self.stop_called = True
-
-        def wait_for_workers(self):
-            child_wait_started.set()
-            assert release_child.wait(timeout=2)
-
-    monkeypatch.setattr(bridge_mod, "RuntimeBridge", FailingChild)
-    parent._send = MagicMock()
-    parent._handle_workflow_call(
-        {"name": "failing-child"},
-        request_id="sub-1",
-    )
-    assert child_wait_started.wait(timeout=1)
-
-    def drain_parent():
-        parent.wait_for_workers()
-        parent_wait_done.set()
-
-    waiter = threading.Thread(target=drain_parent)
-    waiter.start()
-    assert not parent_wait_done.wait(timeout=0.05)
-    assert child is not None
-    assert child.stop_called is True
-
-    release_child.set()
-    waiter.join(timeout=1)
-    parent.stop()
-
-    assert not waiter.is_alive()
-    assert parent_wait_done.is_set()
-
-
-# ---------------------------------------------------------------------------
-# 8. Backpressure rejects when active futures exceed pressure cap
-# ---------------------------------------------------------------------------
-
-
-def test_backpressure_rejects_when_overwhelmed(tmp_path):
-    """When active futures count >= pressure_cap (max(2, max_concurrent*2)),
-    _handle_agent_call must send an error response with code -32000 instead
-    of submitting to the executor."""
-    max_concurrent = 4
-    pressure_cap = max(2, max_concurrent * 2)  # = 8
-
-    bridge = _make_bridge(tmp_path, max_concurrent=max_concurrent)
-    _attach_mock_process(bridge)
-
-    # Use a real executor but spy on submit to ensure it's NOT called
-    bridge._executor = ThreadPoolExecutor(max_workers=max_concurrent)
-    try:
-        sent_errors: list[dict] = []
-
-        def fake_send_error(request_id, code, message, structured=None):
-            sent_errors.append({
-                "request_id": request_id,
-                "code": code,
-                "message": message,
-            })
-
-        bridge._send_error_response = fake_send_error
-        real_submit = bridge._executor.submit
-        submit_calls: list = []
-
-        def tracked_submit(*a, **kw):
-            submit_calls.append(1)
-            return real_submit(*a, **kw)
-
-        bridge._executor.submit = tracked_submit
-
-        # Saturate _active_futures to exactly the cap
-        with bridge._futures_lock:
-            for _ in range(pressure_cap):
-                bridge._active_futures.add(Future())
-
-        params = {"prompt": "test", "tool": "coco"}
-        bridge._handle_agent_call(params, request_id="req-42")
-
-        assert len(sent_errors) == 1, "Expected exactly one error response"
-        err = sent_errors[0]
-        assert err["code"] == -32000, f"Expected -32000 backpressure code, got {err['code']}"
-        assert err["request_id"] == "req-42"
-        # Executor.submit must NOT have been called
-        assert len(submit_calls) == 0, (
-            "Executor.submit should not be called when backpressure is active"
-        )
-    finally:
-        bridge.stop()
-
-
-def test_backpressure_allows_when_below_cap(tmp_path):
-    """Sanity check: below pressure cap, the agent call should be submitted
-    normally (we stub the callback to avoid real work)."""
-    max_concurrent = 4
-    pressure_cap = max(2, max_concurrent * 2)  # = 8
-
-    bridge = _make_bridge(tmp_path, max_concurrent=max_concurrent)
-    try:
-        _attach_mock_process(bridge)
-        bridge._executor = MagicMock()
-        mock_future = Future()
-        bridge._executor.submit.return_value = mock_future
-
-        # Add only (cap-1) futures so we are just under the threshold
-        with bridge._futures_lock:
-            for _ in range(pressure_cap - 1):
-                bridge._active_futures.add(Future())
-
-        sent_errors: list[dict] = []
-        bridge._send_error_response = lambda req_id, code, message, structured=None: sent_errors.append(
-            {"code": code}
-        )
-
-        params = {"prompt": "test", "tool": "coco"}
-        bridge._handle_agent_call(params, request_id="req-under")
-
-        assert sent_errors == [], f"Should NOT reject under pressure cap, got errors: {sent_errors}"
-        bridge._executor.submit.assert_called_once()
-    finally:
-        bridge.stop()
-
-
-# ---------------------------------------------------------------------------
-# 9. abort_request sets per-call cancel_event (race loser abort)
-# ---------------------------------------------------------------------------
-
-
-def test_handle_abort_request_sets_per_call_cancel_event(tmp_path):
-    """When _handle_abort_request is called for an in-flight request, the
-    per-call cancel_event stored in _request_cancel_events must be set,
-    allowing the ACP session's send_prompt loop to exit promptly."""
-    bridge = _make_bridge(tmp_path)
-    try:
-        _attach_mock_process(bridge)
-        bridge._executor = MagicMock()
-        # Simulate an already-running future (cancel() returns False)
-        mock_future = MagicMock(spec=Future)
-        mock_future.cancel.return_value = False
-        bridge._executor.submit.return_value = mock_future
-
-        # Register a per-call cancel event as if _handle_agent_call had done it
-        import threading
-        call_cancel = threading.Event()
-        with bridge._request_cancel_events_lock:
-            bridge._request_cancel_events["req-abort-1"] = call_cancel
-        with bridge._request_futures_lock:
-            bridge._request_futures["req-abort-1"] = mock_future
-
-        # Sanity: event is not set yet
-        assert not call_cancel.is_set()
-
-        # Act: simulate the JS runtime sending abort_request
-        bridge._handle_abort_request("req-abort-1")
-
-        # The per-call cancel event must be set
-        assert call_cancel.is_set(), "per-call cancel_event must be set by abort_request"
-        # The event must still be in the map (find-and-set, not pop) — the worker
-        # thread's finally block handles cleanup for running futures.
-        with bridge._request_cancel_events_lock:
-            assert "req-abort-1" in bridge._request_cancel_events, (
-                "cancel_event should remain in map after abort_request for "
-                "already-running futures (worker finally block handles cleanup)"
-            )
-    finally:
-        bridge.stop()
-
-
-def test_handle_agent_call_creates_per_call_cancel_event(tmp_path):
-    """_handle_agent_call must create a per-call cancel_event and store it in
-    _request_cancel_events so that a later abort_request can interrupt it."""
-    bridge = _make_bridge(tmp_path)
-    try:
-        _attach_mock_process(bridge)
-        bridge._executor = MagicMock()
-        mock_future = Future()
-        bridge._executor.submit.return_value = mock_future
-
-        params = {"prompt": "test", "tool": "coco", "label": "agent-x"}
-        bridge._handle_agent_call(params, request_id="req-new-1")
-
-        # Verify per-call cancel event was created and stored
-        with bridge._request_cancel_events_lock:
-            assert "req-new-1" in bridge._request_cancel_events
-            event = bridge._request_cancel_events["req-new-1"]
-            assert hasattr(event, "is_set")
-            assert hasattr(event, "set")
-            assert not event.is_set(), "newly created event must not be set"
-    finally:
-        bridge.stop()
-
-
-def test_agent_aborted_notification_dispatches_callback(tmp_path):
-    """When the JS runtime sends an 'agent_aborted' notification (e.g. from
-    race() loser abort), the on_agent_aborted callback must be invoked with
-    the label, reason, and request_id (as kwarg)."""
-    import threading
-
-    callback_calls = []
-    callback_event = threading.Event()
-
-    def on_agent_aborted(label: str, reason: str, **kwargs) -> None:
-        callback_calls.append((label, reason, kwargs.get("request_id")))
-        callback_event.set()
-
-    bridge = _make_bridge(tmp_path, on_agent_aborted=on_agent_aborted)
-    try:
-        # Simulate incoming 'agent_aborted' notification via _dispatch_message
-        msg = {
-            "jsonrpc": "2.0",
-            "method": "agent_aborted",
-            "params": {"label": "loser-agent", "reason": "race loser", "request_id": 42},
-        }
-        bridge._dispatch_message(msg)
-
-        # Wait briefly for callback (should be synchronous)
-        assert callback_event.wait(timeout=1.0), "on_agent_aborted callback must be invoked"
-        assert len(callback_calls) == 1
-        label, reason, req_id = callback_calls[0]
-        assert label == "loser-agent"
-        assert reason == "race loser"
-        assert req_id == 42
-    finally:
-        bridge.stop()
-
-
-def test_agent_aborted_backward_compat_no_request_id(tmp_path):
-    """agent_aborted notification without request_id must still work
-    (backward compatibility with older JS runtimes)."""
-    import threading
-
-    callback_calls = []
-    callback_event = threading.Event()
-
-    def on_agent_aborted(label: str, reason: str) -> None:
-        callback_calls.append((label, reason))
-        callback_event.set()
-
-    bridge = _make_bridge(tmp_path, on_agent_aborted=on_agent_aborted)
-    try:
-        msg = {
-            "jsonrpc": "2.0",
-            "method": "agent_aborted",
-            "params": {"label": "agent-1", "reason": "aborted"},
-        }
-        bridge._dispatch_message(msg)
-
-        assert callback_event.wait(timeout=1.0)
-        assert len(callback_calls) == 1
-        assert callback_calls[0] == ("agent-1", "aborted")
-    finally:
-        bridge.stop()
-
-
-def test_agent_aborted_without_callback_is_noop(tmp_path):
-    """If on_agent_aborted callback is not configured, the notification is
-    silently ignored (no error, no crash)."""
-    bridge = _make_bridge(tmp_path)  # no on_agent_aborted
-    try:
-        msg = {
-            "jsonrpc": "2.0",
-            "method": "agent_aborted",
-            "params": {"label": "some-agent", "reason": "race"},
-        }
-        # Should not raise
-        bridge._dispatch_message(msg)
-    finally:
-        bridge.stop()
-
-
-def test_abort_request_for_unknown_request_is_safe(tmp_path):
-    """Calling _handle_abort_request for a request_id that doesn't exist
-    must be a no-op (no error, no crash)."""
-    bridge = _make_bridge(tmp_path)
-    try:
-        _attach_mock_process(bridge)
-
-        # Should not raise
-        bridge._handle_abort_request("nonexistent-req-id")
-
-        # Maps should remain empty
-        with bridge._request_cancel_events_lock:
-            assert len(bridge._request_cancel_events) == 0
-        with bridge._request_futures_lock:
-            assert len(bridge._request_futures) == 0
-    finally:
-        bridge.stop()
-
-
-# ---------------------------------------------------------------------------
-# 10. Early abort race condition (abort arrives before worker retrieves event)
-# ---------------------------------------------------------------------------
-
-
-def test_early_abort_still_sets_cancel_event(tmp_path):
-    """If abort_request arrives BEFORE the worker thread retrieves the
-    cancel_event from the dict (the old pop-and-set pattern would lose the
-    signal), the worker must still see a set event and honour the cancellation.
-
-    This is the core regression test for the race() loser cancel bug: the
-    abort notification can arrive so fast that it pops the event before the
-    worker ever reads it, causing the worker to fall back to the global
-    cancel_event and ignore the per-call abort.
-    """
-    import threading
-
-    bridge = _make_bridge(tmp_path)
-    _attach_mock_process(bridge)
-    bridge._executor = ThreadPoolExecutor(max_workers=1)
-
-    worker_seen_event = threading.Event()
-    worker_event_was_set = threading.Event()
-    worker_started = threading.Event()
-    slow_start_barrier = threading.Event()
-
-    def slow_handler(params, *, cancel_event=None, **kwargs):
-        """Simulate a worker that is slow to start checking cancel_event."""
-        worker_started.set()
-        # Wait for main thread to send abort BEFORE we check cancel_event
-        slow_start_barrier.wait(timeout=5.0)
-        # Now check what the worker sees
-        if cancel_event is not None:
-            worker_seen_event.set()
-            if cancel_event.is_set():
-                worker_event_was_set.set()
-        from src.workflow_engine.models import AgentCallResult
-        return AgentCallResult(output="done", tool=params.tool)
-
-    bridge._on_agent_call = slow_handler
-
-    req_id = "req-early-abort"
-    bridge._handle_agent_call(
-        {"prompt": "test", "tool": "coco", "label": "agent-early"},
-        request_id=req_id,
-    )
-
-    # Wait for worker thread to start
-    assert worker_started.wait(timeout=2.0), "Worker thread should start"
-
-    # Now abort BEFORE the worker checks cancel_event
-    bridge._handle_abort_request(req_id)
-
-    # Release the worker to check the event
-    slow_start_barrier.set()
-
-    # Wait for worker to finish and report what it saw
-    assert worker_seen_event.wait(timeout=5.0), (
-        "Worker should have seen a cancel_event (not None)"
-    )
-    assert worker_event_was_set.wait(timeout=2.0), (
-        "Worker should see cancel_event.is_set() == True even though abort "
-        "arrived before the worker retrieved the event from the dict"
-    )
-
-    bridge.stop()
-
-
-def test_abort_of_not_yet_started_future_cleans_up_cancel_event(tmp_path):
-    """When abort_request cancels a future that hasn't started yet, the
-    cancel_event entry must still be cleaned up (since _execute won't run
-    and its finally block won't fire)."""
-    import threading
-
-    bridge = _make_bridge(tmp_path)
-    _attach_mock_process(bridge)
-    # Use a pool with 0 active workers so future stays pending
-    bridge._executor = ThreadPoolExecutor(max_workers=1)
-    # Block the only worker so our test future can't start
-    block_evt = threading.Event()
-    blocker = bridge._executor.submit(block_evt.wait, 30.0)
-
-    try:
-        req_id = "req-pending-future"
-        bridge._handle_agent_call(
-            {"prompt": "test", "tool": "coco", "label": "agent-pend"},
-            request_id=req_id,
-        )
-
-        # Sanity: event is registered
-        with bridge._request_cancel_events_lock:
-            assert req_id in bridge._request_cancel_events
-
-        # Abort before future starts
-        bridge._handle_abort_request(req_id)
-
-        # The cancel_event should be cleaned up (future was cancelled before
-        # running, so _execute never runs and never cleans up)
-        # Give it a brief moment
-        import time as _t
-        _t.sleep(0.1)
-
-        with bridge._request_cancel_events_lock:
-            assert req_id not in bridge._request_cancel_events, (
-                "cancel_event should be cleaned up when abort cancels a "
-                "not-yet-started future"
-            )
-    finally:
-        block_evt.set()
-        blocker.result(timeout=2.0)
-        bridge.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -1217,7 +481,6 @@ def test_race_cancel_real_node_process(tmp_path):
     - on_agent_aborted callback is called with label='slow'
     - Final result is the fast contestant's return value
     """
-    import threading
 
     from src.workflow_engine.models import AgentCallResult
 
@@ -1339,5 +602,255 @@ def test_race_cancel_real_node_process(tmp_path):
             f"Expected result 'fast-wins', got: {result_data!r}"
         )
 
+    finally:
+        bridge.stop()
+
+
+def _run_real_node_workflow(tmp_path, script, on_agent_call, *, max_concurrent=4):
+    import os
+
+    script_path = tmp_path / f"runtime_regression_{time.time_ns()}.js"
+    script_path.write_text(script, encoding="utf-8")
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    bridge = RuntimeBridge(
+        script_path=str(script_path),
+        cwd=project_root,
+        max_concurrent=max_concurrent,
+        on_agent_call=on_agent_call,
+    )
+    try:
+        bridge.start()
+        raw = bridge.run()
+        return json.loads(raw) if raw else None
+    finally:
+        bridge.stop()
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_verify_returns_closed_evidence_ledger(tmp_path):
+    review = {
+        "issues": [
+            {
+                "severity": "major",
+                "description": "Missing rollback handling",
+                "evidence": "The result has no rollback field",
+            }
+        ],
+        "approve": False,
+    }
+
+    def on_agent_call(params, **_kwargs):
+        return AgentCallResult(
+            output=json.dumps(review),
+            parsed=review,
+            tool=params.tool,
+        )
+
+    result = _run_real_node_workflow(
+        tmp_path,
+        """
+export const meta = { name: 'verify-ledger', description: 'verify evidence', phases: [{ title: 'verify', detail: 'review' }] };
+export default async function main() {
+  return verify('candidate', {
+    maxRounds: 1,
+    timeout: 1,
+    verifiers: [{ tool: 'coco', role: 'security-reviewer' }],
+  });
+}
+""",
+        on_agent_call,
+    )
+
+    assert result["accepted"] is False
+    assert result["reviews"] == [
+        {
+            "round": 1,
+            "verifier": "security-reviewer",
+            "approve": False,
+            "issues": review["issues"],
+        }
+    ]
+    assert result["evidence"][0]["evidence"] == "The result has no rollback field"
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_verify_rejects_non_closed_or_empty_evidence(tmp_path):
+    invalid_review = {
+        "issues": [
+            {
+                "severity": "major",
+                "description": "Missing rollback handling",
+                "evidence": "",
+                "unexpected": "must be rejected",
+            }
+        ],
+        "approve": False,
+    }
+
+    def on_agent_call(params, **_kwargs):
+        return AgentCallResult(
+            output=json.dumps(invalid_review),
+            parsed=invalid_review,
+            tool=params.tool,
+        )
+
+    result = _run_real_node_workflow(
+        tmp_path,
+        """
+export const meta = { name: 'verify-closed', description: 'verify schema', phases: [{ title: 'verify', detail: 'review' }] };
+export default async function main() {
+  return verify('candidate', {
+    maxRounds: 1,
+    timeout: 1,
+    verifiers: [{ tool: 'coco', role: 'strict-reviewer' }],
+  });
+}
+""",
+        on_agent_call,
+    )
+
+    assert result["accepted"] is False
+    assert result["reviews"] == []
+    assert result["evidence"] == []
+    assert result["failures"][0]["stage"] == "verify_schema"
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_race_clamps_timeout_to_node_safe_timer(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        bridge_mod,
+        "_settings_int",
+        lambda field, fallback: 0 if field == "workflow_total_timeout_s" else fallback,
+    )
+
+    def on_agent_call(params, **_kwargs):
+        time.sleep(0.05)
+        return AgentCallResult(output="winner", tool=params.tool)
+
+    result = _run_real_node_workflow(
+        tmp_path,
+        """
+export const meta = { name: 'safe-timer', description: 'large timeout', phases: [{ title: 'race', detail: 'run' }] };
+export default async function main() {
+  return race([{ prompt: 'finish', label: 'winner', tool: 'coco' }], { timeout: 2592000 });
+}
+""",
+        on_agent_call,
+    )
+
+    assert result == "winner"
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_race_timeout_merges_failures_before_deadline(tmp_path):
+    def on_agent_call(params, *, cancel_event=None, **_kwargs):
+        if params.label == "early-failure":
+            return AgentCallResult(error="early boom", tool=params.tool)
+        for _ in range(100):
+            if cancel_event is not None and cancel_event.is_set():
+                return AgentCallResult(error="cancelled", tool=params.tool)
+            time.sleep(0.01)
+        return AgentCallResult(output="too late", tool=params.tool)
+
+    result = _run_real_node_workflow(
+        tmp_path,
+        """
+export const meta = { name: 'failure-ledger', description: 'race failures', phases: [{ title: 'race', detail: 'run' }] };
+export default async function main() {
+  return race([
+    { prompt: 'fail now', label: 'early-failure', tool: 'coco' },
+    { prompt: 'wait', label: 'slow', tool: 'coco' },
+  ], { timeout: 0.15 });
+}
+""",
+        on_agent_call,
+        max_concurrent=2,
+    )
+
+    assert result["timeout"] is True
+    assert any(
+        failure.get("index") == 0 and failure.get("error") == "early boom"
+        for failure in result["failures"]
+    )
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_race_timeout_blocks_delayed_function_dispatch(tmp_path):
+    called_labels: list[str] = []
+
+    def on_agent_call(params, *, cancel_event=None, **_kwargs):
+        called_labels.append(params.label or "")
+        if params.label == "blocking":
+            for _ in range(100):
+                if cancel_event is not None and cancel_event.is_set():
+                    return AgentCallResult(error="cancelled", tool=params.tool)
+                time.sleep(0.01)
+        return AgentCallResult(output="late", tool=params.tool)
+
+    result = _run_real_node_workflow(
+        tmp_path,
+        """
+export const meta = { name: 'delayed-race', description: 'cancel delayed calls', phases: [{ title: 'race', detail: 'run' }] };
+export default async function main() {
+  const result = await race([
+    async () => {
+      await new Promise(resolve => setTimeout(resolve, 80));
+      return agent({ prompt: 'must not dispatch', label: 'late', tool: 'coco' });
+    },
+    { prompt: 'block', label: 'blocking', tool: 'coco' },
+  ], { timeout: 0.03 });
+  await new Promise(resolve => setTimeout(resolve, 150));
+  return result;
+}
+""",
+        on_agent_call,
+        max_concurrent=2,
+    )
+
+    assert result["timeout"] is True
+    assert "blocking" in called_labels
+    assert "late" not in called_labels
+
+
+def test_stderr_helpers_bound_single_line_and_total_bytes():
+    line, line_truncated = bridge_mod._clip_utf8("界" * 5000, bridge_mod.STDERR_LINE_MAX_BYTES)
+    assert line_truncated is True
+    assert len(line.encode("utf-8")) <= bridge_mod.STDERR_LINE_MAX_BYTES
+    assert bridge_mod.STDERR_TRUNCATION_MARKER in line
+
+    bounded, total_truncated = bridge_mod._bound_stderr_text(
+        "\n".join("x" * 4000 for _ in range(30))
+    )
+    assert total_truncated is True
+    assert len(bounded.encode("utf-8")) <= bridge_mod.STDERR_TOTAL_MAX_BYTES
+    assert bridge_mod.STDERR_TRUNCATION_MARKER in bounded
+
+
+def test_stderr_drain_reads_only_bounded_remainder(tmp_path):
+    bridge = _make_bridge(tmp_path)
+    try:
+        proc = _attach_mock_process(bridge)
+        proc.stderr.read.return_value = "z" * (bridge_mod.STDERR_TOTAL_MAX_BYTES + 1)
+
+        result = bridge._drain_stderr()
+
+        proc.stderr.read.assert_called_once_with(bridge_mod.STDERR_TOTAL_MAX_BYTES + 1)
+        assert len(result.encode("utf-8")) <= bridge_mod.STDERR_TOTAL_MAX_BYTES
+        assert bridge_mod.STDERR_TRUNCATION_MARKER in result
     finally:
         bridge.stop()

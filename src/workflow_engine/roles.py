@@ -14,7 +14,7 @@ from __future__ import annotations
 SUBAGENT_ENCOURAGEMENT_PROMPT: str = (
     "When a task can be decomposed, always delegate to subagents rather than "
     "doing everything yourself. Each subagent can further spawn its own "
-    "subagents or sub-workflows. When you encounter independent sub-problems "
+    "subagents. When you encounter independent sub-problems "
     "during this task — such as researching a library API, validating a "
     "hypothesis, running a set of tests, or drafting an isolated component — "
     "you are strongly encouraged to delegate them to subagents. Subagents work "

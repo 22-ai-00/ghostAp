@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 
 from src.card.render.budget import RenderBudget
-from src.card.render.payload_truncator import count_tagged_nodes
 from src.card.render.renderer import render_card
+from src.card.shared.truncation import count_tagged_nodes
 from src.card.state.models import CardMetadata, CardState, ContentBlock, HeaderState
 from src.card.state.runtime_stats import RuntimeStats
 

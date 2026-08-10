@@ -384,40 +384,6 @@ def test_router_persists_complete_lifecycle_and_atomic_queue_position(tmp_path: 
     writer.close()
 
 
-def test_router_peek_dequeue_and_finish_follow_router_writer_order(
-    tmp_path: Path,
-) -> None:
-    from tests.autonomous.chaos.test_employee_attempt_recovery import _TraceRLock
-
-    _, writer, ingress, new_router = _stack(tmp_path)
-    router = new_router()
-    acceptance_id = _accept(ingress, 1)
-    assert router.route(acceptance_id).state == "queued"
-    held = {}
-    trace = []
-    router._mutex = _TraceRLock("router", 0, held, trace)  # noqa: SLF001
-    writer._transaction_mutex = _TraceRLock(  # noqa: SLF001
-        "writer",
-        1,
-        held,
-        trace,
-    )
-
-    candidate = router.peek_dispatch_candidate()
-    assert candidate is not None and candidate.record.state == "queued"
-    assert router.state.by_acceptance_id[acceptance_id].state == "queued"
-    grant = router.dequeue()
-    assert grant is not None and grant.record.state == "queued"
-    grant = _commit_dispatch(router, writer, acceptance_id)
-    assert router.finish(acceptance_id, reason_code="completed").state == "terminal"
-
-    acquired_stacks = [item[3] for item in trace if item[1] == "acquire"]
-    assert ("router", "writer") in acquired_stacks
-    assert all(stack[0] != "writer" or len(stack) == 1 for stack in acquired_stacks)
-    ingress.close()
-    writer.close()
-
-
 def test_invalid_router_transition_is_rejected_before_journal_commit(
     tmp_path: Path,
 ) -> None:
@@ -472,7 +438,7 @@ def test_restart_keeps_dispatching_work_fail_closed_without_redispatch(
     restarted = new_router()
 
     assert restarted.state.by_acceptance_id[first].state == "dispatching"
-    assert restarted.dequeue() is None
+    assert restarted.peek_dispatch_candidate() is None
     assert restarted.state.by_acceptance_id[second].state == "queued"
     ingress.close()
     writer.close()
@@ -530,14 +496,14 @@ def test_per_employee_dispatch_is_one_but_another_employee_can_progress(tmp_path
         assert router.route(acceptance_id).state == "queued"
 
     first = _commit_dispatch(router, writer, alpha_1)
-    second = router.dequeue()
+    second = router.peek_dispatch_candidate()
 
     assert first is not None and first.record.acceptance_id == alpha_1
     assert second is not None and second.record.acceptance_id == beta_1
     second = _commit_dispatch(router, writer, beta_1)
-    assert router.dequeue() is None
+    assert router.peek_dispatch_candidate() is None
     router.finish(alpha_1, reason_code="completed")
-    third = router.dequeue()
+    third = router.peek_dispatch_candidate()
     assert third is not None and third.record.acceptance_id == alpha_2
     ingress.close()
     writer.close()
@@ -582,7 +548,6 @@ def test_two_employees_are_isolated_under_team_and_global_queue_limits(
     assert len(rejected) == 1 and rejected[0].agent_id == "agt_alpha"
     queue_full = [record for record in final_records if record.reason_code == "queue_full"]
     assert len(queue_full) == 1 and queue_full[0].agent_id == "agt_beta"
-    assert router.queue_depth(team_id="oc_team") == 2
     ingress.close()
     writer.close()
 
@@ -597,7 +562,6 @@ def test_no_pending_peer_does_not_reserve_shared_capacity(tmp_path: Path) -> Non
     alpha = (_accept(ingress, 1), _accept(ingress, 2))
 
     assert [router.route(item).state for item in alpha] == ["queued", "queued"]
-    assert router.queue_depth() == 2
     ingress.close()
     writer.close()
 
@@ -614,7 +578,6 @@ def test_inactive_pending_peer_does_not_reserve_shared_capacity(tmp_path: Path) 
     _accept(ingress, 3, "agt_beta")
 
     assert [router.route(item).state for item in alpha] == ["queued", "queued"]
-    assert router.queue_depth() == 2
     ingress.close()
     writer.close()
 
@@ -636,7 +599,6 @@ def test_unauthorized_pending_peer_does_not_reserve_shared_capacity(
     assert rejected.state == "terminal"
     assert rejected.reason_code == "requester_denied"
     assert all(router.state.by_acceptance_id[item].state == "queued" for item in alpha)
-    assert router.queue_depth() == 2
     ingress.close()
     writer.close()
 

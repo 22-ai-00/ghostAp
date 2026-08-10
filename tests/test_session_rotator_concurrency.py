@@ -5,7 +5,7 @@ Verifies atomic rotation, close-during-rotate race, and dispatch-after-close.
 
 import threading
 
-from src.card.events import CardEvent, CardEventType
+from src.card.events import CardEventType
 from src.card.session.rotator import SessionRotator
 
 
@@ -22,38 +22,6 @@ class _FakeSession:
 
     def close(self):
         self.closed = True
-
-
-class TestSessionRotatorBasic:
-    """Basic rotator operations."""
-
-    def test_dispatch_forwards_to_current_session(self):
-        """dispatch() forwards events to the current session."""
-        session = _FakeSession()
-        rotator = SessionRotator(session)
-        event = CardEvent(type=CardEventType.TEXT_DELTA, payload={"text": "hi"})
-
-        rotator.dispatch(event)
-
-        assert len(session.dispatched) == 1
-        assert session.dispatched[0] is event
-
-    def test_current_returns_active_session(self):
-        """current property returns the active session."""
-        session = _FakeSession("s1")
-        rotator = SessionRotator(session)
-
-        assert rotator.current is session
-
-    def test_close_is_idempotent(self):
-        """Calling close() multiple times is safe."""
-        session = _FakeSession()
-        rotator = SessionRotator(session)
-
-        rotator.close()
-        rotator.close()
-
-        assert session.closed is True
 
 
 class TestSessionRotatorRotation:
@@ -95,36 +63,6 @@ class TestSessionRotatorRotation:
 class TestSessionRotatorRaceConditions:
     """Concurrent access safety."""
 
-    def test_dispatch_after_close_is_noop(self):
-        """dispatch() after close() does nothing."""
-        session = _FakeSession()
-        rotator = SessionRotator(session)
-        rotator.close()
-
-        event = CardEvent(type=CardEventType.TEXT_DELTA, payload={"text": "late"})
-        rotator.dispatch(event)
-
-        # Session was already closed, dispatched list should be empty
-        assert len(session.dispatched) == 0
-
-    def test_concurrent_dispatches_are_safe(self):
-        """Multiple threads dispatching concurrently don't corrupt state."""
-        session = _FakeSession()
-        rotator = SessionRotator(session)
-        events_per_thread = 100
-        num_threads = 5
-
-        def dispatch_many():
-            for i in range(events_per_thread):
-                rotator.dispatch(CardEvent(type=CardEventType.TEXT_DELTA, payload={"i": i}))
-
-        threads = [threading.Thread(target=dispatch_many) for _ in range(num_threads)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        assert len(session.dispatched) == events_per_thread * num_threads
 
     def test_close_during_rotate_cleans_up_new_session(self):
         """If close() happens during factory(), new session is cleaned up."""
@@ -201,14 +139,3 @@ class TestSessionRotatorRaceConditions:
         # old_session (the initial one) must have been archived by the first rotate
         archived_old = [e for e in old_session.dispatched if e.type == CardEventType.ARCHIVED]
         assert len(archived_old) == 1, "Initial old_session should have received ARCHIVED"
-
-    def test_rotation_count_is_accurate(self):
-        """_rotation_count matches actual successful rotations under concurrency."""
-        old_session = _FakeSession("old")
-        rotator = SessionRotator(old_session)
-        num_rotations = 10
-
-        for i in range(num_rotations):
-            rotator.rotate(lambda: _FakeSession(f"s{i}"))
-
-        assert rotator._rotation_count == num_rotations

@@ -7,7 +7,10 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
-from ...card import CardBuilder
+from ...card.builders.deep import DeepBuilder
+from ...card.builders.diagnostics import DiagnosticsBuilder
+from ...card.builders.project import ProjectBuilder
+from ...card.models import EngineCardState
 from ...card.ui_text import UI_TEXT
 from ...config import SecurityFinding, evaluate_security_posture
 from ...project import context_helper
@@ -87,11 +90,11 @@ class DiagnosticsHandler(BaseHandler):
                 pid = st.spec.project_id or ""
                 groups.setdefault(pid, []).append(st)
 
-            content = CardBuilder.build_task_board_content(
+            content = DiagnosticsBuilder.build_task_board_content(
                 tasks, mode_display, groups=groups, project_manager=self.project_manager
             )
 
-            msg_type, card_content = CardBuilder.build_smart_response_card(
+            msg_type, card_content = ProjectBuilder.build_smart_response_card(
                 project=None,
                 title=UI_TEXT["diag_task_board_title"],
                 content=content,
@@ -113,9 +116,9 @@ class DiagnosticsHandler(BaseHandler):
             return
 
         tasks = self.scheduler.list_tasks(chat_id=chat_id, project_id=project.project_id, include_done=False, limit=30)
-        content = CardBuilder.build_task_board_content(tasks, mode_display)
+        content = DiagnosticsBuilder.build_task_board_content(tasks, mode_display)
 
-        msg_type, card_content = CardBuilder.build_project_response_card(
+        msg_type, card_content = ProjectBuilder.build_project_response_card(
             project,
             UI_TEXT["diag_task_board_title"],
             content,
@@ -271,7 +274,7 @@ class DiagnosticsHandler(BaseHandler):
         entries = DiagnosticsHelper.get_all_engine_statuses(self.ctx, chat_id, include_done=include_done)
 
         project_name = project.project_name if project else ""
-        content = CardBuilder.build_unified_status_content(entries, include_done, project_name)
+        content = DiagnosticsBuilder.build_unified_status_content(entries, include_done, project_name)
 
         # Determine admin status for lock hints
         _is_admin = False
@@ -291,7 +294,7 @@ class DiagnosticsHandler(BaseHandler):
         if security_lines:
             content += "\n\n" + security_lines
 
-        msg_type, card_content = CardBuilder.build_smart_response_card(
+        msg_type, card_content = ProjectBuilder.build_smart_response_card(
             project=project,
             title=UI_TEXT["diag_unified_status_title"],
             content=content,
@@ -314,12 +317,14 @@ class DiagnosticsHandler(BaseHandler):
                 content = self.ctx.progress_reporter.format_status(engine.project)
                 title = UI_TEXT["diag_task_detail_deep_title"]
                 engine_name = engine.engine_name
-                msg_type, card_content = CardBuilder.build_info_card(
-                    project=project,
-                    title=title,
-                    content=content,
-                    engine_name=engine_name,
-                    show_buttons=False,
+                msg_type, card_content = DeepBuilder.build_info_card(
+                    project,
+                    EngineCardState(
+                        title=title,
+                        content=content,
+                        engine_name=engine_name,
+                        show_buttons=False,
+                    ),
                 )
                 self.reply_card(message_id, card_content)
                 return
@@ -333,12 +338,14 @@ class DiagnosticsHandler(BaseHandler):
                 content = self.ctx.spec_reporter.format_status(engine.project)
                 title = UI_TEXT["diag_task_detail_spec_title"]
                 engine_name = engine.engine_name
-                msg_type, card_content = CardBuilder.build_info_card(
-                    project=project,
-                    title=title,
-                    content=content,
-                    engine_name=f"Spec({engine_name})",
-                    show_buttons=False,
+                msg_type, card_content = DeepBuilder.build_info_card(
+                    project,
+                    EngineCardState(
+                        title=title,
+                        content=content,
+                        engine_name=f"Spec({engine_name})",
+                        show_buttons=False,
+                    ),
                 )
                 self.reply_card(message_id, card_content)
                 return
@@ -346,8 +353,8 @@ class DiagnosticsHandler(BaseHandler):
         # Also check scheduler by task_id
         state = self.scheduler.get_state_by_task_id(task_id, chat_id=chat_id)
         if state:
-            content = CardBuilder.build_task_detail_content(state)
-            msg_type, card_content = CardBuilder.build_smart_response_card(
+            content = DiagnosticsBuilder.build_task_detail_content(state)
+            msg_type, card_content = ProjectBuilder.build_smart_response_card(
                 project=project,
                 title=UI_TEXT["diag_task_detail_title"],
                 content=content,
@@ -413,7 +420,7 @@ class DiagnosticsHandler(BaseHandler):
                 ),
             )
 
-        content = CardBuilder.build_diff_report_content(project, from_v, to_v, entries, show_current)
+        content = DiagnosticsBuilder.build_diff_report_content(project, from_v, to_v, entries, show_current)
         return True, content, None
 
     def _submit_diff_report(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
@@ -433,7 +440,7 @@ class DiagnosticsHandler(BaseHandler):
         initial = f"{banner_tpl}\n\n{ref_note}" if ref_note else banner_tpl
         title = UI_TEXT["diag_diff_report_title"]
 
-        _msg_type, card_content = CardBuilder.build_project_response_card(
+        _msg_type, card_content = ProjectBuilder.build_project_response_card(
             project, title, initial, show_buttons=False,
         )
         card_session = self.create_static_card_session(chat_id, reply_to=message_id)
@@ -470,7 +477,7 @@ class DiagnosticsHandler(BaseHandler):
                 try:
                     full_ref = self.format_ref_note(message_id, request_id, run_id=task_ctx.run_id)
                     if card_message_id and full_ref:
-                        _msg_type, _card = CardBuilder.build_project_response_card(
+                        _msg_type, _card = ProjectBuilder.build_project_response_card(
                             project, title, f"{banner_tpl}\n\n{full_ref}", show_buttons=False,
                         )
                         _card_json = json.loads(_card) if isinstance(_card, str) else _card
@@ -483,7 +490,7 @@ class DiagnosticsHandler(BaseHandler):
                     try:
                         progress_tpl = UI_TEXT["diag_diff_generating_progress"]
                         progress_content = f"{progress_tpl.format(step=UI_TEXT['diag_step_parsing'], pct=5)}\n\n{self.format_ref_note(message_id, request_id, run_id=task_ctx.run_id)}"
-                        _msg_type, _card = CardBuilder.build_project_response_card(
+                        _msg_type, _card = ProjectBuilder.build_project_response_card(
                             project, title, progress_content, show_buttons=False,
                         )
                         _card_json = json.loads(_card) if isinstance(_card, str) else _card
@@ -497,7 +504,7 @@ class DiagnosticsHandler(BaseHandler):
                     final_ref = self.format_ref_note(message_id, request_id, run_id=task_ctx.run_id)
                     final = f"❌ {msg}\n\n{final_ref}" if final_ref else f"❌ {msg}"
                     if card_message_id:
-                        _msg_type, _card = CardBuilder.build_project_response_card(
+                        _msg_type, _card = ProjectBuilder.build_project_response_card(
                             project, title, final, show_buttons=False,
                         )
                         _card_json = json.loads(_card) if isinstance(_card, str) else _card
@@ -511,7 +518,7 @@ class DiagnosticsHandler(BaseHandler):
                     try:
                         progress_tpl = UI_TEXT["diag_diff_generating_progress"]
                         progress_content = f"{progress_tpl.format(step=UI_TEXT['diag_step_generating'], pct=80)}\n\n{self.format_ref_note(message_id, request_id, run_id=task_ctx.run_id)}"
-                        _msg_type, _card = CardBuilder.build_project_response_card(
+                        _msg_type, _card = ProjectBuilder.build_project_response_card(
                             project, title, progress_content, show_buttons=False,
                         )
                         _card_json = json.loads(_card) if isinstance(_card, str) else _card
@@ -522,14 +529,14 @@ class DiagnosticsHandler(BaseHandler):
                 final_ref = self.format_ref_note(message_id, request_id, run_id=task_ctx.run_id)
                 final = f"{content}\n\n{final_ref}" if final_ref and final_ref not in content else content
                 if card_message_id:
-                    _msg_type, _card = CardBuilder.build_project_response_card(
+                    _msg_type, _card = ProjectBuilder.build_project_response_card(
                         project, title, final, show_buttons=False,
                         footer=UI_TEXT["diag_diff_usage_footer"],
                     )
                     _card_json = json.loads(_card) if isinstance(_card, str) else _card
                     card_session.send(_card_json)
                 else:
-                    _msg_type, _card = CardBuilder.build_project_response_card(
+                    _msg_type, _card = ProjectBuilder.build_project_response_card(
                         project, title, final, show_buttons=False,
                         footer=UI_TEXT["diag_diff_usage_footer"],
                     )
@@ -544,7 +551,7 @@ class DiagnosticsHandler(BaseHandler):
                 final = f"❌ {msg}\n\n{final_ref}" if final_ref else f"❌ {msg}"
                 try:
                     if card_message_id:
-                        _msg_type, _card = CardBuilder.build_project_response_card(
+                        _msg_type, _card = ProjectBuilder.build_project_response_card(
                             project, title, final, show_buttons=False,
                         )
                         _card_json = json.loads(_card) if isinstance(_card, str) else _card
@@ -565,7 +572,7 @@ class DiagnosticsHandler(BaseHandler):
             try:
                 full_ref = self.format_ref_note(message_id, request_id, run_id=handle.run_id)
                 msg = UI_TEXT["diag_diff_started_banner"]
-                _msg_type, _card = CardBuilder.build_project_response_card(
+                _msg_type, _card = ProjectBuilder.build_project_response_card(
                     project, title, f"{msg}\n\n{full_ref}", show_buttons=False,
                 )
                 _card_json = json.loads(_card) if isinstance(_card, str) else _card
@@ -616,12 +623,12 @@ class DiagnosticsHandler(BaseHandler):
             except Exception:
                 project = None
 
-        content = CardBuilder.build_message_trace_content(data)
+        content = DiagnosticsBuilder.build_message_trace_content(data)
         title = UI_TEXT["diag_trace_title"]
         footer = UI_TEXT["diag_trace_usage_footer"]
 
         if project:
-            msg_type, card_content = CardBuilder.build_project_response_card(
+            msg_type, card_content = ProjectBuilder.build_project_response_card(
                 project,
                 title,
                 content,
@@ -629,7 +636,7 @@ class DiagnosticsHandler(BaseHandler):
                 footer=footer,
             )
         else:
-            msg_type, card_content = CardBuilder.build_smart_response_card(
+            msg_type, card_content = ProjectBuilder.build_smart_response_card(
                 project=None,
                 title=title,
                 content=content,

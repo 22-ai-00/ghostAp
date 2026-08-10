@@ -22,28 +22,3 @@ class ThreadContext:
 
     def touch(self) -> None:
         self.last_active = time.time()
-
-    def to_dict(self) -> dict:
-        return {
-            "thread_root_id": self.thread_root_id,
-            "chat_id": self.chat_id,
-            "project_id": self.project_id,
-            "mode": self.mode,
-            "tool_name": self.tool_name,
-            "model_name": self.model_name,
-            "created_at": self.created_at,
-            "last_active": self.last_active,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> ThreadContext:
-        return cls(
-            thread_root_id=data["thread_root_id"],
-            chat_id=data["chat_id"],
-            project_id=data["project_id"],
-            mode=data.get("mode", "smart"),
-            tool_name=data.get("tool_name"),
-            model_name=data.get("model_name"),
-            created_at=data.get("created_at", time.time()),
-            last_active=data.get("last_active", time.time()),
-        )

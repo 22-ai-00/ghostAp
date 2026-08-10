@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -16,13 +14,11 @@ from ...acp.claude_capabilities import (
 )
 from ...acp.helper import (
     fetch_acp_models,
-    invalidate_acp_model_cache,
     list_acp_tools,
 )
 from ...acp.providers import tool_registry
-from ...card import CardBuilder
-from ...card.actions import dispatch as action_ids
 from ...card.builders.project import ProjectBuilder
+from ...card.builders.system import SystemBuilder
 from ...card.ui_text import UI_TEXT
 from ...coco_model import get_coco_model_manager
 from ...tasking import TaskPriority, TaskSpec
@@ -65,19 +61,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
     def __init__(self, ctx: "HandlerContext") -> None:
         super().__init__(ctx)
         self._init_command_registry()
-        # Pending programming prompts stashed when showing the ACP model-select
-        # card. After the user picks a model and enters the mode, the stashed
-        # prompt is forwarded to the mode handler as the first requirement.
-        # Keyed by f"{chat_id}:{tool_name}".
-        self._pending_prompts: "OrderedDict[str, str]" = OrderedDict()
-        self._PENDING_PROMPTS_MAX_SIZE = 256
-        # ACP model cards can be answered out of order.  Ownership is scoped
-        # to this handler request, never inferred from mutable project choice.
-        self._acp_activation_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
-        self._acp_activation_tokens: dict[str, object] = {}
         self.help_commands = _SystemSubcommands(self, ("show_help", "show_full_help", "handle_help_category", "handle_menu_command"))
         self.shell_commands = _SystemSubcommands(self, ("submit_shell_command", "execute_shell_and_reply", "change_directory"))
-        self.acp_commands = _SystemSubcommands(self, ("handle_acp_command", "handle_select_acp_tool", "handle_select_acp_model", "handle_refresh_acp_models", "handle_model_command"))
         self.lock_commands = _SystemSubcommands(self, ("handle_force_release_repo_lock", "handle_confirm_lock", "handle_cancel_lock", "handle_confirm_force_release", "handle_cancel_force_release"))
 
     @staticmethod
@@ -85,88 +70,24 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         project_id = getattr(project, "project_id", None) if project else None
         return project_id if isinstance(project_id, str) else None
 
-    @staticmethod
-    def _pending_prompt_key(chat_id: str, tool_name: str) -> str:
-        return f"{chat_id}:{(tool_name or '').lower()}"
-
-    def _stash_pending_prompt(self, chat_id: str, tool_name: str, prompt: str) -> None:
-        if not prompt or not chat_id or not tool_name:
-            return
-        key = self._pending_prompt_key(chat_id, tool_name)
-        self._pending_prompts[key] = prompt
-        self._pending_prompts.move_to_end(key)
-        while len(self._pending_prompts) > self._PENDING_PROMPTS_MAX_SIZE:
-            self._pending_prompts.popitem(last=False)
-
-    def _pop_pending_prompt(self, chat_id: str, tool_name: str) -> Optional[str]:
-        if not chat_id or not tool_name:
-            return None
-        key = self._pending_prompt_key(chat_id, tool_name)
-        return self._pending_prompts.pop(key, None)
-
-    @staticmethod
-    def _acp_activation_scope(chat_id: str, project_id: Optional[str]) -> str:
-        return f"{chat_id}:{project_id or '-'}"
-
-    def _claim_acp_activation(self, chat_id: str, project_id: Optional[str]) -> tuple[str, object]:
-        scope = self._acp_activation_scope(chat_id, project_id)
-        token = object()
-        with self._acp_activation_lock:
-            self._acp_activation_tokens[scope] = token
-        return scope, token
-
-    def _owns_acp_activation(self, scope: str, token: object) -> bool:
-        with self._acp_activation_lock:
-            return self._acp_activation_tokens.get(scope) is token
-
-    def _release_acp_activation(self, scope: str, token: object) -> None:
-        with self._acp_activation_lock:
-            if self._acp_activation_tokens.get(scope) is token:
-                del self._acp_activation_tokens[scope]
-
-    def _commit_acp_activation_if_owned(
-        self,
-        scope: str,
-        token: object,
-        project: "ProjectContext",
-        *,
-        tool_name: str,
-        model_name: Optional[str],
-        session_id: str,
-        query_count: int,
-        activate_mode: bool,
-    ) -> bool:
-        """CAS the request token and project commit under one lock boundary."""
-        with self._acp_activation_lock:
-            if self._acp_activation_tokens.get(scope) is not token:
-                return False
-            return bool(self.project_manager.commit_acp_programming_activation(
-                project,
-                tool_name=tool_name,
-                model_name=model_name,
-                session_id=session_id,
-                query_count=query_count,
-                activate_mode=activate_mode,
-            ))
-
     def _init_command_registry(self):
         """Initialize the command dispatch registry."""
         # Exact match handlers: command -> handler_func(message_id, chat_id, text, project)
         self._exact_handlers = {
             "/help": lambda m, c, t, p: self.show_full_help(m, c, p),
             "/帮助": lambda m, c, t, p: self.show_full_help(m, c, p),
-            "/coco": lambda m, c, t, p: self.handle_select_acp_tool(m, c, "coco", project_id=self._project_id(p)),
-            "/enter_coco": lambda m, c, t, p: self.handle_select_acp_tool(m, c, "coco", project_id=self._project_id(p)),
+            "/coco": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "coco", p),
+            "/enter_coco": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "coco", p),
             "/claude": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude", p),
             "/enter_claude": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude", p),
             "/aiden": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "aiden", p),
             "/enter_aiden": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "aiden", p),
-            "/codex": lambda m, c, t, p: self.handle_select_acp_tool(m, c, "codex", project_id=self._project_id(p)),
-            "/enter_codex": lambda m, c, t, p: self.handle_select_acp_tool(m, c, "codex", project_id=self._project_id(p)),
+            "/codex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "codex", p),
+            "/enter_codex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "codex", p),
             "/gemini": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "gemini", p),
             "/enter_gemini": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "gemini", p),
-            "/traex": lambda m, c, t, p: self.handle_select_acp_tool(m, c, "traex", project_id=self._project_id(p)),
-            "/enter_traex": lambda m, c, t, p: self.handle_select_acp_tool(m, c, "traex", project_id=self._project_id(p)),
+            "/traex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "traex", p),
+            "/enter_traex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "traex", p),
             "/exit": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/quit": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_coco": lambda m, c, t, p: self.exit_current_mode(m, c, p),
@@ -192,7 +113,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/project": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/switch": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/new-chat": lambda m, c, t, p: self._handle_new_chat_project_args(m, c, ""),
-            "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, p),
+            "/acp": lambda m, c, t, p: self.handle_acp_command(m, c, t, p),
             "/menu": lambda m, c, t, p: self.handle_menu_command(m, c, p),
             "/tools": lambda m, c, t, p: self.show_tools_list(m, c, p),
             "/tools_status": lambda m, c, t, p: self.show_tools_status(m, c, p),
@@ -210,6 +131,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             ("/tasks", lambda m, c, t, p: self.get_handler("diagnostics").show_task_board(m, c, t, p)),
             ("/diff", lambda m, c, t, p: self.get_handler("diagnostics").show_context_diff(m, c, t, p)),
             ("/trace", lambda m, c, t, p: self.get_handler("diagnostics").show_message_trace(m, c, t, p)),
+            ("/acp", self.handle_acp_command),
             ("/model", self.handle_model_command),
         ]
 
@@ -333,9 +255,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/spec_metrics",
             "/spec_config",
             "/spec_save",
-            "/spec_pause",
-            "/spec_resume",
-            "/spec_recover",
             "/spec_guide",
             "/spec_export",
         }
@@ -470,13 +389,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         # Use the canonical command as the routing key while preserving the
         # original text for handlers that still need it for legacy parsing.
         text_lower = m.command
-
-        # ACP model-select mode enter: /codex, /traex, ...
-        if not m.has_args and text_lower in {"/codex", "/enter_codex", "/traex", "/enter_traex"}:
-            _pid = self._project_id(project)
-            tool = text_lower.rsplit("_", 1)[-1].lstrip("/") if text_lower.startswith("/enter_") else text_lower.lstrip("/")
-            self.handle_select_acp_tool(message_id, chat_id, tool, project_id=_pid)
-            return
 
         if text_lower == "/btw":
             self._handle_btw_command(message_id, chat_id, m, project)
@@ -851,7 +763,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         return None
 
     def handle_menu_command(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
-        msg_type, card_content = CardBuilder.build_command_menu_card(project)
+        msg_type, card_content = SystemBuilder.build_command_menu_card(project)
         self.reply_card(message_id, card_content)
 
     def handle_help_category(
@@ -885,7 +797,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             logger.debug("failed to check admin config", exc_info=True)
             _settings = None
 
-        msg_type, card_content = CardBuilder.build_help_card(
+        msg_type, card_content = SystemBuilder.build_help_card(
             project, category, current_dir, current_mode,
             is_admin=is_admin, lock_enabled=lock_enabled, chat_id=chat_id,
             no_admin_configured=no_admin_configured,
@@ -963,15 +875,85 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         self.reply_error(message_id, UI_TEXT["system_acp_unsupported_tool"].format(tool_name=tool_name))
         return False
 
-    def handle_acp_command(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
-        project_id = project.project_id if project else None
-        current_tool = project.acp_tool_name if project else None
-        tools = list_acp_tools()
-        if not tools:
-            self.reply_error(message_id, UI_TEXT["system_acp_no_available_tools"])
+    def _configuration_project(
+        self,
+        chat_id: str,
+        project: Optional["ProjectContext"],
+    ) -> Optional["ProjectContext"]:
+        if project is not None:
+            return project
+        active = self.project_manager.get_active_project(chat_id)
+        if active is not None:
+            return active
+        try:
+            active, _created = self.project_manager.get_or_create_project_for_path(
+                self.get_working_dir(chat_id), chat_id
+            )
+            return active
+        except Exception:
+            logger.exception("failed to resolve project for ACP configuration")
+            return None
+
+    @staticmethod
+    def _model_names(models: list) -> list[str]:
+        names: list[str] = []
+        for item in models or []:
+            variants = getattr(item, "selection_variants", ()) or ()
+            for candidate in variants or (item,):
+                name = str(
+                    candidate.get("name", "")
+                    if isinstance(candidate, dict)
+                    else getattr(candidate, "name", candidate)
+                ).strip()
+                if name and name not in names:
+                    names.append(name)
+        return names
+
+    def handle_acp_command(
+        self,
+        message_id: str,
+        chat_id: str,
+        text: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Show or atomically update the saved project ACP tool."""
+        project = self._configuration_project(chat_id, project)
+        names = [
+            str(getattr(item, "name", "") or "").strip()
+            for item in list_acp_tools()
+        ]
+        names = [name for name in names if name]
+        current = str(getattr(project, "acp_tool_name", "") or "").strip() or "未设置"
+        parts = (text or "").strip().split(maxsplit=1)
+        requested = parts[1].strip().lower() if len(parts) > 1 else ""
+        if not requested:
+            self.reply_text(
+                message_id,
+                UI_TEXT["system_acp_config_summary"].format(
+                    current=current,
+                    available=" · ".join(f"`{name}`" for name in names) or "无",
+                ),
+            )
             return
-        msg_type, card_content = CardBuilder.build_acp_tool_select_card(tools, project_id, current_tool=current_tool)
-        self.reply_card(message_id, card_content)
+        if requested not in names:
+            self.reply_error(message_id, UI_TEXT["system_acp_unsupported_tool"].format(tool_name=requested))
+            return
+        if project is None:
+            self.reply_error(message_id, UI_TEXT["system_acp_config_save_failed"])
+            return
+        previous_tool = str(getattr(project, "acp_tool_name", "") or "").strip()
+        model_name = getattr(project, "acp_model_name", None) if previous_tool == requested else None
+        if not self.project_manager.commit_acp_configuration(
+            project, tool_name=requested, model_name=model_name
+        ):
+            self.reply_error(message_id, UI_TEXT["system_acp_config_save_failed"])
+            return
+        self.reply_text(
+            message_id,
+            UI_TEXT["system_acp_config_saved"].format(
+                tool=requested, model=model_name or "default"
+            ),
+        )
 
     def _fetch_acp_models(
         self,
@@ -980,102 +962,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         cwd: Optional[str] = None,
         current_model: Optional[str] = None,
     ) -> list:
-        """Thin wrapper around ``fetch_acp_models`` for easier testing.
-
-        Unit tests can monkeypatch this method on ``SystemHandler`` instances
-        without needing to stub the global helper import.
-        """
+        """Fetch the compact model catalog used by the text command."""
         return fetch_acp_models(tool_name, cwd=cwd, current_model=current_model)
-
-    def _show_acp_model_selection_flow(
-        self,
-        *,
-        message_id: str,
-        chat_id: str,
-        tool: str,
-        project_id: Optional[str],
-        cwd: str,
-        current_model: Optional[str],
-        thread_root_id: Optional[str],
-        update_existing: bool = False,
-        model_page: int = 0,
-    ) -> None:
-        """Show ACP model discovery and selection as one progressively patched card."""
-        _, loading_card = CardBuilder.build_acp_model_loading_card(
-            tool,
-            project_id=project_id,
-            thread_root_id=thread_root_id,
-        )
-        progress_message_id: Optional[str] = None
-        if update_existing:
-            if self.update_card(message_id, loading_card):
-                progress_message_id = message_id
-            else:
-                progress_message_id = self.reply_card(message_id, loading_card)
-        else:
-            progress_message_id = self.reply_card(message_id, loading_card)
-
-        models = self._fetch_acp_models(tool, cwd=cwd, current_model=current_model)
-        if not models:
-            _, error_card = CardBuilder.build_acp_model_error_card(
-                tool,
-                project_id=project_id,
-                thread_root_id=thread_root_id,
-            )
-            if progress_message_id and self.update_card(progress_message_id, error_card):
-                return
-            self.reply_error(message_id, UI_TEXT["system_acp_get_models_failed"].format(tool_name=tool))
-            return
-
-        _, model_card = CardBuilder.build_acp_model_cascade_card(
-            models,
-            tool,
-            project_id,
-            current_model=current_model,
-            thread_root_id=thread_root_id,
-        )
-        if progress_message_id and self.update_card(progress_message_id, model_card):
-            return
-        self.reply_card(message_id, model_card)
-
-    def handle_select_acp_tool(
-        self,
-        message_id: str,
-        chat_id: str,
-        tool_name: str,
-        project_id: Optional[str] = None,
-        *,
-        pending_prompt: Optional[str] = None,
-    ):
-        tool = (tool_name or "").strip().lower()
-        if not tool:
-            self.reply_error(message_id, UI_TEXT["system_acp_select_tool_prompt"])
-            return
-
-        project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
-        cwd = (project.root_path if project else None) or self.get_working_dir(chat_id)
-
-        current_model = None
-        if project and getattr(project, "acp_tool_name", "") == tool:
-            current_model = getattr(project, "acp_model_name", None)
-
-        logger.info("[ACP] selecting tool=%s project_id=%s cwd=%s", tool, project_id or "-", cwd)
-
-        # Stash the pending prompt (if provided) so that after the user picks a
-        # model, the mode handler picks it up as the first programming request.
-        if pending_prompt:
-            self._stash_pending_prompt(chat_id, tool, pending_prompt)
-
-        from ...thread import get_current_thread_id
-        self._show_acp_model_selection_flow(
-            message_id=message_id,
-            chat_id=chat_id,
-            tool=tool,
-            project_id=project_id,
-            cwd=cwd,
-            current_model=current_model,
-            thread_root_id=get_current_thread_id(),
-        )
 
     def handle_enter_acp_saved_selection(
         self,
@@ -1101,123 +989,16 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         if project and getattr(project, "acp_tool_name", "") == tool:
             stored_model = getattr(project, "acp_model_name", None)
         model_name = str(stored_model).strip() if stored_model else None
-        if pending_prompt:
-            self._stash_pending_prompt(chat_id, tool, pending_prompt)
-        self.handle_select_acp_model(message_id, chat_id, tool, model_name, project)
-
-    def handle_refresh_acp_models(
-        self,
-        message_id: str,
-        chat_id: str,
-        tool_name: str,
-        project_id: Optional[str] = None,
-        value: Optional[dict] = None,
-    ):
-        tool = (tool_name or "").strip().lower()
-        if not tool:
-            self.reply_error(message_id, UI_TEXT["system_acp_select_tool_prompt"])
-            return
-        project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else self.project_manager.get_active_project(chat_id)
-        cwd = (project.root_path if project else None) or self.get_working_dir(chat_id)
-        current_model = None
-        if project and getattr(project, "acp_tool_name", "") == tool:
-            current_model = getattr(project, "acp_model_name", None)
-        from ...thread import get_current_thread_id
-        thread_root_id = str((value or {}).get("thread_root_id") or "").strip() or get_current_thread_id()
-        try:
-            model_page = int((value or {}).get("model_page", 0) or 0)
-        except (TypeError, ValueError):
-            model_page = 0
-        if "model_page" not in (value or {}):
-            invalidate_acp_model_cache(tool, cwd)
-        self._show_acp_model_selection_flow(
-            message_id=message_id,
-            chat_id=chat_id,
-            tool=tool,
-            project_id=project_id,
-            cwd=cwd,
-            current_model=current_model,
-            thread_root_id=thread_root_id,
-            update_existing=True,
-            model_page=model_page,
-        )
-
-    def handle_acp_model_cascade_select(
-        self,
-        message_id: str,
-        chat_id: str,
-        tool_name: str,
-        project_id: Optional[str] = None,
-        value: Optional[dict] = None,
-    ) -> None:
-        """Re-render the ACP model cascade after a family/profile/effort change.
-
-        This only updates the pending dropdown selection and repaints the card;
-        it does NOT enter the mode. The user must click the final "confirm"
-        button (``SELECT_ACP_MODEL``) to actually commit the model choice.
-
-        The pending group/profile/effort are carried statelessly in the button
-        ``value`` (plus the Feishu-injected ``_option`` for the just-changed
-        dropdown), so no per-chat selection state is stored.
-        """
-        value = value or {}
-        tool = (tool_name or "").strip().lower()
-        if not tool:
-            self.reply_error(message_id, UI_TEXT["system_acp_select_tool_prompt"])
-            return
-
-        action = str(value.get("action") or "")
-        selected = str(value.get("_option") or "").strip()
-
-        pending_group = value.get("model_group")
-        pending_profile = value.get("model_profile")
-        pending_effort = value.get("model_effort")
-        # Apply the just-changed dropdown's new value. Downstream dropdowns
-        # reset so the cascade recomputes their defaults from the new parent.
-        if action == action_ids.SELECT_ACP_MODEL_GROUP:
-            pending_group = selected or pending_group
-            pending_profile = None
-            pending_effort = None
-        elif action == action_ids.SELECT_ACP_MODEL_PROFILE:
-            pending_profile = selected or pending_profile
-            pending_effort = None
-        elif action == action_ids.SELECT_ACP_MODEL_EFFORT:
-            pending_effort = selected or pending_effort
-
-        project = (
-            self.project_manager.get_project_for_chat(project_id, chat_id)
-            if project_id
-            else self.project_manager.get_active_project(chat_id)
-        )
-        cwd = (project.root_path if project else None) or self.get_working_dir(chat_id)
-        current_model = None
-        if project and getattr(project, "acp_tool_name", "") == tool:
-            current_model = getattr(project, "acp_model_name", None)
-
-        from ...thread import get_current_thread_id
-        thread_root_id = str(value.get("thread_root_id") or "").strip() or get_current_thread_id()
-
-        models = self._fetch_acp_models(tool, cwd=cwd, current_model=current_model)
-        if not models:
-            _, error_card = CardBuilder.build_acp_model_error_card(
-                tool, project_id=project_id, thread_root_id=thread_root_id
-            )
-            self.update_card(message_id, error_card)
-            return
-
-        _, model_card = CardBuilder.build_acp_model_cascade_card(
-            models,
+        self._activate_acp_selection(
+            message_id,
+            chat_id,
             tool,
-            project_id,
-            current_model=current_model,
-            thread_root_id=thread_root_id,
-            pending_group=pending_group,
-            pending_profile=pending_profile,
-            pending_effort=pending_effort,
+            model_name,
+            project,
+            pending_prompt=pending_prompt,
         )
-        self.update_card(message_id, model_card)
 
-    def handle_select_acp_model(
+    def _activate_acp_selection(
         self,
         message_id: str,
         chat_id: str,
@@ -1225,7 +1006,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         model_name: Optional[str],
         project: Optional["ProjectContext"] = None,
         *,
-        run_immediately: bool = False,
+        pending_prompt: Optional[str] = None,
     ) -> None:
         tool = (tool_name or "").strip().lower()
         use_default_model = model_name is None
@@ -1255,18 +1036,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         raw_thread_id = get_current_thread_id()
         thread_root_id = raw_thread_id.strip() if isinstance(raw_thread_id, str) and raw_thread_id.strip() else None
         project_id = self._project_id(target_project)
-        activation_scope, activation_token = self._claim_acp_activation(
-            chat_id,
-            project_id,
-        )
-        _, initializing_card = CardBuilder.build_acp_programming_initializing_card(
-            tool,
-            model,
-            project_id=project_id,
-            thread_root_id=thread_root_id,
-        )
-        self.update_card(message_id, initializing_card)
-
         spec = TaskSpec(
             chat_id=chat_id,
             name="activate_acp_model",
@@ -1277,18 +1046,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             priority=TaskPriority.HIGH,
         )
 
-        def _run_activation_impl(_ctx) -> bool:
-            if not self._owns_acp_activation(activation_scope, activation_token):
-                logger.info(
-                    "[ACP] skip stale model activation chat=%s project=%s tool=%s model=%s",
-                    chat_id,
-                    project_id or "-",
-                    tool,
-                    model or "<default>",
-                )
-                self._release_acp_activation(activation_scope, activation_token)
-                return False
-
+        def _run_activation(_ctx) -> bool:
             previous_handler_model = (
                 handler.current_model
                 if handler and hasattr(handler, "current_model")
@@ -1321,24 +1079,10 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                 entered = False
                 failure_reason = safe_error_message(exc)
 
-            # A later selection owns the card and project state. Never let this
-            # older task overwrite it or forward a prompt under the wrong model.
-            if not self._owns_acp_activation(activation_scope, activation_token):
-                self._release_acp_activation(activation_scope, activation_token)
-                return False
-
             if not entered:
                 if handler and hasattr(handler, "current_model"):
                     handler.current_model = previous_handler_model
-                _, failed_card = CardBuilder.build_acp_programming_failed_card(
-                    tool,
-                    model,
-                    failure_reason,
-                    project_id=project_id,
-                    thread_root_id=thread_root_id,
-                )
-                self.update_card(message_id, failed_card)
-                self._release_acp_activation(activation_scope, activation_token)
+                self.reply_error(message_id, failure_reason)
                 return False
 
             if target_project:
@@ -1351,26 +1095,20 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                 if session is None:
                     if handler and hasattr(handler, "current_model"):
                         handler.current_model = previous_handler_model
-                    self._release_acp_activation(activation_scope, activation_token)
+                    self.reply_error(message_id, UI_TEXT["system_acp_activation_failed_safe"])
                     return False
-                try:
-                    committed = self._commit_acp_activation_if_owned(
-                        activation_scope,
-                        activation_token,
-                        target_project,
-                        tool_name=tool,
-                        model_name=model,
-                        session_id=session.session_id,
-                        query_count=session.message_count,
-                        activate_mode=thread_root_id is None,
-                    )
-                except Exception:
-                    self._release_acp_activation(activation_scope, activation_token)
-                    raise
+                committed = self.project_manager.commit_acp_programming_activation(
+                    target_project,
+                    tool_name=tool,
+                    model_name=model,
+                    session_id=session.session_id,
+                    query_count=session.message_count,
+                    activate_mode=thread_root_id is None,
+                )
                 if not committed:
                     if handler and hasattr(handler, "current_model"):
                         handler.current_model = previous_handler_model
-                    self._release_acp_activation(activation_scope, activation_token)
+                    self.reply_error(message_id, UI_TEXT["system_acp_config_save_failed"])
                     return False
                 if not thread_root_id:
                     # Preserve the normal successful-switch cleanup only after
@@ -1383,40 +1121,17 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                     )
                     handler._enter_mode_on_manager(chat_id, project_id=project_id)
 
-            _, ready_card = CardBuilder.build_acp_programming_ready_card(
-                tool,
-                model,
-                project_id=project_id,
-                thread_root_id=thread_root_id,
-            )
-            self.update_card(message_id, ready_card)
-
-            # Project-chat selection may carry the user's first requirement.
-            # The activation task owns the popped value and forwards it once,
-            # only after the selected session is actually ready.
-            pending = self._pop_pending_prompt(chat_id, tool)
-            if pending and handler and hasattr(handler, "handle_message"):
+            if pending_prompt and handler and hasattr(handler, "handle_message"):
                 try:
                     handler.handle_message(
                         message_id,
                         chat_id,
-                        pending,
+                        pending_prompt,
                         target_project,
                     )
                 except Exception:
                     logger.exception("forwarding pending prompt failed after ACP activation")
-            self._release_acp_activation(activation_scope, activation_token)
             return True
-
-        def _run_activation(_ctx) -> bool:
-            try:
-                return _run_activation_impl(_ctx)
-            finally:
-                self._release_acp_activation(activation_scope, activation_token)
-
-        if run_immediately:
-            _run_activation(None)
-            return
 
         try:
             self.scheduler.submit(spec, _run_activation)
@@ -1427,15 +1142,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                 project_id or "-",
                 tool,
             )
-            _, failed_card = CardBuilder.build_acp_programming_failed_card(
-                tool,
-                model,
-                safe_error_message(exc),
-                project_id=project_id,
-                thread_root_id=thread_root_id,
-            )
-            self.update_card(message_id, failed_card)
-            self._release_acp_activation(activation_scope, activation_token)
+            self.reply_error(message_id, safe_error_message(exc))
 
     # ------------------------------------------------------------------
     # /model command — list/switch models for current ACP tool
@@ -1483,66 +1190,69 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         text: str,
         project: Optional["ProjectContext"] = None,
     ) -> None:
-        """Handle /model [list|<name>|switch <name>] command.
-
-        /model              — show model selection card for current ACP tool
-        /model list         — same as above
-        /model <name>       — switch directly to <name>
-        /model switch <name>— same as /model <name>
-        """
-        text_stripped = (text or "").strip()
-        parts = text_stripped.split(None, 2)
-        # parts[0] == "/model" (case-insensitive)
-        subcommand = parts[1].lower() if len(parts) >= 2 else ""
-
-        # Resolve project if not provided
-        if project is None:
-            project = self.project_manager.get_active_project(chat_id)
-
+        """Show or atomically update the saved project model."""
+        parts = (text or "").strip().split(maxsplit=1)
+        requested = parts[1].strip() if len(parts) > 1 else ""
+        project = self._configuration_project(chat_id, project)
         tool_name = self._resolve_current_acp_tool(chat_id, project)
         cwd = (project.root_path if project else None) or self.get_working_dir(chat_id)
-        project_id = project.project_id if project else None
-
         current_model: Optional[str] = None
         if project and getattr(project, "acp_tool_name", "") == tool_name:
             current_model = getattr(project, "acp_model_name", None)
-
-        if subcommand in ("", "list", "ls"):
-            # Show interactive model selection card
-            from ...thread import get_current_thread_id
-            self._show_acp_model_selection_flow(
-                message_id=message_id,
-                chat_id=chat_id,
-                tool=tool_name,
-                project_id=project_id,
+        model_names = self._model_names(
+            self._fetch_acp_models(
+                tool_name,
                 cwd=cwd,
                 current_model=current_model,
-                thread_root_id=get_current_thread_id(),
             )
-            return
-
-        # Direct switch: /model <name> or /model switch <name>
-        if subcommand == "switch":
-            model_name = parts[2].strip() if len(parts) >= 3 else ""
-        else:
-            model_name = parts[1].strip() if len(parts) >= 2 else ""
-
-        if not model_name:
-            self.reply_error(
+        )
+        if not requested:
+            visible = model_names[:12]
+            available = " · ".join(f"`{name}`" for name in visible) or "暂不可用"
+            if len(model_names) > len(visible):
+                available += f" · 另有 {len(model_names) - len(visible)} 个"
+            self.reply_text(
                 message_id,
-                UI_TEXT["system_acp_specify_model_prompt"].format(
-                    example=UI_TEXT["system_model_usage_example"]
+                UI_TEXT["system_model_config_summary"].format(
+                    tool=tool_name,
+                    current=current_model or "default",
+                    available=available,
                 ),
             )
             return
-
-        self.handle_select_acp_model(
-            message_id,
-            chat_id,
-            tool_name,
-            model_name,
+        model_name = None if requested.lower() == "default" else requested
+        if model_name and model_names and model_name not in model_names:
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_acp_unknown_model"].format(model=model_name),
+            )
+            return
+        if (
+            tool_name == "claude"
+            and model_name
+            and is_1m_variant(model_name)
+            and not model_supports_1m(strip_1m_suffix(model_name))
+        ):
+            self.reply_error(
+                message_id,
+                UI_TEXT["system_acp_unsupported_1m_model"].format(
+                    model=strip_1m_suffix(model_name),
+                ),
+            )
+            return
+        if project is None or not self.project_manager.commit_acp_configuration(
             project,
-            run_immediately=True,
+            tool_name=tool_name,
+            model_name=model_name,
+        ):
+            self.reply_error(message_id, UI_TEXT["system_acp_config_save_failed"])
+            return
+        self.reply_text(
+            message_id,
+            UI_TEXT["system_model_config_saved"].format(
+                tool=tool_name,
+                model=model_name or "default",
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1617,7 +1327,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             executor = SandboxExecutor()
             # Smart mode shell execution: disable interactive mode to avoid .bashrc noise and job control errors
             result = executor.execute(cmd, cwd=working_dir, interactive=False, chat_id=chat_id)
-            msg_type, card_content = CardBuilder.build_shell_result_card(
+            msg_type, card_content = SystemBuilder.build_shell_result_card(
                 cmd,
                 result,
                 working_dir,
@@ -1691,7 +1401,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             self.add_reaction(message_id, EmojiReaction.on_dir_changed())
             if project:
                 content = ProjectBuilder.build_project_info_content(project, current_dir)
-                msg_type, card_content = CardBuilder.build_project_response_card(
+                msg_type, card_content = ProjectBuilder.build_project_response_card(
                     project,
                     UI_TEXT["project_dir_info_title"],
                     content,
@@ -1707,7 +1417,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         success, result = self.set_working_dir(chat_id, path)
         if success:
             self.add_reaction(message_id, EmojiReaction.on_dir_changed())
-            card_res = CardBuilder.build_directory_change_card(project, result, success=True)
+            card_res = SystemBuilder.build_directory_change_card(project, result, success=True)
             if card_res:
                 msg_type, card_content = card_res
                 response_id = self.reply_card(message_id, card_content)
@@ -1717,7 +1427,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                 self.reply_text(message_id, fmt.format_dir_change(result, True))
         else:
             self.add_reaction(message_id, EmojiReaction.on_error())
-            card_res = CardBuilder.build_directory_change_card(project, result, success=False)
+            card_res = SystemBuilder.build_directory_change_card(project, result, success=False)
             if card_res:
                 msg_type, card_content = card_res
                 self.reply_card(message_id, card_content)
@@ -1739,7 +1449,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         current_model = manager.get_current_model()
         models = manager.get_models().models
 
-        content = CardBuilder.build_coco_status_content(current_model, models)
+        content = SystemBuilder.build_coco_status_content(current_model, models)
         self.reply_text(message_id, content)
 
     def show_tools_list(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
@@ -1769,7 +1479,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                 }
             )
 
-        msg_type, card = CardBuilder.build_tools_list_card(tools, project)
+        msg_type, card = SystemBuilder.build_tools_list_card(tools, project)
         self.reply_interactive_card(message_id, card, msg_type=msg_type)
 
     def show_tools_status(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
@@ -1871,5 +1581,5 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                         "message_count": int(latest.get("message_count", 0) or 0),
                     }
 
-        msg_type, card = CardBuilder.build_tools_status_card(tools, active_sessions, project)
+        msg_type, card = SystemBuilder.build_tools_status_card(tools, active_sessions, project)
         self.reply_interactive_card(message_id, card, msg_type=msg_type)

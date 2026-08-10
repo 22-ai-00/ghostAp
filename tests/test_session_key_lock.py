@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from src.acp.helper import SessionKeyCodec
 from src.acp.manager import ACPSessionManager
 
 
@@ -61,7 +62,7 @@ def manager():
 
 
 class TestPerKeyLockSerialization:
-    """Concurrent start_session calls for the same key should not leak sessions."""
+    """Concurrent session creation calls for the same key should not leak sessions."""
 
     def test_concurrent_start_session_same_key_no_leak(self, manager):
         """Multiple threads starting session with same key: only one session survives."""
@@ -70,7 +71,7 @@ class TestPerKeyLockSerialization:
 
         def start_thread():
             try:
-                session = manager.start_session("chat1", project_id="proj1")
+                session = manager._create_session("chat1", project_id="proj1")
                 results.append(session)
             except Exception as e:
                 errors.append(e)
@@ -97,7 +98,7 @@ class TestPerKeyLockSerialization:
 
         def start_with_key(key_suffix):
             start_times[key_suffix] = time.monotonic()
-            manager.start_session(f"chat{key_suffix}", project_id=f"proj{key_suffix}")
+            manager._create_session(f"chat{key_suffix}", project_id=f"proj{key_suffix}")
             end_times[key_suffix] = time.monotonic()
 
         threads = [threading.Thread(target=start_with_key, args=(i,)) for i in range(3)]
@@ -116,8 +117,8 @@ class TestPerKeyLockSerialization:
 
     def test_key_lock_cleanup_on_session_end(self, manager):
         """Per-key lock should be cleaned up when session ends."""
-        manager.start_session("chat1", project_id="proj1")
-        key = manager._session_key("chat1", "proj1")
+        manager._create_session("chat1", project_id="proj1")
+        key = SessionKeyCodec.encode("chat1", "proj1")
 
         # The transient start lock reference should be released after start.
         with manager._key_locks_lock:
@@ -151,14 +152,14 @@ class TestPerKeyLockSerialization:
             return sess, sess.session_id, {}
 
         mgr = ACPSessionManager(agent_type="test", session_starter=starter)
-        key = mgr._session_key("chat1", "proj1")
+        key = SessionKeyCodec.encode("chat1", "proj1")
         with mgr._acquire_lock():
             mgr._sessions[key] = FakeSession()
         errors: list[BaseException] = []
 
         def start_replace():
             try:
-                mgr.start_session("chat1", project_id="proj1", startup_timeout=5)
+                mgr._create_session("chat1", project_id="proj1", startup_timeout=5)
             except BaseException as exc:  # pragma: no cover - assertion reports errors
                 errors.append(exc)
 
@@ -177,10 +178,10 @@ class TestPerKeyLockSerialization:
             mgr.cleanup_all()
 
     def test_end_session_does_not_release_start_owned_key_lock_reference(self):
-        """External end_session must not delete a key lock owned by an in-flight start_session."""
+        """External end_session must not delete a key lock owned by an in-flight session creation."""
         FakeSession._instance_count = 0
         mgr = ACPSessionManager(agent_type="test", session_starter=_make_starter(0.01))
-        key = mgr._session_key("chat1", "proj1")
+        key = SessionKeyCodec.encode("chat1", "proj1")
         with mgr._acquire_lock():
             mgr._sessions[key] = FakeSession()
 
@@ -210,7 +211,7 @@ class TestPerKeyLockSerialization:
 
         def do_start():
             try:
-                mgr.start_session("chat1", project_id="proj1", startup_timeout=2)
+                mgr._create_session("chat1", project_id="proj1", startup_timeout=2)
             except BaseException as exc:  # pragma: no cover - assertion reports errors
                 errors.append(exc)
 
@@ -261,16 +262,16 @@ class TestKeyLockExceptionRecovery:
 
             # First call should fail
             with pytest.raises(RuntimeError, match="startup boom"):
-                mgr.start_session("chat1", project_id="proj1")
+                mgr._create_session("chat1", project_id="proj1")
 
             # Second call should succeed (lock was released by finally block)
-            session = mgr.start_session("chat1", project_id="proj1")
+            session = mgr._create_session("chat1", project_id="proj1")
             assert session is not None
         finally:
             mgr.cleanup_all()
 
     def test_start_end_concurrent_no_crash(self):
-        """start_session and end_session called concurrently should not crash or leak."""
+        """session creation and end_session called concurrently should not crash or leak."""
         FakeSession._instance_count = 0
         mgr = ACPSessionManager(
             agent_type="test",
@@ -280,7 +281,7 @@ class TestKeyLockExceptionRecovery:
 
         def do_start():
             try:
-                mgr.start_session("chat1", project_id="proj1")
+                mgr._create_session("chat1", project_id="proj1")
             except Exception as e:
                 errors.append(e)
 
@@ -320,14 +321,14 @@ class TestKeyLockExceptionRecovery:
 
         def start_slow():
             try:
-                mgr.start_session("chat1", project_id="proj1", startup_timeout=10)
+                mgr._create_session("chat1", project_id="proj1", startup_timeout=10)
             except Exception:
                 pass
 
         def start_with_timeout():
             time.sleep(0.1)  # Ensure slow thread acquires lock first
             try:
-                mgr.start_session("chat1", project_id="proj1", startup_timeout=0.3)
+                mgr._create_session("chat1", project_id="proj1", startup_timeout=0.3)
             except TimeoutError as e:
                 errors.append(e)
 
@@ -345,7 +346,7 @@ class TestKeyLockExceptionRecovery:
 
             # Timeout must release the transient key-lock reference so the same
             # user/session key can retry successfully after the busy operation.
-            retry_session = mgr.start_session("chat1", project_id="proj1", startup_timeout=2)
+            retry_session = mgr._create_session("chat1", project_id="proj1", startup_timeout=2)
             assert retry_session is not None
         finally:
             mgr.cleanup_all()

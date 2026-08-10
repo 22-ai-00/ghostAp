@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import traceback
-from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, fields, replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -17,6 +17,8 @@ import pytest
 
 
 def test_replay_dispatches_one_real_team_session(tmp_path, monkeypatch, caplog) -> None:
+    from src.autonomous.gateway.team import DispatchPermitAuthorityError
+
     """EI-ACP-ONCE-01 crosses Ingress, Router, coordinator, and real Team."""
 
     harness = _real_coordinator_harness(tmp_path)
@@ -47,11 +49,16 @@ def test_replay_dispatches_one_real_team_session(tmp_path, monkeypatch, caplog) 
 
     assert len(finalized) == 1 and finalized[0].status.value == "completed"
     assert sum(
-        isinstance(item, harness.dispatch.DispatchPermitAuthorityError)
+        isinstance(item, DispatchPermitAuthorityError)
         for item in outcomes
     ) == 7
-    assert calls == [(prepared.binding.agent_id, prepared.prompt, 600.0)]
-    assert harness.router.dequeue() is None
+    assert len(calls) == 1
+    agent_id, executed_prompt, timeout = calls[0]
+    assert agent_id == prepared.binding.agent_id
+    assert prepared.prompt in executed_prompt
+    assert "## GHOSTAP_EMPLOYEE_BOOTSTRAP" in executed_prompt
+    assert timeout == 600.0
+    assert harness.router.peek_dispatch_candidate() is None
     assert harness.restart().prepare_next() is None
     assert not (
         tmp_path / "team" / "agents" / "agt_alpha" / "execution_history.jsonl"
@@ -127,7 +134,7 @@ def test_completed_gateway_publishes_scoped_memory_summary(tmp_path, monkeypatch
 
 def test_completed_gateway_fails_closed_without_canonical_document_sink(tmp_path) -> None:
     from src.autonomous.gateway.coordinator import EmployeeDispatchError
-    from src.autonomous.ingress.dispatch import (
+    from src.autonomous.gateway.models import (
         GatewayExecutionResult,
         GatewayExecutionStatus,
     )
@@ -150,8 +157,10 @@ def test_completed_gateway_fails_closed_without_canonical_document_sink(tmp_path
     harness.close()
 
 
-def _binding(module):
-    return module.DispatchBinding(
+def _binding():
+    from src.autonomous.gateway.models import DispatchBinding
+
+    return DispatchBinding(
         schema_version=1,
         permit_id="prm_" + "0" * 64,
         attempt_id="att_" + "1" * 64,
@@ -584,8 +593,23 @@ def _real_coordinator_harness(
     root.mkdir()
 
     class _FakeEngine:
-        def run_agent_session(self, agent, prompt, *, timeout=None, env=None):
-            return self._run_acp_session(agent, prompt, timeout=timeout, env=env)
+        def open_employee_session(self, agent, *, env):
+            engine = self
+
+            class _Session:
+                def send_prompt(self, prompt, *, timeout):
+                    output = engine._run_acp_session(
+                        agent, prompt, timeout=timeout, env=env
+                    )
+                    return SimpleNamespace(text=output)
+
+                def is_server_healthy(self):
+                    return True
+
+                def close(self):
+                    return None
+
+            return _Session()
 
         def _run_acp_session(self, _agent, _prompt, *, timeout=None, env=None):
             raise RuntimeError("team runtime engine is not initialized")
@@ -606,7 +630,6 @@ def _real_coordinator_harness(
     channels = _Channels()
     context = _Context()
     coordinator_kwargs = dict(
-        employee_runtime_mode="legacy_one_shot",
         writer=writer,
         hire_service=hire,
         ingress_service=ingress,
@@ -658,10 +681,6 @@ def _real_coordinator_harness(
         context=context,
         team_runtime=runtime,
         acceptance_ids=tuple(acceptance_ids),
-        dispatch=__import__(
-            "src.autonomous.ingress.dispatch",
-            fromlist=["DispatchPermitAuthorityError"],
-        ),
         restart=restart,
         restart_router=restart_router,
         close=close,
@@ -669,13 +688,13 @@ def _real_coordinator_harness(
 
 
 def test_dispatch_permit_is_frozen_and_atomically_one_shot() -> None:
-    from src.autonomous.ingress import dispatch as module
+    from src.autonomous.gateway.models import (
+        DispatchPermit,
+        DispatchPermitConsumedError,
+    )
 
-    assert hasattr(module, "DispatchBinding")
-    assert hasattr(module, "DispatchPermit")
-    assert hasattr(module, "DispatchPermitConsumedError")
-    permit = module.DispatchPermit(
-        binding=_binding(module),
+    permit = DispatchPermit(
+        binding=_binding(),
         prompt="already-budgeted prompt",
         engine=object(),
         agent=object(),
@@ -688,7 +707,7 @@ def test_dispatch_permit_is_frozen_and_atomically_one_shot() -> None:
     def claim() -> str:
         try:
             permit.claim()
-        except module.DispatchPermitConsumedError:
+        except DispatchPermitConsumedError:
             return "rejected"
         return "claimed"
 
@@ -700,13 +719,13 @@ def test_dispatch_permit_is_frozen_and_atomically_one_shot() -> None:
 
 
 def test_binding_profile_schema_fails_closed_but_legacy_identity_defaults() -> None:
-    from src.autonomous.ingress import dispatch as module
+    from src.autonomous.gateway.models import DispatchBinding
     from src.autonomous.workforce.identity import AgentIdentity
 
-    legacy_binding = _binding(module).to_dict()
+    legacy_binding = _binding().to_dict()
     legacy_binding.pop("profile")
     with pytest.raises(ValueError, match="exact schema"):
-        module.DispatchBinding.from_dict(legacy_binding)
+        DispatchBinding.from_dict(legacy_binding)
 
     identity = AgentIdentity.from_dict(
         {"agent_id": "legacy_agent", "agent_type": "codex", "model_name": "gpt-5"}
@@ -718,11 +737,11 @@ def test_binding_profile_schema_fails_closed_but_legacy_identity_defaults() -> N
 def test_dispatch_binding_allows_empty_capability_set_and_carries_full_authority() -> None:
     """Deny-all is valid and the anchored binding carries every replay coordinate."""
 
-    from src.autonomous.ingress import dispatch as module
+    from src.autonomous.gateway.models import DispatchBinding
 
-    binding = replace(_binding(module), permissions=())
+    binding = replace(_binding(), permissions=())
     assert binding.permissions == ()
-    field_names = {item.name for item in fields(module.DispatchBinding)}
+    field_names = {item.name for item in fields(DispatchBinding)}
     assert {
         "permit_id",
         "employee_version",
@@ -741,10 +760,8 @@ def test_dispatch_binding_allows_empty_capability_set_and_carries_full_authority
 
 
 def test_dispatch_permissions_are_canonical_and_deny_all_is_valid() -> None:
-    from src.autonomous.ingress import dispatch as module
-
     binding = replace(
-        _binding(module),
+        _binding(),
         permissions=("shell", "file_read", "file_write"),
     )
     assert binding.permissions == ("file_read", "file_write", "shell")
@@ -752,10 +769,8 @@ def test_dispatch_permissions_are_canonical_and_deny_all_is_valid() -> None:
 
 
 def test_dispatch_binding_preserves_root_message_and_zero_version_contracts() -> None:
-    from src.autonomous.ingress import dispatch as module
-
     binding = replace(
-        _binding(module),
+        _binding(),
         thread_id="",
         employee_version=0,
         constraints_digest="",
@@ -769,60 +784,9 @@ def test_dispatch_binding_preserves_root_message_and_zero_version_contracts() ->
     assert replace(binding, thread_root_id="").thread_root_id == ""
 
 
-def test_forged_or_reconstructed_permit_requires_gateway_issuance() -> None:
-    """A copied dataclass cannot become a second execution capability."""
-
-    from src.autonomous.ingress import dispatch as module
-
-    assert hasattr(module, "EmployeeTeamGateway")
-    assert hasattr(module.EmployeeTeamGateway, "issue_permit")
-    assert hasattr(module.EmployeeTeamGateway, "execute_permit")
-
-    from src.autonomous.workforce.identity import AgentIdentity
-
-    class _Engine:
-        def __init__(self):
-            self.calls = 0
-
-        def run_agent_session(self, agent, prompt, *, timeout, env):
-            del agent, prompt, timeout, env
-            self.calls += 1
-            return "done"
-
-    binding = _binding(module)
-    agent = AgentIdentity(
-        agent_id=binding.agent_id,
-        agent_type=binding.tool,
-        model_name=_runtime_model(binding),
-        model_profile=binding.profile,
-        reasoning_effort=binding.effort,
-        permissions=list(binding.permissions),
-        security_profile="employee_v1",
-    )
-    engine = _Engine()
-    gateway = module.EmployeeTeamGateway(runtime_mode="legacy_one_shot")
-    permit = gateway.issue_permit(
-        binding=binding,
-        prompt="budgeted",
-        engine=engine,
-        agent=agent,
-        timeout_seconds=30,
-        env={"HOME": "/tmp/employee", "PATH": "/usr/bin"},
-    )
-    forged = replace(permit)
-    with pytest.raises(module.DispatchPermitAuthorityError):
-        gateway.execute_permit(forged)
-    result = gateway.execute_permit(permit)
-    assert result.status.value == "completed"
-    assert engine.calls == 1
-    with pytest.raises(module.DispatchPermitAuthorityError):
-        gateway.execute_permit(permit)
-    with pytest.raises(TypeError):
-        permit.env["HOME"] = "/tmp/forged"  # type: ignore[index]
-
 
 def test_actor_gateway_reuses_session_and_never_falls_back(tmp_path) -> None:
-    from src.autonomous.ingress import dispatch as module
+    from src.autonomous.gateway.team import EmployeeTeamGateway
     from src.autonomous.runtime.employee_supervisor import EmployeeRuntimeSupervisor
     from src.autonomous.workforce.identity import AgentIdentity
 
@@ -865,11 +829,10 @@ def test_actor_gateway_reuses_session_and_never_falls_back(tmp_path) -> None:
     engine = _Engine()
     (tmp_path / "project").mkdir()
     supervisor = EmployeeRuntimeSupervisor()
-    gateway = module.EmployeeTeamGateway(
-        runtime_mode="actor",
+    gateway = EmployeeTeamGateway(
         runtime_supervisor=supervisor,
     )
-    first_binding = _binding(module)
+    first_binding = _binding()
     agent = AgentIdentity(
         agent_id=first_binding.agent_id,
         agent_type=first_binding.tool,
@@ -908,205 +871,6 @@ def test_actor_gateway_reuses_session_and_never_falls_back(tmp_path) -> None:
     gateway.close()
 
 
-def test_shadow_gateway_audits_actor_input_without_second_model_call(tmp_path) -> None:
-    from src.autonomous.ingress import dispatch as module
-    from src.autonomous.runtime.employee_session import EmployeeSessionBootstrap
-    from src.autonomous.workforce.identity import AgentIdentity
-
-    workspace = tmp_path / "employee" / "workspace"
-    workspace.mkdir(parents=True)
-    (workspace / "AGENTS.md").write_text("# Atlas identity\n", encoding="utf-8")
-    (tmp_path / "project").mkdir()
-    observations = []
-
-    class _Engine:
-        root_path = str(tmp_path / "project")
-
-        def __init__(self):
-            self.calls = 0
-
-        def run_agent_session(self, _agent, _prompt, **_kwargs):
-            self.calls += 1
-            return "legacy-result"
-
-        def preview_employee_session_prompt(self, employee, prompt):
-            return EmployeeSessionBootstrap.from_agent(
-                tenant_key="employee",
-                agent=employee,
-                project_root=self.root_path,
-                identity_version=0,
-            ).wrap_prompt(prompt)
-
-    binding = _binding(module)
-    agent = AgentIdentity(
-        agent_id=binding.agent_id,
-        agent_type=binding.tool,
-        model_name=_runtime_model(binding),
-        model_profile=binding.profile,
-        reasoning_effort=binding.effort,
-        permissions=list(binding.permissions),
-        capabilities=list(binding.capabilities),
-        security_profile="employee_v1",
-        workspace_path=str(workspace),
-    )
-    engine = _Engine()
-    gateway = module.EmployeeTeamGateway(
-        runtime_mode="shadow",
-        shadow_observer=observations.append,
-    )
-    permit = gateway.issue_permit(
-        binding=binding,
-        prompt="inspect this task",
-        engine=engine,
-        agent=agent,
-        timeout_seconds=30,
-        env={"PATH": "/usr/bin"},
-    )
-
-    result = gateway.execute_permit(permit)
-
-    assert result.output == "legacy-result"
-    assert engine.calls == 1
-    assert [item["stage"] for item in observations] == ["input", "terminal"]
-    assert observations[0]["input_match"] is True
-    assert observations[0]["context_snapshot_hash"] == binding.context_snapshot_hash
-    assert "inspect this task" not in str(observations)
-    assert observations[1]["output_digest"]
-
-
-def test_shadow_gateway_reports_real_legacy_prompt_drift(tmp_path) -> None:
-    from src.autonomous.ingress import dispatch as module
-    from src.autonomous.workforce.identity import AgentIdentity
-
-    workspace = tmp_path / "employee" / "workspace"
-    workspace.mkdir(parents=True)
-    (workspace / "AGENTS.md").write_text("# Atlas identity\n", encoding="utf-8")
-    (tmp_path / "project").mkdir()
-    observations = []
-
-    class _Engine:
-        root_path = str(tmp_path / "project")
-
-        def preview_employee_session_prompt(self, _employee, prompt):
-            return f"legacy-drift:{prompt}"
-
-        def run_agent_session(self, _agent, _prompt, **_kwargs):
-            return "legacy-result"
-
-    binding = _binding(module)
-    agent = AgentIdentity(
-        agent_id=binding.agent_id,
-        agent_type=binding.tool,
-        model_name=_runtime_model(binding),
-        model_profile=binding.profile,
-        reasoning_effort=binding.effort,
-        permissions=list(binding.permissions),
-        capabilities=list(binding.capabilities),
-        security_profile="employee_v1",
-        workspace_path=str(workspace),
-    )
-    gateway = module.EmployeeTeamGateway(
-        runtime_mode="shadow",
-        shadow_observer=observations.append,
-    )
-    permit = gateway.issue_permit(
-        binding=binding,
-        prompt="inspect this task",
-        engine=_Engine(),
-        agent=agent,
-        timeout_seconds=30,
-        env={"PATH": "/usr/bin"},
-    )
-
-    gateway.execute_permit(permit)
-
-    assert observations[0]["stage"] == "input"
-    assert observations[0]["input_match"] is False
-    assert observations[0]["legacy_input_digest"] != observations[0]["actor_input_digest"]
-
-
-def test_issued_permit_executes_a_frozen_agent_snapshot() -> None:
-    from src.autonomous.ingress import dispatch as module
-    from src.autonomous.workforce.identity import AgentIdentity
-
-    binding = _binding(module)
-    original = AgentIdentity(
-        agent_id=binding.agent_id,
-        agent_type=binding.tool,
-        model_name=_runtime_model(binding),
-        model_profile=binding.profile,
-        reasoning_effort=binding.effort,
-        permissions=list(binding.permissions),
-        security_profile="employee_v1",
-    )
-    observed = {}
-
-    class _Engine:
-        def run_agent_session(self, agent, prompt, *, timeout, env):
-            del prompt, timeout, env
-            observed["agent"] = agent
-            return "done"
-
-    gateway = module.EmployeeTeamGateway(runtime_mode="legacy_one_shot")
-    permit = gateway.issue_permit(
-        binding=binding,
-        prompt="budgeted",
-        engine=_Engine(),
-        agent=original,
-        timeout_seconds=30,
-        env={"HOME": "/tmp/employee"},
-    )
-    original.agent_id = "agt_attacker"
-    original.permissions.append("shell")
-
-    assert isinstance(permit.agent, module.AgentExecutionSpec)
-    assert gateway.execute_permit(permit).status is module.GatewayExecutionStatus.COMPLETED
-    assert observed["agent"].agent_id == binding.agent_id
-    assert observed["agent"].permissions == list(binding.permissions)
-
-
-@pytest.mark.parametrize(
-    ("outcome", "expected"),
-    [
-        ("done", "completed"),
-        (None, "failed"),
-        (TimeoutError(), "timeout"),
-        (CancelledError(), "canceled"),
-        ("action_required", "action_required"),
-    ],
-)
-def test_gateway_maps_all_five_terminal_statuses(outcome, expected) -> None:
-    from src.autonomous.ingress import dispatch as module
-    from src.autonomous.workforce.identity import AgentIdentity
-
-    binding = _binding(module)
-
-    class _Engine:
-        def run_agent_session(self, *_args, **_kwargs):
-            if outcome == "action_required":
-                raise module.EmployeeActionRequiredError
-            if isinstance(outcome, BaseException):
-                raise outcome
-            return outcome
-
-    gateway = module.EmployeeTeamGateway(runtime_mode="legacy_one_shot")
-    permit = gateway.issue_permit(
-        binding=binding,
-        prompt="budgeted",
-        engine=_Engine(),
-        agent=AgentIdentity(
-            agent_id=binding.agent_id,
-                agent_type=binding.tool,
-                model_name=_runtime_model(binding),
-                model_profile=binding.profile,
-                reasoning_effort=binding.effort,
-            permissions=list(binding.permissions),
-            security_profile="employee_v1",
-        ),
-        timeout_seconds=30,
-        env={"HOME": "/tmp/employee"},
-    )
-    assert gateway.execute_permit(permit).status.value == expected
 
 
 def test_router_candidate_is_not_transitioned_before_coordinator_commit() -> None:
@@ -1123,7 +887,10 @@ def test_context_prompt_uses_only_budgeted_layers_in_strict_order() -> None:
         ContextLayer,
         ContextMessage,
     )
-    from src.autonomous.ingress import dispatch as module
+    from src.autonomous.gateway.context_prompt import (
+        RENDER_CONTRACT_DIGEST,
+        render_employee_context,
+    )
 
     def message(message_id, text):
         return ContextMessage(
@@ -1156,12 +923,12 @@ def test_context_prompt_uses_only_budgeted_layers_in_strict_order() -> None:
         system_prompt_tokens_reserved=128,
     )
 
-    rendered = module.render_employee_context(snapshot)
+    rendered = render_employee_context(snapshot)
     payload = json.loads(rendered.prompt.removeprefix("## UNTRUSTED_CONTEXT_JSON\n"))
     assert list(payload) == ["thread", "recent_group", "l1_memory", "l2_group_memory"]
     assert payload["thread"][0]["text"] == "thread body"
     assert payload["recent_group"][0]["text"] == "group body"
-    assert rendered.render_contract_digest == module.RENDER_CONTRACT_DIGEST
+    assert rendered.render_contract_digest == RENDER_CONTRACT_DIGEST
     assert rendered.context_snapshot_hash == snapshot.snapshot_hash
     assert "thread body" in rendered.prompt and "l2 body" in rendered.prompt
 
@@ -1288,7 +1055,7 @@ def test_local_employee_environment_delegates_only_traex_auth_source(
 ) -> None:
     from unittest.mock import patch
 
-    from src.autonomous.gateway import env_scope
+    import src.autonomous.gateway.env_scope as env_scope
     from src.autonomous.gateway.env_scope import EmployeeEnvironmentAuthority
 
     authority = EmployeeEnvironmentAuthority(
@@ -1358,9 +1125,9 @@ def test_environment_provider_failure_is_fail_closed_and_secret_free(
 
 
 def test_environment_material_is_frozen_and_identity_bound() -> None:
-    from src.autonomous.ingress import dispatch
+    from src.autonomous.gateway.env_scope import EmployeeProcessEnvironmentMaterial
 
-    material = dispatch.EmployeeProcessEnvironmentMaterial(
+    material = EmployeeProcessEnvironmentMaterial(
         tenant_key="tenant_1",
         agent_id="agt_alpha",
         employee_version=1,
@@ -1382,12 +1149,13 @@ def test_coordinator_rejects_unbound_environment_material_without_leak(
     tmp_path,
     caplog,
 ) -> None:
-    from src.autonomous.ingress import dispatch
+    from src.autonomous.gateway.coordinator import EmployeeDispatchError
+    from src.autonomous.gateway.env_scope import EmployeeProcessEnvironmentMaterial
 
     harness = _real_coordinator_harness(tmp_path)
     secret = "peer-employee-secret-never-log"
     harness.coordinator._environment_provider = lambda _identity: (  # noqa: SLF001
-        dispatch.EmployeeProcessEnvironmentMaterial(
+        EmployeeProcessEnvironmentMaterial(
             tenant_key="tenant_1",
             agent_id="agt_peer",
             employee_version=1,
@@ -1396,7 +1164,7 @@ def test_coordinator_rejects_unbound_environment_material_without_leak(
             credential_env={"OPENAI_API_KEY": secret},
         )
     )
-    with pytest.raises(dispatch.EmployeeDispatchError, match="environment authority"):
+    with pytest.raises(EmployeeDispatchError, match="environment authority"):
         harness.coordinator.prepare_next()
     journal = json.dumps(
         [[event.to_dict() for event in frame.events] for frame in harness.writer.replay()]
@@ -1718,7 +1486,7 @@ def test_expired_team_assignment_never_reaches_acp(tmp_path, monkeypatch) -> Non
 def test_team_attempt_result_preserves_all_gateway_terminals_at_one_projection_head(
     tmp_path, status_name, safe_error, expected_error
 ) -> None:
-    from src.autonomous.ingress.dispatch import (
+    from src.autonomous.gateway.models import (
         GatewayExecutionResult,
         GatewayExecutionStatus,
     )
@@ -1752,7 +1520,7 @@ def test_team_attempt_result_retries_head_change_without_success_downgrade(
     tmp_path,
     monkeypatch,
 ) -> None:
-    from src.autonomous.ingress.dispatch import (
+    from src.autonomous.gateway.models import (
         GatewayExecutionResult,
         GatewayExecutionStatus,
     )
@@ -1799,7 +1567,7 @@ def test_team_attempt_result_fails_closed_on_authenticated_history_read_failure(
     tmp_path,
     monkeypatch,
 ) -> None:
-    from src.autonomous.ingress.dispatch import (
+    from src.autonomous.gateway.models import (
         GatewayExecutionResult,
         GatewayExecutionStatus,
     )
@@ -1986,46 +1754,6 @@ def test_context_retry_fractional_delay_is_not_truncated(tmp_path) -> None:
     harness.close()
 
 
-def test_legacy_context_retry_replays_immediately_eligible_then_emits_v2(
-    tmp_path,
-) -> None:
-    from datetime import UTC, datetime
-
-    from src.autonomous.journal.frame import JournalEvent
-
-    harness = _real_coordinator_harness(tmp_path)
-    acceptance_id = harness.acceptance_ids[0]
-    record = harness.router.state.by_acceptance_id[acceptance_id]
-    legacy = JournalEvent(
-        event_type="employee.ingress.router_context_retry",
-        aggregate_id=record.aggregate_id,
-        payload={"acceptance_id": acceptance_id, "failure_count": 1},
-    )
-    with harness.writer.transaction_guard():
-        last = harness.writer.get_last_frame()
-        harness.writer.commit(
-            (legacy,),
-            harness.writer.get_aggregate_versions((record.aggregate_id,)),
-            expected_head_sequence=last.sequence,
-            expected_head_hash=last.frame_hash,
-        )
-
-    rebuilt = harness.restart_router()
-    replayed = rebuilt.state.by_acceptance_id[acceptance_id]
-    assert replayed.context_failures == 1
-    assert replayed.next_eligible_at == ""
-    rebuilt._clock = lambda: datetime(2026, 7, 14, tzinfo=UTC)  # noqa: SLF001
-    rebuilt.defer_dispatch_candidate(acceptance_id)
-
-    event = tuple(harness.writer.replay())[-1].events[0]
-    assert set(event.payload) == {
-        "acceptance_id",
-        "failure_count",
-        "next_eligible_at",
-    }
-    harness.close()
-
-
 def test_candidate_pass_samples_one_utc_now_for_all_records(tmp_path) -> None:
     from datetime import UTC, datetime, timedelta
 
@@ -2052,10 +1780,13 @@ def test_candidate_pass_samples_one_utc_now_for_all_records(tmp_path) -> None:
 
 
 def test_gateway_rejects_capability_binding_mismatch() -> None:
-    from src.autonomous.ingress import dispatch as module
+    from src.autonomous.gateway.team import (
+        DispatchPermitAuthorityError,
+        EmployeeTeamGateway,
+    )
     from src.autonomous.workforce.identity import AgentIdentity
 
-    binding = replace(_binding(module), capabilities=("shell",))
+    binding = replace(_binding(), capabilities=("shell",))
     agent = AgentIdentity(
         agent_id=binding.agent_id,
         agent_type=binding.tool,
@@ -2064,8 +1795,8 @@ def test_gateway_rejects_capability_binding_mismatch() -> None:
         capabilities=[],
         security_profile="employee_v1",
     )
-    with pytest.raises(module.DispatchPermitAuthorityError, match="mismatch"):
-        module.EmployeeTeamGateway(runtime_mode="legacy_one_shot").issue_permit(
+    with pytest.raises(DispatchPermitAuthorityError, match="mismatch"):
+        EmployeeTeamGateway(runtime_supervisor=object()).issue_permit(
             binding=binding,
             prompt="budgeted",
             engine=object(),

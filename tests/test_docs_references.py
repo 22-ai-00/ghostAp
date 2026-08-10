@@ -90,7 +90,7 @@ def test_readme_card_tree_documents_current_pipeline_directories() -> None:
     ):
         assert f"│   │   ├── {directory}" in text
 
-    old_card_summary = "CardBuilder（schema 2.0）" + "+ 流式更新 + 统一布局"
+    old_card_summary = "卡片构建器（schema 2.0）" + "+ 流式更新 + 统一布局"
     assert old_card_summary not in text
 
 

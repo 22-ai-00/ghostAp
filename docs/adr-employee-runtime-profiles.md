@@ -119,12 +119,7 @@ runtime defaults:
   does not override either setting. Production composition also treats absent
   fields on an older settings object as these persistent modes, so an upgrade
   cannot silently remain on the fixed v1 pipeline.
-- Real-tenant acceptance remains an evidence gate, not a runtime feature flag.
-  Generate a tenant-bound fail-closed checklist with
-  `scripts/validate_employee_tenant.py --template-out <path>`; only an
-  explicitly opted-in live capture can be appended to the evidence bundle.
-
 Emergency rollback is configuration-only: explicitly set the two legacy modes
 and restart. The fixed Team pipeline and canonical employee one-shot path remain
-temporarily available until external acceptance is recorded; there is no
-automatic runtime fallback from Actor/Coordinator failures.
+temporarily available during migration; there is no automatic runtime fallback
+from Actor/Coordinator failures.

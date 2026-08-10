@@ -1,53 +1,229 @@
-"""ProjectChatService — orchestrator for /new-chat command."""
+"""Create and atomically bind a dedicated Feishu project group."""
 
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
-from collections import OrderedDict
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from ..config import get_settings
 from ..project.context import ProjectContext
 from ..project.manager import ProjectManager
-from .errors import CreateChatError
-from .group_naming import format_group_name, validate_name_part
-from .lark_chat_client import LarkChatClient
+from ..trust.models import ManagedGroupOrigin
+from .lark_chat_client import (
+    CreateChatError,
+    CreateChatFailureDisposition,
+    LarkChatClient,
+    ManagedChatValidation,
+)
 
 if TYPE_CHECKING:
     from ..trust.registry import ManagedGroupRegistry
 
 logger = logging.getLogger(__name__)
-
-# Per-root lock: one provision ID/root may be entered from multiple source chats.
 _creation_locks: dict[str, threading.Lock] = {}
 _creation_locks_guard = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+_VALID_NAME = re.compile(r"^[\w\-.]+$", re.UNICODE)
 
 
-def _get_creation_lock(chat_id: str, path: str) -> threading.Lock:
-    del chat_id
+class _Abort(RuntimeError):
+    """A fail-closed provision outcome suitable for the command reply."""
+
+
+def _creation_lock(path: str) -> threading.Lock:
     key = os.path.normcase(os.path.realpath(os.path.normpath(path)))
     with _creation_locks_guard:
-        if key not in _creation_locks:
-            _creation_locks[key] = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-        return _creation_locks[key]
+        return _creation_locks.setdefault(
+            key,
+            threading.Lock(),  # leaf lock: never held while acquiring a LockLevel lock
+        )
+
+
+def _name_error(part: str) -> str | None:
+    part = part.strip()
+    if not part:
+        return "名称不能为空"
+    if len(part) > 50:
+        return "名称过长（最大 50 字符）"
+    if not _VALID_NAME.match(part):
+        return "名称包含非法字符（不能包含空格或特殊符号，允许字母/数字/中文/下划线/短横/点）"
+    return None
+
+
+class _Provision:
+    """One registry/remote/local compensation boundary for a group provision."""
+
+    def __init__(
+        self,
+        project_manager: ProjectManager,
+        registry: "ManagedGroupRegistry",
+        remote: LarkChatClient,
+        provision_id: str,
+        owner_id: str,
+    ) -> None:
+        self.pm = project_manager
+        self.registry = registry
+        self.remote = remote
+        self.id = provision_id
+        self.owner_id = owner_id
+
+    def begin(self, project_id: str, root: str, bot_ref: str) -> str | None:
+        try:
+            self.registry.begin_provision(
+                provision_id=self.id,
+                owner_id=self.owner_id,
+                origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+                receiving_bot_ref=bot_ref,
+                project_id=project_id,
+                canonical_root_ref=root,
+                created_at=datetime.now(UTC),
+            )
+            return self.registry.provision_chat_id(self.id)
+        except Exception as exc:
+            logger.exception("managed group provision intent failed")
+            raise _Abort("❌ 受管群登记准备失败，请重试") from exc
+
+    def record(self, chat_id: str, state: str) -> None:
+        from ..project.manager import ProjectCommitUncertainError
+
+        try:
+            saved = self.pm.record_managed_group_residual(self.id, chat_id, state)
+        except ProjectCommitUncertainError as exc:
+            raise _Abort(
+                "⚠️ 远端群已保留且未授信，但本地恢复记录耐久性不确定；已失败关闭"
+            ) from exc
+        if not saved:
+            raise _Abort(
+                "⚠️ 远端群已保留且未授信，但本地恢复记录持久化失败；当前进程已失败关闭"
+            )
+
+    def consume(self, residual: tuple[str, str]) -> None:
+        from ..project.manager import ProjectCommitUncertainError
+
+        try:
+            consumed = self.pm.consume_managed_group_residual(
+                self.id, residual[0], residual[1]
+            )
+        except ProjectCommitUncertainError as exc:
+            raise _Abort("⚠️ 本地恢复记录清理耐久性不确定；请重试核对") from exc
+        if not consumed:
+            raise _Abort("⚠️ 本地恢复记录未能持久清理；请重试核对")
+
+    def abandon(self) -> bool:
+        try:
+            return bool(self.registry.abandon_provision(self.id))
+        except Exception:
+            logger.exception("failed to abandon managed group provision")
+            return False
+
+    def retain(self, chat_id: str) -> None:
+        self.record(chat_id, "untrusted_retained")
+
+    def _bind_remote(self, chat_id: str) -> None:
+        from ..trust.registry import RegistryCommitUncertainError
+
+        try:
+            self.registry.bind_provision_chat(self.id, chat_id)
+        except Exception as exc:
+            logger.exception("failed to bind remote chat to provision %s", self.id)
+            if isinstance(exc, RegistryCommitUncertainError) and exc.committed:
+                self.record(chat_id, "registry_bind_uncertain")
+                raise _Abort(
+                    "⚠️ 受管群远端绑定结果不确定，已保留飞书群且不会执行删除；服务恢复核对后可安全重试。"
+                ) from exc
+            self.retain(chat_id)
+            raise _Abort(
+                "⚠️ 受管群远端绑定持久化失败；已保留该群但不授予信任，请由 Owner 处理。"
+            ) from exc
+
+    def acquire_chat(
+        self,
+        recovered_chat_id: str | None,
+        *,
+        name: str,
+        description: str,
+        sender_open_id: str,
+    ) -> tuple[str, tuple[str, str] | None]:
+        residual = self.pm.managed_group_residual(self.id)
+        recovering: tuple[str, str] | None = None
+        if residual and residual[1] == "untrusted_retained":
+            validation = self.remote.validate_managed_chat(residual[0], self.owner_id)
+            if validation is ManagedChatValidation.UNKNOWN:
+                raise _Abort(
+                    "⚠️ 无法确认上次保留群的 Owner/接收 Bot 身份，已继续阻止新建。"
+                )
+            if validation is ManagedChatValidation.INVALID:
+                if not self.abandon():
+                    raise _Abort("⚠️ Registry 创建意图未能持久清理，已失败关闭。")
+                self.consume(residual)
+                raise _Abort("⚠️ 上次保留群身份校验失败，恢复记录已清理。")
+            self._bind_remote(residual[0])
+            recovered_chat_id, recovering = residual[0], residual
+        elif residual and residual[1] not in {
+            "create_outcome_unknown",
+            "registry_bind_uncertain",
+        }:
+            raise _Abort("⚠️ 上次建群留下未确认的飞书群，已阻止重复建群。")
+
+        if recovered_chat_id:
+            if (
+                self.remote.validate_managed_chat(recovered_chat_id, self.owner_id)
+                is not ManagedChatValidation.VALID
+            ):
+                self.record(recovered_chat_id, "recovered_chat_invalid")
+                raise _Abort(
+                    "⚠️ 无法确认恢复群仍存在且 Owner/接收 Bot 均在群内，已停止激活。"
+                )
+            return recovered_chat_id, recovering
+
+        try:
+            dispatch = self.registry.prepare_create_dispatch(
+                self.id, dispatched_at=datetime.now(UTC)
+            )
+        except Exception as exc:
+            logger.exception("managed group dispatch preparation failed")
+            raise _Abort("⚠️ 建群派发状态无法确认，已阻止重复建群。") from exc
+        if not dispatch:
+            self.record("outcome_unknown", "create_outcome_unknown")
+            raise _Abort("⚠️ 上次建群结果仍不确定，已阻止重复建群。")
+
+        try:
+            result = self.remote.create_chat(
+                name=name,
+                description=description,
+                user_id_list=[sender_open_id],
+                operation_id=self.id,
+            )
+        except CreateChatError as exc:
+            if exc.disposition is CreateChatFailureDisposition.OUTCOME_UNKNOWN:
+                try:
+                    self.registry.mark_create_outcome_unknown(self.id)
+                except Exception:
+                    logger.exception("failed to mark unknown create outcome")
+                self.record("outcome_unknown", "create_outcome_unknown")
+            else:
+                self.abandon()
+            raise _Abort(f"❌ 建群失败: {exc}") from exc
+        self._bind_remote(result.chat_id)
+        return result.chat_id, None
 
 
 class ProjectChatService:
-    """Orchestrates /new-chat: parse → idempotency check → create chat → bind project."""
+    """Orchestrate `/new-chat` without exposing intermediate choices."""
 
     def __init__(
         self,
         project_manager: ProjectManager,
         lark_chat_client: LarkChatClient,
-        reply_fn: Callable[[str, str, Optional[str]], Any],
-        send_to_chat_fn: Callable[[str, str, str, Optional[str]], Any],
+        reply_fn: Callable[[str, str, Optional[str]], object],
+        send_to_chat_fn: Callable[[str, str, str, Optional[str]], object],
         managed_group_registry: Optional["ManagedGroupRegistry"] = None,
         owner_id: str = "",
         receiving_bot_ref: str = "",
-    ):
+    ) -> None:
         self._pm = project_manager
         self._lark = lark_chat_client
         self._reply = reply_fn
@@ -55,12 +231,6 @@ class ProjectChatService:
         self._managed_groups = managed_group_registry
         self._owner_id = owner_id
         self._receiving_bot_ref = receiving_bot_ref
-        if managed_group_registry is not None and (
-            not owner_id or not receiving_bot_ref
-        ):
-            raise ValueError(
-                "owner_id and receiving_bot_ref are required with managed_group_registry"
-            )
 
     def handle(
         self,
@@ -69,33 +239,32 @@ class ProjectChatService:
         sender_open_id: str,
         data: dict,
     ) -> None:
-        """Main entry point for /new-chat command."""
         settings = get_settings()
-
-        # 1. Parse defaults
-        path = data.get("path") or os.getcwd()
-        path = os.path.expanduser(os.path.abspath(path))
-        name = data.get("name") or os.path.basename(os.path.normpath(path)) or f"project_{int(time.time())}"
+        path = os.path.expanduser(os.path.abspath(data.get("path") or os.getcwd()))
+        name = data.get("name") or os.path.basename(os.path.normpath(path))
         suffix = data.get("suffix") or settings.project_chat_suffix
-
-        # Validate name/suffix
-        err = validate_name_part(name)
-        if err:
-            self._reply(message_id, f"❌ 项目名无效: {err}", None)
+        for label, part in (("项目名", name), ("后缀", suffix)):
+            if error := _name_error(part):
+                self._reply(message_id, f"❌ {label}无效: {error}", None)
+                return
+        if (
+            self._managed_groups is None
+            or not self._owner_id
+            or not self._receiving_bot_ref
+        ):
+            self._reply(message_id, "❌ 受管群服务未就绪，已保持失败关闭。", None)
             return
-        err = validate_name_part(suffix)
-        if err:
-            self._reply(message_id, f"❌ 后缀无效: {err}", None)
-            return
 
-        # 2. Acquire per-(chat, path) lock
-        lock = _get_creation_lock(chat_id, path)
+        lock = _creation_lock(path)
         if not lock.acquire(timeout=5):
             self._reply(message_id, "⏳ 正在处理中，请稍后再试", None)
             return
-
         try:
-            self._handle_locked(message_id, chat_id, sender_open_id, name, suffix, path)
+            self._handle_locked(
+                message_id, chat_id, sender_open_id, name, suffix, path
+            )
+        except _Abort as exc:
+            self._reply(message_id, str(exc), None)
         finally:
             lock.release()
 
@@ -108,616 +277,215 @@ class ProjectChatService:
         suffix: str,
         path: str,
     ) -> None:
-        from ..trust.models import ManagedGroupOrigin
+        registry = self._managed_groups
+        assert registry is not None
+        ctx = self._pm.find_project_by_path(path, chat_id=None)
+        same_name = self._pm.find_project_by_name(name, chat_id=None)
+        if ctx is None and same_name is not None:
+            raise _Abort("❌ 同名项目已绑定其他目录，请使用不同项目名。")
 
         provision_id = (
             f"new-chat:{self._owner_id}:{ProjectManager.generate_id(name)}:"
             f"{os.path.normpath(path)}"
         )
-        # 3. Idempotency check — chat_id=None to skip visibility filter
-        ctx = self._pm.find_project_by_path(path, chat_id=None)
-
-        # 3.1 Fallback: find by name (legacy project may have mismatched root_path)
-        if ctx is None:
-            ctx = self._pm.find_project_by_name(name, chat_id=None)
-            if ctx:
-                if self._pm.pending_managed_chat_binding_sagas_for_project(
-                    ctx.project_id
-                ):
-                    self._reply(
-                        message_id,
-                        "⚠️ 项目存在未完成的受管群绑定事务，禁止修改根目录；请先重试原绑定。",
-                        None,
-                    )
-                    return
-                # Update root_path/working_dir to current path for legacy project
-                ctx.root_path = path
-                ctx.working_dir = path
-                if self._pm._save_projects() is False:
-                    self._reply(message_id, "❌ 更新历史项目失败，请重试", None)
-                    return
-                logger.info(
-                    "Legacy project %s found by name, updated root_path to %s",
-                    ctx.project_id, path,
-                )
-
+        provision = _Provision(
+            self._pm, registry, self._lark, provision_id, self._owner_id
+        )
         if ctx and ctx.bound_chat_id:
-            if self._managed_groups is not None:
-                active = self._managed_groups.active_record(ctx.bound_chat_id)
-                if (
-                    active is None
-                    or active.project_id != ctx.project_id
-                    or active.canonical_root_ref != ctx.root_path
-                    or active.origin is not ManagedGroupOrigin.GHOSTAP_CREATED
-                    or active.owner_id != self._owner_id
-                    or active.receiving_bot_ref != self._receiving_bot_ref
-                ):
-                    self._reply(
-                        message_id,
-                        "❌ 现有项目群尚未通过受管群校验，请由 Owner 在私聊中导入或重新绑定。",
-                        None,
-                    )
-                    return
-                grant = self._managed_groups.grant_for_chat(ctx.bound_chat_id)
-                if (
-                    grant is None
-                    or grant.project_id != ctx.project_id
-                    or grant.canonical_root_ref != ctx.root_path
-                    or grant.managed_group_id != ctx.bound_chat_id
-                    or grant.owner_id != self._owner_id
-                    or grant.backend_binding_ids
-                    or grant.connected_target_refs
-                ):
-                    self._reply(
-                        message_id,
-                        "❌ 现有项目群授权事实不完整，已保持失败关闭。",
-                        None,
-                    )
-                    return
-                pending = self._pm.pending_managed_chat_binding_sagas_for_project(
-                    ctx.project_id,
-                    ctx.bound_chat_id,
-                )
-                if pending:
-                    saga = self._pm.resolve_managed_chat_binding_saga(
-                        project_id=ctx.project_id,
-                        chat_id=ctx.bound_chat_id,
-                        expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
-                        expected_owner_id=self._owner_id,
-                        expected_receiving_bot_ref=self._receiving_bot_ref,
-                        expected_root_ref=ctx.root_path,
-                    )
-                    if saga is None or (
-                        not self._pm.validate_managed_chat_binding_saga(
-                            saga.operation_id
-                        )
-                        or not self._pm.complete_managed_chat_binding_saga(
-                            saga.operation_id
-                        )
-                    ):
-                        self._reply(
-                            message_id,
-                            "⚠️ 项目群已登记，但本地绑定事务尚未安全收尾，请重试。",
-                            None,
-                        )
-                        return
-                residual = self._pm.managed_group_residual(provision_id)
-                if residual == (ctx.bound_chat_id, "untrusted_retained"):
-                    cleanup_error = self._consume_residual_error(
-                        provision_id,
-                        residual,
-                    )
-                    if cleanup_error is not None:
-                        self._reply(
-                            message_id,
-                            f"⚠️ 项目群已获得信任，但{cleanup_error}",
-                            None,
-                        )
-                        return
-            # Branch A: already bound → ensure originating chat can see it, then return jump card
+            self._verify_existing_binding(ctx, provision)
             if chat_id and chat_id not in ctx.allowed_chat_ids:
                 ctx.add_chat_id(chat_id)
                 if self._pm._save_projects() is False:
-                    self._reply(message_id, "❌ 更新项目可见范围失败，请重试", None)
-                    return
+                    raise _Abort("❌ 更新项目可见范围失败，请重试")
             self._reply_jump_card(message_id, ctx)
             return
 
-        group_name = format_group_name(name, suffix)
-        description = self._build_description(name, path)
         intended_project_id = ctx.project_id if ctx else ProjectManager.generate_id(name)
-        recovered_chat_id: str | None = None
-
-        if self._managed_groups is not None:
-            from ..trust.models import ManagedGroupOrigin
-
-            try:
-                self._managed_groups.begin_provision(
-                    provision_id=provision_id,
-                    owner_id=self._owner_id,
-                    origin=ManagedGroupOrigin.GHOSTAP_CREATED,
-                    receiving_bot_ref=self._receiving_bot_ref,
-                    project_id=intended_project_id,
-                    canonical_root_ref=path,
-                    created_at=datetime.now(UTC),
-                )
-                recovered_chat_id = self._managed_groups.provision_chat_id(
-                    provision_id
-                )
-            except Exception:
-                logger.exception(
-                    "managed group provision intent failed for project=%s",
-                    intended_project_id,
-                )
-                self._reply(message_id, "❌ 受管群登记准备失败，请重试", None)
-                return
-
-        residual = self._pm.managed_group_residual(provision_id)
-        recovering_residual: tuple[str, str] | None = None
-        if residual is not None and residual[1] == "untrusted_retained":
-            from .lark_chat_client import ManagedChatValidation
-
-            validation = self._lark.validate_managed_chat(
-                residual[0],
-                self._owner_id,
-            )
-            if validation is ManagedChatValidation.UNKNOWN:
-                self._reply(
-                    message_id,
-                    "⚠️ 无法确认上次保留群的 Owner/接收 Bot 身份，"
-                    "已继续阻止新建；请稍后重试。",
-                    None,
-                )
-                return
-            if validation is ManagedChatValidation.INVALID:
-                if not self._abandon_provision(provision_id):
-                    self._reply(
-                        message_id,
-                        "⚠️ 上次保留群校验失败，但 Registry 创建意图未能持久清理；"
-                        "已保留恢复记录并失败关闭。",
-                        None,
-                    )
-                    return
-                cleanup_error = self._consume_residual_error(
-                    provision_id,
-                    residual,
-                )
-                if cleanup_error is not None:
-                    self._reply(message_id, f"⚠️ {cleanup_error}", None)
-                    return
-                self._reply(
-                    message_id,
-                    "⚠️ 上次保留群已无法通过 Owner/接收 Bot 校验，"
-                    "本地恢复记录已清理；请重试原命令以明确新建。",
-                    None,
-                )
-                return
-            if self._managed_groups is None:
-                self._reply(message_id, "❌ 受管群服务未就绪，已保持阻断。", None)
-                return
-            try:
-                self._managed_groups.bind_provision_chat(
-                    provision_id,
-                    residual[0],
-                )
-            except Exception:
-                logger.exception(
-                    "retained project group recovery bind failed operation=%s",
-                    provision_id,
-                )
-                self._reply(
-                    message_id,
-                    "⚠️ 保留群已通过身份校验，但 Registry 绑定仍未确认；"
-                    "未新建群，请稍后重试。",
-                    None,
-                )
-                return
-            recovered_chat_id = residual[0]
-            recovering_residual = residual
-        elif residual is not None and residual[1] not in {
-            "create_outcome_unknown",
-            "registry_bind_uncertain",
-        }:
-            self._reply(
-                message_id,
-                "⚠️ 上次建群留下未确认的飞书群，已阻止重复建群；请先人工处理残留群。",
-                None,
-            )
-            return
-
-        # 4. Create the remote chat once, then durably bind its ID before any
-        # local project mutation.  A retry after restart reuses that binding.
-        if recovered_chat_id is not None:
-            from .lark_chat_client import ManagedChatValidation
-
-            validation = self._lark.validate_managed_chat(
-                recovered_chat_id,
-                self._owner_id,
-            )
-            if validation is not ManagedChatValidation.VALID:
-                residual_error = self._record_residual_error(
-                    provision_id,
-                    recovered_chat_id,
-                    "recovered_chat_invalid",
-                )
-                if residual_error is not None:
-                    self._reply(message_id, f"⚠️ {residual_error}", None)
-                    return
-                self._reply(
-                    message_id,
-                    "⚠️ 无法确认重试群仍存在且 Owner/接收 Bot 均在群内，已停止激活。",
-                    None,
-                )
-                return
-            new_chat_id = recovered_chat_id
-            new_chat_name = group_name
-        else:
-            if self._managed_groups is not None and not (
-                self._managed_groups.prepare_create_dispatch(
-                    provision_id,
-                    dispatched_at=datetime.now(UTC),
-                )
-            ):
-                residual_error = self._record_residual_error(
-                    provision_id,
-                    "outcome_unknown",
-                    "create_outcome_unknown",
-                )
-                if residual_error is not None:
-                    self._reply(message_id, f"⚠️ {residual_error}", None)
-                    return
-                self._reply(
-                    message_id,
-                    "⚠️ 上次建群结果仍不确定且去重窗口已过，已阻止重复建群；"
-                    "请人工核对飞书群。",
-                    None,
-                )
-                return
-            try:
-                result = self._lark.create_chat(
-                    name=group_name,
-                    description=description,
-                    user_id_list=[sender_open_id],
-                    operation_id=provision_id,
-                )
-            except CreateChatError as e:
-                from .errors import CreateChatFailureDisposition
-
-                logger.warning("create_chat failed for path=%s: %s", path, str(e))
-                self._reply(message_id, f"❌ 建群失败: {e}", None)
-                if (
-                    self._managed_groups is not None
-                    and e.disposition
-                    is CreateChatFailureDisposition.OUTCOME_UNKNOWN
-                ):
-                    self._managed_groups.mark_create_outcome_unknown(provision_id)
-                    residual_error = self._record_residual_error(
-                        provision_id,
-                        "outcome_unknown",
-                        "create_outcome_unknown",
-                    )
-                    if residual_error is not None:
-                        self._reply(message_id, f"⚠️ {residual_error}", None)
-                else:
-                    self._abandon_provision(provision_id)
-                return
-            new_chat_id = result.chat_id
-            new_chat_name = result.name
-            if self._managed_groups is not None:
-                try:
-                    self._managed_groups.bind_provision_chat(
-                        provision_id, new_chat_id
-                    )
-                except Exception as exc:
-                    from ..trust.registry import RegistryCommitUncertainError
-
-                    logger.exception(
-                        "failed to bind remote chat to provision %s", provision_id
-                    )
-                    if (
-                        isinstance(exc, RegistryCommitUncertainError)
-                        and exc.committed
-                    ):
-                        residual_error = self._record_residual_error(
-                            provision_id,
-                            new_chat_id,
-                            "registry_bind_uncertain",
-                        )
-                        if residual_error is not None:
-                            self._reply(message_id, f"⚠️ {residual_error}", None)
-                            return
-                        self._reply(
-                            message_id,
-                            "⚠️ 受管群远端绑定结果不确定，已保留飞书群且不会执行删除；"
-                            "服务恢复核对后可安全重试。",
-                            None,
-                        )
-                        return
-                    residual_error = self._record_untrusted_remote(
-                        provision_id, new_chat_id
-                    )
-                    if residual_error is not None:
-                        self._reply(message_id, f"⚠️ {residual_error}", None)
-                        return
-                    self._reply(
-                        message_id,
-                        "⚠️ 受管群远端绑定持久化失败；为避免竞态删错群，"
-                        "已保留该群但不授予信任，请重试验证或由 Owner 处理。",
-                        None,
-                    )
-                    return
-
-        # 4.5 Promote sender to group manager (best-effort, enables dissolve permission)
+        recovered = provision.begin(
+            intended_project_id, path, self._receiving_bot_ref
+        )
+        group_name = f"{name.strip()}-{suffix.strip()}"
+        new_chat_id, residual = provision.acquire_chat(
+            recovered,
+            name=group_name,
+            description=self._description(name, path),
+            sender_open_id=sender_open_id,
+        )
         self._lark.add_managers(new_chat_id, [sender_open_id])
+        ctx = self._bind_project(
+            ctx,
+            provision,
+            chat_id,
+            new_chat_id,
+            group_name,
+            name,
+            path,
+            residual,
+        )
+        self._reply_jump_card(message_id, ctx)
+        self._send_welcome(new_chat_id, ctx)
 
-        # 5. Bind, then atomically activate Registry before any success delivery.
-        created_project = False
-        binding_saga_prepared = False
+    def _verify_existing_binding(
+        self, ctx: ProjectContext, provision: _Provision
+    ) -> None:
+        registry = provision.registry
+        try:
+            active, grant = registry.trust_snapshot(ctx.bound_chat_id)
+        except Exception as exc:
+            raise _Abort("❌ 无法读取项目群信任事实，已保持失败关闭。") from exc
+        if not active or not grant or (
+            active.project_id != ctx.project_id
+            or active.canonical_root_ref != ctx.root_path
+            or active.origin is not ManagedGroupOrigin.GHOSTAP_CREATED
+            or active.owner_id != self._owner_id
+            or active.receiving_bot_ref != self._receiving_bot_ref
+            or grant.project_id != ctx.project_id
+            or grant.canonical_root_ref != ctx.root_path
+            or grant.managed_group_id != ctx.bound_chat_id
+            or grant.owner_id != self._owner_id
+            or grant.backend_binding_ids
+            or grant.connected_target_refs
+        ):
+            raise _Abort("❌ 现有项目群信任事实不完整，已保持失败关闭。")
+
+        if self._pm.pending_managed_chat_binding_sagas_for_project(
+            ctx.project_id, ctx.bound_chat_id
+        ):
+            saga = self._pm.resolve_managed_chat_binding_saga(
+                project_id=ctx.project_id,
+                chat_id=ctx.bound_chat_id,
+                expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
+                expected_owner_id=self._owner_id,
+                expected_receiving_bot_ref=self._receiving_bot_ref,
+                expected_root_ref=ctx.root_path,
+            )
+            if saga is None or not (
+                self._pm.validate_managed_chat_binding_saga(saga.operation_id)
+                and self._pm.complete_managed_chat_binding_saga(saga.operation_id)
+            ):
+                raise _Abort("⚠️ 项目群本地绑定事务尚未安全收尾。")
+        residual = self._pm.managed_group_residual(provision.id)
+        if residual == (ctx.bound_chat_id, "untrusted_retained"):
+            provision.consume(residual)
+
+    def _bind_project(
+        self,
+        ctx: ProjectContext | None,
+        provision: _Provision,
+        source_chat_id: str,
+        remote_chat_id: str,
+        remote_chat_name: str,
+        project_name: str,
+        path: str,
+        recovering_residual: tuple[str, str] | None,
+    ) -> ProjectContext:
+        from ..project.manager import ProjectCommitUncertainError
+        from ..trust.registry import RegistryCommitUncertainError
+
+        prepared = False
         try:
             if ctx is None:
-                success, msg, ctx_new = self._pm.create_project_with_managed_chat_saga(
-                    project_id=ProjectManager.generate_id(name),
-                    project_name=name,
+                success, message, created = self._pm.create_project_with_managed_chat_saga(
+                    project_id=ProjectManager.generate_id(project_name),
+                    project_name=project_name,
                     root_path=path,
-                    owner_chat_id=new_chat_id,
-                    additional_chat_id=chat_id,
-                    managed_chat_id=new_chat_id,
-                    managed_chat_name=new_chat_name,
+                    owner_chat_id=remote_chat_id,
+                    additional_chat_id=source_chat_id,
+                    managed_chat_id=remote_chat_id,
+                    managed_chat_name=remote_chat_name,
                     created_at=time.time(),
-                    operation_id=provision_id,
+                    operation_id=provision.id,
                     expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
                     expected_owner_id=self._owner_id,
                     expected_receiving_bot_ref=self._receiving_bot_ref,
                 )
-                if not success or not ctx_new:
-                    residual_error = self._record_untrusted_remote(
-                        provision_id, new_chat_id
-                    )
-                    if residual_error is not None:
-                        self._reply(message_id, f"⚠️ {residual_error}", None)
-                        return
-                    self._reply(
-                        message_id,
-                        f"⚠️ 创建项目失败: {msg}；远端群已保留但不授予信任，请由 Owner 核对。",
-                        None,
-                    )
-                    return
-                created_project = True
-                ctx = ctx_new
-                binding_saga_prepared = True
+                if not success or created is None:
+                    provision.retain(remote_chat_id)
+                    raise _Abort(f"⚠️ 创建项目失败: {message}；远端群未授信。")
+                ctx = created
             else:
-                bound, _binding_snapshot = self._pm.bind_managed_chat_for_saga(
+                bound, _ = self._pm.bind_managed_chat_for_saga(
                     ctx.project_id,
-                    new_chat_id,
-                    chat_name=new_chat_name,
+                    remote_chat_id,
+                    chat_name=remote_chat_name,
                     created_at=time.time(),
-                    operation_id=provision_id,
-                    additional_chat_id=chat_id,
-                    project_name=name,
-                    remove_project_on_restore=False,
+                    operation_id=provision.id,
+                    additional_chat_id=source_chat_id,
+                    project_name=project_name,
                     expected_origin=ManagedGroupOrigin.GHOSTAP_CREATED,
                     expected_owner_id=self._owner_id,
                     expected_receiving_bot_ref=self._receiving_bot_ref,
                 )
                 if not bound:
                     raise OSError("project binding persistence failed")
-                binding_saga_prepared = True
-
-            if self._managed_groups is not None:
-                self._managed_groups.activate(
-                    provision_id=provision_id,
-                    chat_id=new_chat_id,
-                    project_id=ctx.project_id,
-                    canonical_root_ref=ctx.root_path,
-                )
-            if not self._pm.complete_managed_chat_binding_saga(provision_id):
-                self._reply(
-                    message_id,
-                    "⚠️ 项目群已登记，但本地绑定事务收尾失败；请重试以完成恢复核对。",
-                    None,
-                )
-                return
-            if recovering_residual is not None:
-                cleanup_error = self._consume_residual_error(
-                    provision_id,
-                    recovering_residual,
-                )
-                if cleanup_error is not None:
-                    self._reply(
-                        message_id,
-                        f"⚠️ 项目群已获得信任，但{cleanup_error}",
-                        None,
-                    )
-                    return
-        except Exception as e:
-            from ..project.manager import ProjectCommitUncertainError
-            from ..trust.registry import RegistryCommitUncertainError
-
-            if isinstance(
-                e, (RegistryCommitUncertainError, ProjectCommitUncertainError)
-            ) and e.committed:
-                logger.error(
-                    "registry activation durability is uncertain; preserving "
-                    "remote chat and durable project binding chat=%s",
-                    new_chat_id[:12],
-                )
-                self._reply(
-                    message_id,
-                    "⚠️ 项目群登记结果不确定，已停止继续操作且不会删除飞书群；"
-                    "服务恢复核对前该群不获得信任。",
-                    None,
-                )
-                return
-            logger.error(
-                "bind/registry activation failed, rolling back chat %s: %s",
-                new_chat_id[:12],
-                str(e),
+            prepared = True
+            provision.registry.activate(
+                provision_id=provision.id,
+                chat_id=remote_chat_id,
+                project_id=ctx.project_id,
+                canonical_root_ref=ctx.root_path,
             )
-            rollback_ok = (
-                self._pm.restore_managed_chat_binding_saga(provision_id)
-                if binding_saga_prepared
-                else self._rollback_binding(
-                    ctx=ctx,
-                    created_project=created_project,
-                    existing_snapshot=None,
-                    remote_chat_id=new_chat_id,
-                )
-            )
-            residual_error = self._record_untrusted_remote(
-                provision_id, new_chat_id
-            )
-            if residual_error is not None:
-                self._reply(message_id, f"⚠️ {residual_error}", None)
-                return
-            detail = "远端群已保留但未获得信任，请由 Owner 重试验证或处理"
-            if not rollback_ok:
-                detail += "；本地补偿持久化失败，绑定已隔离，请人工检查"
-            self._reply(message_id, f"❌ 项目群绑定失败，{detail}", None)
-            return
+        except _Abort:
+            raise
+        except (RegistryCommitUncertainError, ProjectCommitUncertainError) as exc:
+            if exc.committed:
+                raise _Abort(
+                    "⚠️ 项目群登记结果不确定，已保留群和绑定但不授予信任。"
+                ) from exc
+            self._compensate(provision, remote_chat_id, prepared)
+            raise _Abort("❌ 项目群绑定失败，远端群已保留但未获得信任。") from exc
+        except Exception as exc:
+            logger.exception("project group binding failed")
+            self._compensate(provision, remote_chat_id, prepared)
+            raise _Abort("❌ 项目群绑定失败，远端群已保留但未获得信任。") from exc
 
-        # 6. Reply in main chat + welcome in new chat
-        self._reply_jump_card(message_id, ctx)
-        self._send_welcome(new_chat_id, ctx)
+        if not self._pm.complete_managed_chat_binding_saga(provision.id):
+            raise _Abort("⚠️ 项目群已登记，但本地绑定事务收尾失败。")
+        if recovering_residual is not None:
+            provision.consume(recovering_residual)
+        return ctx
 
-    def _abandon_provision(self, provision_id: str) -> bool:
-        if self._managed_groups is None:
-            return False
-        try:
-            return bool(self._managed_groups.abandon_provision(provision_id))
-        except Exception:
-            logger.exception("failed to abandon managed group provision")
-            return False
-
-    def _record_untrusted_remote(
-        self,
-        provision_id: str,
-        chat_id: str,
-    ) -> str | None:
-        return self._record_residual_error(
-            provision_id,
-            chat_id,
-            "untrusted_retained",
+    def _compensate(
+        self, provision: _Provision, remote_chat_id: str, prepared: bool
+    ) -> None:
+        restored = (
+            self._pm.restore_managed_chat_binding_saga(provision.id)
+            if prepared
+            else True
         )
-
-    def _record_residual_error(
-        self,
-        provision_id: str,
-        chat_id: str,
-        state: str,
-    ) -> str | None:
-        from ..project.manager import ProjectCommitUncertainError
-
-        try:
-            saved = self._pm.record_managed_group_residual(
-                provision_id,
-                chat_id,
-                state,
-            )
-        except ProjectCommitUncertainError:
-            return "远端群已保留且未授信，但本地恢复记录耐久性不确定；已失败关闭"
-        if not saved:
-            return "远端群已保留且未授信，但本地恢复记录持久化失败；当前进程已失败关闭"
-        return None
-
-    def _consume_residual_error(
-        self,
-        provision_id: str,
-        residual: tuple[str, str],
-    ) -> str | None:
-        from ..project.manager import ProjectCommitUncertainError
-
-        try:
-            consumed = self._pm.consume_managed_group_residual(
-                provision_id,
-                residual[0],
-                residual[1],
-            )
-        except ProjectCommitUncertainError:
-            return "本地恢复记录清理耐久性不确定；请重试核对"
-        if not consumed:
-            return "本地恢复记录未能持久清理；请重试核对"
-        return None
-
-    @staticmethod
-    def _binding_snapshot(ctx: ProjectContext) -> dict[str, Any]:
-        return {
-            "allowed_chat_ids": OrderedDict(ctx.allowed_chat_ids),
-            "bound_chat_created_at": ctx.bound_chat_created_at,
-            "bound_chat_id": ctx.bound_chat_id,
-            "bound_chat_name": ctx.bound_chat_name,
-            "owner_chat_id": ctx.owner_chat_id,
-            "project_name": ctx.project_name,
-        }
-
-    def _rollback_binding(
-        self,
-        *,
-        ctx: ProjectContext | None,
-        created_project: bool,
-        existing_snapshot: dict[str, Any] | None,
-        remote_chat_id: str,
-    ) -> bool:
-        if ctx is None:
-            return True
-        if created_project:
-            closed, _ = self._pm.close_project(ctx.project_id)
-            if not closed:
-                self._pm.quarantine_bound_chat(remote_chat_id)
-            return closed
-        if existing_snapshot is None:
-            return True
-        ctx.allowed_chat_ids = OrderedDict(existing_snapshot["allowed_chat_ids"])
-        ctx.bound_chat_created_at = existing_snapshot["bound_chat_created_at"]
-        ctx.bound_chat_id = existing_snapshot["bound_chat_id"]
-        ctx.bound_chat_name = existing_snapshot["bound_chat_name"]
-        ctx.owner_chat_id = existing_snapshot["owner_chat_id"]
-        ctx.project_name = existing_snapshot["project_name"]
-        saved = self._pm._save_projects()
-        if not saved:
+        provision.retain(remote_chat_id)
+        if not restored:
             self._pm.quarantine_bound_chat(remote_chat_id)
-        return saved
 
-    def _build_description(self, name: str, path: str) -> str:
-        git_remote = self._detect_git_remote(path)
-        lines = [
-            f"🎯 项目: {name}",
-            f"📁 目录: {path}",
-        ]
-        if git_remote:
-            lines.append(f"🔗 仓库: {git_remote}")
-        lines.append("🤖 在这个群直接对话即可：默认 Coco / 显式 /claude /codex 等。")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _detect_git_remote(path: str) -> str:
+    def _description(self, name: str, path: str) -> str:
+        lines = [f"🎯 项目: {name}", f"📁 目录: {path}"]
         try:
             result = subprocess.run(
                 ["git", "-C", path, "remote", "get-url", "origin"],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True,
+                text=True,
+                timeout=3,
             )
-            return result.stdout.strip() if result.returncode == 0 else ""
+            if result.returncode == 0 and result.stdout.strip():
+                lines.append(f"🔗 仓库: {result.stdout.strip()}")
         except Exception:
-            return ""
+            pass
+        lines.append("🤖 在群中直接对话即可进入 SMART 编程路由。")
+        return "\n".join(lines)
 
     def _reply_jump_card(self, message_id: str, ctx: ProjectContext) -> None:
-        """Reply with a jump card pointing to the bound chat."""
         from ..card.builders.project import ProjectBuilder
 
         msg_type, card_json = ProjectBuilder.build_project_chat_jump_card(ctx)
         self._reply(message_id, card_json, msg_type)
 
     def _send_welcome(self, chat_id: str, ctx: ProjectContext) -> None:
-        """Send welcome message in the newly created group."""
         text = (
             f"🎉 项目 **{ctx.project_name}** 专属群已就绪\n"
             f"📂 目录: `{ctx.root_path}`\n\n"
-            f"直接在这里对话即可开始编程：\n"
-            f"• 直接发消息 → 默认 Coco\n"
-            f"• `/claude` → Claude 模式\n"
-            f"• `/codex` → Codex 模式\n"
-            f"• `/deep <需求>` → Deep 深度执行"
+            "直接发送任务即可由 SMART 路由自动执行；也可使用显式工具或引擎命令。"
         )
         try:
             self._send_to_chat(chat_id, "text", text, None)
-        except Exception as e:
-            logger.warning("send_welcome to %s failed: %s", chat_id[:12], str(e))
+        except Exception as exc:
+            logger.warning("send_welcome to %s failed: %s", chat_id[:12], exc)

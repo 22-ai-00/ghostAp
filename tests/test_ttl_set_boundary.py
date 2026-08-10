@@ -61,7 +61,6 @@ class TestTTLSetBoundary(unittest.TestCase):
         self.assertIn("b", s)
         self.assertIn("c", s)
         self.assertIn("d", s)
-        self.assertEqual(len(s), 3)
 
     def test_refresh_moves_to_end(self):
         """Re-adding an existing key refreshes its timestamp."""
@@ -97,7 +96,8 @@ class TestTTLSetBoundary(unittest.TestCase):
         now = 6.0
         count = s.purge()
         self.assertEqual(count, 2)
-        self.assertEqual(len(s), 1)
+        self.assertNotIn("a", s)
+        self.assertNotIn("b", s)
         self.assertIn("c", s)
 
     def test_purge_respects_max_evict_batch(self):
@@ -111,7 +111,9 @@ class TestTTLSetBoundary(unittest.TestCase):
         now = 10.0
         count = s.purge()
         self.assertEqual(count, 2)  # Only 2 evicted due to batch limit
-        self.assertEqual(len(s), 3)
+        self.assertEqual(s.purge(), 2)
+        self.assertEqual(s.purge(), 1)
+        self.assertEqual(s.purge(), 0)
 
     def test_invalid_ttl_raises(self):
         """ttl <= 0 raises ValueError."""
@@ -134,8 +136,8 @@ class TestTTLSetBoundary(unittest.TestCase):
         now = 10.0
         # Entry is expired but __contains__ doesn't remove it
         self.assertNotIn("x", s)
-        # Internal length unchanged (lazy eviction)
-        self.assertEqual(len(s), 1)
+        # A later explicit purge still removes it, proving contains was read-only.
+        self.assertEqual(s.purge(), 1)
 
 
 if __name__ == "__main__":

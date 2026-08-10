@@ -11,6 +11,7 @@ from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.writer import CommitState, JournalWriter
 from src.autonomous.runtime.employee_actor import EmployeeAssignmentTerminal
 from src.autonomous.runtime.employee_supervisor import EmployeeRuntimeSupervisor
+from tests.autonomous.helpers import EmployeeTestSession, make_employee_bootstrap
 
 
 def _writer(tmp_path: Path) -> JournalWriter:
@@ -112,18 +113,16 @@ def test_recovery_keeps_richer_live_terminal_when_replaying_its_digest(
     tmp_path: Path,
 ) -> None:
     from src.autonomous.runtime.employee_actor import EmployeeAssignment
-    from tests.autonomous.unit.test_employee_actor import _bootstrap, _Session
-
     writer = _writer(tmp_path)
     notifications: list[EmployeeAssignmentTerminal] = []
     supervisor = EmployeeRuntimeSupervisor(
         writer=writer,
-        session_factory=lambda _bootstrap_value: _Session(),
+        session_factory=lambda _bootstrap_value: EmployeeTestSession(),
         terminal_sink=notifications.append,
     )
     try:
         supervisor.submit(
-            EmployeeAssignment("asgn_1", _bootstrap(tmp_path), "work", 1)
+            EmployeeAssignment("asgn_1", make_employee_bootstrap(tmp_path), "work", 1)
         )
         live = supervisor.wait_terminal("asgn_1", timeout=1)
         assert live.status == "completed"
@@ -176,8 +175,6 @@ def test_recovery_refuses_live_commit_to_sink_window_without_placeholder(
     tmp_path: Path,
 ) -> None:
     from src.autonomous.runtime.employee_actor import EmployeeAssignment
-    from tests.autonomous.unit.test_employee_actor import _bootstrap, _Session
-
     callback_entered = threading.Event()
     callback_release = threading.Event()
 
@@ -191,12 +188,12 @@ def test_recovery_refuses_live_commit_to_sink_window_without_placeholder(
     notifications: list[EmployeeAssignmentTerminal] = []
     supervisor = PausedTerminalSupervisor(
         writer=writer,
-        session_factory=lambda _bootstrap_value: _Session(),
+        session_factory=lambda _bootstrap_value: EmployeeTestSession(),
         terminal_sink=notifications.append,
     )
     try:
         supervisor.submit(
-            EmployeeAssignment("asgn_1", _bootstrap(tmp_path), "work", 1)
+            EmployeeAssignment("asgn_1", make_employee_bootstrap(tmp_path), "work", 1)
         )
         assert callback_entered.wait(timeout=1)
 
@@ -226,8 +223,6 @@ def test_recovery_fences_public_submit_for_full_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.autonomous.runtime.employee_actor import EmployeeAssignment
-    from tests.autonomous.unit.test_employee_actor import _bootstrap, _Session
-
     writer = _writer(tmp_path)
     replay_started = threading.Event()
     replay_release = threading.Event()
@@ -241,7 +236,7 @@ def test_recovery_fences_public_submit_for_full_replay(
     monkeypatch.setattr(writer, "replay", blocking_replay)
     supervisor = EmployeeRuntimeSupervisor(
         writer=writer,
-        session_factory=lambda _bootstrap_value: _Session(),
+        session_factory=lambda _bootstrap_value: EmployeeTestSession(),
     )
     errors: list[BaseException] = []
 
@@ -257,7 +252,7 @@ def test_recovery_fences_public_submit_for_full_replay(
         assert replay_started.wait(timeout=1)
         assignment = EmployeeAssignment(
             "asgn_1",
-            _bootstrap(tmp_path),
+            make_employee_bootstrap(tmp_path),
             "work",
             1,
         )
@@ -339,8 +334,6 @@ def test_recovery_terminalizes_unresolvable_anchored_mailbox_once(tmp_path: Path
 
 def test_backend_effect_is_anchored_before_session_factory(tmp_path: Path) -> None:
     from src.autonomous.runtime.employee_actor import EmployeeAssignment
-    from tests.autonomous.unit.test_employee_actor import _bootstrap, _Session
-
     writer = _writer(tmp_path)
     seen: list[str] = []
 
@@ -350,11 +343,11 @@ def test_backend_effect_is_anchored_before_session_factory(tmp_path: Path) -> No
             for frame in writer.replay()
             for event in frame.events
         )
-        return _Session()
+        return EmployeeTestSession()
 
     supervisor = EmployeeRuntimeSupervisor(writer=writer, session_factory=factory)
     supervisor.submit(
-        EmployeeAssignment("asgn_1", _bootstrap(tmp_path), "work", 1)
+        EmployeeAssignment("asgn_1", make_employee_bootstrap(tmp_path), "work", 1)
     )
     assert supervisor.wait_terminal("asgn_1", timeout=1).status == "completed"
     assert seen[-2:] == [

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
-from concurrent.futures import CancelledError
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -14,18 +13,9 @@ from src.autonomous.gateway.coordinator import (
 from src.autonomous.gateway.models import GatewayExecutionStatus
 from src.autonomous.gateway.projection import (
     ATTEMPT_CANCEL_REQUESTED,
-    ATTEMPT_TERMINAL,
-)
-from src.autonomous.journal.frame import JournalEvent
-from src.autonomous.team import (
-    EmployeeTeamService,
-    TeamRunState,
-    TeamTarget,
 )
 from tests.autonomous.integration.test_employee_team_gateway import (
-    _binding,
     _real_coordinator_harness,
-    _runtime_model,
 )
 
 
@@ -261,175 +251,6 @@ def test_runtime_team_backend_cancel_observation_timeout_is_not_retryable(
     assert result.retry_allowed is False
 
 
-def test_team_timeout_anchors_cancel_interrupts_live_runner_before_retry(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    """One real runner proves timeout cancellation is the retry fence."""
-
-    from src.autonomous.provisioning.composition import _RuntimeTeamBackend
-    from src.autonomous.provisioning.hire_state import HirePhase
-
-    harness = _real_coordinator_harness(tmp_path)
-    harness.router.reject_dispatch_candidate(
-        harness.acceptance_ids[0],
-        reason_code="context_unavailable",
-    )
-    state = TeamRunState(
-        run_id="teamrun_live_timeout",
-        tenant_key="tenant_1",
-        message_id="om_current",
-        chat_id="oc_team",
-        requester_principal_id="ou_requester",
-        task_digest=hashlib.sha256(b"live timeout").hexdigest(),
-    )
-    entered = threading.Event()
-    interrupted = threading.Event()
-
-    def block_runner(*_args, **_kwargs):
-        entered.set()
-        assert interrupted.wait(3)
-        raise CancelledError
-
-    monkeypatch.setattr(harness.engine, "_run_acp_session", block_runner)
-
-    hire_state = SimpleNamespace(
-        agent_id="agt_alpha",
-        tenant_key="tenant_1",
-        phase=HirePhase.ACTIVE,
-        channel_generation=3,
-        bot_principal_id="bot_alpha",
-        app_id="cli_alpha",
-    )
-
-    class _HireService:
-        def synchronize_projection(self):
-            return harness.workforce
-
-        def list_states(self):
-            return (hire_state,)
-
-    runtime = SimpleNamespace(
-        _dispatch=harness.coordinator,
-        _ingress=harness.ingress,
-        _channels=harness.channels,
-        _require_service=lambda: _HireService(),
-        _team_execution_ready_agent_ids=lambda _tenant, _chat: frozenset(
-            {"agt_alpha"}
-        ),
-    )
-    backend = _RuntimeTeamBackend(runtime, lambda *_args: None)
-    service = EmployeeTeamService(
-        writer=harness.writer,
-        backend=backend,
-        runtime_mode="legacy_pipeline",
-        attempt_timeout_seconds=0.5,
-        poll_seconds=0.001,
-    )
-    service._commit(  # noqa: SLF001
-        JournalEvent(
-            event_type="team.run.created",
-            aggregate_id=state.run_id,
-            payload={
-                "tenant_key": state.tenant_key,
-                "message_id": state.message_id,
-                "chat_id": state.chat_id,
-                "requester_principal_id": state.requester_principal_id,
-                "task_digest": state.task_digest,
-                "max_handoffs": 8,
-                "max_depth": 4,
-                "max_fanout": 4,
-            },
-        )
-    )
-    known_acceptances = set(harness.ingress.state.by_acceptance_id)
-    team_thread = threading.Thread(
-        target=service._execute,  # noqa: SLF001
-        args=(
-            state,
-            "live timeout",
-            (TeamTarget("agt_alpha", "Alpha", "developer"),),
-        ),
-        daemon=True,
-    )
-    team_thread.start()
-    deadline = time.monotonic() + 2
-    first_acceptance = ""
-    while time.monotonic() < deadline:
-        new_ids = set(harness.ingress.state.by_acceptance_id) - known_acceptances
-        if new_ids:
-            first_acceptance = next(iter(new_ids))
-            break
-        time.sleep(0.001)
-    assert first_acceptance
-    assert harness.router.route(first_acceptance).state == "queued"
-    prepared = harness.coordinator.prepare_next()
-    assert prepared is not None
-    assert prepared.binding.acceptance_id == first_acceptance
-    runner = threading.Thread(
-        target=harness.coordinator.execute_prepared,
-        args=(prepared,),
-        daemon=True,
-    )
-    runner.start()
-    assert entered.wait(2)
-
-    original_cancel = harness.engine.cancel_employee_session
-
-    def observe_cancel(agent_id):
-        attempt = harness.coordinator.state.attempts[prepared.binding.attempt_id]
-        assert attempt.cancel_requested
-        interrupted.set()
-        return original_cancel(agent_id)
-
-    monkeypatch.setattr(harness.engine, "cancel_employee_session", observe_cancel)
-    retry_aggregate = f"{state.run_id}:analysis-retry"
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        retry_prepared = any(
-            event.event_type == "team.step.prepared"
-            and event.aggregate_id == retry_aggregate
-            for frame in harness.writer.replay()
-            for event in frame.events
-        )
-        if (
-            retry_prepared
-            and len(harness.ingress.state.by_acceptance_id)
-            == len(known_acceptances) + 2
-        ):
-            break
-        time.sleep(0.001)
-    runner.join(3)
-
-    assert not runner.is_alive()
-    frames_and_events = [
-        (frame.sequence, event)
-        for frame in harness.writer.replay()
-        for event in frame.events
-    ]
-    cancel_sequence = next(
-        sequence
-        for sequence, event in frames_and_events
-        if event.event_type == ATTEMPT_CANCEL_REQUESTED
-    )
-    terminal_sequence = next(
-        sequence
-        for sequence, event in frames_and_events
-        if event.event_type == ATTEMPT_TERMINAL
-    )
-    retry_sequence = next(
-        sequence
-        for sequence, event in frames_and_events
-        if event.event_type == "team.step.prepared"
-        and event.aggregate_id == retry_aggregate
-    )
-    assert cancel_sequence < terminal_sequence < retry_sequence
-    assert len(harness.ingress.state.by_acceptance_id) == len(known_acceptances) + 2
-    service.close()
-    team_thread.join(3)
-    assert not team_thread.is_alive()
-    harness.close()
-
 
 def test_team_queued_cancel_is_idempotent_after_effect_terminal_and_restart(
     tmp_path,
@@ -523,7 +344,7 @@ def test_team_live_cancel_is_idempotent_after_effect_terminal_and_restart(
 
 
 def test_team_cancel_after_gateway_terminal_is_stably_already_terminal(tmp_path) -> None:
-    from src.autonomous.ingress.dispatch import (
+    from src.autonomous.gateway.models import (
         GatewayExecutionResult,
         GatewayExecutionStatus,
     )
@@ -614,57 +435,6 @@ def test_stop_allows_configured_admin_and_team_owner(tmp_path) -> None:
         assert outcome.status == "cancel_requested"
         harness.close()
 
-
-def test_gateway_running_cancel_invokes_engine_and_overrides_late_success() -> None:
-    from src.autonomous.ingress import dispatch as module
-    from src.autonomous.workforce.identity import AgentIdentity
-
-    binding = _binding(module)
-    entered = threading.Event()
-    release = threading.Event()
-
-    class _Engine:
-        def __init__(self) -> None:
-            self.canceled: list[str] = []
-
-        def run_agent_session(self, *_args, **_kwargs):
-            entered.set()
-            assert release.wait(2)
-            return "late success"
-
-        def cancel_employee_session(self, agent_id: str) -> bool:
-            self.canceled.append(agent_id)
-            release.set()
-            return True
-
-    engine = _Engine()
-    gateway = module.EmployeeTeamGateway(runtime_mode="legacy_one_shot")
-    permit = gateway.issue_permit(
-        binding=binding,
-        prompt="budgeted",
-        engine=engine,
-        agent=AgentIdentity(
-            agent_id=binding.agent_id,
-            agent_type=binding.tool,
-            model_name=_runtime_model(binding),
-            model_profile=binding.profile,
-            reasoning_effort=binding.effort,
-            permissions=list(binding.permissions),
-            security_profile="employee_v1",
-        ),
-        timeout_seconds=30,
-        env={"HOME": "/tmp/employee"},
-    )
-    result = []
-    thread = threading.Thread(target=lambda: result.append(gateway.execute_permit(permit)))
-    thread.start()
-    assert entered.wait(1)
-
-    assert gateway.cancel_attempt(binding) is True
-    thread.join(2)
-
-    assert engine.canceled == [binding.agent_id]
-    assert result[0].status is GatewayExecutionStatus.CANCELED
 
 
 def test_runtime_consumes_exact_stop_before_router_admission() -> None:

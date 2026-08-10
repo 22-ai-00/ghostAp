@@ -8,9 +8,25 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from .errors import CreateChatError, CreateChatFailureDisposition
-
 logger = logging.getLogger(__name__)
+
+
+class CreateChatFailureDisposition(str, Enum):
+    DEFINITIVE_REJECTED = "definitive_rejected"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+class CreateChatError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        disposition: CreateChatFailureDisposition,
+        api_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.disposition = disposition
+        self.api_code = api_code
 
 
 @dataclass
@@ -252,24 +268,3 @@ class LarkChatClient:
         except Exception:
             logger.exception("Owner migration notification failed")
             return False
-
-    def patch_description(self, chat_id: str, description: str) -> None:
-        """Update group chat description (best-effort)."""
-        from lark_oapi.api.im.v1 import UpdateChatRequest, UpdateChatRequestBody
-
-        client = self._api_client_factory()
-        body = UpdateChatRequestBody.builder().description(description).build()
-        request = UpdateChatRequest.builder() \
-            .chat_id(chat_id) \
-            .request_body(body) \
-            .build()
-
-        try:
-            response = client.im.v1.chat.update(request)
-            if not response.success():
-                logger.warning(
-                    "patch_description(%s) failed: [%s] %s",
-                    chat_id[:12], response.code, response.msg,
-                )
-        except Exception as e:
-            logger.warning("patch_description(%s) exception: %s", chat_id[:12], e)

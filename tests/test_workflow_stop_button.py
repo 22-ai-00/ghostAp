@@ -11,6 +11,7 @@ Validates:
 
 import threading
 import unittest
+from collections import defaultdict
 from unittest.mock import MagicMock
 
 from src.card.actions.dispatch import WORKFLOW_STOP_RUNNING
@@ -166,13 +167,20 @@ class TestInjectWorkflowStopButton(unittest.TestCase):
 
 
 class TestRouterAndRegistryWiring(unittest.TestCase):
-    def test_router_mapping_contains_new_handler(self):
-        from src.feishu.router import FORWARDING_MAP
+    def test_action_registry_contains_new_handler(self):
+        from src.feishu.action_registry import init_action_registry
 
-        self.assertIn("_handle_workflow_stop_running", FORWARDING_MAP)
-        self.assertEqual(
-            FORWARDING_MAP["_handle_workflow_stop_running"],
-            ("workflow", "handle_workflow_stop_running"),
+        client = MagicMock()
+        workflow = MagicMock()
+        handlers = defaultdict(MagicMock)
+        handlers["workflow"] = workflow
+        client._handler_ctx.handlers = handlers
+
+        actions = init_action_registry(client)
+
+        self.assertIs(
+            actions[WORKFLOW_STOP_RUNNING],
+            workflow.handle_workflow_stop_running,
         )
 
 

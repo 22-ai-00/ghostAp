@@ -2,24 +2,19 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from dataclasses import replace
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from src.feishu.handlers.workflow import WorkflowHandler
-from src.spec_engine.review_agents import ReviewAgentBinding
 from src.workflow_engine.engine import WorkflowEngine
 from src.workflow_engine.executor import AgentExecutor
 from src.workflow_engine.models import (
     AgentCallParams,
     AgentCallResult,
-    PendingConfirmation,
-    WorkflowProject,
+    ReviewAgentBinding,
     WorkflowStatus,
 )
 from src.workflow_engine.run_spec import WorkflowRunSpec
@@ -175,103 +170,6 @@ def test_selected_model_map_reaches_every_agent_call(tmp_path) -> None:
     ]
     assert project.run_spec == spec.to_dict()
     assert project.tool_model_map == dict(spec.tool_model_map)
-
-
-def test_confirm_passes_one_frozen_run_spec_to_engine(tmp_path) -> None:
-    """The handler must not fan confirmed bindings back into mutable kwargs."""
-    script_text = """
-export const meta = {
-  name: "handler-binding-contract",
-  description: "handler binding contract",
-  tools: ["coco", "claude"],
-};
-export default async function workflow() {
-  const result = await agent("work", {
-    tool: "coco", model: "invented", timeout: 120
-  });
-  if (result && result.error) return result;
-  return result;
-}
-"""
-    script_path = tmp_path / "generated-workflow-binding.js"
-    script_path.write_text(script_text, encoding="utf-8")
-
-    orchestrator = _binding("coco", "selected-coco-model", selection_key="orch")
-    reviewer = _binding("claude", "selected-claude-model", selection_key="review")
-    engine = WorkflowEngine(chat_id="chat-1", root_path=str(tmp_path))
-    engine._project = WorkflowProject(
-        status=WorkflowStatus.AWAITING_CONFIRM,
-        pending=PendingConfirmation(
-            script_path=str(script_path),
-            script_hash=hashlib.sha256(script_text.encode()).hexdigest(),
-            requirement="implement the binding contract",
-            meta={"name": "handler-binding-contract", "tools": ["coco", "claude"]},
-            initiator_user_id="user-1",
-            engine_session_key="session-1",
-            selected_tools=["coco", "claude"],
-            orchestrator_binding=orchestrator,
-            review_agents=[reviewer],
-            auto_reviewer=False,
-        ),
-    )
-    engine.execute_workflow = MagicMock()
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get.return_value = engine
-    handler.ctx.progress_reporter = MagicMock()
-    handler._resolve_project_from_id = MagicMock(
-        return_value=SimpleNamespace(
-            project_id="project-1",
-            project_name="project",
-            root_path=str(tmp_path),
-        )
-    )
-    handler._get_root_path = MagicMock(return_value=str(tmp_path))
-    handler._reply_workflow_error = MagicMock()
-    handler._resolve_origin = MagicMock(return_value="topic-root-1")
-    handler._show_initial_workflow_progress_card = MagicMock(return_value="progress-1")
-    handler._build_workflow_callbacks = MagicMock(return_value=MagicMock())
-    handler.get_engine_name = MagicMock(return_value="Coco")
-    handler.ensure_request_id = MagicMock(return_value="request-1")
-    handler._safe_execute_engine = MagicMock(
-        side_effect=lambda *, executor_func, **_kwargs: executor_func()
-    )
-    handler._submit_engine_task = MagicMock(
-        side_effect=lambda run_fn, *_args, **_kwargs: run_fn()
-    )
-
-    before = time.monotonic()
-    with patch("src.thread.get_current_sender_id", return_value="user-1"):
-        handler.handle_workflow_confirm_start(
-            "confirm-1",
-            "chat-1",
-            "project-1",
-            {
-                "action": "workflow_confirm_start",
-                "engine_session_key": "session-1",
-            },
-        )
-
-    call = engine.execute_workflow.call_args
-    assert call is not None
-    assert "requirement" not in call.kwargs
-    assert "selected_tools" not in call.kwargs
-    assert "initiator_user_id" not in call.kwargs
-    run_spec = call.kwargs["run_spec"]
-    assert isinstance(run_spec, WorkflowRunSpec)
-    assert run_spec.orchestrator == orchestrator
-    assert run_spec.reviewers == (reviewer,)
-    assert dict(run_spec.tool_model_map) == {
-        "coco": "selected-coco-model",
-        "claude": "selected-claude-model",
-    }
-    assert run_spec.task == "implement the binding contract"
-    assert run_spec.chat_id == "chat-1"
-    assert run_spec.topic_id == "topic-root-1"
-    assert run_spec.budget > 0
-    assert run_spec.deadline is None or run_spec.deadline >= before
-    assert run_spec.auto_reviewer is False
 
 
 def test_run_spec_budget_and_deadline_reach_the_execution_gate(tmp_path) -> None:

@@ -18,7 +18,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from lark_oapi.api.im.v1 import GetMessageResourceRequest
 
@@ -87,8 +87,6 @@ _EVENT_TYPES = frozenset(
         "employee.ingress.attachment_staging_completed",
         "employee.ingress.attachment_staging_failed",
         "employee.ingress.attachment_cleanup_started",
-        "employee.ingress.attachment_cleanup_leaf_started",
-        "employee.ingress.attachment_cleanup_leaf_completed",
         "employee.ingress.attachment_cleanup_completed",
     }
 )
@@ -132,16 +130,6 @@ class CredentialResolver(Protocol):
 
 class AttachmentDownloader(Protocol):
     def download(self, descriptor: EmployeeAttachmentDescriptor) -> DownloadedAttachment: ...
-
-
-class AttachmentDownloaderBuilder(Protocol):
-    def __call__(
-        self,
-        *,
-        app_id: str,
-        app_secret: str,
-        timeout: float,
-    ) -> AttachmentDownloader: ...
 
 
 def _strict_string(value: object, name: str, *, maximum: int = 4096) -> str:
@@ -314,8 +302,6 @@ class AttachmentStagingRecord:
     temporary_paths: tuple[str, ...]
     content_hashes: tuple[str, ...]
     leaf_identities: tuple[tuple[int, int] | None, ...]
-    leaf_cleanup_states: tuple[str, ...]
-    leaf_cleanup_targets: tuple[tuple[int, int, str] | str | None, ...]
     parent_device: int | None = None
     parent_inode: int | None = None
     status: str = "started"
@@ -387,11 +373,8 @@ class AttachmentStagingService:
         writer: JournalWriter,
         root: str | Path,
         credential_resolver: CredentialResolver,
-        downloader_builder: AttachmentDownloaderBuilder = _default_downloader_builder,
         policy: AttachmentPolicy | None = None,
         download_timeout_seconds: float = 30.0,
-        fault_hook: Callable[[str, AttachmentStagingRecord], None] | None = None,
-        name_factory: Callable[[], str] | None = None,
     ) -> None:
         if not isinstance(writer, JournalWriter):
             raise TypeError("writer must be JournalWriter")
@@ -405,11 +388,8 @@ class AttachmentStagingService:
         self._writer = writer
         self._root = canonicalize_user_home_path(root).absolute()
         self._credential_resolver = credential_resolver
-        self._downloader_builder = downloader_builder
         self._policy = policy or AttachmentPolicy()
         self._timeout = float(download_timeout_seconds)
-        self._fault_hook = fault_hook
-        self._name_factory = name_factory or (lambda: secrets.token_hex(16))
         self._mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._closed = False
         self._root_fd = _open_secure_root(self._root)
@@ -477,7 +457,6 @@ class AttachmentStagingService:
             )
             self._commit_unlocked(aggregate_id, started)
             record = self._state.by_staging_id[staging_id]
-            self._call_fault("after_started", record)
             try:
                 parent_device, parent_inode = self._prepare_parent_unlocked(record)
                 parent_bound = JournalEvent(
@@ -501,7 +480,6 @@ class AttachmentStagingService:
                         content=downloaded.content,
                     )
                     record = self._state.by_staging_id[staging_id]
-                self._call_fault("after_publish", record)
                 self._verify_staged_record_unlocked(record)
                 completed = JournalEvent(
                     event_type="employee.ingress.attachment_staging_completed",
@@ -586,7 +564,6 @@ class AttachmentStagingService:
             for staging_id in tuple(sorted(self._state.by_staging_id)):
                 record = self._state.by_staging_id[staging_id]
                 if record.cleanup_state == "completed":
-                    self._observe_completed_tombstones_unlocked(record)
                     continue
                 needs_recovery = (
                     record.status == "started"
@@ -608,7 +585,7 @@ class AttachmentStagingService:
 
     def _allocate_storage_name(self) -> str:
         try:
-            value = self._name_factory()
+            value = secrets.token_hex(16)
         except Exception:
             raise AttachmentStorageError("random storage allocation failed") from None
         if not isinstance(value, str) or _STORAGE_NAME.fullmatch(value) is None:
@@ -627,7 +604,7 @@ class AttachmentStagingService:
             )
             if not isinstance(secret, str) or not secret:
                 raise ValueError
-            return self._downloader_builder(
+            return _default_downloader_builder(
                 app_id=request.app_id,
                 app_secret=secret,
                 timeout=self._timeout,
@@ -723,7 +700,6 @@ class AttachmentStagingService:
             leaf_stat = os.fstat(descriptor)
             if not stat.S_ISREG(leaf_stat.st_mode) or leaf_stat.st_uid != os.getuid():
                 raise AttachmentStorageError("attachment leaf identity is invalid")
-            self._call_fault("after_empty_leaf_fsync", record)
             prepared = JournalEvent(
                 event_type="employee.ingress.attachment_staging_leaf_prepared",
                 aggregate_id=record.aggregate_id,
@@ -736,8 +712,6 @@ class AttachmentStagingService:
             )
             self._commit_unlocked(record.aggregate_id, prepared)
             identity_anchored = True
-            record = self._state.by_staging_id[record.staging_id]
-            self._call_fault("after_leaf_prepared", record)
             current = os.fstat(descriptor)
             identity = (leaf_stat.st_dev, leaf_stat.st_ino)
             if (
@@ -751,7 +725,6 @@ class AttachmentStagingService:
             _require_absent_leaf(parent_fd, final_name)
             os.replace(temp_name, final_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
             os.fsync(parent_fd)
-            self._call_fault("after_leaf_rename", record)
             current = os.fstat(descriptor)
             if (
                 (current.st_dev, current.st_ino) != identity
@@ -869,7 +842,6 @@ class AttachmentStagingService:
         if record is None:
             raise KeyError(staging_id)
         if record.cleanup_state == "completed":
-            self._observe_completed_tombstones_unlocked(record)
             return
         if record.cleanup_state == "none":
             event = JournalEvent(
@@ -879,67 +851,34 @@ class AttachmentStagingService:
             )
             self._commit_unlocked(record.aggregate_id, event)
             record = self._state.by_staging_id[staging_id]
-            self._call_fault("after_cleanup_started", record)
         self._dispose_owned_paths_unlocked(record)
-        record = self._state.by_staging_id[staging_id]
-        self._call_fault("before_cleanup_completed", record)
-        self._verify_cleanup_targets_unlocked(record)
         completed = JournalEvent(
             event_type="employee.ingress.attachment_cleanup_completed",
             aggregate_id=record.aggregate_id,
             payload={"staging_id": staging_id},
         )
         self._commit_unlocked(record.aggregate_id, completed)
-        record = self._state.by_staging_id[staging_id]
-        self._call_fault("after_cleanup_completed", record)
-        self._observe_completed_tombstones_unlocked(record)
 
     def _dispose_owned_paths_unlocked(self, record: AttachmentStagingRecord) -> None:
         if record.parent_device is None or record.parent_inode is None:
-            # Publication is unreachable until this binding is anchored.
-            for index, cleanup_state in enumerate(record.leaf_cleanup_states):
-                if cleanup_state == "none":
-                    self._commit_leaf_cleanup_event_unlocked(
-                        record,
-                        index,
-                        completed=False,
-                        target="absent",
-                    )
-                    record = self._state.by_staging_id[record.staging_id]
-                if record.leaf_cleanup_states[index] == "started":
-                    self._commit_leaf_cleanup_event_unlocked(record, index, completed=True)
-                    record = self._state.by_staging_id[record.staging_id]
+            # No leaf can be published before the parent identity is anchored.
             return
         parent_parts = _relative_parts(record.relative_paths[0])[:-1]
         parent_fd = self._open_directory_unlocked(parent_parts, create=False)
         try:
             self._verify_parent_identity(parent_fd, record)
             for index, identity in enumerate(record.leaf_identities):
-                record = self._state.by_staging_id[record.staging_id]
                 temporary = _relative_parts(record.temporary_paths[index])[-1]
                 final = _relative_parts(record.relative_paths[index])[-1]
-                cleanup_state = record.leaf_cleanup_states[index]
-                if cleanup_state == "completed":
-                    self._verify_disposed_leaf_unlocked(
-                        parent_fd,
-                        cleanup_target=record.leaf_cleanup_targets[index],
-                        temporary=temporary,
-                        final=final,
-                    )
-                    continue
                 if identity is None:
                     self._dispose_unbound_empty_temp_unlocked(
                         parent_fd,
-                        record=record,
-                        index=index,
                         temporary=temporary,
                         final=final,
                     )
                     continue
                 self._erase_bound_leaf_unlocked(
                     parent_fd,
-                    record=record,
-                    index=index,
                     identity=identity,
                     temporary=temporary,
                     final=final,
@@ -956,262 +895,78 @@ class AttachmentStagingService:
         self,
         parent_fd: int,
         *,
-        record: AttachmentStagingRecord,
-        index: int,
         temporary: str,
         final: str,
     ) -> None:
-        cleanup_state = record.leaf_cleanup_states[index]
-        if cleanup_state == "none":
-            target = _observe_unbound_cleanup_target(parent_fd, temporary, final)
-            self._commit_leaf_cleanup_event_unlocked(
-                record,
-                index,
-                completed=False,
-                target=target,
+        if _leaf_lstat(parent_fd, final) is not None:
+            raise AttachmentStorageError("unbound attachment leaf is not trusted")
+        leaf = _leaf_lstat(parent_fd, temporary)
+        if leaf is None:
+            return
+        identity = (leaf.st_dev, leaf.st_ino)
+        if not _trusted_leaf_stat_matches(leaf, identity) or leaf.st_size != 0:
+            raise AttachmentStorageError("unbound attachment leaf is not trusted")
+        fd: int | None = None
+        try:
+            fd = os.open(
+                temporary,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
             )
-            record = self._state.by_staging_id[record.staging_id]
-            self._call_fault("after_unbound_leaf_cleanup_started", record)
-            cleanup_state = record.leaf_cleanup_states[index]
-        if cleanup_state == "started":
-            target = record.leaf_cleanup_targets[index]
-            fd = _open_unbound_cleanup_target(parent_fd, temporary, final, target)
-            try:
-                _revalidate_unbound_cleanup_target(
-                    parent_fd,
-                    temporary,
-                    final,
-                    target,
-                    fd,
-                )
-                self._commit_leaf_cleanup_event_unlocked(record, index, completed=True)
-                record = self._state.by_staging_id[record.staging_id]
-                _revalidate_unbound_cleanup_target(
-                    parent_fd,
-                    temporary,
-                    final,
-                    target,
-                    fd,
-                )
-            finally:
-                if fd is not None:
-                    os.close(fd)
-        self._call_fault("after_leaf_tombstone_ready", record)
+            current = os.fstat(fd)
+            if (
+                not _trusted_leaf_stat_matches(current, identity)
+                or current.st_size != 0
+            ):
+                raise AttachmentStorageError("unbound attachment leaf is not trusted")
+            _require_unique_exact_leaf(parent_fd, identity, temporary)
+            os.unlink(temporary, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            if os.fstat(fd).st_nlink != 0 or _leaf_lstat(parent_fd, temporary) is not None:
+                raise AttachmentStorageError("unbound attachment leaf was not erased")
+        except AttachmentStorageError:
+            raise
+        except OSError:
+            raise AttachmentStorageError("unbound attachment cleanup failed") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _erase_bound_leaf_unlocked(
         self,
         parent_fd: int,
         *,
-        record: AttachmentStagingRecord,
-        index: int,
         identity: tuple[int, int],
         temporary: str,
         final: str,
     ) -> None:
-        name, aliases_present = _locate_leaf_for_erasure(
-            parent_fd,
-            identity,
-            temporary,
-            final,
-        )
+        name = _locate_exact_leaf(parent_fd, identity, temporary, final)
         if name is None:
-            raise AttachmentStorageError("attachment leaf identity is missing")
+            return
         fd: int | None = None
         try:
             fd = os.open(name, os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
             leaf_stat = os.fstat(fd)
-            if (
-                (leaf_stat.st_dev, leaf_stat.st_ino) != identity
-                or not stat.S_ISREG(leaf_stat.st_mode)
-                or leaf_stat.st_uid != os.getuid()
-            ):
+            if not _trusted_leaf_stat_matches(leaf_stat, identity):
                 raise AttachmentStorageError("attachment cleanup leaf identity changed")
-            if record.leaf_cleanup_states[index] == "none":
-                self._commit_leaf_cleanup_event_unlocked(
-                    record,
-                    index,
-                    completed=False,
-                    target=(
-                        identity[0],
-                        identity[1],
-                        "temporary" if name == temporary else "final",
-                    ),
-                )
+            _require_unique_exact_leaf(parent_fd, identity, name)
             os.ftruncate(fd, 0)
             os.fsync(fd)
-            record = self._state.by_staging_id[record.staging_id]
-            self._call_fault("after_leaf_truncate", record)
-            if aliases_present or os.fstat(fd).st_nlink != 1:
-                raise AttachmentStorageError("attachment leaf identity has multiple names")
-            self._commit_leaf_cleanup_event_unlocked(record, index, completed=True)
-            self._call_fault(
-                "after_leaf_erased",
-                self._state.by_staging_id[record.staging_id],
-            )
-        finally:
-            if fd is not None:
-                os.close(fd)
-        self._verify_disposed_leaf_unlocked(
-            parent_fd,
-            cleanup_target=record.leaf_cleanup_targets[index],
-            temporary=temporary,
-            final=final,
-        )
-        os.fsync(parent_fd)
-        self._call_fault("after_leaf_tombstone_ready", record)
-
-    @staticmethod
-    def _verify_disposed_leaf_unlocked(
-        parent_fd: int,
-        *,
-        cleanup_target: tuple[int, int, str] | str | None,
-        temporary: str,
-        final: str,
-    ) -> None:
-        if cleanup_target == "absent":
-            if (
-                _leaf_lstat(parent_fd, temporary) is not None
-                or _leaf_lstat(parent_fd, final) is not None
-            ):
-                raise AttachmentStorageError("attachment cleanup absent target changed")
-            return
-        if not isinstance(cleanup_target, tuple) or len(cleanup_target) != 3:
-            raise AttachmentStorageError("attachment cleanup target is invalid")
-        identity = cleanup_target[:2]
-        name = temporary if cleanup_target[2] == "temporary" else final
-        other = final if name == temporary else temporary
-        if _leaf_lstat(parent_fd, other) is not None:
-            raise AttachmentStorageError("attachment cleanup target path changed")
-        fd: int | None = None
-        try:
-            fd = os.open(
-                name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_fd,
-            )
-            leaf_stat = os.fstat(fd)
-            if (
-                (leaf_stat.st_dev, leaf_stat.st_ino) != identity
-                or not stat.S_ISREG(leaf_stat.st_mode)
-                or stat.S_IMODE(leaf_stat.st_mode) != 0o600
-                or leaf_stat.st_uid != os.getuid()
-                or leaf_stat.st_size != 0
-                or leaf_stat.st_nlink != 1
-            ):
-                raise AttachmentStorageError("erased attachment leaf is not trusted")
+            current = os.fstat(fd)
+            if not _trusted_leaf_stat_matches(current, identity) or current.st_size != 0:
+                raise AttachmentStorageError("attachment cleanup leaf identity changed")
             _require_unique_exact_leaf(parent_fd, identity, name)
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            if os.fstat(fd).st_nlink != 0:
+                raise AttachmentStorageError("attachment leaf was not erased")
         except AttachmentStorageError:
             raise
         except OSError:
-            raise AttachmentStorageError("erased attachment leaf is missing") from None
+            raise AttachmentStorageError("attachment cleanup failed") from None
         finally:
             if fd is not None:
                 os.close(fd)
-
-    def _verify_cleanup_targets_unlocked(
-        self,
-        record: AttachmentStagingRecord,
-    ) -> None:
-        if any(state != "completed" for state in record.leaf_cleanup_states):
-            raise AttachmentStateError("attachment cleanup leaves are incomplete")
-        if record.parent_device is None or record.parent_inode is None:
-            if any(target != "absent" for target in record.leaf_cleanup_targets):
-                raise AttachmentStateError("attachment cleanup target is invalid")
-            return
-        parent_parts = _relative_parts(record.relative_paths[0])[:-1]
-        parent_fd = self._open_directory_unlocked(parent_parts, create=False)
-        try:
-            self._verify_parent_identity(parent_fd, record)
-            for index, target in enumerate(record.leaf_cleanup_targets):
-                self._verify_disposed_leaf_unlocked(
-                    parent_fd,
-                    cleanup_target=target,
-                    temporary=_relative_parts(record.temporary_paths[index])[-1],
-                    final=_relative_parts(record.relative_paths[index])[-1],
-                )
-            os.fsync(parent_fd)
-        except AttachmentStorageError:
-            raise
-        except OSError:
-            raise AttachmentStorageError("attachment cleanup verification failed") from None
-        finally:
-            os.close(parent_fd)
-
-    def _observe_completed_tombstones_unlocked(
-        self,
-        record: AttachmentStagingRecord,
-    ) -> None:
-        """Best-effort verify completed tombstones without pathname mutation."""
-
-        if (
-            record.cleanup_state != "completed"
-            or record.parent_device is None
-            or record.parent_inode is None
-        ):
-            return
-        parent_parts = _relative_parts(record.relative_paths[0])[:-1]
-        try:
-            parent_fd = self._open_directory_unlocked(parent_parts, create=False)
-        except AttachmentError:
-            return
-        try:
-            self._verify_parent_identity(parent_fd, record)
-            for index, target in enumerate(record.leaf_cleanup_targets):
-                if not isinstance(target, tuple) or len(target) != 3:
-                    continue
-                temporary = _relative_parts(record.temporary_paths[index])[-1]
-                final = _relative_parts(record.relative_paths[index])[-1]
-                try:
-                    self._verify_disposed_leaf_unlocked(
-                        parent_fd,
-                        cleanup_target=target,
-                        temporary=temporary,
-                        final=final,
-                    )
-                except (AttachmentError, OSError):
-                    continue
-        except (AttachmentError, OSError):
-            return
-        finally:
-            os.close(parent_fd)
-
-    def _commit_leaf_cleanup_event_unlocked(
-        self,
-        record: AttachmentStagingRecord,
-        index: int,
-        *,
-        completed: bool,
-        target: tuple[int, int, str] | str | None = None,
-    ) -> None:
-        suffix = "completed" if completed else "started"
-        payload: dict[str, object] = {
-            "staging_id": record.staging_id,
-            "index": index,
-        }
-        if not completed:
-            if target == "absent":
-                payload["target_kind"] = "absent"
-            elif (
-                isinstance(target, tuple)
-                and len(target) == 3
-                and target[2] in {"temporary", "final"}
-            ):
-                payload.update(
-                    {
-                        "target_kind": "identity",
-                        "target_device": target[0],
-                        "target_inode": target[1],
-                        "target_path": target[2],
-                    }
-                )
-            else:
-                raise AttachmentStateError("attachment cleanup target is required")
-        event = JournalEvent(
-            event_type=f"employee.ingress.attachment_cleanup_leaf_{suffix}",
-            aggregate_id=record.aggregate_id,
-            payload=payload,
-        )
-        self._commit_unlocked(record.aggregate_id, event)
 
     @staticmethod
     def _verify_parent_identity(
@@ -1246,10 +1001,6 @@ class AttachmentStagingService:
         if isinstance(error, AttachmentError):
             return error
         return AttachmentDownloadError("employee attachment staging failed")
-
-    def _call_fault(self, stage: str, record: AttachmentStagingRecord) -> None:
-        if self._fault_hook is not None:
-            self._fault_hook(stage, record)
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -1398,8 +1149,6 @@ def _apply_event(state: AttachmentStagingState, event: JournalEvent) -> None:
             temporary_paths=temporary_paths,
             content_hashes=hashes,
             leaf_identities=tuple(None for _ in relative_paths),
-            leaf_cleanup_states=tuple("none" for _ in relative_paths),
-            leaf_cleanup_targets=tuple(None for _ in relative_paths),
         )
         expected_base = (
             tenant_storage_component(record.tenant_key),
@@ -1444,86 +1193,6 @@ def _apply_event(state: AttachmentStagingState, event: JournalEvent) -> None:
             record,
             parent_device=parent_device,
             parent_inode=parent_inode,
-        )
-        return
-    if event.event_type in {
-        "employee.ingress.attachment_cleanup_leaf_started",
-        "employee.ingress.attachment_cleanup_leaf_completed",
-    }:
-        is_started = event.event_type == "employee.ingress.attachment_cleanup_leaf_started"
-        base_fields = {"staging_id", "index"}
-        if is_started:
-            target_kind = payload.get("target_kind")
-            expected_fields = (
-                base_fields | {"target_kind"}
-                if target_kind == "absent"
-                else base_fields
-                | {"target_kind", "target_device", "target_inode", "target_path"}
-            )
-        else:
-            expected_fields = base_fields
-        if set(payload) != expected_fields:
-            raise AttachmentStateError("invalid attachment leaf cleanup")
-        staging_id = payload.get("staging_id")
-        if not isinstance(staging_id, str) or staging_id not in state.by_staging_id:
-            raise AttachmentStateError("attachment leaf cleanup references unknown staging")
-        record = state.by_staging_id[staging_id]
-        if event.aggregate_id != record.aggregate_id:
-            raise AttachmentStateError("attachment leaf cleanup aggregate mismatch")
-        index = payload.get("index")
-        if (
-            isinstance(index, bool)
-            or not isinstance(index, int)
-            or index < 0
-            or index >= len(record.leaf_cleanup_states)
-            or record.status not in {"completed", "failed"}
-            or record.cleanup_state != "started"
-        ):
-            raise AttachmentStateError("attachment leaf cleanup cannot transition")
-        expected = "none" if is_started else "started"
-        replacement = "completed" if expected == "started" else "started"
-        if record.leaf_cleanup_states[index] != expected:
-            raise AttachmentStateError("attachment leaf cleanup cannot transition")
-        cleanup_targets = list(record.leaf_cleanup_targets)
-        if is_started:
-            target_kind = payload.get("target_kind")
-            if target_kind == "absent":
-                target: tuple[int, int, str] | str = "absent"
-            elif target_kind == "identity":
-                target_device = payload.get("target_device")
-                target_inode = payload.get("target_inode")
-                target_path = payload.get("target_path")
-                if (
-                    isinstance(target_device, bool)
-                    or not isinstance(target_device, int)
-                    or target_device < 0
-                    or isinstance(target_inode, bool)
-                    or not isinstance(target_inode, int)
-                    or target_inode <= 0
-                    or target_path not in {"temporary", "final"}
-                ):
-                    raise AttachmentStateError("attachment cleanup target is invalid")
-                target = (target_device, target_inode, target_path)
-            else:
-                raise AttachmentStateError("attachment cleanup target is invalid")
-            bound_identity = record.leaf_identities[index]
-            if bound_identity is not None and (
-                not isinstance(target, tuple) or target[:2] != bound_identity
-            ):
-                raise AttachmentStateError("attachment cleanup target mismatch")
-            if bound_identity is None and isinstance(target, tuple) and target[2] != "temporary":
-                raise AttachmentStateError("attachment cleanup target mismatch")
-            if cleanup_targets[index] is not None:
-                raise AttachmentStateError("attachment cleanup target is already bound")
-            cleanup_targets[index] = target
-        elif cleanup_targets[index] is None:
-            raise AttachmentStateError("attachment cleanup target is not bound")
-        cleanup_states = list(record.leaf_cleanup_states)
-        cleanup_states[index] = replacement
-        state.by_staging_id[staging_id] = replace(
-            record,
-            leaf_cleanup_states=tuple(cleanup_states),
-            leaf_cleanup_targets=tuple(cleanup_targets),
         )
         return
     if event.event_type == "employee.ingress.attachment_staging_leaf_prepared":
@@ -1609,10 +1278,11 @@ def _apply_event(state: AttachmentStagingState, event: JournalEvent) -> None:
         if (
             record.status not in {"completed", "failed"}
             or record.cleanup_state != "started"
-            or any(value != "completed" for value in record.leaf_cleanup_states)
         ):
             raise AttachmentStateError("attachment cleanup was not started")
         record = replace(record, cleanup_state="completed")
+    else:
+        raise AttachmentStateError("unknown attachment lifecycle event")
     state.by_staging_id[staging_id] = record
 
 
@@ -1722,101 +1392,6 @@ def _trusted_leaf_generation(file_stat: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _observe_unbound_cleanup_target(
-    parent_fd: int,
-    temporary: str,
-    final: str,
-) -> tuple[int, int, str] | str:
-    if _leaf_lstat(parent_fd, final) is not None:
-        raise AttachmentStorageError("unbound attachment leaf is not trusted")
-    temp_stat = _leaf_lstat(parent_fd, temporary)
-    if temp_stat is None:
-        return "absent"
-    if (
-        not stat.S_ISREG(temp_stat.st_mode)
-        or stat.S_IMODE(temp_stat.st_mode) != 0o600
-        or temp_stat.st_uid != os.getuid()
-        or temp_stat.st_size != 0
-        or temp_stat.st_nlink != 1
-    ):
-        raise AttachmentStorageError("unbound attachment leaf is not trusted")
-    return temp_stat.st_dev, temp_stat.st_ino, "temporary"
-
-
-def _open_unbound_cleanup_target(
-    parent_fd: int,
-    temporary: str,
-    final: str,
-    target: tuple[int, int, str] | str | None,
-) -> int | None:
-    if target == "absent":
-        _revalidate_unbound_cleanup_target(
-            parent_fd,
-            temporary,
-            final,
-            target,
-            None,
-        )
-        return None
-    if not isinstance(target, tuple) or len(target) != 3 or target[2] != "temporary":
-        raise AttachmentStorageError("unbound attachment cleanup target is invalid")
-    try:
-        fd = os.open(
-            temporary,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            dir_fd=parent_fd,
-        )
-    except OSError:
-        raise AttachmentStorageError("unbound attachment leaf is not trusted") from None
-    try:
-        _revalidate_unbound_cleanup_target(
-            parent_fd,
-            temporary,
-            final,
-            target,
-            fd,
-        )
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
-def _revalidate_unbound_cleanup_target(
-    parent_fd: int,
-    temporary: str,
-    final: str,
-    target: tuple[int, int, str] | str | None,
-    fd: int | None,
-) -> None:
-    if _leaf_lstat(parent_fd, final) is not None:
-        raise AttachmentStorageError("unbound attachment leaf is not trusted")
-    temp_stat = _leaf_lstat(parent_fd, temporary)
-    if target == "absent":
-        if fd is not None or temp_stat is not None:
-            raise AttachmentStorageError("unbound attachment leaf is not trusted")
-        return
-    if (
-        not isinstance(target, tuple)
-        or len(target) != 3
-        or target[2] != "temporary"
-        or fd is None
-    ):
-        raise AttachmentStorageError("unbound attachment cleanup target is invalid")
-    file_stat = os.fstat(fd)
-    if (
-        temp_stat is None
-        or (temp_stat.st_dev, temp_stat.st_ino) != target[:2]
-        or (file_stat.st_dev, file_stat.st_ino) != target[:2]
-        or not stat.S_ISREG(file_stat.st_mode)
-        or stat.S_IMODE(file_stat.st_mode) != 0o600
-        or file_stat.st_uid != os.getuid()
-        or file_stat.st_size != 0
-        or file_stat.st_nlink != 1
-    ):
-        raise AttachmentStorageError("unbound attachment leaf is not trusted")
-
-
 def _require_unique_exact_leaf(
     parent_fd: int,
     identity: tuple[int, int],
@@ -1836,40 +1411,6 @@ def _require_unique_exact_leaf(
             exact_names.append(name)
     if exact_names != [expected_name]:
         raise AttachmentStorageError("attachment leaf identity has multiple names")
-
-
-def _locate_leaf_for_erasure(
-    parent_fd: int,
-    identity: tuple[int, int],
-    temporary: str,
-    final: str,
-) -> tuple[str | None, bool]:
-    expected_names = {temporary, final}
-    exact_names: list[str] = []
-    conflicting_expected = False
-    for name in os.listdir(parent_fd):
-        leaf_stat = _leaf_lstat(parent_fd, name)
-        if leaf_stat is None:
-            continue
-        if (leaf_stat.st_dev, leaf_stat.st_ino) == identity:
-            exact_names.append(name)
-        elif name in expected_names:
-            conflicting_expected = True
-    if not exact_names:
-        return None, conflicting_expected
-    selected = next(
-        (name for name in (temporary, final) if name in exact_names),
-        exact_names[0],
-    )
-    selected_stat = _leaf_lstat(parent_fd, selected)
-    aliases_present = (
-        conflicting_expected
-        or len(exact_names) != 1
-        or selected not in expected_names
-        or selected_stat is None
-        or selected_stat.st_nlink != 1
-    )
-    return selected, aliases_present
 
 
 def _locate_exact_leaf(

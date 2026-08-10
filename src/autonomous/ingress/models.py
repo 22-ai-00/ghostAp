@@ -459,17 +459,6 @@ class EmployeeIngressMetadata:
             _canonical_json(list(self.canonical_dedup_material))
         ).hexdigest()
 
-    @property
-    def trusted_worker_binding(self) -> tuple[str, str, str, str, int, str]:
-        return (
-            self.tenant_key,
-            self.agent_id,
-            self.bot_principal_id,
-            self.app_id,
-            self.channel_generation,
-            self.connection_id,
-        )
-
     def to_dict(self) -> dict[str, Any]:
         return {field: getattr(self, field) for field in sorted(self._FIELDS)}
 
@@ -657,74 +646,3 @@ class IngressDisposition:
     @classmethod
     def from_dict(cls, value: Any) -> IngressDisposition:
         return cls(**_exact_dict(value, cls._FIELDS, "ingress disposition"))
-
-
-@dataclass(frozen=True, slots=True)
-class EmployeeAttemptState:
-    """Immutable employee attempt state bound to acceptance and generation."""
-
-    schema_version: int
-    attempt_id: str
-    acceptance_id: str
-    tenant_key: str
-    agent_id: str
-    app_id: str
-    channel_generation: int
-    state: str
-    terminal_epoch: int
-    journal_sequence: int
-    journal_frame_hash: str
-    updated_at: str
-
-    _FIELDS = frozenset(
-        {
-            "schema_version",
-            "attempt_id",
-            "acceptance_id",
-            "tenant_key",
-            "agent_id",
-            "app_id",
-            "channel_generation",
-            "state",
-            "terminal_epoch",
-            "journal_sequence",
-            "journal_frame_hash",
-            "updated_at",
-        }
-    )
-
-    def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError("unsupported attempt schema_version")
-        object.__setattr__(self, "attempt_id", _identifier(self.attempt_id, "attempt_id", "atm_"))
-        object.__setattr__(self, "acceptance_id", _identifier(self.acceptance_id, "acceptance_id", "acc_"))
-        object.__setattr__(self, "tenant_key", _strict_str(self.tenant_key, "tenant_key"))
-        object.__setattr__(self, "agent_id", _identifier(self.agent_id, "agent_id", "agt_"))
-        object.__setattr__(self, "app_id", _identifier(self.app_id, "app_id", "cli_"))
-        object.__setattr__(
-            self,
-            "channel_generation",
-            _strict_int(self.channel_generation, "channel_generation", minimum=1),
-        )
-        if self.state not in _ATTEMPT_STATES:
-            raise ValueError("invalid attempt state")
-        epoch = _strict_int(self.terminal_epoch, "terminal_epoch")
-        if self.state in _TERMINAL_ATTEMPT_STATES and epoch < 1:
-            raise ValueError("terminal_epoch must be positive for terminal state")
-        if self.state not in _TERMINAL_ATTEMPT_STATES and epoch != 0:
-            raise ValueError("terminal_epoch must be zero for nonterminal state")
-        object.__setattr__(self, "terminal_epoch", epoch)
-        object.__setattr__(
-            self,
-            "journal_sequence",
-            _strict_int(self.journal_sequence, "journal_sequence", minimum=1),
-        )
-        object.__setattr__(self, "journal_frame_hash", _sha256(self.journal_frame_hash, "journal_frame_hash"))
-        object.__setattr__(self, "updated_at", _utc_timestamp(self.updated_at, "updated_at"))
-
-    def to_dict(self) -> dict[str, Any]:
-        return {field: getattr(self, field) for field in sorted(self._FIELDS)}
-
-    @classmethod
-    def from_dict(cls, value: Any) -> EmployeeAttemptState:
-        return cls(**_exact_dict(value, cls._FIELDS, "employee attempt state"))

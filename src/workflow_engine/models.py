@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from src.spec_engine.review_agents import ReviewAgentBinding
+from src.spec_engine.models import ReviewAgentBinding
 
 from .constants import (
     AGENT_CALL_TIMEOUT_S,
@@ -26,9 +26,6 @@ class WorkflowStatus(str, Enum):
 
     IDLE = "idle"
     GENERATING_SCRIPT = "generating_script"
-    AWAITING_AGENT_SELECT = "awaiting_agent_select"  # User selecting orchestrator agent
-    AWAITING_TOOL_SELECT = "awaiting_tool_select"  # User selecting tools before script generation
-    AWAITING_CONFIRM = "awaiting_confirm"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -141,16 +138,20 @@ class PhaseProgress(BaseModel):
 
 
 class SubagentProgress(BaseModel):
-    """Latest safe snapshot for one ACP-internal child thread.
+    """Latest safe observation for one ACP-internal child thread.
 
     ``source_id`` is an internal merge key only. Renderers must use list order
     for display labels and must never expose this opaque provider identifier.
+    ACP currently does not forward an authoritative child list, so observations
+    default to non-authoritative and must never drive the outer agent terminal
+    state.
     """
 
     source_id: str
     status: SubagentStatus = SubagentStatus.RUNNING
     progress: str = ""
     model: Optional[str] = None
+    authoritative: bool = False
 
 
 class AgentProgress(BaseModel):
@@ -169,6 +170,7 @@ class AgentProgress(BaseModel):
     finished_at: Optional[float] = None
     current_activity: str = ""  # Live activity hint (e.g. "read_file src/...", "writing code...")
     activity_updated_at: Optional[float] = None
+    attempt: int = 1
     result: Optional[str] = None  # Sanitized terminal result used by Workflow cards only.
     call_index: int = 0
     subagents: list[SubagentProgress] = Field(default_factory=list)
@@ -211,31 +213,25 @@ class WorkflowMetrics(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# PendingConfirmation — pending execution state
+# PendingWorkflow — generated execution handoff state
 # ---------------------------------------------------------------------------
 
 
-class PendingConfirmation(BaseModel):
-    """State for a workflow awaiting user confirmation before execution."""
+class PendingWorkflow(BaseModel):
+    """State owned while a workflow is generated and handed to runtime."""
 
     created_at: float = Field(default_factory=time.time)
     script_path: Optional[str] = None
     requirement: Optional[str] = None
     meta: Optional[dict[str, Any]] = None
-    is_fallback: bool = False
     initiator_user_id: Optional[str] = None
     engine_session_key: Optional[str] = None
     selected_tools: Optional[list[str]] = None
-    tools_mismatch: bool = False
-    orchestrator_agent: Optional[str] = None  # Selected orchestrator agent
-    is_template_hint: Optional[str] = None  # Set when launched via `/wf <template>` so downstream handlers can initialize default tool selection from template meta.tools
-    script_hash: Optional[str] = None  # SHA-256 of the script content at generation time — used for TOCTOU checks at confirm-time so tampered scripts are rejected before execution.
-    # --- New selection flow fields ---
-    orchestrator_binding: Optional[ReviewAgentBinding] = None  # ReviewAgentBinding for the main agent
-    review_agents: Optional[list[ReviewAgentBinding]] = None  # ReviewAgentBinding list for review pool
-    # None is reserved for restored legacy selections. New UI flows always
-    # persist True (Auto) or False (explicit reviewers).
-    auto_reviewer: Optional[bool] = None
+    orchestrator_agent: Optional[str] = None
+    script_hash: Optional[str] = None  # SHA-256 checked again at the execution handoff.
+    orchestrator_binding: Optional[ReviewAgentBinding] = None
+    review_agents: list[ReviewAgentBinding] = Field(default_factory=list)
+    auto_reviewer: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +255,8 @@ class WorkflowProject(BaseModel):
     error: Optional[str] = None
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
-    # Pending confirmation state — set during AWAITING_CONFIRM / AWAITING_TOOL_SELECT
-    pending: Optional[PendingConfirmation] = None
+    # Short-lived generated script state while GENERATING_SCRIPT owns the run.
+    pending: Optional[PendingWorkflow] = None
     # Runtime state — set when execution begins
     initiator_user_id: Optional[str] = None  # Who started this workflow (for stop auth)
     selected_tools: Optional[list[str]] = None  # Active tool whitelist during execution
@@ -269,12 +265,8 @@ class WorkflowProject(BaseModel):
     # the live engine keeps the frozen object itself.
     run_spec: Optional[dict[str, Any]] = None
     reviewer_evidence: list[ReviewerEvidence] = Field(default_factory=list)
-    # Selection state storage for Workflow selection controllers
-    orchestrator_selection_state: Optional[dict] = None
-    review_selection_state: Optional[dict] = None
-
     def start_execution(self) -> None:
-        """Transition from pending confirmation to execution.
+        """Transition from generated state to execution.
 
         Migrates initiator_user_id, selected_tools, and tool-model bindings
         from pending to runtime fields, then clears the pending state.
@@ -284,7 +276,7 @@ class WorkflowProject(BaseModel):
                 self.initiator_user_id = self.pending.initiator_user_id
             if self.pending.selected_tools is not None:
                 self.selected_tools = self.pending.selected_tools
-            # Build tool→model mapping from user selections
+            # Build tool-to-model mapping from automatic bindings.
             mapping: dict[str, Optional[str]] = {}
             if self.pending.orchestrator_binding:
                 b = self.pending.orchestrator_binding
@@ -303,27 +295,5 @@ class WorkflowProject(BaseModel):
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WorkflowProject":
-        """Deserialize from persistence.
-
-        Handles legacy format with flat pending_* fields by migrating them
-        into the PendingConfirmation sub-model.
-        """
-        # Check for legacy flat pending_* fields and migrate
-        legacy_fields = {
-            "script_path": data.pop("pending_script_path", None),
-            "requirement": data.pop("pending_requirement", None),
-            "meta": data.pop("pending_meta", None),
-            "is_fallback": data.pop("pending_is_fallback", False),
-            "initiator_user_id": data.pop("pending_initiator_user_id", None),
-            "engine_session_key": data.pop("pending_engine_session_key", None),
-            "selected_tools": data.pop("pending_selected_tools", None),
-            "tools_mismatch": data.pop("pending_tools_mismatch", False),
-        }
-        # Only create pending if any legacy field has a non-default value
-        has_legacy = any(
-            v is not None and v is not False and v != []
-            for v in legacy_fields.values()
-        )
-        if has_legacy and "pending" not in data:
-            data["pending"] = PendingConfirmation(**legacy_fields).model_dump()
+        """Deserialize current persisted Workflow state."""
         return cls.model_validate(data)

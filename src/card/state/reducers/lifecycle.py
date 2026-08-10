@@ -7,17 +7,12 @@ from typing import cast
 from src.card.themes import TERMINAL_TEMPLATES
 
 from ...engine_meta import ENGINE_CMD_MAP
-from ...events import CardEvent, CardEventType, CompletedPayload, FailedPayload
+from ...events import CardEvent, CardEventType
+from ...events.payloads import CompletedPayload, FailedPayload
 from ...ui_text import UI_TEXT
 from ..button_intent import ButtonIntent
 from ..models import ButtonSpec, CardState, EngineExtState, FooterState, HeaderState, TextBlock
 from ._shared import build_header
-
-# Retry button action IDs per engine type
-_RETRY_ACTIONS: dict[str, str] = {
-    "deep": ButtonIntent.DEEP_RESUME,
-    "spec": ButtonIntent.SPEC_RESUME,
-}
 
 # Engine type → user-facing command — imported from engine_meta
 _ENGINE_CMD = ENGINE_CMD_MAP
@@ -232,11 +227,11 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
             retry_action_id = None
             if isinstance(retry_action, dict):
                 retry_action_id = str(retry_action.get("action") or "") or None
-            if retry_action_id or (engine_type and engine_type in _RETRY_ACTIONS):
+            if retry_action_id:
                 retry_text = _RETRY_CTA_TEXT.get(engine_type, UI_TEXT["card_lifecycle_retry_failed"])
                 buttons_list.append(ButtonSpec(
                     text=retry_text,
-                    action_id=retry_action_id or _RETRY_ACTIONS[engine_type],
+                    action_id=retry_action_id,
                     type="primary",
                     confirm=UI_TEXT["card_btn_confirm_retry_body"],
                     value=dict(retry_action) if isinstance(retry_action, dict) else None,
@@ -283,16 +278,7 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                 persistent_warning=bool(state.footer.warning_banner),
                 duration_seconds=_compute_duration(state, now),
             )
-            # Inject restart button so user can re-trigger without retyping
             cancel_buttons_list: list[ButtonSpec] = []
-            engine_type = state.metadata.engine_type
-            if engine_type and engine_type in _RETRY_ACTIONS:
-                cancel_buttons_list.append(ButtonSpec(
-                    text=UI_TEXT["card_lifecycle_restart"],
-                    action_id=_RETRY_ACTIONS[engine_type],
-                    type="primary",
-                    confirm=UI_TEXT["card_btn_confirm_retry_body"],
-                ))
             # For TTL-expired cancellations, add a unified "show status" button
             if reason == "ttl_expired":
                 cancel_buttons_list.append(ButtonSpec(
@@ -357,17 +343,9 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
 
         case CardEventType.PAUSED:
             header = build_header(state.metadata, "paused")
-            paused_buttons: tuple[ButtonSpec, ...] = ()
-            engine_type = state.metadata.engine_type
-            if engine_type and engine_type in _RETRY_ACTIONS:
-                paused_buttons = (ButtonSpec(
-                    text=UI_TEXT["card_lifecycle_resume"],
-                    action_id=_RETRY_ACTIONS[engine_type],
-                    type="primary",
-                ),)
             return replace(state, terminal="paused", header=header,
                            footer=FooterState(status="idle", status_text=UI_TEXT["card_lifecycle_paused"]),
-                           buttons=paused_buttons)
+                           buttons=())
 
         case CardEventType.RESUMED:
             header = build_header(state.metadata, "running")
@@ -386,18 +364,9 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                 status_text=UI_TEXT.get("card_lifecycle_blocked", "任务已阻塞"),
                 duration_seconds=_compute_duration(state, now),
             )
-            # Inject restart button so user has an exit from blocked state
-            blocked_buttons: tuple[ButtonSpec, ...] = ()
-            engine_type = state.metadata.engine_type
-            if engine_type and engine_type in _RETRY_ACTIONS:
-                blocked_buttons = (ButtonSpec(
-                    text=UI_TEXT["card_lifecycle_restart"],
-                    action_id=_RETRY_ACTIONS[engine_type],
-                    type="primary",
-                ),)
             return replace(state, terminal="blocked", terminal_reason="blocked",
                            header=header,
-                           footer=footer, buttons=blocked_buttons, engine_ext=ext)
+                           footer=footer, buttons=(), engine_ext=ext)
 
         case CardEventType.MODE_TOGGLED:
             # Toggle compact mode and rebuild running buttons

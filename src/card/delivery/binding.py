@@ -30,8 +30,6 @@ class DeliveryBinding:
     pages: dict[int, PageBinding] = field(default_factory=dict)
     segment_index: int = 0
     message_high_watermark: int = -1
-    latest_source_page_index: int = -1
-    stale_replacement_pages: dict[int, int] = field(default_factory=dict)
 
 
 class BindingStore:
@@ -89,9 +87,6 @@ class BindingStore:
             )
             if page_index >= binding.message_high_watermark:
                 binding.message_high_watermark = page_index
-                binding.latest_source_page_index = (
-                    page_index if source_page_index is None else source_page_index
-                )
 
     def update_text(self, session_id: str, page_index: int, text: str) -> None:
         """Update the last_text for a page (after element_content push)."""
@@ -128,8 +123,6 @@ class BindingStore:
             if page is None:
                 return
             page.source_page_index = source_page_index
-            if page_index == binding.message_high_watermark:
-                binding.latest_source_page_index = source_page_index
 
     def mark_frozen(self, session_id: str, page_index: int, *, frozen: bool = True) -> None:
         """Mark whether a page is an immutable history snapshot."""
@@ -169,11 +162,3 @@ class BindingStore:
         """Remove and return the binding for a session."""
         with self._lock:
             return self._bindings.pop(session_id, None)
-
-    def page_count(self, session_id: str) -> int:
-        """Get the number of pages for a session."""
-        with self._lock:
-            binding = self._bindings.get(session_id)
-            if binding is None:
-                return 0
-            return len(binding.pages)

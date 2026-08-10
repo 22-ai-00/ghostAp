@@ -18,6 +18,7 @@ Together these three surface-tests pin down the isolation invariant:
 ``delta_context_tokens ≈ len(final_result)`` and nothing else.
 """
 
+import json
 import threading
 import unittest
 from unittest.mock import MagicMock
@@ -242,29 +243,13 @@ class TestAC4DeltaContextTokensOnlyFinalResult(unittest.TestCase):
 
 
 class TestAC4ProgressCardNoLeakage(unittest.TestCase):
-    """Renderer must raise if rendered card body contains agent output text."""
+    """Renderer must not expose raw intermediate-agent error text."""
 
-    def _make_project_with_sentinal_agent_output(self, sentinel: str) -> WorkflowProject:
-        project = WorkflowProject(
-            status=WorkflowStatus.RUNNING,
-            metrics=WorkflowMetrics(),
-        )
-        mgr = WorkflowStateManager(project)
-        mgr.on_phase_changed("Phase 1")
-        # Put the sentinel into an agent's text that the renderer would walk
-        # while building a progress card.
-        mgr.on_agent_started("a1", "coco", "Phase 1")
-        project.phases[0].agents[0].status = type(
-            "AgentStatus", (), {"DONE": "DONE"}
-        ).DONE
-        project.phases[0].agents[0].error = sentinel
-        return project
-
-    def test_progress_card_raises_on_sentinel(self):
-        import src.workflow_engine.renderer as renderer_module
+    def test_progress_card_omits_agent_error_sentinel(self):
         from src.workflow_engine.models import AgentStatus
         from src.workflow_engine.renderer import WorkflowProgressRenderer
 
+        sentinel = "AC4_SENTINEL_RESULT_must_not_leak"
         project = WorkflowProject(
             status=WorkflowStatus.RUNNING,
             metrics=WorkflowMetrics(),
@@ -273,22 +258,14 @@ class TestAC4ProgressCardNoLeakage(unittest.TestCase):
         mgr.on_phase_changed("Phase 1")
         mgr.on_agent_started("a1", "coco", "Phase 1")
         # Set the agent to FAILED and inject a sentinel string into its error
-        # field so the renderer walks it while iterating elements.
+        # field. Progress cards expose only the generic terminal operation;
+        # raw errors belong in the final result ledger.
         project.phases[0].agents[0].status = AgentStatus.FAILED
-        project.phases[0].agents[0].error = "AC4_SENTINEL_RESULT_must_not_leak"
+        project.phases[0].agents[0].error = sentinel
 
-        # Monkey-patch the module-level tuple the renderer consults.
-        original = renderer_module._AGENT_OUTPUT_FORBIDDEN_MARKERS
-        try:
-            renderer_module._AGENT_OUTPUT_FORBIDDEN_MARKERS = (
-                "AC4_SENTINEL_RESULT_must_not_leak",
-            )
+        card = WorkflowProgressRenderer(project).render_progress_card()
 
-            r = WorkflowProgressRenderer(project)
-            with self.assertRaises(RuntimeError, msg="card leaked agent output"):
-                r.render_progress_card()
-        finally:
-            renderer_module._AGENT_OUTPUT_FORBIDDEN_MARKERS = original
+        self.assertNotIn(sentinel, json.dumps(card, ensure_ascii=False))
 
     def test_completion_card_raises_on_sentinel(self):
         import src.workflow_engine.renderer as renderer_module

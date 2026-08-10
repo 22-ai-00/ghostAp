@@ -96,7 +96,7 @@ class TestFormatterLayerE2E:
 # 2. Card builder layer: build_error_card
 # ---------------------------------------------------------------------------
 
-class TestCardBuilderE2E:
+class TestSystemBuilderE2E:
     """SystemBuilder.build_error_card must always contain non-empty error text."""
 
     @pytest.mark.parametrize("exc", [
@@ -357,13 +357,16 @@ class TestUserFacingEmptyGuardFinal:
 
     # --- agent_session.py: Claude session ---
     def test_claude_session_bare_timeout_nonempty(self):
-        from src.agent_session import SyncClaudeCLISession
+        from src.agent_session.claude_cli import SyncClaudeCLISession
 
         session = SyncClaudeCLISession(cwd="/tmp")
         session.session_id = "test-session"
 
         # Force subprocess.Popen to raise bare TimeoutError inside send_prompt
-        with patch("src.agent_session.subprocess.Popen", side_effect=TimeoutError()):
+        with patch(
+            "src.agent_session.claude_cli.subprocess.Popen",
+            side_effect=TimeoutError(),
+        ):
             result = session.send_prompt("test")
 
         assert result.stop_reason == "error"
@@ -439,10 +442,10 @@ class TestProgrammingHandlerTimeoutBranch:
 
     def test_non_streaming_path_timeout_card_title(self):
         """非流式路径: send_prompt 抛 TimeoutError → error card title 包含'超时'."""
-        from src.card import CardBuilder
+        from src.card.builders.system import SystemBuilder
 
         exc = TimeoutError("ACP prompt 执行超时 (120s)")
-        msg_type, content = CardBuilder.build_error_card(exc, title="执行超时")
+        msg_type, content = SystemBuilder.build_error_card(exc, title="执行超时")
         assert msg_type == "interactive"
         # Card body should include the timeout title
         card_data = json.loads(content) if isinstance(content, str) else content
@@ -451,10 +454,10 @@ class TestProgrammingHandlerTimeoutBranch:
 
     def test_non_streaming_path_bare_timeout_card_nonempty(self):
         """非流式路径: 裸 TimeoutError() → error card 内容非空."""
-        from src.card import CardBuilder
+        from src.card.builders.system import SystemBuilder
 
         exc = TimeoutError()
-        msg_type, content = CardBuilder.build_error_card(exc, title="执行超时")
+        msg_type, content = SystemBuilder.build_error_card(exc, title="执行超时")
         assert msg_type == "interactive"
         card_data = json.loads(content) if isinstance(content, str) else content
         card_str = json.dumps(card_data, ensure_ascii=False)
@@ -470,9 +473,9 @@ class TestProgrammingHandlerTimeoutBranch:
 
 class TestConcurrentFuturesTimeoutE2EChain:
     """Simulate concurrent.futures.TimeoutError() (bare, empty message) through
-    every layer: should_retry → prompt_with_retry → handle_review_exception →
-    build_review_exception_diagnostics → normalize_review_diagnostics →
-    build_review_error_suggestion.  Verify no layer leaks empty message."""
+    the active retry and diagnostics layers: should_retry → prompt_with_retry →
+    build_review_exception_diagnostics → normalize_review_diagnostics. Verify
+    no layer leaks an empty message."""
 
     def test_should_retry_accepts_bare_futures_timeout(self):
         """Layer 1: should_retry recognises concurrent.futures.TimeoutError."""
@@ -521,46 +524,3 @@ class TestConcurrentFuturesTimeoutE2EChain:
         normalized = normalize_review_diagnostics(diag)
         assert normalized["error_text"]
         assert "(empty message)" not in normalized["error_text"]
-
-    def test_suggestion_no_empty_for_futures_timeout(self):
-        """Layer 5: build_review_error_suggestion returns non-empty."""
-        from src.utils.review_helpers import build_review_error_suggestion
-        result = build_review_error_suggestion(fail_reason="timeout")
-        assert result
-        assert "(empty message)" not in result
-
-    def test_handle_review_exception_full_chain(self):
-        """Layer 6 (E2E): handle_review_exception with concurrent.futures.TimeoutError()
-        produces non-empty suggestion_text and correct metrics."""
-        import concurrent.futures
-        from unittest.mock import MagicMock
-
-        from src.spec_engine.review import ReviewCircuitState
-        from src.utils.review_helpers import handle_review_exception
-
-        exc = concurrent.futures.TimeoutError()
-        circuit = ReviewCircuitState()
-        settings = MagicMock()
-        settings.spec_review_failure_circuit_enabled = True
-        settings.spec_review_failure_max_consecutive = 3
-        settings.spec_review_failure_cooldown_cycles = 3
-        settings.spec_review_failure_max_cooldown_cycles = 12
-
-        result = handle_review_exception(
-            exc, circuit=circuit, cycle=1,
-            settings=settings, engine="spec",
-        )
-
-        # suggestion_text must be non-empty and not contain empty markers
-        assert result.suggestion_text
-        assert result.suggestion_text.strip()
-        assert "(empty message)" not in result.suggestion_text
-        assert "empty" not in result.suggestion_text.lower()
-
-        # diagnostics must identify timeout
-        assert result.diag["fail_reason"] == "timeout"
-        assert result.diag["error_text"]
-
-        # metrics must record timeout
-        assert result.metrics["fail_reason"] == "timeout"
-        assert result.metrics["consecutive_timeouts"] == 1

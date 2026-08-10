@@ -6,12 +6,11 @@ deliberately not accepted as a dependency or used as a fallback.
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, TypeVar, cast
+from typing import Any, Callable, TypeVar
 
 import lark_oapi as lark
 from lark_oapi.api.application.v6 import GetApplicationRequest
@@ -27,12 +26,7 @@ from .models import (
     ContextUnavailableReason,
     EmployeeMessageScope,
 )
-from .source import (
-    CredentialResolver,
-    EmployeeClientBuilder,
-    MessagePage,
-    ResolvedThread,
-)
+from .source import CredentialResolver, MessagePage, ResolvedThread
 
 _T = TypeVar("_T")
 
@@ -122,33 +116,6 @@ def _message_text(message: Any, *, deleted: bool, msg_type: str) -> str:
     if not isinstance(raw_content, str):
         raise _fail(ContextUnavailableReason.CONTENT)
     try:
-        decoded = json.loads(raw_content)
-    except (TypeError, ValueError):
-        raise _fail(ContextUnavailableReason.CONTENT) from None
-    if not isinstance(decoded, dict):
-        raise _fail(ContextUnavailableReason.CONTENT)
-    required_key = {
-        "text": "text",
-        "image": "image_key",
-        "file": "file_key",
-        "audio": "file_key",
-        "media": "file_key",
-        "video": "file_key",
-        "sticker": "file_key",
-        "folder": "file_key",
-        "system": "template",
-    }.get(msg_type)
-    if required_key is not None:
-        value = decoded.get(required_key)
-        if not isinstance(value, str) or not value:
-            raise _fail(ContextUnavailableReason.CONTENT)
-    post_text = _normalize_post_content(decoded) if msg_type == "post" else ""
-    interactive_text = (
-        _normalize_interactive_content(decoded)
-        if msg_type == "interactive"
-        else ""
-    )
-    try:
         parsed = parse_message_content(msg_type, raw_content)
         if isinstance(parsed, UnknownContent):
             raise _fail(ContextUnavailableReason.CONTENT)
@@ -158,149 +125,32 @@ def _message_text(message: Any, *, deleted: bool, msg_type: str) -> str:
         raise _fail(exc.reason) from None
     except Exception:
         raise _fail(ContextUnavailableReason.CONTENT) from None
-    if msg_type == "post":
-        return post_text
-    if msg_type == "interactive":
-        return interactive_text
-    resource_types = {
-        "image",
-        "file",
-        "audio",
-        "media",
-        "video",
-        "sticker",
-        "folder",
-    }
-    if msg_type in resource_types or resources:
+    if msg_type in {"image", "file", "audio", "media", "video", "sticker", "folder"}:
+        return f"[{msg_type}]"
+    # Context never transports attachment identifiers; ingress owns safe staging.
+    for resource in resources:
+        key = getattr(resource, "file_key", None)
+        if isinstance(key, str) and key:
+            text = text.replace(key, "")
+    text = text.strip()
+    if not text and resources:
         return f"[{msg_type}]"
     if not text:
         raise _fail(ContextUnavailableReason.CONTENT)
     return text
 
 
-def _normalize_post_content(decoded: dict[str, Any]) -> str:
-    if isinstance(decoded.get("content"), list):
-        payload = decoded
-    else:
-        locales = ["zh_cn", "en_us", "ja_jp"]
-        locale_key = next(
-            (key for key in locales if isinstance(decoded.get(key), dict)),
-            None,
-        )
-        if locale_key is None:
-            locale_key = next(
-                (
-                    key
-                    for key in sorted(decoded)
-                    if isinstance(decoded.get(key), dict)
-                ),
-                None,
-            )
-        if locale_key is None:
-            raise _fail(ContextUnavailableReason.CONTENT)
-        payload = decoded[locale_key]
-    title = payload.get("title", "")
-    content = payload.get("content")
-    if not isinstance(title, str) or not isinstance(content, list) or not content:
-        raise _fail(ContextUnavailableReason.CONTENT)
-    rendered_paragraphs: list[str] = []
-    for paragraph in content:
-        if not isinstance(paragraph, list) or not paragraph:
-            raise _fail(ContextUnavailableReason.CONTENT)
-        rendered_elements = [_normalize_post_element(element) for element in paragraph]
-        rendered_paragraphs.append("".join(rendered_elements))
-    body = "\n".join(rendered_paragraphs)
-    rendered = "\n\n".join(part for part in (title, body) if part)
-    if not rendered:
-        raise _fail(ContextUnavailableReason.CONTENT)
-    return rendered
-
-
-def _normalize_post_element(element: Any) -> str:
-    if not isinstance(element, dict):
-        raise _fail(ContextUnavailableReason.CONTENT)
-    tag = element.get("tag")
-    if not isinstance(tag, str) or not tag:
-        raise _fail(ContextUnavailableReason.CONTENT)
-    if tag in {"text", "a", "code_block", "md"}:
-        text = element.get("text")
-        if not isinstance(text, str) or not text:
-            raise _fail(ContextUnavailableReason.CONTENT)
-        if tag == "a" and not isinstance(element.get("href"), str):
-            raise _fail(ContextUnavailableReason.CONTENT)
-        return text
-    if tag == "at":
-        if not isinstance(element.get("user_id"), str) or not element["user_id"]:
-            raise _fail(ContextUnavailableReason.CONTENT)
-        return "[@mention]"
-    key_name = {
-        "img": "image_key",
-        "media": "file_key",
-        "audio": "file_key",
-        "file": "file_key",
-    }.get(tag)
-    if key_name is not None:
-        key = element.get(key_name)
-        if not isinstance(key, str) or not key:
-            raise _fail(ContextUnavailableReason.CONTENT)
-        return "[image]" if tag == "img" else f"[{tag}]"
-    if tag == "emotion":
-        if not isinstance(element.get("emoji_type"), str) or not element["emoji_type"]:
-            raise _fail(ContextUnavailableReason.CONTENT)
-        return "[emotion]"
-    if tag == "hr":
-        return "\n---\n"
-    raise _fail(ContextUnavailableReason.CONTENT)
-
-
-def _normalize_interactive_content(decoded: dict[str, Any]) -> str:
-    has_v1_elements = isinstance(decoded.get("elements"), list)
-    body = decoded.get("body")
-    has_v2_body = isinstance(body, dict) and isinstance(
-        body.get("elements"), list
-    )
-    has_header = isinstance(decoded.get("header"), dict)
-    has_default_title = isinstance(decoded.get("title"), str)
-    if not (has_v1_elements or has_v2_body or has_header or has_default_title):
-        raise _fail(ContextUnavailableReason.CONTENT)
-    text_parts: list[str] = []
-    _collect_card_text(decoded, text_parts, key="")
-    normalized = "\n".join(
-        part for index, part in enumerate(text_parts) if part not in text_parts[:index]
-    )
-    return normalized or "[interactive]"
-
-
-def _collect_card_text(value: Any, output: list[str], *, key: str) -> None:
-    ignored_keys = {
-        "action",
-        "behaviors",
-        "fallback",
-        "file_key",
-        "href",
-        "image_key",
-        "multi_url",
-        "url",
-        "value",
-    }
-    text_keys = {"content", "markdown", "text", "title"}
-    if key in ignored_keys:
-        return
-    if isinstance(value, str):
-        if key in text_keys and value:
-            output.append(value)
-        return
-    if isinstance(value, list):
-        for item in value:
-            _collect_card_text(item, output, key=key)
-        return
-    if isinstance(value, dict):
-        for child_key, child_value in value.items():
-            _collect_card_text(child_value, output, key=child_key)
-
-
 def _validate_parsed_content(parsed: Any, *, msg_type: str) -> None:
-    required_attribute = {
+    required = {
+        "text": "text",
+        "image": "image_key",
+        "file": "file_key",
+        "audio": "file_key",
+        "media": "file_key",
+        "video": "file_key",
+        "sticker": "file_key",
+        "folder": "file_key",
+        "system": "template",
         "share_chat": "chat_id",
         "share_user": "user_id",
         "hongbao": "text",
@@ -310,30 +160,28 @@ def _validate_parsed_content(parsed: Any, *, msg_type: str) -> None:
         "calendar": "summary",
         "vote": "topic",
     }.get(msg_type)
-    if required_attribute is not None:
-        value = getattr(parsed, required_attribute, None)
-        if not isinstance(value, str) or not value:
-            raise _fail(ContextUnavailableReason.CONTENT)
+    if required is not None and not _required_string(
+        getattr(parsed, required, None), ContextUnavailableReason.CONTENT
+    ):
+        raise _fail(ContextUnavailableReason.CONTENT)
     if msg_type == "interactive":
         card = getattr(parsed, "card", None)
         if not isinstance(card, dict) or not card:
             raise _fail(ContextUnavailableReason.CONTENT)
-        if not {"header", "elements", "body", "schema"}.intersection(card):
+        body = card.get("body")
+        if not isinstance(body, dict) or not isinstance(body.get("elements"), list):
             raise _fail(ContextUnavailableReason.CONTENT)
+    if msg_type == "post" and not isinstance(getattr(parsed, "post", None), dict):
+        raise _fail(ContextUnavailableReason.CONTENT)
     if msg_type == "location":
-        if (
-            not isinstance(getattr(parsed, "name", None), str)
-            or not getattr(parsed, "name", "")
-            or getattr(parsed, "longitude", None) is None
-            or getattr(parsed, "latitude", None) is None
+        if not getattr(parsed, "name", "") or None in (
+            getattr(parsed, "longitude", None),
+            getattr(parsed, "latitude", None),
         ):
             raise _fail(ContextUnavailableReason.CONTENT)
     if msg_type == "todo":
-        title = getattr(parsed, "title", None)
-        body = getattr(parsed, "body", None)
-        if not all(isinstance(value, str) for value in (title, body)) or not (
-            title or body
-        ):
+        values = (getattr(parsed, "title", None), getattr(parsed, "body", None))
+        if not all(isinstance(value, str) for value in values) or not any(values):
             raise _fail(ContextUnavailableReason.CONTENT)
     if msg_type == "merge_forward":
         raw = getattr(parsed, "raw", None)
@@ -945,19 +793,17 @@ class _EmployeeSourceLease:
             if self._entered:
                 raise _fail(ContextUnavailableReason.SOURCE)
             self._entered = True
-            failure_reason: ContextUnavailableReason | None = None
             try:
                 self._source = self._factory._acquire(
                     scope=self.scope,
                     principal=self._principal,
                 )
             except ContextUnavailableError as exc:
-                failure_reason = exc.reason
-            except Exception:
-                failure_reason = ContextUnavailableReason.CREDENTIALS
-            if failure_reason is not None:
                 self._source = None
-                raise _fail(failure_reason)
+                raise _fail(exc.reason) from None
+            except Exception:
+                self._source = None
+                raise _fail(ContextUnavailableReason.CREDENTIALS) from None
             return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
@@ -1016,27 +862,21 @@ class _EmployeeSourceLease:
         operation: Callable[[_LarkEmployeeMessageSource], _T],
     ) -> _T:
         source = self._begin_call()
-        failure_reason: ContextUnavailableReason | None = None
-        result: _T | None = None
         try:
-            try:
-                result = operation(source)
-            except ContextUnavailableError as exc:
-                failure_reason = exc.reason
-            except Exception:
-                failure_reason = ContextUnavailableReason.SOURCE
+            return operation(source)
+        except ContextUnavailableError as exc:
+            raise _fail(exc.reason) from None
+        except Exception:
+            raise _fail(ContextUnavailableReason.SOURCE) from None
         finally:
             self._factory._end_call(source)
-        if failure_reason is not None:
-            raise _fail(failure_reason)
-        return cast(_T, result)
 
 
 @dataclass(repr=False, init=False)
 class LarkEmployeeMessageSourceFactory:
     credential_resolver: CredentialResolver
     request_timeout_seconds: float
-    _client_builder: EmployeeClientBuilder = field(repr=False)
+    _client_builder: Callable[..., Any] = field(repr=False)
     _active_sources: set[_LarkEmployeeMessageSource] = field(repr=False)
     _lock: threading.RLock = field(repr=False, compare=False)
     _condition: threading.Condition = field(repr=False, compare=False)
@@ -1063,23 +903,6 @@ class LarkEmployeeMessageSourceFactory:
         self._pending_by_agent: dict[str, int] = {}
         self._active_calls_by_agent: dict[str, int] = {}
         self.__post_init__()
-
-    @classmethod
-    def _with_client_builder_for_testing(
-        cls,
-        *,
-        credential_resolver: CredentialResolver,
-        client_builder: EmployeeClientBuilder,
-        request_timeout_seconds: float = 10.0,
-    ) -> LarkEmployeeMessageSourceFactory:
-        factory = cls(
-            credential_resolver=credential_resolver,
-            request_timeout_seconds=request_timeout_seconds,
-        )
-        if not callable(client_builder):
-            raise TypeError("client_builder must be callable")
-        factory._client_builder = client_builder
-        return factory
 
     def __post_init__(self) -> None:
         timeout = self.request_timeout_seconds
@@ -1123,110 +946,28 @@ class LarkEmployeeMessageSourceFactory:
 
     def probe(self, principal: BotPrincipal) -> bool:
         """Verify employee credentials and app identity via an employee client."""
-        with self._condition:
-            if (
-                self._closed.is_set()
-                or not isinstance(principal, BotPrincipal)
-                or not principal.app_id
-                or not principal.credential_ref
-                or principal.agent_id in self._invalidated_agents
-            ):
-                return False
-            self._pending_acquires += 1
-            self._increment_agent_count(
-                self._pending_by_agent,
-                principal.agent_id,
-            )
-        try:
-            secret = self.credential_resolver.resolve(
-                principal.credential_ref,
-                principal.agent_id,
-                principal.app_id,
-            )
-            if not isinstance(secret, str) or not secret:
-                return False
-            client = self._client_builder(
-                app_id=principal.app_id,
-                app_secret=secret,
-                timeout=float(self.request_timeout_seconds),
-            )
-            request = (
+        return self._probe(
+            principal,
+            lambda client: client.application.v6.application.get(
                 GetApplicationRequest.builder()
                 .app_id(principal.app_id)
                 .build()
+            ),
+            lambda response: getattr(
+                getattr(getattr(response, "data", None), "app", None),
+                "app_id",
+                None,
             )
-            response = client.application.v6.application.get(request)
-            success = getattr(response, "success", None)
-            data = getattr(response, "data", None)
-            app = getattr(data, "app", None)
-            with self._condition:
-                return (
-                    client is not None
-                    and callable(success)
-                    and success() is True
-                    and getattr(response, "code", None) == 0
-                    and getattr(app, "app_id", None) == principal.app_id
-                    and not self._closed.is_set()
-                    and principal.agent_id not in self._invalidated_agents
-                )
-        except Exception:
-            return False
-        finally:
-            if "secret" in locals():
-                del secret
-            if "client" in locals():
-                close = getattr(client, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
-                del client
-            if "request" in locals():
-                del request
-            if "response" in locals():
-                del response
-            with self._condition:
-                self._pending_acquires -= 1
-                self._decrement_agent_count(
-                    self._pending_by_agent,
-                    principal.agent_id,
-                )
-                self._condition.notify_all()
+            == principal.app_id,
+        )
 
     def probe_group_history(self, principal: BotPrincipal, chat_id: str) -> bool:
         """Verify the employee can read bounded group history in a real team."""
-
         if re.fullmatch(r"oc_[A-Za-z0-9][A-Za-z0-9_-]*", chat_id) is None:
             return False
-        with self._condition:
-            if (
-                self._closed.is_set()
-                or not isinstance(principal, BotPrincipal)
-                or not principal.app_id
-                or not principal.credential_ref
-                or principal.agent_id in self._invalidated_agents
-            ):
-                return False
-            self._pending_acquires += 1
-            self._increment_agent_count(
-                self._pending_by_agent,
-                principal.agent_id,
-            )
-        try:
-            secret = self.credential_resolver.resolve(
-                principal.credential_ref,
-                principal.agent_id,
-                principal.app_id,
-            )
-            if not isinstance(secret, str) or not secret:
-                return False
-            client = self._client_builder(
-                app_id=principal.app_id,
-                app_secret=secret,
-                timeout=float(self.request_timeout_seconds),
-            )
-            request = (
+        return self._probe(
+            principal,
+            lambda client: client.im.v1.message.list(
                 ListMessageRequest.builder()
                 .container_id_type("chat")
                 .container_id(chat_id)
@@ -1234,41 +975,65 @@ class LarkEmployeeMessageSourceFactory:
                 .page_size(1)
                 .card_msg_content_type("user_card_content")
                 .build()
-            )
-            response = client.im.v1.message.list(request)
+            ),
+        )
+
+    def _probe(
+        self,
+        principal: BotPrincipal,
+        operation: Callable[[Any], Any],
+        validate: Callable[[Any], bool] = lambda _response: True,
+    ) -> bool:
+        if not self._begin_pending(principal):
+            return False
+        client: Any = None
+        try:
+            client = self._client_for(principal)
+            response = operation(client)
             success = getattr(response, "success", None)
             with self._condition:
                 return (
                     callable(success)
                     and success() is True
                     and getattr(response, "code", None) == 0
+                    and validate(response)
                     and not self._closed.is_set()
                     and principal.agent_id not in self._invalidated_agents
                 )
         except Exception:
             return False
         finally:
-            if "secret" in locals():
-                del secret
-            if "client" in locals():
-                close = getattr(client, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
-                del client
-            if "request" in locals():
-                del request
-            if "response" in locals():
-                del response
-            with self._condition:
-                self._pending_acquires -= 1
-                self._decrement_agent_count(
-                    self._pending_by_agent,
-                    principal.agent_id,
-                )
-                self._condition.notify_all()
+            self._close_client(client)
+            self._end_pending(principal.agent_id)
+
+    def _begin_pending(self, principal: BotPrincipal) -> bool:
+        with self._condition:
+            if (
+                self._closed.is_set()
+                or not isinstance(principal, BotPrincipal)
+                or not principal.app_id
+                or not principal.credential_ref
+                or principal.agent_id in self._invalidated_agents
+            ):
+                return False
+            self._pending_acquires += 1
+            self._increment_agent_count(self._pending_by_agent, principal.agent_id)
+            return True
+
+    def _end_pending(self, agent_id: str) -> None:
+        with self._condition:
+            self._pending_acquires -= 1
+            self._decrement_agent_count(self._pending_by_agent, agent_id)
+            self._condition.notify_all()
+
+    @staticmethod
+    def _close_client(client: Any) -> None:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
 
     def close(self) -> None:
         with self._condition:
@@ -1375,11 +1140,20 @@ class LarkEmployeeMessageSourceFactory:
         if scope_identity != principal_identity or not principal.credential_ref:
             raise _fail(ContextUnavailableReason.CREDENTIALS)
         try:
-            secret = self.credential_resolver.resolve(
-                principal.credential_ref,
-                principal.agent_id,
-                principal.app_id,
-            )
+            client = self._client_for(principal)
+        except ContextUnavailableError:
+            raise _fail(ContextUnavailableReason.CREDENTIALS) from None
+        except Exception:
+            raise _fail(ContextUnavailableReason.CREDENTIALS) from None
+        return _LarkEmployeeMessageSource(scope=scope, _client=client)
+
+    def _client_for(self, principal: BotPrincipal) -> Any:
+        secret = self.credential_resolver.resolve(
+            principal.credential_ref,
+            principal.agent_id,
+            principal.app_id,
+        )
+        try:
             if not isinstance(secret, str) or not secret:
                 raise _fail(ContextUnavailableReason.CREDENTIALS)
             client = self._client_builder(
@@ -1389,14 +1163,9 @@ class LarkEmployeeMessageSourceFactory:
             )
             if client is None:
                 raise _fail(ContextUnavailableReason.CREDENTIALS)
-        except ContextUnavailableError:
-            raise _fail(ContextUnavailableReason.CREDENTIALS) from None
-        except Exception:
-            raise _fail(ContextUnavailableReason.CREDENTIALS) from None
+            return client
         finally:
-            if "secret" in locals():
-                del secret
-        return _LarkEmployeeMessageSource(scope=scope, _client=client)
+            del secret
 
     def _release(self, source: _LarkEmployeeMessageSource) -> None:
         source.close()

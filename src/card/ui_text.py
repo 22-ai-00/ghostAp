@@ -59,15 +59,10 @@ UI_TEXT = {
         "- `/spec_config`：查看 Spec 长程配置（阈值/保留策略）\n"
         "- `/spec_export`：导出当前 Spec/Plan 报告\n"
         "- `/spec_save`：立即落盘保存状态（用于断点续传）\n"
-        "- `/spec_pause`：暂停\n"
-        "- `/spec_resume`：恢复\n"
-        "- `/spec_recover`：列出或恢复异常中断的任务（需指定 Task ID）\n"
         "- `/stop_spec`：停止\n"
     ),
     # Generic Engine Lifecycle
     "engine_no_active_task": "📊 当前没有正在执行的 {engine_prefix} 任务",
-    "engine_multi_resume_conflict": "⚠️ 有多个项目存在可恢复的 {engine_prefix} 任务，请查看状态后切换项目再恢复",
-    "engine_no_resumable_task": "当前没有可恢复的 {engine_prefix} 任务",
     "engine_multi_stop_conflict": "⚠️ 有多个项目正在执行 {engine_prefix} 任务，请先切换项目再停止",
     "engine_stop_no_active": "📊 当前没有正在执行的 {engine_prefix} 任务",
     # System Commands
@@ -168,37 +163,13 @@ UI_TEXT = {
     "system_acp_no_available_tools": "未检测到可用 ACP 工具",
     "system_acp_select_tool_prompt": "请选择 ACP 工具",
     "system_acp_select_model_prompt": "请选择 ACP 模型",
-    "system_acp_default_model_option": "使用默认模型",
-    "system_acp_default_model_desc": "不固定传入模型，使用工具当前默认配置",
-    "system_acp_querying_models": "🔍 正在查询 {tool_name} 支持的模型…",
-    "system_acp_get_models_failed": "获取 {tool_name} 模型列表失败，请稍后重试",
-    "system_acp_model_loading_title": "💭 {tool} 模型选择",
-    "system_acp_model_loading_body": "🔍 正在查询 `{tool}` 支持的模型…",
-    "system_acp_model_error_title": "⚠️ {tool} 模型加载失败",
-    "system_acp_model_error_body": "暂时无法获取 `{tool}` 的模型列表，可以稍后刷新重试。",
-    "system_acp_programming_initializing_title": "⏳ {tool} 编程模式正在初始化",
-    "system_acp_programming_initializing_body": "模型选择已保存，正在后台启动 ACP 会话。\n\n**工具**：`{tool}`\n**模型**：`{model}`",
-    "system_acp_programming_ready_title": "✅ {tool} 编程模式已就绪",
-    "system_acp_programming_ready_body": "`{tool}` 已使用 `{model}` 进入编程模式。\n\n现在可以直接在当前会话发送需求。",
-    "system_acp_programming_failed_title": "⚠️ {tool} 编程模式初始化失败",
-    "system_acp_programming_failed_body": "模型选择已保存，但 ACP 会话未能启动。\n\n**工具**：`{tool}`\n**模型**：`{model}`\n\n**原因**：{reason}",
     "system_acp_activation_failed_safe": "ACP 会话启动失败，请重试",
-    "system_acp_retry_activation_btn": "重试初始化",
-    "system_acp_back_to_models_btn": "返回模型选择",
-    "system_acp_switch_model_btn": "切换模型",
-    "system_acp_1m_warning_banner": "⚠️ **1M 上下文模式已启用**：使用 `{model}`，**超过 200K tokens 后按 2× 基础费率计费**。该选择会随项目持久保存，重启/重连后自动恢复。如非必要，请切换回标准上下文版本。",
-    "system_acp_1m_switch_standard_btn": "切回标准上下文",
-    "system_acp_specify_model_prompt": "请指定模型名称，例如：{example}",
-    "system_model_usage_example": "\n• `/model list` — 查看可用模型\n• `/model <name>` — 切换到指定模型",
-    "spec_review_no_selection_error": "请至少选择一个工具-模型组合",
-    "spec_review_select_tool_error": "未选择工具",
-    "spec_review_project_not_found": "找不到关联的项目，请先通过 /projects 关联一个项目",
-    "spec_review_select_model_prompt": "为 {tool} 选择模型：",
-    "spec_review_auto_btn": "Auto：使用主 agent 审查",
-    "spec_review_auto_desc": "不额外选择 review 工具，保持当前主任务 agent + 模型的原有流程。",
-    "spec_review_select_tool_title": "Spec Review — 选择工具",
-    "spec_review_select_model_title": "Spec Review — 选择模型",
-    "spec_review_select_message": "请选择后续多角色 review 可使用的工具；也可以直接 Auto 保持原流程。",
+    "system_acp_config_summary": "**ACP 配置**\n当前工具：`{current}`\n可用工具：{available}\n用法：`/acp <tool>`",
+    "system_acp_config_saved": "ACP 配置已保存：`{tool}` / `{model}`。后续任务将自动采用。",
+    "system_model_config_summary": "**模型配置** · `{tool}`\n当前模型：`{current}`\n可用模型：{available}\n用法：`/model <model>` 或 `/model default`",
+    "system_model_config_saved": "模型配置已保存：`{tool}` / `{model}`。后续任务将自动采用。",
+    "system_acp_config_save_failed": "ACP 配置保存失败，原配置保持不变。",
+    "system_acp_unknown_model": "当前工具未报告模型 `{model}`。请发送 `/model` 查看可用值。",
     "system_dir_changed_title": "目录已切换",
     "system_error_title": "操作失败",
     "system_coco_status_title": "**🤖 Coco 状态**\n",
@@ -213,9 +184,6 @@ UI_TEXT = {
     "system_shell_no_output": "✅ 命令执行成功（无输出）",
     "system_shell_return_code": "返回码: `{code}`",
     "system_shell_stderr_label": "⚠️ **错误输出**:",
-    "system_refresh_models_btn": "🔄 刷新模型列表",
-    "system_acp_tool_select_title": "🧩 ACP 工具选择",
-    "system_acp_model_select_title": "💭 {tool} 模型选择",
     "system_menu_title": "📱 快捷菜单",
     "system_menu_header": "**📱 常用指令菜单**",
     "system_menu_btn_new_project": "新项目",
@@ -223,7 +191,6 @@ UI_TEXT = {
     "system_menu_btn_deep_task": "Deep",
     "system_menu_btn_workflow": "Workflow",
     "system_menu_btn_status": "状态",
-    "system_menu_btn_acp": "工具",
     "system_menu_btn_help": "📖 帮助",
     "system_help_title": "📖 GhostAP 使用帮助",
     "system_help_status_header": "**当前状态** · {mode} · 项目: {project}\n<font color='grey'>{cwd}</font>",
@@ -247,11 +214,10 @@ UI_TEXT = {
     "system_help_section_spec": "📋 Spec Engine · 结构化开发闭环",
     "system_help_section_spec_body": (
         "`/spec <需求>` · 启动  ·  `/spec_status` · 查看进度\n"
-        "`/spec_pause` · 暂停  ·  `/spec_resume` · 继续\n"
         "`/spec_guide <引导>` · 补充约束/偏好\n"
         "`/spec_history` · 历史  ·  `/spec_metrics` · 目标达成度\n"
         "`/spec_config` · 配置  ·  `/spec_save` · 立即保存\n"
-        "`/spec_export` · 导出报告  ·  `/spec_recover [任务ID]` · 恢复失败任务\n"
+        "`/spec_export` · 导出报告  ·  `/stop_spec` · 停止任务\n"
         "`/stop_spec` · 停止"
     ),
     "system_help_section_project": "📂 项目管理",
@@ -269,9 +235,6 @@ UI_TEXT = {
         "`/wf_status` · 查看当前 Workflow 进度\n"
         "`/wf_help` · Workflow 命令帮助\n"
         "`/stop_wf` · 停止正在运行的 Workflow\n"
-        "`/wf_save <名称>` · 保存当前编排脚本为模板\n"
-        "`/wf_list` · 列出可用 Workflow 模板\n"
-        "`/wf_delete <名称>` · 删除已保存模板\n"
         "别名：`/workflow` · `/workflow_status` · `/stop_workflow`\n"
         "流程：需求分析 → 生成脚本 → 自动执行 → 多 Agent 并行/流水线 → 汇总结果"
     ),
@@ -430,13 +393,6 @@ UI_TEXT = {
     "project_created_title": "🎉 新项目已创建",
     "project_btn_start_coco": "🤖 开始 Coco",
     "project_btn_start_claude": "🔮 开始 Claude",
-    "project_resume_detected": "🔄 检测到未完成的 {mode} 会话",
-    "project_resume_session_id": "• 会话 ID: `{id}`",
-    "project_resume_query_count": "• 对话数: {count} 条",
-    "project_resume_last_query": "• 最后对话: {query}",
-    "project_resume_btn_resume": "🔄 恢复会话",
-    "project_resume_btn_new": "➕ 新建会话",
-    "project_resume_no_session": "没有可恢复的会话",
     "project_notif_suggestion_header": "💡 **建议下一步:**",
     # ── Programming Mode Prompts (centralized) ──
     "mode_enter_msg": "{emoji} 已进入{name}编程模式\n\n现在可以用自然语言描述你的需求\n\n说「退出模式」或发送 `/exit` 退出",
@@ -509,10 +465,6 @@ UI_TEXT = {
     "mode_exit_banner": "已退出 {name} 编程模式",
     "mode_exit_card_title": "模式已退出",
     "mode_resume_banner": "{name} 会话已恢复",
-    "mode_resume_card_title": "{name} 会话已恢复",
-    "mode_resume_card_content": "🔄 已恢复 {name} 会话\n\n会话 ID: `{session_id}`\n\n现在可以继续之前的对话了",
-    "mode_resume_no_project_msg": "🔄 已恢复 {name} 会话: `{session_id}`",
-    "mode_resume_fail_title": "恢复 {name} 会话失败",
     "mode_session_info_title": "{name} 会话信息",
     "mode_model_switched_banner": "已切换 {name} 模型为: {model}",
     "mode_model_switched_title": "{name} 模型已切换",
@@ -537,8 +489,6 @@ UI_TEXT = {
         "Codex Goal 已确认暂停，未在收尾阶段继续扩张；"
         "可查看脱敏诊断后重新发起或从会话历史恢复任务。"
     ),
-    "mode_exec_waiting_title": "等待用户确认",
-    "mode_exec_waiting_msg": "⚠️ 本次任务未完成：{reason}\n请在新一轮明确你的选择/授权后继续。",
     "mode_exec_timeout_title": "执行超时",
     "mode_exec_exception_title": "执行异常",
     "mode_exec_timeout_msg": "⏳ 执行超时: {error}",
@@ -548,19 +498,15 @@ UI_TEXT = {
     "card_lifecycle_thinking": "💭 正在思考…",
     "card_lifecycle_reasoning": "💭 正在分析…",
     "card_lifecycle_error_fallback": "❌ 执行异常，请重新发送 {engine_cmd} 启动新任务",
-    "card_lifecycle_error_fallback_spec": "❌ 执行异常，发送 /spec_recover 可恢复进度，或重新发送 {engine_cmd} 启动新任务",
+    "card_lifecycle_error_fallback_spec": "❌ 自动恢复已耗尽，任务已明确失败；可重新发送 {engine_cmd} 启动新任务",
     "card_lifecycle_retry_failed": "🔄 重新执行失败工具",
     "card_lifecycle_restart": "🔄 重新开始",
     "card_lifecycle_degraded_primary": "继续使用 {mode}",
     "card_lifecycle_degraded_primary_unknown": "重新发送原命令",
-    "card_lifecycle_retry_original": "重试原模式",
-    "card_lifecycle_continue_degraded_ack": "✅ 已继续使用 {mode}。你可以直接继续发送消息；如需恢复原能力，可点击重试。",
+    "card_lifecycle_continue_degraded_ack": "✅ 已继续使用 {mode}。你可以直接继续发送消息；原能力恢复由系统自动处理。",
     "card_lifecycle_continue_degraded_unknown_ack": "当前暂未确定可继续模式，请重新发送原命令或查看诊断。",
     "card_lifecycle_show_details": "查看详情",
     "card_lifecycle_details_collapsed": "🔒 详情已收起：点击“查看详情”后将返回已脱敏、截断的诊断信息。",
-    "card_lifecycle_retry_original_started": "🔄 已开始重试原模式：{mode}。请继续关注当前会话反馈。",
-    "card_lifecycle_retry_original_manual_required": "已收到重试请求，但当前卡片无法安全自动恢复 {mode}。请重新发送原命令、查看诊断，或在卡片存在可继续模式时使用该模式。",
-    "card_lifecycle_retry_original_unavailable": "当前降级卡缺少可自动重试的原模式上下文，请重新发送原命令或查看诊断。",
     "card_lifecycle_cancelled_block": "⚠️ 已取消",
     "card_lifecycle_cancelled_status": "已取消",
     "card_lifecycle_paused": "⏸ 已暂停",
@@ -575,7 +521,6 @@ UI_TEXT = {
     "card_btn_stop": "⏹️ 停止",
     "card_btn_stopping": "正在停止…",
     "card_btn_stop_confirm": "是否停止？已完成的部分不受影响。",
-    "card_btn_skip_retry": "跳过重试",
     "card_btn_restart": "🔄 重新开始",
     "card_tool_running": "🔧 执行中: {tool_name}",
     "card_retry_waiting": "⏳ 等待 {delay_sec} 秒后重试（{attempt}/{max_attempts}）",
@@ -599,7 +544,7 @@ UI_TEXT = {
     # All engine-specific messages follow a consistent structure:
     # TTL expired messages — unified two-line structure: status line + action line
     "card_session_ttl_expired": "⏰ 已超时关闭 · 系统回收资源\n发送 {expired_commands} 重新启动",
-    "card_session_ttl_expired_spec": "⏰ {engine_name} 已超时关闭 · 进度已保存\n发送 /spec_recover 恢复进度 / {engine_cmd} 重新启动",
+    "card_session_ttl_expired_spec": "⏰ {engine_name} 已超时关闭 · 失败终态与进度已保存\n可重新发送 {engine_cmd} 启动新任务",
     "card_session_ttl_expired_deep": "⏰ {engine_name} 已超时关闭 · 执行结果已保存\n发送 /deep_status 查看状态 / {engine_cmd} 重新启动",
     "card_session_ttl_expired_commands": "",  # dynamically generated below from ENGINE_CMD_MAP
     "card_session_ttl_prewarning": "{engine_name} 会话长时间无更新，将在约 {minutes} 分钟后关闭；执行中的任务会自动顺延。点击下方「保持连接」按钮或发送任意消息即可续期",
@@ -626,8 +571,6 @@ UI_TEXT = {
     "card_btn_confirm_stop_danger_body": "⚠️ 强制停止将中断一切进度（普通停止仅中断当前步骤，已完成部分保留）。\n已提交的代码不受影响，发送 {engine_cmd} 可重新开始。",
     "card_btn_confirm_retry_title": "重新执行任务",
     "card_btn_confirm_retry_body": "确认重新执行？上次执行的结果将被替换",
-    "card_btn_confirm_approve_title": "授权执行",
-    "card_btn_confirm_reject_title": "拒绝请求",
     "card_btn_confirm_default_title": "确认操作",
     "btn_confirm_template": "确认「{text}」？",
     "card_stop_escalation_hint": "任务未响应停止信号时将出现强制停止选项",
@@ -747,7 +690,7 @@ UI_TEXT = {
     "deep_spec_style_analyzing_done": "分析与任务拆解已完成。",
     "deep_spec_style_build_done": "执行阶段已完成。",
     "deep_exec_completed": "✅ 执行完成 · 工具调用: {tool_calls_count}",
-    "deep_exec_incomplete": "⚠️ 执行未完成（已完成 {completed}/{total} 步）\n💡 重试: /deep 继续执行",
+    "deep_exec_incomplete": "⚠️ 执行未完成（已完成 {completed}/{total} 步）\n自动恢复次数已耗尽，任务已明确失败。",
     "deep_progress_executing": "执行中",
     "deep_progress_done": "已完成",
     "spec_cycle_label": "第 {cycle_num} 轮",
@@ -768,14 +711,7 @@ UI_TEXT = {
         "error": "red",               # Error state
         "completed": "green",         # Successfully completed
     },
-    # --- Workflow stepper labels (selection flow: main agent → review agents → auto execution) ---
-    "workflow_stepper_step_main_agent": "① 选择主 Agent",
-    "workflow_stepper_step_review_agents": "② 选择评审 Agent",
-    "workflow_stepper_step_confirm": "③ 自动生成并执行",
-    "workflow_stepper_current_label": "当前步骤：{current} / {total}",
     # --- Workflow confirm dialogs ---
-    "workflow_btn_confirm_cancel_title": "确认取消 Workflow？",
-    "workflow_btn_confirm_cancel_body": "取消后已生成的脚本将被丢弃，如需继续请重新发起。",
     "workflow_btn_confirm_stop_title": "确认停止 Workflow？",
     "workflow_btn_confirm_stop_body": "正在执行的步骤将中断，已完成的部分不受影响。",
     # --- Workflow error cards ---
@@ -792,31 +728,7 @@ UI_TEXT = {
     "workflow_error_review_failed_title": "独立评审失败",
     "workflow_error_review_failed_body": "一个或多个独立评审 Agent 未正常结束，因此 Workflow 按安全策略未发布成功结果。\n\n🔎 细节：{detail}\n\n💡 可重新发起 `/wf`，或改用当前可用的评审 Agent",
     "workflow_error_internal_error_title": "服务内部错误",
-    "workflow_error_internal_error_body": "Workflow 执行过程中发生内部错误。{detail}\n\n💡 请稍后重试，或重新发起 `/wf` 基于当前工具选择生成脚本并自动执行；如持续出现请联系管理员",
-    # --- Workflow entry help ---
-    "workflow_entry_title": "⚡ Workflow · 多 Agent 编排执行",
-    "workflow_entry_body": (
-        "**Workflow 可以做什么？**\n"
-        "• 自动将复杂需求拆解为多 Agent 并行/流水线任务\n"
-        "• 支持 `agent()` / `parallel()` / `pipeline()` / `phase()` 编排原语\n"
-        "• 内置超时保护\n"
-        "• 支持模板保存与复用，常用流程一键启动\n"
-        "• **每个工具 Agent 可自主继续拆分 subagent 并行工作，大幅提升复杂任务收敛速度**\n\n"
-        "✅ 主编排 Agent 入口：`/wf` 即 Workflow 主编排 Agent 入口，无需先进入 `/coco` 等普通编程态\n"
-        "📋 流程：主编排 Agent(工具+模型) → 评审 Agent(工具+模型/Auto) → 自动生成脚本并执行\n\n"
-        "**前置要求**\n"
-        "• Workflow 在 Node.js ≥ 20 的沙盒内执行编排脚本；请确保 `node --version` ≥ 20\n\n"
-        "**快速开始**\n"
-        "• 点击下方「开始编排任务」输入需求，直接进入两步编排流程\n"
-        "• 也可在聊天中发送 `/wf <需求描述>` 立即开始\n"
-        "• `/wf <模板名> [参数]` — 使用内置/保存的模板\n"
-        "• `/wf_status` — 查看当前进度\n"
-        "• `/wf_help` — 完整命令帮助\n"
-        "• `/stop_wf` — 停止运行中的任务"
-    ),
-    "workflow_entry_btn_start": "开始编排任务",
-    "workflow_entry_btn_templates": "📋 查看模板库",
-    "workflow_entry_btn_help": "📖 查看帮助",
+    "workflow_error_internal_error_body": "Workflow 执行过程中发生内部错误。{detail}\n\n💡 请稍后重试，或重新发起 `/wf` 基于推荐可用工具生成脚本并自动执行；如持续出现请联系管理员",
 }
 
 # Merge spec-engine UI text from the shared utils layer (avoids card→engine reverse dep)

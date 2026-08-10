@@ -1,9 +1,5 @@
-"""GhostAp Autonomous Work System - Phase 1 Core.
+"""Durable Employee Department runtime for GhostAP.
 
-Five-layer architecture:
-- Goal Control: understand goals, generate plans, continuous replanning
-- Durable Runtime: persistent scheduling, leases, checkpoints, recovery
-- Agent Runtime: model turns, tool results, continue/stop decisions
-- Safety Control: permissions, approvals, budget, isolation, audit, kill switch
-- Feishu Interaction: Manager Bot, optional employee bots, groups
+Production execution is composed from the journal, workforce, provisioning,
+gateway, employee runtime, channel supervision, and trust boundaries.
 """

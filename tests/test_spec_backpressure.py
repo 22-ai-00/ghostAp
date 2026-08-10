@@ -21,7 +21,8 @@ def test_spec_backpressure(mock_scheduler_cls):
     mock_scheduler.submit.side_effect = mock_submit
 
     client = FeishuWSClient(message_callback=lambda x: None)
-    client._reply_text = MagicMock()
+    reply_text = MagicMock()
+    client._handler_ctx.handlers["coco"].reply_text = reply_text
     # This unit test exercises scheduler backpressure after trust admission.
     # Registry-first ingress behavior has its own managed/external group suite.
     client._managed_group_registry = None
@@ -45,6 +46,6 @@ def test_spec_backpressure(mock_scheduler_cls):
 
     client._handle_message(data)
 
-    client._reply_text.assert_called_once()
-    args = client._reply_text.call_args[0]
+    reply_text.assert_called_once()
+    args = reply_text.call_args[0]
     assert "系统繁忙" in args[1]

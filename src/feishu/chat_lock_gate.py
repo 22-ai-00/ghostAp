@@ -26,17 +26,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @runtime_checkable
-class GateHost(Protocol):
-    """Minimal interface that ChatLockGate depends on.
+class GateHandler(Protocol):
+    """Minimal SystemHandler surface used by the ingress lock gate."""
 
-    Satisfied by ``FeishuWSClient`` without creating a circular import.
-    """
+    def reply_text(self, message_id: str, text: str) -> Optional[str]: ...
 
-    def _reply_text(self, message_id: str, text: str) -> Optional[str]: ...
+    def add_reaction(self, message_id: str, emoji_type: str) -> None: ...
 
-    def _add_reaction(self, message_id: str, emoji_type: str) -> None: ...
+    def send_chat_lock_intercept_card(
+        self, message_id: str, chat_id: str, manager: Any,
+    ) -> None: ...
 
-    def _get_handler(self, name: str) -> Any: ...
+    def send_chat_lock_throttled_reply(
+        self, message_id: str, chat_id: str, manager: Any,
+    ) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -64,20 +67,19 @@ class ChatLockGate:
     dedup_cache:
         A ``MessageCache`` instance for deduplicating lock intercept cards
         within a 30-second window per (chat, sender).
-    host:
-        Narrow protocol reference to the ``FeishuWSClient`` for reply/reaction
-        fallback paths.
+    handler:
+        System handler responsible for lock cards and fallback feedback.
     """
 
     def __init__(
         self,
         chat_lock_manager: Optional[ChatLockManager],
         dedup_cache: Any,  # MessageCache
-        host: GateHost,
+        handler: GateHandler,
     ) -> None:
         self._clm = chat_lock_manager
         self._dedup = dedup_cache
-        self._host = host
+        self._handler = handler
 
     # ------------------------------------------------------------------
     # Public API
@@ -167,14 +169,10 @@ class ChatLockGate:
             if not _is_admin and clm.is_locked(chat_id):
                 if not is_card_action:
                     if self._should_send_intercept(chat_id, sender_id):
-                        _handler = self._host._get_handler("system")
-                        if _handler:
-                            _handler.send_chat_lock_intercept_card(message_id, chat_id, clm)
-                        else:
-                            try:
-                                self._host._reply_text(message_id, UI_TEXT["chat_locked_fallback"])
-                            except Exception:
-                                logger.debug("failed to reply lock message", exc_info=True)
+                        try:
+                            self._handler.send_chat_lock_intercept_card(message_id, chat_id, clm)
+                        except Exception:
+                            self._handler.reply_text(message_id, UI_TEXT["chat_locked_fallback"])
                 return True
 
         return False
@@ -202,22 +200,17 @@ class ChatLockGate:
         if not blocked:
             return False
 
-        _handler = self._host._get_handler("system")
         if self._should_send_intercept(chat_id, sender_id):
-            if _handler:
-                _handler.send_chat_lock_intercept_card(message_id, chat_id, clm)
-            else:
-                try:
-                    self._host._reply_text(message_id, UI_TEXT["chat_locked_fallback"])
-                except Exception:
-                    logger.debug("failed to reply lock fallback message", exc_info=True)
+            try:
+                self._handler.send_chat_lock_intercept_card(message_id, chat_id, clm)
+            except Exception:
+                if is_card_action:
+                    raise
+                logger.warning(
+                    "Chat lock intercept card delivery failed; using text fallback",
+                    exc_info=True,
+                )
+                self._handler.reply_text(message_id, UI_TEXT["chat_locked_fallback"])
         else:
-            if _handler:
-                _handler.send_chat_lock_throttled_reply(message_id, chat_id, clm)
-            else:
-                try:
-                    from .emoji import EmojiReaction
-                    self._host._add_reaction(message_id, EmojiReaction.on_chat_locked())
-                except Exception:
-                    logger.debug("failed to add lock reaction", exc_info=True)
+            self._handler.send_chat_lock_throttled_reply(message_id, chat_id, clm)
         return True

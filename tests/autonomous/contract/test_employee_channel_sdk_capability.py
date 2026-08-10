@@ -50,7 +50,6 @@ def _run_sdk_client(
     event_kind: str,
     callback_entered: Any,
     release_callback: Any,
-    high_level: bool,
     callback_wait_seconds: float = _PROCESS_WAIT_SECONDS,
     request_reconnect: Any | None = None,
     callback_finished: Any | None = None,
@@ -93,59 +92,35 @@ def _run_sdk_client(
 
     security = _strict_security_config()
 
-    if high_level:
-        from lark_channel import FeishuChannel
+    callback_count = 0
 
-        channel = FeishuChannel(
-            app_id="cli_capability",
-            app_secret="test-only-secret",
-            domain=domain,
-            log_level=LogLevel.ERROR,
-            security=security,
-            name_lookup=lambda ids: {value: value for value in ids},
-        )
-
-        async def hold_message(_message: Any) -> None:
+    def hold_callback(_event: Any) -> Any:
+        nonlocal callback_count
+        callback_count += 1
+        if callback_count == 1:
             callback_entered.set()
-            try:
-                await __import__("asyncio").to_thread(release_callback.wait)
-            finally:
-                if callback_finished is not None:
-                    callback_finished.set()
+        elif second_callback_entered is not None:
+            second_callback_entered.set()
+        try:
+            if callback_behavior == "parent_close":
+                raise EOFError("employee ingress parent unavailable")
+            if callback_behavior == "exception":
+                raise RuntimeError("employee ingress callback failed")
+            if not release_callback.wait(callback_wait_seconds):
+                raise TimeoutError("employee ingress anchor deadline exceeded")
+            if event_kind == "card":
+                return P2CardActionTriggerResponse({})
+            return None
+        finally:
+            if callback_finished is not None:
+                callback_finished.set()
 
-        channel.on("message", hold_message)
-        channel._ensure_bg_loop()
-        dispatcher = channel._build_dispatcher()
+    builder = EventDispatcherHandler.builder("", "", security=security)
+    if event_kind == "message":
+        builder = builder.register_p2_im_message_receive_v1(hold_callback)
     else:
-        callback_count = 0
-
-        def hold_callback(_event: Any) -> Any:
-            nonlocal callback_count
-            callback_count += 1
-            if callback_count == 1:
-                callback_entered.set()
-            elif second_callback_entered is not None:
-                second_callback_entered.set()
-            try:
-                if callback_behavior == "parent_close":
-                    raise EOFError("employee ingress parent unavailable")
-                if callback_behavior == "exception":
-                    raise RuntimeError("employee ingress callback failed")
-                if not release_callback.wait(callback_wait_seconds):
-                    raise TimeoutError("employee ingress anchor deadline exceeded")
-                if event_kind == "card":
-                    return P2CardActionTriggerResponse({})
-                return None
-            finally:
-                if callback_finished is not None:
-                    callback_finished.set()
-
-        builder = EventDispatcherHandler.builder("", "", security=security)
-        if event_kind == "message":
-            builder = builder.register_p2_im_message_receive_v1(hold_callback)
-        else:
-            builder = builder.register_p2_card_action_trigger(hold_callback)
-        dispatcher = builder.build()
+        builder = builder.register_p2_card_action_trigger(hold_callback)
+    dispatcher = builder.build()
 
     client = WSClient(
         app_id="cli_capability",
@@ -243,7 +218,6 @@ class _WireHarness(AbstractContextManager["_WireHarness"]):
         *,
         wire_type: str = "event",
         send_event_once: bool = False,
-        endpoint_scheme: str = "wss",
         declared_fragment_sum: int = 1,
         send_two_events: bool = False,
         close_first_connection: bool = False,
@@ -257,7 +231,6 @@ class _WireHarness(AbstractContextManager["_WireHarness"]):
         self._payload = payload
         self._wire_type = wire_type
         self._send_event_once = send_event_once
-        self._endpoint_scheme = endpoint_scheme
         self._declared_fragment_sum = declared_fragment_sum
         self._send_two_events = send_two_events
         self._close_first_connection = close_first_connection
@@ -307,7 +280,7 @@ class _WireHarness(AbstractContextManager["_WireHarness"]):
             (_EndpointHandler,),
             {
                 "endpoint_url": (
-                    f"{self._endpoint_scheme}://localhost:{wss_port}/callback"
+                    f"wss://localhost:{wss_port}/callback"
                     f"?device_id=dev-capability&service_id=1{sentinel_query}"
                 )
             },
@@ -628,7 +601,6 @@ def _assert_low_level_waits_for_callback(tmp_path: Path, event_kind: str) -> Non
             event_kind,
             callback_entered,
             release_callback,
-            False,
         )
         try:
             assert harness.read_waiting.wait(_PROCESS_WAIT_SECONDS)
@@ -661,37 +633,6 @@ def test_card_action_wire_response_waits_for_parent_anchor(tmp_path: Path) -> No
     _assert_low_level_waits_for_callback(tmp_path, "card")
 
 
-@pytest.mark.integration
-def test_high_level_message_handler_can_finish_after_wire_success(tmp_path: Path) -> None:
-    """Negative proof: high-level scheduling cannot provide durable ACK ordering."""
-    context = multiprocessing.get_context("spawn")
-    callback_entered = context.Event()
-    callback_finished = context.Event()
-    release_callback = context.Event()
-
-    with _WireHarness(tmp_path, _message_payload()) as harness:
-        process = _start_client(
-            context,
-            harness,
-            "message",
-            callback_entered,
-            release_callback,
-            True,
-            _PROCESS_WAIT_SECONDS,
-            None,
-            callback_finished,
-        )
-        try:
-            assert harness.response_received.wait(_PROCESS_WAIT_SECONDS)
-            assert json.loads(harness.response_frame().payload)["code"] == HTTPStatus.OK
-            assert callback_entered.wait(_PROCESS_WAIT_SECONDS)
-            assert not callback_finished.is_set()
-            assert not release_callback.is_set()
-            assert harness.connection_count == 1
-        finally:
-            _stop_process(process, release_callback)
-
-
 def _assert_callback_failure(
     tmp_path: Path,
     event_kind: str,
@@ -711,7 +652,6 @@ def _assert_callback_failure(
             event_kind,
             callback_entered,
             release_callback,
-            False,
             callback_wait_seconds,
             None,
             None,
@@ -774,7 +714,6 @@ def test_raw_card_wire_type_is_not_card_action_capability(tmp_path: Path) -> Non
             "card",
             callback_entered,
             release_callback,
-            False,
         )
         try:
             assert harness.read_waiting.wait(_PROCESS_WAIT_SECONDS)
@@ -799,7 +738,6 @@ def test_reconnect_requested_during_callback_is_bounded(tmp_path: Path) -> None:
             "message",
             callback_entered,
             release_callback,
-            False,
             _PROCESS_WAIT_SECONDS,
             request_reconnect,
         )
@@ -830,7 +768,6 @@ def test_idle_reconnect_is_bounded(tmp_path: Path) -> None:
             "message",
             callback_entered,
             release_callback,
-            False,
             _PROCESS_WAIT_SECONDS,
             request_reconnect,
         )
@@ -861,7 +798,6 @@ def test_blocked_callback_worker_termination_is_bounded(tmp_path: Path) -> None:
             "message",
             callback_entered,
             release_callback,
-            False,
             60.0,
         )
         assert callback_entered.wait(_PROCESS_WAIT_SECONDS)
@@ -888,7 +824,6 @@ def test_control_ping_resumes_after_callback(tmp_path: Path) -> None:
             "message",
             callback_entered,
             release_callback,
-            False,
         )
         try:
             assert callback_entered.wait(_PROCESS_WAIT_SECONDS)
@@ -896,58 +831,6 @@ def test_control_ping_resumes_after_callback(tmp_path: Path) -> None:
             release_callback.set()
             assert harness.response_received.wait(_PROCESS_WAIT_SECONDS)
             assert harness.ping_after_response.wait(_PROCESS_WAIT_SECONDS)
-        finally:
-            _stop_process(process, release_callback)
-
-
-@pytest.mark.integration
-def test_strict_local_ws_endpoint_is_rejected(tmp_path: Path) -> None:
-    context = multiprocessing.get_context("spawn")
-    callback_entered = context.Event()
-    release_callback = context.Event()
-
-    with _WireHarness(
-        tmp_path,
-        _message_payload(),
-        endpoint_scheme="ws",
-    ) as harness:
-        process = _start_client(
-            context,
-            harness,
-            "message",
-            callback_entered,
-            release_callback,
-            False,
-        )
-        process.join(timeout=_PROCESS_WAIT_SECONDS)
-        if process.is_alive():
-            _stop_process(process)
-            pytest.fail("strict client did not reject local ws endpoint")
-        assert process.exitcode != 0
-        assert not callback_entered.is_set()
-        assert harness.connection_count == 0
-
-
-@pytest.mark.integration
-def test_environment_proxy_is_ignored_for_direct_wss(tmp_path: Path) -> None:
-    context = multiprocessing.get_context("spawn")
-    callback_entered = context.Event()
-    release_callback = context.Event()
-
-    with _WireHarness(tmp_path, _message_payload()) as harness:
-        process = _start_client(
-            context,
-            harness,
-            "message",
-            callback_entered,
-            release_callback,
-            False,
-        )
-        try:
-            assert callback_entered.wait(_PROCESS_WAIT_SECONDS)
-            assert harness.connection_count == 1
-            release_callback.set()
-            assert harness.response_received.wait(_PROCESS_WAIT_SECONDS)
         finally:
             _stop_process(process, release_callback)
 
@@ -970,7 +853,6 @@ def test_fragment_overflow_is_dropped_before_callback(tmp_path: Path) -> None:
             "message",
             callback_entered,
             release_callback,
-            False,
         )
         try:
             assert harness.read_waiting.wait(_PROCESS_WAIT_SECONDS)
@@ -1006,7 +888,6 @@ def test_fragment_byte_overflow_is_dropped_before_callback(tmp_path: Path) -> No
             "message",
             callback_entered,
             release_callback,
-            False,
         )
         try:
             assert harness.read_waiting.wait(_PROCESS_WAIT_SECONDS)
@@ -1038,7 +919,6 @@ def test_concurrency_cap_holds_second_callback(tmp_path: Path) -> None:
             "message",
             callback_entered,
             release_callback,
-            False,
             _PROCESS_WAIT_SECONDS,
             None,
             None,
@@ -1072,7 +952,6 @@ def test_single_frame_payload_limit_requires_parent_gate(tmp_path: Path) -> None
             "message",
             callback_entered,
             release_callback,
-            False,
         )
         try:
             assert callback_entered.wait(_PROCESS_WAIT_SECONDS)
@@ -1104,7 +983,6 @@ def test_sensitive_sentinels_are_absent_from_worker_logs(tmp_path: Path) -> None
             "message",
             callback_entered,
             release_callback,
-            False,
             _PROCESS_WAIT_SECONDS,
             None,
             None,

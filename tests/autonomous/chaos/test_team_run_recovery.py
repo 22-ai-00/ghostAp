@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from src.autonomous.journal.frame import JournalEvent
-from src.autonomous.team import (
+from src.autonomous.team.coordinator import TeamCoordinatorActor
+from src.autonomous.team.models import (
     CoordinatorAction,
     CoordinatorDecision,
-    TeamAttemptResult,
-    TeamCoordinatorActor,
     TeamRunPhase,
 )
+from src.autonomous.team.service import TeamAttemptResult
 from tests.autonomous.team_helpers import ImmediateTeamBackend, make_team_storage
 
 
@@ -175,7 +175,18 @@ def test_restart_after_contribution_commit_continues_to_review(tmp_path) -> None
 
 
 class _CrashNotifyBackend(ImmediateTeamBackend):
-    def notify(self, message_id, chat_id, result):
+    def notify(
+        self,
+        message_id,
+        chat_id,
+        result,
+        *,
+        idempotency_key="",
+        tenant_key="",
+        requester_principal_id="",
+    ):
+        del message_id, chat_id, result
+        del idempotency_key, tenant_key, requester_principal_id
         raise SystemExit("simulated process death after notify executing")
 
 
@@ -192,8 +203,10 @@ class _RetryableNotifyBackend(ImmediateTeamBackend):
         result,
         *,
         idempotency_key,
-        **_scope,
+        tenant_key="",
+        requester_principal_id="",
     ):
+        del tenant_key, requester_principal_id
         self.idempotency_keys.append(idempotency_key)
         if self.fail:
             raise RuntimeError("simulated final notification failure")
@@ -205,18 +218,36 @@ class _FailOnceNotifyBackend(_RetryableNotifyBackend):
         super().__init__()
         self.failures_remaining = 1
 
-    def notify(self, *args, idempotency_key, **kwargs):
+    def notify(
+        self,
+        message_id,
+        chat_id,
+        result,
+        *,
+        idempotency_key,
+        tenant_key="",
+        requester_principal_id="",
+    ):
+        del tenant_key, requester_principal_id
         self.idempotency_keys.append(idempotency_key)
         if self.failures_remaining:
             self.failures_remaining -= 1
             raise RuntimeError("simulated transient final delivery failure")
-        message_id, chat_id, result = args
         self.notifications.append((message_id, chat_id, result))
 
 
 class _FinalFailingBlockSuccessBackend(_RetryableNotifyBackend):
-    def notify(self, *args, idempotency_key, **kwargs):
-        message_id, chat_id, result = args
+    def notify(
+        self,
+        message_id,
+        chat_id,
+        result,
+        *,
+        idempotency_key,
+        tenant_key="",
+        requester_principal_id="",
+    ):
+        del tenant_key, requester_principal_id
         if result.startswith("⚠️"):
             self.notifications.append((message_id, chat_id, result))
             return
@@ -237,8 +268,10 @@ class _PersistentBlockNotificationFailureBackend(ImmediateTeamBackend):
         _result,
         *,
         idempotency_key,
-        **_scope,
+        tenant_key="",
+        requester_principal_id="",
     ):
+        del tenant_key, requester_principal_id
         self.notification_attempts.append(idempotency_key)
         raise RuntimeError("simulated persistent blocked notification failure")
 
@@ -272,6 +305,32 @@ def _seed_final_notification_action_required(
     actor.drain()
     original_effect(f"{run.run_id}:notify", "notify", "action_required")
     return actor, run
+
+
+def test_no_capable_employee_reaches_durable_blocked_terminal(tmp_path) -> None:
+    writer, blobs = make_team_storage(tmp_path)
+    backend = ImmediateTeamBackend()
+    backend.targets = ()
+    actor = _actor(writer, blobs, backend)
+
+    run = actor.start_task(
+        tenant_key="tenant_1",
+        message_id="om_no_capable_employee",
+        chat_id="oc_team",
+        requester_principal_id="ou_user",
+        task="没有可调度员工时自动失败",
+    )
+    actor.drain()
+
+    projection = actor.projection()
+    assert projection.runs[run.run_id].phase is TeamRunPhase.BLOCKED
+    assert (
+        projection.effects[(f"{run.run_id}:blocked-notify:1", "notify")]
+        == "committed"
+    )
+    actor.close()
+    blobs.close()
+    writer.close()
 
 
 def test_initial_block_notification_commit_precedes_only_terminal_transition(

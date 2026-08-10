@@ -2,26 +2,14 @@
 
 from __future__ import annotations
 
-import contextlib
-import dataclasses
 import logging
 import threading
 import time
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Generator
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class PoolStats:
-    """Immutable snapshot of SessionLockPool state for monitoring/inspection."""
-
-    lock_count: int
-    in_flight: int
-    accepting_work: bool
-    eviction_alive: bool
 
 
 def _eviction_loop_fn(
@@ -49,8 +37,6 @@ class SessionLockPool:
     Public interface:
         acquire(session_id) -> RLock          # get-or-create per-session lock
         release(session_id) -> None           # remove lock entry (on session close)
-        contains(session_id) -> bool          # check if session has a lock
-        count -> int                          # current lock count
         drain(timeout) -> bool                # wait for all in-flight to finish
         fence() -> None                       # stop accepting new work
         shutdown() -> None                    # stop eviction thread
@@ -109,25 +95,9 @@ class SessionLockPool:
         self._last_full_scan: float = time.monotonic()
 
     @property
-    def count(self) -> int:
-        """Current number of managed session locks."""
-        with self._lock:
-            return len(self._session_locks)
-
-    @property
     def accepting_work(self) -> bool:
         """Whether the pool is accepting new work."""
         return self._accepting_work.is_set()
-
-    def stats(self) -> PoolStats:
-        """Return an immutable snapshot of pool state for monitoring."""
-        with self._lock:
-            return PoolStats(
-                lock_count=len(self._session_locks),
-                in_flight=self._in_flight_count,
-                accepting_work=self._accepting_work.is_set(),
-                eviction_alive=self._eviction_thread.is_alive(),
-            )
 
     def acquire(self, session_id: str) -> threading.RLock:
         """Get or create a per-session RLock, updating LRU timestamp.
@@ -164,28 +134,6 @@ class SessionLockPool:
         with self._lock:
             self._session_locks.pop(session_id, None)
             self._timestamps.pop(session_id, None)
-
-    def contains(self, session_id: str) -> bool:
-        """Check if a session has a lock entry."""
-        with self._lock:
-            return session_id in self._session_locks
-
-    @contextlib.contextmanager
-    def session_lock(self, session_id: str) -> Generator[threading.RLock, None, None]:
-        """Context manager that acquires a per-session RLock for the duration.
-
-        Usage::
-
-            with lock_pool.session_lock(sid) as rlock:
-                # rlock is held; safe to mutate session state
-                ...
-        """
-        rlock = self.acquire(session_id)
-        rlock.acquire()
-        try:
-            yield rlock
-        finally:
-            rlock.release()
 
     def enter_delivery(self) -> None:
         """Increment in-flight counter (call before starting I/O)."""

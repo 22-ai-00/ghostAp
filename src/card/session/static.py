@@ -13,19 +13,12 @@ import json
 import logging
 import threading
 import uuid
-from typing import Optional
 
 from src.card.delivery.engine import CardDelivery
 from src.card.protocols import Session  # noqa: F401 — structural compliance
 from src.card.types import RenderedCard
 
 logger = logging.getLogger(__name__)
-
-
-def _compute_json_signature(card_json: dict) -> str:
-    """Compute MD5 signature of the full card JSON for change detection."""
-    raw = json.dumps(card_json, sort_keys=True, ensure_ascii=False)
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 class StaticCardSession:
@@ -77,7 +70,7 @@ class StaticCardSession:
     def closed(self) -> bool:
         return self._closed.is_set()
 
-    def send(self, card_json: dict | str) -> Optional[str]:
+    def send(self, card_json: dict | str) -> str | None:
         """Send or update a card.
 
         First call creates the card; subsequent calls patch it.
@@ -93,12 +86,12 @@ class StaticCardSession:
         if isinstance(card_json, str):
             card_json = json.loads(card_json)
 
-        signature = _compute_json_signature(card_json)
-        content_hash = hashlib.md5(json.dumps(card_json, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        raw = json.dumps(card_json, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        content_hash = hashlib.md5(raw).hexdigest()
         rendered = [
             RenderedCard(
                 _card_json=card_json,
-                structure_signature=signature,
+                structure_signature=content_hash,
                 content_hash=content_hash,
                 active_element=None,
                 page_index=0,

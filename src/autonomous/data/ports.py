@@ -65,15 +65,3 @@ class EmployeeDataSink(Protocol):
     def record_terminal(self, terminal: AuthenticatedExecutionTerminal) -> None: ...
 
     def publish_document(self, command: PublishEmployeeDocumentCommand) -> None: ...
-
-
-class EmployeeHistoryReadPort(Protocol):
-    """Read port for paginated history queries."""
-
-    def query(self, request: object, spec: HistoryQuerySpec) -> object: ...
-
-
-class EmployeeMemoryReadPort(Protocol):
-    """Read port for memory/summary queries."""
-
-    def query(self, request: object, spec: MemoryQuerySpec) -> object: ...

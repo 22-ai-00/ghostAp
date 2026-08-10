@@ -1,5 +1,11 @@
 import logging
 
+import src.agent_session.factory as session_factory
+import src.agent_session.model_diagnostics as model_diagnostics
+import src.agent_session.wrappers as session_wrappers
+from src.agent_session.factory import create_engine_session
+from src.agent_session.wrappers import ModelFailureAwareSession
+
 
 def test_e2e_model_failure_need_compaction_then_loop_then_failover(monkeypatch, caplog):
     """端到端回归夹具：need compaction -> loop -> failover 到 gpt-5.1 后成功。
@@ -8,8 +14,6 @@ def test_e2e_model_failure_need_compaction_then_loop_then_failover(monkeypatch, 
     - 不启动真实子进程
     - 通过 monkeypatch 构造 create_engine_session 产生的包装链路
     """
-    import src.agent_session as agent_session
-
     caplog.set_level(logging.WARNING)
 
     # Settings: force deterministic loop threshold
@@ -24,8 +28,8 @@ def test_e2e_model_failure_need_compaction_then_loop_then_failover(monkeypatch, 
         model_failure_compaction_loop_max = 2  # second compaction event triggers loop
         model_failure_failover_map = "gpt-5.2:gpt-5.1"
 
-    monkeypatch.setattr(agent_session.factory, "get_settings", lambda: _S())
-    monkeypatch.setattr(agent_session.wrappers, "get_settings", lambda: _S())
+    monkeypatch.setattr(session_factory, "get_settings", lambda: _S())
+    monkeypatch.setattr(session_wrappers, "get_settings", lambda: _S())
 
     # Base session that simulates model errors across calls
     class _Base:
@@ -35,7 +39,6 @@ def test_e2e_model_failure_need_compaction_then_loop_then_failover(monkeypatch, 
             self.last_active = 0.0
             self.message_count = 0
             self.last_query = ""
-            self.is_resumed = False
             self._agent_type = "coco"
             self._cwd = "/tmp"
             self._agent_cmd = "coco"
@@ -48,9 +51,6 @@ def test_e2e_model_failure_need_compaction_then_loop_then_failover(monkeypatch, 
         def start(self, startup_timeout: float = 60):
             return self.session_id
 
-        def load_session(self, session_id: str, timeout: float = 60):
-            del timeout
-            return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
             return []
@@ -76,7 +76,7 @@ def test_e2e_model_failure_need_compaction_then_loop_then_failover(monkeypatch, 
         def send_prompt(self, text: str, on_event=None, timeout=None):
             self.calls += 1
             # model gpt-5.2: first call -> need compaction; second call -> need compaction again triggers loop -> failover
-            cur_model = agent_session._extract_model_from_agent_args(self._agent_args)
+            cur_model = model_diagnostics._extract_model_from_agent_args(self._agent_args)
             if cur_model == "gpt-5.2":
                 if self.calls == 1:
                     raise RuntimeError("Model failed: model 'gpt-5.2': receive message: need compaction")
@@ -93,19 +93,23 @@ def test_e2e_model_failure_need_compaction_then_loop_then_failover(monkeypatch, 
 
     # Compaction action: rebuild a new base session with same model
     def _compaction_action(sess):
-        model = agent_session._extract_model_from_agent_args(list(getattr(sess, "_agent_args", []) or []))
+        model = model_diagnostics._extract_model_from_agent_args(
+            list(getattr(sess, "_agent_args", []) or [])
+        )
         return _Base(model)
 
     # Patch SyncACPSession used by failover rebuild
     def _fake_sync_acp_session(**kw):
-        model = agent_session._extract_model_from_agent_args(list(kw.get("agent_args") or []))
+        model = model_diagnostics._extract_model_from_agent_args(
+            list(kw.get("agent_args") or [])
+        )
         return _Base(model)
 
-    monkeypatch.setattr(agent_session.wrappers, "SyncACPSession", _fake_sync_acp_session)
+    monkeypatch.setattr(session_wrappers, "SyncACPSession", _fake_sync_acp_session)
 
     # Create session through factory (ensures wrapper chain is applied)
-    sess = agent_session.create_engine_session(agent_type="coco", cwd="/tmp", model_name="gpt-5.2")
-    assert isinstance(sess, agent_session.ModelFailureAwareSession)
+    sess = create_engine_session(agent_type="coco", cwd="/tmp", model_name="gpt-5.2")
+    assert isinstance(sess, ModelFailureAwareSession)
     # inject compaction action for deterministic behavior
     sess._compaction_action = _compaction_action
 

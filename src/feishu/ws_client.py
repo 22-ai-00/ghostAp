@@ -2,11 +2,10 @@
 
 职责概览：
 - 接收飞书 WS 事件（消息、卡片动作、反应等）并做基础校验/去重。
-- 将用户消息路由到不同 handler（SMART/编程/SHELL 以及 Deep/Spec 引擎）。
+- 解码并准入事件，将消息和卡片动作交给权威 handler。
 - 通过 `TaskScheduler` 提供：按项目串行、全局并发限制、系统命令快通道、背压与熔断。
 
 关键设计点：
-- `_FORWARDING_MAP` + `__getattr__`：把不同 mode 的实现解耦到 handlers 中，同时保持 ws_client 的调用面稳定。
 - 兼容性：部分 lark-oapi 版本不包含完整的 callback model 类型；这里对仅用于类型标注的符号做了降级处理。
 """
 
@@ -51,7 +50,7 @@ from ..access_control import (
 )
 from ..acp.manager import ACPSessionManager
 from ..acp.telemetry import build_idle_health_config_for_manager
-from ..agent.intent_recognizer import IntentRecognizer, IntentResult, TaskStep
+from ..agent.intent_recognizer import IntentRecognizer
 from ..autonomous.provisioning.notification_state import (
     hire_notification_message_uuid,
 )
@@ -60,7 +59,6 @@ from ..config import IngressAccessMode, get_settings
 from ..config.env_file_store import AtomicEnvFileStore
 from ..deep_engine import DeepEngineManager, ProgressReporter
 from ..project import (
-    ContextSourceMode,
     MessageLinker,
     MessageProjectMapper,
     ProjectContext,
@@ -94,7 +92,6 @@ from ..utils.errors import get_error_detail
 from ..utils.rate_limit import RateLimiter, RateLimitExceededException
 from ..utils.restart_gate import RestartGate
 from ..utils.trace import TraceContext, configure_logging_with_trace
-from .action_dispatcher import ActionDispatcher
 from .emoji import EmojiReaction
 from .handler_context import HandlerContext
 from .handlers import (
@@ -178,6 +175,10 @@ def _employee_hire_status_uuid(intent_id: str, status: str) -> str:
     return hire_notification_message_uuid(intent_id, status)
 
 
+def _ignore_ws_event(_data: object) -> None:
+    """Acknowledge subscribed events that require no product action."""
+
+
 def _unavailable_main_bot_outbound_audit(
     _tenant_key: str,
     _operation: str,
@@ -222,31 +223,9 @@ def _visible_employee_runtime_requires_outbound_audit(settings: object) -> bool:
         return True
     return limit > 0
 
-# Sentinel used to distinguish "caller didn't provide command_match" from
-# "caller provided command_match=None". This ensures request-scoped SSOT:
-# parse exactly once at WS ingress, then thread the result through.
-_COMMAND_MATCH_MISSING: object = object()
-
-
 _READONLY_CARD_ACTIONS = {
     "deep_expand", "deep_collapse", "deep_mode_full", "deep_mode_compact", "deep_expand_ac", "deep_collapse_ac",
     "spec_expand", "spec_collapse", "spec_mode_full", "spec_mode_compact", "spec_expand_ac", "spec_collapse_ac",
-}
-
-# Selection-flow actions where duplicate clicks are silently dropped (no toast).
-# Rapid clicking during model/tool selection is normal UX — showing a toast
-# every time is disruptive.
-_SILENT_DEDUP_ACTIONS = {
-    "workflow_select_tool", "workflow_orchestrator_select_tool",
-    "workflow_orchestrator_select_model_group",
-    "workflow_orchestrator_select_model_profile",
-    "workflow_orchestrator_select_model_effort",
-    "workflow_orchestrator_select_model", "workflow_review_select_tool",
-    "workflow_review_select_model_group",
-    "workflow_review_select_model_profile",
-    "workflow_review_select_model_effort",
-    "workflow_review_select_model", "spec_review_select_tool",
-    "spec_review_select_model", "select_acp_tool",
 }
 
 _CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
@@ -330,48 +309,24 @@ class FeishuWSClient:
         # 避免在构造函数中直接依赖具体 Telemetry/Service 实现。
         idle_health_cfg = build_idle_health_config_for_manager()
 
-        self._coco_manager = ACPSessionManager(
-            "coco",
-            session_timeout=self.settings.coco_session_timeout,
-            keepalive_interval=self.settings.acp_keepalive_interval,
-            idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
-            idle_health_config=idle_health_cfg,
-        )
-        self._claude_manager = ACPSessionManager(
-            "claude",
-            session_timeout=self.settings.claude_session_timeout,
-            keepalive_interval=self.settings.acp_keepalive_interval,
-            idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
-            idle_health_config=idle_health_cfg,
-        )
-        self._aiden_manager = ACPSessionManager(
-            "aiden",
-            session_timeout=self.settings.coco_session_timeout,
-            keepalive_interval=self.settings.acp_keepalive_interval,
-            idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
-            idle_health_config=idle_health_cfg,
-        )
-        self._codex_manager = ACPSessionManager(
-            "codex",
-            session_timeout=self.settings.coco_session_timeout,
-            keepalive_interval=self.settings.acp_keepalive_interval,
-            idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
-            idle_health_config=idle_health_cfg,
-        )
-        self._gemini_manager = ACPSessionManager(
-            "gemini",
-            session_timeout=self.settings.coco_session_timeout,
-            keepalive_interval=self.settings.acp_keepalive_interval,
-            idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
-            idle_health_config=idle_health_cfg,
-        )
-        self._traex_manager = ACPSessionManager(
-            "traex",
-            session_timeout=self.settings.coco_session_timeout,
-            keepalive_interval=self.settings.acp_keepalive_interval,
-            idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
-            idle_health_config=idle_health_cfg,
-        )
+        manager_timeouts = {
+            "coco": self.settings.coco_session_timeout,
+            "claude": self.settings.claude_session_timeout,
+            "aiden": self.settings.coco_session_timeout,
+            "codex": self.settings.coco_session_timeout,
+            "gemini": self.settings.coco_session_timeout,
+            "traex": self.settings.coco_session_timeout,
+        }
+        acp_managers = {
+            name: ACPSessionManager(
+                name,
+                session_timeout=session_timeout,
+                keepalive_interval=self.settings.acp_keepalive_interval,
+                idle_healthcheck_s=self.settings.acp_session_idle_healthcheck_s,
+                idle_health_config=idle_health_cfg,
+            )
+            for name, session_timeout in manager_timeouts.items()
+        }
         self._intent_recognizer = IntentRecognizer()
         self._message_cache = MessageCache(ttl=self.settings.message_cache_ttl, max_size=self.settings.message_cache_max_size, cleanup_interval=60)
         self._message_ingress_guard = MessageIngressGuard(
@@ -525,12 +480,12 @@ class FeishuWSClient:
             settings=self.settings,
             api_client_factory=self._get_api_client,
             message_callback=self.message_callback,
-            coco_manager=self._coco_manager,
-            claude_manager=self._claude_manager,
-            aiden_manager=self._aiden_manager,
-            codex_manager=self._codex_manager,
-            gemini_manager=self._gemini_manager,
-            traex_manager=self._traex_manager,
+            coco_manager=acp_managers["coco"],
+            claude_manager=acp_managers["claude"],
+            aiden_manager=acp_managers["aiden"],
+            codex_manager=acp_managers["codex"],
+            gemini_manager=acp_managers["gemini"],
+            traex_manager=acp_managers["traex"],
             intent_recognizer=self._intent_recognizer,
             scheduler=self._scheduler,
             project_manager=self._project_manager,
@@ -600,61 +555,26 @@ class FeishuWSClient:
             managed_group_bot_rotation=self.rotate_main_managed_group_bot,
         )
 
-        # Instantiate handlers (temp locals for registry population)
-        coco_handler = CocoModeHandler(self._handler_ctx)
-        claude_handler = ClaudeModeHandler(self._handler_ctx)
-        aiden_handler = AidenModeHandler(self._handler_ctx)
-        codex_handler = CodexModeHandler(self._handler_ctx)
-        gemini_handler = GeminiModeHandler(self._handler_ctx)
-        traex_handler = TraexModeHandler(self._handler_ctx)
-        deep_handler = DeepHandler(self._handler_ctx)
-        deep_handler.renderer = DeepRenderer(deep_handler)
-        spec_handler = SpecHandler(self._handler_ctx)
-        spec_handler.renderer = SpecRenderer(spec_handler)
-        project_handler = ProjectHandler(self._handler_ctx)
-        system_handler = SystemHandler(self._handler_ctx)
-        diagnostics_handler = DiagnosticsHandler(self._handler_ctx)
-        workflow_handler = WorkflowHandler(self._handler_ctx)
-
-        # ------------------------------------------------------------------
-        # Populate registry containers in context
-        # ------------------------------------------------------------------
-        # Bind handlers directly on instance for backward compatibility (especially for tests)
-        self._coco_handler = coco_handler
-        self._claude_handler = claude_handler
-        self._aiden_handler = aiden_handler
-        self._codex_handler = codex_handler
-        self._gemini_handler = gemini_handler
-        self._traex_handler = traex_handler
-        self._deep_handler = deep_handler
-        self._spec_handler = spec_handler
-        self._project_handler = project_handler
-        self._system_handler = system_handler
-        self._diagnostics_handler = diagnostics_handler
-        self._workflow_handler = workflow_handler
-
-        self._handler_ctx.managers.update({
-            "coco": self._coco_manager,
-            "claude": self._claude_manager,
-            "aiden": self._aiden_manager,
-            "codex": self._codex_manager,
-            "gemini": self._gemini_manager,
-            "traex": self._traex_manager,
-        })
-        self._handler_ctx.handlers.update({
-            "coco": coco_handler,
-            "claude": claude_handler,
-            "aiden": aiden_handler,
-            "codex": codex_handler,
-            "gemini": gemini_handler,
-            "traex": traex_handler,
-            "deep": deep_handler,
-            "spec": spec_handler,
-            "project": project_handler,
-            "system": system_handler,
-            "diagnostics": diagnostics_handler,
-            "workflow": workflow_handler,
-        })
+        handler_types = {
+            "coco": CocoModeHandler,
+            "claude": ClaudeModeHandler,
+            "aiden": AidenModeHandler,
+            "codex": CodexModeHandler,
+            "gemini": GeminiModeHandler,
+            "traex": TraexModeHandler,
+            "deep": DeepHandler,
+            "spec": SpecHandler,
+            "project": ProjectHandler,
+            "system": SystemHandler,
+            "diagnostics": DiagnosticsHandler,
+            "workflow": WorkflowHandler,
+        }
+        handlers = {name: cls(self._handler_ctx) for name, cls in handler_types.items()}
+        handlers["deep"].renderer = DeepRenderer(handlers["deep"])
+        handlers["spec"].renderer = SpecRenderer(handlers["spec"])
+        self._handler_ctx.managers.update(acp_managers)
+        self._handler_ctx.handlers.update(handlers)
+        system_handler = handlers["system"]
 
         # Subscribe to hard-timeout reclaim events on RepoLockManager
         # (fire-and-forget notification to the displaced lock holder chat).
@@ -732,11 +652,9 @@ class FeishuWSClient:
         from .chat_lock_gate import ChatLockGate
         _clm = getattr(self._handler_ctx, "chat_lock_manager", None)
         _lock_dedup = MessageCache(ttl=30, max_size=10_000, cleanup_interval=60)
-        self._chat_lock_gate = ChatLockGate(_clm, _lock_dedup, host=self)
-
-        # Bind forwarding methods directly on instance (replaces __getattr__ dispatch)
-        from .router import bind_forwarding_methods
-        bind_forwarding_methods(self, self._handler_ctx)
+        self._chat_lock_gate = ChatLockGate(
+            _clm, _lock_dedup, handler=system_handler,
+        )
 
         # ------------------------------------------------------------------
         # Control-plane (deferred /exit, system command gate)
@@ -745,21 +663,16 @@ class FeishuWSClient:
         self._control_plane = ControlPlane(
             scheduler=self._scheduler,
             project_manager=self._project_manager,
-            exit_handler_fn=lambda *a, **kw: self._exit_current_mode(*a, **kw),
+            exit_handler_fn=system_handler.exit_current_mode,
         )
         self._scheduler.add_listener(self._control_plane.on_scheduler_event)
-        # Backward-compat aliases for tests
-        self._system_cmd_gate_lock = self._control_plane._system_cmd_gate_lock
-        self._system_cmd_inflight_by_chat = self._control_plane._system_cmd_inflight_by_chat
-
         # --- Message Dispatcher ---
         from .dispatcher import MessageDispatcher
         self._message_dispatcher = MessageDispatcher(self)
 
         # --- Action Dispatcher ---
         from .action_registry import init_action_registry
-        self._action_dispatcher = ActionDispatcher()
-        init_action_registry(self)
+        self._action_handlers = init_action_registry(self)
 
         # Configure trace logging
         configure_logging_with_trace()
@@ -775,7 +688,7 @@ class FeishuWSClient:
         if runtime is None:
             return
         try:
-            if not callable(getattr(self, "_reply_text", None)):
+            if "coco" not in self._handler_ctx.handlers:
                 raise RuntimeError("main Bot reply transport is not bound")
             runtime.recover()
         except Exception:
@@ -881,10 +794,6 @@ class FeishuWSClient:
                 "Employee Department cleanup failed after initialization error",
                 exc_info=True,
             )
-
-    def _register_action(self, handler: Callable, exact: Optional[str] = None, prefix: Optional[str] = None):
-        """Register a card action handler."""
-        self._action_dispatcher.register(handler, exact, prefix)
 
     def close(self) -> bool:
         """Fence intake, drain work, then clean up dependencies.
@@ -1115,29 +1024,26 @@ class FeishuWSClient:
                     show_buttons=False,
                     extra_buttons=buttons,
                 )
-                self.reply(evicted_chat_id, card_json, msg_type=msg_type, chat_id=evicted_chat_id)
+                if msg_type == "text":
+                    self._handler_ctx.handlers["coco"].send_text_to_chat(
+                        evicted_chat_id, card_json
+                    )
+                else:
+                    self._handler_ctx.handlers["coco"].send_card_to_chat(
+                        evicted_chat_id, card_json
+                    )
             except Exception as send_err:
                 # Fallback to plain text
                 try:
                     msg = UI_TEXT["ws_project_eviction_notify"].format(name=project_name)
-                    self.reply(evicted_chat_id, msg, msg_type="text", chat_id=evicted_chat_id)
+                    self._handler_ctx.handlers["coco"].send_text_to_chat(
+                        evicted_chat_id, msg
+                    )
                 except Exception:
                     logger.debug("failed to send eviction fallback notification", exc_info=True)
                 logger.warning("Failed to send LRU eviction notification to %s: %s", evicted_chat_id[:12], send_err)
 
         threading.Thread(target=_send_notification, daemon=True).start()
-
-    def _is_message_expired(self, create_time: int) -> bool:
-        """判断消息是否过期。
-
-        飞书历史消息可能会被 WS 重放；这里通过 `create_time` 过滤掉过旧消息，
-        避免触发重复执行（尤其是 shell/编程任务）。
-        """
-        return self._message_ingress_guard.is_message_expired(create_time)
-
-    def _is_duplicate_message(self, message_id: str) -> bool:
-        """消息去重：基于 `MessageCache` 判断是否重复处理。"""
-        return self._message_ingress_guard.is_duplicate_message(message_id)
 
     def _get_api_client(self) -> lark.Client:
         """延迟构造 `lark_oapi.Client`（用于调用消息/卡片 API）。"""
@@ -1219,155 +1125,6 @@ class FeishuWSClient:
         if self._image_handler is None:
             self._image_handler = FeishuImageHandler(self._get_api_client, self.settings)
         return self._image_handler
-
-    # ==================================================================
-    # Handler forwarding dispatch
-    # ==================================================================
-    # Maps ``client._xxx(...)`` calls to the corresponding handler
-    # method.  This replaces 50+ one-liner stubs with a single
-    # ``__getattr__`` lookup, keeping backward compatibility with tests
-    # that mock ``client._enter_coco_mode`` etc.
-    # ------------------------------------------------------------------
-
-    def reply(self, message_id: str, content, msg_type: str = "text", chat_id: Optional[str] = None):
-        """轻量回复封装：兼容旧调用路径，按 msg_type 委托到对应的新 API。"""
-        if chat_id is not None:
-            logger.warning("chat_id 参数已废弃且不再生效，请移除该参数")
-        if msg_type == "text":
-            self._reply_text(message_id, content)
-        else:
-            self._reply_card(message_id, content)
-
-    def add_reaction(self, message_id: str, emoji_type: str):
-        """轻量表情反馈封装：委托到 handler 的 `add_reaction`。"""
-        self._add_reaction(message_id, emoji_type)
-
-    def send_lock_conflict_card(
-        self,
-        e,
-        message_id: str,
-        command_text: str,
-        *,
-        retry_count: int = 0,
-        chat_id: str = "",
-    ) -> None:
-        """Public facade: send a repo-lock conflict card via the system handler.
-
-        Delegates to ``SystemHandler.send_lock_conflict_card`` obtained via
-        ``_get_handler("system")``, consistent with other handler access
-        patterns (e.g. ``_switch_project``).
-        """
-        handler = self._get_handler("system")
-        if handler:
-            handler.send_lock_conflict_card(
-                e,
-                message_id,
-                command_text,
-                retry_count=retry_count,
-                chat_id=chat_id,
-            )
-        else:
-            from .handlers.lock_helper import logger as _lock_logger
-            _lock_logger.warning("send_lock_conflict_card: _system_handler unavailable, cannot notify user")
-            # Fallback: send plain text notification
-            self._reply_text(message_id, f"🔒 {str(e) or 'lock conflict'}")
-
-    def _get_handler(self, key: str) -> Any:
-        return self._handler_ctx.handlers.get(key)
-
-    def _switch_project(self, message_id: str, chat_id: str, name: str, auto_enter_coco: bool = True):
-        """切换当前 chat 的 active project，并可选自动进入 Coco 模式。"""
-        project_handler = self._get_handler("project")
-        if project_handler:
-            project_handler.switch_project(
-                message_id,
-                chat_id,
-                name,
-                auto_enter_coco=auto_enter_coco,
-                coco_handler=self._get_handler("coco"),
-                claude_handler=self._get_handler("claude"),
-            )
-
-    @staticmethod
-    def _is_exit_command(text: str) -> bool:
-        """判断是否为“退出当前编程模式”的命令（跨模式一致）。"""
-        return SystemHandler.is_exit_command(text)
-
-    @staticmethod
-    def _is_deep_command(text: str) -> bool:
-        """判断是否为 Deep Engine 命令。"""
-        return SystemHandler.is_deep_command(text)
-
-    @staticmethod
-    def _is_spec_command(text: str) -> bool:
-        """判断是否为 Spec Engine 命令。"""
-        return SystemHandler.is_spec_command(text)
-
-    @staticmethod
-    def _is_workflow_command(text: str) -> bool:
-        """判断是否为 Workflow Engine 命令。"""
-        return SystemHandler.is_workflow_command(text)
-
-
-
-
-    # ------------------------------------------------------------------
-    # Passive mode auto-activate helpers
-    # ------------------------------------------------------------------
-
-    _chat_locks: dict[str, threading.Lock] = {}
-    _chat_locks_meta: dict[str, float] = {}  # chat_id → last_used timestamp
-    _chat_locks_guard = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-
-    def _get_chat_lock(self, chat_id: str) -> threading.Lock:
-        """Get or create a per-chat activation lock."""
-        with self._chat_locks_guard:
-            if chat_id not in self._chat_locks:
-                self._chat_locks[chat_id] = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-            self._chat_locks_meta[chat_id] = time.time()
-            return self._chat_locks[chat_id]
-
-    @classmethod
-    def _gc_chat_locks(cls, max_age: float = 300.0) -> int:
-        """Remove chat locks unused for more than max_age seconds."""
-        now = time.time()
-        removed = 0
-        with cls._chat_locks_guard:
-            stale = [
-                cid for cid, ts in cls._chat_locks_meta.items()
-                if now - ts > max_age
-            ]
-            for cid in stale:
-                # Only remove if lock is not currently held
-                lock = cls._chat_locks.get(cid)
-                if lock and not lock.locked():
-                    del cls._chat_locks[cid]
-                    del cls._chat_locks_meta[cid]
-                    removed += 1
-        return removed
-
-
-
-    @staticmethod
-    def _is_interceptable_command_match(command_match: CommandMatch | None) -> bool:
-        """SSOT variant: decide based on request-scoped CommandMatch."""
-        return SystemHandler.is_interceptable_command_match(command_match)
-
-    @staticmethod
-    def _mode_to_context_source(mode) -> ContextSourceMode:
-        """将 `InteractionMode` 映射到 `ContextSourceMode`（用于统一上下文记录）。"""
-        from ..mode import InteractionMode
-
-        mapping = {
-            InteractionMode.SMART: ContextSourceMode.SMART,
-            InteractionMode.COCO: ContextSourceMode.COCO,
-            InteractionMode.CLAUDE: ContextSourceMode.CLAUDE,
-            InteractionMode.AIDEN: ContextSourceMode.AIDEN,
-            InteractionMode.CODEX: ContextSourceMode.CODEX,
-            InteractionMode.GEMINI: ContextSourceMode.GEMINI,
-            InteractionMode.TRAEX: ContextSourceMode.TRAEX,
-        }
-        return mapping.get(mode, ContextSourceMode.SMART)
 
     # ==================================================================
     # Core routing — these remain in ws_client.py
@@ -1825,14 +1582,14 @@ class FeishuWSClient:
                 project_id = None
 
         is_system = bool(
-            text and (text.startswith("/") or self._is_exit_command(text))
+            text and (text.startswith("/") or SystemHandler.is_exit_command(text))
         )
         is_shell_fast = (
             False
             if is_system
             else SystemHandler.is_likely_shell_command(text)
         )
-        is_spec = self._is_spec_command(text) if text else False
+        is_spec = SystemHandler.is_spec_command(text) if text else False
 
         # For likely shell commands, route to a separate shell queue so they
         # don't block behind long-running programming tasks on the project queue.
@@ -1849,7 +1606,7 @@ class FeishuWSClient:
             queue_suffix = project_id or "default"
             queue_key = f"{chat_id}:{queue_suffix}:t:{thread_root_id}"
 
-        request_id = self._ensure_request_id(message_id, chat_id=chat_id, project_id=project_id)
+        request_id = self._handler_ctx.handlers["coco"].ensure_request_id(message_id, chat_id=chat_id, project_id=project_id)
         try:
             self._message_linker.register_origin(
                 message_id,
@@ -1904,27 +1661,15 @@ class FeishuWSClient:
             except (RateLimitExceededException, CircuitBreakerOpenException) as e:
                 logger.warning(f"Backpressure applied: {get_error_detail(e)}")
                 if is_spec:
-                    self._reply_text(message_id, UI_TEXT["ws_backpressure_spec"])
+                    self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_backpressure_spec"])
                 else:
-                    self._reply_text(message_id, UI_TEXT["ws_backpressure_generic"])
+                    self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_backpressure_generic"])
                 return
             try:
                 if message_id:
                     self._message_linker.link_task(message_id, handle.run_id)
             except (KeyError, AttributeError, RuntimeError) as e:
                 logger.debug("link_task失败(message): message_id=%s, run_id=%s, err=%s", message_id, handle.run_id, get_error_detail(e))
-
-    def _is_system_command_message(self, data: P2ImMessageReceiveV1) -> bool:
-        """Check if the message is a system command that should bypass project queue.
-
-        All slash commands (``/xxx``) are system commands: they should never
-        block behind long-running Coco/Claude programming tasks on the project
-        queue.  This includes ``/stop_deep``, ``/exit``, ``/spec_status``, etc.
-        """
-        text = self._extract_text_from_message(data)
-        if not text:
-            return False
-        return text.startswith("/") or self._is_exit_command(text)
 
     def _extract_text_from_message(self, data: P2ImMessageReceiveV1) -> str:
         """Extract message text with the same parser used by async dispatch."""
@@ -1941,27 +1686,21 @@ class FeishuWSClient:
         except (AttributeError, KeyError, TypeError, ValueError):
             return ""
 
-    @staticmethod
-    def _is_programming_entry_command(text: str) -> bool:
-        """是否为编程模式初始化命令（用于与 /spec 串行化控制面执行）。"""
-        from .product_catalog import is_programming_entry_command
-
-        return is_programming_entry_command(text)
-
     def _build_control_queue_key(self, *, chat_id: str, project_id: Optional[str], text: str) -> Optional[str]:
         """为编程初始化与 spec 命令构造串行控制队列 key。"""
+        from .product_catalog import is_programming_entry_command
+
         normalized = (text or "").strip()
         if not normalized:
             return None
-        if not (self._is_spec_command(normalized) or self._is_programming_entry_command(normalized) or self._is_workflow_command(normalized)):
+        if not (
+            SystemHandler.is_spec_command(normalized)
+            or is_programming_entry_command(normalized)
+            or SystemHandler.is_workflow_command(normalized)
+        ):
             return None
         queue_suffix = project_id or "default"
         return f"{chat_id}:control:{queue_suffix}"
-
-    def _is_likely_shell_command_message(self, data: P2ImMessageReceiveV1) -> bool:
-        """Check if the message looks like a shell command for early routing."""
-        text = self._extract_text_from_message(data)
-        return SystemHandler.is_likely_shell_command(text) if text else False
 
     def _process_message_async(
         self,
@@ -2068,7 +1807,7 @@ class FeishuWSClient:
             ):
                 return
 
-            request_id = self._ensure_request_id(message_id, chat_id=chat_id)
+            request_id = self._handler_ctx.handlers["coco"].ensure_request_id(message_id, chat_id=chat_id)
 
             # Validation follows authorization so denied traffic cannot mutate
             # duplicate/expiry state or trigger unsupported-content replies.
@@ -2092,7 +1831,7 @@ class FeishuWSClient:
                 set_current_sender_union_id(_sender_union_id or None)
                 set_current_is_p2p(_is_p2p)
                 set_current_tenant_key(_tenant_key or None)
-                self._system_handler.handle_intercepted_command(
+                self._handler_ctx.handlers["system"].handle_intercepted_command(
                     message_id,
                     chat_id,
                     text,
@@ -2281,7 +2020,7 @@ class FeishuWSClient:
         except asyncio.TimeoutError as e:
             logger.warning("处理消息超时: %s", get_error_detail(e))
             try:
-                self._reply_text(message_id, UI_TEXT["ws_message_timeout"])
+                self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_message_timeout"])
             except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
                 classify_ws_error(RuntimeError("reply timeout failed"), phase="dispatch")
                 logger.debug("failed to reply timeout message", exc_info=True)
@@ -2290,7 +2029,7 @@ class FeishuWSClient:
             if classification.action == WSErrorAction.REPLY_INTERNAL_ERROR:
                 logger.error("处理消息异常: %s", get_error_detail(e), exc_info=True)
                 try:
-                    self._reply_text(message_id, UI_TEXT["ws_message_internal_error"])
+                    self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_message_internal_error"])
                 except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
                     classify_ws_error(RuntimeError("reply internal error failed"), phase="best_effort_notify")
                     logger.debug("failed to reply internal error message", exc_info=True)
@@ -2313,17 +2052,19 @@ class FeishuWSClient:
 
     def _validate_message(self, message, request_id: str) -> bool:
         """校验消息是否需要处理（过期/重复/类型不支持等）。"""
-        if message.create_time and self._is_message_expired(int(message.create_time)):
+        if message.create_time and self._message_ingress_guard.is_message_expired(
+            int(message.create_time)
+        ):
             logger.debug("跳过过期消息: %s", message.message_id)
             return False
 
-        if self._is_duplicate_message(message.message_id):
+        if self._message_ingress_guard.is_duplicate_message(message.message_id):
             logger.debug("跳过重复消息: %s", message.message_id)
             return False
 
         supported_types = {"text", "image", "post"}
         if message.message_type not in supported_types:
-            self._reply_text(message.message_id, UI_TEXT["ws_unsupported_msg_type"])
+            self._handler_ctx.handlers["coco"].reply_text(message.message_id, UI_TEXT["ws_unsupported_msg_type"])
             return False
         return True
 
@@ -2377,7 +2118,7 @@ class FeishuWSClient:
 
         save_dir = FeishuImageHandler.get_image_save_dir(
             project.root_path if project else None,
-            self._get_working_dir(chat_id),
+            self._handler_ctx.handlers["coco"].get_working_dir(chat_id),
         )
 
         image_handler = self._get_image_handler()
@@ -2456,16 +2197,7 @@ class FeishuWSClient:
         return bool(thread_ctx and thread_ctx.mode in {"deep", "spec", "workflow"})
 
     def _get_mode_handler(self, mode):
-        from ..mode import InteractionMode
-        _map = {
-            InteractionMode.COCO: self._coco_handler,
-            InteractionMode.CLAUDE: self._claude_handler,
-            InteractionMode.AIDEN: self._aiden_handler,
-            InteractionMode.CODEX: self._codex_handler,
-            InteractionMode.GEMINI: self._gemini_handler,
-            InteractionMode.TRAEX: self._traex_handler,
-        }
-        return _map.get(mode)
+        return self._handler_ctx.handlers.get(getattr(mode, "value", ""))
 
     def _find_active_thread(self, chat_id):
         if not self.settings.thread_programming_enabled:
@@ -2507,7 +2239,7 @@ class FeishuWSClient:
             if handler:
                 handler.handle_message(message_id, chat_id, "", project)
         else:
-            self._show_help(message_id, chat_id)
+            self._handler_ctx.handlers["system"].show_help(message_id, chat_id)
 
     def _dispatch_message_logic(
         self,
@@ -2517,274 +2249,137 @@ class FeishuWSClient:
         project,
         auto_enter_mode,
         *,
-        command_match=_COMMAND_MATCH_MISSING,
+        command_match,
         is_image_only=False,
         shell_fast_tracked=False,
         chat_type: str = "group",
         effective_trust: EffectiveTrust | None = None,
     ):
-        """根据 auto-enter 与当前模式，将消息路由到对应编程模式或 SMART 处理路径。"""
-        # Compatibility: some unit tests call _dispatch_message_logic directly.
-        # In the real message ingress path, command_match is always provided.
-        if command_match is _COMMAND_MATCH_MISSING:
-            try:
-                command_match = SlashCommandParser.parse(text)
-            except Exception:
-                command_match = None
+        """Apply topic/project safety gates, then use the one dispatcher."""
+        handlers = self._handler_ctx.handlers
 
-        def forward_to_intent(target_project=project) -> None:
+        def dispatch(target_project=project) -> None:
             if not self._current_trust_can_dispatch(
-                effective_trust,
-                project=target_project,
+                effective_trust, project=target_project
             ):
                 return
-            kwargs = {
-                "command_match": command_match,
-                "shell_fast_tracked": shell_fast_tracked,
-                "chat_type": chat_type,
-            }
-            if effective_trust is not None:
-                kwargs["effective_trust"] = effective_trust
-            self._process_with_intent(
+            self._message_dispatcher.process_with_intent(
                 message_id,
                 chat_id,
                 text,
                 target_project,
-                **kwargs,
-            )
-
-        missing_topic_project_safe_commands = {
-            "/help",
-            "/projects",
-            "/project",
-            "/status",
-            "/exit",
-            "/quit",
-        }
-        command = command_match.command if command_match is not None else ""
-        args = command_match.args.lower() if command_match is not None else ""
-        is_global_deep_stop = command == "/stop_deep" and args in {"all", "-a", "--all"}
-        is_global_deep_status = command == "/deep_status" and args in {"all", "-a", "--all"}
-        is_missing_topic_exit = self._is_exit_command(text)
-        can_recover_missing_topic = (
-            command in missing_topic_project_safe_commands
-            or is_global_deep_stop
-            or is_global_deep_status
-            or is_missing_topic_exit
-        )
-        if (
-            auto_enter_mode in {"deep", "spec", "workflow"}
-            and project is None
-            and not can_recover_missing_topic
-        ):
-            self._reply_text(message_id, UI_TEXT["ws_topic_project_unavailable"])
-            return
-        if (
-            auto_enter_mode in {"deep", "spec", "workflow"}
-            and project is None
-            and is_missing_topic_exit
-        ):
-            if not self._current_trust_can_dispatch(effective_trust):
-                return
-            self._exit_current_mode(message_id, chat_id, project=None)
-            return
-
-        if auto_enter_mode:
-            if self._reply_if_topic_engine_switch_blocked(
-                message_id,
-                auto_enter_mode,
                 command_match=command_match,
-            ):
-                return
-            if self._is_exit_command(text):
-                if not self._current_trust_can_dispatch(
-                    effective_trust,
-                    project=project,
-                ):
-                    return
-                self._add_reaction(message_id, EmojiReaction.on_coco_mode())
-                _pid = project.project_id if project else None
-                if self._control_plane.should_defer_exit(chat_id=chat_id, project_id=_pid):
-                    self._control_plane.request_deferred_exit(message_id=message_id, chat_id=chat_id, project_id=_pid)
-                    self._reply_text(message_id, UI_TEXT["ws_exit_deferred_msg"])
-                    return
-                self._exit_current_mode(message_id, chat_id, project=project)
-                return
-            # Interceptable system commands (/help, /status, /codex, etc.)
-            # must be routed to the system handler even inside thread programming mode,
-            # otherwise they can be hidden behind same-mode/topic-hint handling.
-            if self._is_interceptable_command_match(command_match):
-                forward_to_intent()
-                return
-            from .product_catalog import is_same_programming_mode_entry
-
-            if is_same_programming_mode_entry(auto_enter_mode, text):
-                self._reply_text(
-                    message_id,
-                    UI_TEXT["ws_topic_hint_msg"],
-                )
-                return
-            if self._is_programming_entry_command(text):
-                self._reply_text(
-                    message_id,
-                    UI_TEXT["ws_topic_hint_msg"],
-                )
-                return
-            if (
-                self._is_deep_command(text)
-                or self._is_spec_command(text)
-                or self._is_workflow_command(text)
-            ):
-                forward_to_intent()
-                return
-        if auto_enter_mode in {"deep", "spec", "workflow"}:
-            if command_match is not None:
-                forward_to_intent()
-                return
-            self._add_reaction(message_id, EmojiReaction.on_processing())
-            if not self._current_trust_can_dispatch(
-                effective_trust,
-                project=project,
-            ):
-                return
-            if auto_enter_mode == "deep":
-                self._start_deep_engine(message_id, chat_id, text, project)
-            elif auto_enter_mode == "workflow":
-                self._workflow_handler.handle_message(message_id, chat_id, text, project)
-            else:
-                self._start_spec_engine(message_id, chat_id, text, project)
-            return
-
-        if auto_enter_mode and auto_enter_mode in {"coco", "claude", "aiden", "codex", "gemini", "traex"}:
-            from ..mode import InteractionMode
-            handler = self._get_mode_handler(InteractionMode(auto_enter_mode))
-            if handler:
-                if not self._current_trust_can_dispatch(
-                    effective_trust,
-                    project=project,
-                ):
-                    return
-                self._add_reaction(message_id, EmojiReaction.on_coco_mode())
-                self._add_reaction(message_id, EmojiReaction.on_processing())
-                handler.handle_message(message_id, chat_id, text, project)
-            else:
-                forward_to_intent()
-        else:
-            # Project-chat default: when the chat is bound to a project via
-            # /new-chat and the message is neither a slash command, a shell-like
-            # invocation, nor an image-only message, route free-form text into
-            # the Coco programming flow (model-select card + pending prompt).
-            # Slash commands (command_match is not None) always fall through to
-            # _process_with_intent so that /coco, /help, /deep, /exit, ...
-            # keep their highest priority.
-            has_registry_project_authority = (
-                effective_trust is not None
-                and effective_trust.zone is TrustZone.MANAGED_AGENT_GROUP
+                shell_fast_tracked=shell_fast_tracked,
+                chat_type=chat_type,
+                effective_trust=effective_trust,
             )
-            if (
-                not has_registry_project_authority
-                and command_match is None
-                and not is_image_only
-                and text
-                and not self._intent_recognizer.looks_like_shell(text)
-            ):
-                bound_project = self._project_manager.find_by_bound_chat_id(chat_id)
-                if bound_project is not None:
-                    bound_project_id = getattr(bound_project, "project_id", None)
-                    current_mode, is_programming = self._get_effective_mode(
-                        chat_id, project_id=bound_project_id
+
+        engine_modes = {"deep", "spec", "workflow"}
+        if auto_enter_mode in engine_modes:
+            command = getattr(command_match, "command", "")
+            args = str(getattr(command_match, "args", "")).lower()
+            is_exit = SystemHandler.is_exit_command(text)
+            safe_without_project = command in {
+                "/help", "/projects", "/project", "/status", "/exit", "/quit",
+            } or (
+                command in {"/stop_deep", "/deep_status"}
+                and args in {"all", "-a", "--all"}
+            )
+            if project is None:
+                if is_exit and self._current_trust_can_dispatch(effective_trust):
+                    handlers["system"].exit_current_mode(
+                        message_id, chat_id, project=None
                     )
-                    if is_programming:
-                        forward_to_intent(bound_project)
-                        return
-
-                    default_tool = str(
-                        getattr(bound_project, "acp_tool_name", None)
-                        or getattr(self.settings, "default_acp_tool", None)
-                        or "coco"
-                    ).strip().lower()
-                    saved_tool = str(getattr(bound_project, "acp_tool_name", None) or "").strip().lower()
-                    self._add_reaction(message_id, EmojiReaction.on_coco_mode())
-                    self._add_reaction(message_id, EmojiReaction.on_processing())
-                    if saved_tool in {"coco", "claude", "aiden", "codex", "gemini", "traex"}:
-                        self._system_handler.handle_enter_acp_saved_selection(
-                            message_id,
-                            chat_id,
-                            saved_tool,
-                            bound_project,
-                            pending_prompt=text,
-                        )
-                    elif default_tool == "coco":
-                        self._message_dispatcher._handle_enter_coco(
-                            message_id, chat_id, bound_project, pending_prompt=text,
-                        )
-                    elif default_tool in {"codex", "traex"}:
-                        self._message_dispatcher._handle_enter_acp_mode(
-                            default_tool, message_id, chat_id, bound_project, pending_prompt=text,
-                        )
-                    else:
-                        self._message_dispatcher._handle_enter_coco(
-                            message_id, chat_id, bound_project, pending_prompt=text,
-                        )
-                    return
-            if has_registry_project_authority:
-                forward_to_intent()
+                elif safe_without_project:
+                    dispatch()
+                else:
+                    handlers["coco"].reply_text(
+                        message_id, UI_TEXT["ws_topic_project_unavailable"]
+                    )
                 return
-            forward_to_intent()
 
-    @staticmethod
-    def _requested_topic_engine(command_match) -> Optional[str]:
-        command = getattr(command_match, "command", None)
-        if command in {"/deep", "/deep_update", "/deep_status", "/stop_deep"}:
-            return "deep"
-        if command in {
-            "/spec",
-            "/spec_status",
-            "/spec_history",
-            "/spec_metrics",
-            "/spec_config",
-            "/spec_export",
-            "/spec_save",
-            "/spec_pause",
-            "/spec_resume",
-            "/spec_recover",
-            "/spec_guide",
-            "/stop_spec",
-        }:
-            return "spec"
-        from ..workflow_engine.commands import TOPIC_ENGINE_COMMANDS as _WF_CMDS
-        if command in _WF_CMDS:
-            return "workflow"
-        return None
+            requested = None
+            if command in {"/deep", "/deep_update", "/deep_status", "/stop_deep"}:
+                requested = "deep"
+            elif command.startswith("/spec") or command == "/stop_spec":
+                requested = "spec"
+            else:
+                from ..workflow_engine.commands import TOPIC_ENGINE_COMMANDS
 
-    @staticmethod
-    def _engine_display_name(engine: str) -> str:
-        return {
-            "deep": "Deep",
-            "spec": "Spec",
-            "workflow": "WF",
-        }.get(engine, engine)
+                if command in TOPIC_ENGINE_COMMANDS:
+                    requested = "workflow"
+            if requested and requested != auto_enter_mode:
+                handlers["coco"].reply_text(
+                    message_id,
+                    UI_TEXT["topic_engine_switch_blocked"].format(
+                        current=auto_enter_mode.upper(),
+                        requested=requested.upper(),
+                    ),
+                )
+                return
+            if command_match is None:
+                if not self._current_trust_can_dispatch(
+                    effective_trust, project=project
+                ):
+                    return
+                handlers["coco"].add_reaction(
+                    message_id, EmojiReaction.on_processing()
+                )
+                if auto_enter_mode == "workflow":
+                    handlers["workflow"].handle_message(
+                        message_id, chat_id, text, project
+                    )
+                else:
+                    getattr(
+                        handlers[auto_enter_mode],
+                        f"start_{auto_enter_mode}_engine",
+                    )(message_id, chat_id, text, project)
+                return
 
-    def _reply_if_topic_engine_switch_blocked(
-        self,
-        message_id: str,
-        current_engine: str,
-        *,
-        command_match=None,
-    ) -> bool:
-        requested = self._requested_topic_engine(command_match)
-        if not requested or requested == current_engine:
-            return False
-        if current_engine not in {"deep", "spec", "workflow"}:
-            return False
-        self._reply_text(
-            message_id,
-            UI_TEXT["topic_engine_switch_blocked"].format(
-                current=self._engine_display_name(current_engine),
-                requested=self._engine_display_name(requested),
-            ),
+        managed = (
+            effective_trust is not None
+            and effective_trust.zone is TrustZone.MANAGED_AGENT_GROUP
         )
-        return True
+        if (
+            auto_enter_mode is None
+            and not managed
+            and command_match is None
+            and not is_image_only
+            and text
+            and not self._intent_recognizer.looks_like_shell(text)
+        ):
+            bound_project = self._project_manager.find_by_bound_chat_id(chat_id)
+            if bound_project is not None:
+                project_id = getattr(bound_project, "project_id", None)
+                _, is_programming = self._get_effective_mode(
+                    chat_id, project_id=project_id
+                )
+                if is_programming:
+                    dispatch(bound_project)
+                    return
+                tool = str(
+                    getattr(bound_project, "acp_tool_name", None)
+                    or getattr(self.settings, "default_acp_tool", None)
+                    or "coco"
+                ).strip().lower()
+                supported = {"coco", "claude", "aiden", "codex", "gemini", "traex"}
+                handler = handlers[tool if tool in supported else "coco"]
+                if not self._current_trust_can_dispatch(
+                    effective_trust, project=bound_project
+                ):
+                    return
+                handlers["coco"].add_reaction(
+                    message_id, EmojiReaction.on_coco_mode()
+                )
+                handlers["coco"].add_reaction(
+                    message_id, EmojiReaction.on_processing()
+                )
+                handler.enter_mode(
+                    message_id, chat_id, silent=True, project=bound_project
+                )
+                handler.handle_message(message_id, chat_id, text, bound_project)
+                return
+        dispatch()
 
     def _refresh_managed_card_revisions(
         self,
@@ -2834,7 +2429,12 @@ class FeishuWSClient:
                 group_revision=trust.group_revision,
                 grant_revision=trust.grant_revision,
             )
-            return self._system_handler.update_card(message_id, refreshed) is True
+            return (
+                self._handler_ctx.handlers["system"].update_card(
+                    message_id, refreshed
+                )
+                is True
+            )
         except (AttributeError, RuntimeError, OSError, TypeError, ValueError, json.JSONDecodeError):
             logger.warning("managed stale card refresh failed closed", exc_info=True)
             return False
@@ -2966,11 +2566,12 @@ class FeishuWSClient:
             action_type_preview = ""
 
         try:
-            with self._system_cmd_gate_lock:
-                inflight = int(self._system_cmd_inflight_by_chat.get(open_chat_id, 0) or 0)
-            if inflight > 0 and action_type_preview not in _READONLY_CARD_ACTIONS:
+            if (
+                self._control_plane.is_system_cmd_inflight(open_chat_id)
+                and action_type_preview not in _READONLY_CARD_ACTIONS
+            ):
                 if open_message_id:
-                    self._reply_text(open_message_id, UI_TEXT["ws_system_cmd_gate_blocked"])
+                    self._handler_ctx.handlers["coco"].reply_text(open_message_id, UI_TEXT["ws_system_cmd_gate_blocked"])
                 return None
         except (RuntimeError, OSError, TypeError, ValueError):
             classify_card_action_error(RuntimeError("system command gate failed"), phase="dispatch")
@@ -2993,8 +2594,6 @@ class FeishuWSClient:
             dedupe_key = f"{open_chat_id}:{open_message_id}:{operator_id}:{action_type_preview}:{dedupe_fingerprint}"
             try:
                 if self._card_action_dedup_cache.is_duplicate(dedupe_key):
-                    if action_type_preview in _SILENT_DEDUP_ACTIONS:
-                        return {}
                     return {"toast": {"type": "info", "content": UI_TEXT["card_session_toast_dedup"]}}
 
 
@@ -3051,9 +2650,9 @@ class FeishuWSClient:
             )
         # Provenance has already been resolved above. Request bookkeeping must
         # not overwrite its trusted chat/operator fields after a rejected card.
-        request_id = self._ensure_request_id(origin_message_id, project_id=project_id)
+        request_id = self._handler_ctx.handlers["coco"].ensure_request_id(origin_message_id, project_id=project_id)
 
-        is_system = self._is_system_card_action(data)
+        is_system = CardActionInspector.is_system_action(data.event.action)
 
         with TraceContext(request_id):
             spec = TaskSpec(
@@ -3191,7 +2790,7 @@ class FeishuWSClient:
         previous_tenant_key = get_current_tenant_key()
         set_current_tenant_key(tenant_key or None)
         try:
-            return self._reply_text(
+            return self._handler_ctx.handlers["coco"].reply_text(
                 message_id,
                 text,
                 idempotency_key=idempotency_key,
@@ -3233,7 +2832,7 @@ class FeishuWSClient:
         previous_tenant_key = get_current_tenant_key()
         set_current_tenant_key(tenant_key)
         try:
-            reply_id = self._reply_text(
+            reply_id = self._handler_ctx.handlers["coco"].reply_text(
                 message_id,
                 text,
                 idempotency_key=idempotency_key,
@@ -3321,28 +2920,6 @@ class FeishuWSClient:
         except Exception:
             logger.warning("chat mode lookup failed: chat=%s", chat_id[:12], exc_info=True)
             return None
-
-    @classmethod
-    def _card_action_dedup_fingerprint(cls, action: Any) -> str:
-        """Return a stable fingerprint for the concrete card interaction payload."""
-        return CardActionInspector.dedup_fingerprint(action)
-
-    @staticmethod
-    def _normalize_card_action_dedup_value(value: Any) -> Any:
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                return value
-            return parsed
-        return value
-
-    def _is_system_card_action(self, data: P2CardActionTrigger) -> bool:
-        """Check if the card action is a system action that should bypass project queue."""
-        try:
-            return CardActionInspector.is_system_action(data.event.action)
-        except (json.JSONDecodeError, AttributeError, KeyError, TypeError):
-            return False
 
     def _process_card_action_async(
         self,
@@ -3506,14 +3083,15 @@ class FeishuWSClient:
             ):
                 return
 
-            # --- Dispatch via ActionDispatcher ---
+            # --- Exact dispatch against the authoritative action table ---
             if not self._current_trust_can_dispatch(current_trust):
                 return
-            matched = self._action_dispatcher.dispatch(action_type, open_message_id, open_chat_id, project_id, value)
-
-            if not matched:
+            handler = self._action_handlers.get(action_type)
+            if handler is None:
                 logger.warning("未注册的卡片动作: action=%s, message_id=%s", action_type, open_message_id)
-                self._reply_text(open_message_id, f"⚠️ 未识别的操作: {action_type}")
+                self._handler_ctx.handlers["coco"].reply_text(open_message_id, f"⚠️ 未识别的操作: {action_type}")
+            else:
+                handler(open_message_id, open_chat_id, project_id, value)
 
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
             logger.debug("卡片回调处理耗时: %dms", elapsed_ms)
@@ -3524,7 +3102,7 @@ class FeishuWSClient:
             _action = locals().get("action_type", "unknown")
             try:
                 if _mid != "unknown":
-                    self._reply_text(_mid, f"⏳ 操作超时 ({_action}): {get_error_detail(e)}")
+                    self._handler_ctx.handlers["coco"].reply_text(_mid, f"⏳ 操作超时 ({_action}): {get_error_detail(e)}")
             except Exception:
                 logger.debug("failed to reply timeout action error", exc_info=True)
         except Exception as e:
@@ -3535,7 +3113,7 @@ class FeishuWSClient:
             _action = locals().get("action_type", "unknown")
             try:
                 if _mid != "unknown":
-                    self._reply_text(_mid, f"❌ 操作失败 ({_action}): {get_error_detail(e)}")
+                    self._handler_ctx.handlers["coco"].reply_text(_mid, f"❌ 操作失败 ({_action}): {get_error_detail(e)}")
             except Exception:
                 logger.debug("failed to reply action failure error", exc_info=True)
         finally:
@@ -3545,94 +3123,6 @@ class FeishuWSClient:
             set_current_sender_name("")
             set_current_is_p2p(False)
             set_current_tenant_key(None)
-
-    def _process_with_intent(
-        self,
-        message_id: str,
-        chat_id: str,
-        text: str,
-        project: Optional[ProjectContext] = None,
-        *,
-        command_match=_COMMAND_MATCH_MISSING,
-        shell_fast_tracked: bool = False,
-        chat_type: str = "group",
-        effective_trust: EffectiveTrust | None = None,
-    ):
-        """SMART 模式下的主路由：控制命令优先，其次进入意图识别/多任务执行。"""
-        # Compatibility: allow callers outside ws message ingress to omit command_match.
-        if command_match is _COMMAND_MATCH_MISSING:
-            try:
-                command_match = SlashCommandParser.parse(text)
-            except Exception:
-                command_match = None
-        from .dispatcher import FeishuRequestContext
-
-        self._message_dispatcher.process_request(
-            FeishuRequestContext(
-                message_id=message_id,
-                chat_id=chat_id,
-                text=text,
-                project=project,
-                command_match=command_match,
-                shell_fast_tracked=shell_fast_tracked,
-                chat_type=chat_type,
-                effective_trust=effective_trust,
-            )
-        )
-
-    def _execute_multi_tasks(
-        self, message_id: str, chat_id: str, intent_result: IntentResult, project: Optional[ProjectContext] = None
-    ):
-        """执行多任务计划（逐步执行；遇到失败停止后续步骤）。"""
-        self._message_dispatcher.execute_multi_tasks(message_id, chat_id, intent_result, project=project)
-
-    def _execute_single_task(
-        self,
-        message_id: str,
-        chat_id: str,
-        task: Optional[TaskStep],
-        original_text: str,
-        project: Optional[ProjectContext] = None,
-        *,
-        shell_fast_tracked: bool = False,
-    ):
-        """执行单一任务步骤（模式切换/系统命令/引擎命令/执行 shell 等）。"""
-        self._message_dispatcher.execute_single_task(
-            message_id, chat_id, task, original_text, project=project, shell_fast_tracked=shell_fast_tracked
-        )
-
-    def _execute_task_step(
-        self,
-        message_id: str,
-        chat_id: str,
-        task: TaskStep,
-        step_num: int,
-        total_steps: int,
-        project: Optional[ProjectContext] = None,
-    ) -> bool:
-        """执行一个 TaskStep，并返回是否成功。"""
-        return self._message_dispatcher.execute_task_step(
-            message_id, chat_id, task, step_num, total_steps, project=project
-        )
-
-    def _get_task_description(self, task: TaskStep) -> str:
-        """为 TaskStep 生成可读描述（用于多任务计划展示）。"""
-        return self._message_dispatcher.get_task_description(task)
-
-    # ==================================================================
-    # Event stubs (no-op)
-    # ==================================================================
-    def _handle_reaction_created(self, data):
-        """飞书 reaction 事件回调（当前无需处理，保留占位）。"""
-        pass
-
-    def _handle_chat_entered(self, data):
-        """飞书 chat entered 事件回调（当前无需处理，保留占位）。"""
-        pass
-
-    def _handle_message_read(self, data):
-        """飞书 message read 事件回调（当前无需处理，保留占位）。"""
-        pass
 
     def _handle_bot_deleted(self, data):
         """Durably revoke trust before retiring a remotely deleted group."""
@@ -3961,9 +3451,9 @@ class FeishuWSClient:
         event_builder = (
             ChannelEventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._handle_message)
-            .register_p2_im_message_reaction_created_v1(self._handle_reaction_created)
+            .register_p2_im_message_reaction_created_v1(_ignore_ws_event)
             .register_p2_im_chat_member_bot_deleted_v1(self._handle_bot_deleted)
-            .register_p2_im_message_message_read_v1(self._handle_message_read)
+            .register_p2_im_message_message_read_v1(_ignore_ws_event)
             .register_p2_card_action_trigger(self._handle_card_action)
         )
         # lark-channel-sdk 1.1.0 omits the typed p2p-chat-entered registrar,
@@ -3976,11 +3466,11 @@ class FeishuWSClient:
             None,
         )
         if callable(register_chat_entered):
-            event_builder = register_chat_entered(self._handle_chat_entered)
+            event_builder = register_chat_entered(_ignore_ws_event)
         else:
             event_builder = event_builder.register_p2_customized_event(
                 "im.chat.access_event.bot_p2p_chat_entered_v1",
-                self._handle_chat_entered,
+                _ignore_ws_event,
             )
         return event_builder.build()
 

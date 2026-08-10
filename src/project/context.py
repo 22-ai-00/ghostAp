@@ -115,8 +115,6 @@ class ProjectContext:
     bound_chat_created_at: float = 0.0
     managed_binding_generation: int = 0
 
-    spec_review_selection_state: Any = None
-
     def __post_init__(self):
         # Lightweight lock protecting add_chat_id() mutations on
         # allowed_chat_ids and evicted_chat_ids.  Callers via
@@ -127,9 +125,6 @@ class ProjectContext:
         # New code should pass OrderedDict directly (see create_project).
         if isinstance(self.allowed_chat_ids, list):
             self.allowed_chat_ids = OrderedDict(self.allowed_chat_ids)
-        if self.spec_review_selection_state is None:
-            from ..spec_engine.review_selection import SpecReviewSelectionState
-            self.spec_review_selection_state = SpecReviewSelectionState()
         if not self.working_dir:
             self.working_dir = self.root_path
         self.root_path = os.path.expanduser(self.root_path)
@@ -363,6 +358,18 @@ class ProjectContext:
             self.acp_tool_name = tool_name
             self.acp_model_name = model_name
             self.touch()
+            return previous
+
+    def replace_acp_configuration(
+        self,
+        tool_name: str,
+        model_name: Optional[str],
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Replace the saved tool/model pair and return rollback state."""
+        with self._chat_lock:
+            previous = (self.acp_tool_name, self.acp_model_name)
+            self.acp_tool_name = tool_name
+            self.acp_model_name = model_name
             return previous
 
     def restore_acp_programming_activation(self, previous: dict[str, object]) -> None:

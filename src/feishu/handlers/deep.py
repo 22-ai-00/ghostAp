@@ -1,4 +1,4 @@
-"""Deep Engine handler — start, status, pause, resume, stop, update context."""
+"""Deep Engine handler — start, status, stop, and live context updates."""
 
 from __future__ import annotations
 
@@ -7,7 +7,9 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from ...card import CardBuilder
+from ...card.builders.deep import DeepBuilder
+from ...card.builders.project import ProjectBuilder
+from ...card.models import EngineCardState
 from ...deep_engine.models import DeepProjectStatus
 from ...utils.command_parser import CommandParser
 from ...utils.errors import get_error_detail
@@ -228,17 +230,19 @@ class DeepHandler(BaseEngineHandler):
         for e in engines:
             if not e.project:
                 continue
-            if e.project.status in (DeepProjectStatus.EXECUTING, DeepProjectStatus.PAUSED, DeepProjectStatus.IDLE):
+            if e.project.status in (DeepProjectStatus.PLANNING, DeepProjectStatus.EXECUTING):
                 candidates.append(e)
 
         if not candidates:
             engine_name = self.get_engine_name(chat_id, project_id=None)
-            _msg_type, card_content = CardBuilder.build_info_card(
-                project=None,
-                title="📊 Deep Agent 看板",
-                content="当前没有 Deep Agent 任务\n\n发送 `/deep <需求>` 开始一个复杂任务",
-                engine_name=engine_name,
-                show_buttons=False,
+            _msg_type, card_content = DeepBuilder.build_info_card(
+                None,
+                EngineCardState(
+                    title="📊 Deep Agent 看板",
+                    content="当前没有 Deep Agent 任务\n\n发送 `/deep <需求>` 开始一个复杂任务",
+                    engine_name=engine_name,
+                    show_buttons=False,
+                ),
             )
             session = self.create_static_card_session(chat_id, reply_to=message_id)
             session.send(json.loads(card_content))
@@ -247,8 +251,7 @@ class DeepHandler(BaseEngineHandler):
 
         def _sort_key(e):
             running_rank = 0 if e.is_running else 1
-            paused_rank = 0 if (e.project and e.project.status == DeepProjectStatus.PAUSED) else 1
-            return (running_rank, paused_rank, -(e.project.started_at or 0))
+            return (running_rank, -(e.project.started_at or 0))
 
         candidates.sort(key=_sort_key)
         reporter = self.ctx.progress_reporter
@@ -269,7 +272,7 @@ class DeepHandler(BaseEngineHandler):
             status = e.project.status.value
             lines.append(f"- 🧠 **{proj_name}** · `{status}` · {info['progress_bar']} · `{root}`")
 
-        _msg_type, card_content = CardBuilder.build_smart_response_card(
+        _msg_type, card_content = ProjectBuilder.build_smart_response_card(
             project=None,
             title="📊 Deep Agent 看板",
             content="\n".join(lines),
@@ -281,30 +284,8 @@ class DeepHandler(BaseEngineHandler):
         session.close()
 
     # ------------------------------------------------------------------
-    # pause / resume / stop
+    # stop
     # ------------------------------------------------------------------
-    def pause_deep_engine(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
-        self._safe_lifecycle_action(
-            lambda: self._pause_engine_generic(
-                message_id, chat_id, project, status_paused_enum=DeepProjectStatus.PAUSED
-            ),
-            "pause",
-            chat_id,
-            message_id,
-            project,
-        )
-
-    def resume_deep_engine(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
-        self._safe_lifecycle_action(
-            lambda: self._resume_engine_generic(
-                message_id, chat_id, project, status_paused_enum=DeepProjectStatus.PAUSED
-            ),
-            "resume",
-            chat_id,
-            message_id,
-            project,
-        )
-
     def stop_deep_engine(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         self._safe_lifecycle_action(
             lambda: self._stop_engine_generic(message_id, chat_id, project), "stop", chat_id, message_id, project
@@ -373,12 +354,14 @@ class DeepHandler(BaseEngineHandler):
             except Exception:
                 project = None
 
-        _msg_type, card_content = CardBuilder.build_info_card(
-            project=project,
-            title=title,
-            content=content,
-            engine_name=engine_name,
-            show_buttons=False,
+        _msg_type, card_content = DeepBuilder.build_info_card(
+            project,
+            EngineCardState(
+                title=title,
+                content=content,
+                engine_name=engine_name,
+                show_buttons=False,
+            ),
         )
         session = self.create_static_card_session(chat_id)
         session.send(json.loads(card_content))
@@ -404,8 +387,6 @@ class DeepHandler(BaseEngineHandler):
                 target_project = None
 
         deep_actions = {
-            "deep_pause": self.pause_deep_engine,
-            "deep_resume": self.resume_deep_engine,
             "deep_stop": self.stop_deep_engine,
         }
 

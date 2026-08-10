@@ -12,9 +12,7 @@ Wiring into engine.conduct_review happens in Step 7.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import subprocess
 import time
 from dataclasses import asdict, dataclass, field
@@ -30,7 +28,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ReviewArtifacts",
     "collect_review_artifacts",
-    "persist_review_artifacts",
 ]
 
 
@@ -168,20 +165,3 @@ def collect_review_artifacts(
         verify_passed=verify_passed,
         verify_output=truncate_text(verify_output or "", 4_000),
     )
-
-
-def persist_review_artifacts(
-    artifacts: ReviewArtifacts, dest_dir: str
-) -> Optional[str]:
-    """Dump artifacts to disk as JSON. Returns file path on success, None on failure."""
-    try:
-        os.makedirs(dest_dir, exist_ok=True)
-        path = os.path.join(
-            dest_dir, f"review_artifacts_cycle_{artifacts.cycle_number}.json"
-        )
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(artifacts.to_dict(), f, ensure_ascii=False, indent=2)
-        return path
-    except Exception as e:
-        logger.debug("[ReviewArtifacts] persist failed: %s", repr(e))
-        return None

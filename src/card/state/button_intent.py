@@ -18,14 +18,8 @@ class ButtonIntent(str, Enum):
     # Engine control (shared across deep/spec)
     ENGINE_STOP = "intent.engine.stop"
 
-    # Deep engine
-    DEEP_RESUME = "intent.deep.resume"
-    DEEP_STOP = "intent.deep.stop"
-
     # Spec engine
-    SPEC_RESUME = "intent.spec.resume"
     SPEC_STOP = "intent.spec.stop"
-    SPEC_SKIP_RETRY = "intent.spec.skip_retry"
 
     # View mode toggle
     MODE_FULL = "intent.mode.full"
@@ -33,7 +27,3 @@ class ButtonIntent(str, Enum):
 
     # Global
     SHOW_STATUS = "intent.global.show_status"
-
-    # Approval
-    APPROVE = "intent.approval.approve"
-    REJECT = "intent.approval.reject"

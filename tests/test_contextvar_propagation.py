@@ -20,6 +20,7 @@ from src.thread import (
     set_current_tenant_key,
     set_current_thread_id,
 )
+from src.utils.thread_pools import submit_io
 
 
 class TestContextVarPropagation:
@@ -43,9 +44,7 @@ class TestContextVarPropagation:
             results["tenant_key"] = get_current_tenant_key()
             results["thread_id"] = get_current_thread_id()
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(ctx.run, _worker)
-            fut.result()
+        submit_io(ctx.run, _worker).result(timeout=5)
 
         assert results["sender_id"] == "user_abc"
         assert results["sender_union_id"] == "union_abc"

@@ -9,7 +9,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 from ..journal.blob_store import BlobError, BlobRef, BlobStore
 from ..journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
@@ -48,20 +48,6 @@ class DataBlobError(DataServiceError):
 
 class DataWriteDisabledError(DataServiceError):
     """Data writes are disabled due to authority or anchor failure."""
-
-
-class AuditPort(Protocol):
-    """Injected port for non-sensitive durable audit events."""
-
-    def emit_read_audit(
-        self,
-        *,
-        principal_id: str,
-        operation: str,
-        resource_id: str,
-        outcome: str,
-        reason: str,
-    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -116,7 +102,6 @@ class EmployeeDataService:
         self._active_key_id = active_key_id
         self._shard_timezone = shard_timezone
         self._authority_required = authority_required
-        self._legacy_import_depth = threading.local()
         self._mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._known_cursor = (
             data_state.cursor_sequence,
@@ -154,21 +139,6 @@ class EmployeeDataService:
         with self._mutex:
             yield
 
-    @contextmanager
-    def legacy_import_scope(self) -> Iterator[None]:
-        """Allow verified startup import only before canonical authority exists."""
-
-        with self._mutex:
-            self._synchronize_projection_unlocked()
-            if self._state.data_authority.mode != "legacy":
-                raise DataWriteDisabledError("legacy import authority is closed")
-            depth = getattr(self._legacy_import_depth, "value", 0)
-            self._legacy_import_depth.value = depth + 1
-            try:
-                yield
-            finally:
-                self._legacy_import_depth.value = depth
-
     def cutover_to_canonical(self) -> DataAuthority:
         """Publish the one-way independent data-writer authority fence."""
 
@@ -203,10 +173,6 @@ class EmployeeDataService:
 
     def _require_write_authority_unlocked(self) -> None:
         if not self._authority_required:
-            return
-        if getattr(self._legacy_import_depth, "value", 0) > 0:
-            if self._state.data_authority.mode != "legacy":
-                raise DataWriteDisabledError("stale legacy data writer")
             return
         authority = self._state.data_authority
         if authority.mode != "canonical" or authority.epoch < 1:

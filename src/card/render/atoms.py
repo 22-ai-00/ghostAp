@@ -509,10 +509,3 @@ def _get_block_kind_handlers() -> dict[str, Callable[[ContentBlock], RenderAtom]
 
             _block_kind_handlers = handlers
     return _block_kind_handlers
-
-
-def invalidate_atom_handlers() -> None:
-    """Reset the cached handler mapping. Intended for testing/hot-reload scenarios."""
-    global _block_kind_handlers
-    with _handlers_lock:
-        _block_kind_handlers = None

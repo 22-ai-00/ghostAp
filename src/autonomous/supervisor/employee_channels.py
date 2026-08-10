@@ -17,7 +17,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Protocol
+from typing import Any, Callable, Protocol
 
 from src.autonomous.ingress.models import (
     EmployeeIngressAck,
@@ -91,14 +91,6 @@ class SandboxAttestation:
 
 
 @dataclass(frozen=True, slots=True)
-class ChannelLaunchContract:
-    argv: tuple[str, ...]
-    close_fds: bool
-    pass_fds: tuple[int, ...]
-    env: dict[str, str]
-
-
-@dataclass(frozen=True, slots=True)
 class _SandboxAttempt:
     prefix: tuple[str, ...]
     mechanism: str
@@ -125,8 +117,6 @@ class ChannelProcessStatus:
     exit_code: int | None = None
     error_code: str = ""
     stale_frames: int = 0
-    restart_count: int = 0
-    backoff_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,15 +139,6 @@ class _PendingSend:
     message_id: str = ""
     operation: str = "send"
     expected_message_id: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class DesiredEmployeeChannel:
-    agent_id: str
-    app_id: str
-    credential_ref: str = field(repr=False)
-    generation: int = 1
-    on_event: Callable[[dict[str, Any]], None] = field(default=lambda _: None, repr=False, compare=False)
 
 
 class SandboxAttestor(Protocol):
@@ -360,57 +341,6 @@ class EmployeeChannelSupervisor:
         with self._lifecycle_registry_lock:
             return self._lifecycle_locks.setdefault(agent_id, threading.RLock())  # leaf lock: never held while acquiring a LockLevel lock
 
-    def launch_contract(
-        self,
-        *,
-        bootstrap_fd: int,
-        control_fd: int,
-        event_fd: int,
-        sandbox_prefix: tuple[str, ...] | None = None,
-        sandbox_proof_fd: int | None = None,
-        sandbox_proof_nonce: str = "",
-        sandbox_pass_fds: tuple[int, ...] = (),
-        sandbox_env: dict[str, str] | None = None,
-        sandbox_temp_dir: str | Path | None = None,
-    ) -> ChannelLaunchContract:
-        """Return the immutable fresh-exec and FD inheritance contract."""
-        prefix = self._sandbox_prefix if sandbox_prefix is None else sandbox_prefix
-        effective_env = dict(sandbox_env or {})
-        if prefix and prefix[0] == "/usr/bin/sandbox-exec":
-            if sandbox_temp_dir is None:
-                raise ValueError("macOS sandbox temp directory is required")
-            temp_path = Path(sandbox_temp_dir)
-            if not temp_path.is_absolute():
-                raise ValueError("macOS sandbox temp directory must be absolute")
-            prefix = _with_seatbelt_temp_dir(prefix, temp_path)
-            effective_env.update(
-                {
-                    "GHOSTAP_CHANNEL_TMP": str(temp_path),
-                    "TMPDIR": str(temp_path),
-                }
-            )
-        worker_args = (
-            sys.executable,
-            "-I",
-            str(self._worker_path),
-            str(bootstrap_fd),
-            str(control_fd),
-            str(event_fd),
-        )
-        passed_fds = (bootstrap_fd, control_fd, event_fd)
-        if sandbox_proof_fd is not None:
-            if not sandbox_proof_nonce:
-                raise ValueError("sandbox proof nonce is required")
-            worker_args += (str(sandbox_proof_fd), sandbox_proof_nonce)
-            passed_fds += (sandbox_proof_fd,)
-        passed_fds += sandbox_pass_fds
-        return ChannelLaunchContract(
-            argv=prefix + worker_args,
-            close_fds=True,
-            pass_fds=passed_fds,
-            env={"PYTHONUTF8": "1", **effective_env},
-        )
-
     def _launch_candidate(
         self,
         *,
@@ -457,25 +387,34 @@ class EmployeeChannelSupervisor:
                     )
                 )
                 sandbox_temp_dir.chmod(0o700)
-            contract = self.launch_contract(
-                bootstrap_fd=bootstrap_r,
-                control_fd=control_r,
-                event_fd=event_w,
-                sandbox_prefix=prefix,
-                sandbox_proof_fd=(
-                    metadata_w if sandbox_attempt.seatbelt_proof else None
-                ),
-                sandbox_proof_nonce=proof_nonce,
-                sandbox_pass_fds=(
-                    (metadata_w,) if sandbox_attempt.bwrap_info else ()
-                ),
-                sandbox_temp_dir=sandbox_temp_dir,
+            env = {"PYTHONUTF8": "1"}
+            if sandbox_attempt.seatbelt_proof:
+                if sandbox_temp_dir is None:
+                    raise ChannelSandboxUnavailable()
+                prefix = _with_seatbelt_temp_dir(prefix, sandbox_temp_dir)
+                env.update(
+                    GHOSTAP_CHANNEL_TMP=str(sandbox_temp_dir),
+                    TMPDIR=str(sandbox_temp_dir),
+                )
+            worker_args = (
+                sys.executable,
+                "-I",
+                str(self._worker_path),
+                str(bootstrap_r),
+                str(control_r),
+                str(event_w),
             )
+            pass_fds = (bootstrap_r, control_r, event_w)
+            if sandbox_attempt.seatbelt_proof:
+                worker_args += (str(metadata_w), proof_nonce)
+                pass_fds += (metadata_w,)
+            elif sandbox_attempt.bwrap_info:
+                pass_fds += (metadata_w,)
             process = self._launcher(
-                contract.argv,
-                close_fds=contract.close_fds,
-                pass_fds=contract.pass_fds,
-                env=contract.env,
+                prefix + worker_args,
+                close_fds=True,
+                pass_fds=pass_fds,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -855,49 +794,11 @@ class EmployeeChannelSupervisor:
         """Send through the exact READY employee generation and await its receipt."""
         if not isinstance(target, str) or not target:
             raise ValueError("target is required")
-        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
-            raise ValueError("generation must be a positive integer")
-        request_id = f"send_{uuid.uuid4().hex}"
-        pending = _PendingSend()
-        with self._lock:
-            runtime = self._runtimes.get(agent_id)
-            if runtime is None or runtime.status.state is not ChannelProcessState.READY:
-                raise RuntimeError("employee Channel is not ready")
-            if runtime.status.generation != generation:
-                raise ValueError("employee Channel generation mismatch")
-            runtime.pending_sends[request_id] = pending
-            try:
-                sent = self._send_control(
-                    runtime,
-                    FrameType.SEND,
-                    {
-                        "request_id": request_id,
-                        "target": target,
-                        "message": message,
-                        "options": options,
-                    },
-                )
-            except ProtocolError:
-                runtime.pending_sends.pop(request_id, None)
-                raise ValueError("unsafe send payload") from None
-            if not sent:
-                runtime.pending_sends.pop(request_id, None)
-                raise RuntimeError("employee Channel send failed")
-        if not pending.completed.wait(self._send_timeout):
-            with self._lock:
-                runtime.pending_sends.pop(request_id, None)
-            raise TimeoutError("employee Channel send receipt timed out")
-        with self._lock:
-            runtime.pending_sends.pop(request_id, None)
-        if pending.success is not True:
-            raise RuntimeError("employee Channel send was not acknowledged")
-        return ChannelSendReceipt(
-            request_id=request_id,
-            success=True,
-            app_id=pending.app_id,
-            generation=pending.generation,
-            connection_id=pending.connection_id,
-            message_id=pending.message_id,
+        return self._request_outbound(
+            agent_id,
+            generation,
+            FrameType.SEND,
+            {"target": target, "message": message, "options": options},
         )
 
     def update_card(
@@ -913,13 +814,28 @@ class EmployeeChannelSupervisor:
             raise ValueError("message_id is required")
         if not isinstance(card, dict):
             raise ValueError("card must be an object")
-        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
-            raise ValueError("generation must be a positive integer")
-        request_id = f"update_{uuid.uuid4().hex}"
-        pending = _PendingSend(
-            operation="update_card",
+        return self._request_outbound(
+            agent_id,
+            generation,
+            FrameType.UPDATE_CARD,
+            {"message_id": message_id, "card": card},
             expected_message_id=message_id,
         )
+
+    def _request_outbound(
+        self,
+        agent_id: str,
+        generation: int,
+        frame_type: FrameType,
+        payload: dict[str, Any],
+        *,
+        expected_message_id: str = "",
+    ) -> ChannelSendReceipt:
+        if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+            raise ValueError("generation must be a positive integer")
+        operation = "send" if frame_type is FrameType.SEND else "update_card"
+        request_id = f"{operation}_{uuid.uuid4().hex}"
+        pending = _PendingSend(operation=operation, expected_message_id=expected_message_id)
         with self._lock:
             runtime = self._runtimes.get(agent_id)
             if runtime is None or runtime.status.state is not ChannelProcessState.READY:
@@ -930,27 +846,23 @@ class EmployeeChannelSupervisor:
             try:
                 sent = self._send_control(
                     runtime,
-                    FrameType.UPDATE_CARD,
-                    {
-                        "request_id": request_id,
-                        "message_id": message_id,
-                        "card": card,
-                    },
+                    frame_type,
+                    {"request_id": request_id, **payload},
                 )
             except ProtocolError:
                 runtime.pending_sends.pop(request_id, None)
-                raise ValueError("unsafe update card payload") from None
+                raise ValueError(f"unsafe {operation.replace('_', ' ')} payload") from None
             if not sent:
                 runtime.pending_sends.pop(request_id, None)
-                raise RuntimeError("employee Channel update card failed")
+                raise RuntimeError(f"employee Channel {operation.replace('_', ' ')} failed")
         if not pending.completed.wait(self._send_timeout):
             with self._lock:
                 runtime.pending_sends.pop(request_id, None)
-            raise TimeoutError("employee Channel update card receipt timed out")
+            raise TimeoutError(f"employee Channel {operation.replace('_', ' ')} receipt timed out")
         with self._lock:
             runtime.pending_sends.pop(request_id, None)
         if pending.success is not True:
-            raise RuntimeError("employee Channel update card was not acknowledged")
+            raise RuntimeError(f"employee Channel {operation.replace('_', ' ')} was not acknowledged")
         return ChannelSendReceipt(
             request_id=request_id,
             success=True,
@@ -981,34 +893,6 @@ class EmployeeChannelSupervisor:
                 )
                 runtime.ready.set()
             return runtime.status
-
-    def recover(self, desired: Iterable[DesiredEmployeeChannel]) -> dict[str, ChannelProcessStatus]:
-        """Reconcile live children to the durable desired employee set."""
-        desired_by_agent: dict[str, DesiredEmployeeChannel] = {}
-        for item in desired:
-            if item.agent_id in desired_by_agent:
-                raise ValueError("duplicate desired employee Channel")
-            desired_by_agent[item.agent_id] = item
-        with self._lock:
-            current_ids = set(self._runtimes)
-        for agent_id in current_ids - set(desired_by_agent):
-            self.stop(agent_id)
-        result: dict[str, ChannelProcessStatus] = {}
-        for agent_id, item in desired_by_agent.items():
-            current = self.status(agent_id)
-            if current is not None and current.state is ChannelProcessState.READY and current.generation == item.generation:
-                result[agent_id] = current
-                continue
-            if current is not None and current.state not in {ChannelProcessState.STOPPED, ChannelProcessState.FAILED, ChannelProcessState.CRASHED}:
-                self.stop(agent_id)
-            result[agent_id] = self.start(
-                item.agent_id,
-                item.app_id,
-                item.credential_ref,
-                item.generation,
-                item.on_event,
-            )
-        return result
 
     def close(self) -> None:
         """Stop all owned children and make admission permanently closed."""

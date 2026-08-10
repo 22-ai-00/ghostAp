@@ -10,7 +10,7 @@ Tests cover:
 - Dedup: _should_send_intercept returns True first time, False on repeat
 - close() stops dedup cache cleanup thread
 - Throttled path: handler.send_chat_lock_throttled_reply called on dedup hit
-- Fallback: _reply_text used when handler is None
+- Fallback: reply_text used when the intercept card cannot be delivered
 """
 
 from __future__ import annotations
@@ -29,15 +29,12 @@ def _make_gate(
     handler=None,
     cache_ttl: int = 30,
 ):
-    """Build a ChatLockGate with mocked host and optional handler."""
-    host = MagicMock()
-    if handler is not None:
-        host._get_handler.return_value = handler
-    else:
-        host._get_handler.return_value = None
+    """Build a ChatLockGate with its required handler dependency."""
+    if handler is None:
+        handler = MagicMock()
     cache = MessageCache(ttl=cache_ttl, max_size=10_000, cleanup_interval=60)
-    gate = ChatLockGate(chat_lock_manager=clm, dedup_cache=cache, host=host)
-    return gate, host
+    gate = ChatLockGate(chat_lock_manager=clm, dedup_cache=cache, handler=handler)
+    return gate, handler
 
 
 class TestNoClm(unittest.TestCase):
@@ -65,19 +62,25 @@ class TestCheckMessage(unittest.TestCase):
     def test_blocked_returns_true_and_sends_card(self):
         clm = MagicMock()
         clm.should_block.return_value = True
+        clm.is_admin.return_value = False
+        clm.is_locked.return_value = True
         handler = MagicMock()
         gate, _ = _make_gate(clm=clm, handler=handler)
 
         assert gate.check("chat", "user", "msg") is True
         handler.send_chat_lock_intercept_card.assert_called_once_with("msg", "chat", clm)
 
-    def test_blocked_fallback_reply_when_no_handler(self):
+    def test_blocked_falls_back_to_text_when_card_delivery_fails(self):
         clm = MagicMock()
         clm.should_block.return_value = True
-        gate, host = _make_gate(clm=clm, handler=None)
+        clm.is_admin.return_value = False
+        clm.is_locked.return_value = True
+        handler = MagicMock()
+        handler.send_chat_lock_intercept_card.side_effect = RuntimeError("delivery failed")
+        gate, _ = _make_gate(clm=clm, handler=handler)
 
         assert gate.check("chat", "user", "msg") is True
-        host._reply_text.assert_called_once()
+        handler.reply_text.assert_called_once()
 
     def test_blocked_spec_goal_with_tab_still_sends_visible_intercept_feedback(self):
         clm = MagicMock()
@@ -208,16 +211,6 @@ class TestThrottledPath(unittest.TestCase):
         assert gate.check("chat", "user", "msg") is True
         handler.send_chat_lock_throttled_reply.assert_called_once()
         handler.send_chat_lock_intercept_card.assert_not_called()
-
-    def test_throttled_fallback_emoji_when_no_handler(self):
-        clm = MagicMock()
-        clm.should_block.return_value = True
-        gate, host = _make_gate(clm=clm, handler=None)
-
-        gate._should_send_intercept("chat", "user")
-        assert gate.check("chat", "user", "msg") is True
-        host._add_reaction.assert_called_once()
-
 
 class TestClose(unittest.TestCase):
     """close() delegates to dedup cache."""

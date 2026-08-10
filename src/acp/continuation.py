@@ -24,10 +24,12 @@ logger = logging.getLogger(__name__)
 
 MAX_ORDINARY_CONTINUATIONS = 3
 MAX_CHILD_RECONCILIATIONS = 1
-MAX_USER_CONFIRMATION_CONTINUATIONS = MAX_ORDINARY_CONTINUATIONS
+MAX_AUTOMATIC_DECISIONS = 1
+MAX_GOAL_RECOVERIES = 1
 _monotonic = time.monotonic
 _PLAN_CONTINUATION = "plan"
 _CHILD_RECONCILIATION = "child_reconciliation"
+_GOAL_RECOVERY = "goal_recovery"
 _USER_INPUT_MARKERS = (
     "请确认",
     "请选择",
@@ -115,7 +117,6 @@ class PromptContinuationResult:
     result: PromptResult
     assessment: PromptAssessment
     automatic_continuations: int
-    awaiting_user_input: bool
     entered_finalization: bool
 
 
@@ -197,27 +198,6 @@ def _has_dangerous_confirmation_requirement(text: str) -> bool:
     return any(marker in normalized for marker in _USER_INPUT_DANGEROUS_MARKERS)
 
 
-def _auto_confirmable_prompt(
-    result: PromptResult,
-    assessment: PromptAssessment,
-) -> bool:
-    if not _requests_explicit_user_input(result):
-        return False
-    if _has_dangerous_confirmation_requirement(_confirmation_context(result)):
-        return False
-    return (
-        assessment.outcome is PromptOutcome.INCOMPLETE
-        and assessment.stop_reason == "end_turn"
-    )
-
-
-def _requires_user_confirmation(result: PromptResult) -> bool:
-    return (
-        _requests_explicit_user_input(result)
-        and _has_dangerous_confirmation_requirement(_confirmation_context(result))
-    )
-
-
 def _normalize_user_input_assessment(
     result: PromptResult,
     assessment: PromptAssessment,
@@ -244,6 +224,26 @@ def _build_confirmation_default_prompt() -> str:
         "本次按“文档推荐选项 + 最小可逆本地默认值”自动继续，不要再次询问。"
         "这不构成新增授权：不得猜测凭据或权限，不得发布、部署、付费、删除数据，"
         "也不得执行不可逆外部操作；若确实需要这些授权，请只说明精确阻塞项。"
+    )
+
+
+def _build_risk_denial_prompt() -> str:
+    return (
+        "[GhostAP 自动安全决策]\n"
+        "上一步请求了新增凭据/权限，或部署、发布、删除数据等高风险操作。"
+        "该操作未获原始请求的明确精确授权，本次自动拒绝并跳过，不要再次询问，"
+        "也不得寻找绕过方式。请继续完成原任务中其余已授权、安全、可逆的工作；"
+        "若被拒绝的操作是完成任务的必要条件，请保留已有结果并明确报告失败原因。"
+    )
+
+
+def _build_goal_recovery_prompt(status: str) -> str:
+    return (
+        "[GhostAP 自动恢复指令]\n"
+        f"结构化 Goal 当前为 {status}，但任务不能等待用户交互。请在同一会话中"
+        "采用推荐的安全可逆默认值继续；需要新增权限、凭据或不可逆副作用的步骤"
+        "一律拒绝并跳过。不要再次暂停、阻塞或询问用户。若无法安全完成，请完整"
+        "保留已有结果并明确报告失败原因。"
     )
 
 
@@ -327,8 +327,9 @@ def _continuation_kind(
         entered_finalization
         or assessment.outcome is not PromptOutcome.INCOMPLETE
         or assessment.stop_reason != "end_turn"
-        or _requests_explicit_user_input(result)
     ):
+        return None
+    if _requests_explicit_user_input(result):
         return None
     goal = result.goal
     goal_status = (
@@ -337,14 +338,6 @@ def _continuation_kind(
         else ""
     )
     if (
-        goal is None
-        and assessment.pending_plan_entries > 0
-        and assessment.incomplete_tool_calls == 0
-    ):
-        return _PLAN_CONTINUATION
-    if (
-        (goal is None or goal_status == "completed")
-        and
         assessment.pending_plan_entries == 0
         and assessment.incomplete_tool_calls > 0
         and assessment.incomplete_outer_tool_calls == 0
@@ -352,6 +345,17 @@ def _continuation_kind(
         == assessment.unresolved_child_tool_calls
     ):
         return _CHILD_RECONCILIATION
+    if (
+        goal_status in {"paused", "blocked"}
+        and assessment.incomplete_tool_calls == 0
+    ):
+        return _GOAL_RECOVERY
+    if (
+        (goal is None or goal_status in {"active", "completed"})
+        and assessment.pending_plan_entries > 0
+        and assessment.incomplete_tool_calls == 0
+    ):
+        return _PLAN_CONTINUATION
     return None
 
 
@@ -421,7 +425,8 @@ def run_prompt_with_continuation(
     automatic_continuations = 0
     plan_continuations = 0
     child_reconciliations = 0
-    explicit_confirmation_continuations = 0
+    automatic_decisions = 0
+    goal_recoveries = 0
 
     while True:
         continuation_kind = _continuation_kind(
@@ -433,20 +438,28 @@ def run_prompt_with_continuation(
         if continuation_kind is None:
             if (
                 not ever_entered_finalization
-                and explicit_confirmation_continuations
-                < MAX_USER_CONFIRMATION_CONTINUATIONS
-                and _auto_confirmable_prompt(result, assessment)
+                and automatic_decisions < MAX_AUTOMATIC_DECISIONS
+                and assessment.outcome is PromptOutcome.INCOMPLETE
+                and assessment.stop_reason == "end_turn"
+                and _requests_explicit_user_input(result)
             ):
                 _notify_continuation_start(on_continuation_start)
                 remaining_budget = deadline - _monotonic()
                 if remaining_budget <= 0:
                     break
+                decision_prompt = (
+                    _build_risk_denial_prompt()
+                    if _has_dangerous_confirmation_requirement(
+                        _confirmation_context(result)
+                    )
+                    else _build_confirmation_default_prompt()
+                )
                 next_result, entered_finalization = run_turn(
-                    _build_confirmation_default_prompt(),
+                    decision_prompt,
                     remaining_budget,
                     replay_deferred_child_events=True,
                 )
-                explicit_confirmation_continuations += 1
+                automatic_decisions += 1
                 ever_entered_finalization = (
                     ever_entered_finalization or entered_finalization
                 )
@@ -465,12 +478,21 @@ def run_prompt_with_continuation(
         ) or (
             continuation_kind == _CHILD_RECONCILIATION
             and child_reconciliations >= MAX_CHILD_RECONCILIATIONS
+        ) or (
+            continuation_kind == _GOAL_RECOVERY
+            and goal_recoveries >= MAX_GOAL_RECOVERIES
         ):
             break
 
+        raw_goal_status = getattr(result.goal, "status", "")
+        goal_status = str(
+            getattr(raw_goal_status, "value", raw_goal_status) or ""
+        ).strip().casefold()
         continuation_prompt = (
             _build_continuation_prompt(assessment.pending_plan_entries)
             if continuation_kind == _PLAN_CONTINUATION
+            else _build_goal_recovery_prompt(goal_status)
+            if continuation_kind == _GOAL_RECOVERY
             else _build_child_reconciliation_prompt(
                 assessment.unresolved_child_tool_calls
             )
@@ -481,13 +503,16 @@ def run_prompt_with_continuation(
             break
         reconciliation_started_at: float | None = None
         reconciliation_finished_at: float | None = None
-        if continuation_kind == _PLAN_CONTINUATION:
+        if continuation_kind in {_PLAN_CONTINUATION, _GOAL_RECOVERY}:
             next_result, entered_finalization = run_turn(
                 continuation_prompt,
                 remaining_budget,
                 replay_deferred_child_events=True,
             )
-            plan_continuations += 1
+            if continuation_kind == _PLAN_CONTINUATION:
+                plan_continuations += 1
+            else:
+                goal_recoveries += 1
         else:
             # Reconciliation is itself the single safe cleanup turn. Running it
             # through the ordinary timeout-finalization wrapper could send a
@@ -559,33 +584,10 @@ def run_prompt_with_continuation(
             classify_prompt_result(result),
         )
 
-    goal = result.goal
-    goal_status = (
-        str(goal.status or "").strip().casefold()
-        if goal is not None
-        else ""
-    )
-    awaiting_user_input = (
-        assessment.outcome is PromptOutcome.INCOMPLETE
-        and assessment.stop_reason == "end_turn"
-        and (
-            (
-                not ever_entered_finalization
-                and _requires_user_confirmation(result)
-            )
-            or (
-                goal is not None
-                and not ever_entered_finalization
-                and assessment.incomplete_tool_calls == 0
-                and goal_status in {"paused", "blocked"}
-            )
-        )
-    )
     return PromptContinuationResult(
         result=result,
         assessment=assessment,
         automatic_continuations=automatic_continuations,
-        awaiting_user_input=awaiting_user_input,
         entered_finalization=ever_entered_finalization,
     )
 

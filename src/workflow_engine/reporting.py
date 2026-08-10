@@ -192,12 +192,13 @@ def _phase_process(project: WorkflowProject) -> str:
         lines.append(f"### 阶段 {idx}: {phase.title}")
         lines.append(f"- 汇总: {done}/{total} 完成，{failed} 失败，{cancelled} 已取消{duration}")
         for agent in agents:
+            display_index = max(1, int(getattr(agent, "call_index", 0) or 0) + 1)
             agent_line = (
-                f"- [{_status_text(agent.status)}] {agent.label or 'agent'}"
+                f"- Agent #{display_index} [{_status_text(agent.status)}] {agent.label or 'agent'}"
                 f" tool={agent.tool or '(none)'}"
+                f" model={agent.model or 'default'}"
+                f" attempt={max(1, int(getattr(agent, 'attempt', 1) or 1))}"
             )
-            if agent.model:
-                agent_line += f" model={agent.model}"
             if agent.role:
                 agent_line += f" role={agent.role}"
             if agent.duration_s:
@@ -206,8 +207,22 @@ def _phase_process(project: WorkflowProject) -> str:
                 agent_line += f" tokens={agent.token_usage}"
             if agent.task_summary:
                 agent_line += f"\n  - task: {agent.task_summary}"
+            operation = str(agent.current_activity or "").strip()
+            if operation:
+                agent_line += f"\n  - latest operation: {operation}"
             if agent.error:
                 agent_line += f"\n  - error: {agent.error}"
+            if agent.result is not None:
+                agent_line += f"\n  - full result:\n{agent.result}"
+            if agent.subagents:
+                agent_line += "\n  - ACP internal Agent observations (non-authoritative):"
+                for child_index, child in enumerate(agent.subagents, start=1):
+                    child_status = _status_text(child.status)
+                    child_progress = child.progress or "(no latest operation)"
+                    agent_line += (
+                        f"\n    - observation {child_index}: status={child_status} "
+                        f"model={child.model or 'default'} latest={child_progress}"
+                    )
             lines.append(agent_line)
         lines.append("")
     return "\n".join(lines).strip()

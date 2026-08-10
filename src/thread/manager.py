@@ -49,13 +49,20 @@ class ThreadContextManager:
             tool_name=tool_name,
             model_name=model_name,
         )
+        aliases = tuple(
+            dict.fromkeys(
+                alias for alias in (alias_keys or []) if alias and alias != thread_root_id
+            )
+        )
         with self._lock:
             self._contexts[thread_root_id] = ctx
-            for alias in (alias_keys or []):
-                if alias and alias != thread_root_id:
-                    self._aliases[alias] = thread_root_id
-                    self._contexts[alias] = ctx
-        alias_info = ",".join((alias_keys or [])[:3]) if alias_keys else "none"
+            self._aliases = {
+                alias: root
+                for alias, root in self._aliases.items()
+                if root != thread_root_id
+            }
+            self._aliases.update({alias: thread_root_id for alias in aliases})
+        alias_info = ",".join(aliases[:3]) if aliases else "none"
         logger.info(
             "[Thread] Registered: root=%s aliases=%s chat=%s project=%s mode=%s tool=%s model=%s",
             thread_root_id[:12],
@@ -70,20 +77,10 @@ class ThreadContextManager:
 
     def get(self, thread_root_id: str) -> Optional[ThreadContext]:
         with self._lock:
-            ctx = self._contexts.get(thread_root_id)
+            ctx = self._contexts.get(self._aliases.get(thread_root_id, thread_root_id))
             if ctx:
                 ctx.touch()
         return ctx
-
-    def get_engine_context(self, thread_root_id: str) -> Optional[ThreadContext]:
-        """Return a topic-bound engine context for an exact thread root."""
-        ctx = self.get(thread_root_id)
-        if ctx and ctx.mode and ctx.mode != "smart":
-            return ctx
-        return None
-
-    def has_active_engine(self, thread_root_id: str) -> bool:
-        return self.get_engine_context(thread_root_id) is not None
 
     def bind_engine(
         self,
@@ -108,46 +105,17 @@ class ThreadContextManager:
 
     def get_by_chat(self, chat_id: str) -> list[ThreadContext]:
         with self._lock:
-            seen: set[int] = set()
-            result: list[ThreadContext] = []
-            for c in self._contexts.values():
-                if c.chat_id == chat_id and id(c) not in seen:
-                    seen.add(id(c))
-                    result.append(c)
-            return result
-
-    def update_mode(self, thread_root_id: str, mode: str) -> bool:
-        with self._lock:
-            ctx = self._contexts.get(thread_root_id)
-            if not ctx:
-                return False
-            ctx.mode = mode
-            ctx.touch()
-        return True
-
-    def update_tool(self, thread_root_id: str, tool_name: Optional[str], model_name: Optional[str] = None) -> bool:
-        with self._lock:
-            ctx = self._contexts.get(thread_root_id)
-            if not ctx:
-                return False
-            if tool_name is not None:
-                ctx.tool_name = tool_name
-            if model_name is not None:
-                ctx.model_name = model_name
-            ctx.touch()
-        return True
+            return [ctx for ctx in self._contexts.values() if ctx.chat_id == chat_id]
 
     def remove(self, thread_root_id: str) -> Optional[ThreadContext]:
         with self._lock:
             canonical = self._aliases.get(thread_root_id, thread_root_id)
             ctx = self._contexts.pop(canonical, None)
-            if canonical != thread_root_id:
-                self._contexts.pop(thread_root_id, None)
-                self._aliases.pop(thread_root_id, None)
-            alias_keys = [k for k, v in self._aliases.items() if v == canonical]
-            for k in alias_keys:
-                self._aliases.pop(k, None)
-                self._contexts.pop(k, None)
+            self._aliases = {
+                alias: root
+                for alias, root in self._aliases.items()
+                if root != canonical
+            }
         if ctx and self._on_evict:
             try:
                 self._on_evict(ctx)
@@ -155,41 +123,10 @@ class ThreadContextManager:
                 logger.debug("[Thread] on_evict callback error", exc_info=True)
         return ctx
 
-    def remove_by_chat(self, chat_id: str) -> int:
-        removed: list[ThreadContext] = []
-        with self._lock:
-            to_remove = {k for k, c in self._contexts.items() if c.chat_id == chat_id}
-            seen_ids: set[int] = set()
-            for k in to_remove:
-                ctx = self._contexts.pop(k, None)
-                if ctx and id(ctx) not in seen_ids:
-                    seen_ids.add(id(ctx))
-                    removed.append(ctx)
-            stale_aliases = [a for a, c in self._aliases.items() if c in to_remove or a in to_remove]
-            for a in stale_aliases:
-                self._aliases.pop(a, None)
-        if self._on_evict:
-            for ctx in removed:
-                try:
-                    self._on_evict(ctx)
-                except Exception:
-                    logger.debug("[Thread] on_evict callback error", exc_info=True)
-        return len(removed)
-
-    @property
-    def active_count(self) -> int:
-        with self._lock:
-            return len({id(c) for c in self._contexts.values()})
-
     def close(self) -> None:
         self._cleanup_stop.set()
-        remaining: list[ThreadContext] = []
         with self._lock:
-            seen: set[int] = set()
-            for ctx in self._contexts.values():
-                if id(ctx) not in seen:
-                    seen.add(id(ctx))
-                    remaining.append(ctx)
+            remaining = list(self._contexts.values())
             self._contexts.clear()
             self._aliases.clear()
         if self._on_evict:
@@ -210,16 +147,17 @@ class ThreadContextManager:
         now = time.time()
         evicted: list[ThreadContext] = []
         with self._lock:
-            expired = {k for k, c in self._contexts.items() if (now - c.last_active) > self._ttl}
-            seen: set[int] = set()
-            for k in expired:
-                ctx = self._contexts.pop(k, None)
-                if ctx and id(ctx) not in seen:
-                    seen.add(id(ctx))
-                    evicted.append(ctx)
-            stale_aliases = [a for a in self._aliases if a in expired or self._aliases[a] in expired]
-            for a in stale_aliases:
-                self._aliases.pop(a, None)
+            expired = {
+                root
+                for root, ctx in self._contexts.items()
+                if (now - ctx.last_active) > self._ttl
+            }
+            evicted = [self._contexts.pop(root) for root in expired]
+            self._aliases = {
+                alias: root
+                for alias, root in self._aliases.items()
+                if root not in expired
+            }
         if evicted:
             logger.info("[Thread] Evicted %d expired thread contexts", len(evicted))
         if self._on_evict:
@@ -255,13 +193,6 @@ def get_thread_manager() -> ThreadContextManager:
             if _manager is None:
                 _manager = ThreadContextManager()
     return _manager
-
-
-def _reset_thread_manager_for_testing() -> None:
-    """Reset the global ThreadContextManager singleton. **Test-only.**"""
-    global _manager
-    with _manager_lock:
-        _manager = None
 
 
 def set_current_thread_id(thread_id: Optional[str]) -> None:

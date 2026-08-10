@@ -61,9 +61,6 @@ class DeepBuilder:
                 "failed": "red",
                 "cancelled": "orange",
                 "blocked": "grey",
-                "awaiting_approval": "blue",
-                "denied": "red",
-                "continued": "green",
             }
             if terminal_state in TERMINAL_COLORS:
                 return TERMINAL_COLORS[terminal_state]
@@ -88,7 +85,7 @@ class DeepBuilder:
         if not config:
             return {}
 
-        # Determine specific action string (e.g. "deep_pause")
+        # Determine the engine-prefixed action string.
         if action_suffix:
             action_name = f"{state.action_prefix}_{action_suffix}"
         else:
@@ -122,10 +119,12 @@ class DeepBuilder:
 
         # Control buttons
         if state.is_executing:
-            buttons.append(DeepBuilder._create_button("pause", state))
+            if state.action_prefix != "deep":
+                buttons.append(DeepBuilder._create_button("pause", state))
             buttons.append(DeepBuilder._create_button("stop", state))
         elif state.is_paused:
-            buttons.append(DeepBuilder._create_button("resume", state))
+            if state.action_prefix != "deep":
+                buttons.append(DeepBuilder._create_button("resume", state))
             buttons.append(DeepBuilder._create_button("stop", state))
 
         # View buttons
@@ -163,10 +162,12 @@ class DeepBuilder:
 
         # 1. Collect Control Buttons (Pause/Resume, Stop)
         if state.is_executing:
-            control_buttons.append(DeepBuilder._create_button("pause", state))
+            if state.action_prefix != "deep":
+                control_buttons.append(DeepBuilder._create_button("pause", state))
             control_buttons.append(DeepBuilder._create_button("stop_danger", state, action_suffix="stop"))
         elif state.is_paused:
-            control_buttons.append(DeepBuilder._create_button("resume", state))
+            if state.action_prefix != "deep":
+                control_buttons.append(DeepBuilder._create_button("resume", state))
             control_buttons.append(DeepBuilder._create_button("stop_danger", state, action_suffix="stop"))
 
         # 2. Collect View/Mode Buttons

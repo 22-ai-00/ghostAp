@@ -14,26 +14,11 @@ from src.card.delivery.page_mutator import PageMutator, sanitize_card_text_for_a
 from src.card.delivery.registry import DeliveryRegistry, delivery_registry
 from src.card.delivery.sequence import SequenceManager
 from src.card.delivery.ttl_set import TTLSet
-from src.card.delivery.types import MutationOutcome, SequenceConflictError, TransportError
+from src.card.delivery.types import MutationOutcome
 from src.card.protocols import CardAPIClient
 from src.card.types import RenderedCard
 
 logger = logging.getLogger(__name__)
-
-_RECREATE_OUTCOME_PREFIX = "recreate:"
-
-
-# ---------------------------------------------------------------------------
-# Outcome types (re-exported from src.card.delivery.types for backwards compat)
-# ---------------------------------------------------------------------------
-
-__all__ = ["CardDelivery", "MutationOutcome", "SequenceConflictError", "TransportError", "CardAPIClient"]
-
-
-# ---------------------------------------------------------------------------
-# CardDelivery engine
-# ---------------------------------------------------------------------------
-
 
 class CardDelivery:
     """Unified delivery engine.
@@ -97,11 +82,6 @@ class CardDelivery:
         self._lock_pool.shutdown()
         self._registry.unregister(self)
 
-    @property
-    def _accepting_work(self) -> bool:
-        """Whether this delivery engine is accepting new work (read-only proxy to lock pool)."""
-        return self._lock_pool.accepting_work
-
     def _drain(self, timeout: float = 5.0) -> bool:
         """Wait for all in-flight deliveries on this instance to finish.
 
@@ -117,19 +97,6 @@ class CardDelivery:
         the per-session delivery lock on session termination.
         """
         self._lock_pool.release(session_id)
-
-    def __del__(self) -> None:
-        """Defense-in-depth: stop eviction thread if instance leaks without explicit shutdown."""
-        try:
-            self._lock_pool.shutdown()
-        except Exception:
-            pass
-
-    def __enter__(self) -> CardDelivery:
-        return self
-
-    def __exit__(self, *exc_info) -> None:
-        self._shutdown()
 
     def deliver(
         self,
@@ -183,7 +150,14 @@ class CardDelivery:
         self._lock_pool.enter_delivery()
         try:
             with session_lock:
-                return self._deliver_unlocked(session_id, chat_id, rendered, reply_to=reply_to, reply_in_thread=reply_in_thread, is_terminal=is_terminal)
+                return self._deliver_unlocked(
+                    session_id,
+                    chat_id,
+                    rendered,
+                    reply_to=reply_to,
+                    reply_in_thread=reply_in_thread,
+                    is_terminal=is_terminal,
+                )
         finally:
             self._lock_pool.exit_delivery()
 
@@ -222,73 +196,33 @@ class CardDelivery:
 
         if binding is None:
             binding = self._bindings.create(session_id, chat_id)
-            previous_page_index: int | None = None
-            for card in ordered:
-                outcome = self._create_page(
-                    session_id,
-                    chat_id,
-                    card,
-                    reply_to=reply_to,
-                    reply_in_thread=reply_in_thread,
-                    is_terminal=is_terminal,
-                )
-                outcomes.append(outcome)
-                if outcome.kind != "applied":
-                    break
-                if previous_page_index is not None:
-                    freeze_outcome = self._freeze_page(session_id, previous_page_index)
-                    if freeze_outcome.kind == "reconcile":
-                        outcomes.append(freeze_outcome)
-                        break
-                previous_page_index = card.page_index
-            return outcomes
-
-        message_high_watermark = binding.message_high_watermark
-
-        # A failed append leaves the visible slot reserved by the monotonic high
-        # watermark while no binding exists for it. Retry from the same logical
-        # source page at the same next visible index/idempotency key.
-        if (
-            message_high_watermark >= 0
-            and message_high_watermark not in binding.pages
-        ):
-            replacement_page = binding.stale_replacement_pages.get(
-                binding.latest_source_page_index
-            )
-            if replacement_page == message_high_watermark:
-                return [self._stale_recovery_exhausted()]
-            return self._append_from_source(
+            return self._create_initial_pages(
                 session_id,
                 chat_id,
-                binding,
                 ordered,
-                source_page_index=binding.latest_source_page_index,
                 reply_to=reply_to,
                 reply_in_thread=reply_in_thread,
                 is_terminal=is_terminal,
             )
 
-        if not binding.pages:
-            previous_page_index = None
-            for card in ordered:
-                outcome = self._create_page(
-                    session_id,
-                    chat_id,
-                    card,
-                    reply_to=reply_to,
-                    reply_in_thread=reply_in_thread,
-                    is_terminal=is_terminal,
+        message_high_watermark = binding.message_high_watermark
+        if message_high_watermark >= 0 and message_high_watermark not in binding.pages:
+            return [
+                MutationOutcome(
+                    kind="reconcile",
+                    message=f"binding_missing:{message_high_watermark}",
                 )
-                outcomes.append(outcome)
-                if outcome.kind != "applied":
-                    break
-                if previous_page_index is not None:
-                    freeze_outcome = self._freeze_page(session_id, previous_page_index)
-                    if freeze_outcome.kind == "reconcile":
-                        outcomes.append(freeze_outcome)
-                        break
-                previous_page_index = card.page_index
-            return outcomes
+            ]
+
+        if not binding.pages:
+            return self._create_initial_pages(
+                session_id,
+                chat_id,
+                ordered,
+                reply_to=reply_to,
+                reply_in_thread=reply_in_thread,
+                is_terminal=is_terminal,
+            )
 
         latest_page = binding.pages[message_high_watermark]
         latest_source_idx = latest_page.source_page_index
@@ -313,20 +247,7 @@ class CardDelivery:
                 latest_card,
                 is_terminal=is_terminal,
             )
-            if self._is_stale_binding_outcome(outcome):
-                outcome = self._recover_stale_page(
-                    session_id,
-                    chat_id,
-                    binding,
-                    ordered[-1],
-                    outcome,
-                    stale_page_index=latest_page.page_index,
-                    reply_to=reply_to,
-                    reply_in_thread=reply_in_thread,
-                    is_terminal=is_terminal,
-                )
-            elif outcome.kind == "applied":
-                binding.stale_replacement_pages.pop(latest_rendered_idx, None)
+            if outcome.kind == "applied":
                 self._bindings.update_source_page_index(
                     session_id,
                     message_high_watermark,
@@ -383,25 +304,6 @@ class CardDelivery:
                     target_card,
                     is_terminal=is_terminal,
                 )
-            if self._is_stale_binding_outcome(outcome):
-                outcome = self._recover_stale_page(
-                    session_id,
-                    chat_id,
-                    binding,
-                    card,
-                    outcome,
-                    stale_page_index=(
-                        existing_page.page_index
-                        if existing_page is not None
-                        else binding.message_high_watermark
-                    ),
-                    reply_to=reply_to,
-                    reply_in_thread=reply_in_thread,
-                    is_terminal=is_terminal,
-                )
-                mutated_visible_index = binding.message_high_watermark
-            elif outcome.kind == "applied":
-                binding.stale_replacement_pages.pop(page_idx, None)
             outcomes.append(outcome)
             if outcome.kind == "reconcile":
                 break
@@ -424,6 +326,38 @@ class CardDelivery:
                     else binding.message_high_watermark
                 )
 
+        return outcomes
+
+    def _create_initial_pages(
+        self,
+        session_id: str,
+        chat_id: str,
+        cards: list[RenderedCard],
+        *,
+        reply_to: str | None,
+        reply_in_thread: bool | None,
+        is_terminal: bool,
+    ) -> list[MutationOutcome]:
+        outcomes: list[MutationOutcome] = []
+        previous_page_index: int | None = None
+        for card in cards:
+            outcome = self._mutator.create_page(
+                session_id,
+                chat_id,
+                card,
+                reply_to=reply_to,
+                reply_in_thread=reply_in_thread,
+                finish_streaming=is_terminal,
+            )
+            outcomes.append(outcome)
+            if outcome.kind != "applied":
+                break
+            if previous_page_index is not None:
+                freeze_outcome = self._freeze_page(session_id, previous_page_index)
+                if freeze_outcome.kind == "reconcile":
+                    outcomes.append(freeze_outcome)
+                    break
+            previous_page_index = card.page_index
         return outcomes
 
     def _transform_rendered_payload(
@@ -544,52 +478,6 @@ class CardDelivery:
             return None
         return max(matches, key=lambda page: page.page_index)
 
-    def _append_from_source(
-        self,
-        session_id: str,
-        chat_id: str,
-        binding,
-        ordered: list[RenderedCard],
-        *,
-        source_page_index: int,
-        reply_to: str | None,
-        reply_in_thread: bool | None,
-        is_terminal: bool,
-    ) -> list[MutationOutcome]:
-        """Retry a missing live page and append any newer logical pages."""
-        start = next(
-            (
-                index
-                for index, card in enumerate(ordered)
-                if card.page_index == source_page_index
-            ),
-            len(ordered) - 1,
-        )
-        outcomes: list[MutationOutcome] = []
-        pending_freeze_index: int | None = None
-        for index, card in enumerate(ordered[start:], start=start):
-            outcome = self._append_visible_page(
-                session_id,
-                chat_id,
-                binding,
-                card,
-                reply_to=reply_to,
-                reply_in_thread=reply_in_thread,
-                is_terminal=is_terminal,
-            )
-            outcomes.append(outcome)
-            if outcome.kind != "applied":
-                break
-            if pending_freeze_index is not None:
-                freeze_outcome = self._freeze_page(session_id, pending_freeze_index)
-                if freeze_outcome.kind == "reconcile":
-                    outcomes.append(freeze_outcome)
-                    break
-                pending_freeze_index = None
-            if index < len(ordered) - 1:
-                pending_freeze_index = binding.message_high_watermark
-        return outcomes
-
     def _append_visible_page(
         self,
         session_id: str,
@@ -608,61 +496,14 @@ class CardDelivery:
             page_index=replacement_index,
             total_pages=replacement_index + 1,
         )
-        return self._create_page(
+        return self._mutator.create_page(
             session_id,
             chat_id,
             replacement,
             reply_to=reply_to,
             reply_in_thread=reply_in_thread,
             source_page_index=card.page_index,
-            is_terminal=is_terminal,
-        )
-
-    def _recover_stale_page(
-        self,
-        session_id: str,
-        chat_id: str,
-        binding,
-        card: RenderedCard,
-        stale_outcome: MutationOutcome,
-        *,
-        stale_page_index: int,
-        reply_to: str | None,
-        reply_in_thread: bool | None,
-        is_terminal: bool,
-    ) -> MutationOutcome:
-        """Append once unless the current physical page is already a replacement."""
-        source_page_index = card.page_index
-        if (
-            binding.stale_replacement_pages.get(source_page_index)
-            == stale_page_index
-        ):
-            return self._stale_recovery_exhausted(stale_outcome)
-        replacement_page_index = binding.message_high_watermark + 1
-        binding.stale_replacement_pages[source_page_index] = replacement_page_index
-        replacement_outcome = self._append_visible_page(
-            session_id,
-            chat_id,
-            binding,
-            card,
-            reply_to=reply_to,
-            reply_in_thread=reply_in_thread,
-            is_terminal=is_terminal,
-        )
-        if self._is_stale_binding_outcome(replacement_outcome):
-            return self._stale_recovery_exhausted(replacement_outcome)
-        return replacement_outcome
-
-    @staticmethod
-    def _stale_recovery_exhausted(
-        stale_outcome: MutationOutcome | None = None,
-    ) -> MutationOutcome:
-        code = "99992354"
-        if stale_outcome is not None:
-            code = stale_outcome.message.removeprefix(_RECREATE_OUTCOME_PREFIX)
-        return MutationOutcome(
-            kind="reconcile",
-            message=f"stale_replacement_exhausted:{code}",
+            finish_streaming=is_terminal,
         )
 
     @staticmethod
@@ -715,21 +556,21 @@ class CardDelivery:
             and page.is_streaming
             and callable(getattr(self._client, "finish_streaming_card", None))
         ):
-            return self._update_page(
+            return self._mutator.update_page(
                 session_id,
                 page,
                 card,
-                finish_streaming=True,
+                force_finish_streaming=True,
             )
         if page.signature != card.structure_signature:
-            return self._update_page(session_id, page, card)
+            return self._mutator.update_page(session_id, page, card)
         if (
             card.active_element is not None
             and sanitize_card_text_for_audit(card.active_element.text) != page.last_text
         ):
             if page.supports_element_update:
-                return self._stream_element(session_id, page, card)
-            return self._update_page(session_id, page, card)
+                return self._mutator.stream_element(session_id, page, card)
+            return self._mutator.update_page(session_id, page, card)
         return MutationOutcome(kind="skipped")
 
     def _freeze_page(
@@ -794,85 +635,5 @@ class CardDelivery:
             self.release_session_lock(session_id)
 
     def get_binding(self, session_id: str):
-        """Get the current binding for inspection/testing."""
+        """Return the visible message binding for session integrations."""
         return self._bindings.get(session_id)
-
-    # ----- Internal operations (delegated to PageMutator) -----
-
-    def _create_page(
-        self,
-        session_id: str,
-        chat_id: str,
-        card: RenderedCard,
-        *,
-        reply_to: str | None = None,
-        reply_in_thread: bool | None = None,
-        source_page_index: int | None = None,
-        is_terminal: bool = False,
-    ) -> MutationOutcome:
-        """Create a new card page via API."""
-        outcome = self._mutator.create_page(
-            session_id,
-            chat_id,
-            card,
-            reply_to=reply_to,
-            reply_in_thread=reply_in_thread,
-            source_page_index=source_page_index,
-        )
-        if outcome.kind != "applied" or not is_terminal:
-            return outcome
-        binding = self._bindings.get(session_id)
-        page = binding.pages.get(card.page_index) if binding is not None else None
-        if (
-            page is None
-            or not page.is_streaming
-            or not callable(getattr(self._client, "finish_streaming_card", None))
-        ):
-            return outcome
-        return self._mutator.update_page(
-            session_id,
-            page,
-            card,
-            force_finish_streaming=True,
-        )
-
-    def _update_page(
-        self,
-        session_id: str,
-        page: PageBinding,
-        card: RenderedCard,
-        *,
-        finish_streaming: bool = False,
-    ) -> MutationOutcome:
-        """Update card structure via PATCH API."""
-        return self._mutator.update_page(
-            session_id,
-            page,
-            card,
-            force_finish_streaming=finish_streaming,
-        )
-
-    def _stream_element(
-        self, session_id: str, page: PageBinding, card: RenderedCard
-    ) -> MutationOutcome:
-        """Push text update via CardKit element_content API."""
-        return self._mutator.stream_element(session_id, page, card)
-
-    def _finalize_page(self, session_id: str, page: PageBinding) -> None:
-        """Finalize a stale page."""
-        self._mutator.finalize_page(session_id, page)
-
-    @staticmethod
-    def _is_recreate_outcome(outcome: MutationOutcome) -> bool:
-        return outcome.kind == "reconcile" and outcome.message.startswith(_RECREATE_OUTCOME_PREFIX)
-
-    @staticmethod
-    def _is_stale_binding_outcome(outcome: MutationOutcome) -> bool:
-        """Return whether a confirmed-missing binding is safe to replace now."""
-        if not CardDelivery._is_recreate_outcome(outcome):
-            return False
-        try:
-            code = int(outcome.message.removeprefix(_RECREATE_OUTCOME_PREFIX))
-        except ValueError:
-            return False
-        return code in TransportError.RECREATE_CODES

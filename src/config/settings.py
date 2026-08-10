@@ -3,9 +3,7 @@
 import base64
 import binascii
 import logging as _logging
-import math
 import os
-import re
 import shlex
 from pathlib import Path
 from typing import Literal
@@ -20,8 +18,6 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from src.autonomous.config import AutonomousDeploymentMode
 
 from .card import CardSessionConfig
 from .spec import SpecReviewConfig
@@ -72,11 +68,9 @@ class Settings(BaseSettings):
 
     coco_execution_timeout: int = Field(default=7200, gt=0)
     coco_session_timeout: int = 86400
-    coco_max_output_length: int = 30000
 
     claude_execution_timeout: int = Field(default=7200, gt=0)
     claude_session_timeout: int = 86400
-    claude_max_output_length: int = 30000
     programming_finalization_reserve_s: int = Field(
         default=600,
         ge=0,
@@ -169,9 +163,9 @@ class Settings(BaseSettings):
     acp_diagnostics_snippet_limit: int = 240
     acp_diagnostics_total_limit: int = 2000
 
-    # Claude CLI backend: skip Claude's built-in permission checks.
-    # GhostAP has its own sandbox safety layer, so this is usually safe.
-    claude_cli_skip_permissions: bool = True
+    # Claude CLI permission bypass is opt-in and only valid in the managed
+    # employee sandbox. Ordinary programming keeps Claude's permission checks.
+    claude_cli_skip_permissions: bool = False
 
     # ACP agent command overrides (optional)
     # Example:
@@ -186,24 +180,10 @@ class Settings(BaseSettings):
     # Workflow Engine
     # ------------------------------------------------------------------
 
-    # Generated workflows start immediately by default. Disable only when an
-    # operator explicitly wants the legacy confirmation-card step.
-    workflow_auto_execute: bool = True
-
-    # Sub-workflow budget ratio: fraction of parent budget allocated to each sub-workflow.
-    # Prevents a single sub-workflow from consuming the entire parent budget.
-    # Range: 5% to 50% (enforced via Field validation).
-    workflow_subflow_budget_ratio: float = Field(
-        default=0.2,
-        ge=0.05,
-        le=0.5,
-        description="Fraction of parent budget allocated to each sub-workflow (0.05-0.5)",
-    )
-
-    # Subagent / workflow encouragement hint: when True (default), every
+    # Subagent encouragement hint: when True (default), every
     # agent() prompt template and every script-generation prompt template
     # includes a trailing paragraph that encourages the model to delegate to
-    # subagents and invoke sub-workflows.  Set to False to suppress the hint
+    # subagents. Set to False to suppress the hint
     # (e.g. for short one-shot calls where the extra verbosity is not useful).
     workflow_subagent_hint_enabled: bool = True
 
@@ -281,7 +261,6 @@ class Settings(BaseSettings):
     # ---- 完成度把控（Completion Control）----
     spec_objective_verify_enabled: bool = True
     spec_objective_verify_timeout: int = 300
-    spec_completion_control_active_verify: bool = True
     spec_completion_gate_enabled: bool = True
     @property
     def spec_review(self) -> "SpecReviewConfig":
@@ -308,11 +287,6 @@ class Settings(BaseSettings):
             pass_streak_required=self.spec_review_pass_streak_required,
         )
 
-    # Streaming card collapsible panels (tool calls / thoughts folded by default)
-    # Engine card collapsible panels (Deep/Spec: structured content with collapsible panels)
-    engine_collapsible_enabled: bool = True
-
-    # Streaming card auto-continuation (create new card when content exceeds threshold)
     # Card session / delivery / UI configuration (nested model)
     card: CardSessionConfig = CardSessionConfig()
 
@@ -379,9 +353,6 @@ class Settings(BaseSettings):
     spec_max_consecutive_failures: int = 3
     spec_model_switch_enabled: bool = True
     spec_generated_specs_retention: int = 1000
-    # Override hint: when set (non-empty), mask BUILD phase errors to "Internal error"
-    spec_failed_task_id_override: str = ""
-
     streaming_enabled: bool = True
 
     # Feishu WebSocket reconnect delay (seconds) when underlying client exits unexpectedly
@@ -399,8 +370,6 @@ class Settings(BaseSettings):
     message_cache_ttl: int = 300
     # 消息去重缓存最大容量
     message_cache_max_size: int = 1000
-    # 消息去重缓存清理间隔（秒）
-    message_cache_cleanup_interval: int = 60
     # 系统命令并发数
     system_command_concurrency: int = 10
     # Spec 引擎任务限流容量
@@ -411,12 +380,6 @@ class Settings(BaseSettings):
     spec_circuit_breaker_threshold: int = 10
     # Spec 引擎任务熔断恢复超时（秒）
     spec_circuit_breaker_recovery: float = 5.0
-
-    # Streaming flow control (Adaptive interval)
-    streaming_adaptive_interval_base: float = 0.3  # Base interval (seconds) for low rate
-    streaming_adaptive_interval_max: float = 2.0  # Max interval (seconds) for high rate
-    streaming_adaptive_rate_low: float = 20.0  # Low rate threshold (chars/sec)
-    streaming_adaptive_rate_high: float = 150.0  # High rate threshold (chars/sec)
 
     # ------------------------------------------------------------------
     # IM API / Deep Streaming Control
@@ -469,6 +432,7 @@ class Settings(BaseSettings):
     restart_gate_timeout: float = Field(
         default=7200.0,
         gt=0,
+        allow_inf_nan=False,
         validation_alias=AliasChoices(
             "restart_gate_timeout",
             "GHOSTAP_RESTART_GATE_TIMEOUT",
@@ -502,24 +466,14 @@ class Settings(BaseSettings):
             )
         return str(normalized)
 
-    @field_validator("restart_gate_timeout")
-    @classmethod
-    def _validate_restart_gate_timeout(cls, value: float) -> float:
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError("restart gate timeout must be finite and > 0")
-        return value
-
     # 消息回复模式配置
     # - direct: 直接回复（消息显示在被回复消息下方）
     # - thread: 话题回复（使用 reply_in_thread=True，消息会显示在独立话题区域，更整洁）
     #
-    # smart_reply_mode: 智能模式下的回复方式（默认 direct，群内直接引用消息回复）
     # default_reply_mode: 其他模式（Coco/Claude/Shell/Deep等）的回复方式（默认 thread，话题回复更整洁）
-    smart_reply_mode: str = "direct"
     default_reply_mode: str = "thread"
 
     thread_programming_enabled: bool = True
-    thread_context_ttl: int = 86400 * 7
 
     # ref-note 关联信息开关（默认关闭，调试时可通过 .env 设置 REF_NOTE_ENABLED=true）
     ref_note_enabled: bool = False
@@ -559,17 +513,11 @@ class Settings(BaseSettings):
     admin_user_ids: str = ""
 
     # ------------------------------------------------------------------
-    # Autonomous Work System
-    # Configuration requests a deployment surface; effective write autonomy
-    # is derived separately from runtime safety attestations.
+    # Employee Department persistence
     # ------------------------------------------------------------------
-    autonomous_deployment_mode: AutonomousDeploymentMode = AutonomousDeploymentMode.OFF
-    autonomous_write_enabled: bool = False
     autonomous_state_dir: str = "~/.ghostap/autonomy"
     autonomous_journal_dir: str = "~/.ghostap/autonomy/journal"
     autonomous_journal_hmac_key: SecretStr = SecretStr("")
-    autonomous_snapshot_dir: str = "~/.ghostap/autonomy/snapshots"
-    autonomous_blob_dir: str = "~/.ghostap/autonomy/blobs"
     # Team employee data-continuity ABI. Keep this root stable so existing
     # employee workspaces remain discoverable across upgrades.
     autonomous_employee_storage_base: str = "~/.ghostap/slock"
@@ -630,10 +578,6 @@ class Settings(BaseSettings):
         le=3600,
         allow_inf_nan=False,
     )
-    # Persistent coordination is the normal employee-Team runtime.
-    autonomous_team_runtime_mode: Literal["legacy_pipeline", "coordinator"] = (
-        "coordinator"
-    )
     autonomous_team_coordinator_tool: str = "coco"
     autonomous_team_coordinator_model: str = ""
     autonomous_team_coordinator_profile: str = ""
@@ -651,26 +595,6 @@ class Settings(BaseSettings):
         lt=3.0,
         allow_inf_nan=False,
     )
-    autonomous_employee_ingress_max_payload_bytes: int = Field(
-        default=256 * 1024,
-        ge=1,
-        le=256 * 1024,
-    )
-    autonomous_employee_ingress_max_attachment_count: int = Field(
-        default=10,
-        ge=1,
-        le=10,
-    )
-    autonomous_employee_ingress_max_attachment_bytes: int = Field(
-        default=20 * 1024 * 1024,
-        ge=1,
-        le=20 * 1024 * 1024,
-    )
-    autonomous_employee_ingress_max_total_attachment_bytes: int = Field(
-        default=50 * 1024 * 1024,
-        ge=1,
-        le=50 * 1024 * 1024,
-    )
     autonomous_employee_ingress_blob_dir: str = (
         "~/.ghostap/autonomy/ingress-blobs"
     )
@@ -685,11 +609,6 @@ class Settings(BaseSettings):
         ge=1,
         le=1_000_000,
     )
-    # ``actor`` is the normal employee runtime and never falls back to one-shot.
-    # Other declared modes are reserved for controlled diagnostics.
-    autonomous_employee_runtime_mode: Literal[
-        "legacy_one_shot", "shadow", "actor"
-    ] = "actor"
     autonomous_employee_session_idle_ttl_seconds: float = Field(
         default=900.0,
         gt=0,
@@ -701,36 +620,8 @@ class Settings(BaseSettings):
     autonomous_employee_queue_per_team_limit: int = Field(default=32, ge=1, le=100_000)
     autonomous_employee_queue_global_limit: int = Field(default=128, ge=1, le=1_000_000)
     autonomous_manager_acl: str = ""
-    autonomous_anchor_provider: str = ""
     autonomous_anchor_path: str = "~/.ghostap/autonomy/journal.anchor"
-    autonomous_sandbox_required: bool = True
-    autonomous_worker_sandbox_verified: bool = False
-    autonomous_oracle_sandbox_verified: bool = False
-    autonomous_memory_enabled: bool = False
-    autonomous_vc_enabled: bool = False
-    autonomous_goal_queue_limit: int = Field(default=1000, ge=1)
-    autonomous_run_queue_limit: int = Field(default=100, ge=1)
     autonomous_visible_employee_limit: int = Field(default=8, ge=0)
-    autonomous_employee_auto_activation: bool = True
-    autonomous_employee_release_evidence_bundle: str = (
-        "~/.ghostap/autonomy/employee-release-evidence.jsonl"
-    )
-    autonomous_employee_release_checkpoint: str = (
-        "~/.ghostap/autonomy/employee-release-attestation.json"
-    )
-    autonomous_employee_release_public_key: str = ""
-    autonomous_employee_release_key_id: str = ""
-    autonomous_employee_release_id: str = ""
-    autonomous_employee_commit_sha: str = ""
-    autonomous_employee_service_instance_id: str = ""
-    autonomous_employee_staging_tenant_hash: str = ""
-    autonomous_employee_production_tenant_hash: str = ""
-    autonomous_employee_release_trust_socket: str = ""
-    autonomous_employee_release_trust_timeout_seconds: float = Field(
-        default=2.0,
-        gt=0,
-        le=30,
-    )
     autonomous_main_bot_audit_dir: str = (
         "~/.ghostap/autonomy/main-bot-send-audit"
     )
@@ -752,10 +643,6 @@ class Settings(BaseSettings):
         "autonomous_fire_grace_seconds",
         "autonomous_context_max_pages",
         "autonomous_employee_ingress_ack_timeout_seconds",
-        "autonomous_employee_ingress_max_payload_bytes",
-        "autonomous_employee_ingress_max_attachment_count",
-        "autonomous_employee_ingress_max_attachment_bytes",
-        "autonomous_employee_ingress_max_total_attachment_bytes",
         "autonomous_employee_queue_per_employee_limit",
         "autonomous_employee_queue_per_team_limit",
         "autonomous_employee_queue_global_limit",
@@ -830,33 +717,14 @@ class Settings(BaseSettings):
             raise ValueError("autonomous_anchor_path must be a non-empty path")
         return value
 
-    @field_validator("autonomous_anchor_provider")
-    @classmethod
-    def _validate_autonomous_anchor_provider(cls, value: str) -> str:
-        if value == "":
-            return value
-        if not isinstance(value, str) or re.fullmatch(r"[a-z][a-z0-9_-]*", value) is None:
-            raise ValueError(
-                "autonomous_anchor_provider must be a stable lowercase identifier"
-            )
-        return value
-
-    @field_validator("autonomous_employee_release_trust_timeout_seconds", mode="before")
-    @classmethod
-    def _reject_boolean_release_trust_timeout(cls, value: object) -> object:
-        if isinstance(value, bool):
-            raise ValueError("release trust timeout rejects booleans")
-        return value
-
     @field_validator(
-        "autonomous_employee_release_trust_socket",
         "autonomous_main_bot_audit_dir",
         "autonomous_main_bot_audit_anchor_path",
     )
     @classmethod
-    def _validate_employee_release_paths(cls, value: str) -> str:
+    def _validate_main_bot_audit_paths(cls, value: str) -> str:
         if not isinstance(value, str) or "\x00" in value:
-            raise ValueError("employee release paths must be text without NUL")
+            raise ValueError("main Bot audit paths must be text without NUL")
         return value
 
     @field_validator("autonomous_history_timezone")
@@ -903,33 +771,23 @@ class Settings(BaseSettings):
     max_evicted_cache: int = 200  # evicted_chat_ids 有界 LRU 上限
     project_chat_suffix: str = "dev"  # 项目专属群名称后缀
 
-    @field_validator("max_allowed_chat_ids", mode="before")
+    @field_validator(
+        "max_allowed_chat_ids",
+        "lock_confirm_timeout",
+        "max_evicted_cache",
+        "repo_lock_idle_timeout",
+        "repo_lock_cleanup_interval",
+        "repo_lock_hard_timeout",
+        "chat_lock_max_duration",
+        "chat_lock_cleanup_interval",
+        mode="before",
+    )
     @classmethod
-    def _max_allowed_chat_ids_must_be_positive(cls, v: int, info) -> int:
-        if int(v) < 1:
-            raise ValueError(f"{info.field_name.upper()} 必须 ≥ 1（当前值: {v}）")
-        return int(v)
-
-    @field_validator("lock_confirm_timeout", "max_evicted_cache", mode="before")
-    @classmethod
-    def _lock_confirm_and_evicted_cache_must_be_positive(cls, v: int, info) -> int:
-        if int(v) < 1:
+    def _positive_int(cls, v: int, info: ValidationInfo) -> int:
+        value = int(v)
+        if value < 1:
             raise ValueError(f"{info.field_name.upper()} 必须 > 0（当前值: {v}）")
-        return int(v)
-
-    @field_validator("repo_lock_idle_timeout", "repo_lock_cleanup_interval", "repo_lock_hard_timeout", mode="before")
-    @classmethod
-    def _repo_lock_timers_must_be_positive(cls, v: int, info) -> int:
-        if int(v) < 1:
-            raise ValueError(f"{info.field_name.upper()} 必须 > 0（当前值: {v}）")
-        return int(v)
-
-    @field_validator("chat_lock_max_duration", "chat_lock_cleanup_interval", mode="before")
-    @classmethod
-    def _chat_lock_timers_must_be_positive(cls, v: int, info) -> int:
-        if int(v) < 1:
-            raise ValueError(f"{info.field_name.upper()} 必须 > 0（当前值: {v}）")
-        return int(v)
+        return value
 
     @field_validator("lock_undo_window_seconds", mode="before")
     @classmethod
@@ -947,64 +805,33 @@ class Settings(BaseSettings):
         return val
 
     @field_validator(
-        "spec_review_timeout", "spec_review_min_timeout", "spec_review_hard_floor",
+        "spec_review_timeout",
+        "spec_review_min_timeout",
+        "spec_review_hard_floor",
         "spec_review_startup_timeout",
-        mode="before",
-    )
-    @classmethod
-    def _spec_review_timeout_fields_must_be_positive(cls, v: int, info) -> int:
-        val = int(v)
-        if val < 1:
-            raise ValueError(f"{info.field_name} 必须 > 0，当前值为 {v}")
-        return val
-
-    @field_validator("spec_review_max_parallel", mode="before")
-    @classmethod
-    def _spec_review_max_parallel_must_be_in_range(cls, v: int, info) -> int:
-        val = int(v)
-        if val < 1:
-            raise ValueError(f"{info.field_name} 必须 ≥ 1，当前值为 {v}")
-        if val > 20:
-            raise ValueError(f"{info.field_name} 必须 ≤ 20，当前值为 {v}")
-        return val
-
-    @field_validator(
+        "spec_review_max_parallel",
         "spec_review_dynamic_roles_max",
         "spec_review_total_roles_max",
         "spec_review_pass_streak_required",
+        "spec_review_retry_max_delay",
+        "spec_review_retry_max_attempts",
         mode="before",
     )
     @classmethod
-    def _spec_review_adaptive_fields_must_be_positive(cls, v: int, info) -> int:
-        val = int(v)
-        if val < 1:
-            raise ValueError(f"{info.field_name} 必须 > 0，当前值为 {v}")
-        if info.field_name == "spec_review_total_roles_max" and val < 5:
-            raise ValueError(f"{info.field_name} 必须 ≥ 5，当前值为 {v}")
-        return val
-
-    @field_validator("spec_review_retry_max_delay", mode="before")
-    @classmethod
-    def _spec_retry_max_delay_must_be_positive(cls, v: int, info) -> int:
-        if int(v) < 1:
-            raise ValueError(f"{info.field_name} 必须 > 0，当前值为 {v}")
-        return int(v)
-
-    @field_validator("spec_review_retry_max_attempts", mode="before")
-    @classmethod
-    def _spec_retry_max_attempts_must_be_non_negative(cls, v: int, info) -> int:
-        val = int(v)
-        if val < 0:
+    def _bounded_spec_review_int(cls, v: int, info: ValidationInfo) -> int:
+        bounds = {
+            "spec_review_max_parallel": (1, 20),
+            "spec_review_total_roles_max": (5, None),
+            "spec_review_retry_max_attempts": (0, 10),
+        }
+        lower, upper = bounds.get(info.field_name, (1, None))
+        value = int(v)
+        if value < lower or (upper is not None and value > upper):
+            ceiling = f", {upper}" if upper is not None else ""
             raise ValueError(
-                f"{info.field_name} 必须 ≥ 0（设为 0 可禁用重试），当前值为 {v}"
+                f"{info.field_name} 必须在 [{lower}{ceiling}] 范围内，当前值为 {v}"
             )
-        # 上限 10：单次 retry 耗时 ≈ max_delay + adaptive_timeout * multiplier，
-        # 10 次重试可能导致单 cycle 总耗时超过 cycle budget，不建议生产使用（推荐 1-3）。
-        if val > 10:
-            raise ValueError(
-                f"{info.field_name} 必须 ≤ 10（推荐 1-3），当前值为 {v}"
-            )
-        return val
+        return value
 
     @field_validator("spec_review_role_timeout_multipliers", mode="before")
     @classmethod
@@ -1036,12 +863,9 @@ class Settings(BaseSettings):
             return data
         # Map from flat Settings field name (card_xxx) to CardSessionConfig field name (xxx)
         _CARD_FIELD_MAP = {
-            "card_collapsible_enabled": "collapsible_enabled",
             "card_continuation_enabled": "continuation_enabled",
-            "card_button_layout": "button_layout",
             "card_button_size": "button_size",
             "card_mobile_force_vertical": "mobile_force_vertical",
-            "card_deep_compact_default": "deep_compact_default",
             "card_max_chars": "max_chars",
             "card_session_lock_max": "session_lock_max",
             "card_session_lock_ttl": "session_lock_ttl",
@@ -1053,7 +877,6 @@ class Settings(BaseSettings):
             "card_delivery_api_timeout": "delivery_api_timeout",
             "card_action_dedup_ttl": "action_dedup_ttl",
             "card_action_dedup_max_size": "action_dedup_max_size",
-            "card_action_dedup_cleanup_interval": "action_dedup_cleanup_interval",
             "card_ticker_interval": "ticker_interval",
             "card_task_level_cards_enabled": "task_level_cards_enabled",
             "card_max_task_cards": "max_task_cards",

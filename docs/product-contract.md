@@ -16,12 +16,23 @@ engineering environment.
 - Direct programming keeps the selected Agent's existing session, cancellation,
   retry and streaming-card semantics; the control plane does not add a planning
   or routing model call.
+- Direct, Deep, Spec and Workflow automatically advance each accepted task to a
+  successful or explicit failed terminal state. Missing ordinary choices use the
+  saved or recommended default; bounded recovery never turns into a request for
+  the user to select an Agent, confirm a script, approve continuation or resume.
+- Users retain explicit stop and configuration controls. High-risk actions that
+  were not precisely authorized by the original request remain fail-closed; safe
+  work may continue without weakening ACP permission checks.
 - `/hire <name>` creates a durable Employee Bot through the controlled
   tool/model/profile flow. Arbitrary `/hire --prompt` input is rejected.
 - The standalone Autonomous Manager command surface is retired. Employee and team
   actually connected to production.
 - Deep and Spec remain protected execution strategies rather than being rewritten
   as a shared workflow.
+- Workflow generates task-specific JavaScript and scales from one Agent to the
+  `classify`, `fanout`, `verify`, `generate`, `tournament`, `loop`, `sequence` and
+  `race` primitives. Its runtime owns deterministic control flow while Agents own
+  semantic work.
 
 This contract describes product boundaries. Security controls, process isolation
 and file-backed durability must not be presented as stronger guarantees than the

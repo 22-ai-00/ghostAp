@@ -39,17 +39,6 @@ if TYPE_CHECKING:
     from .image_handler import FeishuImageHandler
 
 
-@dataclass(frozen=True)
-class HandlerDependencyView:
-    """Narrow dependency surface for handlers that do not need the full container."""
-    settings: Any
-    scheduler: Any
-    project_manager: Any
-    message_linker: Any
-    mode_manager: Any
-    context_manager: Any
-
-
 @dataclass
 class HandlerContext:
     """All shared dependencies that handlers need, injected once."""
@@ -115,14 +104,3 @@ class HandlerContext:
     managed_group_owner_id: str = ""
     managed_group_receiving_bot_ref: str = ""
     managed_group_bot_rotation: Optional[Callable[[str], tuple[int, int]]] = None
-
-    def dependency_view(self) -> HandlerDependencyView:
-        """Return a minimal service view while keeping existing fields compatible."""
-        return HandlerDependencyView(
-            settings=self.settings,
-            scheduler=self.scheduler,
-            project_manager=self.project_manager,
-            message_linker=self.message_linker,
-            mode_manager=self.mode_manager,
-            context_manager=self.context_manager,
-        )

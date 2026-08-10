@@ -1,5 +1,3 @@
-import asyncio
-import inspect
 import json
 import os
 import stat
@@ -17,7 +15,6 @@ from src.autonomous.journal import (
     AnchorMismatchError,
     CommitState,
     JournalClosedError,
-    JournalEntry,
     JournalWriter,
     MemoryAnchor,
     WriterLockError,
@@ -211,12 +208,6 @@ class BlockingFsOps:
             os.close(fd)
 
 
-def resolve_compat_result(value: Any) -> Any:
-    if inspect.isawaitable(value):
-        return asyncio.run(value)
-    return value
-
-
 def test_second_writer_fails_nonblocking_and_close_releases_lock(
     tmp_path: Path,
 ) -> None:
@@ -359,24 +350,6 @@ def test_anchor_cas_failure_is_durable_but_closes_writes_and_restart_fails_close
     writer.close()
     with pytest.raises(AnchorMismatchError):
         open_writer(base_dir, durable_anchor, writer_epoch=8)
-
-
-def test_compatibility_commit_frame_does_not_hide_unanchored_state(
-    tmp_path: Path,
-) -> None:
-    writer = open_writer(
-        tmp_path / "journal",
-        RejectingAnchor(MemoryAnchor()),
-    )
-    entry = JournalEntry(
-        entry_type="goal_created",
-        entity_id="goal_1",
-        data={"objective": "durable"},
-    )
-
-    with pytest.raises(AnchorMismatchError, match="not anchored"):
-        resolve_compat_result(writer.commit_frame([entry]))
-    writer.close()
 
 
 def test_anchor_exception_is_durable_but_closes_writes(
@@ -696,24 +669,3 @@ def test_replay_rejects_event_and_version_key_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(JournalIntegrityError, match="aggregate"):
         open_writer(base_dir, anchor)
-
-
-def test_compatibility_commit_frame_uses_the_canonical_journal_chain(
-    tmp_path: Path,
-) -> None:
-    base_dir = tmp_path / "journal"
-    with open_writer(base_dir, MemoryAnchor()) as writer:
-        first = committed_frame(writer.commit([event()], {"goal_1": 0}))
-        legacy_entry = JournalEntry(
-            entry_type="goal_state_changed",
-            entity_id="goal_1",
-            data={"state": "active"},
-        )
-        second = committed_frame(
-            resolve_compat_result(writer.commit_frame([legacy_entry]))
-        )
-        replayed = list(writer.replay(from_sequence=1))
-
-    assert [frame.sequence for frame in replayed] == [1, 2]
-    assert second.previous_hash == first.frame_hash
-    assert list(base_dir.rglob("*.jsonl")) == [journal_path(base_dir)]

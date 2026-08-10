@@ -210,43 +210,6 @@ class EmployeeIngressService:
             self._ensure_open_unlocked()
             self._admission_closed = True
 
-    def close_employee(
-        self,
-        tenant_key: str,
-        agent_id: str,
-        *,
-        reason_code: str,
-    ) -> bool:
-        """Durably reject future ACKs for one employee; idempotent on replay."""
-
-        if not all(
-            isinstance(value, str) and value and value == value.strip()
-            for value in (tenant_key, agent_id, reason_code)
-        ):
-            raise ValueError("employee ingress closure fields must be non-empty")
-        employee_key = (tenant_key, agent_id)
-        aggregate_id = f"employee-ingress:{tenant_key}:{agent_id}"
-        with self._mutex, self._writer.transaction_guard():
-            self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
-            if employee_key in self._state.closed_employees:
-                return False
-            self._commit_unlocked(
-                aggregate_id,
-                JournalEvent(
-                    event_type="employee.ingress.closed",
-                    aggregate_id=aggregate_id,
-                    payload={
-                        "tenant_key": tenant_key,
-                        "agent_id": agent_id,
-                        "reason_code": reason_code,
-                        "closed_at": _utc_now(),
-                    },
-                ),
-            )
-            if employee_key not in self._state.closed_employees:
-                raise IngressWriteDisabledError("employee ingress closure was not applied")
-            return True
 
     def accept(
         self,

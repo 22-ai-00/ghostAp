@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from .models import ContextMessage, EmployeeMessageScope
 
@@ -31,10 +31,6 @@ class MessagePage:
 
 class CredentialResolver(Protocol):
     def resolve(self, credential_ref: str, agent_id: str, app_id: str) -> str: ...
-
-
-class EmployeeClientBuilder(Protocol):
-    def __call__(self, *, app_id: str, app_secret: str, timeout: float) -> Any: ...
 
 
 class EmployeeScopedMessageSource(Protocol):
@@ -80,7 +76,6 @@ class EmployeeMessageSourceFactory(Protocol):
 
 __all__ = [
     "CredentialResolver",
-    "EmployeeClientBuilder",
     "EmployeeMessageSourceFactory",
     "EmployeeScopedMessageSource",
     "MessagePage",

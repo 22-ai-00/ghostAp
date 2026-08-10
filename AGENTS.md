@@ -65,31 +65,32 @@ uv run python scripts/test_inventory.py tests/
 
 ## 自主工作系统 (`src/autonomous/`)
 
+- **现役生产面是 Employee Department**。旧 Goal/Run Manager、AgentRuntime、Policy/Broker、Scheduler/Reporter/Verifier 已退役，不要重新接回生产入口。
 
 - **Journal 是唯一事实源**。所有状态变更通过 `JournalWriter.write_event()` 记录。投影和快照可从 Journal 重放重建。
 - **域对象冻结**。`domain/` 下的 dataclass 都是 `frozen=True`，状态变更使用 `dataclasses.replace()` 而非赋值。
 - **Effect 在派发前必须锚定**。PREPARED 和 EXECUTING 帧必须 fsync 并锚定后才能发起外部调用。
 - **终态需要 finalization**。Run 在有未解决 Effect 或未处置已提交 Effect 时不能进入终态。
-- **默认拒绝**。Policy 层对所有操作默认拒绝，需显式授权。
+- **默认拒绝**。`src/trust/action_matrix.py` 对所有操作默认拒绝，需显式授权。
 - **Assist 不写入**。`assist` 模式下系统只读，R4 风险始终拒绝。
 - **飞书 SDK 使用官方包**。消息/卡片投递使用 `lark-oapi`，WebSocket 事件订阅使用 `lark-channel-sdk`。不要手写 HTTP 调用。
 
 关键模块入口：
 
-- `src/autonomous/bootstrap.py`：生产组装根，初始化 lark-oapi 客户端。
-- `src/autonomous/coordinator.py`：Goal/Run 生命周期编排。
-- `src/autonomous/planner.py`：计划编译。
+- `src/autonomous/provisioning/composition.py`：Employee Department 生产组装根。
+- `src/autonomous/provisioning/hire_service.py`：员工创建与配置编排。
+- `src/autonomous/gateway/coordinator.py`：现役 Effect 派发与恢复协调。
 - `src/autonomous/domain/state_machine.py`：纯状态转换函数（`transition_run/plan/step/effect`）。
 - `src/autonomous/journal/writer.py`：单写入者，fsync + flock。
-- `src/autonomous/broker/dispatch_gate.py`：线性化派发门。
-- `src/autonomous/manager/feishu_adapter.py`：使用 lark-oapi 的飞书投递适配器。
-- `src/autonomous/manager/cards.py`：交互式卡片模板（员工创建、进度、审批）。
-- `src/autonomous/supervisor/supervisor.py`：系统启动/恢复/关闭。
+- `src/trust/action_matrix.py`：权威动作授权矩阵。
+- `src/autonomous/runtime/employee_actor.py`：现役员工 actor 执行循环。
+- `src/autonomous/supervisor/employee_channels.py`：员工 Channel SDK 进程生命周期。
+- `src/autonomous/provisioning/channel_worker.py`：由 supervisor 通过文件路径启动的 Channel 子进程入口。
 
 测试命令：
 
 ```bash
-uv run pytest tests/autonomous/ -q          # 577+ 测试
+uv run pytest tests/autonomous/ -q
 uv run ruff check src/autonomous/           # 0 错误
 ```
 
@@ -168,7 +169,6 @@ Workflow 引擎提供 6+2 个高阶编排原语，作为 JS 运行时全局函�
 
 **安全约束**：`generate()` 上限 50；`loop()` 硬上限 50；`MAX_TOTAL_AGENTS`（200）由 Python 侧强制。所有原语通过 `sandboxWrapHostFn` 包装。
 
-**内置模板**（`src/workflow_engine/builtin_templates/`）：smart-router、tournament-solve、loop-hunt、generate-filter、adversarial-review、batch-migration、code-audit、refactor-pipeline、test-generation、doc-generation、performance-analysis。
 
 错误处理：
 - 任一步骤为空选择时，卡片中会显示内联错误；用户需要选择至少一个工具/模型并重试。
@@ -182,7 +182,6 @@ Workflow 引擎提供 6+2 个高阶编排原语，作为 JS 运行时全局函�
 | 命令 | 用途 |
 | --- | --- |
 | `/wf <需求描述>` | 从需求描述启动新工作流 |
-| `/wf <模板名称>` | （可选）从保存的模板名称启动 |
 | `/stop_wf` | 中止当前运行的工作流 |
 | `/wf_status` | 显示活动工作流进度和已选工具 |
 | `/wf_help` | 聊天内帮助文本 |
@@ -250,3 +249,16 @@ Workflow 引擎提供 6+2 个高阶编排原语，作为 JS 运行时全局函�
 - 评审 Agent 对编排器的工作提供反馈
 - 最终输出将所有 Agent 结果合并为一个连贯的交付物
 - 进度通过工作流进度卡片实时流式传输
+## 全自动执行契约
+
+普通编程、Deep、Spec、Workflow 在收到任务后均应自动推进到成功或明确失败终态：
+
+- 使用项目已保存配置；缺失时采用可用的推荐工具和后端默认模型。
+- 普通、安全、可逆的选择自动采用推荐项；高风险且未经原始请求精确授权的操作自动拒绝或跳过，并继续安全部分。
+- Agent 提问、Review 不确定、格式修复和暂时性失败使用有界自动恢复；耗尽后明确失败，不进入等待用户状态。
+- 只保留用户主动的停止/取消和显式配置入口；任务主路径不得要求选择 Agent、确认脚本、批准继续或手动恢复。
+- ACP 权限保持 fail-closed，只允许明确的一次性安全授权；禁止以跳过权限检查换取自动化。
+
+Workflow 使用 `src/workflow_engine/runtime/runtime.js` 提供的 `classify`、`fanout`、`verify`、`generate`、`tournament`、`loop`、`sequence`、`race` 原语动态生成任务专用 JS。运行时负责确定性控制流，Agent 负责语义工作；简单任务保持单 Agent，复杂度增长时再组合原语。
+
+Workflow 飞书卡片显示任务摘要、阶段统计和所有直接 `agent()` 调用的调度状态；每个 Agent 只显示一条最新操作，终态通过分页或附件完整交付结果。ACP 内部嵌套 Agent 在协议缺少权威列表时只能标记为观测信息，不得从陈旧快照推断终态。

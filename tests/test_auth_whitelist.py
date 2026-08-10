@@ -9,6 +9,7 @@ Covers:
 
 import hashlib
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -142,13 +143,14 @@ class TestWhitelistEnforcement:
         client._employee_department_runtime = MagicMock()
         client._handle_image_content = MagicMock()
         client._is_likely_shell_command_message = MagicMock(return_value=False)
-        # Router-bound methods (normally attached by bind_forwarding_methods)
-        client._ensure_request_id = MagicMock(return_value="req_test_001")
+        coco_handler = MagicMock()
+        coco_handler.ensure_request_id.return_value = "req_test_001"
+        client._handler_ctx = SimpleNamespace(
+            handlers={"coco": coco_handler, "system": MagicMock()}
+        )
         client._get_api_client = MagicMock()
         # Mock _dispatch_message_logic to track whether it was called
         client._dispatch_message_logic = MagicMock()
-        client._show_help = MagicMock()
-        client._reply_text = MagicMock()
         client._dispatch_empty_text = MagicMock()
         return client
 
@@ -254,7 +256,6 @@ class TestWhitelistEnforcement:
 
         mock_resolve_name.assert_not_called()
         client._chat_lock_gate.check.assert_not_called()
-        client._employee_department_runtime.record_group_event.assert_not_called()
         client._handle_image_content.assert_not_called()
         client._dispatch_message_logic.assert_not_called()
 
@@ -287,20 +288,19 @@ class TestWhitelistEnforcement:
         parse_result = client._get_image_handler.return_value.parse_message.return_value
         parse_result.text = "/access allow-chat"
         parse_result.image_keys = ["img_ignored"]
-        client._system_handler = MagicMock()
+        system_handler = client._handler_ctx.handlers["system"]
         data = _make_fake_data(chat_id="oc_new", sender_id="ou_ok")
 
         client._process_message_async(data)
 
-        client._system_handler.handle_intercepted_command.assert_called_once()
-        call = client._system_handler.handle_intercepted_command.call_args
+        system_handler.handle_intercepted_command.assert_called_once()
+        call = system_handler.handle_intercepted_command.call_args
         assert call.args[:3] == (
             "om_001",
             "oc_new",
             "/access allow-chat",
         )
         assert call.kwargs["command_match"].command == "/access"
-        client._employee_department_runtime.record_group_event.assert_not_called()
         client._handle_image_content.assert_not_called()
         client._chat_lock_gate.check.assert_not_called()
         mock_resolve_name.assert_not_called()
@@ -371,6 +371,5 @@ class TestWhitelistEnforcement:
 
         client._process_message_async(data)
 
-        client._employee_department_runtime.record_group_event.assert_not_called()
         client._handle_image_content.assert_not_called()
         client._dispatch_message_logic.assert_not_called()

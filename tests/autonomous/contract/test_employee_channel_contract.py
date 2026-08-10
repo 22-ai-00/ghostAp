@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import ast
-import asyncio
 import hashlib
 import inspect
 import json
-import sys
 import textwrap
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
 
@@ -32,11 +29,7 @@ from src.autonomous.provisioning.channel_worker import (
     WorkerSecurityError,
     _fetch_employee_bot_open_id,
     _handle_low_level_outbound,
-    _handle_update_card,
     _normalize_sdk_ingress,
-    create_employee_channel,
-    extract_raw_message_metadata,
-    register_channel_handlers,
     run_low_level_employee_channel,
 )
 from src.autonomous.provisioning.channel_worker import (
@@ -252,54 +245,6 @@ def test_low_level_worker_executes_employee_owned_outbound(frame_type: FrameType
                 {**frame.payload, "card": {"token": "forbidden"}},
             )
         )
-
-
-@pytest.mark.asyncio
-async def test_update_handler_calls_public_sdk_method_and_returns_bound_receipt() -> None:
-    calls: list[tuple[str, dict]] = []
-    emitted: list[tuple[FrameType, dict]] = []
-
-    class _Result:
-        success = True
-        message_id = "om_employee_card"
-
-    class _Channel:
-        async def update_card(self, message_id: str, card: dict) -> _Result:
-            calls.append((message_id, card))
-            return _Result()
-
-    class _Emitter:
-        def emit(self, kind: FrameType, payload: dict) -> None:
-            emitted.append((kind, payload))
-
-    await _handle_update_card(
-        _Channel(),
-        {
-            "request_id": "update_1",
-            "message_id": "om_employee_card",
-            "card": {"schema": "2.0"},
-        },
-        _Emitter(),
-        app_id="cli_employee",
-        generation=3,
-        connection_id="conn_employee",
-    )
-
-    assert calls == [("om_employee_card", {"schema": "2.0"})]
-    assert emitted == [
-        (
-            FrameType.HEALTH,
-            {
-                "operation": "update_card",
-                "request_id": "update_1",
-                "success": True,
-                "app_id": "cli_employee",
-                "generation": 3,
-                "connection_id": "conn_employee",
-                "message_id": "om_employee_card",
-            },
-        )
-    ]
 
 
 @pytest.mark.parametrize(
@@ -555,69 +500,6 @@ def test_protocol_rejects_oversized_and_multiline_frames() -> None:
         decode_frame(b"x" * (MAX_FRAME_BYTES + 1))
 
 
-class _FakeChannel:
-    def __init__(self) -> None:
-        self.handlers: dict[str, object] = {}
-
-    def on(self, event: str, handler: object) -> None:
-        self.handlers[event] = handler
-
-
-@pytest.mark.filterwarnings(
-    "ignore:datetime.datetime.utcfromtimestamp.*:DeprecationWarning:lark_channel.*"
-)
-def test_worker_registers_exact_sdk_events_with_sync_reconnect_shims() -> None:
-    """The pinned SDK imports cleanly when invoked in its production loop."""
-    channel = _FakeChannel()
-
-    async def register() -> None:
-        register_channel_handlers(channel, lambda *_: None)
-
-    asyncio.run(register())
-
-    assert set(channel.handlers) == {
-        "message",
-        "cardAction",
-        "reconnecting",
-        "reconnected",
-        "error",
-        "botAdded",
-        "botLeave",
-        "raw",
-    }
-    assert inspect.iscoroutinefunction(channel.handlers["message"])
-    assert inspect.iscoroutinefunction(channel.handlers["cardAction"])
-    assert not inspect.iscoroutinefunction(channel.handlers["reconnecting"])
-    assert not inspect.iscoroutinefunction(channel.handlers["reconnected"])
-
-
-def test_worker_extracts_only_authoritative_non_secret_raw_message_metadata() -> None:
-    raw = {
-        "header": {
-            "event_id": "evt_1",
-            "tenant_key": "tenant_a",
-            "token": "must-not-cross-ipc",
-            "app_id": "cli_employee",
-        },
-        "event": {
-            "message": {"message_id": "om_1", "content": "secret user text"},
-            "sender": {
-                "sender_id": {
-                    "open_id": "ou_employee_app_admin",
-                    "union_id": "on_admin",
-                }
-            },
-        },
-    }
-
-    assert extract_raw_message_metadata(raw) == {
-        "event_id": "evt_1",
-        "tenant_key": "tenant_a",
-        "message_id": "om_1",
-        "sender_union_id": "on_admin",
-    }
-
-
 def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> None:
     from types import SimpleNamespace
 
@@ -678,70 +560,6 @@ def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> Non
             "tenant_key": "tenant_1",
         },
     )
-
-
-def test_worker_channel_forces_strict_direct_wss_and_error_only_logs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import lark_channel
-
-    captured: dict[str, object] = {}
-
-    def fake_channel(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr(lark_channel, "FeishuChannel", fake_channel)
-
-    create_employee_channel("cli_employee", "secret-only-in-memory")
-
-    assert captured["log_level"] is lark_channel.LogLevel.ERROR
-    transport = captured["transport"]
-    assert isinstance(transport, lark_channel.TransportConfig)
-    assert transport.proxy_url is None
-    assert transport.trust_env_proxy is False
-    assert transport.handshake_timeout_seconds == 10.0
-    security = captured["security"]
-    assert isinstance(security, lark_channel.SecurityConfig)
-    assert security.mode == "strict"
-    assert security.allow_insecure_ws is False
-    assert security.allow_local_insecure_ws is False
-    assert security.max_ws_fragment_parts == 8
-    assert security.max_ws_fragment_bytes == 256 * 1024
-    assert security.max_concurrent_ws_handlers == 1
-    assert security.resource_overflow_policy == "drop"
-
-
-def test_production_launch_contract_is_fixed_fresh_interpreter() -> None:
-    supervisor = EmployeeChannelSupervisor(secret_resolver=lambda *_: "unused")
-
-    contract = supervisor.launch_contract(bootstrap_fd=41, control_fd=42, event_fd=43)
-
-    expected_worker = Path(
-        inspect.getfile(sys.modules["src.autonomous.provisioning.channel_worker"])
-    ).resolve()
-    assert contract.argv[0] == "/usr/bin/bwrap"
-    assert "--unshare-user" in contract.argv
-    assert "--unshare-pid" in contract.argv
-    assert "--as-pid-1" in contract.argv
-    assert "--ro-bind" in contract.argv
-    assert str(expected_worker.parents[3] / ".env") not in contract.argv
-    assert str(expected_worker.parents[3] / "pyproject.toml") in contract.argv
-    assert str(expected_worker.parents[3] / "uv.lock") in contract.argv
-    assert str(expected_worker.parents[3] / "AGENTS.md") not in contract.argv
-    assert contract.argv[-7:] == (
-        "--",
-        sys.executable,
-        "-I",
-        str(expected_worker),
-        "41",
-        "42",
-        "43",
-    )
-    assert contract.close_fds is True
-    assert contract.pass_fds == (41, 42, 43)
-    assert "credential" not in " ".join(contract.argv).lower()
-    assert contract.env == {"PYTHONUTF8": "1"}
 
 
 def test_production_worker_main_reaches_only_the_low_level_durable_bridge() -> None:

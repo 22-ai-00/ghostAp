@@ -1,9 +1,9 @@
 """Unit tests for Claude 1M-context support.
 
 Covers the small surface introduced for the ``[1m]`` model-id suffix:
-capabilities helpers, ANTHROPIC_BETAS env injection, the probe-side
-variant injector, ``_apply_model_args`` round-tripping the suffix, and
-the provider config flag that finally makes ``--model`` reach the CLI.
+capabilities helpers, ANTHROPIC_BETAS env injection,
+``_apply_model_args`` round-tripping the suffix, and the provider config
+flag that finally makes ``--model`` reach the CLI.
 """
 
 from __future__ import annotations
@@ -19,8 +19,6 @@ from src.acp.claude_capabilities import (
     strip_1m_suffix,
     with_1m_suffix,
 )
-from src.acp.helper import _inject_claude_1m_variants
-from src.acp.options import ACPModelOption
 from src.acp.providers import (
     ClaudeProvider,
     _apply_model_args,
@@ -197,58 +195,6 @@ class TestClaudeProviderConfig(unittest.TestCase):
             cmd, args = ClaudeProvider().get_serve_command("claude-opus-4-8[1m]")
         self.assertEqual(cmd, "claude")
         self.assertEqual(args, ["acp", "serve", "--model", "claude-opus-4-8[1m]"])
-
-
-# ---------------------------------------------------------------------------
-# _inject_claude_1m_variants
-# ---------------------------------------------------------------------------
-class TestInject1mVariants(unittest.TestCase):
-    def test_appends_variant_for_supported_model(self):
-        items = [
-            ACPModelOption(name="claude-opus-4-8", description="Opus", is_default=True),
-            ACPModelOption(name="claude-haiku-4-5", description="Haiku"),
-        ]
-        out = _inject_claude_1m_variants(items)
-        names = [m.name for m in out]
-        # Opus picks up a [1m] sibling; Haiku does not.
-        self.assertIn("claude-opus-4-8", names)
-        self.assertIn("claude-opus-4-8[1m]", names)
-        self.assertIn("claude-haiku-4-5", names)
-        self.assertNotIn("claude-haiku-4-5[1m]", names)
-
-    def test_variant_is_marked_supports_1m_and_not_default(self):
-        items = [
-            ACPModelOption(name="claude-opus-4-8", description="Opus", is_default=True),
-        ]
-        out = _inject_claude_1m_variants(items)
-        variant = next(m for m in out if m.name == "claude-opus-4-8[1m]")
-        self.assertTrue(variant.supports_1m)
-        self.assertFalse(variant.is_default)
-        # Description carries the visual badge so the card shows it without
-        # any builder-side change.
-        self.assertIn("🚀", variant.description)
-        self.assertIn("1M", variant.description)
-
-    def test_idempotent_on_already_suffixed_input(self):
-        items = [ACPModelOption(name="claude-opus-4-8[1m]", description="Opus 1M")]
-        out = _inject_claude_1m_variants(items)
-        self.assertEqual([m.name for m in out], ["claude-opus-4-8[1m]"])
-
-    def test_does_not_double_inject_when_both_already_present(self):
-        items = [
-            ACPModelOption(name="claude-opus-4-8", description="Opus"),
-            ACPModelOption(name="claude-opus-4-8[1m]", description="Opus 1M"),
-        ]
-        out = _inject_claude_1m_variants(items)
-        self.assertEqual(
-            sorted(m.name for m in out),
-            ["claude-opus-4-8", "claude-opus-4-8[1m]"],
-        )
-
-    def test_no_changes_when_no_supported_models(self):
-        items = [ACPModelOption(name="claude-haiku-4-5", description="Haiku")]
-        out = _inject_claude_1m_variants(items)
-        self.assertEqual([m.name for m in out], ["claude-haiku-4-5"])
 
 
 if __name__ == "__main__":

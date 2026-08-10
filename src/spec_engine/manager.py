@@ -43,47 +43,26 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
     ) -> tuple[str, str, Optional[str]]:
         normalized_agent = str(agent_type or "").strip().lower()
         normalized_name = str(engine_name or "").strip() or "Coco"
-
-        if normalized_agent == "claude":
-            return "Claude", "claude", None
-        if normalized_agent in {"aiden", "codex", "gemini", "traex", "coco"}:
-            from ..mode import InteractionMode
-
-            mode_map = {
-                "coco": InteractionMode.COCO,
-                "aiden": InteractionMode.AIDEN,
-                "codex": InteractionMode.CODEX,
-                "gemini": InteractionMode.GEMINI,
-                "traex": InteractionMode.TRAEX,
-            }
-            identity = resolve_engine_identity(mode=mode_map[normalized_agent])
-            return identity.engine_name, identity.agent_type, (model_name or identity.model_name)
-        if normalized_agent:
-            return SpecEngine._infer_engine_name(normalized_agent), normalized_agent, model_name
-
         from ..mode import InteractionMode
-        if normalized_name.lower().startswith("claude"):
-            identity = resolve_engine_identity(mode=InteractionMode.CLAUDE)
-            return identity.engine_name, identity.agent_type, identity.model_name
-
-        if normalized_name.lower().startswith("aiden"):
-            identity = resolve_engine_identity(mode=InteractionMode.AIDEN)
-            return identity.engine_name, identity.agent_type, (model_name or identity.model_name)
-
-        if normalized_name.lower().startswith("codex"):
-            identity = resolve_engine_identity(mode=InteractionMode.CODEX)
-            return identity.engine_name, identity.agent_type, (model_name or identity.model_name)
-
-        if normalized_name.lower().startswith("gemini"):
-            identity = resolve_engine_identity(mode=InteractionMode.GEMINI)
-            return identity.engine_name, identity.agent_type, (model_name or identity.model_name)
-
-        if normalized_name.lower().startswith("traex"):
-            identity = resolve_engine_identity(mode=InteractionMode.TRAEX)
-            return identity.engine_name, identity.agent_type, (model_name or identity.model_name)
-
-        identity = resolve_engine_identity(mode=InteractionMode.COCO)
-        return identity.engine_name, identity.agent_type, (model_name or identity.model_name)
+        mode_map = {
+            "coco": InteractionMode.COCO,
+            "claude": InteractionMode.CLAUDE,
+            "aiden": InteractionMode.AIDEN,
+            "codex": InteractionMode.CODEX,
+            "gemini": InteractionMode.GEMINI,
+            "traex": InteractionMode.TRAEX,
+        }
+        backend = normalized_agent or next(
+            (name for name in mode_map if normalized_name.lower().startswith(name)),
+            "coco",
+        )
+        if backend not in mode_map:
+            return SpecEngine._infer_engine_name(backend), backend, model_name
+        if backend == "claude" and normalized_agent:
+            return "Claude", "claude", None
+        identity = resolve_engine_identity(mode=mode_map[backend])
+        resolved_model = identity.model_name if backend == "claude" else (model_name or identity.model_name)
+        return identity.engine_name, identity.agent_type, resolved_model
 
     def get_or_create(
         self,
@@ -117,22 +96,16 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
             if existing is None or should_replace:
                 if existing is not None:
                     existing.cleanup()
-                self._engines[key] = SpecEngine(
-                    chat_id=chat_id,
-                    root_path=root_path,
-                    agent_type=resolved_agent_type,
-                    engine_name=resolved_engine_name,
-                    model_name=resolved_model_name,
+                self._engines[key] = self._create_engine(
+                    chat_id, root_path, resolved_agent_type,
+                    resolved_engine_name, resolved_model_name,
                 )
                 self._add_index(chat_id, key)
 
             return self._engines[key]
 
     def load_or_create_from_disk(self, chat_id: str, root_path: str, engine_name: str = "Coco") -> "SpecEngine":
-        """Create engine and hydrate project state from disk if present.
-
-        用于进程重启后的断点续传：handler 在 `/spec_status`/`/spec_resume` 时可调用。
-        """
+        """Hydrate the one canonical run-state for automatic recovery/reporting."""
         seed_engine = self.get_or_create(chat_id, root_path, engine_name=engine_name)
         if not seed_engine.settings.spec_allow_resume_from_disk:
             return seed_engine
@@ -141,25 +114,6 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
             chat_id,
             root_path,
             state_path_candidates(root_path, seed_engine.settings),
-            engine_name=engine_name,
-        )
-
-    def load_or_create_from_state_file(
-        self,
-        chat_id: str,
-        root_path: str,
-        state_path: str,
-        *,
-        engine_name: str = "Coco",
-    ) -> "SpecEngine":
-        """Create engine and hydrate project state from an explicit Spec run state file."""
-        seed_engine = self.get_or_create(chat_id, root_path, engine_name=engine_name)
-        if not seed_engine.settings.spec_allow_resume_from_disk:
-            return seed_engine
-        return self._load_or_create_from_state_paths(
-            chat_id,
-            root_path,
-            [state_path],
             engine_name=engine_name,
         )
 

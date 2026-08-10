@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.feishu.control_plane import ControlPlane
-from src.feishu.ws_client import _READONLY_CARD_ACTIONS
 from src.tasking import TaskEvent, TaskStatus
 
 
@@ -98,7 +97,7 @@ class TestControlPlane:
         finally:
             cp.stop()
 
-    def test_system_exit_gate_blocks_model_selection_until_terminal(self):
+    def test_system_exit_gate_tracks_until_terminal(self):
         cp = self._make_cp()
         try:
             cp.on_scheduler_event(
@@ -106,8 +105,6 @@ class TestControlPlane:
             )
             assert cp._system_cmd_inflight_by_chat["chat1"] == 1
             assert cp.is_system_cmd_inflight("chat1") is True
-            assert "select_acp_model" not in _READONLY_CARD_ACTIONS
-
             cp.on_scheduler_event(
                 _event("exit-run", TaskStatus.SUCCEEDED, task_type="system_exit")
             )

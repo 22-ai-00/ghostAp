@@ -1,4 +1,4 @@
-"""Document materializers and memory compatibility facade for canonical employees."""
+"""Document materializers and canonical employee memory reads."""
 
 from __future__ import annotations
 
@@ -175,68 +175,34 @@ class EmployeeDocumentMaterializer:
 
 
 class EmployeeMemoryFacade:
-    """Compatibility facade that reads canonical first, falls back to legacy.
-
-    For canonical employees: reads from materialized projection path.
-    For legacy virtual agents: delegates to existing MemoryManager.
-    """
+    """Read only projection-owned canonical employee documents."""
 
     def __init__(
         self,
         *,
         materializer: EmployeeDocumentMaterializer,
         state: DataProjectionState,
-        legacy_base_path: str | Path | None = None,
         projection_guard: Callable[[], ContextManager[Any]] | None = None,
     ) -> None:
         self._materializer = materializer
         self._state = state
-        self._legacy_base = Path(legacy_base_path) if legacy_base_path else None
         self._projection_guard = projection_guard or nullcontext
-
-    @property
-    def legacy_base_path(self) -> Path | None:
-        """Configured legacy root used only by the startup importer."""
-
-        return self._legacy_base
 
     def read_l1(
         self,
         agent_id: str,
         tenant_key: str,
-        *,
-        allow_unscoped_legacy: bool = False,
     ) -> str | None:
         """Read tenant-owned L1, distinguishing absence from corruption."""
         if not isinstance(tenant_key, str) or not tenant_key.strip():
             raise MemoryAccessError("tenant_key is required")
         with self._projection_guard():
-            canonical = self._read_projected_canonical(
+            return self._read_projected_canonical(
                 tenant_key,
                 agent_id,
                 DataKind.L1_MEMORY,
                 "l1_memory",
             )
-            canonical_path = self._materializer.resolve_path(
-                agent_id,
-                DataKind.L1_MEMORY,
-                "l1_memory",
-            ).absolute
-            legacy = self._read_legacy_l1(
-                agent_id,
-                exclude_path=canonical_path,
-            )
-            if canonical is not None and legacy is not None:
-                raise MemoryConflictError(
-                    f"canonical and legacy L1 both exist for {agent_id}"
-                )
-            if canonical is not None:
-                return canonical
-            if legacy is not None and not allow_unscoped_legacy:
-                raise MemoryConflictError(
-                    f"unscoped legacy L1 is not authorized for {agent_id}"
-                )
-            return legacy
 
     def read_memory_summary(
         self, agent_id: str, tenant_key: str, chat_id: str, thread_root_id: str = ""
@@ -258,7 +224,7 @@ class EmployeeMemoryFacade:
         """Read skill profile JSON."""
         content = self._read_canonical(agent_id, DataKind.SKILL_PROFILE, "skill_profile")
         if content is None:
-            return self._read_legacy_skill(agent_id)
+            return None
         try:
             return json.loads(content)
         except (json.JSONDecodeError, TypeError):
@@ -329,59 +295,6 @@ class EmployeeMemoryFacade:
         if hashlib.sha256(content.encode("utf-8")).hexdigest() != metadata.content_hash:
             raise MemoryIntegrityError("materialized document hash mismatch")
         return content
-
-    def _read_legacy_l1(
-        self,
-        agent_id: str,
-        *,
-        exclude_path: Path | None = None,
-    ) -> str | None:
-        if self._legacy_base is None:
-            return None
-        _require_agent_id(agent_id)
-        candidates = (
-            f"agents/{agent_id}/memory/MEMORY.md",
-            f"agents/{agent_id}/MEMORY.md",
-        )
-        existing = [
-            relative
-            for relative in candidates
-            if (
-                exclude_path is None
-                or (self._legacy_base / relative).absolute()
-                != exclude_path.absolute()
-            )
-            if _rooted_path_exists(self._legacy_base, relative)
-        ]
-        if len(existing) > 1:
-            raise MemoryConflictError("multiple legacy L1 files exist")
-        if not existing:
-            return None
-        return _read_rooted_regular_text(
-            self._legacy_base,
-            existing[0],
-            missing_ok=False,
-        )
-
-    def _read_legacy_skill(self, agent_id: str) -> dict | None:
-        if self._legacy_base is None:
-            return None
-        _require_agent_id(agent_id)
-        relative = f"agents/{agent_id}/skill_profile.json"
-        try:
-            content = _read_rooted_regular_text(
-                self._legacy_base,
-                relative,
-                missing_ok=True,
-            )
-            return None if content is None else json.loads(content)
-        except (MemoryIntegrityError, json.JSONDecodeError):
-            return None
-
-
-class MemoryConflictError(RuntimeError):
-    """Memory sources conflict or lack tenant-scoped authorization."""
-
 
 class MemoryAccessError(RuntimeError):
     """Memory ownership cannot authorize this read."""

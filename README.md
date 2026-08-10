@@ -29,7 +29,7 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 | provider/transport | ACP 直接模式、Shell CLI 桥接 |
 | Host Shell | 独立的特权宿主执行能力，不是 Agent provider，也不是操作系统沙箱 |
 
-普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
+普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。四种执行策略收到任务后都会自动推进到成功或明确失败，不以 Agent 选择、Review、脚本确认或手动恢复阻塞主路径。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
 
 ## 快速开始
 
@@ -189,11 +189,11 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 | 命令 | 作用 |
 | --- | --- |
 | `/deep <需求>` | 单次规划并自主执行 |
-| `/deep_status`、`/deep_update <补充>`、`/stop_deep` | 查看、补充或停止 Deep |
+| `/deep_status`、`/stop_deep` | 查看或停止 Deep |
 | `/spec <需求>` | 按 Spec → Plan → Task → Build → Review 闭环推进 |
-| `/spec_status`、`/spec_guide <引导>`、`/spec_pause`、`/spec_resume`、`/stop_spec` | 管理 Spec 任务 |
+| `/spec_status`、`/stop_spec` | 查看或停止 Spec |
 | `/wf <需求>` | 生成并执行 JS Workflow 编排脚本 |
-| `/wf_status`、`/wf_help`、`/wf_save`、`/wf_list`、`/wf_history`、`/stop_wf` | 管理 Workflow |
+| `/wf`、`/wf_status`、`/wf_help`、`/stop_wf` | 生成、查看或停止 Workflow |
 
 ### Agent Department（持久数字员工）
 
@@ -228,7 +228,13 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 旧的独立 Autonomous Manager 命令面已经退役并默认拒绝，不是 Agent Department
 的生产入口。
 
-Workflow 使用三步流程：选择主编排 Agent、选择评审 Agent 或 Auto、确认后自动生成并执行脚本。内置原语包括 `agent()`、`sequence()`、`fanout()`、`verify()`、`generate()`、`tournament()`、`loop()` 和 `race()`，并由运行时限制总 agent 数、嵌套深度和危险脚本能力。
+## 全自动执行
+
+普通编程、Deep、Spec 和 Workflow 共用一条主路径契约：使用已保存配置，缺失时采用可用的推荐工具和默认模型，经过有界自动恢复后到达成功或明确失败终态。用户只需在运行中主动停止，或通过独立配置入口改变默认值。
+
+普通、安全、可逆的选择自动采用推荐项；高风险且未经原始请求精确授权的操作拒绝或跳过，并继续可安全完成的部分。ACP 权限保持 fail-closed，不通过跳过权限检查换取自动化。
+
+Workflow 动态生成任务专用 JS，并按复杂度组合 `agent()`、`sequence()`、`fanout()`、`verify()`、`generate()`、`tournament()`、`loop()` 和 `race()`。运行时负责确定性控制流、总 Agent 数和危险能力限制，Agent 负责语义工作；简单任务保持单 Agent。进度卡片展示任务、阶段和直接子 Agent 的调度状态，每个 Agent 只保留一条最新操作，完整结果通过分页或附件交付。
 
 ## 架构入口
 
@@ -260,30 +266,7 @@ handler -> session -> render
 
 ## Agent Department 耐久架构（src/autonomous/）
 
-生产 Employee Department 使用 Journal-backed 持久化架构，所有状态变更通过
-事务帧记录，并通过 Vault、Blob、独立员工 Channel 和 Durable Outbox 完成恢复。
-旧 Autonomous Manager 的目标/Run 命令模块仅保留兼容导入，不构成生产产品入口。
-
-```text
-src/autonomous/
-├── bootstrap.py              # 生产组装根，初始化 lark-oapi 客户端
-├── coordinator.py            # 目标/Run 生命周期编排
-├── planner.py                # 计划编译（模型辅助或默认单步）
-├── employees.py              # 员工生命周期和协作规划
-├── config.py                 # 部署模式和有效自治等级
-├── domain/                   # 冻结聚合体和纯状态机
-├── journal/                  # 事务帧、写入者、锚点、Blob、投影
-├── policy/                   # 默认拒绝授权、预算 CAS、Kill Switch
-├── broker/                   # 能力注册、线性化派发门、模型/工具代理
-├── scheduler/                # 持久队列、租约围栏、触发器
-├── runtime/                  # 结构化轮次协议、沙箱运行器
-├── verifier/                 # 准则编译器和 Oracle 验证
-├── reporter/                 # 持久发件箱和效果处置 Saga
-├── supervisor/               # 启动/恢复/关闭和对账
-├── manager/                  # 命令处理、飞书卡片、lark-oapi 适配器
-├── acceptance/               # 77 门禁清单、统计度量、证据存储
-└── feishu/                   # 能力探测和功能可见性门控
-```
+生产 Employee Department 使用 Journal-backed 持久化架构，所有状态变更通过事务帧记录，并通过 Vault、Blob、独立员工 Channel 和 Durable Outbox 完成恢复。生产组装根位于 `provisioning/composition.py`，现役执行面由 `gateway/coordinator.py`、`runtime/employee_actor.py` 和 `supervisor/employee_channels.py` 构成；旧 Goal/Run Manager 不再是产品入口。
 
 **关键依赖：**
 - `lark-oapi==1.7.1`：REST API 消息发送、卡片更新、机器人管理

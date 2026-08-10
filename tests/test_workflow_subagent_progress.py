@@ -105,8 +105,8 @@ def test_executor_forwards_stable_subagent_updates_without_false_activity_comple
 ) -> None:
     """Different tool-call IDs for one child must keep its thread identity.
 
-    In particular, an ACP activity tool whose own status is ``completed`` only
-    means the activity notification finished; it does not prove the child did.
+    In particular, neither a completed ACP activity notification nor a nested
+    ``agentsStates`` snapshot is authoritative evidence that the child finished.
     """
     thread_a = "0192a4a7-aaaa-7bbb-8ccc-111111111111"
     thread_b = "0192a4a7-bbbb-7ccc-8ddd-222222222222"
@@ -224,7 +224,7 @@ def test_executor_forwards_stable_subagent_updates_without_false_activity_comple
         },
     )
     assert updates[4][1][0]["status"] == "cancelled"
-    assert updates[5][1][0]["status"] == "completed"
+    assert updates[5][1][0]["status"] == "running"
     assert updates[5][1][0]["progress"] == "Workflow 卡片核查完成"
 
 
@@ -367,6 +367,9 @@ def test_renderer_shows_safe_subagent_status_without_internal_ids() -> None:
     assert "执行中" in text
     assert "子 Agent 2" in text
     assert "已取消" in text
+    assert "非权威，不参与终态判定" in text
+    assert "观测执行中" in text
+    assert "当前操作：" in text
     assert "TOKEN=" in text
     assert "redacted" in text
     assert thread_id not in text

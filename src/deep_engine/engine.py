@@ -12,8 +12,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from ..acp import ACPEvent, ACPEventType, PromptResult
-from ..acp.outcome import PromptOutcome, classify_prompt_result
+from ..acp import ACPEvent, ACPEventType, PromptResult, run_prompt_with_continuation
+from ..acp.outcome import PromptAssessment, PromptOutcome, classify_prompt_result
 from ..agent_session import create_engine_session
 from ..agent_session.backend_resolver import resolve_cwd
 from ..engine_base import BaseEngine, BaseEngineManager
@@ -64,6 +64,35 @@ class DeepEngineCallbacks:
         self.on_analyzing_done = value
 
 
+class _RetryingPromptSession:
+    """Adapt Deep's transport retry contract to the shared auto-continuation loop."""
+
+    def __init__(self, session, before_retry: Callable[[int, Exception], None]):
+        self._session = session
+        self._before_retry = before_retry
+
+    @property
+    def _force_dead(self) -> bool:
+        value = getattr(self._session, "_force_dead", False)
+        return value if isinstance(value, bool) else False
+
+    @_force_dead.setter
+    def _force_dead(self, value: bool) -> None:
+        setattr(self._session, "_force_dead", value)
+
+    def send_prompt(self, text, on_event=None, timeout=None):
+        return self._session.send_prompt_with_retry(
+            text,
+            on_event=on_event,
+            timeout=timeout,
+            retry_policy=RetryPolicy(max_retries=2, retry_delay=2.0),
+            before_retry=self._before_retry,
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+
 class DeepEngine(BaseEngine):
     """ACP-driven Deep Engine — the agent plans and executes autonomously."""
 
@@ -104,7 +133,7 @@ class DeepEngine(BaseEngine):
         gc_monitor.check_and_collect(label="DeepEngine")
 
     def _make_on_event(self, callbacks: DeepEngineCallbacks) -> Callable[[ACPEvent], None]:
-        """Create the on_event callback shared by plan_and_execute and resume."""
+        """Create the event callback for autonomous execution."""
         gc_monitor = get_gc_monitor(memory_threshold_percent=self.settings.deep_memory_threshold)
 
         def on_event(event: ACPEvent):
@@ -247,29 +276,30 @@ class DeepEngine(BaseEngine):
                     if self._agent_type == "coco"
                     else self.settings.claude_execution_timeout
                 )
-                def _before_retry(attempt: int, error: Exception):
-                    # For Deep Engine, we clear the renderer and progress to avoid duplicated rendering
-                    self._renderer.reset()
-                    # Cannot fully reset self._progress since we might lose some previous steps,
-                    # but typically deep engine retry happens early or we just append to text.
-                    # Best effort clear for a fresh retry
-                    self._planning_done_fired = False
-
-                result = self._session.send_prompt_with_retry(
-                    prompt, on_event=on_event, timeout=timeout,
-                    retry_policy=RetryPolicy(max_retries=2, retry_delay=2.0),
-                    before_retry=_before_retry
+                result, assessment = self._send_prompt_autonomously(
+                    prompt,
+                    on_event,
+                    timeout,
                 )
 
                 # Process pending context injections as follow-up prompts
-                result = self._drain_pending_context(on_event, timeout, result)
+                result, assessment = self._drain_pending_context(
+                    on_event,
+                    timeout,
+                    result,
+                    assessment,
+                )
 
                 # Determine final status
                 if self._run_state == EngineRunState.STOPPING:
-                    self._project.pause()
-                    logger.info("[Deep:%s] 执行已暂停", project_name)
+                    self._project.cancel()
+                    logger.info("[Deep:%s] 执行已取消", project_name)
                 else:
-                    self._apply_prompt_result(result, project_name=project_name)
+                    self._apply_prompt_result(
+                        result,
+                        assessment=assessment,
+                        project_name=project_name,
+                    )
 
                 if callbacks.on_project_done:
                     callbacks.on_project_done(self._project)
@@ -277,6 +307,11 @@ class DeepEngine(BaseEngine):
                 return self._project
 
         except TimeoutError as e:
+            if self._run_state == EngineRunState.STOPPING:
+                self._project.cancel()
+                if callbacks.on_project_done:
+                    callbacks.on_project_done(self._project)
+                return self._project
             self._fail_project_and_notify(
                 e,
                 "执行",
@@ -286,6 +321,11 @@ class DeepEngine(BaseEngine):
             return self._project
 
         except Exception as e:
+            if self._run_state == EngineRunState.STOPPING:
+                self._project.cancel()
+                if callbacks.on_project_done:
+                    callbacks.on_project_done(self._project)
+                return self._project
             self._fail_project_and_notify(
                 e,
                 "执行",
@@ -299,11 +339,16 @@ class DeepEngine(BaseEngine):
                 self._run_state = EngineRunState.IDLE
             get_gc_monitor(memory_threshold_percent=self.settings.deep_memory_threshold).check_and_collect(label="Deep", mem_snapshot=self._mem_snapshot)
 
-    def _apply_prompt_result(self, result, *, project_name: str) -> None:
+    def _apply_prompt_result(
+        self,
+        result: PromptResult,
+        *,
+        assessment: PromptAssessment,
+        project_name: str,
+    ) -> None:
         """Translate transport completion into the Deep project terminal state."""
         if self._project is None:
             return
-        assessment = classify_prompt_result(result)
         if assessment.outcome is PromptOutcome.COMPLETED:
             self._project.complete()
             logger.info(
@@ -314,8 +359,8 @@ class DeepEngine(BaseEngine):
                 self._project.duration() or 0,
             )
         elif assessment.outcome is PromptOutcome.CANCELLED:
-            self._project.pause()
-            logger.info("[Deep:%s] 执行已取消并暂停", project_name)
+            self._project.cancel()
+            logger.info("[Deep:%s] 执行已取消", project_name)
         else:
             self._project.fail(f"执行未完成: {assessment.detail}")
             logger.warning(
@@ -325,10 +370,16 @@ class DeepEngine(BaseEngine):
                 assessment.detail,
             )
 
-    def _drain_pending_context(self, on_event, timeout, last_result):
+    def _drain_pending_context(
+        self,
+        on_event,
+        timeout,
+        last_result: PromptResult,
+        last_assessment: PromptAssessment,
+    ) -> tuple[PromptResult, PromptAssessment]:
         """Send any pending context injections as follow-up prompts in the same session."""
         while self._run_state == EngineRunState.RUNNING:
-            # Guard: session may have been closed by concurrent pause/stop
+            # Guard: session may have been closed by concurrent stop/cleanup
             if not self._session:
                 logger.warning("[Deep] _drain_pending_context: session 已关闭, 停止处理")
                 break
@@ -345,27 +396,63 @@ class DeepEngine(BaseEngine):
 
 请根据以上信息调整你的执行方案并继续。"""
             try:
-                follow_up_result = self._session.send_prompt_with_retry(
-                    follow_up, on_event=on_event, timeout=timeout,
-                    retry_policy=RetryPolicy(max_retries=1, retry_delay=2.0)
+                follow_up_result, follow_up_assessment = self._send_prompt_autonomously(
+                    follow_up,
+                    on_event,
+                    timeout,
                 )
-                assessment = classify_prompt_result(follow_up_result)
-                if assessment.outcome is not PromptOutcome.COMPLETED:
+                if follow_up_assessment.outcome is not PromptOutcome.COMPLETED:
                     with self._lock:
                         self._pending_context[0:0] = batch
-                    return follow_up_result
+                    return follow_up_result, follow_up_assessment
                 last_result = follow_up_result
+                last_assessment = follow_up_assessment
             except TimeoutError as e:
                 with self._lock:
                     self._pending_context[0:0] = batch
                 logger.warning("[Deep] _drain_pending_context 超时: %s", get_error_detail(e))
-                return PromptResult(stop_reason="pending_context_timeout")
+                failed = PromptResult(stop_reason="pending_context_timeout")
+                return failed, classify_prompt_result(failed)
             except Exception as e:
                 with self._lock:
                     self._pending_context[0:0] = batch
                 logger.error("[Deep] _drain_pending_context 发送失败: %s", get_error_detail(e))
-                return PromptResult(stop_reason="pending_context_error")
-        return last_result
+                failed = PromptResult(stop_reason="pending_context_error")
+                return failed, classify_prompt_result(failed)
+        return last_result, last_assessment
+
+    def _send_prompt_autonomously(
+        self,
+        prompt: str,
+        on_event,
+        timeout: float,
+    ) -> tuple[PromptResult, PromptAssessment]:
+        """Run one logical Deep turn with bounded retries and safe auto-decisions."""
+
+        def _before_retry(_attempt: int, _error: Exception) -> None:
+            self._renderer.reset()
+            self._planning_done_fired = False
+
+        session = _RetryingPromptSession(self._session, _before_retry)
+        execution = run_prompt_with_continuation(
+            session,
+            prompt,
+            on_event=on_event,
+            timeout_s=timeout,
+            finalization_reserve_s=max(
+                0,
+                int(getattr(self.settings, "programming_finalization_reserve_s", 0) or 0),
+            ),
+            finalization_task_text=prompt,
+        )
+        if execution.automatic_continuations:
+            logger.info(
+                "[Deep] 自动续做完成: continuations=%d outcome=%s detail=%s",
+                execution.automatic_continuations,
+                execution.assessment.outcome.value,
+                execution.assessment.detail,
+            )
+        return execution.result, execution.assessment
 
     def _build_deep_prompt(self, requirement: str) -> str:
         """Build the deep prompt — let agent autonomously plan and execute."""
@@ -407,111 +494,11 @@ class DeepEngine(BaseEngine):
 
     inject_context = inject_guidance
 
-    def pause(self):
-        with self._lock:
-            if self._project:
-                self._project.pause()
-            self._run_state = EngineRunState.STOPPING
-            session = self._session
-        if session:
-            try:
-                session.cancel()
-            except Exception:
-                logger.debug("session.cancel() failed during pause", exc_info=True)
-
-    def resume(self, callbacks: Optional[DeepEngineCallbacks] = None) -> Optional[DeepProject]:
-        """Resume a paused deep execution by loading the ACP session and sending a continuation prompt."""
-        if not self._project or self._project.status not in (DeepProjectStatus.PAUSED, DeepProjectStatus.FAILED):
-            return self._project
-
-        callbacks = callbacks or DeepEngineCallbacks()
-        with self._lock:
-            self._run_state = EngineRunState.RUNNING
-            self._project.status = DeepProjectStatus.EXECUTING
-
-        try:
-            # Close old session before opening new one (prevent resource leak)
-            self._close_session_safely()
-
-
-            self._session = create_engine_session(
-                agent_type=self._agent_type,
-                cwd=resolve_cwd(self._agent_type, self.root_path),
-                on_rate_limit=getattr(self, "_on_rate_limit", None),
-                model_name=self._model_name,
-            )
-
-            resume_prompt = self._build_resume_prompt()
-
-            on_event = self._make_on_event(callbacks)
-            timeout = (
-                self.settings.coco_execution_timeout
-                if self._agent_type == "coco"
-                else self.settings.claude_execution_timeout
-            )
-            result = self._session.send_prompt_with_retry(
-                resume_prompt, on_event=on_event, timeout=timeout,
-                retry_policy=RetryPolicy(max_retries=2, retry_delay=2.0)
-            )
-            result = self._drain_pending_context(on_event, timeout, result)
-
-            if self._run_state == EngineRunState.STOPPING:
-                self._project.pause()
-            else:
-                self._apply_prompt_result(
-                    result,
-                    project_name=self._project.name,
-                )
-
-            if callbacks.on_project_done:
-                callbacks.on_project_done(self._project)
-
-        except TimeoutError as e:
-            self._fail_project_and_notify(
-                e,
-                "恢复执行",
-                is_timeout=True,
-                callbacks=callbacks,
-            )
-
-        except Exception as e:
-            self._fail_project_and_notify(
-                e,
-                "恢复执行",
-                is_timeout=False,
-                callbacks=callbacks,
-            )
-
-        finally:
-            with self._lock:
-                self._run_state = EngineRunState.IDLE
-            get_gc_monitor(memory_threshold_percent=self.settings.deep_memory_threshold).check_and_collect(label="Deep", mem_snapshot=self._mem_snapshot)
-
-        return self._project
-
-    def _build_resume_prompt(self) -> str:
-        """Build a context-rich resume prompt from progress state."""
-        sections = ["你之前的执行被暂停了。以下是之前的进度，请继续完成剩余任务。"]
-
-        if self._progress.plan_entries:
-            plan_lines = []
-            for entry in self._progress.plan_entries:
-                status_icon = "✅" if entry["status"] == "completed" else "⬜"
-                plan_lines.append(f"  {status_icon} {entry['content']}")
-            sections.append("## 任务计划\n" + "\n".join(plan_lines))
-
-        if self._progress.modified_files:
-            files = sorted(self._progress.modified_files)[:20]
-            sections.append("## 已修改文件\n" + "\n".join(f"  - {f}" for f in files))
-
-        sections.append("请从未完成的步骤继续执行。完成后输出总结报告。")
-        return "\n\n".join(sections)
-
     # Static status messages (no f-string allocation per call)
     _STATUS_MESSAGES: dict[DeepProjectStatus, str] = {
         DeepProjectStatus.IDLE: "等待开始",
         DeepProjectStatus.PLANNING: "正在规划任务...",
-        DeepProjectStatus.PAUSED: "已暂停",
+        DeepProjectStatus.CANCELLED: "已取消",
         DeepProjectStatus.COMPLETED: "全部完成",
     }
 

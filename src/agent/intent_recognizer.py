@@ -45,8 +45,6 @@ class IntentType(Enum):
     ENTER_SPEC = "enter_spec"
     SPEC_STATUS = "spec_status"
     STOP_SPEC = "stop_spec"
-    SPEC_PAUSE = "spec_pause"
-    SPEC_RESUME = "spec_resume"
     SPEC_GUIDE = "spec_guide"
     SHOW_HELP = "show_help"
     SHOW_TOOLS = "show_tools"
@@ -159,8 +157,6 @@ class IntentRecognizer:
         "enter_spec": IntentType.ENTER_SPEC,
         "spec_status": IntentType.SPEC_STATUS,
         "stop_spec": IntentType.STOP_SPEC,
-        "spec_pause": IntentType.SPEC_PAUSE,
-        "spec_resume": IntentType.SPEC_RESUME,
         "spec_guide": IntentType.SPEC_GUIDE,
         "show_help": IntentType.SHOW_HELP,
         "show_tools": IntentType.SHOW_TOOLS,
@@ -206,8 +202,6 @@ class IntentRecognizer:
         "/spec": (IntentType.ENTER_SPEC, "进入 Spec 模式"),
         "/spec_status": (IntentType.SPEC_STATUS, "查看 Spec 任务状态"),
         "/stop_spec": (IntentType.STOP_SPEC, "停止 Spec 任务"),
-        "/spec_pause": (IntentType.SPEC_PAUSE, "暂停 Spec 任务"),
-        "/spec_resume": (IntentType.SPEC_RESUME, "恢复 Spec 任务"),
         "/help": (IntentType.SHOW_HELP, "显示帮助信息"),
         "/帮助": (IntentType.SHOW_HELP, "显示帮助信息"),
         "/tools": (IntentType.SHOW_TOOLS, "查看所有可用工具"),

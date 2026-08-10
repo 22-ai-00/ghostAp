@@ -1,13 +1,4 @@
-"""DeliveryRegistry: process-level registry for CardDelivery instances.
-
-Extracted from CardDelivery ClassVar state to enable test isolation.
-The module-level singleton `delivery_registry` is used by CardDelivery
-for lifecycle tracking; tests can call `delivery_registry.reset()` to
-cleanly restore state between test cases.
-
-NOTE: atexit handler is automatically installed on first register() call.
-Explicit `delivery_registry.install_atexit()` is still supported but no longer required.
-"""
+"""Process-level lifecycle registry for card delivery engines."""
 
 from __future__ import annotations
 
@@ -24,14 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class DeliveryRegistry:
-    """Process-level registry tracking all living CardDelivery instances.
-
-    Responsibilities:
-    - Track instances via explicit set + unregister (deterministic lifecycle)
-    - Coordinate graceful shutdown across all instances
-    - Provide drain_in_flight for process exit
-    - Expose reset() for test isolation
-    """
+    """Track living delivery engines and coordinate graceful shutdown."""
 
     def __init__(self) -> None:
         self._instances: set[CardDelivery] = set()
@@ -56,17 +40,6 @@ class DeliveryRegistry:
             self.shutdown_all()
 
         atexit.register(_atexit_shutdown)
-
-    @property
-    def instances(self) -> frozenset[CardDelivery]:
-        """Read-only snapshot of tracked instances (for monitoring/audit)."""
-        with self._lock:
-            return frozenset(self._instances)
-
-    @property
-    def shutdown_done(self) -> bool:
-        """Whether shutdown_all() has already been called."""
-        return self._shutdown_done
 
     def register(self, instance: CardDelivery) -> None:
         """Register a new CardDelivery instance.
@@ -117,19 +90,6 @@ class DeliveryRegistry:
             if not instance._drain(timeout=remaining):
                 return False
         return True
-
-    def reset(self) -> None:
-        """Reset registry state for test isolation.
-
-        Clears instance tracking and resets shutdown flag.
-        Does NOT call shutdown on existing instances — caller is responsible
-        for proper cleanup before calling reset.
-        Does NOT unregister atexit handler (atexit module has no unregister API).
-        """
-        with self._lock:
-            self._instances = set()
-            self._shutdown_done = False
-
 
 # Module-level singleton
 delivery_registry = DeliveryRegistry()

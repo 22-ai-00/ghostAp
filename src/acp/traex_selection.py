@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from .model_selection import CODEX_REASONING_EFFORTS
-from .options import ACPModelOption
 
 _PROFILES = frozenset({"standard", "max"})
 
@@ -208,51 +206,3 @@ def resolve_traex_runtime_selection(
         profile=profile,
         effort=effort,
     )
-
-
-def expand_acp_model_options(
-    models: list[ACPModelOption],
-) -> list[ACPModelOption]:
-    expanded: list[ACPModelOption] = []
-    for model in models:
-        if not model.selection_variants:
-            expanded.append(dataclasses.replace(model))
-            continue
-        for variant in model.selection_variants:
-            expanded.append(
-                dataclasses.replace(
-                    model,
-                    name=variant.name,
-                    description=variant.display_name or model.description,
-                    is_default=bool(model.is_default and variant.is_variant_default),
-                    selection_variants=(),
-                )
-            )
-    return expanded
-
-
-def expand_model_option_dicts(models: list[dict]) -> list[dict]:
-    expanded: list[dict] = []
-    for model in models or []:
-        item = dict(model or {})
-        variants = list(item.get("selection_variants") or [])
-        if not variants:
-            expanded.append(item)
-            continue
-        for raw_variant in variants:
-            variant = dict(raw_variant or {})
-            name = str(variant.get("name") or "").strip()
-            if not name:
-                continue
-            clone = dict(item)
-            clone.pop("selection_variants", None)
-            clone["name"] = name
-            clone["display_name"] = str(
-                variant.get("display_name") or name
-            )
-            clone["is_default"] = bool(
-                item.get("is_default")
-                and variant.get("is_variant_default")
-            )
-            expanded.append(clone)
-    return expanded

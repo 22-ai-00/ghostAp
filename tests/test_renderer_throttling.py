@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.acp import ACPEventType
-from src.card.builder import CardBuilder
+from src.card.builders.system import SystemBuilder
 from src.deep_engine.models import DeepProjectStatus
 from src.feishu.renderers.deep_renderer import DeepRenderer
 
@@ -98,7 +98,7 @@ class TestRendererThrottling:
 
     def test_help_card_structure(self):
         """Test that build_help_card returns valid structure"""
-        msg_type, content_json = CardBuilder.build_help_card(
+        msg_type, content_json = SystemBuilder.build_help_card(
             category="main",
             session_idle_timeout=600,
             session_idle_warn_at_remaining=120,

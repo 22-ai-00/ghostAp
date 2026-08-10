@@ -37,11 +37,6 @@ class SequenceManager:
             if floor > current_floor:
                 self._floors[card_id] = floor
 
-    def current(self, card_id: str) -> int:
-        """Get the current sequence number (without incrementing)."""
-        with self._lock:
-            return self._sequences.get(card_id, 0)
-
     def reset(self, card_id: str) -> None:
         """Reset sequence for a card."""
         with self._lock:

@@ -3,7 +3,6 @@
 from .authority import (
     AuthorityMode,
     AuthoritySnapshot,
-    LegacyMutationGuard,
     StaleAuthorityEpoch,
 )
 from .credential_vault import (
@@ -14,7 +13,6 @@ from .credential_vault import (
     CredentialVaultError,
 )
 from .projection import (
-    EmployeeIdentityMaterializer,
     WorkforceProjectionState,
     apply_workforce_event,
     commit_workforce_events,
@@ -30,10 +28,8 @@ __all__ = [
     "CredentialVaultError",
     "AuthorityMode",
     "AuthoritySnapshot",
-    "LegacyMutationGuard",
     "StaleAuthorityEpoch",
     "AmbiguousEmployeeName",
-    "EmployeeIdentityMaterializer",
     "ProjectedAgentRegistry",
     "WorkforceProjectionState",
     "apply_workforce_event",

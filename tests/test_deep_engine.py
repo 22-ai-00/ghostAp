@@ -1,20 +1,17 @@
 """Tests for deep_engine — ACP-driven DeepEngine."""
 
-import io
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.acp.models import PlanEntryInfo, PlanInfo, ToolCallInfo
-from src.agent_session import ClaudeCLIConfig, SyncClaudeCLISession
 from src.deep_engine.engine import DeepEngine, DeepEngineCallbacks, DeepEngineManager
 from src.deep_engine.models import DeepProject, DeepProjectStatus, EngineRunState
 from src.deep_engine.progress import DeepProgress, _truncate_nested_data
 
 
 class _DummySession:
-    """Minimal session stub shared across startup/resume tests."""
+    """Minimal session stub shared by Deep startup tests."""
 
     def __init__(self, *a, **k):
         self.session_id = "sid"
@@ -22,7 +19,6 @@ class _DummySession:
         self.last_active = 0.0
         self.message_count = 0
         self.last_query = ""
-        self.is_resumed = False
 
     def describe_agent(self):
         return "dummy"
@@ -30,9 +26,6 @@ class _DummySession:
     def start(self, startup_timeout: float = 60, **kwargs):
         return "sid"
 
-    def load_session(self, session_id: str, timeout: float = 60):
-        del timeout
-        return None
 
     def load_local_history(self, session_id=None, limit: int = 200):
         return []
@@ -82,7 +75,7 @@ class TestDeepEngine:
     def test_successful_retry_clears_previous_project_error(self):
         project = DeepProject.create("retry", "/tmp/retry")
         project.fail("first attempt failed")
-        project.resume()
+        project.start()
 
         project.complete()
 
@@ -96,94 +89,6 @@ class TestDeepEngine:
         engine.stop()
         assert engine.run_state == EngineRunState.STOPPING
         engine._session.cancel.assert_called_once()
-
-    def test_pause(self):
-        engine = self._make_engine()
-        engine._project = MagicMock()
-        engine._session = MagicMock()
-        engine._run_state = EngineRunState.RUNNING
-        engine.pause()
-        engine._project.pause.assert_called_once()
-        assert engine.run_state == EngineRunState.STOPPING
-
-    def test_pause_holds_lock(self):
-        """pause() must acquire self._lock when writing _run_state."""
-        engine = self._make_engine()
-        engine._project = MagicMock()
-        engine._session = None
-        engine._run_state = EngineRunState.RUNNING
-
-        lock_acquired = False
-        original_lock = engine._lock
-
-        class TrackedLock:
-            def __enter__(self_lock):
-                nonlocal lock_acquired
-                lock_acquired = True
-                return original_lock.__enter__()
-
-            def __exit__(self_lock, *args):
-                return original_lock.__exit__(*args)
-
-        engine._lock = TrackedLock()
-        engine.pause()
-        assert lock_acquired, "pause() should acquire self._lock"
-        assert engine._run_state == EngineRunState.STOPPING
-
-    def test_pause_session_cancel_raises(self):
-        """pause() swallows exceptions from session.cancel() and still sets STOPPING."""
-        engine = self._make_engine()
-        engine._project = MagicMock()
-        engine._run_state = EngineRunState.RUNNING
-
-        session = MagicMock()
-        session.cancel.side_effect = RuntimeError("connection lost")
-        engine._session = session
-
-        engine.pause()
-
-        assert engine._run_state == EngineRunState.STOPPING
-        session.cancel.assert_called_once()
-
-    def test_pause_project_none(self):
-        """pause() when _project is None must still set STOPPING without raising."""
-        engine = self._make_engine()
-        engine._project = None
-        engine._session = MagicMock()
-        engine._run_state = EngineRunState.RUNNING
-
-        engine.pause()
-
-        assert engine._run_state == EngineRunState.STOPPING
-        engine._session.cancel.assert_called_once()
-
-    def test_pause_concurrent(self):
-        """Concurrent pause() calls must not raise and final state is STOPPING."""
-        import threading
-
-        engine = self._make_engine()
-        engine._project = MagicMock()
-        engine._session = MagicMock()
-        engine._run_state = EngineRunState.RUNNING
-
-        errors = []
-        barrier = threading.Barrier(10, timeout=5)
-
-        def call_pause():
-            try:
-                barrier.wait()
-                engine.pause()
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=call_pause) for _ in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-
-        assert not errors, f"Concurrent pause() raised: {errors}"
-        assert engine._run_state == EngineRunState.STOPPING
 
     def test_cleanup(self):
         engine = self._make_engine()
@@ -239,8 +144,14 @@ class TestDeepEngine:
 
     def test_error_callback_observes_frozen_failed_project(self):
         engine = self._make_engine()
-        session = MagicMock()
-        session.send_prompt_with_retry.side_effect = TimeoutError("deadline")
+
+        class TimeoutSession:
+            _force_dead = False
+
+            def send_prompt_with_retry(self, *_args, **_kwargs):
+                raise TimeoutError("deadline")
+
+        session = TimeoutSession()
         observed: list[tuple[DeepProjectStatus, float | None, float | None]] = []
 
         callbacks = DeepEngineCallbacks(
@@ -262,10 +173,6 @@ class TestDeepEngine:
         assert status == DeepProjectStatus.FAILED
         assert completed_at is not None
         assert duration == result.duration()
-
-
-
-
 
 
 class TestDeepEngineManager:
@@ -369,72 +276,6 @@ class TestDeepProgress:
         p.update_plan(plan)
         bar = p.progress_bar
         assert "50%" in bar
-
-
-class TestClaudeCLISession:
-    def test_resume_missing_conversation_fallback_to_new_session(self):
-        class FakeProc:
-            def __init__(self, stdout_text: str, stderr_text: str, returncode: int):
-                self.stdout = io.StringIO(stdout_text)
-                self.stderr = io.StringIO(stderr_text)
-                self.returncode = returncode
-
-            def wait(self, timeout: int = 0):
-                return self.returncode
-
-            def terminate(self):
-                return None
-
-        cfg = ClaudeCLIConfig(command="claude", add_dir=False, bypass_permissions=False)
-        s = SyncClaudeCLISession(cwd="/tmp", config=cfg)
-        s.session_id = "sid0"
-        s.is_resumed = True
-
-        procs = [
-            FakeProc(stdout_text="", stderr_text="No conversation found with session ID: sid0\n", returncode=1),
-            FakeProc(stdout_text="ok\n", stderr_text="", returncode=0),
-        ]
-
-        popen_calls = []
-
-        def fake_popen(
-            args,
-            cwd,
-            stdout,
-            stderr,
-            text,
-            env=None,
-            start_new_session=False,
-        ):
-            popen_calls.append((args, env))
-            assert env is not None
-            assert "CLAUDECODE" not in env
-            assert start_new_session is (os.name == "posix")
-            return procs.pop(0)
-
-        with (
-            patch.dict(os.environ, {"CLAUDECODE": "1"}),
-            patch("src.agent_session.subprocess.Popen", side_effect=fake_popen),
-            patch("src.agent_session.uuid.uuid4", return_value="sid_new"),
-        ):
-            events = []
-            res = s.send_prompt("hi", on_event=lambda e: events.append(e), timeout=5)
-
-        assert res.stop_reason == "end_turn"
-        assert "ok" in res.text
-        assert len(popen_calls) == 2
-        assert "--resume" in popen_calls[0][0]
-        assert "sid0" in popen_calls[0][0]
-        assert "--session-id" in popen_calls[1][0]
-        assert "sid_new" in popen_calls[1][0]
-
-
-
-
-
-
-
-
 
 
 # ---------------------------------------------------------------------------

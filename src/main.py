@@ -103,19 +103,7 @@ def _print_validate_summary(settings):
     print(f"  LOCK_UNDO_WINDOW_SECONDS = {_format_duration(settings.lock_undo_window_seconds)}")
     print()
 
-    # Group 3: 员工运行时
-    print("[员工运行时]")
-    print(
-        "  AUTONOMOUS_EMPLOYEE_RUNTIME_MODE = "
-        f"{settings.autonomous_employee_runtime_mode}"
-    )
-    print(
-        "  AUTONOMOUS_TEAM_RUNTIME_MODE     = "
-        f"{settings.autonomous_team_runtime_mode}"
-    )
-    print()
-
-    # Group 4: 高级参数
+    # Group 3: 高级参数
     print("[高级参数]")
     print(f"  CARD_DELIVERY_POOL_MAX_WORKERS = {settings.card.delivery_pool_max_workers} (threads)")
     print(f"  CARD_DELIVERY_API_TIMEOUT      = {_format_seconds(settings.card.delivery_api_timeout)}")
@@ -186,7 +174,7 @@ class Application:
     def handle_message(self, message_id: str, chat_id: str, command: str, working_dir: Optional[str] = None):
         """Legacy callback — executes shell command directly via SandboxExecutor."""
         try:
-            self.feishu_client._system_handler.execute_shell_and_reply(
+            self.feishu_client._handler_ctx.handlers["system"].execute_shell_and_reply(
                 message_id,
                 chat_id,
                 command,
@@ -196,8 +184,9 @@ class Application:
             logger.error("处理命令异常: %s", get_error_detail(e))
             try:
                 fmt, EmojiReaction, _FeishuWSClient = _load_feishu_runtime()
-                self.feishu_client.add_reaction(message_id, EmojiReaction.on_error())
-                self.feishu_client.reply(message_id, fmt.format_error(get_error_detail(e)), chat_id=chat_id)
+                base = self.feishu_client._handler_ctx.handlers["coco"]
+                base.add_reaction(message_id, EmojiReaction.on_error())
+                base.reply_text(message_id, fmt.format_error(get_error_detail(e)))
             except Exception:
                 logger.debug("failed to reply error message", exc_info=True)
 

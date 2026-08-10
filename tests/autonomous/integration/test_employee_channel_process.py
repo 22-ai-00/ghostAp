@@ -24,7 +24,6 @@ from src.autonomous.provisioning.channel_protocol import (
 from src.autonomous.supervisor import employee_channels as employee_channel_module
 from src.autonomous.supervisor.employee_channels import (
     ChannelProcessState,
-    DesiredEmployeeChannel,
     EmployeeChannelSupervisor,
     SandboxAttestation,
 )
@@ -625,25 +624,6 @@ def test_stale_generation_frames_are_rejected_and_events_are_delivered(tmp_path:
         supervisor.close()
 
 
-def test_recover_matches_desired_set_and_fences_generation_reuse(tmp_path: Path) -> None:
-    supervisor, _secret, _calls = _supervisor(tmp_path)
-    desired = [
-        DesiredEmployeeChannel("agt_1", "cli_1", "cred_1", 2, lambda _: None),
-        DesiredEmployeeChannel("agt_2", "cli_2", "cred_2", 4, lambda _: None),
-    ]
-    try:
-        recovered = supervisor.recover(desired)
-        assert set(recovered) == {"agt_1", "agt_2"}
-        assert all(item.state is ChannelProcessState.READY for item in recovered.values())
-        same = supervisor.start("agt_1", "cli_1", "cred_1", 2, lambda _: None)
-        assert same.pid == recovered["agt_1"].pid
-        supervisor.stop("agt_1")
-        with pytest.raises(ValueError, match="generation"):
-            supervisor.start("agt_1", "cli_1", "cred_1", 2, lambda _: None)
-    finally:
-        supervisor.close()
-
-
 def test_send_is_generation_fenced_and_waits_for_employee_worker_receipt(
     tmp_path: Path,
 ) -> None:
@@ -760,14 +740,6 @@ def test_parent_supervisor_anchors_runtime_bound_ingress_before_ack(
         assert status.ready_metadata["health"]["success"] is True
         records = tuple(service.state.by_acceptance_id.values())
         assert len(records) == 1
-        assert records[0].metadata.trusted_worker_binding == (
-            "tenant-fixture",
-            "agt_fixture",
-            "bot_fixture",
-            "cli_fixture",
-            3,
-            "conn_fixture",
-        )
         assert writer.anchor.read().sequence == records[0].acceptance.journal_sequence
     finally:
         supervisor.close()

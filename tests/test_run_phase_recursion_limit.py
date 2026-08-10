@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from src.engine_base import EngineRunState
 from src.spec_engine.engine import SpecEngine, SpecEngineCallbacks
 from src.spec_engine.models import SpecPhase
 
@@ -21,6 +22,7 @@ def test_run_phase_recursion_limit(monkeypatch):
     eng._project = MagicMock(name="test")
     eng._session = MagicMock()
     eng._renderer = MagicMock()
+    eng._run_state = EngineRunState.RUNNING
 
     # _send_prompt_with_retry always fails
     monkeypatch.setattr(eng, "_send_prompt_with_retry", MagicMock(side_effect=RuntimeError("model error")))
@@ -53,6 +55,7 @@ def test_run_phase_succeeds_within_depth_limit(monkeypatch):
     eng._project = MagicMock(name="test")
     eng._session = MagicMock()
     eng._renderer = MagicMock()
+    eng._run_state = EngineRunState.RUNNING
 
     call_count = 0
 

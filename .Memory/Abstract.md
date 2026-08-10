@@ -960,3 +960,11 @@
 ## 2026-06-29
 - **WF卡片乱码+进度+Traex修复** — bridge.py ensure_ascii导致中文\uXXXX乱码、FeishuCardAPIClient缺surrogate清理、两处内联卡片缺schema 2.0引发200830错误、脚本生成阶段缺实时进度反馈、Traex model=None导致Internal error；全部修复，Workflow回归 2019 passed → [详细记录](2026-06-29.md)
 - Codex child rollout 权威终态实时对账（2026-08-09）
+- 2026-08-09：清退旧运行时与自证测试，详见 `2026-08-09.md`
+- 2026-08-09：四模式全自动、Workflow调度卡与测试减半，详见当日记录。
+
+- 2026-08-09：四模式全自动、Workflow完整调度卡与代码总量减半；验证及待授权风险见当日日志。
+
+- 2026-08-09：四模式自动路径静态闭环；Workflow证据、race超时、stderr与失败指标增强，总代码仍严格减半。
+
+- 2026-08-10：三目标最终收口；总量减少50.250%，四模式全自动与Workflow算法/卡片完成，2858测试全绿。

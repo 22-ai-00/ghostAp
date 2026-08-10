@@ -8,6 +8,7 @@ from ...card.render.budget import RenderBudget
 from ...card.state.models import CardMetadata
 from ...card.ui_text import UI_TEXT
 from ...deep_engine import DeepEngineCallbacks
+from ...deep_engine.models import DeepProjectStatus
 from ...project import ContextSourceMode
 from ...utils.text import summarize_question_title
 from ._deep_stream_processor import DeepStreamProcessor
@@ -203,6 +204,10 @@ class DeepRenderer(BaseRenderer):
             ))
 
         # Terminal state
-        if not progress_info["is_executing"]:
+        if deep_project.status == DeepProjectStatus.COMPLETED:
             session.dispatch(CardEvent.completed())
+        elif deep_project.status == DeepProjectStatus.CANCELLED:
+            session.dispatch(CardEvent.cancelled(reason="cancelled"))
+        elif deep_project.status == DeepProjectStatus.FAILED:
+            session.dispatch(CardEvent.failed(deep_project.error or "Deep 执行失败"))
         # If still executing, leave session open (card delivered via dispatch)

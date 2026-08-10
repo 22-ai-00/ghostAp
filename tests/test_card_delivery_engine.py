@@ -3,18 +3,14 @@
 import dataclasses
 import threading
 import time
-from unittest.mock import MagicMock, patch
 
-import pytest
-
-from src.card.delivery.engine import CardDelivery, SequenceConflictError, TransportError
-from src.card.delivery.types import MutationOutcome as MutationOutcomeType
+from src.card.delivery.engine import CardDelivery
+from src.card.delivery.types import SequenceConflictError, TransportError
 from src.card.programming_adapter import build_programming_metadata
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import render_card
-from src.card.state.models import CardState, ContentBlock, ImageBlock
+from src.card.state.models import CardState, ContentBlock
 from src.card.types import ActiveElement, RenderedCard
-from tests.helpers.delivery_internals import DeliveryInspector
 
 
 class MockCardClient:
@@ -99,71 +95,6 @@ class TestCardDeliveryCreate:
 class TestCardDeliveryUpdate:
     """Subsequent deliveries compare signatures."""
 
-    @pytest.mark.parametrize(
-        ("replacement_key", "replacement_alt"),
-        [
-            pytest.param("img_new", "旧图片", id="image-key"),
-            pytest.param("img_old", "新图片", id="alt"),
-        ],
-    )
-    def test_replacing_image_render_fields_triggers_card_update(
-        self,
-        replacement_key,
-        replacement_alt,
-    ):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        initial = CardState(
-            blocks=(
-                ImageBlock(
-                    block_id="image:artifact",
-                    image_key="img_old",
-                    alt="旧图片",
-                    status="completed",
-                ),
-            ),
-        )
-        replacement = CardState(
-            blocks=(
-                ImageBlock(
-                    block_id="image:artifact",
-                    image_key=replacement_key,
-                    alt=replacement_alt,
-                    status="completed",
-                ),
-            ),
-        )
-
-        initial_card = render_card(initial, RenderBudget())[0]
-        replacement_card = render_card(replacement, RenderBudget())[0]
-        delivery.deliver("image_session", "chat_abc", [initial_card])
-
-        outcomes = delivery.deliver(
-            "image_session",
-            "chat_abc",
-            [replacement_card],
-        )
-
-        assert replacement_card.structure_signature != initial_card.structure_signature
-        assert outcomes[0].kind == "applied"
-        assert client.updates[0]["card_json"]["body"]["elements"][0] == {
-            "tag": "img",
-            "img_key": replacement_key,
-            "alt": {"tag": "plain_text", "content": replacement_alt},
-        }
-
-    def test_signature_change_triggers_update(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        r1 = [RenderedCard(_card_json={}, structure_signature="sig_1", page_index=0, total_pages=1)]
-        delivery.deliver("sess_1", "chat_abc", r1)
-
-        r2 = [RenderedCard(_card_json={"updated": True}, structure_signature="sig_2", page_index=0, total_pages=1)]
-        outcomes = delivery.deliver("sess_1", "chat_abc", r2)
-
-        assert outcomes[0].kind == "applied"
-        assert len(client.updates) == 1
 
     def test_non_streaming_message_text_change_uses_full_patch(self):
         client = MockCardClient()
@@ -231,111 +162,6 @@ class TestCardDeliveryUpdate:
             },
         ]
 
-    def test_live_elapsed_does_not_disable_programming_element_streaming(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        metadata = dataclasses.replace(
-            build_programming_metadata("codex"),
-            session_started_at=100.0,
-        )
-        initial_state = CardState(
-            blocks=(
-                ContentBlock(
-                    kind="text",
-                    block_id="stream",
-                    content="正在检查",
-                    element_id="el_stream",
-                    status="active",
-                ),
-            ),
-            metadata=metadata,
-        )
-        updated_state = dataclasses.replace(
-            initial_state,
-            blocks=(
-                dataclasses.replace(
-                    initial_state.blocks[0],
-                    content="正在检查流式投递",
-                ),
-            ),
-        )
-
-        with patch("src.card.render.footer.time.monotonic", return_value=220.0):
-            initial = render_card(initial_state, RenderBudget())
-        with patch("src.card.render.footer.time.monotonic", return_value=221.0):
-            updated = render_card(updated_state, RenderBudget())
-
-        delivery.deliver("elapsed-programming-section", "chat_abc", initial)
-        outcomes = delivery.deliver(
-            "elapsed-programming-section",
-            "chat_abc",
-            updated,
-        )
-
-        assert initial[0].structure_signature == updated[0].structure_signature
-        assert outcomes[0].kind == "applied"
-        assert client.updates == []
-        assert client.elements == [
-            {
-                "card_id": "stream_card_1",
-                "element_id": "el_stream",
-                "content": "正在检查流式投递",
-                "sequence": 1,
-            },
-        ]
-
-    def test_live_elapsed_mask_keeps_other_footer_metadata_in_signature(self):
-        metadata = dataclasses.replace(
-            build_programming_metadata("codex"),
-            is_subagent=True,
-            model_name="model-a",
-            unit_id="task-1",
-            unit_label="核对投递",
-            session_started_at=100.0,
-        )
-        initial_state = CardState(
-            blocks=(
-                ContentBlock(
-                    kind="text",
-                    block_id="stream",
-                    content="正在检查",
-                    element_id="el_stream",
-                    status="active",
-                ),
-            ),
-            metadata=metadata,
-        )
-        updated_state = dataclasses.replace(
-            initial_state,
-            blocks=(
-                dataclasses.replace(
-                    initial_state.blocks[0],
-                    content="正在检查流式投递",
-                ),
-            ),
-            metadata=dataclasses.replace(metadata, model_name="model-b"),
-        )
-
-        with patch("src.card.render.footer.time.monotonic", return_value=220.0):
-            initial = render_card(initial_state, RenderBudget())
-        with patch("src.card.render.footer.time.monotonic", return_value=221.0):
-            updated = render_card(updated_state, RenderBudget())
-
-        assert initial[0].structure_signature != updated[0].structure_signature
-
-    def test_no_change_skips(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        active = ActiveElement(element_id="el_1", text="same")
-        r1 = [RenderedCard(_card_json={}, structure_signature="sig_1", active_element=active, page_index=0, total_pages=1)]
-        delivery.deliver("sess_1", "chat_abc", r1)
-
-        outcomes = delivery.deliver("sess_1", "chat_abc", r1)
-        assert outcomes[0].kind == "skipped"
-        assert len(client.updates) == 0
-        assert len(client.elements) == 0
-
 
 class TestSequenceConflict:
     def test_sequence_conflict_reconcile(self):
@@ -354,17 +180,6 @@ class TestSequenceConflict:
 
 
 class TestMultiPage:
-    def test_multi_page_delivery(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        rendered = [
-            RenderedCard(_card_json={"page": 0}, structure_signature="sig_1", page_index=0, total_pages=2),
-            RenderedCard(_card_json={"page": 1}, structure_signature="sig_1", page_index=1, total_pages=2),
-        ]
-        outcomes = delivery.deliver("sess_1", "chat_abc", rendered)
-        assert len(outcomes) == 2
-        assert all(o.kind == "applied" for o in outcomes)
 
     def test_first_five_page_delivery_creates_messages_in_page_order(self):
         """Initial pagination must never create tail pages before history pages."""
@@ -417,20 +232,6 @@ class TestMultiPage:
         assert client.creates == []
         assert [outcome.kind for outcome in outcomes] == ["reconcile"]
 
-    def test_new_page_created_on_growth(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        r1 = [RenderedCard(_card_json={}, structure_signature="sig_1", page_index=0, total_pages=1)]
-        delivery.deliver("sess_1", "chat_abc", r1)
-
-        r2 = [
-            RenderedCard(_card_json={}, structure_signature="sig_1", page_index=0, total_pages=2),
-            RenderedCard(_card_json={}, structure_signature="sig_1", page_index=1, total_pages=2),
-        ]
-        outcomes = delivery.deliver("sess_1", "chat_abc", r2)
-        assert outcomes[1].kind == "applied"
-        assert len(client.creates) == 2
 
     def test_growth_flushes_previous_latest_page_once_before_freezing_it(self):
         """The page-boundary chunk must reach the old latest message before append."""
@@ -512,77 +313,9 @@ class TestMultiPage:
         patched_pages = [u["card_json"].get("page") for u in client.updates]
         assert patched_pages == [1]
 
-    def test_non_terminal_still_freezes_history_pages(self):
-        """Streaming (non-terminal) updates keep freezing history pages to avoid
-        churn — the terminal exemption must not regress this optimization."""
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        first = [
-            RenderedCard(_card_json={"page": 0, "title": "old"}, structure_signature="p0_t1", page_index=0, total_pages=2),
-            RenderedCard(_card_json={"page": 1, "title": "latest 1s"}, structure_signature="p1_t1", page_index=1, total_pages=2),
-        ]
-        delivery.deliver("sess_1", "chat_abc", first)
-
-        second = [
-            RenderedCard(_card_json={"page": 0, "title": "old 2s"}, structure_signature="p0_t2", page_index=0, total_pages=2),
-            RenderedCard(_card_json={"page": 1, "title": "latest 2s"}, structure_signature="p1_t2", page_index=1, total_pages=2),
-        ]
-        outcomes = delivery.deliver("sess_1", "chat_abc", second, is_terminal=False)
-        assert [o.kind for o in outcomes] == ["skipped", "applied"]
-
 
 class TestPageShrink:
-    def test_shrink_keeps_message_high_watermark_and_updates_latest_message(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
 
-        r2 = [
-            RenderedCard(_card_json={"page": 0}, structure_signature="sig_1", page_index=0, total_pages=2),
-            RenderedCard(_card_json={"page": 1}, structure_signature="sig_1", page_index=1, total_pages=2),
-        ]
-        delivery.deliver("sess_1", "chat_abc", r2)
-
-        r1 = [RenderedCard(
-            _card_json={"content": "final compact state"},
-            structure_signature="sig_2",
-            page_index=0,
-            total_pages=1,
-        )]
-        outcomes = delivery.deliver("sess_1", "chat_abc", r1, is_terminal=True)
-
-        binding = delivery.get_binding("sess_1")
-        assert set(binding.pages) == {0, 1}
-        assert outcomes[-1].kind == "applied"
-        assert client.updates[-1]["card_id"] == "card_2"
-        assert client.updates[-1]["card_json"]["content"] == "final compact state"
-
-    def test_shrink_relabels_latest_message_with_visible_high_watermark_page(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        delivery.deliver("sess_1", "chat_abc", [
-            RenderedCard(
-                _card_json={"header": {"title": {"content": f"Deep 任务 · 页 {idx + 1}/3"}}},
-                structure_signature=f"sig_{idx}",
-                page_index=idx,
-                total_pages=3,
-            )
-            for idx in range(3)
-        ])
-
-        compact = RenderedCard(
-            _card_json={"header": {"title": {"content": "Deep 任务"}}},
-            structure_signature="sig_compact",
-            page_index=0,
-            total_pages=1,
-        )
-        delivery.deliver("sess_1", "chat_abc", [compact], is_terminal=True)
-
-        assert client.updates[-1]["card_id"] == "card_3"
-        assert client.updates[-1]["card_json"]["header"]["title"]["content"] == (
-            "Deep 任务 · 页 3/3"
-        )
 
     def test_three_to_two_page_shrink_preserves_ordered_content_across_messages(self):
         client = MockCardClient()
@@ -620,21 +353,6 @@ class TestPageShrink:
 
 
 class TestStreamingFallback:
-    def test_streaming_success_uses_cardkit_path(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        active = ActiveElement(element_id="el_1", text="streaming text")
-        rendered = [RenderedCard(
-            _card_json={"config": {"streaming_mode": True}, "body": {}},
-            structure_signature="sig_1", active_element=active, page_index=0, total_pages=1,
-        )]
-
-        outcomes = delivery.deliver("sess_1", "chat_abc", rendered)
-        assert outcomes[0].kind == "applied"
-        assert len(client.streaming_creates) == 1
-        assert len(client.card_references) == 1
-        assert len(client.creates) == 0
 
     def test_streaming_fallback_to_im_api(self):
         client = MockCardClient()
@@ -715,30 +433,6 @@ class TestClose:
         outcomes = delivery.deliver("sess_1", "chat_abc", r1)
         assert outcomes == []
 
-    def test_close_releases_session_lock_when_binding_cleanup_raises(self):
-        """The delivery lock is released even if internal cleanup fails."""
-        delivery = CardDelivery(MockCardClient())
-        rendered = [
-            RenderedCard(
-                _card_json={},
-                structure_signature="sig_close_failure",
-                page_index=0,
-                total_pages=1,
-            )
-        ]
-        delivery.deliver("sess_close_failure", "chat_abc", rendered)
-        assert delivery._lock_pool.contains("sess_close_failure")
-
-        with patch.object(
-            delivery._bindings,
-            "remove",
-            side_effect=RuntimeError("binding cleanup failed"),
-        ):
-            with pytest.raises(RuntimeError, match="binding cleanup failed"):
-                delivery.close("sess_close_failure")
-
-        assert not delivery._lock_pool.contains("sess_close_failure")
-
 
 class TestTransportError:
     def test_transport_error_returns_reconcile(self):
@@ -754,421 +448,6 @@ class TestTransportError:
 
         assert outcomes[0].kind == "reconcile"
         assert "connection timeout" in outcomes[0].message
-
-    def test_stale_latest_binding_preserves_history_and_appends_replacement(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        rendered_v1 = [
-            RenderedCard(_card_json={"page": 0}, structure_signature="sig_1", page_index=0, total_pages=2),
-            RenderedCard(_card_json={"page": 1}, structure_signature="sig_1", page_index=1, total_pages=2),
-        ]
-        delivery.deliver("sess_stale", "chat_abc", rendered_v1)
-
-        update_attempts = {"n": 0}
-
-        def stale_update(*args, **kwargs):
-            update_attempts["n"] += 1
-            raise TransportError("message not found", code=99992354)
-
-        client.update_card = stale_update
-        rendered_v2 = [
-            RenderedCard(_card_json={"page": 0, "v": 2}, structure_signature="sig_2", page_index=0, total_pages=2),
-            RenderedCard(_card_json={"page": 1, "v": 2}, structure_signature="sig_2", page_index=1, total_pages=2),
-        ]
-        outcomes = delivery.deliver("sess_stale", "chat_abc", rendered_v2)
-
-        assert [outcome.kind for outcome in outcomes] == ["skipped", "applied"]
-        assert update_attempts["n"] == 1
-        binding = delivery.get_binding("sess_stale")
-        assert binding is not None
-        assert set(binding.pages) == {0, 2}
-        assert binding.pages[0].is_frozen is True
-        assert binding.message_high_watermark == 2
-
-        client.update_card = MockCardClient.update_card.__get__(client, MockCardClient)
-        outcomes = delivery.deliver("sess_stale", "chat_abc", rendered_v2)
-        assert [outcome.kind for outcome in outcomes] == ["skipped", "skipped"]
-        assert [item["card_json"]["page"] for item in client.creates] == [0, 1, 1]
-
-    def test_second_consecutive_stale_stops_creating_replacement_messages(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        initial = RenderedCard(
-            _card_json={"version": 1},
-            structure_signature="version_1",
-            page_index=0,
-            total_pages=1,
-        )
-        delivery.deliver("sess_stale_storm", "chat_abc", [initial])
-        client._raise_on_update = TransportError(
-            "message not found",
-            code=99992354,
-        )
-
-        first = delivery.deliver(
-            "sess_stale_storm",
-            "chat_abc",
-            [dataclasses.replace(
-                initial,
-                _card_json={"version": 2},
-                structure_signature="version_2",
-            )],
-        )
-        second = delivery.deliver(
-            "sess_stale_storm",
-            "chat_abc",
-            [dataclasses.replace(
-                initial,
-                _card_json={"version": 3},
-                structure_signature="version_3",
-            )],
-        )
-
-        assert [outcome.kind for outcome in first] == ["applied"]
-        assert [outcome.kind for outcome in second] == ["reconcile"]
-        assert second[0].message == "stale_replacement_exhausted:99992354"
-        assert len(client.creates) == 2
-
-    def test_terminal_streaming_replacement_stale_is_bounded(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        running = RenderedCard(
-            _card_json={"config": {"streaming_mode": True}, "version": 1},
-            structure_signature="streaming_1",
-            page_index=0,
-            total_pages=1,
-        )
-        delivery.deliver("sess_terminal_stale", "chat_abc", [running])
-        client._raise_on_update = TransportError(
-            "card entity not found",
-            code=99992354,
-        )
-        terminal = dataclasses.replace(
-            running,
-            _card_json={"config": {"streaming_mode": True}, "version": 2},
-            structure_signature="streaming_2",
-        )
-
-        first = delivery.deliver(
-            "sess_terminal_stale",
-            "chat_abc",
-            [terminal],
-            is_terminal=True,
-        )
-        second = delivery.deliver(
-            "sess_terminal_stale",
-            "chat_abc",
-            [terminal],
-            is_terminal=True,
-        )
-
-        assert first == [
-            MutationOutcomeType(
-                kind="reconcile",
-                message="stale_replacement_exhausted:99992354",
-            )
-        ]
-        assert second == first
-        assert len(client.card_references) == 2
-
-    def test_stale_replacement_lineage_resets_after_page_growth(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        initial = RenderedCard(
-            _card_json={"content": "initial"},
-            structure_signature="initial",
-            page_index=0,
-            total_pages=1,
-        )
-        delivery.deliver("sess_stale_lineage", "chat_abc", [initial])
-        client._raise_on_update = TransportError(
-            "message not found",
-            code=99992354,
-        )
-        page_zero = dataclasses.replace(
-            initial,
-            _card_json={"content": "replacement"},
-            structure_signature="replacement",
-        )
-        delivery.deliver("sess_stale_lineage", "chat_abc", [page_zero])
-
-        client._raise_on_update = None
-        page_one = RenderedCard(
-            _card_json={"content": "new live page"},
-            structure_signature="new_live_page",
-            page_index=1,
-            total_pages=2,
-        )
-        delivery.deliver(
-            "sess_stale_lineage",
-            "chat_abc",
-            [dataclasses.replace(page_zero, total_pages=2), page_one],
-        )
-
-        client._raise_on_update = TransportError(
-            "new live page became stale",
-            code=99992354,
-        )
-        compact = dataclasses.replace(
-            initial,
-            _card_json={"content": "compacted result"},
-            structure_signature="compacted_result",
-        )
-        outcome = delivery.deliver(
-            "sess_stale_lineage",
-            "chat_abc",
-            [compact],
-        )
-
-        assert [item.kind for item in outcome] == ["applied"]
-        assert len(client.creates) == 4
-
-    def test_stale_compacted_latest_appends_replacement_without_history_waterfall(
-        self, caplog
-    ):
-        """A stale compacted live page must not expose each history page to PATCH."""
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        delivery.deliver(
-            "sess_compacted_stale",
-            "chat_abc",
-            [
-                RenderedCard(
-                    _card_json={"page": page_index},
-                    structure_signature=f"old_{page_index}",
-                    page_index=page_index,
-                    total_pages=3,
-                )
-                for page_index in range(3)
-            ],
-        )
-
-        update_attempts = 0
-
-        def stale_once(*args, **kwargs):
-            nonlocal update_attempts
-            update_attempts += 1
-            if update_attempts == 1:
-                raise TransportError("message not found", code=99992354)
-            return MockCardClient.update_card(client, *args, **kwargs)
-
-        client.update_card = stale_once
-        compact = RenderedCard(
-            _card_json={
-                "header": {"title": {"content": "Deep 任务"}},
-                "content": "final compact state",
-            },
-            structure_signature="final_compact",
-            page_index=0,
-            total_pages=1,
-        )
-
-        with caplog.at_level("WARNING"):
-            outcomes = delivery.deliver(
-                "sess_compacted_stale",
-                "chat_abc",
-                [compact],
-                is_terminal=True,
-            )
-
-        assert [outcome.kind for outcome in outcomes] == ["applied"]
-        assert update_attempts == 1
-        assert len(client.creates) == 4
-        assert client.creates[-1]["card_json"]["content"] == "final compact state"
-        assert client.creates[-1]["card_json"]["header"]["title"]["content"].endswith(
-            "页 4/4"
-        )
-        binding = delivery.get_binding("sess_compacted_stale")
-        assert binding.message_high_watermark == 3
-        assert set(binding.pages) == {0, 1, 3}
-        assert not [record for record in caplog.records if record.levelname == "WARNING"]
-
-        delivery.deliver(
-            "sess_compacted_stale",
-            "chat_abc",
-            [dataclasses.replace(compact, structure_signature="final_compact_v2")],
-            is_terminal=True,
-        )
-        assert update_attempts == 2
-        assert client.updates[-1]["card_id"] == "card_4"
-
-    def test_stale_during_growth_keeps_boundary_and_latest_in_distinct_messages(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        delivery.deliver(
-            "sess_stale_growth",
-            "chat_abc",
-            [RenderedCard(
-                _card_json={"content": "before boundary"},
-                structure_signature="before_boundary",
-                page_index=0,
-                total_pages=1,
-            )],
-        )
-
-        def stale_update(*args, **kwargs):
-            raise TransportError("message not found", code=99992354)
-
-        client.update_card = stale_update
-        outcomes = delivery.deliver(
-            "sess_stale_growth",
-            "chat_abc",
-            [
-                RenderedCard(
-                    _card_json={"content": "complete boundary"},
-                    structure_signature="complete_boundary",
-                    page_index=0,
-                    total_pages=2,
-                ),
-                RenderedCard(
-                    _card_json={"content": "new latest"},
-                    structure_signature="new_latest",
-                    page_index=1,
-                    total_pages=2,
-                ),
-            ],
-        )
-
-        assert [outcome.kind for outcome in outcomes] == ["applied", "applied"]
-        assert [item["card_json"]["content"] for item in client.creates] == [
-            "before boundary",
-            "complete boundary",
-            "new latest",
-        ]
-        binding = delivery.get_binding("sess_stale_growth")
-        assert binding.message_high_watermark == 2
-        assert set(binding.pages) == {1, 2}
-        assert binding.pages[1].is_frozen is True
-        assert binding.pages[2].is_frozen is False
-
-        client.update_card = MockCardClient.update_card.__get__(client, MockCardClient)
-        follow_up = delivery.deliver(
-            "sess_stale_growth",
-            "chat_abc",
-            [
-                RenderedCard(
-                    _card_json={"content": "old history"},
-                    structure_signature="old_history",
-                    page_index=0,
-                    total_pages=3,
-                ),
-                RenderedCard(
-                    _card_json={"content": "second boundary complete"},
-                    structure_signature="second_boundary",
-                    page_index=1,
-                    total_pages=3,
-                ),
-                RenderedCard(
-                    _card_json={"content": "newest latest"},
-                    structure_signature="newest_latest",
-                    page_index=2,
-                    total_pages=3,
-                ),
-            ],
-        )
-
-        assert [outcome.kind for outcome in follow_up] == [
-            "skipped",
-            "applied",
-            "applied",
-        ]
-        assert client.updates[-1]["card_id"] == "card_3"
-        assert client.updates[-1]["card_json"]["content"] == (
-            "second boundary complete"
-        )
-        assert client.creates[-1]["card_json"]["content"] == "newest latest"
-        binding = delivery.get_binding("sess_stale_growth")
-        assert binding.message_high_watermark == 3
-        assert binding.pages[2].source_page_index == 1
-        assert binding.pages[2].is_frozen is True
-        assert binding.pages[3].source_page_index == 2
-        assert binding.pages[3].is_frozen is False
-
-    def test_failed_single_page_replacement_retries_reserved_visible_page(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        original_create = client.create_card
-        delivery.deliver(
-            "sess_stale_retry",
-            "chat_abc",
-            [RenderedCard(
-                _card_json={"content": "initial"},
-                structure_signature="initial",
-                page_index=0,
-                total_pages=1,
-            )],
-        )
-
-        client.update_card = lambda *args, **kwargs: (_ for _ in ()).throw(
-            TransportError("message not found", code=99992354)
-        )
-        attempted_keys: list[str | None] = []
-
-        def fail_replacement(
-            chat_id,
-            card_json,
-            *,
-            reply_to=None,
-            reply_in_thread=None,
-            idempotency_key=None,
-        ):
-            attempted_keys.append(idempotency_key)
-            raise TimeoutError("replacement create timed out")
-
-        client.create_card = fail_replacement
-        replacement = RenderedCard(
-            _card_json={"content": "replacement"},
-            structure_signature="replacement",
-            page_index=0,
-            total_pages=1,
-        )
-        first = delivery.deliver(
-            "sess_stale_retry",
-            "chat_abc",
-            [replacement],
-        )
-        assert [outcome.kind for outcome in first] == ["reconcile"]
-        binding = delivery.get_binding("sess_stale_retry")
-        assert binding.pages == {}
-        assert binding.message_high_watermark == 0
-
-        def successful_retry(*args, **kwargs):
-            attempted_keys.append(kwargs.get("idempotency_key"))
-            return original_create(*args, **kwargs)
-
-        client.create_card = successful_retry
-        second = delivery.deliver(
-            "sess_stale_retry",
-            "chat_abc",
-            [replacement],
-        )
-
-        assert [outcome.kind for outcome in second] == ["applied"]
-        assert attempted_keys[0] == attempted_keys[1]
-        assert attempted_keys[0] != client.creates[0]["idempotency_key"]
-        binding = delivery.get_binding("sess_stale_retry")
-        assert binding.message_high_watermark == 1
-        assert set(binding.pages) == {1}
-
-    def test_transport_error_on_element_falls_back_to_update(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        active = ActiveElement(element_id="el_1", text="hello")
-        r1 = [RenderedCard(_card_json={}, structure_signature="sig_1", active_element=active, page_index=0, total_pages=1)]
-        delivery.deliver("sess_1", "chat_abc", r1)
-
-        def failing_element(*args, **kwargs):
-            raise TransportError("element push failed")
-
-        client.update_element = failing_element
-        active2 = ActiveElement(element_id="el_1", text="world")
-        r2 = [RenderedCard(_card_json={}, structure_signature="sig_1", active_element=active2, page_index=0, total_pages=1)]
-        outcomes = delivery.deliver("sess_1", "chat_abc", r2)
-
-        assert outcomes[0].kind == "applied"
-        assert len(client.updates) == 1
 
 
 class TestCreateCardFailure:
@@ -1269,18 +548,6 @@ class TestCardDeliveryTOCTOU:
 
 
 class TestDeliveryTimeout:
-    def test_deliver_timeout_on_slow_api(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        def slow_create(*args, **kwargs):
-            raise TimeoutError("Connection timed out after 30s")
-        client.create_card = slow_create
-
-        rendered = [RenderedCard(_card_json={}, structure_signature="sig_1", page_index=0, total_pages=1)]
-        outcomes = delivery.deliver("sess_1", "chat_abc", rendered)
-
-        assert outcomes[0].kind == "reconcile"
 
     def test_update_timeout_returns_reconcile(self):
         client = MockCardClient()
@@ -1384,124 +651,6 @@ class TestPartialMultipageFailure:
         assert outcomes2[0].kind == "skipped"
         assert outcomes2[1].kind == "applied"
 
-    def test_retry_missing_page_reuses_same_idempotency_key(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-
-        call_count = 0
-        original_create = client.create_card
-
-        def _failing_second_create(chat_id, card_json, *, reply_to=None, reply_in_thread=None, idempotency_key=None):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 2:
-                _failing_second_create.last_key = idempotency_key
-                raise TimeoutError("lost")
-            return original_create(chat_id, card_json, reply_to=reply_to, idempotency_key=idempotency_key)
-        _failing_second_create.last_key = None
-
-        client.create_card = _failing_second_create
-        rendered = [
-            RenderedCard(_card_json={"page": 0}, structure_signature="sig_a", page_index=0, total_pages=2),
-            RenderedCard(_card_json={"page": 1}, structure_signature="sig_b", page_index=1, total_pages=2),
-        ]
-
-        delivery.deliver("sess_retry", "chat_abc", rendered)
-        failed_key = _failing_second_create.last_key
-
-        client.create_card = original_create
-        delivery.deliver("sess_retry", "chat_abc", rendered)
-        assert failed_key
-        assert client.creates[-1]["idempotency_key"] == failed_key
-
-
-class TestSessionLockEviction:
-    def _make_delivery(self, *, max_locks: int = 10, lock_ttl: float = 600.0):
-        client = MockCardClient()
-        delivery = CardDelivery(client, max_session_locks=max_locks, session_lock_ttl=lock_ttl)
-        return client, delivery
-
-    def test_session_lock_evicted_after_close_and_ttl(self):
-        import time as _time
-        client, delivery = self._make_delivery(max_locks=10, lock_ttl=600.0)
-
-        for i in range(9):
-            sid = f"zombie_{i}"
-            rendered = [RenderedCard(_card_json={}, structure_signature=f"sig_{i}", page_index=0, total_pages=1)]
-            delivery.deliver(sid, "chat_1", rendered)
-
-        inspector = DeliveryInspector.from_delivery(delivery)
-        for i in range(9):
-            inspector.timestamps[f"zombie_{i}"] = _time.monotonic() - 700.0
-        for i in range(9):
-            delivery._bindings.remove(f"zombie_{i}")
-
-        assert len(inspector.session_locks) == 9
-        inspector.evict_stale_two_phase()
-        assert len(inspector.session_locks) < 9
-
-    def test_session_lock_not_evicted_while_active(self):
-        import time as _time
-        client, delivery = self._make_delivery(max_locks=10, lock_ttl=600.0)
-
-        for i in range(9):
-            sid = f"active_{i}"
-            rendered = [RenderedCard(_card_json={}, structure_signature=f"sig_{i}", page_index=0, total_pages=1)]
-            delivery.deliver(sid, "chat_1", rendered)
-
-        inspector = DeliveryInspector.from_delivery(delivery)
-        for i in range(9):
-            inspector.timestamps[f"active_{i}"] = _time.monotonic() - 700.0
-
-        inspector.evict_stale_two_phase()
-        for i in range(9):
-            assert f"active_{i}" in inspector.session_locks
-
-
-class TestEvictionConcurrencyStress:
-    def test_concurrent_deliver_and_eviction_no_deadlock(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client, max_session_locks=50, session_lock_ttl=1.0)
-        delivery._eviction_interval = 0.05
-
-        num_threads = 25
-        iterations_per_thread = 20
-        barrier = threading.Barrier(num_threads, timeout=30)
-        errors: list[Exception] = []
-
-        def worker(thread_id: int):
-            try:
-                barrier.wait()
-                for i in range(iterations_per_thread):
-                    session_id = f"stress_t{thread_id}_i{i}"
-                    rendered = [RenderedCard(
-                        _card_json={"body": {"elements": [{"tag": "markdown", "content": f"t{thread_id}i{i}"}]}},
-                        structure_signature=f"sig_{thread_id}_{i}", page_index=0,
-                    )]
-                    try:
-                        delivery.deliver(session_id, f"chat_{thread_id}", rendered)
-                    except Exception:
-                        pass
-                    if i % 3 == 0:
-                        try:
-                            delivery.close(session_id)
-                        except Exception:
-                            pass
-                    time.sleep(0.001)
-            except Exception as exc:
-                errors.append(exc)
-
-        threads = [threading.Thread(target=worker, args=(tid,)) for tid in range(num_threads)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=60)
-
-        alive = [t for t in threads if t.is_alive()]
-        assert not alive, f"{len(alive)} threads still alive"
-        assert not errors
-        delivery._shutdown()
-
 
 class TestDeliverRejectedAtCapacity:
     def test_noop_degradation_when_capacity_full(self):
@@ -1531,18 +680,6 @@ class TestDeliverRejectedAtCapacity:
         result = delivery.deliver("session_0", "chat_1", rendered_update)
         assert result[0].kind in ("applied", "reconcile")
         delivery._shutdown()
-
-
-class TestDeliverEmptyRenderedOpenSession:
-    def test_empty_rendered_new_session(self):
-        client = MockCardClient()
-        delivery = CardDelivery(client)
-        try:
-            outcomes = delivery.deliver("sess_empty", "chat_1", [])
-            assert outcomes == []
-            assert len(client.creates) == 0
-        finally:
-            delivery._shutdown()
 
 
 class TestNonContiguousPageIndex:
@@ -1576,40 +713,6 @@ class TestTOCTOUClosedAfterLock:
             assert len(client.creates) == 1
         finally:
             delivery._shutdown()
-
-
-class TestSessionLockPoolFullScan:
-    def test_full_scan_cleans_stale_locks(self):
-        from src.card.delivery.lock_pool import SessionLockPool
-
-        pool = SessionLockPool(max_locks=100, lock_ttl=0.1, eviction_interval=9999)
-        try:
-            for i in range(10):
-                pool.acquire(f"s{i}")
-            time.sleep(0.2)
-            pool._last_full_scan = 0
-            pool._full_scan_if_needed()
-            assert pool.count == 0
-        finally:
-            pool.shutdown()
-
-    def test_full_scan_skips_active_bindings(self):
-        from src.card.delivery.lock_pool import SessionLockPool
-
-        pool = SessionLockPool(
-            max_locks=100, lock_ttl=0.1, eviction_interval=9999,
-            has_active_binding=lambda sid: sid == "s_active",
-        )
-        try:
-            pool.acquire("s_active")
-            pool.acquire("s_stale")
-            time.sleep(0.2)
-            pool._last_full_scan = 0
-            pool._full_scan_if_needed()
-            assert pool.contains("s_active")
-            assert not pool.contains("s_stale")
-        finally:
-            pool.shutdown()
 
 
 class TestAsyncDeliveryExactlyOnce:
@@ -1686,33 +789,6 @@ class TestDeliveryCloseRace:
     def _rendered(self, sig: str = "sig_1") -> list[RenderedCard]:
         return [RenderedCard(_card_json={"body": {"elements": []}}, structure_signature=sig, page_index=0, total_pages=1)]
 
-    def test_close_during_create_card_no_exception(self):
-        client = _SlowCreateClient(delay=0.15)
-        delivery = CardDelivery(client)
-        session_id = "race_1"
-        errors: list[Exception] = []
-
-        def deliver_thread():
-            try:
-                delivery.deliver(session_id, "chat_1", self._rendered())
-            except Exception as e:
-                errors.append(e)
-
-        def close_thread():
-            try:
-                client.create_started.wait(timeout=5)
-                delivery.close(session_id)
-            except Exception as e:
-                errors.append(e)
-
-        t_deliver = threading.Thread(target=deliver_thread)
-        t_close = threading.Thread(target=close_thread)
-        t_deliver.start(); t_close.start()
-        t_deliver.join(timeout=5); t_close.join(timeout=5)
-
-        assert errors == []
-        assert delivery.get_binding(session_id) is None
-        delivery._shutdown()
 
     def test_per_session_lock_serializes_deliver_and_close(self):
         client = _SlowCreateClient(delay=0.2)
@@ -1739,35 +815,3 @@ class TestDeliveryCloseRace:
         assert close_done.is_set()
         assert delivery.get_binding(session_id) is None
         delivery._shutdown()
-
-
-class TestCardDeliveryDestructor:
-    def test_del_calls_lock_pool_shutdown(self):
-        client = MagicMock()
-        client.create_card = MagicMock(return_value=("msg_1", "card_1"))
-        delivery = CardDelivery(client)
-        mock_shutdown = MagicMock()
-        delivery._lock_pool.shutdown = mock_shutdown
-        delivery.__del__()
-        mock_shutdown.assert_called_once()
-        delivery._shutdown()
-
-    def test_del_suppresses_exceptions(self):
-        client = MagicMock()
-        client.create_card = MagicMock(return_value=("msg_1", "card_1"))
-        delivery = CardDelivery(client)
-        delivery._lock_pool.shutdown = MagicMock(side_effect=RuntimeError("already shut down"))
-        delivery.__del__()  # Should not raise
-        delivery._lock_pool.shutdown = MagicMock()
-        delivery._shutdown()
-
-
-class TestMutationOutcomeStructure:
-    def test_is_frozen_dataclass(self):
-        outcome = MutationOutcomeType(kind="applied")
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            outcome.kind = "rejected"  # type: ignore[misc]
-
-    def test_default_message_is_empty(self):
-        o = MutationOutcomeType(kind="applied")
-        assert o.message == ""

@@ -11,7 +11,7 @@ class DeepProjectStatus(Enum):
     IDLE = "idle"
     PLANNING = "planning"
     EXECUTING = "executing"
-    PAUSED = "paused"
+    CANCELLED = "cancelled"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -58,11 +58,9 @@ class DeepProject:
         if self.started_at is None:
             self.started_at = time.time()
 
-    def pause(self):
-        self.status = DeepProjectStatus.PAUSED
-
-    def resume(self):
-        self.status = DeepProjectStatus.EXECUTING
+    def cancel(self):
+        self.status = DeepProjectStatus.CANCELLED
+        self.completed_at = time.time()
 
     def complete(self):
         self.status = DeepProjectStatus.COMPLETED
@@ -95,11 +93,14 @@ class DeepProject:
 
     @classmethod
     def from_dict(cls, data: dict) -> "DeepProject":
+        raw_status = data.get("status", "idle")
+        if raw_status == "paused":
+            raw_status = DeepProjectStatus.CANCELLED.value
         return cls(
             project_id=data["project_id"],
             name=data["name"],
             root_path=data["root_path"],
-            status=DeepProjectStatus(data.get("status", "idle")),
+            status=DeepProjectStatus(raw_status),
             created_at=data.get("created_at", time.time()),
             started_at=data.get("started_at"),
             completed_at=data.get("completed_at"),

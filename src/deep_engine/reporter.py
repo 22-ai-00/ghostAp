@@ -32,11 +32,13 @@ class ProgressReporter:
                 f"📂 项目: {project.name}",
                 f"⏱️ 总耗时: {format_duration(project.duration())}" if project.duration() else "",
             ]
-        else:
+        elif project.status == DeepProjectStatus.CANCELLED:
             lines = [
-                "⏸️ **执行已暂停**\n",
+                "⏹️ **执行已取消**\n",
                 f"📂 项目: {project.name}",
             ]
+        else:
+            lines = ["❌ **执行未进入有效终态**\n", f"📂 项目: {project.name}"]
 
         return "\n".join(line for line in lines if line)
 
@@ -55,7 +57,7 @@ class ProgressReporter:
         if summary_parts:
             summary_line = "\n\n" + "\n".join([f"- {p}" for p in summary_parts]) + "\n"
 
-        advice = "建议您稍后点击重试。" if is_timeout else "请检查错误信息后重试。"
+        advice = "自动恢复已耗尽，任务已明确失败。"
 
         return f"""❌ **Deep Agent 错误**{summary_line}
 ```
@@ -69,7 +71,7 @@ class ProgressReporter:
             DeepProjectStatus.IDLE: "⏳ 等待开始",
             DeepProjectStatus.PLANNING: "🧠 正在规划",
             DeepProjectStatus.EXECUTING: "🔄 执行中",
-            DeepProjectStatus.PAUSED: "⏸️ 已暂停",
+            DeepProjectStatus.CANCELLED: "⏹️ 已取消",
             DeepProjectStatus.COMPLETED: "✅ 已完成",
             DeepProjectStatus.FAILED: "❌ 执行失败",
         }.get(project.status, "❓ 未知状态")
@@ -108,7 +110,9 @@ class ProgressReporter:
             return "🎉 全部任务完成！"
         elif project.status == DeepProjectStatus.FAILED:
             return "⚠️ 执行完成（有失败）"
-        return "⏸️ 执行已暂停"
+        if project.status == DeepProjectStatus.CANCELLED:
+            return "⏹️ 执行已取消"
+        return "❌ 执行未完成"
 
     def get_context_injected_title(self) -> str:
         return "💬 上下文已注入"
@@ -127,6 +131,8 @@ class ProgressReporter:
             "status": project.status,
             "project_name": project.name,
             "project_id": project.project_id,
-            "is_executing": project.status == DeepProjectStatus.EXECUTING,
-            "is_paused": project.status == DeepProjectStatus.PAUSED,
+            "is_executing": project.status in (
+                DeepProjectStatus.PLANNING,
+                DeepProjectStatus.EXECUTING,
+            ),
         }

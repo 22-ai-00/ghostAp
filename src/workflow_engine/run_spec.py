@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from src.spec_engine.review_agents import ReviewAgentBinding
+from src.spec_engine.models import ReviewAgentBinding
 
 
 @dataclass(frozen=True, slots=True)

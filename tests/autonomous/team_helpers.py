@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from src.autonomous.journal.blob_store import AesGcmEncryptionProvider, BlobStore
-from src.autonomous.team import TeamAttemptResult, TeamTarget
+from src.autonomous.team.service import TeamAttemptResult, TeamTarget
 from tests.autonomous.workforce_helpers import make_writer
 
 TEAM_KEY = b"t" * 32
@@ -45,9 +45,35 @@ class ImmediateTeamBackend:
         assert chat_id == "oc_team"
         return self.targets
 
-    def submit(self, *, step_id, target, instruction, **kwargs):
+    def submit(
+        self,
+        *,
+        run_id,
+        step_id,
+        target,
+        tenant_key,
+        chat_id,
+        message_id,
+        requester_principal_id,
+        instruction,
+        deadline_at,
+    ):
         acceptance_id = f"acc_{len(self.submissions)}"
-        self.submissions.append((step_id, target.agent_id, instruction, kwargs))
+        self.submissions.append(
+            (
+                step_id,
+                target.agent_id,
+                instruction,
+                {
+                    "run_id": run_id,
+                    "tenant_key": tenant_key,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "requester_principal_id": requester_principal_id,
+                    "deadline_at": deadline_at,
+                },
+            )
+        )
         self.results[acceptance_id] = TeamAttemptResult(
             "completed",
             output=f"deliverable by {target.agent_id} for {step_id}",
@@ -58,9 +84,19 @@ class ImmediateTeamBackend:
     def result(self, acceptance_id):
         return self.results.get(acceptance_id)
 
-    def cancel(self, acceptance_id, **_kwargs):
+    def cancel(self, acceptance_id, *, run_id, step_id):
+        del run_id, step_id
         return TeamAttemptResult("canceled", error_code="canceled")
 
-    def notify(self, message_id, chat_id, result):
+    def notify(
+        self,
+        message_id,
+        chat_id,
+        result,
+        *,
+        idempotency_key="",
+        tenant_key="",
+        requester_principal_id="",
+    ):
+        del idempotency_key, tenant_key, requester_principal_id
         self.notifications.append((message_id, chat_id, result))
-

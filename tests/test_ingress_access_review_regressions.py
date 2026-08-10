@@ -300,7 +300,6 @@ def test_ws_worker_rejects_malformed_current_facts_before_content_or_business(
     client._get_image_handler.assert_not_called()
     client._validate_message.assert_not_called()
     client._chat_lock_gate.check.assert_not_called()
-    client._employee_department_runtime.record_group_event.assert_not_called()
     client._handle_image_content.assert_not_called()
     client._dispatch_message_logic.assert_not_called()
 
@@ -699,11 +698,11 @@ def test_status_surfaces_security_posture_warnings(
             return_value=[],
         ),
         patch(
-            "src.feishu.handlers.diagnostics.CardBuilder.build_unified_status_content",
+            "src.feishu.handlers.diagnostics.DiagnosticsBuilder.build_unified_status_content",
             return_value="base",
         ),
         patch(
-            "src.feishu.handlers.diagnostics.CardBuilder.build_smart_response_card",
+            "src.feishu.handlers.diagnostics.ProjectBuilder.build_smart_response_card",
             return_value=("interactive", {"card": "ok"}),
         ) as build_card,
     ):
@@ -742,11 +741,11 @@ def test_status_surfaces_shared_provider_blocking_findings() -> None:
             return_value=[],
         ),
         patch(
-            "src.feishu.handlers.diagnostics.CardBuilder.build_unified_status_content",
+            "src.feishu.handlers.diagnostics.DiagnosticsBuilder.build_unified_status_content",
             return_value="base",
         ),
         patch(
-            "src.feishu.handlers.diagnostics.CardBuilder.build_smart_response_card",
+            "src.feishu.handlers.diagnostics.ProjectBuilder.build_smart_response_card",
             return_value=("interactive", {"card": "ok"}),
         ) as build_card,
     ):

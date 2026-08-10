@@ -20,10 +20,6 @@ SHORT_COMMANDS: frozenset[str] = frozenset({
     "/wf_status",
     "/wf_help",
     "/stop_wf",
-    "/wf_save",
-    "/wf_list",
-    "/wf_delete",
-    "/wf_history",
 })
 
 # Long-form commands (canonical aliases)
@@ -32,10 +28,6 @@ LONG_COMMANDS: frozenset[str] = frozenset({
     "/workflow_status",
     "/workflow_help",
     "/stop_workflow",
-    "/workflow_save",
-    "/workflow_list",
-    "/workflow_delete",
-    "/workflow_history",
 })
 
 # All commands recognized as topic-engine triggers

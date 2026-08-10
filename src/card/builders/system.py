@@ -1,35 +1,21 @@
 from __future__ import annotations
 
 import json
-import logging
 import math
 import re
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 from src.card.error_diagnostics import register_error_diagnostic
-from src.model_selection import DEFAULT_MODEL_OPTION_VALUE
 from src.utils.errors import GhostAPError, get_error_detail
 
 from ..actions import dispatch as action_ids
-from ..models import ModelOptionView, ToolOptionView
 from ..shared import build_responsive_layout
 from ..themes import PANEL_STYLES
 from ..thresholds import THRESHOLDS
 from ..ui_text import UI_TEXT
 from .core import CoreBuilder
 from .lock import build_lock_help_body
-
-logger = logging.getLogger(__name__)
-
-_SELECT_LABEL_MOBILE_LIMIT = 72
-_BUTTON_LABEL_MOBILE_LIMIT = 40
-
-# Cap how many concrete model buttons render on a single ACP model-select card.
-# Providers like Traex expose ~90 models; rendering them all at once overflows
-# Feishu's per-card element limit (ErrCode 11310). Larger lists are paginated so
-# every model stays selectable across all modes that share this card.
-_MAX_ACP_MODEL_BUTTONS = 20
 
 if TYPE_CHECKING:
     from src.project.context import ProjectContext
@@ -54,8 +40,6 @@ class SystemBuilder:
         "project_id",
         "degraded_to",
         "mode",
-        "original_mode",
-        "retry_mode",
     }
     _SENSITIVE_TOKEN_RE = re.compile(
         r"(?i)\b(cmd|cwd|path|args|token|secret|password|passwd|key)\s*=\s*[^\s\n]+"
@@ -75,33 +59,6 @@ class SystemBuilder:
         }
 
     @staticmethod
-    def _select_option(label: str, value: str) -> dict:
-        """Build a Feishu select option with consistent plain-text shape."""
-        return {"text": {"tag": "plain_text", "content": SystemBuilder._mobile_safe_label(label)}, "value": value}
-
-    @staticmethod
-    def _mobile_safe_label(label: object, *, limit: int = _SELECT_LABEL_MOBILE_LIMIT) -> str:
-        """Keep select labels compact enough for mobile Feishu cards."""
-        text = str(label or "")
-        if len(text) <= limit:
-            return text
-        return text[: max(1, limit - 1)].rstrip() + "…"
-
-    @staticmethod
-    def _label_with_optional_description(name: object, description: object = "") -> str:
-        """Format a select/button label without duplicating empty descriptions."""
-        label = str(name or "")
-        desc = str(description or "").strip()
-        if desc:
-            label += f" ({desc})"
-        return label
-
-    @staticmethod
-    def _mobile_safe_button_label(label: object) -> str:
-        """Keep button labels short enough for Feishu mobile card columns."""
-        return SystemBuilder._mobile_safe_label(label, limit=_BUTTON_LABEL_MOBILE_LIMIT)
-
-    @staticmethod
     def _compact_help_path(path: object, *, limit: int = 42) -> str:
         text = str(path or "~").strip() or "~"
         if len(text) <= limit:
@@ -112,33 +69,6 @@ class SystemBuilder:
             if len(compact) <= limit:
                 return compact
         return "..." + text[-max(1, limit - 3):]
-
-    @staticmethod
-    def _build_select_static(
-        *,
-        placeholder_key: str,
-        action: str,
-        options: list[dict],
-        initial_option: Optional[str] = None,
-        value_extra: Optional[dict] = None,
-    ) -> dict:
-        """Build a reusable select_static element."""
-        value = {"action": action}
-        if value_extra:
-            value.update(value_extra)
-        return {
-            "tag": "select_static",
-            "placeholder": {"tag": "plain_text", "content": UI_TEXT[placeholder_key]},
-            "initial_option": initial_option,
-            "value": value,
-            "options": options,
-        }
-
-    @staticmethod
-    def _wrap_system_card(title: str, elements: list[dict], *, template: str = "blue") -> tuple[str, str]:
-        """Wrap system-card elements with the standard interactive response tuple."""
-        card = CoreBuilder._wrap_card(title, template, elements)
-        return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
     def build_directory_change_card(
@@ -170,17 +100,6 @@ class SystemBuilder:
                 banner=banner,
             )
         return None
-
-    @staticmethod
-    def build_switching_status_card(
-        tool: str,
-        model: str,
-    ) -> tuple[str, str]:
-        """Build a simple status message for switching tools/models."""
-        msg = UI_TEXT["system_switching_to"].format(
-            tool=tool, model=model
-        )
-        return "text", msg
 
     @staticmethod
     def build_coco_status_content(
@@ -250,30 +169,28 @@ class SystemBuilder:
         # We'll stick to a simpler interactive card here or wrap it.
 
         if severity == "degraded":
-            degraded_mode = SystemBuilder._resolve_degraded_mode(continue_action, context)
-            if degraded_mode:
-                primary_continue = SystemBuilder._callback_button(
-                    text=UI_TEXT["card_lifecycle_degraded_primary"].format(
-                        mode=SystemBuilder._display_mode_label(degraded_mode)
-                    ),
-                    action=SystemBuilder._build_degraded_continue_action(continue_action, context),
-                    button_type="primary",
-                )
-                elements.extend(build_responsive_layout([primary_continue]))
-
-            secondary_buttons = SystemBuilder._build_degraded_secondary_buttons(
-                detail_action=detail_action,
-                continue_action=continue_action,
-                retry_action=retry_action,
-                context=context,
+            detail_payload = SystemBuilder._build_detail_action(
+                detail_action,
                 title=title,
                 summary=message,
                 details=details,
+                context=context,
             )
-            elements.extend(build_responsive_layout(secondary_buttons, layout="mobile"))
+            elements.extend(
+                build_responsive_layout(
+                    [
+                        SystemBuilder._callback_button(
+                            text=UI_TEXT["card_lifecycle_show_details"],
+                            action=detail_payload,
+                            button_type="default",
+                        )
+                    ],
+                    layout="mobile",
+                )
+            )
 
-            # 降级卡只保留一个主决策和两个次级决策。异常自带 quick_actions
-            # 不再追加成第三组同级按钮，避免稀释“继续使用目标模式”的主决策。
+            # Safe work and recovery continue automatically; the card only
+            # exposes diagnostics and never waits for a continue decision.
         elif quick_actions:
             buttons = build_quick_actions(quick_actions, context)
             elements.extend(build_responsive_layout(buttons))
@@ -308,68 +225,6 @@ class SystemBuilder:
 
         card = CoreBuilder._wrap_card(UI_TEXT["system_error_prompt_title"], header_template, elements)
         return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def _build_degraded_continue_action(
-        continue_action: Optional[dict],
-        context: Optional[dict] = None,
-    ) -> dict:
-        action = SystemBuilder._safe_action_payload(context)
-        action.update(SystemBuilder._safe_action_payload(continue_action))
-        action["action"] = action_ids.CONTINUE_DEGRADED
-        degraded_mode = SystemBuilder._resolve_degraded_mode(continue_action, context)
-        if degraded_mode:
-            action.setdefault("degraded_to", degraded_mode)
-        return action
-
-    @staticmethod
-    def _build_degraded_secondary_buttons(
-        *,
-        detail_action: Optional[dict],
-        continue_action: Optional[dict],
-        retry_action: Optional[dict],
-        context: Optional[dict],
-        title: str,
-        summary: str,
-        details: Optional[str],
-    ) -> list[dict]:
-        safe_context = SystemBuilder._safe_action_payload(context)
-        detail_payload = SystemBuilder._build_detail_action(
-            detail_action,
-            title=title,
-            summary=summary,
-            details=details,
-            context=safe_context,
-        )
-        retry_payload = {**safe_context, **SystemBuilder._safe_action_payload(retry_action)}
-        retry_payload["action"] = str(retry_payload.get("action") or action_ids.RETRY_ORIGINAL)
-        retry_payload.pop("mode", None)
-        buttons = [
-            SystemBuilder._callback_button(
-                text=UI_TEXT["card_lifecycle_show_details"],
-                action=detail_payload,
-                button_type="default",
-            )
-        ]
-        if SystemBuilder._has_complete_retry_original_payload(retry_payload):
-            buttons.append(
-                SystemBuilder._callback_button(
-                    text=UI_TEXT["card_lifecycle_retry_original"],
-                    action=retry_payload,
-                    button_type="default",
-                )
-            )
-        return buttons
-
-    @staticmethod
-    def _has_complete_retry_original_payload(payload: dict) -> bool:
-        if str(payload.get("action") or "") != action_ids.RETRY_ORIGINAL:
-            return False
-        return all(str(payload.get(field) or "").strip() for field in ("original_mode", "retry_mode", "degraded_to"))
-
-    @staticmethod
-    def _safe_degraded_context(context: Optional[dict]) -> dict:
-        return SystemBuilder._safe_action_payload(context)
 
     @staticmethod
     def _safe_action_payload(payload: Optional[dict]) -> dict:
@@ -409,8 +264,8 @@ class SystemBuilder:
         if severity == "degraded":
             mode = SystemBuilder._resolve_degraded_mode(continue_action, context)
             if mode:
-                return f"可继续使用 {SystemBuilder._display_mode_label(mode)}，或查看脱敏诊断后再决定是否重试原模式。"
-            return "当前暂未确定可继续模式；请重新发送原命令，或查看脱敏诊断后再决定是否重试。"
+                return f"可继续使用 {SystemBuilder._display_mode_label(mode)}；原能力恢复由系统自动处理。"
+            return "当前暂未确定可继续模式；系统将继续安全的可执行部分，或进入明确失败终态。"
         if severity == "recoverable":
             return "可查看脱敏诊断，也可以按卡片按钮重试。"
         return "当前操作已停止；可查看脱敏诊断并按提示重新发起。"
@@ -539,724 +394,6 @@ class SystemBuilder:
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
-    def build_acp_tool_select_card(
-        tools: list,
-        project_id: Optional[str] = None,
-        current_tool: Optional[str] = None,
-    ) -> tuple[str, str]:
-        """Build an interactive card for ACP tool selection.
-
-        ``tools`` 可以是：
-        - ``ToolOptionView`` 列表（首选，卡片层通用视图模型）；
-        - 旧版的字符串列表或带 ``name`` 属性的对象列表（向后兼容）。
-        """
-
-        elements = [{"tag": "markdown", "content": UI_TEXT["system_acp_select_tool_prompt"]}]
-
-        tool_options: list[ToolOptionView] = []
-        for item in tools or []:
-            if isinstance(item, ToolOptionView):
-                tool_options.append(item)
-                continue
-
-            name = getattr(item, "name", None) or str(item)
-            name = str(name or "").strip()
-            if not name:
-                continue
-
-            # 优先使用 UI_TEXT 中的描述，保持既有文案；否则回退到对象上的 description 字段
-            desc_key = f"system_acp_tool_desc_{name}"
-            desc = UI_TEXT[desc_key] if desc_key in UI_TEXT else getattr(item, "description", "")
-            emoji = getattr(item, "emoji", "🤖")
-            is_default = bool(getattr(item, "is_default", False))
-            disabled = bool(getattr(item, "disabled", False))
-
-            tool_options.append(
-                ToolOptionView(
-                    name=name,
-                    description=str(desc or ""),
-                    is_default=is_default,
-                    emoji=str(emoji or "🤖"),
-                    disabled=disabled,
-                )
-            )
-
-        buttons = []
-        for t in tool_options:
-            btn_text = f"{t.emoji} {t.name}"
-            if t.description:
-                btn_text += f" ({t.description})"
-            btn_text = SystemBuilder._mobile_safe_button_label(btn_text)
-
-            buttons.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_text},
-                    "type": "primary" if t.name == current_tool else "default",
-                    "disabled": bool(t.disabled),
-                    "value": {
-                        "action": "select_acp_tool",
-                        "tool_name": t.name,
-                        "project_id": project_id,
-                    },
-                }
-            )
-
-        elements.extend(build_responsive_layout(buttons))
-
-        card = CoreBuilder._wrap_card(UI_TEXT["system_acp_tool_select_title"], "blue", elements)
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-
-
-    @staticmethod
-    def build_acp_model_select_card(
-        models: list,
-        tool_name: str,
-        project_id: Optional[str] = None,
-        current_model: Optional[str] = None,
-        thread_root_id: Optional[str] = None,
-        *,
-        action_name: str = action_ids.SELECT_ACP_MODEL,
-        value_extra: Optional[dict] = None,
-        context_markdown: Optional[str] = None,
-        refresh_action_name: Optional[str] = action_ids.REFRESH_ACP_MODELS,
-        model_page: int = 0,
-    ) -> tuple[str, str]:
-        """Build an interactive card for ACP model selection.
-
-        ``models`` 可以是 ModelOptionView 或任意带 ``name``/``description`` 属性的对象。
-
-        模型数量较多时（例如 Traex 约 90 个）按 ``_MAX_ACP_MODEL_BUTTONS`` 分页，
-        翻页按钮复用 ``refresh_action_name`` 并携带 ``model_page``，避免一次性渲染
-        所有按钮触发飞书卡片元素上限（ErrCode 11310）。"""
-
-        elements = [
-            {
-                "tag": "markdown",
-                "content": UI_TEXT["system_acp_select_model_prompt"].format(tool=tool_name),
-            }
-        ]
-        if context_markdown:
-            elements.append({"tag": "markdown", "content": context_markdown})
-
-        items: list[ModelOptionView] = []
-        for model in models or []:
-            if isinstance(model, ModelOptionView):
-                items.append(model)
-                continue
-
-            selection_variants = list(
-                getattr(model, "selection_variants", ()) or ()
-            )
-            if selection_variants:
-                model_default = bool(getattr(model, "is_default", False))
-                model_description = str(
-                    getattr(model, "description", "") or ""
-                )
-                for variant in selection_variants:
-                    variant_name = str(
-                        getattr(variant, "name", "") or ""
-                    ).strip()
-                    if not variant_name:
-                        continue
-                    variant_display = str(
-                        getattr(variant, "display_name", "")
-                        or variant_name
-                    )
-                    items.append(
-                        ModelOptionView(
-                            name=variant_name,
-                            description=variant_display or model_description,
-                            is_default=bool(
-                                model_default
-                                and getattr(
-                                    variant,
-                                    "is_variant_default",
-                                    False,
-                                )
-                            ),
-                            display_name=variant_display,
-                        )
-                    )
-                continue
-
-            m_name = getattr(model, "name", None) or str(model)
-            m_name = str(m_name or "").strip()
-            if not m_name:
-                continue
-            m_desc = getattr(model, "description", "")
-            display = getattr(model, "display_name", None) or getattr(model, "friendly_name", None)
-
-            items.append(
-                ModelOptionView(
-                    name=m_name,
-                    description=str(m_desc or ""),
-                    is_default=bool(getattr(model, "is_default", False)),
-                    display_name=str(display) if display is not None else None,
-                )
-            )
-
-        def _selection_value(model_name: str, *, use_default_model: bool = False) -> dict:
-            value = {
-                "action": action_name,
-                "tool_name": tool_name,
-                "model_name": model_name,
-                "project_id": project_id,
-                "thread_root_id": thread_root_id,
-            }
-            if use_default_model:
-                value["use_default_model"] = True
-            if value_extra:
-                value.update(value_extra)
-            return value
-
-        buttons = [
-            {
-                "tag": "button",
-                "text": {
-                    "tag": "plain_text",
-                    "content": SystemBuilder._mobile_safe_button_label(
-                        UI_TEXT["system_acp_default_model_option"]
-                    ),
-                },
-                "type": "primary" if not current_model else "default",
-                "value": _selection_value(DEFAULT_MODEL_OPTION_VALUE, use_default_model=True),
-                "behaviors": [
-                    {"type": "callback", "value": _selection_value(DEFAULT_MODEL_OPTION_VALUE, use_default_model=True)}
-                ],
-            }
-        ]
-
-        total_models = len(items)
-        total_pages = max(1, math.ceil(total_models / _MAX_ACP_MODEL_BUTTONS))
-        page = min(max(0, int(model_page or 0)), total_pages - 1)
-        start = page * _MAX_ACP_MODEL_BUTTONS
-        end = start + _MAX_ACP_MODEL_BUTTONS
-        if total_pages > 1:
-            elements.append(
-                {
-                    "tag": "markdown",
-                    "content": (
-                        f"_模型 {start + 1}-{min(end, total_models)} / {total_models}"
-                        f" · 第 {page + 1}/{total_pages} 页_"
-                    ),
-                }
-            )
-
-        for m in items[start:end]:
-            label = m.display_name or m.name
-            btn_text = f"{label}"
-            if m.description and m.description != label:
-                btn_text += f" ({m.description})"
-            btn_text = SystemBuilder._mobile_safe_button_label(btn_text)
-
-            buttons.append(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": btn_text},
-                    "type": "primary" if m.name == current_model else "default",
-                    "value": _selection_value(m.name),
-                    "behaviors": [{"type": "callback", "value": _selection_value(m.name)}],
-                }
-            )
-
-        elements.extend(build_responsive_layout(buttons))
-
-        # Pagination navigation (only when there is more than one page). Page
-        # buttons reuse the refresh action so the handler re-renders the card
-        # at the requested page; they are no-ops when refresh is disabled.
-        if total_pages > 1 and refresh_action_name:
-            def _page_value(target_page: int) -> dict:
-                value = {
-                    "action": refresh_action_name,
-                    "tool_name": tool_name,
-                    "project_id": project_id,
-                    "thread_root_id": thread_root_id,
-                    "model_page": target_page,
-                }
-                if value_extra:
-                    value.update(value_extra)
-                return value
-
-            nav_buttons: list[dict] = []
-            if page > 0:
-                prev_value = _page_value(page - 1)
-                nav_buttons.append(
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "上一页"},
-                        "type": "default",
-                        "value": prev_value,
-                        "behaviors": [{"type": "callback", "value": prev_value}],
-                    }
-                )
-            if page + 1 < total_pages:
-                next_value = _page_value(page + 1)
-                nav_buttons.append(
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "下一页"},
-                        "type": "default",
-                        "value": next_value,
-                        "behaviors": [{"type": "callback", "value": next_value}],
-                    }
-                )
-            if nav_buttons:
-                elements.extend(build_responsive_layout(nav_buttons))
-
-        if refresh_action_name:
-            refresh_value = {
-                "action": refresh_action_name,
-                "tool_name": tool_name,
-                "project_id": project_id,
-                "thread_root_id": thread_root_id,
-            }
-            if value_extra:
-                refresh_value.update(value_extra)
-            elements.append({"tag": "hr"})
-            elements.extend(
-                build_responsive_layout(
-                    [
-                        {
-                            "tag": "button",
-                            "text": {"tag": "plain_text", "content": UI_TEXT["system_refresh_models_btn"]},
-                            "type": "primary",
-                            "value": refresh_value,
-                            "behaviors": [{"type": "callback", "value": refresh_value}],
-                        }
-                    ]
-                )
-            )
-
-        card = CoreBuilder._wrap_card(UI_TEXT["system_acp_model_select_title"].format(tool=tool_name), "blue", elements)
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def build_acp_model_cascade_card(
-        models: list,
-        tool_name: str,
-        project_id: Optional[str] = None,
-        current_model: Optional[str] = None,
-        thread_root_id: Optional[str] = None,
-        *,
-        pending_group: Optional[str] = None,
-        pending_profile: Optional[str] = None,
-        pending_effort: Optional[str] = None,
-        context_markdown: Optional[str] = None,
-        group_action: str = action_ids.SELECT_ACP_MODEL_GROUP,
-        profile_action: str = action_ids.SELECT_ACP_MODEL_PROFILE,
-        effort_action: str = action_ids.SELECT_ACP_MODEL_EFFORT,
-        select_action: str = action_ids.SELECT_ACP_MODEL,
-        refresh_action: str = action_ids.REFRESH_ACP_MODELS,
-        value_extra: Optional[dict] = None,
-    ) -> tuple[str, str]:
-        """Build a cascade (family × profile × effort) ACP model-select card.
-
-        Mirrors the Workflow ``/wf`` cascade UI: instead of paginating ~90
-        Traex model buttons, the model list is compressed into
-        family/profile/effort ``select_static`` dropdowns plus a "confirm"
-        button (:data:`SELECT_ACP_MODEL`). Changing a dropdown re-renders the
-        card via the ``SELECT_ACP_MODEL_*`` actions without entering the mode.
-
-        Default selection remembers the last chosen model: the cascade
-        reverse-solves ``current_model`` into its group/profile/effort so the
-        dropdowns open pre-selected on the user's previous choice.
-
-        Lists without splittable variants (e.g. Coco's handful of models) fall
-        back to the plain paginated button card so those flows keep working.
-        """
-        from ..render.model_cascade import build_model_cascade_elements, has_cascade_variants
-
-        norm_models: list[dict] = []
-        for model in models or []:
-            if isinstance(model, dict):
-                m_name = str(model.get("name") or "").strip()
-                m_disp = model.get("display_name") or m_name
-                m_desc = model.get("description", "")
-                reasoning_efforts = tuple(model.get("reasoning_efforts") or ())
-                adapted_reasoning_effort = model.get(
-                    "adapted_reasoning_effort"
-                )
-                is_default = bool(model.get("is_default"))
-                raw_selection_variants = list(
-                    model.get("selection_variants") or []
-                )
-            else:
-                m_name = str(getattr(model, "name", None) or model or "").strip()
-                m_disp = getattr(model, "display_name", None) or getattr(model, "friendly_name", None) or m_name
-                m_desc = getattr(model, "description", "")
-                reasoning_efforts = tuple(
-                    getattr(model, "reasoning_efforts", ()) or ()
-                )
-                adapted_reasoning_effort = getattr(
-                    model,
-                    "adapted_reasoning_effort",
-                    None,
-                )
-                is_default = bool(getattr(model, "is_default", False))
-                raw_selection_variants = list(
-                    getattr(model, "selection_variants", ()) or ()
-                )
-            if not m_name:
-                continue
-            selection_variants = []
-            for raw_variant in raw_selection_variants:
-                if isinstance(raw_variant, dict):
-                    selection_variants.append(dict(raw_variant))
-                else:
-                    selection_variants.append({
-                        "name": str(getattr(raw_variant, "name", "") or ""),
-                        "profile": str(
-                            getattr(raw_variant, "profile", "") or ""
-                        ),
-                        "effort": str(
-                            getattr(raw_variant, "effort", "default")
-                            or "default"
-                        ),
-                        "display_name": str(
-                            getattr(raw_variant, "display_name", "") or ""
-                        ),
-                        "is_variant_default": bool(
-                            getattr(raw_variant, "is_variant_default", False)
-                        ),
-                    })
-            norm_models.append({
-                "name": m_name,
-                "display_name": str(m_disp or m_name),
-                "description": str(m_desc or ""),
-                "reasoning_efforts": reasoning_efforts,
-                "adapted_reasoning_effort": adapted_reasoning_effort,
-                "is_default": is_default,
-                "selection_variants": selection_variants,
-            })
-
-        # No splittable variants → nothing to cascade; reuse the button card so
-        # small model lists (Coco et al.) keep the original behavior.
-        if not has_cascade_variants(norm_models):
-            return SystemBuilder.build_acp_model_select_card(
-                models,
-                tool_name,
-                project_id,
-                current_model=current_model,
-                thread_root_id=thread_root_id,
-                action_name=select_action,
-                value_extra=value_extra,
-                context_markdown=context_markdown,
-                refresh_action_name=refresh_action,
-            )
-
-        def _value_builder(action: str, extra: dict) -> dict:
-            value = {
-                "action": action,
-                "tool_name": tool_name,
-                "project_id": project_id,
-                "thread_root_id": thread_root_id,
-            }
-            value.update(extra)
-            if value_extra:
-                value.update(value_extra)
-            return value
-
-        elements: list[dict] = [
-            {
-                "tag": "markdown",
-                "content": UI_TEXT["system_acp_select_model_prompt"].format(tool=tool_name),
-            }
-        ]
-        if context_markdown:
-            elements.append({"tag": "markdown", "content": context_markdown})
-
-        elements.extend(
-            build_model_cascade_elements(
-                models=norm_models,
-                value_builder=_value_builder,
-                group_action=group_action,
-                profile_action=profile_action,
-                effort_action=effort_action,
-                select_action=select_action,
-                default_action=select_action,
-                pending_group=pending_group,
-                pending_profile=pending_profile,
-                pending_effort=pending_effort,
-                current_model=current_model,
-                button_row_builder=build_responsive_layout,
-            )
-        )
-
-        # Refresh button (re-probe models), consistent with the button card.
-        refresh_value = {
-            "action": refresh_action,
-            "tool_name": tool_name,
-            "project_id": project_id,
-            "thread_root_id": thread_root_id,
-        }
-        if value_extra:
-            refresh_value.update(value_extra)
-        elements.append({"tag": "hr"})
-        elements.extend(
-            build_responsive_layout(
-                [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["system_refresh_models_btn"]},
-                        "type": "default",
-                        "value": refresh_value,
-                        "behaviors": [{"type": "callback", "value": refresh_value}],
-                    }
-                ]
-            )
-        )
-
-        card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_model_select_title"].format(tool=tool_name), "blue", elements
-        )
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def build_acp_model_loading_card(
-        tool_name: str,
-        project_id: Optional[str] = None,
-        thread_root_id: Optional[str] = None,
-    ) -> tuple[str, str]:
-        """Build the first frame for ACP model discovery."""
-        _ = project_id, thread_root_id
-        elements = [
-            {
-                "tag": "markdown",
-                "content": UI_TEXT["system_acp_model_loading_body"].format(tool=tool_name),
-            }
-        ]
-        card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_model_loading_title"].format(tool=tool_name),
-            "blue",
-            elements,
-        )
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def build_acp_model_error_card(
-        tool_name: str,
-        project_id: Optional[str] = None,
-        thread_root_id: Optional[str] = None,
-    ) -> tuple[str, str]:
-        """Build an in-place error frame for ACP model discovery."""
-        elements = [
-            {
-                "tag": "markdown",
-                "content": UI_TEXT["system_acp_model_error_body"].format(tool=tool_name),
-            },
-            {"tag": "hr"},
-        ]
-        elements.extend(
-            build_responsive_layout(
-                [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": UI_TEXT["system_refresh_models_btn"]},
-                        "type": "primary",
-                        "value": {
-                            "action": "refresh_acp_models",
-                            "tool_name": tool_name,
-                            "project_id": project_id,
-                            "thread_root_id": thread_root_id,
-                        },
-                    }
-                ]
-            )
-        )
-        card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_model_error_title"].format(tool=tool_name),
-            "red",
-            elements,
-        )
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def build_acp_programming_ready_card(
-        tool_name: str,
-        model_name: Optional[str],
-        project_id: Optional[str] = None,
-        thread_root_id: Optional[str] = None,
-    ) -> tuple[str, str]:
-        """Build the final frame after an ACP model has been selected."""
-        model_label = model_name or UI_TEXT["system_acp_default_model_option"]
-
-        # Detect Anthropic 1M-context [1m] variant — its higher billing tier
-        # warrants a prominent warning, especially because the choice is
-        # persisted to ProjectContext and silently auto-restored on every
-        # subsequent /claude entry, project open, daemon restart, or session
-        # resume. Without this banner, a one-time experimental click can
-        # become a hidden default that doubles base-rate billing past 200K
-        # tokens of context.
-        is_1m = False
-        try:
-            if isinstance(model_name, str) and model_name.strip():
-                from src.acp.claude_capabilities import is_1m_variant
-                is_1m = is_1m_variant(model_name.strip())
-        except Exception:  # pragma: no cover — UI must never crash on detection
-            is_1m = False
-
-        elements: list[dict] = []
-        if is_1m:
-            elements.append(
-                {
-                    "tag": "markdown",
-                    "content": UI_TEXT["system_acp_1m_warning_banner"].format(model=model_label),
-                    "text_align": "left",
-                }
-            )
-            elements.append({"tag": "hr"})
-
-        elements.append(
-            {
-                "tag": "markdown",
-                "content": UI_TEXT["system_acp_programming_ready_body"].format(
-                    tool=tool_name,
-                    model=model_label,
-                ),
-            }
-        )
-        elements.append({"tag": "hr"})
-
-        action_buttons: list[dict] = [
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": UI_TEXT["system_acp_switch_model_btn"]},
-                "type": "default",
-                "value": {
-                    "action": "refresh_acp_models",
-                    "tool_name": tool_name,
-                    "project_id": project_id,
-                    "thread_root_id": thread_root_id,
-                },
-            }
-        ]
-        if is_1m:
-            # One-click escape hatch back to the standard (non-1M) model id.
-            standard_model = (model_name or "").strip()
-            if standard_model.endswith("[1m]"):
-                standard_model = standard_model[: -len("[1m]")]
-            action_buttons.insert(
-                0,
-                {
-                    "tag": "button",
-                    "text": {
-                        "tag": "plain_text",
-                        "content": UI_TEXT["system_acp_1m_switch_standard_btn"],
-                    },
-                    "type": "danger",
-                    "value": {
-                        "action": "select_acp_model",
-                        "tool_name": tool_name,
-                        "model_name": standard_model,
-                        "project_id": project_id,
-                        "thread_root_id": thread_root_id,
-                    },
-                },
-            )
-        elements.extend(build_responsive_layout(action_buttons))
-
-        card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_programming_ready_title"].format(tool=tool_name),
-            "red" if is_1m else "green",
-            elements,
-        )
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def build_acp_programming_initializing_card(
-        tool_name: str,
-        model_name: Optional[str],
-        project_id: Optional[str] = None,
-        thread_root_id: Optional[str] = None,
-    ) -> tuple[str, str]:
-        """Build the immediate frame shown while the selected ACP session starts."""
-        _ = project_id, thread_root_id
-        model_label = model_name or UI_TEXT["system_acp_default_model_option"]
-        elements = [
-            {
-                "tag": "markdown",
-                "content": UI_TEXT["system_acp_programming_initializing_body"].format(
-                    tool=tool_name,
-                    model=model_label,
-                ),
-            }
-        ]
-        card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_programming_initializing_title"].format(tool=tool_name),
-            "blue",
-            elements,
-        )
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def build_acp_programming_failed_card(
-        tool_name: str,
-        model_name: Optional[str],
-        reason: str,
-        project_id: Optional[str] = None,
-        thread_root_id: Optional[str] = None,
-    ) -> tuple[str, str]:
-        """Build a retryable terminal frame after ACP session startup fails."""
-        model_label = model_name or UI_TEXT["system_acp_default_model_option"]
-        retry_value = {
-            "action": action_ids.SELECT_ACP_MODEL,
-            "tool_name": tool_name,
-            "model_name": model_name or DEFAULT_MODEL_OPTION_VALUE,
-            "project_id": project_id,
-            "thread_root_id": thread_root_id,
-        }
-        if model_name is None:
-            retry_value["use_default_model"] = True
-        elements = [
-            {
-                "tag": "markdown",
-                "content": UI_TEXT["system_acp_programming_failed_body"].format(
-                    tool=tool_name,
-                    model=model_label,
-                    reason=reason,
-                ),
-            },
-            {"tag": "hr"},
-        ]
-        elements.extend(
-            build_responsive_layout(
-                [
-                    {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": UI_TEXT["system_acp_retry_activation_btn"],
-                        },
-                        "type": "danger",
-                        "value": retry_value,
-                    },
-                    {
-                        "tag": "button",
-                        "text": {
-                            "tag": "plain_text",
-                            "content": UI_TEXT["system_acp_back_to_models_btn"],
-                        },
-                        "type": "default",
-                        "value": {
-                            "action": action_ids.REFRESH_ACP_MODELS,
-                            "tool_name": tool_name,
-                            "project_id": project_id,
-                            "thread_root_id": thread_root_id,
-                        },
-                    },
-                ]
-            )
-        )
-        card = CoreBuilder._wrap_card(
-            UI_TEXT["system_acp_programming_failed_title"].format(tool=tool_name),
-            "red",
-            elements,
-        )
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
     def build_command_menu_card(project: Optional[ProjectContext] = None) -> tuple[str, str]:
         """Build a mobile-friendly command menu card."""
         # Local import preserves the card -> Feishu initialization boundary.
@@ -1289,11 +426,6 @@ class SystemBuilder:
                 "text": UI_TEXT["system_menu_btn_status"],
                 "type": "default",
                 "action": "show_status",
-            },
-            {
-                "text": UI_TEXT["system_menu_btn_acp"],
-                "type": "default",
-                "action": "show_acp_menu",
             },
             {
                 "text": UI_TEXT["system_menu_btn_help"],

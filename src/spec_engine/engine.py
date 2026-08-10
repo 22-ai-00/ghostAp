@@ -10,9 +10,7 @@ import contextlib
 import json
 import logging
 import os
-import threading
 import time
-from collections import namedtuple
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -23,12 +21,13 @@ from ..agent_session import create_engine_session
 from ..engine_base import (
     BaseEngine,
     EngineRunState,
-    PerspectiveReview,
     ReviewResult,
 )
-from ..utils.acp_prompt import prompt_via_acp
 from ..utils.errors import get_error_detail
 from ..utils.retry import RetryPolicy
+from ..utils.review_diagnostics import (
+    build_review_exception_diagnostics,
+)
 from ..utils.trace import TraceContext
 from .artifacts import (
     merge_acceptance_criteria,
@@ -43,9 +42,6 @@ from .convergence import (
     detect_backlog_stuck,
     detect_convergence,
     update_review_pass_streak,
-)
-from .criteria import (
-    decompose_criteria_with_llm as _decompose_criteria_with_llm_impl,
 )
 from .criteria import (
     evaluate_criteria as _evaluate_criteria_impl,
@@ -66,6 +62,10 @@ from .discovery import (
     should_load_spec_directly as _should_load_spec_directly,
 )
 from .models import (
+    AdaptiveReviewResult,
+    ReviewAgentBinding,
+    ReviewCircuitState,
+    ReviewContext,
     SpecCycle,
     SpecPhase,
     SpecProject,
@@ -104,9 +104,6 @@ from .persistence import (
     save_engine_state as _save_engine_state,
 )
 from .persistence import (
-    save_failed_task as _save_failed_task_impl,
-)
-from .persistence import (
     truncate_output as _truncate_output,
 )
 from .prompts import (
@@ -119,22 +116,12 @@ from .prompts import (
 )
 from .retry_status import RetryEvent
 from .review import (
-    ReviewCircuitState,
     ReviewOrchestrator,
-    build_review_exception_diagnostics,
-    extract_reviews_from_llm_response,
-    format_review_exception_log_line,
-    normalize_review_diagnostics,
+    conduct_review,
+    normalize_review_agents,
     review_result_to_text,
+    validate_completion_gate_outcomes,
 )
-from .review import (
-    parse_review_output as _parse_review_output_impl,
-)
-from .review import (
-    parse_review_with_llm as _parse_review_with_llm_impl,
-)
-from .review_agents import ReviewAgentBinding, normalize_review_agents
-from .review_strategy import ReviewContext, select_review_strategy
 from .session_utils import (
     build_runtime_context as _build_runtime_context,
 )
@@ -154,13 +141,10 @@ from .session_utils import (
     try_switch_model as _try_switch_model,
 )
 from .storage import state_path_candidates as _state_path_candidates
-from .task_persistence import SpecTaskState, delete_task_state
 from .tracker import PhaseTracker
 from .validation import SpecInput
 
 logger = logging.getLogger(__name__)
-
-VerifyResult = namedtuple("VerifyResult", ["passed", "output"])
 
 
 @dataclass
@@ -180,7 +164,6 @@ class SpecEngineCallbacks:
     on_phase_retry: Optional[Callable[[int, int, str], None]] = None  # (attempt, max_attempts, detail)
     on_review_retry: Optional[Callable[[int, "RetryEvent"], None]] = None  # (cycle, event)
     on_model_switch: Optional[Callable[[str, str], None]] = None
-    on_task_saved: Optional[Callable[[str], None]] = None
 
 
 class SpecEngine(BaseEngine):
@@ -201,72 +184,16 @@ class SpecEngine(BaseEngine):
         self._project: Optional[SpecProject] = None
         self._user_guidance: list[str] = []
         self._last_review: Optional[ReviewResult] = None
-        # success / paused / converged / max_cycles / stopped
-        self._termination_reason: Optional[str] = None
         self._resume_meta: Optional[dict] = None
         self._retry_policy = retry_policy or RetryPolicy()
         self._create_session_fn = create_session_fn or create_engine_session
         self._models_tried: list[str] = []
         self._current_model: Optional[str] = None
         self._on_rate_limit: Optional[Callable[[int], None]] = None
-        self._saved_task_id: Optional[str] = None
-        # Idempotency guard for failed task persistence: avoid saving the same failure multiple times.
-        # Format: (cycle_num, phase.value, task_id)
-        self._saved_task_signature: Optional[tuple[int, str, str]] = None
         self._review_orchestrator = ReviewOrchestrator()
-        self._last_cycle_num: int = 0
-        self._last_phase: SpecPhase = SpecPhase.SPEC
         self._review_agent_pool: list[ReviewAgentBinding] = []
         self._last_verify_passed: bool | None = None
         self._last_verify_output: str = ""
-
-    def set_review_agent_pool(self, agents: list[object] | None) -> None:
-        """Set optional heterogeneous review agents for adaptive role review."""
-        self._review_agent_pool = normalize_review_agents(agents)
-
-    # ------------------------------------------------------------------
-    # Compatibility properties: delegate to _review_orchestrator
-    # ------------------------------------------------------------------
-    @property
-    def _review_circuit(self) -> ReviewCircuitState:
-        return self._review_orchestrator.circuit
-
-    @_review_circuit.setter
-    def _review_circuit(self, value: ReviewCircuitState) -> None:
-        self._review_orchestrator.restore_circuit(value)
-
-    @property
-    def _review_cancel_event(self) -> threading.Event:
-        return self._review_orchestrator.cancel_event
-
-    @property
-    def skip_retry_event(self) -> threading.Event:
-        """Event to skip retry wait without cancelling the entire retry cycle."""
-        return self._review_orchestrator.skip_retry_event
-
-    @property
-    def _last_review_failure_diag(self) -> Optional[dict]:
-        return self._review_orchestrator.circuit.last_review_failure_diag
-
-    @_last_review_failure_diag.setter
-    def _last_review_failure_diag(self, value: Optional[dict]):
-        self._review_orchestrator.circuit.last_review_failure_diag = value
-
-    @property
-    def _review_failure_consecutive(self) -> int:
-        return self._review_orchestrator.circuit.review_failure_consecutive
-
-    @_review_failure_consecutive.setter
-    def _review_failure_consecutive(self, value: int):
-        self._review_orchestrator.circuit.review_failure_consecutive = value
-
-    @property
-    def _review_circuit_open_until_cycle(self) -> int:
-        return self._review_orchestrator.circuit.review_circuit_open_until_cycle
-
-    @_review_circuit_open_until_cycle.setter
-    def _review_circuit_open_until_cycle(self, value: int):
-        self._review_orchestrator.circuit.review_circuit_open_until_cycle = value
 
     def _wrap_callbacks(self, callbacks: SpecEngineCallbacks) -> SpecEngineCallbacks:
         def _wrap(fn: Optional[Callable[..., None]], name: str) -> Optional[Callable[..., None]]:
@@ -282,22 +209,10 @@ class SpecEngine(BaseEngine):
 
             return _inner
 
-        return SpecEngineCallbacks(
-            on_analyzing_start=_wrap(callbacks.on_analyzing_start, "on_analyzing_start"),
-            on_analyzing_done=_wrap(callbacks.on_analyzing_done, "on_analyzing_done"),
-            on_cycle_start=_wrap(callbacks.on_cycle_start, "on_cycle_start"),
-            on_phase_start=_wrap(callbacks.on_phase_start, "on_phase_start"),
-            on_phase_event=_wrap(callbacks.on_phase_event, "on_phase_event"),
-            on_phase_done=_wrap(callbacks.on_phase_done, "on_phase_done"),
-            on_review_done=_wrap(callbacks.on_review_done, "on_review_done"),
-            on_cycle_done=_wrap(callbacks.on_cycle_done, "on_cycle_done"),
-            on_project_done=_wrap(callbacks.on_project_done, "on_project_done"),
-            on_error=_wrap(callbacks.on_error, "on_error"),
-            on_phase_retry=_wrap(callbacks.on_phase_retry, "on_phase_retry"),
-            on_review_retry=_wrap(callbacks.on_review_retry, "on_review_retry"),
-            on_model_switch=_wrap(callbacks.on_model_switch, "on_model_switch"),
-            on_task_saved=_wrap(callbacks.on_task_saved, "on_task_saved"),
-        )
+        return SpecEngineCallbacks(**{
+            name: _wrap(getattr(callbacks, name), name)
+            for name in SpecEngineCallbacks.__dataclass_fields__
+        })
 
     def _initialize_model_context(self) -> None:
         self._current_model, self._models_tried = _initialize_model_context(self._agent_type)
@@ -328,7 +243,6 @@ class SpecEngine(BaseEngine):
         self,
         runtime_context: Optional[dict],
         *,
-        saved_task_id: Optional[str] = None,
         on_rate_limit: Optional[Callable[[int], None]] = None,
     ) -> None:
         runtime = dict(runtime_context or {})
@@ -342,10 +256,7 @@ class SpecEngine(BaseEngine):
             models_tried=self._models_tried,
             infer_engine_name_fn=self._infer_engine_name,
             initialize_model_context_fn=lambda: _initialize_model_context(tentative_agent),
-            saved_task_id=saved_task_id,
             on_rate_limit=on_rate_limit,
-            existing_saved_task_id=self._saved_task_id,
-            project=self._project,
         )
         self._agent_type = result["agent_type"]
         self.engine_name = result["engine_name"]
@@ -353,32 +264,8 @@ class SpecEngine(BaseEngine):
         self._current_model = result["current_model"]
         self._models_tried = result["models_tried"]
         self._on_rate_limit = result["on_rate_limit"]
-        self._saved_task_id = result["saved_task_id"]
-        self._saved_task_signature = None
         self._review_agent_pool = normalize_review_agents(runtime.get("review_agents"))
 
-    def restore_from_task_state(
-        self,
-        state: SpecTaskState,
-        *,
-        on_rate_limit: Optional[Callable[[int], None]] = None,
-    ) -> SpecProject:
-        if not state.project_snapshot:
-            raise ValueError("恢复失败：缺少 project_snapshot")
-
-        project = SpecProject.from_dict(state.project_snapshot)
-        project.status = SpecProjectStatus.PAUSED
-        project.task_id = state.task_id
-        if project.cycles:
-            project.cycle_count_total = max(project.cycle_count_total, project.cycles[-1].cycle_number)
-
-        self._project = project
-        self._restore_runtime_context(
-            state.resolved_runtime_context(),
-            saved_task_id=state.task_id,
-            on_rate_limit=on_rate_limit,
-        )
-        return project
 
     def _send_prompt_with_retry(
         self,
@@ -411,76 +298,105 @@ class SpecEngine(BaseEngine):
             session_id=session_id,
         )
 
-    @classmethod
-    def _normalize_review_diagnostics(cls, diag: object) -> dict:
-        return normalize_review_diagnostics(diag)
-
-    @classmethod
-    def _format_review_exception_log_line(cls, diag: dict, *, diag_json: str) -> str:
-        return format_review_exception_log_line(diag, diag_json=diag_json)
-
-
     # Main execution
     # ------------------------------------------------------------------
 
     def _finalize_execution(
         self,
         *,
+        reason: str,
         max_cycles: int,
         callbacks: SpecEngineCallbacks,
         error: Optional[Exception] = None,
         is_timeout: bool = False,
         label: str = "Spec执行",
     ) -> None:
-        """Shared termination logic for execute() and resume().
-
-        Handles either normal termination (reason-based routing) or exception
-        recovery (timeout / generic error).
-        """
+        """Commit a completed, failed, or explicitly cancelled terminal state."""
         if error is not None:
-            # Exception path
             error_msg = self._format_engine_error(error, label, is_timeout=is_timeout, callbacks=callbacks)
             if self._project:
-                self._project.status = SpecProjectStatus.ABORTED
-                self._project.completed_at = time.time()
-                if not self._saved_task_id:
-                    try:
-                        self._save_failed_task(error_msg, self._last_cycle_num, self._last_phase, callbacks)
-                    except Exception as save_err:
-                        logger.warning("[Spec] 异常任务保存失败: %s", save_err, exc_info=True)
+                self._project.fail(error_msg)
+                self._persist_state_best_effort()
+                if callbacks.on_project_done:
+                    callbacks.on_project_done(self._project)
             return
 
-        # Normal termination path — route by reason
-        reason = self._termination_reason or "max_cycles"
         with self._lock:
-            _run_state_snapshot = self._run_state
-        if _run_state_snapshot == EngineRunState.STOPPING or reason == "paused":
-            self._project.status = SpecProjectStatus.PAUSED
+            run_state = self._run_state
+        if run_state == EngineRunState.STOPPING or reason == "cancelled":
+            self._project.cancel()
         elif reason == "success":
-            self._project.status = SpecProjectStatus.COMPLETED
-            self._project.completed_at = time.time()
+            self._project.complete()
+        elif reason == "converged":
+            self._project.fail(
+                f"收敛终止：连续{self.settings.spec_convergence_window}轮无有效改进，"
+                "仍有未满足验收标准或审查未通过"
+            )
+        elif reason == "backlog_stuck":
+            self._project.fail("Backlog 停滞终止：连续多轮 backlog 未消减")
+        elif reason == "consecutive_failures":
+            count = getattr(self.settings, "spec_max_consecutive_failures", 3)
+            self._project.fail(f"连续异常终止：{count} 个循环连续因异常失败")
+        elif reason == "max_cycles":
+            self._handle_max_cycles_termination(max_cycles)
         else:
-            if reason == "converged":
-                msg = (
-                    f"收敛终止：连续{self.settings.spec_convergence_window}轮无有效改进，"
-                    "仍有未满足验收标准或审查未通过"
-                )
-                self._project.abort(msg)
-            elif reason == "backlog_stuck":
-                msg = "Backlog 停滞终止：连续多轮 backlog 未消减"
-                self._project.abort(msg)
-            elif reason == "consecutive_failures":
-                n = getattr(self.settings, "spec_max_consecutive_failures", 3)
-                msg = f"连续异常终止：{n} 个循环连续因异常失败"
-                self._project.abort(msg)
-            elif reason == "max_cycles":
-                self._handle_max_cycles_termination(max_cycles)
-            else:
-                msg = f"终止：{reason}"
-                self._project.abort(msg)
-
+            self._project.fail(f"终止：{reason}")
+        self._persist_state_best_effort()
         if callbacks.on_project_done:
             callbacks.on_project_done(self._project)
+
+    def _run_to_terminal(
+        self,
+        *,
+        start_cycle: int,
+        max_cycles: int,
+        callbacks: SpecEngineCallbacks,
+        label: str,
+        first_raw_input: Optional[str] = None,
+        initialize: bool = False,
+    ) -> None:
+        """Open one session, drive the canonical loop, and commit one terminal state."""
+        try:
+            if initialize:
+                self._initialize_model_context()
+                criteria = parse_acceptance_criteria(self._project.requirement)
+                self._project.acceptance_criteria = criteria
+                self._project.criteria_tracker.init_criteria(criteria)
+                self._project.start()
+                self._last_review = None
+                if callbacks.on_analyzing_done:
+                    callbacks.on_analyzing_done(self._project)
+
+            self._close_session_safely()
+            self._session = self._create_session_fn(
+                agent_type=self._agent_type,
+                cwd=self.root_path,
+                on_rate_limit=self._on_rate_limit,
+                model_name=self._model_name,
+            )
+            reason = self._run_cycle_loop(
+                start_cycle=start_cycle,
+                max_cycles=max_cycles,
+                callbacks=callbacks,
+                timeout=self.settings.spec_execution_timeout,
+                first_raw_input=first_raw_input,
+            )
+        except TimeoutError as exc:
+            self._finalize_execution(
+                reason="failed", max_cycles=max_cycles, callbacks=callbacks,
+                error=exc, is_timeout=True, label=label,
+            )
+        except Exception as exc:
+            logger.exception("Unexpected error in %s", label)
+            self._finalize_execution(
+                reason="failed", max_cycles=max_cycles, callbacks=callbacks,
+                error=exc, label=label,
+            )
+        else:
+            self._finalize_execution(
+                reason=reason, max_cycles=max_cycles, callbacks=callbacks,
+            )
+
 
     def execute(
         self,
@@ -494,9 +410,6 @@ class SpecEngine(BaseEngine):
         with self._lock:
             self._run_state = EngineRunState.RUNNING
             self._on_rate_limit = on_rate_limit
-            self._saved_task_id = None
-            self._saved_task_signature = None
-            self._termination_reason = None
         max_cycles = self._resolve_max_cycles(self.settings.spec_max_cycles)
 
         project_name = os.path.basename(self.root_path) or "spec_project"
@@ -513,9 +426,7 @@ class SpecEngine(BaseEngine):
             # Flatten validation errors to a readable string
             errors = "; ".join([f"{err['loc'][0]}: {err['msg']}" for err in e.errors()])
             error_msg = f"非法配置参数: {errors}"
-            self._project.status = SpecProjectStatus.ABORTED
-            self._project.error = error_msg
-            self._project.completed_at = time.time()
+            self._project.fail(error_msg)
             logger.error("[Spec:%s] %s", project_name, error_msg)
             if callbacks.on_error:
                 callbacks.on_error(error_msg)
@@ -525,8 +436,6 @@ class SpecEngine(BaseEngine):
         self._project.task_id = task_id
         self._project.status = SpecProjectStatus.ANALYZING
         self._project.requirement = requirement_text
-        self._last_cycle_num = 0
-        self._last_phase = SpecPhase.SPEC
 
         if callbacks.on_analyzing_start:
             callbacks.on_analyzing_start(requirement_text)
@@ -540,60 +449,21 @@ class SpecEngine(BaseEngine):
         )
 
         try:
-            self._initialize_model_context()
-
-            # Parse requirement from explicit user markers only. Plain-language
-            # input starts with a single provisional criterion; the first Spec
-            # artifact replaces it with model-derived acceptance criteria.
-            criteria = parse_acceptance_criteria(requirement_text)
-            self._project.acceptance_criteria = criteria
-            self._project.criteria_tracker.init_criteria(criteria)
-            self._project.status = SpecProjectStatus.RUNNING
-            self._project.started_at = time.time()
-
-            if callbacks.on_analyzing_done:
-                callbacks.on_analyzing_done(self._project)
-
-            # Create ACP session
-            self._session = self._create_session_fn(
-                agent_type=self._agent_type,
-                cwd=self.root_path,
-                on_rate_limit=on_rate_limit,
-                model_name=self._model_name,
-            )
-
-            self._last_review = None
-
-            self._termination_reason = self._run_cycle_loop(
+            self._run_to_terminal(
                 start_cycle=1,
                 max_cycles=max_cycles,
                 callbacks=callbacks,
-                timeout=self.settings.spec_execution_timeout,
+                label="Spec执行",
                 first_raw_input=requirement_text,
+                initialize=True,
             )
-
-            self._finalize_execution(max_cycles=max_cycles, callbacks=callbacks)
             return self._project
-
-        except TimeoutError as e:
-            self._finalize_execution(max_cycles=max_cycles, callbacks=callbacks, error=e, is_timeout=True, label="Spec执行")
-            return self._project
-
-        except Exception as e:
-            logger.exception("Unexpected error in Spec execution")
-            self._finalize_execution(max_cycles=max_cycles, callbacks=callbacks, error=e, is_timeout=False, label="Spec执行")
-            return self._project
-
         finally:
             trace_ctx.__exit__(None, None, None)
             self._close_session_safely()
             with self._lock:
                 self._run_state = EngineRunState.IDLE
 
-            if self._project and self._project.status == SpecProjectStatus.COMPLETED and self._saved_task_id:
-                delete_task_state(self._saved_task_id)
-                self._saved_task_id = None
-                self._saved_task_signature = None
 
     # ------------------------------------------------------------------
     # Phase execution
@@ -611,6 +481,8 @@ class SpecEngine(BaseEngine):
         project_name = self._project.name if self._project else "unknown"
         logger.info("[Spec:%s] 循环 %d 阶段 %s 开始", project_name, cycle_num, phase.value)
 
+        if self._run_state != EngineRunState.RUNNING:
+            raise RuntimeError("Spec execution stopped")
         if not self._session:
             raise RuntimeError(f"Spec session is None before phase {phase.value} (cycle={cycle_num}), session may have failed to initialize or rebuild")
 
@@ -624,7 +496,6 @@ class SpecEngine(BaseEngine):
                 _max = self.settings.spec_max_retries
                 callbacks.on_phase_retry(attempt, _max, get_error_detail(error))
 
-        from ..utils.retry import RetryPolicy
         retry_policy = RetryPolicy(
             max_retries=self.settings.spec_max_retries,
             retry_delay=self._retry_policy.retry_delay,
@@ -641,10 +512,7 @@ class SpecEngine(BaseEngine):
                     if renderer is not None:
                         renderer.process_event(event)
                     if callbacks.on_phase_event:
-                        try:
-                            callbacks.on_phase_event(cycle_num, phase, event)
-                        except Exception as cb_exc:
-                            logger.warning("[Spec] on_phase_event callback failed: %s", get_error_detail(cb_exc), exc_info=True)
+                        callbacks.on_phase_event(cycle_num, phase, event)
                 except Exception as exc:
                     logger.warning("[Spec] on_event handler error: %s", get_error_detail(exc), exc_info=True)
 
@@ -655,6 +523,8 @@ class SpecEngine(BaseEngine):
                 retry_policy=retry_policy,
                 before_retry=_before_retry,
             )
+            if self._run_state != EngineRunState.RUNNING:
+                raise RuntimeError("Spec execution stopped")
             output = tracker.text_buffer
             logger.info(
                 "[Spec:%s] 循环 %d 阶段 %s 完成, 输出长度=%d",
@@ -673,20 +543,7 @@ class SpecEngine(BaseEngine):
             return output
 
         except Exception as e:
-            from ..utils.errors import get_error_detail as _ged
-            last_error = _ged(e)
-
-            try:
-                override_hint = (self.settings.spec_failed_task_id_override or "").strip()
-                if (
-                    override_hint
-                    and phase == SpecPhase.BUILD
-                    and "internal error" not in (last_error or "").lower()
-                ):
-                    last_error = "Internal error"
-            except Exception:
-                logger.warning("override hint processing failed", exc_info=True)
-
+            last_error = get_error_detail(e)
             # 停止态下（例如服务关闭触发 cancel），phase 异常通常是 session cancel 或进程退出导致，
             # 不应继续触发模型切换或失败任务持久化。
             if self._run_state == EngineRunState.STOPPING:
@@ -695,7 +552,7 @@ class SpecEngine(BaseEngine):
                     if len(reason) > 200:
                         reason = reason[:200] + "…(truncated)"
                 logger.info("[Spec] Phase %s 中断（引擎停止中）: %s", phase.value, reason)
-                return ""
+                raise
 
             if self._try_switch_model(callbacks):
                 if _depth >= 3:
@@ -704,29 +561,13 @@ class SpecEngine(BaseEngine):
                     ) from e
                 return self._run_phase(cycle_num, phase, prompt, callbacks, timeout, _depth=_depth + 1)
 
-            task_id = self._save_failed_task(last_error, cycle_num, phase, callbacks)
             err_preview = last_error or ""
             with contextlib.suppress(Exception):  # intentional: defensive string truncation
                 if len(err_preview) > 500:
                     err_preview = err_preview[:500] + "…(truncated)"
-            logger.error("[Spec] Phase %s 失败 (task_id=%s): %s", phase.value, task_id, err_preview)
-            raise RuntimeError(f"Phase {phase.value} 失败，任务已保存(task_id={task_id}): {last_error}") from e
-
-    def _verify_build_result(self) -> VerifyResult:
-        if not self._project or not self._project.verify_command:
-            return VerifyResult(passed=True, output="")
-        from ..sandbox.executor import SandboxExecutor
-        executor = SandboxExecutor()
-        result = executor.execute(
-            self._project.verify_command,
-            cwd=self.root_path,
-            interactive=False,
-            chat_id=self.chat_id,
-        )
-        output = result.stdout
-        if result.stderr:
-            output = f"{output}\n{result.stderr}".strip()
-        return VerifyResult(passed=result.success, output=output)
+            self._persist_state_best_effort()
+            logger.error("[Spec] Phase %s 失败: %s", phase.value, err_preview)
+            raise RuntimeError(f"Phase {phase.value} 失败: {last_error}") from e
 
     def _try_switch_model(self, callbacks) -> bool:
         switched, new_current, _, self._models_tried, new_session = _try_switch_model(
@@ -757,37 +598,9 @@ class SpecEngine(BaseEngine):
         if new_session is not None:
             self._session = new_session
 
-    def _save_failed_task(
-        self,
-        error: str,
-        cycle_num: int,
-        phase: SpecPhase,
-        callbacks,
-    ) -> str:
-        task_id, new_saved_id, new_sig = _save_failed_task_impl(
-            project=self._project,
-            root_path=self.root_path,
-            chat_id=self.chat_id,
-            agent_type=self._agent_type,
-            settings=self.settings,
-            models_tried=self._models_tried,
-            build_runtime_context_fn=self._build_runtime_context,
-            project_to_compact_dict_fn=self._project_to_compact_dict,
-            saved_task_id=self._saved_task_id,
-            saved_task_signature=self._saved_task_signature,
-            error=error,
-            cycle_num=cycle_num,
-            phase=phase,
-            callbacks=callbacks,
-        )
-        if new_saved_id is not None:
-            self._saved_task_id = new_saved_id
-        if new_sig is not None:
-            self._saved_task_signature = new_sig
-        return task_id
 
     # ------------------------------------------------------------------
-    # Cycle loop (shared by execute / resume)
+    # Cycle loop (shared by execute / automatic recovery)
     # ------------------------------------------------------------------
     def _accumulate_phase_stats(self, cycle: "SpecCycle", phase_name: str) -> None:
         """Accumulate _last_phase_stats into the current cycle."""
@@ -813,7 +626,7 @@ class SpecEngine(BaseEngine):
 
         Returns a termination reason:
         - success: all criteria satisfied and (review disabled or all PASS)
-        - paused: user stopped/pause requested
+        - cancelled: user stopped the run
         - converged: no measurable progress in window
         - max_cycles: hit max_cycles without success
         - stopped: engine stopped without a cycle (edge)
@@ -835,11 +648,10 @@ class SpecEngine(BaseEngine):
 
         for cycle_num in range(start_cycle, max_cycles + 1):
             if self._run_state != EngineRunState.RUNNING:
-                termination = "paused" if self._run_state == EngineRunState.STOPPING else "stopped"
+                termination = "cancelled" if self._run_state == EngineRunState.STOPPING else "stopped"
                 break
 
             cycle = SpecCycle(cycle_number=cycle_num)
-            self._last_cycle_num = cycle_num
 
             if callbacks.on_cycle_start:
                 callbacks.on_cycle_start(cycle_num, max_cycles)
@@ -864,26 +676,13 @@ class SpecEngine(BaseEngine):
                 spec_output = self._run_spec_phase(
                     cycle_num, cycle, spec_input, work_item, callbacks, _phase_timeout["spec"],
                 )
-                if self._check_cycle_pause(cycle, cycle_num):
-                    termination = "paused"
-                    break
-
                 plan_output = self._run_plan_phase(
                     cycle_num, cycle, spec_output, callbacks, _phase_timeout["plan"],
                 )
-                if self._check_cycle_pause(cycle, cycle_num):
-                    termination = "paused"
-                    break
-
                 self._run_task_phase(cycle_num, cycle, plan_output, callbacks, _phase_timeout["task"])
-                if self._check_cycle_pause(cycle, cycle_num):
-                    termination = "paused"
-                    break
-
                 self._run_build_phase(cycle_num, cycle, plan_output, callbacks, _phase_timeout["build"])
-                if self._check_cycle_pause(cycle, cycle_num):
-                    termination = "paused"
-                    break
+                if self._run_state != EngineRunState.RUNNING:
+                    raise RuntimeError("Spec execution stopped")
 
                 # Pre-review objective verify (results fed to completion_control)
                 self._last_verify_passed = None
@@ -930,6 +729,32 @@ class SpecEngine(BaseEngine):
     # Cycle-loop helper methods (extracted from _run_cycle_loop)
     # ------------------------------------------------------------------
 
+    def _finish_phase(
+        self,
+        cycle: SpecCycle,
+        cycle_num: int,
+        phase: SpecPhase,
+        content: str,
+        *,
+        artifact_name: Optional[str] = None,
+        ext: str = "txt",
+        accumulate_stats: bool = True,
+    ) -> None:
+        if accumulate_stats:
+            self._accumulate_phase_stats(cycle, phase.value)
+        name = artifact_name or phase.value
+        if self.settings.spec_persist_phase_artifacts:
+            setattr(
+                cycle,
+                f"{name}_path",
+                _persist_cycle_artifact(
+                    self.root_path, self.settings, self._project,
+                    cycle_num, name, content, ext,
+                ),
+            )
+        if self.settings.spec_persist_every_phase:
+            self._persist_state_best_effort()
+
     def _prepare_cycle_input(
         self,
         cycle_num: int,
@@ -956,7 +781,6 @@ class SpecEngine(BaseEngine):
     ) -> str:
         """Execute the SPEC phase and return spec output text."""
         cycle.phase = SpecPhase.SPEC
-        self._last_phase = cycle.phase
         if work_item and work_item.spec_path and _should_load_spec_directly(work_item):
             # spec 文件本身就是 spec-kit 规格产物：直接加载进入下一阶段
             spec_output = _read_text_file_best_effort(work_item.spec_path)
@@ -969,13 +793,8 @@ class SpecEngine(BaseEngine):
                 timeout,
             )
         cycle.spec_content = _truncate_output(spec_output, self.settings)
-        self._accumulate_phase_stats(cycle, SpecPhase.SPEC.value)
-        if self.settings.spec_persist_phase_artifacts:
-            cycle.spec_path = _persist_cycle_artifact(self.root_path, self.settings, self._project, cycle_num, "spec", spec_output, "json")
         cycle.spec_artifact, cycle.spec_artifact_errors = parse_spec_artifact(spec_output)
-
-        if self.settings.spec_persist_every_phase:
-            self._persist_state_best_effort()
+        self._finish_phase(cycle, cycle_num, SpecPhase.SPEC, spec_output, ext="json")
 
         if work_item:
             work_item.status = SpecWorkItemStatus.DONE
@@ -1007,7 +826,6 @@ class SpecEngine(BaseEngine):
     ) -> str:
         """Execute the PLAN phase and return plan output text."""
         cycle.phase = SpecPhase.PLAN
-        self._last_phase = cycle.phase
         plan_output = self._run_phase(
             cycle_num,
             SpecPhase.PLAN,
@@ -1016,13 +834,8 @@ class SpecEngine(BaseEngine):
             timeout,
         )
         cycle.plan_content = _truncate_output(plan_output, self.settings)
-        self._accumulate_phase_stats(cycle, SpecPhase.PLAN.value)
-        if self.settings.spec_persist_phase_artifacts:
-            cycle.plan_path = _persist_cycle_artifact(self.root_path, self.settings, self._project, cycle_num, "plan", plan_output, "json")
         cycle.plan_artifact, cycle.plan_artifact_errors = parse_plan_artifact(plan_output)
-
-        if self.settings.spec_persist_every_phase:
-            self._persist_state_best_effort()
+        self._finish_phase(cycle, cycle_num, SpecPhase.PLAN, plan_output, ext="json")
         return plan_output
 
     def _run_task_phase(
@@ -1035,7 +848,6 @@ class SpecEngine(BaseEngine):
     ) -> None:
         """Execute the TASK phase. Populates ``cycle.tasks``."""
         cycle.phase = SpecPhase.TASK
-        self._last_phase = cycle.phase
         task_output = self._run_phase(
             cycle_num,
             SpecPhase.TASK,
@@ -1043,20 +855,14 @@ class SpecEngine(BaseEngine):
             callbacks,
             timeout,
         )
-        self._accumulate_phase_stats(cycle, SpecPhase.TASK.value)
         parsed_tasks = parse_tasks(task_output)
         cycle.tasks_total = len(parsed_tasks)
         cycle.tasks = parsed_tasks[: self.settings.spec_cycle_tasks_max]
-        if self.settings.spec_persist_phase_artifacts:
-            cycle.tasks_path = _persist_cycle_artifact(
-                self.root_path, self.settings, self._project, cycle_num,
-                "tasks",
-                json.dumps([t.to_dict() for t in parsed_tasks], ensure_ascii=False, indent=2),
-                "json",
-            )
-
-        if self.settings.spec_persist_every_phase:
-            self._persist_state_best_effort()
+        self._finish_phase(
+            cycle, cycle_num, SpecPhase.TASK,
+            json.dumps([t.to_dict() for t in parsed_tasks], ensure_ascii=False, indent=2),
+            artifact_name="tasks", ext="json",
+        )
 
     def _run_build_phase(
         self,
@@ -1068,7 +874,6 @@ class SpecEngine(BaseEngine):
     ) -> None:
         """Execute the BUILD phase."""
         cycle.phase = SpecPhase.BUILD
-        self._last_phase = cycle.phase
         build_output = self._run_phase(
             cycle_num,
             SpecPhase.BUILD,
@@ -1077,12 +882,7 @@ class SpecEngine(BaseEngine):
             timeout,
         )
         cycle.build_output = _truncate_output(build_output, self.settings)
-        self._accumulate_phase_stats(cycle, SpecPhase.BUILD.value)
-        if self.settings.spec_persist_phase_artifacts:
-            cycle.build_path = _persist_cycle_artifact(self.root_path, self.settings, self._project, cycle_num, "build", build_output, "txt")
-
-        if self.settings.spec_persist_every_phase:
-            self._persist_state_best_effort()
+        self._finish_phase(cycle, cycle_num, SpecPhase.BUILD, build_output)
 
     def _run_review_phase(
         self,
@@ -1094,36 +894,29 @@ class SpecEngine(BaseEngine):
         review_passed = True
         if self.settings.spec_review_enabled:
             cycle.phase = SpecPhase.REVIEW
-            self._last_phase = cycle.phase
             if callbacks.on_phase_start:
                 callbacks.on_phase_start(cycle_num, SpecPhase.REVIEW)
             review_result = self._conduct_review(cycle_num, callbacks, cycle_obj=cycle)
             cycle.review_result = review_result
             # best-effort: persist review failure decision/diagnostics for traceability
-            diag = self._last_review_failure_diag
+            diag = self._review_orchestrator.circuit.last_review_failure_diag
             if isinstance(diag, dict) and diag:
                 cycle.review_decision = str(diag.get("decision") or "review_failed_continue")
                 cycle.review_diagnostics = dict(diag)
-            if self.settings.spec_persist_phase_artifacts:
-                cycle.review_path = _persist_cycle_artifact(
-                    self.root_path, self.settings, self._project, cycle_num, "review", review_result_to_text(review_result), "txt"
-                )
             self._last_review = review_result
             review_passed = review_result.all_passed
-
-            if self.settings.spec_persist_every_phase:
-                self._persist_state_best_effort()
+            self._finish_phase(
+                cycle, cycle_num, SpecPhase.REVIEW,
+                review_result_to_text(review_result), accumulate_stats=False,
+            )
         return review_passed
 
-    def _check_cycle_pause(self, cycle: SpecCycle, cycle_num: int) -> bool:
-        """Check if engine should pause. Marks cycle failed and persists if so."""
-        if self._run_state != EngineRunState.RUNNING:
-            cycle.fail()
+    def _record_cycle(self, cycle: SpecCycle, cycle_num: int, *, persist: bool = False) -> None:
+        if not self._project.cycles or self._project.cycles[-1] is not cycle:
             self._project.cycles.append(cycle)
-            self._project.cycle_count_total = max(self._project.cycle_count_total, cycle_num)
+        self._project.cycle_count_total = max(self._project.cycle_count_total, cycle_num)
+        if persist:
             self._persist_state_best_effort()
-            return True
-        return False
 
     def _handle_cycle_exception(
         self,
@@ -1137,21 +930,18 @@ class SpecEngine(BaseEngine):
 
         Returns ``(should_break, termination_reason, consecutive_failures)``.
         """
-        # If engine is STOPPING (user pause/stop), preserve original pause behavior
+        # An explicit stop is terminal and never creates a resumable wait state
         if self._run_state != EngineRunState.RUNNING:
             cycle.fail()
-            self._project.cycles.append(cycle)
-            self._project.cycle_count_total = max(self._project.cycle_count_total, cycle_num)
-            self._persist_state_best_effort()
-            return True, "paused", consecutive_failures
+            self._record_cycle(cycle, cycle_num, persist=True)
+            return True, "cancelled", consecutive_failures
 
         # Digest exception: mark cycle failed, continue to next cycle
         err_detail = get_error_detail(exc)
         cycle.error_message = err_detail
         cycle.fail()
 
-        self._project.cycles.append(cycle)
-        self._project.cycle_count_total = max(self._project.cycle_count_total, cycle_num)
+        self._record_cycle(cycle, cycle_num)
 
         logger.error(
             "[Spec:%s] 循环 %d 异常失败 (%s): %s",
@@ -1207,8 +997,7 @@ class SpecEngine(BaseEngine):
 
         Returns ``(should_stop, termination_reason)``.
         """
-        self._project.cycles.append(cycle)
-        self._project.cycle_count_total = max(self._project.cycle_count_total, cycle_num)
+        self._record_cycle(cycle, cycle_num)
 
         if callbacks.on_cycle_done:
             callbacks.on_cycle_done(cycle_num, cycle)
@@ -1316,101 +1105,9 @@ class SpecEngine(BaseEngine):
                     int(getattr(self.settings, "spec_review_pass_streak_required", 2) or 2),
                 )
 
-        # --- COMPLETION GATE (Phase 3): evidence-backed early stop / veto ---
-        completion_gate_met = False
-        completion_gate_confidence = ""
-        completion_gate_enabled = getattr(
-            self.settings,
-            "spec_completion_gate_enabled",
-            True,
+        effective_review_passed = self._apply_completion_gate(
+            cycle, all_satisfied, review_passed, effective_review_passed,
         )
-        if cycle.review_result:
-            from .adaptive_review import (
-                AdaptiveReviewResult,
-                validate_completion_gate_outcomes,
-            )
-            if isinstance(cycle.review_result, AdaptiveReviewResult):
-                if completion_gate_enabled:
-                    (
-                        completion_gate_valid,
-                        completion_gate_error,
-                        _completion_outcome,
-                    ) = validate_completion_gate_outcomes(
-                        cycle.review_result.role_outcomes
-                    )
-                else:
-                    completion_gate_valid = True
-                    completion_gate_error = ""
-
-                manual_confirmation_reason = str(
-                    cycle.review_result.manual_confirmation_reason or ""
-                )
-                if completion_gate_enabled and not completion_gate_valid:
-                    manual_confirmation_reason = manual_confirmation_reason or (
-                        "完成度闸门契约无效"
-                        f"（{completion_gate_error}）"
-                    )
-                if cycle.review_result.requires_manual_confirmation or manual_confirmation_reason:
-                    base_message = manual_confirmation_reason or "审查输出无法可靠判定"
-                    message = f"{base_message}；已暂停，需人工确认后再恢复执行"
-                    logger.warning(
-                        "[Spec:%s] %s",
-                        self._project.name,
-                        message,
-                    )
-                    self._project.pause()
-                    self._project.error = message
-                    self._persist_state_best_effort()
-                    return True, "paused"
-
-                completion_gate_met = (
-                    completion_gate_valid
-                    and cycle.review_result.completion_gate_met
-                )
-                completion_gate_confidence = (
-                    cycle.review_result.completion_gate_confidence
-                )
-
-        # Evidence-backed early stop: bypass streak requirement when completion_control
-        # confirms GOAL_MET with high confidence AND objective verify passed AND
-        # no other blocking suggestions exist.
-        if (
-            all_satisfied
-            and completion_gate_met
-            and completion_gate_confidence == "high"
-            and review_passed
-            and not effective_review_passed
-            and getattr(self, "_last_verify_passed", None) is not False
-        ):
-            logger.info(
-                "[Spec:%s] 完成度闸门允许提前结束：completion_control=GOAL_MET(high), verify=%s",
-                self._project.name,
-                getattr(self, "_last_verify_passed", None),
-            )
-            effective_review_passed = True
-
-        # Completion control veto: an explicit rejection, invalid/missing
-        # verdict, or format failure must prevent success even when there is no
-        # high-confidence blocking suggestion.
-        if (
-            all_satisfied
-            and effective_review_passed
-            and not completion_gate_met
-            and cycle.review_result
-            and completion_gate_enabled
-        ):
-            if isinstance(cycle.review_result, AdaptiveReviewResult):
-                completion_control_rejected = any(
-                    o.role_id == "completion_control"
-                    and (not o.passed or o.goal_verdict != "GOAL_MET")
-                    for o in cycle.review_result.role_outcomes
-                )
-                if completion_control_rejected:
-                    logger.info(
-                        "[Spec:%s] 完成度闸门否决：completion_control 未提供有效通过判定",
-                        self._project.name,
-                    )
-                    effective_review_passed = False
 
         decision = policy.should_stop(
             cycle_num=cycle_num,
@@ -1445,23 +1142,55 @@ class SpecEngine(BaseEngine):
                 )
         return False, ""
 
+    def _apply_completion_gate(
+        self,
+        cycle: SpecCycle,
+        all_satisfied: bool,
+        review_passed: bool,
+        effective_review_passed: bool,
+    ) -> bool:
+        result = cycle.review_result
+        if not isinstance(result, AdaptiveReviewResult):
+            return effective_review_passed
+        enabled = getattr(self.settings, "spec_completion_gate_enabled", True)
+        valid = not enabled or validate_completion_gate_outcomes(result.role_outcomes)[0]
+        gate_met = valid and result.completion_gate_met
+        if (
+            all_satisfied and gate_met
+            and result.completion_gate_confidence == "high"
+            and review_passed and not effective_review_passed
+            and self._last_verify_passed is not False
+        ):
+            logger.info(
+                "[Spec:%s] 完成度闸门允许提前结束：completion_control=GOAL_MET(high), verify=%s",
+                self._project.name, self._last_verify_passed,
+            )
+            return True
+        rejected = any(
+            outcome.role_id == "completion_control"
+            and (not outcome.passed or outcome.goal_verdict != "GOAL_MET")
+            for outcome in result.role_outcomes
+        )
+        if all_satisfied and effective_review_passed and enabled and not gate_met and rejected:
+            logger.info("[Spec:%s] 完成度闸门否决：completion_control 未提供有效通过判定", self._project.name)
+            return False
+        return effective_review_passed
+
     # ------------------------------------------------------------------
     # Long-range: work items, discovery, spec generation
     # ------------------------------------------------------------------
     def _resolve_max_cycles(self, requested: int) -> int:
-        with contextlib.suppress(Exception):  # intentional: defensive int coercion
+        try:
             requested = int(requested)
-        if not isinstance(requested, int):
+        except (TypeError, ValueError):
             requested = 10
-
-        limit = 5000
-        with contextlib.suppress(Exception):  # intentional: defensive int coercion
+        try:
             limit = int(getattr(self.settings, "spec_max_cycles_limit", 5000))
+        except (TypeError, ValueError):
+            limit = 5000
         if limit <= 0:
             limit = 5000
-        if requested <= 0:
-            requested = 1
-        return min(requested, limit)
+        return min(max(1, requested), limit)
 
     def _discover_optimization_questions(
         self,
@@ -1499,27 +1228,6 @@ class SpecEngine(BaseEngine):
         _persist_state_best_effort(self._project, self.save_state, _get_state_path(self.root_path, self.settings))
 
     # ------------------------------------------------------------------
-    # Monitoring metrics
-    # ------------------------------------------------------------------
-
-    def _make_aux_send_fn(self) -> Callable[[str], str]:
-        """Create a send_fn that uses a disposable ACP sub-session."""
-        def _send(text: str) -> str:
-            timeout = getattr(self.settings, "engine_aux_prompt_timeout", 600)
-            return prompt_via_acp(
-                text,
-                create_session_fn=self._create_session_fn,
-                agent_type=self._agent_type,
-                cwd=self.root_path,
-                timeout=timeout,
-                model_name=self._model_name,
-            )
-        return _send
-
-    def _decompose_criteria_with_llm(self, text: str) -> list[str]:
-        return _decompose_criteria_with_llm_impl(text, self.settings, send_fn=self._make_aux_send_fn())
-
-    # ------------------------------------------------------------------
     # Criteria evaluation (reuses loop pattern)
     # ------------------------------------------------------------------
     def _evaluate_criteria(self, criteria: list[str], cycle: int) -> dict:
@@ -1539,21 +1247,10 @@ class SpecEngine(BaseEngine):
     # ------------------------------------------------------------------
     # Review (reuses shared parsing infrastructure)
     # ------------------------------------------------------------------
-    def _reset_cancel_event(self) -> bool:
-        """Reset _review_cancel_event under lock, guarding against stop/pause races.
-
-        Returns True if the event was successfully cleared (engine is RUNNING),
-        False if the engine is no longer running (event is set immediately).
-        """
-        with self._lock:
-            is_running = (self._run_state == EngineRunState.RUNNING)
-        return self._review_orchestrator.reset_cancel_event(is_running=is_running)
-
     def _conduct_review(self, cycle: int, callbacks: SpecEngineCallbacks, cycle_obj=None) -> ReviewResult:
         # When cycle_obj is provided and parallel pipeline is enabled, collect artifacts.
         artifacts = None
-        parallel_enabled = getattr(self.settings, "spec_review_parallel_enabled", True)
-        if parallel_enabled and cycle_obj is not None:
+        if cycle_obj is not None:
             try:
                 from .review_artifacts import collect_review_artifacts
                 artifacts = collect_review_artifacts(
@@ -1564,18 +1261,13 @@ class SpecEngine(BaseEngine):
                     verify_output=getattr(self, "_last_verify_output", "") or "",
                 )
             except Exception as e:
-                logger.warning("[Spec] collect_review_artifacts failed, falling back to legacy: %s", repr(e), exc_info=True)
+                logger.warning("[Spec] collect_review_artifacts failed: %s", repr(e), exc_info=True)
 
-        # Reset cancel_event for this review cycle; set immediately if engine is stopping.
-        self._reset_cancel_event()
+        with self._lock:
+            is_running = self._run_state == EngineRunState.RUNNING
+        self._review_orchestrator.reset_cancel_event(is_running=is_running)
 
-        # on_retry_status callback forwards to callbacks.on_review_retry for user visibility.
-        def _on_retry_status(event: "RetryEvent") -> None:
-            if callbacks.on_review_retry:
-                callbacks.on_review_retry(cycle, event)
-
-        strategy = select_review_strategy(self.settings)
-        return strategy.run(
+        return conduct_review(
             ReviewContext(
                 settings=self.settings,
                 circuit=self._review_orchestrator.circuit,
@@ -1588,25 +1280,14 @@ class SpecEngine(BaseEngine):
                 artifacts=artifacts,
                 agent_type=self._agent_type or "coco",
                 model_name=self._model_name,
-                on_retry_status=_on_retry_status,
+                on_retry_status=(
+                    (lambda event: callbacks.on_review_retry(cycle, event))
+                    if callbacks.on_review_retry else None
+                ),
                 cancel_event=self._review_orchestrator.cancel_event,
                 review_agents=list(self._review_agent_pool),
-            ),
+            )
         )
-
-    def _parse_review_output(self, text: str, cycle: int) -> ReviewResult:
-        return _parse_review_output_impl(
-            text,
-            cycle,
-            parse_with_llm_fn=lambda raw: _parse_review_with_llm_impl(raw, self.settings, send_fn=self._make_aux_send_fn()),
-        )
-
-    def _parse_review_with_llm(self, raw_text: str) -> list[PerspectiveReview]:
-        return _parse_review_with_llm_impl(raw_text, self.settings, send_fn=self._make_aux_send_fn())
-
-    @staticmethod
-    def _extract_reviews_from_llm_response(text: str) -> list[PerspectiveReview]:
-        return extract_reviews_from_llm_response(text)
 
     def _consume_guidance(self) -> str:
         if not self._user_guidance:
@@ -1653,18 +1334,6 @@ class SpecEngine(BaseEngine):
         """Signal review cancel event when engine is stopped."""
         self._review_orchestrator.signal_stop()
 
-    def pause(self):
-        with self._lock:
-            if self._project:
-                self._project.status = SpecProjectStatus.PAUSED
-            self._run_state = EngineRunState.STOPPING
-            session = self._session
-        self._review_orchestrator.signal_stop()
-        if session:
-            try:
-                session.cancel()
-            except Exception:
-                logger.debug("[Spec] session.cancel() failed during stop", exc_info=True)
 
     def _handle_max_cycles_termination(self, max_cycles: int):
         is_all_satisfied = self._project.is_all_satisfied
@@ -1681,38 +1350,49 @@ class SpecEngine(BaseEngine):
 
         if is_all_satisfied and last_review_passed:
             msg = f"达到最大循环次数({max_cycles})。核心验收标准已满足，但仍有待办优化项（Backlog）。"
-            self._project.status = SpecProjectStatus.PAUSED
-            self._project.error = msg + "（已暂停，可使用 /spec resume 继续执行优化项）"
-            self._project.completed_at = time.time()
+            logger.info("[Spec:%s] %s", self._project.name, msg)
+            self._project.complete()
+            _append_history_event(
+                self.root_path,
+                self.settings,
+                self._project,
+                "max_cycles_completed",
+                {
+                    "max_cycles": max_cycles,
+                    "backlog_pending": sum(
+                        1
+                        for item in self._project.work_items
+                        if item.status == SpecWorkItemStatus.PENDING
+                    ),
+                },
+            )
         else:
             msg = f"达到最大循环次数({max_cycles})仍未满足验收标准或审查未通过"
-            if self.settings.spec_infinite_mode:
-                self._project.status = SpecProjectStatus.PAUSED
-                self._project.error = msg + "（已暂停，可继续 /spec resume 或提升 SPEC_MAX_CYCLES）"
-                self._project.completed_at = time.time()
-            else:
-                self._project.abort(msg)
+            self._project.fail(msg)
 
-    def resume(self, callbacks: Optional[SpecEngineCallbacks] = None) -> Optional[SpecProject]:
-        """Resume a paused spec execution."""
-        if not self._project or self._project.status not in (SpecProjectStatus.PAUSED, SpecProjectStatus.CLARIFYING):
+    def _continue_recovered_run(self, callbacks: Optional[SpecEngineCallbacks] = None) -> Optional[SpecProject]:
+        """Continue the canonical run-state after process interruption."""
+        if not self._project or self._project.status not in (
+            SpecProjectStatus.ANALYZING,
+            SpecProjectStatus.RUNNING,
+        ):
             return self._project
 
         # Restore review circuit state from persistence (survives process restart)
         try:
             for state_path in _state_path_candidates(self.root_path, self.settings):
                 if os.path.isfile(state_path):
-                    _, circuit = self.load_state_with_circuit(state_path)
+                    _, circuit_data = _load_engine_state(state_path)
+                    circuit = ReviewCircuitState.from_dict(circuit_data) if circuit_data else ReviewCircuitState()
                     self._review_orchestrator.restore_circuit(circuit)
                     break
         except Exception as e:
-            logger.warning("[Spec] resume circuit restore skipped: %s", get_error_detail(e), exc_info=True)
+            logger.warning("[Spec] automatic recovery circuit restore skipped: %s", get_error_detail(e), exc_info=True)
 
         callbacks = self._wrap_callbacks(callbacks or SpecEngineCallbacks())
         with self._lock:
             self._run_state = EngineRunState.RUNNING
             self._project.status = SpecProjectStatus.RUNNING
-            self._termination_reason = None
         additional_cycles = self._resolve_max_cycles(self.settings.spec_max_cycles)
 
         last_cycle_num = 0
@@ -1722,45 +1402,19 @@ class SpecEngine(BaseEngine):
         max_cycles = start_cycle + additional_cycles - 1
 
         try:
-            self._close_session_safely()
-
-            self._session = self._create_session_fn(
-                agent_type=self._agent_type,
-                cwd=self.root_path,
-                on_rate_limit=getattr(self, "_on_rate_limit", None),
-                model_name=self._model_name,
-            )
-
-            self._termination_reason = self._run_cycle_loop(
+            self._run_to_terminal(
                 start_cycle=start_cycle,
                 max_cycles=max_cycles,
                 callbacks=callbacks,
-                timeout=self.settings.spec_execution_timeout,
+                label="Spec自动恢复",
             )
-
-            self._finalize_execution(max_cycles=max_cycles, callbacks=callbacks)
-
-        except TimeoutError as e:
-            self._finalize_execution(max_cycles=max_cycles, callbacks=callbacks, error=e, is_timeout=True, label="Spec恢复")
-
-        except Exception as e:
-            logger.exception("Unexpected error in Spec resume")
-            self._finalize_execution(max_cycles=max_cycles, callbacks=callbacks, error=e, is_timeout=False, label="Spec恢复")
-
         finally:
             self._close_session_safely()
             with self._lock:
                 self._run_state = EngineRunState.IDLE
-
-            if self._project and self._project.status == SpecProjectStatus.COMPLETED and self._saved_task_id:
-                delete_task_state(self._saved_task_id)
-                self._saved_task_id = None
-                self._saved_task_signature = None
-
+            self._resume_meta = None
+            self._auto_recovery_claimed = False
         return self._project
-
-    def _project_to_compact_dict(self) -> dict:
-        return _project_to_compact_dict_impl(self._project, self.settings, self.root_path)
 
     def save_state(self, filepath: Optional[str] = None) -> str:
         return _save_engine_state(
@@ -1769,22 +1423,10 @@ class SpecEngine(BaseEngine):
             self.root_path,
             self.chat_id,
             self._build_runtime_context,
-            self._project_to_compact_dict,
+            lambda: _project_to_compact_dict_impl(self._project, self.settings, self.root_path),
             filepath,
             review_circuit=self._review_orchestrator.to_dict(),
         )
-
-    @classmethod
-    def load_state(cls, filepath: str) -> Optional[SpecProject]:
-        project, _rc = _load_engine_state(filepath)
-        return project
-
-    @classmethod
-    def load_state_with_circuit(cls, filepath: str) -> tuple[Optional[SpecProject], ReviewCircuitState]:
-        """Load project + review circuit state (backward-compatible)."""
-        project, rc_dict = _load_engine_state(filepath)
-        circuit = ReviewCircuitState.from_dict(rc_dict) if rc_dict else ReviewCircuitState()
-        return project, circuit
 
     def cleanup(self):
         super().cleanup()

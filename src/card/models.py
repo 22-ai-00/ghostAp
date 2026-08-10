@@ -7,36 +7,6 @@ from typing import Optional
 
 
 @dataclass
-class ToolOptionView:
-    """卡片层通用的“工具选择”选项模型。
-
-    说明：
-    - 与具体后端实现解耦，只承载 UI 所需字段；
-    - name: 逻辑工具名称（如 coco/claude 等）；
-    - description: 简要说明文案；
-    - is_default: 是否作为默认高亮/推荐选项；
-    - emoji: 可选图标，用于提高可读性；
-    - disabled: 卡片上是否禁用该选项（例如工具不可用时）。
-    """
-
-    name: str
-    description: str = ""
-    is_default: bool = False
-    emoji: str = "🤖"
-    disabled: bool = False
-
-
-@dataclass
-class ModelOptionView:
-    """卡片层通用的“模型选择”选项模型。"""
-
-    name: str
-    description: str = ""
-    is_default: bool = False
-    display_name: Optional[str] = None
-
-
-@dataclass
 class ReasoningState:
     """Reasoning block state for card rendering."""
     content: str = ""
@@ -71,9 +41,9 @@ class EngineCardState:
     # 当 rendered_content 存在时，DeepBuilder 会使用 to_elements(collapsible=True) 替代纯 markdown
     rendered_content: Optional[object] = None  # RenderedContent from acp.renderer
     # ── 消息卡片优化新增字段 ──
-    terminal_state: Optional[str] = None  # running/completed/failed/cancelled/blocked/awaiting_approval/denied/continued
+    terminal_state: Optional[str] = None  # running/completed/failed/cancelled/blocked/denied/continued
     is_read: bool = True  # 未读标记 (False → 标题前缀 🔴)
-    footer_status: Optional[str] = None  # thinking/tool_running/waiting_approval
+    footer_status: Optional[str] = None  # thinking/tool_running
     reasoning: Optional[ReasoningState] = None  # Reasoning block state
 
     @property
@@ -135,7 +105,7 @@ class CardLayoutSpec:
     button_elements: Optional[list[dict]] = None
 
     # ---- 消息卡片优化新增字段 ----
-    footer_status: Optional[str] = None  # thinking/tool_running/waiting_approval
+    footer_status: Optional[str] = None  # thinking/tool_running
     terminal_state: Optional[str] = None  # completed/failed/cancelled/blocked etc.
 
 

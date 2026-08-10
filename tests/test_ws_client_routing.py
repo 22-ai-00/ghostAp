@@ -213,12 +213,13 @@ def test_employee_registration_notifier_explains_pending_oauth_state(
         employee_name="Atlas",
         intent_id="hire_intent_1",
     )
-    mock_ws_client._reply_text = MagicMock()
+    reply_text = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply_text
     mock_ws_client._get_chat_mode = MagicMock(return_value="p2p")
 
     runtime._service._on_registration_status(state, "polling")
 
-    mock_ws_client._reply_text.assert_called_once_with(
+    reply_text.assert_called_once_with(
         "msg_hire",
         "独立飞书智能体注册请求已提交，正在等待你在上方链接中完成授权确认。"
         "确认前注册接口会持续返回 400 authorization_pending，这是设备授权"
@@ -321,16 +322,21 @@ def test_explicit_engine_command_reaches_its_final_handler_in_every_programming_
     project = ProjectContext("proj_1", "GhostAP", "/tmp")
     mock_ws_client._get_mode_handler = MagicMock()
     programming_modes = ("coco", "claude", "aiden", "codex", "gemini", "traex")
+    mock_ws_client._handler_ctx.handlers["coco"].add_reaction = MagicMock()
     engine_cases = (
-        ("/deep 深入完成复杂任务", "_handle_deep_command"),
-        ("/spec 按规格迭代直到收敛", "_handle_spec_command"),
-        ("/wf 编排多个代理完成任务", "_handle_workflow_command"),
+        ("/deep 深入完成复杂任务", "deep", "handle_deep_command"),
+        ("/spec 按规格迭代直到收敛", "spec", "handle_spec_command"),
+        ("/wf 编排多个代理完成任务", "workflow", "handle_workflow_command"),
     )
 
-    for text, expected_handler in engine_cases:
+    for text, handler_name, method_name in engine_cases:
         for programming_mode in programming_modes:
             target = MagicMock()
-            setattr(mock_ws_client, expected_handler, target)
+            setattr(
+                mock_ws_client._handler_ctx.handlers[handler_name],
+                method_name,
+                target,
+            )
 
             mock_ws_client._dispatch_message_logic(
                 "msg_engine_final",
@@ -341,9 +347,8 @@ def test_explicit_engine_command_reaches_its_final_handler_in_every_programming_
                 command_match=SlashCommandParser.parse(text),
             )
 
-            assert target.call_count == 1, (
-                f"{text!r} did not reach {expected_handler!r} from "
-                f"{programming_mode!r}"
+            target.assert_called_once_with(
+                "msg_engine_final", "chat_456", text, project
             )
             assert not mock_ws_client._get_mode_handler.called, (
                 f"{text!r} fell back to {programming_mode!r}"
@@ -353,8 +358,8 @@ def test_explicit_engine_command_reaches_its_final_handler_in_every_programming_
 @pytest.mark.parametrize(
     ("engine", "expected_method"),
     [
-        ("deep", "_start_deep_engine"),
-        ("spec", "_start_spec_engine"),
+        ("deep", "start_deep_engine"),
+        ("spec", "start_spec_engine"),
     ],
 )
 def test_deep_and_spec_topic_plain_text_keeps_engine_strategy(
@@ -364,8 +369,11 @@ def test_deep_and_spec_topic_plain_text_keeps_engine_strategy(
 ):
     """Deep/Spec topic continuation should not fall back to SMART intent routing."""
     project = ProjectContext("proj_1", "GhostAP", "/tmp")
-    mock_ws_client._process_with_intent = MagicMock()
-    setattr(mock_ws_client, expected_method, MagicMock())
+    dispatch = MagicMock()
+    mock_ws_client._message_dispatcher.process_with_intent = dispatch
+    target = MagicMock()
+    setattr(mock_ws_client._handler_ctx.handlers[engine], expected_method, target)
+    mock_ws_client._handler_ctx.handlers["coco"].add_reaction = MagicMock()
 
     mock_ws_client._dispatch_message_logic(
         "msg_next",
@@ -376,25 +384,27 @@ def test_deep_and_spec_topic_plain_text_keeps_engine_strategy(
         command_match=None,
     )
 
-    getattr(mock_ws_client, expected_method).assert_called_once_with(
+    target.assert_called_once_with(
         "msg_next",
         "chat_456",
         "继续按这个方向做",
         project,
     )
-    mock_ws_client._process_with_intent.assert_not_called()
+    dispatch.assert_not_called()
 
 
 def test_topic_engine_without_resolved_project_never_falls_back_to_smart(
     mock_ws_client: FeishuWSClient,
 ):
     """A topic-owned engine resolves/rejects its project instead of changing strategy."""
-    mock_ws_client._process_with_intent = MagicMock()
-    mock_ws_client._reply_text = MagicMock()
+    dispatch = MagicMock()
+    reply_text = MagicMock()
+    mock_ws_client._message_dispatcher.process_with_intent = dispatch
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply_text
     engine_cases = (
-        ("deep", "_start_deep_engine"),
-        ("spec", "_start_spec_engine"),
-        ("workflow", "_workflow_handler.handle_message"),
+        ("deep", "start_deep_engine"),
+        ("spec", "start_spec_engine"),
+        ("workflow", "handle_message"),
     )
     slash_texts = {
         "deep": "/deep 继续执行",
@@ -404,14 +414,14 @@ def test_topic_engine_without_resolved_project_never_falls_back_to_smart(
 
     for engine, expected_method in engine_cases:
         for has_slash_command in (False, True):
-            mock_ws_client._process_with_intent.reset_mock()
-            mock_ws_client._reply_text.reset_mock()
-            if expected_method == "_workflow_handler.handle_message":
-                target = MagicMock()
-                mock_ws_client._workflow_handler.handle_message = target
-            else:
-                target = MagicMock()
-                setattr(mock_ws_client, expected_method, target)
+            dispatch.reset_mock()
+            reply_text.reset_mock()
+            target = MagicMock()
+            setattr(
+                mock_ws_client._handler_ctx.handlers[engine],
+                expected_method,
+                target,
+            )
 
             text = slash_texts[engine] if has_slash_command else "继续执行"
             command_match = (
@@ -427,11 +437,11 @@ def test_topic_engine_without_resolved_project_never_falls_back_to_smart(
             )
 
             assert not target.called, f"{engine!r} ran without a project"
-            assert mock_ws_client._reply_text.call_count == 1, (
+            assert reply_text.call_count == 1, (
                 f"{engine!r} did not explain the missing project"
             )
-            assert "未执行" in mock_ws_client._reply_text.call_args.args[1]
-            assert not mock_ws_client._process_with_intent.called, (
+            assert "未执行" in reply_text.call_args.args[1]
+            assert not dispatch.called, (
                 f"{engine!r} fell back to SMART"
             )
 
@@ -439,8 +449,10 @@ def test_topic_engine_without_resolved_project_never_falls_back_to_smart(
 def test_missing_topic_project_allows_safe_recovery_and_diagnostics_commands(
     mock_ws_client: FeishuWSClient,
 ):
-    mock_ws_client._process_with_intent = MagicMock()
-    mock_ws_client._reply_text = MagicMock()
+    dispatch = MagicMock()
+    reply_text = MagicMock()
+    mock_ws_client._message_dispatcher.process_with_intent = dispatch
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply_text
     commands = (
         "/projects",
         "/status",
@@ -450,8 +462,8 @@ def test_missing_topic_project_allows_safe_recovery_and_diagnostics_commands(
     )
 
     for text in commands:
-        mock_ws_client._process_with_intent.reset_mock()
-        mock_ws_client._reply_text.reset_mock()
+        dispatch.reset_mock()
+        reply_text.reset_mock()
         mock_ws_client._dispatch_message_logic(
             "msg_recover",
             "chat_456",
@@ -461,10 +473,10 @@ def test_missing_topic_project_allows_safe_recovery_and_diagnostics_commands(
             command_match=SlashCommandParser.parse(text),
         )
 
-        assert mock_ws_client._process_with_intent.call_count == 1, (
+        assert dispatch.call_count == 1, (
             f"{text!r} was not routed as a safe recovery command"
         )
-        assert not mock_ws_client._reply_text.called, (
+        assert not reply_text.called, (
             f"{text!r} was rejected as an unsafe missing-project command"
         )
 
@@ -494,43 +506,6 @@ def test_process_message_async_auto_enter_mode(mock_ws_client: FeishuWSClient):
     )
 
 
-def test_group_ledger_publication_precedes_programming_mode_dispatch(
-    mock_ws_client: FeishuWSClient,
-) -> None:
-    msg = create_mock_message("implement this")
-    msg.event.message.chat_type = "group"
-    msg.event.message.root_id = "om_topic_root"
-    msg.event.message.thread_id = "omt_topic"
-    mock_ws_client._validate_message = MagicMock(return_value=True)
-    project = ProjectContext("proj_1", "Test", "/tmp")
-    mock_ws_client._resolve_message_context = MagicMock(
-        return_value=(project, "coco")
-    )
-    mock_coco_handler = MagicMock()
-    mock_ws_client._get_mode_handler = MagicMock(return_value=mock_coco_handler)
-    runtime = mock_ws_client._employee_department_runtime
-    runtime.record_group_event = MagicMock(return_value=True)
-    task_ctx = SimpleNamespace(
-        run_id="run_group_ledger",
-        spec=SimpleNamespace(
-            sender_id="ou_user",
-            sender_union_id="on_user",
-            is_p2p=False,
-            tenant_key="tenant_1",
-        )
-    )
-
-    mock_ws_client._process_message_async(msg, task_ctx=task_ctx)
-
-    runtime.record_group_event.assert_called_once_with(
-        tenant_key="tenant_test",
-        chat_id="oc_456",
-        thread_id="omt_topic",
-        message_id="om_123",
-        sender_id="ou_test",
-        text="implement this",
-    )
-    mock_coco_handler.handle_message.assert_called_once()
 
 
 def test_flat_post_engine_command_reaches_dispatch_with_command_and_image(
@@ -553,9 +528,6 @@ def test_flat_post_engine_command_reaches_dispatch_with_command_and_image(
     mock_ws_client._get_image_handler = MagicMock(return_value=image_handler)
     mock_ws_client._validate_message = MagicMock(return_value=True)
     mock_ws_client._resolve_message_context = MagicMock(return_value=(project, "traex"))
-    mock_ws_client._employee_department_runtime.record_group_event = MagicMock(
-        return_value=True
-    )
     mock_ws_client._dispatch_message_logic = MagicMock()
 
     mock_ws_client._process_message_async(msg)
@@ -574,8 +546,10 @@ def test_flat_post_engine_command_reaches_dispatch_with_command_and_image(
 def test_topic_bound_deep_blocks_spec_switch_command(mock_ws_client: FeishuWSClient):
     """A Deep topic must not be implicitly switched to Spec by a slash command."""
     project = ProjectContext("proj_1", "Test", "/tmp")
-    mock_ws_client._reply_text = MagicMock()
-    mock_ws_client._process_with_intent = MagicMock()
+    reply_text = MagicMock()
+    dispatch = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply_text
+    mock_ws_client._message_dispatcher.process_with_intent = dispatch
 
     mock_ws_client._dispatch_message_logic(
         "msg_123",
@@ -586,18 +560,19 @@ def test_topic_bound_deep_blocks_spec_switch_command(mock_ws_client: FeishuWSCli
         command_match=MagicMock(command="/spec"),
     )
 
-    mock_ws_client._reply_text.assert_called_once()
-    assert "Deep" in mock_ws_client._reply_text.call_args.args[1]
-    assert "Spec" in mock_ws_client._reply_text.call_args.args[1]
-    mock_ws_client._process_with_intent.assert_not_called()
+    reply_text.assert_called_once()
+    assert "DEEP" in reply_text.call_args.args[1]
+    assert "SPEC" in reply_text.call_args.args[1]
+    dispatch.assert_not_called()
 
 
 def test_topic_bound_spec_allows_spec_command(mock_ws_client: FeishuWSClient):
     """Same-engine explicit commands remain available inside their topic."""
     project = ProjectContext("proj_1", "Test", "/tmp")
-    mock_ws_client._reply_text = MagicMock()
-    mock_ws_client._process_with_intent = MagicMock()
-    mock_ws_client._is_interceptable_command_match = MagicMock(return_value=False)
+    reply_text = MagicMock()
+    dispatch = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply_text
+    mock_ws_client._message_dispatcher.process_with_intent = dispatch
 
     mock_ws_client._dispatch_message_logic(
         "msg_123",
@@ -608,23 +583,24 @@ def test_topic_bound_spec_allows_spec_command(mock_ws_client: FeishuWSClient):
         command_match=MagicMock(command="/spec_status"),
     )
 
-    mock_ws_client._reply_text.assert_not_called()
-    mock_ws_client._process_with_intent.assert_called_once()
+    reply_text.assert_not_called()
+    dispatch.assert_called_once()
 
 
 def test_deep_start_binds_topic_context(mock_ws_client: FeishuWSClient):
     """Starting Deep registers the current Feishu topic as a Deep strategy context."""
     project = ProjectContext("proj_1", "GhostAP", "/tmp")
     mock_ws_client._thread_manager.remove("msg_deep")
-    mock_ws_client._deep_handler._submit_engine_task = MagicMock()
-    mock_ws_client._deep_handler.add_reaction = MagicMock()
-    mock_ws_client._deep_handler.ensure_request_id = MagicMock(return_value="req-1")
-    mock_ws_client._deep_handler.ctx.deep_engine_manager.get = MagicMock(return_value=None)
-    mock_ws_client._deep_handler.ctx.deep_engine_manager.get_or_create = MagicMock(return_value=MagicMock())
+    handler = mock_ws_client._handler_ctx.handlers["deep"]
+    handler._submit_engine_task = MagicMock()
+    handler.add_reaction = MagicMock()
+    handler.ensure_request_id = MagicMock(return_value="req-1")
+    handler.ctx.deep_engine_manager.get = MagicMock(return_value=None)
+    handler.ctx.deep_engine_manager.get_or_create = MagicMock(return_value=MagicMock())
 
     set_current_thread_id(None)
     try:
-        mock_ws_client._deep_handler.start_deep_engine("msg_deep", "chat_456", "深入分析", project)
+        handler.start_deep_engine("msg_deep", "chat_456", "深入分析", project)
     finally:
         set_current_thread_id(None)
 
@@ -638,15 +614,16 @@ def test_spec_start_binds_topic_context(mock_ws_client: FeishuWSClient):
     """Starting Spec registers the current Feishu topic as a Spec strategy context."""
     project = ProjectContext("proj_1", "GhostAP", "/tmp")
     mock_ws_client._thread_manager.remove("msg_spec")
-    mock_ws_client._spec_handler._submit_engine_task = MagicMock()
-    mock_ws_client._spec_handler.add_reaction = MagicMock()
-    mock_ws_client._spec_handler.ensure_request_id = MagicMock(return_value="req-1")
-    mock_ws_client._spec_handler.ctx.spec_engine_manager.get = MagicMock(return_value=None)
-    mock_ws_client._spec_handler.ctx.spec_engine_manager.get_or_create = MagicMock(return_value=MagicMock())
+    handler = mock_ws_client._handler_ctx.handlers["spec"]
+    handler._submit_engine_task = MagicMock()
+    handler.add_reaction = MagicMock()
+    handler.ensure_request_id = MagicMock(return_value="req-1")
+    handler.ctx.spec_engine_manager.get = MagicMock(return_value=None)
+    handler.ctx.spec_engine_manager.get_or_create = MagicMock(return_value=MagicMock())
 
     set_current_thread_id(None)
     try:
-        mock_ws_client._spec_handler.start_spec_engine("msg_spec", "chat_456", "写清规格", project)
+        handler.start_spec_engine("msg_spec", "chat_456", "写清规格", project)
     finally:
         set_current_thread_id(None)
 
@@ -660,7 +637,8 @@ def test_exit_in_engine_topic_unbinds_topic_strategy(mock_ws_client: FeishuWSCli
     """In an engine-only topic, /exit exits the topic strategy instead of reporting SMART."""
     project = ProjectContext("proj_1", "GhostAP", "/tmp")
     mock_ws_client._thread_manager.register("thread-deep-exit", "chat_456", "proj_1", mode="deep")
-    mock_ws_client._system_handler.reply_text = MagicMock()
+    system = mock_ws_client._handler_ctx.handlers["system"]
+    system.reply_text = MagicMock()
     mock_ws_client._control_plane.should_defer_exit = MagicMock(return_value=False)
 
     set_current_thread_id("thread-deep-exit")
@@ -671,16 +649,16 @@ def test_exit_in_engine_topic_unbinds_topic_strategy(mock_ws_client: FeishuWSCli
             "/exit",
             project,
             "deep",
-            command_match=MagicMock(command="/exit"),
+            command_match=SlashCommandParser.parse("/exit"),
         )
     finally:
         set_current_thread_id(None)
 
     assert mock_ws_client._thread_manager.get("thread-deep-exit") is None
-    mock_ws_client._system_handler.reply_text.assert_called_once()
+    system.reply_text.assert_called_once()
 
 
-def test_process_with_intent_multitask(mock_ws_client: FeishuWSClient):
+def test_dispatcher_processes_each_recognized_task(mock_ws_client: FeishuWSClient):
     """Test that intent recognizer correctly triggers multi-task execution."""
     project = ProjectContext("proj_1", "Test", "/tmp")
     mock_ws_client._get_effective_mode = MagicMock(return_value=(InteractionMode.SMART, False))
@@ -695,84 +673,45 @@ def test_process_with_intent_multitask(mock_ws_client: FeishuWSClient):
     )
     mock_ws_client._intent_recognizer.recognize.return_value = mock_intent_result
 
-    # Mock message reply and task steps
-    mock_ws_client._reply_text = MagicMock()
-    mock_ws_client._message_dispatcher.execute_task_step = MagicMock(return_value=True)
+    execute_single_task = MagicMock()
+    mock_ws_client._message_dispatcher.execute_single_task = execute_single_task
+    mock_ws_client._handler_ctx.handlers["coco"].add_reaction = MagicMock()
 
-    mock_ws_client._process_with_intent("msg_123", "chat_456", "create a project and enter coco", project)
+    mock_ws_client._message_dispatcher.process_with_intent(
+        "msg_123", "chat_456", "create a project and enter coco", project
+    )
 
-    # It should reply with a multi-task plan
-    assert mock_ws_client._reply_text.call_count >= 1
-    # It should have called _execute_task_step for each task
-    assert mock_ws_client._message_dispatcher.execute_task_step.call_count == 2
+    assert execute_single_task.call_count == 2
 
-    call_args_list = mock_ws_client._message_dispatcher.execute_task_step.call_args_list
+    call_args_list = execute_single_task.call_args_list
     assert call_args_list[0][0][2].intent == IntentType.CREATE_PROJECT
     assert call_args_list[1][0][2].intent == IntentType.ENTER_COCO
 
 
-def test_process_with_intent_system_command_interception(mock_ws_client: FeishuWSClient):
+def test_dispatcher_intercepts_engine_command_before_intent_recognition(
+    mock_ws_client: FeishuWSClient,
+):
     """Test that system commands bypass intent recognition completely during SMART mode."""
     project = ProjectContext("proj_1", "Test", "/tmp")
     mock_ws_client._get_effective_mode = MagicMock(return_value=(InteractionMode.SMART, False))
 
-    mock_ws_client._handle_deep_command = MagicMock()
+    handle_deep_command = MagicMock()
+    mock_ws_client._handler_ctx.handlers["deep"].handle_deep_command = (
+        handle_deep_command
+    )
+    mock_ws_client._handler_ctx.handlers["coco"].add_reaction = MagicMock()
 
     # Send a deep engine command
-    mock_ws_client._process_with_intent("msg_123", "chat_456", "/deep something", project)
+    mock_ws_client._message_dispatcher.process_with_intent(
+        "msg_123", "chat_456", "/deep something", project
+    )
 
     # Intent recognizer must not be called
     mock_ws_client._intent_recognizer.recognize.assert_not_called()
     # It should be directly routed to handle_deep_command
-    mock_ws_client._handle_deep_command.assert_called_once_with("msg_123", "chat_456", "/deep something", project)
-
-
-def test_card_action_deduplication_and_routing(mock_ws_client: FeishuWSClient):
-    """Test card action callback ignores duplicates and routes correctly via ActionDispatcher."""
-    # Create fake card action data
-    data = MagicMock()
-    data.header.event_id = "event_001"
-    data.header.tenant_key = "tenant_card"
-    data.event.context.open_message_id = "msg_123"
-    data.event.context.open_chat_id = "chat_456"
-    data.event.action.value = '{"action": "show_status", "project_id": "proj_1"}'
-    data.event.operator.open_id = "ou_test"
-    data.event.operator.user_id = "u_test"
-    data.event.operator.union_id = "on_test"
-
-    # Mock deduplication cache to False
-    mock_ws_client._card_event_cache.is_duplicate = MagicMock(return_value=False)
-
-    # Inject action dispatcher spy
-    mock_ws_client._action_dispatcher.dispatch = MagicMock(return_value=True)
-
-    mock_ws_client._handle_card_action(data)
-
-    # The action should be submitted as a task
-    submit_mock = mock_ws_client._scheduler.submit
-    assert submit_mock.call_count == 1
-    spec, func = submit_mock.call_args[0]
-
-    assert spec.task_type == "feishu_card_action"
-    assert spec.tenant_key == "tenant_card"
-    assert spec.project_id == "proj_1"
-    assert spec.sender_union_id == "on_test"
-    # System card actions like show_status are HIGH priority and is_system_command
-    assert spec.priority == TaskPriority.HIGH
-    assert spec.is_system_command is True
-
-    # Now run the callback to verify dispatcher routing
-    task_ctx = MagicMock()
-    func(task_ctx)
-
-    # ActionDispatcher should have received the decoded value
-    mock_ws_client._action_dispatcher.dispatch.assert_called_once()
-    args, kwargs = mock_ws_client._action_dispatcher.dispatch.call_args
-    assert args[0] == "show_status"
-    assert args[1] == "msg_123"
-    assert args[2] == "chat_456"
-    assert args[3] == "proj_1"
-    assert args[4]["action"] == "show_status"
+    handle_deep_command.assert_called_once_with(
+        "msg_123", "chat_456", "/deep something", project
+    )
 
 
 def _card_action_data(*, event_id: str, message_id: str, chat_id: str, operator_id: str):

@@ -24,7 +24,6 @@ _SUBTASK_STATUS_LABELS = {
     "failed": "执行失败",
     "cancelled": "已取消",
     "paused": "已暂停",
-    "awaiting_approval": "等待确认",
     "archived": "已封存",
     "blocked": "已阻塞",
     "denied": "已拒绝",

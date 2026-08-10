@@ -13,16 +13,20 @@ from src.autonomous.context import (
     ContextUnavailableReason,
     ThreadContextConfig,
 )
+from tests.autonomous.helpers import (
+    FakeEmployeeMessageSource as _FakeSource,
+)
+from tests.autonomous.helpers import (
+    make_context_message as _msg,
+)
+from tests.autonomous.helpers import (
+    message_pages as _pages,
+)
 from tests.autonomous.integration.test_employee_context_service import (
     _composition,
     _Delegate,
     _Fence,
     _request,
-)
-from tests.autonomous.unit.test_employee_thread_context import (
-    _FakeSource,
-    _msg,
-    _pages,
 )
 
 

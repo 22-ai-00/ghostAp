@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from enum import Enum, IntEnum
 from typing import Any, Callable, ContextManager, Deque, Optional
@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 class TaskStatus(str, Enum):
-    """任务运行状态（终态：`SUCCEEDED`/`FAILED`/`CANCELED`）。"""
-
     QUEUED = "queued"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -30,8 +28,6 @@ class TaskStatus(str, Enum):
 
 
 class TaskPriority(IntEnum):
-    """任务优先级：数值越小优先级越高。"""
-
     HIGH = 0
     NORMAL = 10
     LOW = 20
@@ -88,18 +84,6 @@ class TaskSpec(BaseModel):
         if self.project_id:
             return f"{self.chat_id}:{self.project_id}"
         return f"{self.chat_id}{DEFAULT_QUEUE_SUFFIX}"
-
-class TaskResult(BaseModel):
-    """任务执行结果（由 `TaskScheduler.wait()` 返回）。"""
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    run_id: str
-    status: TaskStatus
-    value: Any = None
-    error: Optional[str] = None
-    started_at: Optional[float] = None
-    ended_at: Optional[float] = None
-
 
 class TaskEvent(BaseModel):
     """任务状态/进度事件（用于 listeners 与可观测性输出）。"""
@@ -166,7 +150,6 @@ class TaskRunState(BaseModel):
     progress_percent: Optional[float] = None
     error: Optional[str] = None
     cancellation: CancellationToken = Field(default_factory=CancellationToken)
-    future: Optional[Future] = None
 
 
 class TaskContext:
@@ -198,7 +181,7 @@ class _QueuedTask(BaseModel):
 
 
 class TaskHandle:
-    """任务句柄：供调用方取消/等待/查询状态。"""
+    """Non-blocking task identity and cancellation handle."""
 
     def __init__(self, scheduler: "TaskScheduler", run_id: str):
         self._scheduler = scheduler
@@ -208,49 +191,15 @@ class TaskHandle:
         """请求取消任务。"""
         return self._scheduler.cancel(self.run_id)
 
-    def wait(self, timeout: Optional[float] = None) -> TaskResult:
-        """等待任务结束并返回 `TaskResult`。"""
-        return self._scheduler.wait(self.run_id, timeout=timeout)
-
-    def get_state(self) -> TaskRunState:
-        """返回当前 `TaskRunState`（不存在则抛 `KeyError`）。"""
-        state = self._scheduler.get_state(self.run_id)
-        if not state:
-            raise KeyError(f"unknown run_id: {self.run_id}")
-        return state
-
-
 class TaskScheduler:
-    """一个轻量级、线程安全的任务调度器。
+    """Thread-safe scheduler with project serialization and a system fast lane."""
 
-    设计目标（面向服务端长连接 Bot）：
-    - **按队列串行**：同一 `queue_key` 默认串行执行，避免同一项目/会话的并发写冲突。
-    - **全局并发受控**：通过线程池限制整体并发，避免资源打爆。
-    - **系统命令快通道**：系统控制类任务可走 `:SYSTEM` 队列，绕开 per-key 串行限制。
-    - **可观测性**：`TaskRunState` + `TaskEvent` 提供状态/进度/错误的统一视图。
-    - **背压/熔断**：按 `task_type` 维度接入 `RateLimiter` / `CircuitBreaker`。
-
-    关键语义约定：
-    - `submit()` 只负责排队 + 返回 `TaskHandle`，不会阻塞执行。
-    - `cancel(run_id)`：
-      - 若任务仍在队列中，会从队列移除并进入 `CANCELED`。
-      - 若任务正在运行，只会设置 cancellation token，具体中断由任务函数自行检查。
-    - `update_progress()` 只在 RUNNING 阶段生效（避免错误的“进度倒灌”）。
-
-    Queue key routing:
-    - per-key ordered execution (default per_key_concurrency=1)
-    - global concurrency limit (max_concurrent)
-    - task status tracking and progress updates
-    - system command fast-track (bypasses per-key limit)
-
-    Queue key routing:
-    - System commands: {chat_id}:SYSTEM (high concurrency)
-    - Project tasks: {chat_id}:{project_id} (serial within project)
-    - No project: {chat_id}:DEFAULT (serial)
-
-    This allows different projects to execute concurrently while
-    maintaining serial execution within each project.
-    """
+    _TRANSITIONS = {
+        TaskStatus.QUEUED: frozenset({TaskStatus.RUNNING, TaskStatus.FAILED, TaskStatus.CANCELED}),
+        TaskStatus.RUNNING: frozenset({TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED}),
+    }
+    _TERMINAL_STATUSES = frozenset({TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED})
+    _REAP_DEFAULT_MAX_AGE = 300.0
 
     def __init__(
         self,
@@ -280,12 +229,6 @@ class TaskScheduler:
             None,
         )
 
-        # Two executors:
-        # - normal executor: bounded by max_concurrent
-        # - system executor: reserved capacity for system/control-plane tasks
-        #
-        # This avoids system commands being starved when normal workers are busy
-        # with long-running programming tasks.
         self._executor = worker_executor or ThreadPoolExecutor(
             max_workers=max_concurrent,
             thread_name_prefix=thread_name_prefix,
@@ -305,15 +248,11 @@ class TaskScheduler:
         self._states: dict[str, TaskRunState] = {}
         self._listeners: list[Callable[[TaskEvent], None]] = []
 
-        # Rate limiters and circuit breakers by task_type
         self._rate_limiters: dict[str, RateLimiter] = {}
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
-
-        # Lightweight indexes for querying tasks by project/chat.
-        # Keep ordering by insertion time (oldest -> newest).
-        self._by_chat: dict[str, Deque[str]] = defaultdict(deque)  # chat_id -> run_ids
-        self._by_project: dict[str, Deque[str]] = defaultdict(deque)  # project_id -> run_ids
-        self._by_task_id: dict[str, str] = {}  # task_id -> run_id
+        self._by_chat: dict[str, Deque[str]] = defaultdict(deque)
+        self._by_project: dict[str, Deque[str]] = defaultdict(deque)
+        self._by_task_id: dict[str, str] = {}
         self._admission_fenced = False
         self._stopped = False
         self._dispatcher = threading.Thread(
@@ -355,17 +294,34 @@ class TaskScheduler:
             q.append(item)
 
     def _drain_queued_tasks_unlocked(self) -> None:
-        now = time.time()
         for key, q in list(self._queues.items()):
             while q:
                 item = q.popleft()
-                st = self._states.get(item.run_id)
-                if not st or st.status != TaskStatus.QUEUED:
-                    continue
-                st.status = TaskStatus.CANCELED
-                st.ended_at = now
-                self._emit(item.run_id, TaskStatus.CANCELED)
+                self._transition_unlocked(item.run_id, TaskStatus.CANCELED)
             self._queues[key] = deque()
+
+    def _transition_unlocked(
+        self,
+        run_id: str,
+        status: TaskStatus,
+        *,
+        error: str | None = None,
+    ) -> TaskRunState | None:
+        """Apply one legal transition; terminal states fence all late writers."""
+        state = self._states.get(run_id)
+        if state is None or status not in self._TRANSITIONS.get(state.status, ()):
+            return None
+        state.status = status
+        now = time.time()
+        if status is TaskStatus.RUNNING:
+            state.started_at = now
+        elif status in self._TERMINAL_STATUSES:
+            state.ended_at = now
+            state.progress_message = None
+            state.progress_percent = None
+        state.error = error
+        self._emit(state)
+        return state
 
     def submit(self, spec: TaskSpec, fn: Callable[[TaskContext], Any]) -> TaskHandle:
         """提交任务（入队）并返回 `TaskHandle`。
@@ -406,13 +362,12 @@ class TaskScheduler:
                 self._by_project[str(spec.project_id)].append(run_id)
             self._queues[key]
 
-            # Capture current context
             ctx = contextvars.copy_context()
             item = _QueuedTask(run_id=run_id, spec=spec, fn=fn, context=ctx)
 
             self._requeue_item_unlocked(key, item)
 
-            self._emit(run_id, TaskStatus.QUEUED)
+            self._emit(state)
             self._cv.notify_all()
 
         return TaskHandle(self, run_id)
@@ -455,16 +410,10 @@ class TaskScheduler:
             state.spec = new_spec
             state.project_serial_key = new_project_key
 
-            # update indexes
             if old_project:
                 self._remove_from_index_unlocked(self._by_project, str(old_project), run_id)
             self._by_project[str(project_id)].append(run_id)
-
-            # emit updated state to listeners (as RUNNING with progress info if running,
-            # otherwise as current status). This is for observability only.
-            self._emit(
-                run_id, state.status, progress_message=state.progress_message, progress_percent=state.progress_percent
-            )
+            self._emit(state)
             self._cv.notify_all()
             return True
 
@@ -478,16 +427,14 @@ class TaskScheduler:
             state = self._states.get(run_id)
             if not state:
                 return False
-            if state.status in (TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED):
+            if state.status in self._TERMINAL_STATUSES:
                 return False
 
             state.cancellation.cancel()
 
             if state.status == TaskStatus.QUEUED:
                 self._remove_from_queue_unlocked(run_id, state.assigned_queue_key or state.spec.get_effective_queue_key())
-                state.status = TaskStatus.CANCELED
-                state.ended_at = time.time()
-                self._emit(run_id, TaskStatus.CANCELED)
+                self._transition_unlocked(run_id, TaskStatus.CANCELED)
                 self._cv.notify_all()
                 return True
 
@@ -506,7 +453,7 @@ class TaskScheduler:
             if percent is not None:
                 # clamp into [0, 100]
                 state.progress_percent = max(0.0, min(100.0, float(percent)))
-            self._emit(run_id, state.status, progress_message=message, progress_percent=state.progress_percent)
+            self._emit(state)
 
     def get_state(self, run_id: str) -> Optional[TaskRunState]:
         """获取任务运行态（不存在返回 None）。"""
@@ -521,19 +468,11 @@ class TaskScheduler:
         (enforces cross-chat isolation at the API level).
         """
         with self._lock:
-            state: Optional[TaskRunState] = None
-            # Exact match
             run_id = self._by_task_id.get(task_id)
-            if run_id:
-                state = self._states.get(run_id)
-            # Partial suffix match (for short-id queries like "a1b2" or "143025_a1b2")
-            elif len(task_id) >= 4:
-                matches = [
-                    (tid, rid) for tid, rid in self._by_task_id.items() if tid.endswith(task_id) or task_id in tid
-                ]
-                if len(matches) == 1:
-                    state = self._states.get(matches[0][1])
-            # Chat-level isolation check
+            if run_id is None and len(task_id) >= 4:
+                matches = [rid for tid, rid in self._by_task_id.items() if tid.endswith(task_id) or task_id in tid]
+                run_id = matches[0] if len(matches) == 1 else None
+            state = self._states.get(run_id) if run_id else None
             if state and state.spec.chat_id != chat_id:
                 return None
             return state
@@ -555,12 +494,9 @@ class TaskScheduler:
             return []
 
         with self._lock:
-            run_ids: list[str]
-
             if chat_id is not None and project_id is not None:
-                chat_ids = list(self._by_chat.get(chat_id, []))
                 proj_ids = set(self._by_project.get(str(project_id), []))
-                run_ids = [rid for rid in chat_ids if rid in proj_ids]
+                run_ids = [rid for rid in self._by_chat.get(chat_id, ()) if rid in proj_ids]
             elif chat_id is not None:
                 run_ids = list(self._by_chat.get(chat_id, []))
             elif project_id is not None:
@@ -568,55 +504,12 @@ class TaskScheduler:
             else:
                 run_ids = list(self._states.keys())
 
-            # newest first
-            run_ids = run_ids[-limit:][::-1]
-
-            out: list[TaskRunState] = []
-            for rid in run_ids:
-                st = self._states.get(rid)
-                if not st:
-                    continue
-                if not include_done and st.status in (TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED):
-                    continue
-                out.append(st)
-
-            return out
-
-    def wait(self, run_id: str, timeout: Optional[float] = None) -> TaskResult:
-        """等待任务进入终态并返回 `TaskResult`（超时抛 `TimeoutError`）。"""
-        deadline = None if timeout is None else (time.time() + timeout)
-
-        with self._cv:
-            st = self._states.get(run_id)
-            if not st:
-                raise KeyError(f"unknown run_id: {run_id}")
-
-            while st.status not in (TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED):
-                remaining = None if deadline is None else max(0.0, deadline - time.time())
-                if remaining is not None and remaining <= 0:
-                    raise TimeoutError("wait timeout")
-                self._cv.wait(timeout=remaining)
-                st = self._states.get(run_id)
-                if not st:
-                    raise KeyError(f"unknown run_id: {run_id}")
-
-            # terminal
-            value = None
-            if st.future and st.status == TaskStatus.SUCCEEDED:
-                try:
-                    # future should already be done; keep it best-effort
-                    value = st.future.result(timeout=0)
-                except BaseException:
-                    value = None
-
-            return TaskResult(
-                run_id=run_id,
-                status=st.status,
-                value=value,
-                error=st.error,
-                started_at=st.started_at,
-                ended_at=st.ended_at,
-            )
+            states = (self._states.get(rid) for rid in reversed(run_ids))
+            return [
+                state
+                for state in states
+                if state is not None and (include_done or state.status not in self._TERMINAL_STATUSES)
+            ][:limit]
 
     def stop(self, *, wait: bool = False, shutdown_executor: bool = False):
         """停止调度器（best-effort）。
@@ -631,16 +524,11 @@ class TaskScheduler:
         if wait or shutdown_executor:
             self._dispatcher.join(timeout=2)
         if shutdown_executor:
-            try:
-                # Best-effort: cancel queued futures to speed up shutdown.
-                # Running futures cannot be forcibly stopped by ThreadPoolExecutor.
-                self._executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                logger.debug("failed to shutdown executor", exc_info=True)
-            try:
-                self._system_executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                logger.debug("failed to shutdown system executor", exc_info=True)
+            for executor in (self._executor, self._system_executor):
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    logger.debug("failed to shutdown executor", exc_info=True)
 
     def fence_admission(self) -> None:
         """Reject new work and cancel work that has not entered its callback.
@@ -690,51 +578,20 @@ class TaskScheduler:
                 self._cv.wait(timeout=remaining)
             return True
 
-    # ------------------------ internal ------------------------
-
-    _TERMINAL_STATUSES = frozenset({TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED})
-    _REAP_DEFAULT_MAX_AGE = 300.0  # seconds
-
     def _reap_completed_states(self, max_age_seconds: float = _REAP_DEFAULT_MAX_AGE) -> int:
-        """Evict terminal TaskRunState entries older than *max_age_seconds*.
-
-        Must be called while holding ``self._cv`` (or ``self._lock``).
-        Returns the number of evicted entries.
-        """
-        now = time.time()
-        to_remove: list[str] = []
-        for run_id, st in self._states.items():
-            if st.status not in self._TERMINAL_STATUSES:
-                continue
-            ended = st.ended_at or st.created_at
-            if (now - ended) >= max_age_seconds:
-                to_remove.append(run_id)
+        cutoff = time.time() - max_age_seconds
+        to_remove = [
+            run_id
+            for run_id, state in self._states.items()
+            if state.status in self._TERMINAL_STATUSES and (state.ended_at or state.created_at) <= cutoff
+        ]
         for run_id in to_remove:
-            st = self._states.pop(run_id, None)
-            if st:
-                # clean up secondary indexes
-                chat_id = st.spec.chat_id
-                dq = self._by_chat.get(chat_id)
-                if dq:
-                    try:
-                        dq.remove(run_id)
-                    except ValueError:
-                        logger.debug("run_id %s not found in chat deque", run_id, exc_info=True)
-                    if not dq:
-                        self._by_chat.pop(chat_id, None)
-                pid = st.spec.project_id
-                if pid:
-                    pdq = self._by_project.get(pid)
-                    if pdq:
-                        try:
-                            pdq.remove(run_id)
-                        except ValueError:
-                            logger.debug("run_id %s not found in project deque", run_id, exc_info=True)
-                        if not pdq:
-                            self._by_project.pop(pid, None)
-                tid = st.spec.task_id
-                if tid:
-                    self._by_task_id.pop(tid, None)
+            state = self._states.pop(run_id)
+            self._remove_from_index_unlocked(self._by_chat, state.spec.chat_id, run_id)
+            if state.spec.project_id:
+                self._remove_from_index_unlocked(self._by_project, state.spec.project_id, run_id)
+            if state.spec.task_id:
+                self._by_task_id.pop(state.spec.task_id, None)
         return len(to_remove)
 
     def _dispatch_loop(self):
@@ -766,9 +623,7 @@ class TaskScheduler:
                 if state and state.project_serial_key:
                     self._running_by_project[state.project_serial_key] += 1
                 if state:
-                    state.status = TaskStatus.RUNNING
-                    state.started_at = time.time()
-                    self._emit(task.run_id, TaskStatus.RUNNING)
+                    self._transition_unlocked(task.run_id, TaskStatus.RUNNING)
                 self._cv.notify_all()
 
                 try:
@@ -786,14 +641,10 @@ class TaskScheduler:
                             0, self._running_by_project[state.project_serial_key] - 1
                         )
                     if state:
-                        state.status = TaskStatus.FAILED
-                        state.error = get_error_detail(e)
-                        state.ended_at = time.time()
-                        self._emit(task.run_id, TaskStatus.FAILED, error=state.error)
+                        self._transition_unlocked(task.run_id, TaskStatus.FAILED, error=get_error_detail(e))
                     self._cv.notify_all()
                     continue
-                if state:
-                    state.future = fut
+                del fut
 
     def _is_system_queue(self, key: str) -> bool:
         """判断队列 key 是否为系统快通道。"""
@@ -827,11 +678,12 @@ class TaskScheduler:
             while q:
                 item = q[0]
                 st = self._states.get(item.run_id)
-                if st and st.cancellation.is_canceled:
+                if not st or st.status is not TaskStatus.QUEUED:
                     q.popleft()
-                    st.status = TaskStatus.CANCELED
-                    st.ended_at = time.time()
-                    self._emit(item.run_id, TaskStatus.CANCELED)
+                    continue
+                if st.cancellation.is_canceled:
+                    q.popleft()
+                    self._transition_unlocked(item.run_id, TaskStatus.CANCELED)
                     continue
                 if st and st.project_serial_key and self._running_by_project.get(st.project_serial_key, 0) >= 1:
                     # Project-level serialization: keep per-project tasks ordered.
@@ -844,11 +696,6 @@ class TaskScheduler:
             if not q:
                 continue
 
-            head = q[0]
-            head_state = self._states.get(head.run_id)
-            if head_state and head_state.project_serial_key and self._running_by_project.get(head_state.project_serial_key, 0) >= 1:
-                if head_state.spec.task_type not in {"system_help", "system_exit"}:
-                    continue
             return q.popleft()
 
         return None
@@ -887,15 +734,10 @@ class TaskScheduler:
                         self._admission_fenced
                         or state.cancellation.is_canceled
                     )
-                    state.status = (
-                        TaskStatus.CANCELED if canceled else TaskStatus.FAILED
-                    )
-                    state.error = None if canceled else get_error_detail(exc)
-                    state.ended_at = time.time()
-                    self._emit(
+                    self._transition_unlocked(
                         task.run_id,
-                        state.status,
-                        error=state.error,
+                        TaskStatus.CANCELED if canceled else TaskStatus.FAILED,
+                        error=None if canceled else get_error_detail(exc),
                     )
                 self._release_running_slot_unlocked(task)
                 self._cv.notify_all()
@@ -972,9 +814,7 @@ class TaskScheduler:
             with self._cv:
                 st = self._states.get(run_id)
                 if st:
-                    st.status = TaskStatus.SUCCEEDED
-                    st.ended_at = time.time()
-                    self._emit(run_id, TaskStatus.SUCCEEDED)
+                    self._transition_unlocked(run_id, TaskStatus.SUCCEEDED)
                 self._cv.notify_all()
                 return value
 
@@ -982,9 +822,7 @@ class TaskScheduler:
             with self._cv:
                 st = self._states.get(run_id)
                 if st:
-                    st.status = TaskStatus.CANCELED
-                    st.ended_at = time.time()
-                    self._emit(run_id, TaskStatus.CANCELED)
+                    self._transition_unlocked(run_id, TaskStatus.CANCELED)
                 self._cv.notify_all()
             return None
 
@@ -992,10 +830,7 @@ class TaskScheduler:
             with self._cv:
                 st = self._states.get(run_id)
                 if st:
-                    st.status = TaskStatus.FAILED
-                    st.error = get_error_detail(e)
-                    st.ended_at = time.time()
-                    self._emit(run_id, TaskStatus.FAILED, error=st.error)
+                    self._transition_unlocked(run_id, TaskStatus.FAILED, error=get_error_detail(e))
                 self._cv.notify_all()
             raise
 
@@ -1004,23 +839,12 @@ class TaskScheduler:
                 self._release_running_slot_unlocked(task)
                 self._cv.notify_all()
 
-    def _emit(
-        self,
-        run_id: str,
-        status: TaskStatus,
-        *,
-        progress_message: Optional[str] = None,
-        progress_percent: Optional[float] = None,
-        error: Optional[str] = None,
-    ):
+    def _emit(self, st: TaskRunState):
         """向所有监听器广播一次任务事件（best-effort）。"""
-        st = self._states.get(run_id)
-        if not st:
-            return
         ev = TaskEvent(
-            run_id=run_id,
+            run_id=st.run_id,
             chat_id=st.spec.chat_id,
-            status=status,
+            status=st.status,
             timestamp=time.time(),
             name=st.spec.name,
             task_type=st.spec.task_type,
@@ -1029,9 +853,9 @@ class TaskScheduler:
             origin_message_id=st.spec.origin_message_id,
             request_id=st.spec.request_id,
             task_id=st.spec.task_id,
-            progress_message=progress_message,
-            progress_percent=progress_percent,
-            error=error,
+            progress_message=st.progress_message,
+            progress_percent=st.progress_percent,
+            error=st.error,
         )
         for listener in list(self._listeners):
             try:
@@ -1059,9 +883,9 @@ class TaskScheduler:
         self._pop_queued_item_unlocked(run_id, key)
 
     def _remove_from_index_unlocked(self, index: dict[str, Deque[str]], key: str, run_id: str):
-        """从索引（by_chat/by_project）中移除 run_id（调用方需持锁）。"""
         q = index.get(key)
         if not q:
             return
-        # rebuild to remove run_id
         index[key] = deque(rid for rid in q if rid != run_id)
+        if not index[key]:
+            index.pop(key, None)

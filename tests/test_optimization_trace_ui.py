@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import unittest
 from unittest.mock import MagicMock
 
@@ -35,23 +36,25 @@ class TestOptimizationTraceUI(unittest.TestCase):
         req_id = "sched-req-456"
 
         result_container = {}
+        completed = threading.Event()
 
         def task_fn(ctx: TaskContext):
             result_container["req_id"] = get_trace_id()
+            completed.set()
             return "done"
 
         with TraceContext(req_id):
             # submit inside context
             spec = TaskSpec(chat_id="chat1", name="test_task")
-            handle = scheduler.submit(spec, task_fn)
+            scheduler.submit(spec, task_fn)
 
-        handle.wait()
+        self.assertTrue(completed.wait(timeout=1))
 
         self.assertEqual(result_container.get("req_id"), req_id)
         scheduler.stop(shutdown_executor=True)
 
     def test_pagination_logic(self):
-        """Test project board pagination logic in CardBuilder."""
+        """Test project board pagination logic in ProjectBuilder."""
         # Mock 12 projects
         projects = []
         for i in range(12):

@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from src.card.delivery.lock_pool import PoolStats, SessionLockPool
+from src.card.delivery.lock_pool import SessionLockPool
 
 
 @pytest.fixture
@@ -23,27 +23,26 @@ class TestAcquire:
         # Verify it's an RLock by checking it's acquirable
         assert lock.acquire(blocking=False)
         lock.release()
-        assert pool.count == 1
+        assert pool.get_existing("s1") is lock
 
     def test_acquire_same_session_returns_same(self, pool: SessionLockPool):
         lock1 = pool.acquire("s1")
         lock2 = pool.acquire("s1")
         assert lock1 is lock2
-        assert pool.count == 1
 
     def test_acquire_different_sessions(self, pool: SessionLockPool):
         pool.acquire("s1")
         pool.acquire("s2")
-        assert pool.count == 2
+        assert pool.get_existing("s1") is not None
+        assert pool.get_existing("s2") is not None
 
     def test_acquire_at_capacity_evicts_oldest(self, pool: SessionLockPool):
         for i in range(5):
             pool.acquire(f"s{i}")
-        assert pool.count == 5
         # Acquiring a 6th should evict the oldest
         pool.acquire("s5")
-        assert pool.count == 5
-        assert not pool.contains("s0")  # oldest evicted
+        assert pool.get_existing("s0") is None  # oldest evicted
+        assert pool.get_existing("s5") is not None
 
     def test_acquire_at_capacity_with_active_binding_skips(self, pool: SessionLockPool):
         for i in range(5):
@@ -51,70 +50,20 @@ class TestAcquire:
         # Mark s0 as having active binding
         pool._has_active_binding = lambda sid: sid == "s0"
         pool.acquire("s5")
-        assert pool.count == 5
         # s0 should NOT be evicted (active binding), s1 evicted instead
-        assert pool.contains("s0")
-        assert not pool.contains("s1")
+        assert pool.get_existing("s0") is not None
+        assert pool.get_existing("s1") is None
 
 
 class TestRelease:
     def test_release_removes_lock(self, pool: SessionLockPool):
         pool.acquire("s1")
         pool.release("s1")
-        assert pool.count == 0
-        assert not pool.contains("s1")
+        assert pool.get_existing("s1") is None
 
     def test_release_nonexistent_is_noop(self, pool: SessionLockPool):
         pool.release("nonexistent")  # Should not raise
-        assert pool.count == 0
-
-
-class TestSessionLockContextManager:
-    def test_session_lock_acquires_and_releases(self, pool: SessionLockPool):
-        acquired_inside = []
-
-        def try_acquire_from_another_thread(rlock):
-            """Try non-blocking acquire from a different thread to test exclusion."""
-            result = rlock.acquire(blocking=False)
-            acquired_inside.append(result)
-            if result:
-                rlock.release()
-
-        with pool.session_lock("s1") as rlock:
-            # From a different thread, the lock should NOT be acquirable
-            t = threading.Thread(target=try_acquire_from_another_thread, args=(rlock,))
-            t.start()
-            t.join()
-            assert acquired_inside == [False]
-
-        # After context exit, another thread should be able to acquire
-        acquired_outside = []
-        def try_after():
-            r = rlock.acquire(blocking=False)
-            acquired_outside.append(r)
-            if r:
-                rlock.release()
-        t2 = threading.Thread(target=try_after)
-        t2.start()
-        t2.join()
-        assert acquired_outside == [True]
-
-    def test_session_lock_releases_on_exception(self, pool: SessionLockPool):
-        with pytest.raises(ValueError):
-            with pool.session_lock("s1"):
-                raise ValueError("test")
-        # Lock should be released despite exception — verify from another thread
-        rlock = pool.acquire("s1")
-        acquired = []
-        def try_lock():
-            r = rlock.acquire(blocking=False)
-            acquired.append(r)
-            if r:
-                rlock.release()
-        t = threading.Thread(target=try_lock)
-        t.start()
-        t.join()
-        assert acquired == [True]
+        assert pool.get_existing("nonexistent") is None
 
 
 class TestFence:
@@ -180,45 +129,6 @@ class TestShutdown:
     def test_shutdown_idempotent(self, pool: SessionLockPool):
         pool.shutdown()
         pool.shutdown()  # Should not raise
-
-
-class TestStats:
-    def test_stats_initial(self, pool: SessionLockPool):
-        s = pool.stats()
-        assert isinstance(s, PoolStats)
-        assert s.lock_count == 0
-        assert s.in_flight == 0
-        assert s.accepting_work is True
-        assert s.eviction_alive is True
-
-    def test_stats_reflects_locks(self, pool: SessionLockPool):
-        pool.acquire("s1")
-        pool.acquire("s2")
-        s = pool.stats()
-        assert s.lock_count == 2
-
-    def test_stats_reflects_in_flight(self, pool: SessionLockPool):
-        pool.enter_delivery()
-        s = pool.stats()
-        assert s.in_flight == 1
-        pool.exit_delivery()
-        s2 = pool.stats()
-        assert s2.in_flight == 0
-
-    def test_stats_reflects_fence(self, pool: SessionLockPool):
-        pool.fence()
-        s = pool.stats()
-        assert s.accepting_work is False
-
-    def test_stats_reflects_shutdown(self, pool: SessionLockPool):
-        pool.shutdown()
-        s = pool.stats()
-        assert s.eviction_alive is False
-
-    def test_stats_is_frozen(self, pool: SessionLockPool):
-        s = pool.stats()
-        with pytest.raises(AttributeError):
-            s.lock_count = 99  # type: ignore[misc]
 
 
 class TestGetExisting:
@@ -298,8 +208,8 @@ class TestHasActiveBindingCallback:
             pool.acquire("s1")
             # Both return falsy → oldest can be evicted
             pool.acquire("s2")
-            assert pool.count == 2
-            assert not pool.contains("s0")  # oldest evicted
+            assert pool.get_existing("s0") is None  # oldest evicted
+            assert pool.get_existing("s2") is not None
         finally:
             pool.shutdown()
 
@@ -347,102 +257,6 @@ class TestHasActiveBindingCallback:
             assert call_count["n"] > 0
         finally:
             pool.shutdown()
-
-
-class TestPoolStatsIntegration:
-    """Integration test: verify stats through CardDelivery lifecycle."""
-
-    def _make_delivery(self):
-        from src.card.delivery.engine import CardDelivery
-
-        class MinimalClient:
-            def __init__(self):
-                self._n = 0
-
-            def create_card(self, chat_id, card_json, *, reply_to=None, reply_in_thread=None, idempotency_key=None):
-                self._n += 1
-                return (f"msg_{self._n}", f"card_{self._n}")
-
-            def update_card(self, card_id, card_json, *, sequence=0):
-                pass
-
-            def update_element(self, card_id, element_id, content, *, sequence=0):
-                pass
-
-            def create_streaming_card(self, card_json):
-                self._n += 1
-                return f"card_{self._n}"
-
-            def send_card_reference(self, chat_id, card_id, *, reply_to=None, reply_in_thread=None, idempotency_key=None):
-                self._n += 1
-                return f"msg_{self._n}"
-
-        return CardDelivery(MinimalClient(), max_session_locks=100, session_lock_ttl=600.0)
-
-    def test_initial_stats(self):
-        delivery = self._make_delivery()
-        try:
-            s = delivery._lock_pool.stats()
-            assert s.lock_count == 0
-            assert s.in_flight == 0
-            assert s.accepting_work is True
-        finally:
-            delivery._shutdown()
-
-    def test_deliver_increases_lock_count(self):
-        from src.card.types import RenderedCard
-
-        delivery = self._make_delivery()
-        try:
-            rendered = [RenderedCard(_card_json={}, structure_signature="sig", page_index=0)]
-            delivery.deliver("s1", "chat", rendered)
-            s = delivery._lock_pool.stats()
-            assert s.lock_count == 1
-        finally:
-            delivery._shutdown()
-
-    def test_close_preserves_lock_count(self):
-        """close() removes the lock entry, reducing lock_count."""
-        from src.card.types import RenderedCard
-
-        delivery = self._make_delivery()
-        try:
-            rendered = [RenderedCard(_card_json={}, structure_signature="sig", page_index=0)]
-            delivery.deliver("s1", "chat", rendered)
-            delivery.close("s1")
-            s = delivery._lock_pool.stats()
-            assert s.lock_count == 0
-        finally:
-            delivery._shutdown()
-
-    def test_fence_sets_accepting_work_false(self):
-        delivery = self._make_delivery()
-        try:
-            delivery._lock_pool.fence()
-            s = delivery._lock_pool.stats()
-            assert s.accepting_work is False
-        finally:
-            delivery._shutdown()
-
-    def test_shutdown_marks_eviction_dead(self):
-        delivery = self._make_delivery()
-        delivery._shutdown()
-        s = delivery._lock_pool.stats()
-        assert s.eviction_alive is False
-
-    def test_in_flight_during_delivery(self):
-        """in_flight increments during deliver and decrements after."""
-        from src.card.types import RenderedCard
-
-        delivery = self._make_delivery()
-        try:
-            # After deliver completes, in_flight should be back to 0
-            rendered = [RenderedCard(_card_json={}, structure_signature="sig", page_index=0)]
-            delivery.deliver("s1", "chat", rendered)
-            s = delivery._lock_pool.stats()
-            assert s.in_flight == 0  # delivery completed
-        finally:
-            delivery._shutdown()
 
 
 # ---------------------------------------------------------------------------

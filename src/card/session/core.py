@@ -17,14 +17,19 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from src.card.delivery.tracker import PendingAction
+from src.card.actions.router import ActionRouter
+from src.card.delivery.tracker import DeliveryTracker, PendingAction
+from src.card.dispatch_coordinator import DispatchDeliveryCoordinator
 from src.card.events import VALIDATE_PAYLOAD, CardEvent, CardEventType
+from src.card.hooks import HookFirer
 from src.card.render.fallback import render_fallback_card
 from src.card.render.renderer import render_card
 from src.card.session._constants import ENGINE_CMD_MAP, ENGINE_NAME_MAP
 from src.card.session.config import SessionCallbacks
+from src.card.session.ttl import TTLHandler
 from src.card.session.ttl_activity import has_active_card_work
 from src.card.state.reducer import reduce_card_state
+from src.card.timers.manager import SessionTimerManager
 from src.card.ui_text import UI_TEXT
 
 if TYPE_CHECKING:
@@ -169,11 +174,48 @@ class CardSession:
         self._delivery_in_flight_terminal = False
         self._delivery_pending: tuple[list, bool, CardEvent, int | None] | None = None
         self._delivery_highest_revision = -1
-
         self._first_deliver_fired: bool = False
+        self._state: CardState | None = None
+        self._ttl_warned = False
+        self._terminal_reason: str | None = None
+        self._last_dispatch_time = self._clock()
+        self._ttl_seconds = config.ttl_seconds if config.ttl_seconds is not None else 1800.0
 
-        # --- Delegate collaborator construction to SessionBuilder ---
-        self._build_and_assign(config, cbs)
+        self._action_router = ActionRouter(
+            session_id=self._session_id,
+            engine_type=self._metadata.engine_type or "",
+            action_registry=self._action_registry,
+        )
+        self._tracker = DeliveryTracker()
+        self._hook_firer = HookFirer(self._hooks, self._session_id)
+        self._timers = SessionTimerManager(
+            session_id=self._session_id,
+            ttl_seconds=self._ttl_seconds,
+            clock=self._clock,
+            retry_delay=config.retry_delay,
+            warn_before_seconds=(
+                config.warn_before_seconds
+                if config.warn_before_seconds is not None
+                else 420.0
+            ),
+        )
+        self._ttl_handler = TTLHandler(self)
+        self._coordinator = DispatchDeliveryCoordinator(
+            session_id=self._session_id,
+            chat_id=self._chat_id,
+            delivery=self._delivery,
+            tracker=self._tracker,
+            hook_firer=self._hook_firer,
+            ttl_handler=self._ttl_handler,
+            notify_callback=self._notify_callback,
+            cancel_callback=self._cancel_callback,
+            reply_text_fn=self._reply_text_fn,
+            reply_to=self._reply_to,
+        )
+        self._finalizer = weakref.finalize(
+            self, _release_lock, weakref.ref(self._delivery), self._session_id
+        )
+        self._reset_ttl_timer()
 
     # ------------------------------------------------------------------
     # Private helpers split from __init__ for readability
@@ -214,52 +256,6 @@ class CardSession:
                 session_id or "(pending)",
             )
 
-    def _build_and_assign(self, config: "SessionConfig", cbs: SessionCallbacks) -> None:
-        """Use SessionBuilder to construct collaborators and assign to self."""
-        from src.card.session.builder import SessionBuilder
-
-        ttl_seconds = config.ttl_seconds if config.ttl_seconds is not None else 1800.0
-        warn_before = config.warn_before_seconds if config.warn_before_seconds is not None else 420.0
-
-        collab = SessionBuilder(
-            session_id=self._session_id,
-            chat_id=self._chat_id,
-            metadata=self._metadata,
-            delivery=self._delivery,
-            budget=self._budget,
-            reply_to=self._reply_to,
-            lock=self._lock,
-            closed=self._closed,
-            clock=self._clock,
-            callbacks=cbs,
-            ttl_seconds=ttl_seconds,
-            warn_before_seconds=warn_before,
-            retry_delay=config.retry_delay,
-            deliver_and_track_fn=self._deliver_and_track,
-            engine_cmd_fn=lambda _ref=weakref.ref(self): (_ref().engine_cmd if _ref() else ""),
-            engine_name_fn=lambda _ref=weakref.ref(self): (_ref().engine_name if _ref() else ""),
-        ).build()
-
-        # Assign collaborators
-        self._action_router = collab.action_router
-        self._tracker = collab.tracker
-        self._hook_firer = collab.hook_firer
-        self._timers = collab.timers
-        self._ttl_ctx = collab.ttl_ctx
-        self._ttl_actuator = collab.ttl_actuator
-        self._ttl_handler = collab.ttl_handler
-        self._coordinator = collab.coordinator
-
-        # TTLHandler needs the session as decider (circular ref resolved here)
-        self._ttl_handler._d = self  # type: ignore[attr-defined]
-
-        # GC safety: weakref.finalize for delivery lock cleanup
-        self._finalizer = weakref.finalize(
-            self, _release_lock, weakref.ref(self._delivery), self._session_id
-        )
-        # Start the idle TTL timer
-        self._reset_ttl_timer()
-
     @property
     def session_id(self) -> str:
         return self._session_id
@@ -288,16 +284,11 @@ class CardSession:
     def state(self) -> CardState | None:
         """Read-only access to current card state."""
         with self._lock:
-            return self._ttl_ctx.mutable.state
+            return self._state
 
     @property
     def closed(self) -> bool:
         return self._closed.is_set()
-
-    # TTLDecider protocol (get_ttl_state delegated to actuator)
-    def get_ttl_state(self):
-        """Return a consistent snapshot of TTL-relevant session state."""
-        return self._ttl_actuator.get_ttl_state()
 
     @property
     def engine_cmd(self) -> str:
@@ -319,41 +310,6 @@ class CardSession:
         if binding and 0 in binding.pages:
             return binding.pages[0].message_id
         return ""
-
-    # Alias for backward compatibility — internal state access now goes through _ttl_ctx.mutable
-    @property
-    def _state(self) -> CardState | None:
-        return self._ttl_ctx.mutable.state
-
-    @_state.setter
-    def _state(self, value: CardState | None) -> None:
-        self._ttl_ctx.mutable.state = value
-
-    @property
-    def _ttl_warned(self) -> bool:
-        return self._ttl_ctx.mutable.ttl_warned
-
-    @_ttl_warned.setter
-    def _ttl_warned(self, value: bool) -> None:
-        self._ttl_ctx.mutable.ttl_warned = value
-
-    @property
-    def _terminal_reason(self) -> str | None:
-        return self._ttl_ctx.mutable.terminal_reason
-
-    @_terminal_reason.setter
-    def _terminal_reason(self, value: str | None) -> None:
-        self._ttl_ctx.mutable.terminal_reason = value
-
-    @property
-    def _last_dispatch_time(self) -> float:
-        return self._ttl_ctx.mutable.last_dispatch_time
-
-    @_last_dispatch_time.setter
-    def _last_dispatch_time(self, value: float) -> None:
-        self._ttl_ctx.mutable.last_dispatch_time = value
-
-    # ------------------------------------------------------------------
 
     def _reset_ttl_timer(self) -> None:
         """Cancel existing TTL timer and schedule a new one (idle-timeout)."""
@@ -394,14 +350,6 @@ class CardSession:
             self.dispatch(CardEvent.stop_escalated())
         except Exception:
             logger.debug("CardSession %s: stop escalation dispatch failed (session may be closed)", self._session_id)
-
-    @property
-    def _ttl_seconds(self) -> float:
-        return self._ttl_ctx.mutable.ttl_seconds
-
-    @_ttl_seconds.setter
-    def _ttl_seconds(self, value: float) -> None:
-        self._ttl_ctx.mutable.ttl_seconds = value
 
     def dispatch(self, event: CardEvent) -> None:
         """Dispatch event through reduce → render → deliver pipeline (thread-safe)."""
@@ -571,7 +519,6 @@ class CardSession:
         closed_event = getattr(self, "_closed", None)
         if closed_event is not None and closed_event.is_set():
             return
-        CardSession._ensure_delivery_coalescing_state(self)
         if self._sync_delivery:
             with self._delivery_gate:
                 if not self._accept_delivery_revision(revision):
@@ -606,18 +553,6 @@ class CardSession:
             return False
         self._delivery_highest_revision = revision
         return True
-
-    def _ensure_delivery_coalescing_state(self) -> None:
-        if not hasattr(self, "_delivery_gate"):
-            self._delivery_gate = threading.Condition(threading.Lock())  # leaf lock: never held while acquiring a LockLevel lock
-        if not hasattr(self, "_delivery_in_flight"):
-            self._delivery_in_flight = False
-        if not hasattr(self, "_delivery_in_flight_terminal"):
-            self._delivery_in_flight_terminal = False
-        if not hasattr(self, "_delivery_pending"):
-            self._delivery_pending = None
-        if not hasattr(self, "_delivery_highest_revision"):
-            self._delivery_highest_revision = -1
 
     def _submit_delivery_job(self, rendered: list, is_terminal: bool, event: CardEvent) -> None:
         from src.card.delivery.pool import get_delivery_pool

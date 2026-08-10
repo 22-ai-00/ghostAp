@@ -338,6 +338,23 @@ class ProjectManager:
             project.restore_acp_programming_activation(previous)
             return False
 
+    def commit_acp_configuration(
+        self,
+        project: ProjectContext,
+        *,
+        tool_name: str,
+        model_name: Optional[str],
+    ) -> bool:
+        """Persist one explicit tool/model setting with rollback on failure."""
+        with self._lock:
+            if self._projects.get(project.project_id) is not project:
+                return False
+            previous = project.replace_acp_configuration(tool_name, model_name)
+            if self._save_projects():
+                return True
+            project.replace_acp_configuration(*previous)
+            return False
+
     @staticmethod
     def _is_visible(ctx: ProjectContext, chat_id: Optional[str]) -> bool:
         """Check if a project is visible to the given chat_id.
@@ -560,24 +577,6 @@ class ProjectManager:
                 return False, f"项目 {ctx.project_name} 关闭持久化失败"
             return True, f"项目 {ctx.project_name} 已关闭"
 
-    def update_working_dir(self, project_id: str, new_dir: str) -> tuple[bool, str]:
-        with self._lock:
-            ctx = self._projects.get(project_id)
-            if not ctx:
-                return False, f"项目 {project_id} 不存在"
-
-            expanded = os.path.expanduser(new_dir)
-            if not os.path.isabs(expanded):
-                expanded = os.path.normpath(os.path.join(ctx.working_dir, expanded))
-
-            if not os.path.isdir(expanded):
-                return False, f"目录不存在: {expanded}"
-
-            ctx.working_dir = expanded
-            ctx.touch()
-            self._save_projects()
-            return True, expanded
-
     def find_project_by_name(self, name: str, chat_id: Optional[str] = None) -> Optional[ProjectContext]:
         name_lower = name.lower()
         with self._lock:
@@ -653,24 +652,6 @@ class ProjectManager:
         self._save_projects()
         self._rebuild_bound_chat_index()
         return False
-
-    def bind_managed_chat(
-        self,
-        project_id: str,
-        chat_id: str,
-        *,
-        chat_name: str = "",
-        created_at: float,
-    ) -> bool:
-        """Persist a validated Owner-control group binding."""
-
-        bound, _ = self.bind_managed_chat_for_saga(
-            project_id,
-            chat_id,
-            chat_name=chat_name,
-            created_at=created_at,
-        )
-        return bound
 
     def bind_managed_chat_for_saga(
         self,
@@ -925,10 +906,6 @@ class ProjectManager:
                 if displaced_was_quarantined:
                     self._quarantined_bound_chat_ids.add(displaced.chat_id)
             return False
-
-    def managed_chat_binding_saga(self, operation_id: str) -> ManagedChatBindingSaga | None:
-        with self._lock:
-            return self._managed_chat_binding_sagas.get(operation_id)
 
     def pending_managed_chat_binding_sagas_for_project(
         self,

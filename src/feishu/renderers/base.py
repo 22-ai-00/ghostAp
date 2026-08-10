@@ -417,7 +417,7 @@ class BaseRenderer:
     ) -> str:
         """Check if card content exceeds size limit and truncate if necessary.
 
-        Delegates to src.card.render.payload_truncator.
+        Delegates to src.card.shared.truncation.
         """
         return _check_and_truncate(card_content, max_size, engine_type=engine_type)
 

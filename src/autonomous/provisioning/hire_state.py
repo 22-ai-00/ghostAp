@@ -510,8 +510,12 @@ class HireProjection:
                     consumed_at = event.payload["consumed_at"]
                     if (
                         event.aggregate_id != current.intent_id
-                        or current.phase is not HirePhase.READY_PENDING_VERIFICATION
-                        or current.verification_consumed
+                        or current.phase
+                        not in {
+                            HirePhase.CONFIGURING,
+                            HirePhase.VALIDATING,
+                            HirePhase.READY_PENDING_VERIFICATION,
+                        }
                         or _required_string(event.payload, "nonce")
                         != current.verification_nonce
                         or isinstance(consumed_at, bool)

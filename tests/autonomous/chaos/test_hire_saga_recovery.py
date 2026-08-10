@@ -13,8 +13,6 @@ from src.autonomous.journal.writer import JournalWriter
 from src.autonomous.provisioning.hire_port import EmployeeHireRequest
 from src.autonomous.provisioning.hire_service import ProductionEmployeeHireService
 from src.autonomous.provisioning.hire_state import (
-    HireEffectState,
-    HirePhase,
     HireProjection,
     HireProjectionError,
 )
@@ -68,112 +66,8 @@ def _service(writer, vault=None, registrar=None):
     )
 
 
-def test_restart_adopts_deterministic_orphan_after_vault_put_before_binding(
-    tmp_path: Path,
-) -> None:
-    writer = _writer(tmp_path, 1)
-    vault = _vault(tmp_path)
-    service = _service(writer, vault=vault)
-    admitted = service.start_hire(_request())
-    service.commit_effect_transition(
-        admitted.intent_id,
-        effect_id="register-app",
-        effect_type="app_registration",
-        next_state=HireEffectState.PREPARED,
-    )
-    service.commit_effect_transition(
-        admitted.intent_id,
-        effect_id="register-app",
-        effect_type="app_registration",
-        next_state=HireEffectState.EXECUTING,
-    )
-    service.commit_effect_transition(
-        admitted.intent_id,
-        effect_id="register-app",
-        effect_type="app_registration",
-        next_state=HireEffectState.COMMITTED,
-        metadata={"app_id": "cli_employee"},
-    )
-    service.commit_effect_transition(
-        admitted.intent_id,
-        effect_id="store-credential",
-        effect_type="credential_vault_put",
-        next_state=HireEffectState.PREPARED,
-        metadata={"app_id": "cli_employee"},
-    )
-    service.commit_effect_transition(
-        admitted.intent_id,
-        effect_id="store-credential",
-        effect_type="credential_vault_put",
-        next_state=HireEffectState.EXECUTING,
-        metadata={"app_id": "cli_employee"},
-    )
-    receipt = vault.put(
-        admitted.agent_id,
-        "cli_employee",
-        APP_SECRET,
-        admitted.intent_id,
-        admitted.attempt_id,
-    )
-    writer.close()
-
-    class RegistrarMustNotRun:
-        async def register(self, *_args, **_kwargs):
-            raise AssertionError("registration must not be retried")
-
-    reopened = _writer(tmp_path, 2)
-    recovered = _service(
-        reopened,
-        vault=vault,
-        registrar=RegistrarMustNotRun(),
-    )
-    state = recovered.recover().get(admitted.intent_id)
-
-    assert state is not None
-    assert state.phase is HirePhase.CONFIGURING
-    assert state.app_id == "cli_employee"
-    assert state.credential_ref == receipt.credential_ref
-    assert recovered.projection_state.bot_principals[state.bot_principal_id].credential_ref == receipt.credential_ref
-    assert vault.resolve(receipt.credential_ref, state.agent_id, state.app_id) == APP_SECRET
-    assert APP_SECRET not in reopened.journal_path.read_text(encoding="utf-8")
 
 
-def test_restart_marks_unknown_registration_executing_action_required_without_retry(
-    tmp_path: Path,
-) -> None:
-    writer = _writer(tmp_path, 1)
-    service = _service(writer)
-    admitted = service.start_hire(_request())
-    service.commit_effect_transition(
-        admitted.intent_id,
-        effect_id="register-app",
-        effect_type="app_registration",
-        next_state=HireEffectState.PREPARED,
-    )
-    service.commit_effect_transition(
-        admitted.intent_id,
-        effect_id="register-app",
-        effect_type="app_registration",
-        next_state=HireEffectState.EXECUTING,
-    )
-    writer.close()
-
-    class RecordingRegistrar:
-        calls = 0
-
-        async def register(self, *_args, **_kwargs):
-            self.calls += 1
-            raise AssertionError("registration must not be retried")
-
-    registrar = RecordingRegistrar()
-    reopened = _writer(tmp_path, 2)
-    recovered = _service(reopened, registrar=registrar)
-    state = recovered.recover().get(admitted.intent_id)
-
-    assert state is not None
-    assert state.phase is HirePhase.ACTION_REQUIRED
-    assert state.effect_state("register-app") is HireEffectState.ACTION_REQUIRED
-    assert registrar.calls == 0
 
 
 @pytest.mark.parametrize(

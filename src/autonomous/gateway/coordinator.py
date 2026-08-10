@@ -7,7 +7,7 @@ import json
 import logging
 import threading
 from collections.abc import Callable, Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -164,9 +164,7 @@ class EmployeeDispatchCoordinator:
         attempt_lifecycle: EmployeeAttemptLifecycle | None = None,
         admin_principal_ids: frozenset[str] = frozenset(),
         team_owner_resolver: Callable[[str], str] | None = None,
-        employee_runtime_mode: str,
         employee_session_idle_ttl_seconds: float = 900.0,
-        shadow_observer: Callable[[Mapping[str, object]], None] | None = None,
     ) -> None:
         if not callable(environment_provider):
             raise TypeError("environment_provider is required")
@@ -186,13 +184,11 @@ class EmployeeDispatchCoordinator:
                 writer=writer,
                 idle_ttl_seconds=employee_session_idle_ttl_seconds,
             )
-            if gateway is None and employee_runtime_mode == "actor"
+            if gateway is None
             else None
         )
         self._gateway = gateway or EmployeeTeamGateway(
-            runtime_mode=employee_runtime_mode,
             runtime_supervisor=self._employee_runtime,
-            shadow_observer=shadow_observer,
         )
         self._timeout_seconds = float(timeout_seconds)
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -401,14 +397,9 @@ class EmployeeDispatchCoordinator:
             activation_context = self._team_runtime.employee_activation_guard(
                 chat_id=grant.request.chat_id,
             )
-            with activation_context as team_binding, ExitStack() as stack:
-                stack.enter_context(self._projection_sync_lock)
-                stack.enter_context(self._hire.employee_dispatch_guard())
-                stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
-                stack.enter_context(self._data.employee_dispatch_guard())
-                stack.enter_context(self._channels.employee_dispatch_guard())
-                stack.enter_context(self._writer.transaction_guard())
-                self._require_presynchronized_head(captured_head)
+            with activation_context as team_binding, self._dispatch_commit_guard(
+                captured_head
+            ):
                 current_registry = self._registry_factory(self._hire.projection_state)
                 current = current_registry.get(
                     grant.request.tenant_key,
@@ -541,9 +532,8 @@ class EmployeeDispatchCoordinator:
             return False
         if not isinstance(step_id, str) or not step_id:
             return False
-        # Coordinator mode anchors the full assignment identity.  The retained
-        # Team ``legacy_pipeline`` writes the same effect under run/step.  Both
-        # are Team-owned Journal facts; newest matching evidence wins.
+        # The second coordinate is replay-only compatibility for historical
+        # journals. No active path writes the retired event shape.
         effect_coordinates = {
             (f"{run_id}:assignment:{step_id}", "team.v2.effect."),
             (f"{run_id}:{step_id}", "team.effect."),
@@ -596,6 +586,20 @@ class EmployeeDispatchCoordinator:
         )
         if current != expected or any(head != expected for head in projection_heads):
             raise _ProjectionHeadChanged
+
+    @contextmanager
+    def _dispatch_commit_guard(self, captured_head: tuple[int, str]):
+        """Acquire the shared dispatch transaction boundary in canonical order."""
+
+        with ExitStack() as stack:
+            stack.enter_context(self._projection_sync_lock)
+            stack.enter_context(self._hire.employee_dispatch_guard())
+            stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
+            stack.enter_context(self._data.employee_dispatch_guard())
+            stack.enter_context(self._channels.employee_dispatch_guard())
+            stack.enter_context(self._writer.transaction_guard())
+            self._require_presynchronized_head(captured_head)
+            yield
 
     def execute_prepared(
         self,
@@ -734,9 +738,10 @@ class EmployeeDispatchCoordinator:
             if not matching:
                 return EmployeeCancellationOutcome("no_active")
             live = tuple(record for record in matching if not record.terminal_status)
-            target = live[0] if len(live) == 1 else max(
-                matching,
-                key=lambda item: item.dispatch_sequence,
+            target = (
+                live[0]
+                if len(live) == 1
+                else max(matching, key=lambda item: item.dispatch_sequence)
             )
             try:
                 team_owner = self._team_owner_resolver(chat_id)
@@ -747,75 +752,18 @@ class EmployeeDispatchCoordinator:
                 *self._admin_principal_ids,
                 team_owner,
             }:
-                return EmployeeCancellationOutcome(
-                    "forbidden",
-                    target.binding.attempt_id,
-                )
+                return EmployeeCancellationOutcome("forbidden", target.binding.attempt_id)
             if not live:
                 return EmployeeCancellationOutcome(
-                    "already_terminal",
-                    target.binding.attempt_id,
+                    "already_terminal", target.binding.attempt_id
                 )
             if len(live) != 1:
                 return EmployeeCancellationOutcome("ambiguous")
-            target = live[0]
-            if target.cancel_requested:
-                return EmployeeCancellationOutcome(
-                    "cancel_requested",
-                    target.binding.attempt_id,
-                    False,
-                )
-            requested_at = self._timestamp()
-            for _attempt in range(3):
-                captured_head = self._presynchronize_domains()
-                try:
-                    with team_runtime_guard(), ExitStack() as stack:
-                        stack.enter_context(self._projection_sync_lock)
-                        stack.enter_context(self._hire.employee_dispatch_guard())
-                        stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
-                        stack.enter_context(self._data.employee_dispatch_guard())
-                        stack.enter_context(self._channels.employee_dispatch_guard())
-                        stack.enter_context(self._writer.transaction_guard())
-                        self._require_presynchronized_head(captured_head)
-                        current = self._gateway_state.attempts.get(
-                            target.binding.attempt_id
-                        )
-                        if current is None:
-                            return EmployeeCancellationOutcome("no_active")
-                        if current.terminal_status:
-                            return EmployeeCancellationOutcome(
-                                "already_terminal",
-                                current.binding.attempt_id,
-                            )
-                        if current.cancel_requested:
-                            return EmployeeCancellationOutcome(
-                                "cancel_requested",
-                                current.binding.attempt_id,
-                                False,
-                            )
-                        event = JournalEvent(
-                            event_type=ATTEMPT_CANCEL_REQUESTED,
-                            aggregate_id=current.binding.attempt_id,
-                            payload={
-                                "attempt_id": current.binding.attempt_id,
-                                "cancel_epoch": 1,
-                                "requester_principal_id": requester_principal_id,
-                                "command_acceptance_id": command_acceptance_id,
-                                "requested_at": requested_at,
-                            },
-                        )
-                        commit = self._commit_events_unlocked((event,))
-                        self._apply_committed_frame_unlocked(commit.frame)
-                        binding = current.binding
-                    self._gateway.cancel_attempt(binding)
-                    return EmployeeCancellationOutcome(
-                        "cancel_requested",
-                        binding.attempt_id,
-                        True,
-                    )
-                except _ProjectionHeadChanged:
-                    continue
-            raise EmployeeDispatchError("employee cancellation head remained unstable")
+            return self._anchor_cancellation(
+                requester_principal_id=requester_principal_id,
+                command_acceptance_id=command_acceptance_id,
+                attempt_id=live[0].binding.attempt_id,
+            )
 
     def request_team_cancel(
         self,
@@ -851,93 +799,89 @@ class EmployeeDispatchCoordinator:
         if not isinstance(requester, str) or not requester:
             raise EmployeeDispatchError("team cancellation requester unavailable")
         with self._terminal_lock:
-            requested_at = self._timestamp()
-            for _attempt in range(3):
-                captured_head = self._presynchronize_domains()
-                owner_active = self._team_assignment_effect_is_active(part)
-                try:
-                    with team_runtime_guard(), ExitStack() as stack:
-                        stack.enter_context(self._projection_sync_lock)
-                        stack.enter_context(self._hire.employee_dispatch_guard())
-                        stack.enter_context(
-                            self._ingress.employee_dispatch_guard(router=self._router)
-                        )
-                        stack.enter_context(self._data.employee_dispatch_guard())
-                        stack.enter_context(self._channels.employee_dispatch_guard())
-                        stack.enter_context(self._writer.transaction_guard())
-                        self._require_presynchronized_head(captured_head)
-                        attempt_id = self._gateway_state.attempt_by_acceptance_id.get(
-                            acceptance_id
-                        )
+            return self._anchor_cancellation(
+                requester_principal_id=requester,
+                command_acceptance_id=acceptance_id,
+                acceptance_id=acceptance_id,
+                queued_reason="team_step_canceled",
+                owner_is_active=lambda: self._team_assignment_effect_is_active(part),
+            )
+
+    def _anchor_cancellation(
+        self,
+        *,
+        requester_principal_id: str,
+        command_acceptance_id: str,
+        attempt_id: str = "",
+        acceptance_id: str = "",
+        queued_reason: str = "",
+        owner_is_active: Callable[[], bool] | None = None,
+    ) -> EmployeeCancellationOutcome:
+        requested_at = self._timestamp()
+        for _attempt in range(3):
+            captured_head = self._presynchronize_domains()
+            owner_active = owner_is_active is None or owner_is_active()
+            try:
+                with team_runtime_guard(), self._dispatch_commit_guard(captured_head):
+                    current_id = attempt_id or self._gateway_state.attempt_by_acceptance_id.get(
+                        acceptance_id, ""
+                    )
+                    if not current_id:
                         routed = self._router.state.by_acceptance_id.get(acceptance_id)
-                        if attempt_id is None:
-                            if routed is None:
-                                return EmployeeCancellationOutcome("no_active")
-                            if routed.state == "terminal":
+                        if routed is None or routed.state != "queued":
+                            if routed is not None and routed.state == "terminal":
                                 status = (
                                     "cancel_requested"
-                                    if routed.reason_code == "team_step_canceled"
+                                    if routed.reason_code == queued_reason
                                     else "already_terminal"
                                 )
                                 return EmployeeCancellationOutcome(status)
-                            if routed.state != "queued":
-                                return EmployeeCancellationOutcome("no_active")
-                            if not owner_active:
-                                raise EmployeeDispatchError(
-                                    "team cancellation owner mismatch"
-                                )
-                            event = self._router.preflight_rejection_event_unlocked(
-                                acceptance_id=acceptance_id,
-                                reason_code="team_step_canceled",
-                            )
-                            commit = self._commit_events_unlocked((event,))
-                            self._apply_committed_frame_unlocked(commit.frame)
-                            return EmployeeCancellationOutcome(
-                                "cancel_requested",
-                                changed=True,
-                            )
-                        current = self._gateway_state.attempts.get(attempt_id)
-                        if current is None:
-                            raise EmployeeDispatchError(
-                                "team cancellation attempt mismatch"
-                            )
-                        if current.binding.acceptance_id != acceptance_id:
-                            raise EmployeeDispatchError(
-                                "team cancellation attempt mismatch"
-                            )
-                        if current.terminal_status:
-                            return EmployeeCancellationOutcome(
-                                "already_terminal", attempt_id
-                            )
-                        if current.cancel_requested:
-                            return EmployeeCancellationOutcome(
-                                "cancel_requested", attempt_id, False
-                            )
-                        if not owner_active:
-                            raise EmployeeDispatchError(
-                                "team cancellation owner mismatch"
-                            )
-                        event = JournalEvent(
-                            event_type=ATTEMPT_CANCEL_REQUESTED,
-                            aggregate_id=attempt_id,
-                            payload={
-                                "attempt_id": attempt_id,
-                                "cancel_epoch": 1,
-                                "requester_principal_id": requester,
-                                "command_acceptance_id": acceptance_id,
-                                "requested_at": requested_at,
-                            },
+                            return EmployeeCancellationOutcome("no_active")
+                        if not owner_active or not queued_reason:
+                            raise EmployeeDispatchError("team cancellation owner mismatch")
+                        event = self._router.preflight_rejection_event_unlocked(
+                            acceptance_id=acceptance_id,
+                            reason_code=queued_reason,
                         )
                         commit = self._commit_events_unlocked((event,))
                         self._apply_committed_frame_unlocked(commit.frame)
-                        binding = current.binding
-                    self._gateway.cancel_attempt(binding)
-                    return EmployeeCancellationOutcome(
-                        "cancel_requested", attempt_id, True
+                        return EmployeeCancellationOutcome("cancel_requested", changed=True)
+                    current = self._gateway_state.attempts.get(current_id)
+                    if current is None:
+                        if acceptance_id:
+                            raise EmployeeDispatchError(
+                                "team cancellation attempt mismatch"
+                            )
+                        return EmployeeCancellationOutcome("no_active")
+                    if acceptance_id and current.binding.acceptance_id != acceptance_id:
+                        raise EmployeeDispatchError("team cancellation attempt mismatch")
+                    if current.terminal_status:
+                        return EmployeeCancellationOutcome("already_terminal", current_id)
+                    if current.cancel_requested:
+                        return EmployeeCancellationOutcome(
+                            "cancel_requested", current_id, False
+                        )
+                    if not owner_active:
+                        raise EmployeeDispatchError("team cancellation owner mismatch")
+                    event = JournalEvent(
+                        event_type=ATTEMPT_CANCEL_REQUESTED,
+                        aggregate_id=current_id,
+                        payload={
+                            "attempt_id": current_id,
+                            "cancel_epoch": 1,
+                            "requester_principal_id": requester_principal_id,
+                            "command_acceptance_id": command_acceptance_id,
+                            "requested_at": requested_at,
+                        },
                     )
-                except _ProjectionHeadChanged:
-                    continue
-            raise EmployeeDispatchError("team cancellation head remained unstable")
+                    commit = self._commit_events_unlocked((event,))
+                    self._apply_committed_frame_unlocked(commit.frame)
+                    binding = current.binding
+                self._gateway.cancel_attempt(binding)
+                return EmployeeCancellationOutcome("cancel_requested", current_id, True)
+            except _ProjectionHeadChanged:
+                continue
+        raise EmployeeDispatchError("employee cancellation head remained unstable")
 
     def _finalize_attempt_without_reporting(
         self,
@@ -952,18 +896,11 @@ class EmployeeDispatchCoordinator:
         lifecycle = self._gateway_state.attempts.get(attempt_id)
         if lifecycle is None or not lifecycle.dispatch_committed:
             raise EmployeeDispatchError("attempt is not dispatch committed")
-        if lifecycle.terminal_status:
-            if lifecycle.terminal_status != execution_result.status.value or lifecycle.result_digest != _result_digest(
-                execution_result
-            ):
-                raise EmployeeDispatchError("attempt terminal result conflicts")
-            return FinalizedEmployeeAttempt(
-                attempt_id,
-                execution_result.status,
-                lifecycle.history_record_id,
-                lifecycle.terminal_sequence,
-            )
+        existing = self._existing_terminal(lifecycle, execution_result)
+        if existing is not None:
+            return existing
         ended_at = self._timestamp()
+        result_digest = _result_digest(execution_result)
         record, payload = self._history_models(
             lifecycle.binding,
             execution_result,
@@ -976,33 +913,17 @@ class EmployeeDispatchCoordinator:
             for _attempt in range(3):
                 captured_head = self._presynchronize_domains()
                 try:
-                    with team_runtime_guard(), ExitStack() as stack:
-                        stack.enter_context(self._projection_sync_lock)
-                        stack.enter_context(self._hire.employee_dispatch_guard())
-                        stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
-                        stack.enter_context(self._data.employee_dispatch_guard())
-                        stack.enter_context(self._channels.employee_dispatch_guard())
-                        stack.enter_context(self._writer.transaction_guard())
-                        self._require_presynchronized_head(captured_head)
+                    with team_runtime_guard(), self._dispatch_commit_guard(captured_head):
                         lifecycle = self._gateway_state.attempts.get(attempt_id)
                         if lifecycle is None:
-                            raise EmployeeDispatchError("attempt disappeared during terminal commit")
-                        if lifecycle.terminal_status:
-                            if (
-                                lifecycle.terminal_status != execution_result.status.value
-                                or lifecycle.result_digest != _result_digest(execution_result)
-                            ):
-                                raise EmployeeDispatchError("attempt terminal result conflicts")
-                            raced = FinalizedEmployeeAttempt(
-                                attempt_id,
-                                execution_result.status,
-                                lifecycle.history_record_id,
-                                lifecycle.terminal_sequence,
+                            raise EmployeeDispatchError(
+                                "attempt disappeared during terminal commit"
                             )
-                        else:
-                            raced = None
+                        raced = self._existing_terminal(lifecycle, execution_result)
                         if raced is None:
-                            history_event = self._data.preflight_history_event_unlocked(staged)
+                            history_event = self._data.preflight_history_event_unlocked(
+                                staged
+                            )
                             router_event = self._router.preflight_terminal_event_unlocked(
                                 acceptance_id=lifecycle.binding.acceptance_id,
                                 reason_code=execution_result.status.value,
@@ -1014,12 +935,14 @@ class EmployeeDispatchCoordinator:
                                     "attempt_id": attempt_id,
                                     "terminal_epoch": 1,
                                     "status": execution_result.status.value,
-                                    "result_digest": _result_digest(execution_result),
+                                    "result_digest": result_digest,
                                     "history_record_id": record.record_id,
                                     "ended_at": ended_at,
                                 },
                             )
-                            commit = self._commit_events_unlocked((history_event, terminal_event, router_event))
+                            commit = self._commit_events_unlocked(
+                                (history_event, terminal_event, router_event)
+                            )
                             anchored = True
                             self._apply_committed_frame_unlocked(commit.frame)
                             return FinalizedEmployeeAttempt(
@@ -1038,10 +961,28 @@ class EmployeeDispatchCoordinator:
                 self._data.quarantine_staged_history(staged)
             raise
 
+    @staticmethod
+    def _existing_terminal(
+        lifecycle,
+        result: GatewayExecutionResult,
+    ) -> FinalizedEmployeeAttempt | None:
+        if not lifecycle.terminal_status:
+            return None
+        if (
+            lifecycle.terminal_status != result.status.value
+            or lifecycle.result_digest != _result_digest(result)
+        ):
+            raise EmployeeDispatchError("attempt terminal result conflicts")
+        return FinalizedEmployeeAttempt(
+            lifecycle.binding.attempt_id,
+            result.status,
+            lifecycle.history_record_id,
+            lifecycle.terminal_sequence,
+        )
+
     def recover_incomplete_attempts(self) -> tuple[FinalizedEmployeeAttempt, ...]:
         """Reconcile Actor facts, then terminalize unknowns without re-execution."""
 
-        self._recover_legacy_router_dispatches()
         self._synchronize_gateway_from_journal()
         pending = tuple(
             attempt_id
@@ -1105,18 +1046,11 @@ class EmployeeDispatchCoordinator:
                 continue
             payload = self._data.get_history_payload(lifecycle.history_record_id)
             status = GatewayExecutionStatus(lifecycle.terminal_status)
+            completed = status is GatewayExecutionStatus.COMPLETED
             result = GatewayExecutionResult(
                 status=status,
-                output=(
-                    payload.result_text
-                    if status is GatewayExecutionStatus.COMPLETED
-                    else ""
-                ),
-                safe_error_code=(
-                    ""
-                    if status is GatewayExecutionStatus.COMPLETED
-                    else payload.error_detail
-                ),
+                output=payload.result_text if completed else "",
+                safe_error_code="" if completed else payload.error_detail,
             )
             if status is GatewayExecutionStatus.COMPLETED:
                 self._publish_completed_artifacts(
@@ -1181,40 +1115,41 @@ class EmployeeDispatchCoordinator:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-        commands = (
-            PublishEmployeeDocumentCommand(
-                **common,
-                kind=DataKind.L1_MEMORY,
-                source_id=DataKind.L1_MEMORY.value,
-                content=l1,
-                content_type="text/markdown",
+        documents = (
+            (DataKind.L1_MEMORY, DataKind.L1_MEMORY.value, l1, "text/markdown", {}),
+            (
+                DataKind.MEMORY_SUMMARY,
+                "",
+                output.encode("utf-8"),
+                "text/markdown",
+                {"chat_id": binding.chat_id, "thread_root_id": binding.thread_root_id},
             ),
-            PublishEmployeeDocumentCommand(
-                **common,
-                kind=DataKind.MEMORY_SUMMARY,
-                source_id="",
-                content=output.encode("utf-8"),
-                content_type="text/markdown",
-                chat_id=binding.chat_id,
-                thread_root_id=binding.thread_root_id,
+            (
+                DataKind.SKILL_PROFILE,
+                DataKind.SKILL_PROFILE.value,
+                skill_profile,
+                "application/json",
+                {},
             ),
-            PublishEmployeeDocumentCommand(
-                **common,
-                kind=DataKind.SKILL_PROFILE,
-                source_id=DataKind.SKILL_PROFILE.value,
-                content=skill_profile,
-                content_type="application/json",
-            ),
-            PublishEmployeeDocumentCommand(
-                **common,
-                kind=DataKind.REASONING,
-                source_id=binding.task_id,
-                content=reasoning,
-                content_type="application/json",
+            (
+                DataKind.REASONING,
+                binding.task_id,
+                reasoning,
+                "application/json",
+                {},
             ),
         )
-        for command in commands:
-            sink.publish_document(command)
+        for kind, source_id, content, content_type, scope in documents:
+            sink.publish_document(
+                PublishEmployeeDocumentCommand(
+                    **common,
+                    **scope,
+                    kind=kind,
+                    source_id=source_id,
+                    content=content,
+                    content_type=content_type,
+                )
+            )
         enqueue_knowledge = getattr(sink, "enqueue_knowledge_terminal", None)
         if callable(enqueue_knowledge):
             enqueue_knowledge(
@@ -1226,53 +1161,6 @@ class EmployeeDispatchCoordinator:
                     error_detail="",
                 )
             )
-
-    def _recover_legacy_router_dispatches(self) -> int:
-        """Dispose Router-only dispatches without ever re-running ACP.
-
-        Older code could anchor ``router_dispatching`` without an attempt
-        binding in that frame.  Its external outcome is unknowable, so the
-        only safe recovery is a durable ``action_required`` terminal.
-        """
-
-        for _attempt in range(3):
-            captured_head = self._presynchronize_domains()
-            try:
-                return self._recover_legacy_router_dispatches_once(captured_head)
-            except _ProjectionHeadChanged:
-                continue
-        raise EmployeeDispatchError("employee recovery head remained unstable")
-
-    def _recover_legacy_router_dispatches_once(
-        self,
-        captured_head: tuple[int, str],
-    ) -> int:
-        with team_runtime_guard(), ExitStack() as stack:
-            stack.enter_context(self._projection_sync_lock)
-            stack.enter_context(self._hire.employee_dispatch_guard())
-            stack.enter_context(self._ingress.employee_dispatch_guard(router=self._router))
-            stack.enter_context(self._data.employee_dispatch_guard())
-            stack.enter_context(self._channels.employee_dispatch_guard())
-            stack.enter_context(self._writer.transaction_guard())
-            self._require_presynchronized_head(captured_head)
-            legacy = tuple(
-                record
-                for record in self._router.state.by_acceptance_id.values()
-                if record.state == "dispatching"
-                and record.acceptance_id not in self._gateway_state.attempt_by_acceptance_id
-            )
-            if not legacy:
-                return 0
-            events = tuple(
-                self._router.preflight_terminal_event_unlocked(
-                    acceptance_id=record.acceptance_id,
-                    reason_code=GatewayExecutionStatus.ACTION_REQUIRED.value,
-                )
-                for record in legacy
-            )
-            commit = self._commit_events_unlocked(events)
-            self._apply_committed_frame_unlocked(commit.frame)
-            return len(events)
 
     def _commit_events_unlocked(self, events: tuple[JournalEvent, ...]):
         versions = self._writer.get_aggregate_versions({event.aggregate_id for event in events})

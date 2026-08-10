@@ -75,38 +75,6 @@ class ProjectBuilder:
         return "\n".join(lines)
 
     @staticmethod
-    def build_project_status_content(project: ProjectContext, global_working_dir: str) -> str:
-        """Build the Markdown content for project status report."""
-        lines = []
-
-        lines.append(
-            UI_TEXT["project_status_label"].format(
-                emoji=project.get_status_emoji(), status=project.status.value
-            )
-        )
-        lines.append(UI_TEXT["project_dir_label"].format(path=project.root_path))
-        lines.append(UI_TEXT["project_dir_info_cwd"].format(cwd=global_working_dir))
-        lines.append(
-            UI_TEXT["project_last_active_label"].format(
-                time_ago=CoreBuilder._format_time_ago(project.last_active)
-            )
-        )
-
-        if project.coco_mode and project.coco_session_snapshot:
-            snap = project.coco_session_snapshot
-            lines.append(UI_TEXT["project_coco_session_header"])
-            lines.append(UI_TEXT["project_session_id_label"].format(id=snap.session_id))
-            lines.append(UI_TEXT["project_session_count_label"].format(count=snap.query_count))
-
-        if project.claude_mode and project.claude_session_snapshot:
-            snap = project.claude_session_snapshot
-            lines.append(UI_TEXT["project_claude_session_header"])
-            lines.append(UI_TEXT["project_session_id_label"].format(id=snap.session_id))
-            lines.append(UI_TEXT["project_session_count_label"].format(count=snap.query_count))
-
-        return "\n".join(lines)
-
-    @staticmethod
     def build_current_project_card(project: ProjectContext, global_working_dir: str) -> tuple[str, str]:
         """Build the full card for current project info."""
         content = ProjectBuilder.build_project_info_content(project, global_working_dir)
@@ -194,31 +162,6 @@ class ProjectBuilder:
         return content
 
     @staticmethod
-    def build_restore_info_content(restore_info: dict) -> str:
-        """Build the Markdown content for context restoration info."""
-        if not restore_info.get("has_context"):
-            return ""
-
-        content = UI_TEXT["project_restore_info"].format(
-            count=restore_info['entry_count']
-        )
-        if restore_info.get("last_mode"):
-            content += UI_TEXT["project_restore_last_mode"].format(
-                mode=restore_info['last_mode']
-            )
-        return content
-
-    @staticmethod
-    def build_project_switch_card(project: ProjectContext, context_info: str = "") -> tuple[str, str]:
-        """Build a notification card for project switch."""
-        content = UI_TEXT["project_switched_content"].format(
-            name=project.project_name, root=project.root_path, context_info=context_info
-        )
-        return ProjectBuilder.build_project_response_card(
-            project, UI_TEXT["project_switch_title"], content, show_buttons=True
-        )
-
-    @staticmethod
     def build_project_response_card(
         project: Optional[ProjectContext],
         title: str,
@@ -253,23 +196,6 @@ class ProjectBuilder:
         )
 
     @staticmethod
-    def build_coco_response_card(
-        project: Optional[ProjectContext],
-        title: str,
-        content: str,
-        working_dir: Optional[str] = None,
-        show_buttons: bool = True,
-    ) -> tuple[str, str]:
-        return ProjectBuilder._build_response_card_inner(
-            project,
-            title,
-            content,
-            working_dir,
-            show_buttons,
-            mode=InteractionMode.COCO,
-        )
-
-    @staticmethod
     def build_smart_response_card(
         project: Optional[ProjectContext],
         title: str,
@@ -299,17 +225,7 @@ class ProjectBuilder:
         image_keys: Optional[list[str]] = None,
         banner: Optional[dict] = None,
     ) -> tuple[str, str]:
-        # Determine actual mode from project if not provided directly
         effective_mode = mode
-        if effective_mode is None and project:
-            if getattr(project, "claude_mode", False):
-                effective_mode = InteractionMode.CLAUDE
-            elif getattr(project, "gemini_mode", False):
-                effective_mode = InteractionMode.GEMINI
-            elif getattr(project, "traex_mode", False):
-                effective_mode = InteractionMode.TRAEX
-            elif getattr(project, "coco_mode", False):
-                effective_mode = InteractionMode.COCO
 
         theme_color = getattr(project, "theme_color", None) if project else None
         if not theme_color:
@@ -568,145 +484,6 @@ class ProjectBuilder:
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
-    def build_notification_card(
-        project: ProjectContext,
-        notification_type: str,
-        title: str,
-        content: str,
-        suggestions: Optional[list[str]] = None,
-        buttons: Optional[list[dict]] = None,
-    ) -> tuple[str, str]:
-        theme = get_theme(project.theme_color)
-
-        type_emoji = {
-            "success": "✅",
-            "error": "❌",
-            "warning": "⚠️",
-            "info": "ℹ️",
-            "task_complete": "🎉",
-        }.get(notification_type, "📢")
-
-        header_title = f"{type_emoji} {title}"
-
-        elements = [
-            CoreBuilder._build_directory_element(project),
-            {"tag": "hr"},
-            CoreBuilder._build_content_element(content),
-        ]
-
-        if suggestions:
-            suggestion_text = UI_TEXT["project_notif_suggestion_header"] + "\n" + "\n".join(f"• {s}" for s in suggestions)
-            elements.append({"tag": "markdown", "content": suggestion_text})
-
-        if buttons:
-            elements.extend(build_responsive_layout(buttons[:4]))
-        else:
-            effective_mode = None
-            if project:
-                if getattr(project, "claude_mode", False):
-                    effective_mode = InteractionMode.CLAUDE
-                elif getattr(project, "gemini_mode", False):
-                    effective_mode = InteractionMode.GEMINI
-                elif getattr(project, "traex_mode", False):
-                    effective_mode = InteractionMode.TRAEX
-                elif getattr(project, "coco_mode", False):
-                    effective_mode = InteractionMode.COCO
-            elements.extend(
-                build_responsive_layout(
-                    CoreBuilder._build_footer_buttons(
-                        project,
-                        mode=effective_mode,
-                    )
-                )
-            )
-
-        card = CoreBuilder._wrap_card(header_title, theme.header_template, elements)
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def _build_resume_card(
-        project: ProjectContext,
-        mode: str,
-    ) -> tuple[str, str]:
-        theme = get_theme(project.theme_color)
-        mode_names = {
-            "coco": "Coco",
-            "claude": "Claude",
-            "aiden": "Aiden",
-            "codex": "Codex",
-            "gemini": "Gemini",
-            "traex": "Traex",
-        }
-        mode_name = mode_names.get(mode, mode.title())
-        snapshot = project.get_programming_snapshot(mode)
-
-        if not snapshot:
-            return ProjectBuilder.build_project_response_card(
-                project, f"{mode_name}{UI_TEXT['system_mode_label']}", UI_TEXT["project_resume_no_session"], show_buttons=True
-            )
-
-        content = (
-            UI_TEXT["project_resume_detected"].format(mode=mode_name) + "\n\n"
-            "• " + UI_TEXT["project_resume_session_id"].format(id=snapshot.session_id) + "\n"
-            "• " + UI_TEXT["project_resume_query_count"].format(count=snapshot.query_count) + "\n"
-            "• " + UI_TEXT["project_resume_last_query"].format(query=snapshot.last_query)
-        )
-
-        resume_action = f"resume_{mode}"
-        new_action = f"new_{mode}"
-
-        buttons = [
-            apply_compact_style(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_resume_btn_resume"]},
-                    "type": "primary",
-                    "value": {
-                        "action": resume_action,
-                        "project_id": project.project_id,
-                        "session_id": snapshot.session_id,
-                    },
-                }
-            ),
-            apply_compact_style(
-                {
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": UI_TEXT["project_resume_btn_new"]},
-                    "type": "default",
-                    "value": {
-                        "action": new_action,
-                        "project_id": project.project_id,
-                    },
-                }
-            ),
-        ]
-
-        try:
-            effective_mode = InteractionMode(mode)
-        except ValueError:
-            effective_mode = None
-
-        header_title = CoreBuilder._build_header_title(project, mode=effective_mode)
-
-        elements = [
-            CoreBuilder._build_directory_element(project),
-            {"tag": "hr"},
-        ]
-        elements.append(CoreBuilder._build_content_element(content))
-        elements.extend(build_responsive_layout(buttons))
-
-        card = CoreBuilder._wrap_card(header_title, theme.header_template, elements)
-        return "interactive", json.dumps(card, ensure_ascii=False)
-
-    @staticmethod
-    def build_coco_resume_card(project: ProjectContext) -> tuple[str, str]:
-        return ProjectBuilder._build_resume_card(project, "coco")
-
-    @staticmethod
-    def build_claude_resume_card(project: ProjectContext) -> tuple[str, str]:
-        return ProjectBuilder._build_resume_card(project, "claude")
-
-    @staticmethod
     def build_project_created_card(
         project: ProjectContext,
     ) -> tuple[str, str]:
@@ -757,12 +534,24 @@ class ProjectBuilder:
         project: ProjectContext,
         restore_info: dict,
     ) -> tuple[str, str]:
-        """Consolidates switch message, context restoration info, and resume session logic."""
-        context_info = ProjectBuilder.build_restore_info_content(restore_info)
-
-        if project.coco_session_snapshot and project.coco_session_snapshot.is_resumable:
-            return ProjectBuilder.build_coco_resume_card(project)
-        elif project.claude_session_snapshot and project.claude_session_snapshot.is_resumable:
-            return ProjectBuilder.build_claude_resume_card(project)
-        else:
-            return ProjectBuilder.build_project_switch_card(project, context_info)
+        """Build a switch notice without forcing a resume/new-session choice."""
+        context_info = ""
+        if restore_info.get("has_context"):
+            context_info = UI_TEXT["project_restore_info"].format(
+                count=restore_info["entry_count"]
+            )
+            if restore_info.get("last_mode"):
+                context_info += UI_TEXT["project_restore_last_mode"].format(
+                    mode=restore_info["last_mode"]
+                )
+        content = UI_TEXT["project_switched_content"].format(
+            name=project.project_name,
+            root=project.root_path,
+            context_info=context_info,
+        )
+        return ProjectBuilder.build_project_response_card(
+            project,
+            UI_TEXT["project_switch_title"],
+            content,
+            show_buttons=True,
+        )

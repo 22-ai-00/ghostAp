@@ -2,7 +2,7 @@
 
 Button text values are sourced from UI_TEXT (src/card/ui_text.py) where a
 corresponding key exists, ensuring a single source of truth across both the
-legacy CardBuilder pipeline and the new CardSession pipeline.
+static card builders and the CardSession pipeline.
 """
 
 from src.card.ui_text import UI_TEXT

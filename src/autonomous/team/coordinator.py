@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import threading
 import time
@@ -49,6 +48,10 @@ class _BlockNotificationOutcome(Enum):
 
 _MAX_FINAL_NOTIFICATION_ATTEMPTS = 3
 _MAX_BLOCK_NOTIFICATION_ATTEMPTS = 3
+_NOTIFICATION_POLICIES = {
+    "final": ("final-notify", _MAX_FINAL_NOTIFICATION_ATTEMPTS, True, False),
+    "blocked": ("blocked-notify", _MAX_BLOCK_NOTIFICATION_ATTEMPTS, False, True),
+}
 
 
 DecisionProvider = Callable[[TeamRunV2, tuple[object, ...], str], CoordinatorDecision]
@@ -271,16 +274,11 @@ class TeamCoordinatorActor:
         project_id: str = "",
         done_criteria: tuple[str, ...] = ("deliverable_non_empty", "review_completed"),
     ) -> TeamRunV2:
-        run, _created = self.admit_task(
-            tenant_key=tenant_key,
-            message_id=message_id,
-            chat_id=chat_id,
-            requester_principal_id=requester_principal_id,
-            task=task,
-            project_id=project_id,
-            done_criteria=done_criteria,
-        )
-        return run
+        return self.admit_task(
+            tenant_key=tenant_key, message_id=message_id, chat_id=chat_id,
+            requester_principal_id=requester_principal_id, task=task,
+            project_id=project_id, done_criteria=done_criteria,
+        )[0]
 
     def admit_task(
         self,
@@ -327,26 +325,14 @@ class TeamCoordinatorActor:
                     (tenant_key, chat_id, project_id, self._tool, self._model, self._profile, self._effort)
                 ).encode()
             ).hexdigest()
-            self._commit(
-                JournalEvent(
-                    event_type="team.v2.run.created",
-                    aggregate_id=run_id,
-                    payload={
-                        "tenant_key": tenant_key,
-                        "chat_id": chat_id,
-                        "project_id": project_id,
-                        "message_id": message_id,
-                        "requester_principal_id": requester_principal_id,
-                        "task_ref": task_ref.to_dict(),
-                        "goal": safe_goal,
-                        "done_criteria": list(done_criteria),
-                        "coordinator_session_key": session_key,
-                        "coordinator_tool": self._tool,
-                        "coordinator_model": self._model,
-                        "coordinator_profile": self._profile,
-                        "coordinator_effort": self._effort,
-                    },
-                )
+            self._record(
+                "team.v2.run.created", run_id, tenant_key=tenant_key,
+                chat_id=chat_id, project_id=project_id, message_id=message_id,
+                requester_principal_id=requester_principal_id,
+                task_ref=task_ref.to_dict(), goal=safe_goal,
+                done_criteria=list(done_criteria), coordinator_session_key=session_key,
+                coordinator_tool=self._tool, coordinator_model=self._model,
+                coordinator_profile=self._profile, coordinator_effort=self._effort,
             )
             run = self.projection().runs[run_id]
             self._schedule(run_id)
@@ -407,12 +393,9 @@ class TeamCoordinatorActor:
                 or assignment.status is not TeamAssignmentStatus.CREATED
             ):
                 return False
-            self._commit(
-                JournalEvent(
-                    event_type="team.v2.assignment.claimed",
-                    aggregate_id=assignment_id,
-                    payload={"run_id": assignment.run_id, "agent_id": agent_id},
-                )
+            self._record(
+                "team.v2.assignment.claimed", assignment_id,
+                run_id=assignment.run_id, agent_id=agent_id,
             )
             return True
 
@@ -452,17 +435,10 @@ class TeamCoordinatorActor:
                 or causal_event_id in projection.collaboration_events
             ):
                 return False
-            self._commit(
-                JournalEvent(
-                    event_type="team.v2.collaboration.observed",
-                    aggregate_id=team_run_id,
-                    payload={
-                        "run_id": team_run_id,
-                        "assignment_id": assignment_id,
-                        "agent_id": agent_id,
-                        "causal_event_id": causal_event_id,
-                    },
-                )
+            self._record(
+                "team.v2.collaboration.observed", team_run_id,
+                run_id=team_run_id, assignment_id=assignment_id,
+                agent_id=agent_id, causal_event_id=causal_event_id,
             )
             return True
 
@@ -483,13 +459,7 @@ class TeamCoordinatorActor:
                 and run.final_result_ref is not None
                 and self._final_notification_pending(projection, run_id)
             ):
-                self._commit(
-                    JournalEvent(
-                        event_type="team.v2.run.finalization_reopened",
-                        aggregate_id=run.run_id,
-                        payload={"run_id": run.run_id},
-                    )
-                )
+                self._record("team.v2.run.finalization_reopened", run.run_id, run_id=run.run_id)
                 self._resume_finalization(self.projection().runs[run_id])
             elif run.phase is TeamRunPhase.FINALIZING:
                 self._resume_finalization(run)
@@ -497,12 +467,9 @@ class TeamCoordinatorActor:
                 run.phase is TeamRunPhase.BLOCKED
                 and self._blocked_notification_pending(projection, run_id)
             ):
-                self._commit(
-                    JournalEvent(
-                        event_type="team.v2.run.block_notification_reopened",
-                        aggregate_id=run.run_id,
-                        payload={"run_id": run.run_id},
-                    )
+                self._record(
+                    "team.v2.run.block_notification_reopened", run.run_id,
+                    run_id=run.run_id,
                 )
                 self._resume_block_notification(
                     self.projection().runs[run_id]
@@ -794,18 +761,11 @@ class TeamCoordinatorActor:
             run_id=run.run_id,
             kind="team_instruction",
         )
-        self._commit(
-            JournalEvent(
-                event_type="team.v2.assignment.created",
-                aggregate_id=assignment_id,
-                payload={
-                    "run_id": run.run_id,
-                    "agent_id": agent_id,
-                    "role": decision.role,
-                    "instruction_ref": instruction_ref.to_dict(),
-                    "depends_on": list(decision.depends_on),
-                },
-            )
+        self._record(
+            "team.v2.assignment.created", assignment_id, run_id=run.run_id,
+            agent_id=agent_id, role=decision.role,
+            instruction_ref=instruction_ref.to_dict(),
+            depends_on=list(decision.depends_on),
         )
         return assignment_id
 
@@ -843,12 +803,9 @@ class TeamCoordinatorActor:
                 self._effect(aggregate, "employee_dispatch", "action_required")
                 self._assignment_failed(assignment, "team_dispatch_failed")
                 return True
-            self._commit(
-                JournalEvent(
-                    event_type="team.v2.assignment.submitted",
-                    aggregate_id=aggregate,
-                    payload={"run_id": run.run_id, "acceptance_id": acceptance_id},
-                )
+            self._record(
+                "team.v2.assignment.submitted", aggregate,
+                run_id=run.run_id, acceptance_id=acceptance_id,
             )
             assignment = self.projection().assignments[aggregate]
         if assignment.status is not TeamAssignmentStatus.RUNNING:
@@ -877,16 +834,10 @@ class TeamCoordinatorActor:
             kind="team_contribution",
         )
         self._effect(aggregate, "employee_dispatch", "committed")
-        self._commit(
-            JournalEvent(
-                event_type="team.v2.assignment.completed",
-                aggregate_id=aggregate,
-                payload={
-                    "run_id": run.run_id,
-                    "contribution_ref": contribution_ref.to_dict(),
-                    "history_record_id": result.history_record_id,
-                },
-            )
+        self._record(
+            "team.v2.assignment.completed", aggregate, run_id=run.run_id,
+            contribution_ref=contribution_ref.to_dict(),
+            history_record_id=result.history_record_id,
         )
         publish_collaboration = getattr(
             self._backend,
@@ -915,15 +866,9 @@ class TeamCoordinatorActor:
 
     def _assignment_failed(self, assignment, error_code: str) -> None:
         safe_error = self._public_block_reason(error_code)
-        self._commit(
-            JournalEvent(
-                event_type="team.v2.assignment.failed",
-                aggregate_id=assignment.assignment_id,
-                payload={
-                    "run_id": assignment.run_id,
-                    "error_code": safe_error,
-                },
-            )
+        self._record(
+            "team.v2.assignment.failed", assignment.assignment_id,
+            run_id=assignment.run_id, error_code=safe_error,
         )
 
     def _finalize(
@@ -934,16 +879,9 @@ class TeamCoordinatorActor:
         *,
         done_checks: dict[str, bool],
     ) -> None:
-        self._commit(
-            JournalEvent(
-                event_type="team.v2.run.finalization_started",
-                aggregate_id=run.run_id,
-                payload={
-                    "run_id": run.run_id,
-                    "result_ref": result_ref.to_dict(),
-                    "done_checks": done_checks,
-                },
-            )
+        self._record(
+            "team.v2.run.finalization_started", run.run_id, run_id=run.run_id,
+            result_ref=result_ref.to_dict(), done_checks=done_checks,
         )
         finalizing = self.projection().runs[run.run_id]
         if (
@@ -963,16 +901,10 @@ class TeamCoordinatorActor:
         output = self._read_text(run.final_result_ref)
         if not self._deliver_final_notification(run, output):
             raise TeamCoordinatorError("final notification is not committed")
-        self._commit(
-            JournalEvent(
-                event_type="team.v2.run.completed",
-                aggregate_id=run.run_id,
-                payload={
-                    "run_id": run.run_id,
-                    "result_ref": run.final_result_ref.to_dict(),
-                    "done_checks": dict(run.final_done_checks),
-                },
-            )
+        self._record(
+            "team.v2.run.completed", run.run_id, run_id=run.run_id,
+            result_ref=run.final_result_ref.to_dict(),
+            done_checks=dict(run.final_done_checks),
         )
 
     def _notify(
@@ -985,41 +917,11 @@ class TeamCoordinatorActor:
         idempotency_key = hashlib.sha256(
             f"team-{purpose}\0{run.run_id}".encode()
         ).hexdigest()[:50]
-        notify = self._backend.notify
-        try:
-            parameters = tuple(inspect.signature(notify).parameters.values())
-        except (TypeError, ValueError):
-            supports_idempotency = True
-            supports_recipient_scope = False
-        else:
-            supports_idempotency = any(
-                parameter.name == "idempotency_key"
-                or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters
-            )
-            supports_recipient_scope = all(
-                any(
-                    parameter.name == name
-                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
-                    for parameter in parameters
-                )
-                for name in ("tenant_key", "requester_principal_id")
-            )
-        kwargs = {}
-        if supports_idempotency:
-            kwargs["idempotency_key"] = idempotency_key
-        if supports_recipient_scope:
-            kwargs.update(
-                tenant_key=run.tenant_key,
-                requester_principal_id=run.requester_principal_id,
-            )
-        if kwargs:
-            notify(run.message_id, run.chat_id, output, **kwargs)
-        else:
-            # Compatibility-only backends predate the idempotent notify port.
-            # Production coordinator composition accepts the key and durable
-            # recipient scope.
-            self._backend.notify(run.message_id, run.chat_id, output)
+        self._backend.notify(
+            run.message_id, run.chat_id, output,
+            idempotency_key=idempotency_key, tenant_key=run.tenant_key,
+            requester_principal_id=run.requester_principal_id,
+        )
 
     def _block(self, run_id: str, error_code: str) -> None:
         with self._lock:
@@ -1034,7 +936,8 @@ class TeamCoordinatorActor:
             if run.phase is TeamRunPhase.BLOCKING:
                 blocking = run
             else:
-                notify_prefix = self._blocked_notify_prefix(run_id)
+                blocked_name = _NOTIFICATION_POLICIES["blocked"][0]
+                notify_prefix = f"{run_id}:{blocked_name}:"
                 for (aggregate, effect_type), state in projection.effects.items():
                     belongs_to_run = (
                         aggregate == run_id
@@ -1088,40 +991,24 @@ class TeamCoordinatorActor:
         return "team_task_failed"
 
     @staticmethod
-    def _blocked_notify_prefix(run_id: str) -> str:
-        return f"{run_id}:blocked-notify:"
-
-    @staticmethod
-    def _legacy_final_notify_aggregate(run_id: str) -> str:
-        return f"{run_id}:notify"
-
-    @staticmethod
-    def _final_notify_prefix(run_id: str) -> str:
-        return f"{run_id}:final-notify:"
-
-    @classmethod
-    def _final_notification_attempts(
-        cls,
-        projection,
-        run_id: str,
-    ) -> tuple[tuple[int, str, str], ...]:
+    def _notification_attempts(projection, run_id: str, purpose: str):
+        name, _limit, legacy, _abandon = _NOTIFICATION_POLICIES[purpose]
         attempts = []
-        legacy_aggregate = cls._legacy_final_notify_aggregate(run_id)
-        legacy_state = projection.effects.get((legacy_aggregate, "notify"))
-        if legacy_state is not None:
-            attempts.append((0, legacy_aggregate, legacy_state))
-        prefix = cls._final_notify_prefix(run_id)
+        if legacy:
+            aggregate = f"{run_id}:notify"
+            state = projection.effects.get((aggregate, "notify"))
+            if state is not None:
+                attempts.append((0, aggregate, state))
+        prefix = f"{run_id}:{name}:"
         for (aggregate, effect_type), state in projection.effects.items():
-            if effect_type != "notify" or not aggregate.startswith(prefix):
-                continue
-            ordinal = aggregate[len(prefix) :]
-            if ordinal.isdigit() and int(ordinal) > 0:
+            ordinal = aggregate[len(prefix) :] if aggregate.startswith(prefix) else ""
+            if effect_type == "notify" and ordinal.isdigit() and int(ordinal) > 0:
                 attempts.append((int(ordinal), aggregate, state))
         return tuple(sorted(attempts))
 
     @classmethod
     def _final_notification_pending(cls, projection, run_id: str) -> bool:
-        attempts = cls._final_notification_attempts(projection, run_id)
+        attempts = cls._notification_attempts(projection, run_id, "final")
         return bool(attempts) and not any(
             state == "committed"
             for _ordinal, _aggregate, state in attempts
@@ -1132,105 +1019,16 @@ class TeamCoordinatorActor:
         run: TeamRunV2,
         output: str,
     ) -> bool:
-        """Deliver one logical final notice across crash-safe attempts."""
-
-        with self._lock:
-            projection = self.projection()
-            attempts = self._final_notification_attempts(
-                projection,
-                run.run_id,
-            )
-            if any(
-                state == "committed"
-                for _ordinal, _aggregate, state in attempts
-            ):
-                return True
-            replayable = next(
-                (
-                    (aggregate, state)
-                    for _ordinal, aggregate, state in reversed(attempts)
-                    if state in {"prepared", "executing"}
-                ),
-                None,
-            )
-            if replayable is None:
-                if len(attempts) >= _MAX_FINAL_NOTIFICATION_ATTEMPTS:
-                    raise _FinalNotificationExhausted(
-                        "final notification attempts are exhausted"
-                    )
-                if attempts:
-                    ordinal = attempts[-1][0] + 1
-                    aggregate = (
-                        f"{self._final_notify_prefix(run.run_id)}{ordinal}"
-                    )
-                else:
-                    aggregate = self._legacy_final_notify_aggregate(run.run_id)
-                self._effect(aggregate, "notify", "prepared")
-                state = "prepared"
-            else:
-                aggregate, state = replayable
-            if state == "prepared":
-                self._effect(aggregate, "notify", "executing")
-
-        try:
-            self._notify(run, output)
-        except Exception:
-            with self._lock:
-                projection = self.projection()
-                if projection.effects.get((aggregate, "notify")) == "executing":
-                    self._effect(
-                        aggregate,
-                        "notify",
-                        "action_required",
-                    )
-                attempts = self._final_notification_attempts(
-                    self.projection(),
-                    run.run_id,
-                )
-            if len(attempts) >= _MAX_FINAL_NOTIFICATION_ATTEMPTS:
-                raise _FinalNotificationExhausted(
-                    "final notification attempts are exhausted"
-                )
-            raise _FinalNotificationRetry(
-                "final notification delivery will retry"
-            )
-        with self._lock:
-            projection = self.projection()
-            if projection.effects.get((aggregate, "notify")) == "executing":
-                self._effect(aggregate, "notify", "committed")
-            projection = self.projection()
-            return any(
-                state == "committed"
-                for _ordinal, _aggregate, state in (
-                    self._final_notification_attempts(
-                        projection,
-                        run.run_id,
-                    )
-                )
-            )
-
-    @classmethod
-    def _blocked_notification_attempts(
-        cls,
-        projection,
-        run_id: str,
-    ) -> tuple[tuple[int, str, str], ...]:
-        prefix = cls._blocked_notify_prefix(run_id)
-        attempts = []
-        for (aggregate, effect_type), state in projection.effects.items():
-            if effect_type != "notify" or not aggregate.startswith(prefix):
-                continue
-            ordinal = aggregate[len(prefix) :]
-            if ordinal.isdigit() and int(ordinal) > 0:
-                attempts.append((int(ordinal), aggregate, state))
-        return tuple(sorted(attempts))
+        outcome = self._deliver_notification(run, output, "final")
+        if outcome is _BlockNotificationOutcome.RETRY:
+            raise _FinalNotificationRetry("final notification delivery will retry")
+        if outcome is _BlockNotificationOutcome.EXHAUSTED:
+            raise _FinalNotificationExhausted("final notification attempts are exhausted")
+        return True
 
     @classmethod
     def _blocked_notification_pending(cls, projection, run_id: str) -> bool:
-        attempts = cls._blocked_notification_attempts(
-            projection,
-            run_id,
-        )
+        attempts = cls._notification_attempts(projection, run_id, "blocked")
         return not any(
             state in {"committed", "abandoned"}
             for _ordinal, _aggregate, state in attempts
@@ -1241,69 +1039,50 @@ class TeamCoordinatorActor:
         run: TeamRunV2,
         safe_error: str,
     ) -> _BlockNotificationOutcome:
-        """Deliver or durably retry the terminal notice using one logical key."""
+        content = (
+            f"⚠️ 团队任务未完成（`{run.run_id[:20]}…`）。"
+            f"原因：`{safe_error}`。请执行 `/roster` 查看员工状态后重试。"
+        )
+        return self._deliver_notification(run, content, "blocked")
 
+    def _deliver_notification(
+        self, run: TeamRunV2, content: str, purpose: str,
+    ) -> _BlockNotificationOutcome:
+        name, limit, legacy, abandon = _NOTIFICATION_POLICIES[purpose]
         with self._lock:
-            projection = self.projection()
-            attempts = self._blocked_notification_attempts(projection, run.run_id)
-            if any(state == "committed" for _ordinal, _aggregate, state in attempts):
+            attempts = self._notification_attempts(self.projection(), run.run_id, purpose)
+            states = {state for _ordinal, _aggregate, state in attempts}
+            if "committed" in states:
                 return _BlockNotificationOutcome.COMMITTED
-            if any(state == "abandoned" for _ordinal, _aggregate, state in attempts):
+            if "abandoned" in states:
                 return _BlockNotificationOutcome.EXHAUSTED
-            replayable = next(
-                (
-                    (aggregate, state)
-                    for _ordinal, aggregate, state in reversed(attempts)
-                    if state in {"prepared", "executing"}
-                ),
-                None,
-            )
+            replayable = next(((aggregate, state) for _ordinal, aggregate, state
+                               in reversed(attempts) if state in {"prepared", "executing"}), None)
             if replayable is None:
-                if len(attempts) >= _MAX_BLOCK_NOTIFICATION_ATTEMPTS:
-                    aggregate = attempts[-1][1]
-                    if attempts[-1][2] == "action_required":
-                        self._effect(
-                            aggregate,
-                            "notify",
-                            "abandoned",
-                        )
+                if len(attempts) >= limit:
+                    if abandon and attempts[-1][2] == "action_required":
+                        self._effect(attempts[-1][1], "notify", "abandoned")
                     return _BlockNotificationOutcome.EXHAUSTED
                 ordinal = attempts[-1][0] + 1 if attempts else 1
-                aggregate = f"{self._blocked_notify_prefix(run.run_id)}{ordinal}"
+                aggregate = (f"{run.run_id}:notify" if legacy and not attempts
+                             else f"{run.run_id}:{name}:{ordinal}")
                 self._effect(aggregate, "notify", "prepared")
                 state = "prepared"
             else:
                 aggregate, state = replayable
             if state == "prepared":
                 self._effect(aggregate, "notify", "executing")
-
-        content = (
-            f"⚠️ 团队任务未完成（`{run.run_id[:20]}…`）。"
-            f"原因：`{safe_error}`。请执行 `/roster` 查看员工状态后重试。"
-        )
         try:
-            self._notify(run, content, purpose="blocked")
+            self._notify(run, content, purpose=purpose)
         except Exception:
             with self._lock:
                 projection = self.projection()
                 if projection.effects.get((aggregate, "notify")) == "executing":
                     self._effect(aggregate, "notify", "action_required")
-                attempts = self._blocked_notification_attempts(
-                    self.projection(),
-                    run.run_id,
-                )
-                if len(attempts) >= _MAX_BLOCK_NOTIFICATION_ATTEMPTS:
-                    if (
-                        self.projection().effects.get(
-                            (aggregate, "notify")
-                        )
-                        == "action_required"
-                    ):
-                        self._effect(
-                            aggregate,
-                            "notify",
-                            "abandoned",
-                        )
+                attempts = self._notification_attempts(self.projection(), run.run_id, purpose)
+                if len(attempts) >= limit:
+                    if abandon and self.projection().effects.get((aggregate, "notify")) == "action_required":
+                        self._effect(aggregate, "notify", "abandoned")
                     return _BlockNotificationOutcome.EXHAUSTED
             return _BlockNotificationOutcome.RETRY
         with self._lock:
@@ -1324,18 +1103,11 @@ class TeamCoordinatorActor:
         next_turn = run.turn_count if turn is None else turn
         if next_turn > MAX_TEAM_TURNS:
             raise TeamCoordinatorError("team turn bound exceeded")
-        self._commit(
-            JournalEvent(
-                event_type="team.v2.run.phase_changed",
-                aggregate_id=run.run_id,
-                payload={
-                    "run_id": run.run_id,
-                    "phase": phase.value,
-                    "turn_count": next_turn,
-                    "handoff_count": run.handoff_count if handoff is None else handoff,
-                    "error_code": error,
-                },
-            )
+        self._record(
+            "team.v2.run.phase_changed", run.run_id, run_id=run.run_id,
+            phase=phase.value, turn_count=next_turn,
+            handoff_count=run.handoff_count if handoff is None else handoff,
+            error_code=error,
         )
 
     def _assignment_by_role(self, run_id: str, role: str):
@@ -1440,13 +1212,10 @@ class TeamCoordinatorActor:
         return checks if checks and all(checks.values()) else None
 
     def _effect(self, aggregate: str, effect_type: str, state: str) -> None:
-        self._commit(
-            JournalEvent(
-                event_type=f"team.v2.effect.{state}",
-                aggregate_id=aggregate,
-                payload={"effect_type": effect_type},
-            )
-        )
+        self._record(f"team.v2.effect.{state}", aggregate, effect_type=effect_type)
+
+    def _record(self, event_type: str, aggregate_id: str, **payload: object) -> None:
+        self._commit(JournalEvent(event_type=event_type, aggregate_id=aggregate_id, payload=payload))
 
     def _publish_json(self, value: object, **labels: str) -> BlobRef:
         return self._blobs.stage_and_publish(

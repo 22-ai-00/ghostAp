@@ -90,17 +90,12 @@ STATUS_ICONS: dict[AgentStatus, str] = {
 WORKFLOW_STATUS_ICONS: dict[WorkflowStatus, str] = {
     WorkflowStatus.IDLE: "\u23f3",
     WorkflowStatus.GENERATING_SCRIPT: "\U0001f504",
-    WorkflowStatus.AWAITING_AGENT_SELECT: "\U0001f916",
-    WorkflowStatus.AWAITING_TOOL_SELECT: "\U0001f527",
-    WorkflowStatus.AWAITING_CONFIRM: "\u23f3",
     WorkflowStatus.RUNNING: "\U0001f504",
     WorkflowStatus.COMPLETED: "\u2705",
     WorkflowStatus.FAILED: "\u274c",
     WorkflowStatus.CANCELLED: "\u274c",
 }
 
-_PHASE_AGENT_DISPLAY_LIMIT = 20
-_PHASE_COMPLETED_TAIL = 5
 _CARD_MAX_BYTES = 27 * 1024  # Shared card payload budget with safety margin.
 _SUBAGENT_DISPLAY_LIMIT = 12
 
@@ -260,7 +255,7 @@ def _format_tokens(tokens: int) -> str:
 
 
 def _render_subagent_lines(subagents: list[SubagentProgress]) -> str:
-    """Render bounded child status lines without provider thread identifiers."""
+    """Render bounded, explicitly non-authoritative ACP child observations."""
     if not subagents:
         return ""
 
@@ -284,13 +279,13 @@ def _render_subagent_lines(subagents: list[SubagentProgress]) -> str:
     for child in subagents:
         counts[child.status] += 1
     summary_parts = [
-        f"运行 {counts[SubagentStatus.RUNNING]}",
-        f"完成 {counts[SubagentStatus.COMPLETED]}",
-        f"失败 {counts[SubagentStatus.FAILED]}",
-        f"取消 {counts[SubagentStatus.CANCELLED]}",
+        f"观测运行 {counts[SubagentStatus.RUNNING]}",
+        f"观测完成 {counts[SubagentStatus.COMPLETED]}",
+        f"观测失败 {counts[SubagentStatus.FAILED]}",
+        f"观测取消 {counts[SubagentStatus.CANCELLED]}",
     ]
     lines = [
-        f"    ↳ 子 Agent · {len(subagents)} 个 · "
+        f"    ↳ ACP 内部 Agent 观测（非权威，不参与终态判定）· {len(subagents)} 个 · "
         + " / ".join(part for part in summary_parts if not part.endswith(" 0"))
     ]
     for index, child in indexed:
@@ -301,21 +296,22 @@ def _render_subagent_lines(subagents: list[SubagentProgress]) -> str:
             max_chars=60,
             opaque_ids=source_ids,
         )
-        model_text = f" · {model}" if model else ""
-        lines.append(
-            f"    - {icon} 子 Agent {index} · {status_text}{model_text}"
-        )
+        model_text = model or "默认模型"
         progress = sanitize_tool_failure_detail(
             _strip_internal_details(child.progress),
             fallback="",
             max_chars=180,
             opaque_ids=source_ids,
         )
-        if progress:
-            lines.append(f"      - 进展：{progress}")
+        authority = "" if child.authoritative else "观测"
+        latest = " ".join((progress or "暂无最新操作").split())
+        lines.append(
+            f"    - {icon} ACP 子 Agent {index} · {authority}{status_text} · "
+            f"{model_text} · 最新操作：{latest}"
+        )
     hidden = len(subagents) - len(indexed)
     if hidden > 0:
-        lines.append(f"    - 另有 {hidden} 个子 Agent 已折叠")
+        lines.append(f"    - 另有 {hidden} 个非权威观测已折叠，不影响主 Agent 终态")
     return "\n" + "\n".join(lines)
 
 
@@ -372,11 +368,23 @@ class WorkflowProgressRenderer:
         return self._render_progress_card_impl()
 
     def render_progress_cards(self, project: WorkflowProject | None = None) -> list[dict[str, Any]]:
-        """Render one mutable status page followed by append-only result pages."""
+        """Render lossless status pages followed by append-only result pages."""
         target = project or self._project
-        return [self.render_progress_card(target), *_render_result_ledger_cards(target)]
+        if project is not None:
+            saved = self._project
+            self._project = project
+            try:
+                status_cards = self._render_progress_card_pages_impl()
+            finally:
+                self._project = saved
+        else:
+            status_cards = self._render_progress_card_pages_impl()
+        return [*status_cards, *_render_result_ledger_cards(target)]
 
     def _render_progress_card_impl(self) -> dict[str, Any]:
+        return self._render_progress_card_pages_impl()[0]
+
+    def _render_progress_card_pages_impl(self) -> list[dict[str, Any]]:
         elements: list[dict[str, Any]] = []
 
         # -- Current execution summary section (top) --
@@ -404,13 +412,7 @@ class WorkflowProgressRenderer:
         # Defensive check: ensure no accidental agent-output sentinel leaks
         _card_text_for_agent_output(elements, _AGENT_OUTPUT_FORBIDDEN_MARKERS)
 
-        # Enforce Feishu card payload size limit
-        elements = _enforce_card_size(elements)
-
-        return {
-            "header": self._render_header(),
-            "elements": elements,
-        }
+        return _paginate_progress_cards(self._render_header(), elements)
 
     def _render_summary_section(self) -> dict[str, Any] | None:
         """Render a compact current/latest activity summary block."""
@@ -462,11 +464,30 @@ class WorkflowProgressRenderer:
             latest_phase = latest_phase_only
             latest_changed_at = latest_phase_changed_at
 
-        if active_agent is None and latest_phase is None:
+        requirement = str(self._project.requirement or "").strip()
+        if active_agent is None and latest_phase is None and not requirement:
             return None
 
         # Compose the summary lines
         lines: list[str] = []
+        if requirement:
+            lines.append(f"🎯 **任务:** {_middle_ellipsis(requirement, 240)}")
+        metrics = self._project.metrics
+        total_phases = len(self._project.phases)
+        completed_phases = min(
+            total_phases,
+            max(
+                int(getattr(metrics, "phases_completed", 0) or 0),
+                sum(1 for phase in self._project.phases if phase.finished_at is not None),
+            ),
+        )
+        start = self._project.started_at or self._start_time
+        end = self._project.finished_at or time.time()
+        elapsed = max(0.0, end - start)
+        lines.append(
+            f"📊 **总览:** Phase {completed_phases}/{total_phases} · "
+            f"Token {_format_tokens(metrics.total_tokens)} · 耗时 {format_elapsed_clock(elapsed)}"
+        )
         terminal = self._project.status in (
             WorkflowStatus.COMPLETED,
             WorkflowStatus.FAILED,
@@ -496,13 +517,14 @@ class WorkflowProgressRenderer:
             lines.append(f"🤖 **{agent_label_key}:** {agent_status_icon} {agent_label}")
             if active_agent.tool:
                 binding = f"`{active_agent.tool}`"
-                if active_agent.model:
-                    binding += f" / `{active_agent.model}`"
+                binding += f" / `{active_agent.model or '默认模型'}`"
                 lines.append(f"🛠 **{tool_label_key}:** {binding}")
             else:
                 lines.append(f"🛠 **{tool_label_key}:** (未指定工具)")
             if active_agent.task_summary:
                 lines.append(f"📋 **当前任务:** {_middle_ellipsis(active_agent.task_summary, 60)}")
+            attempt = max(1, int(getattr(active_agent, "attempt", 1) or 1))
+            lines.append(f"🔁 **Attempt:** {attempt}")
             activity = getattr(active_agent, "current_activity", "") or ""
             if activity and not terminal and active_agent.status == AgentStatus.RUNNING:
                 lines.append(f"⚡ **正在:** {_middle_ellipsis(activity, 60)}")
@@ -602,6 +624,7 @@ class WorkflowProgressRenderer:
         agents = phase.agents
         total_agents = len(agents)
         completed_count = sum(1 for a in agents if a.status in (AgentStatus.DONE, AgentStatus.CACHED))
+        phase_tokens = sum(max(0, int(getattr(a, "token_usage", 0) or 0)) for a in agents)
 
         # Phase header — row 1: title (middle-ellipsis); row 2: completion count + duration
         phase_status = self._get_phase_status_icon(phase)
@@ -610,9 +633,18 @@ class WorkflowProgressRenderer:
         if phase.started_at and total_agents > 0:
             elapsed = (phase.finished_at or time.time()) - phase.started_at
             duration_text = _format_duration(elapsed)
-            elements.append(_md_element(f"已完成 {completed_count}/{total_agents} · 耗时 {duration_text}"))
+            elements.append(
+                _md_element(
+                    f"已完成 {completed_count}/{total_agents} · "
+                    f"Token {_format_tokens(phase_tokens)} · 耗时 {duration_text}"
+                )
+            )
         elif total_agents > 0:
-            elements.append(_md_element(f"已完成 {completed_count}/{total_agents}"))
+            elements.append(
+                _md_element(
+                    f"已完成 {completed_count}/{total_agents} · Token {_format_tokens(phase_tokens)}"
+                )
+            )
         elif phase.finished_at:
             if phase.started_at:
                 elapsed = phase.finished_at - phase.started_at
@@ -626,11 +658,6 @@ class WorkflowProgressRenderer:
 
         if not agents:
             return elements
-
-        # Paginate: for phases with more agents than a small-phase threshold,
-        # show all running/failed + the last N done/cached agents.
-        small_phase_threshold = 8
-        apply_pagination = total_agents > small_phase_threshold
 
         # Group agents by status buckets
         buckets: dict[str, list[AgentProgress]] = {
@@ -649,17 +676,6 @@ class WorkflowProgressRenderer:
             else:
                 buckets["PENDING"].append(agent)
 
-        # Track hidden done/cached for the counter line (only when pagination applies)
-        hidden_done = 0
-        hidden_cached = 0
-        if apply_pagination:
-            if len(buckets["DONE"]) > _PHASE_COMPLETED_TAIL:
-                hidden_done = len(buckets["DONE"]) - _PHASE_COMPLETED_TAIL
-                buckets["DONE"] = buckets["DONE"][-_PHASE_COMPLETED_TAIL:]
-            if len(buckets["CACHED"]) > _PHASE_COMPLETED_TAIL:
-                hidden_cached = len(buckets["CACHED"]) - _PHASE_COMPLETED_TAIL
-                buckets["CACHED"] = buckets["CACHED"][-_PHASE_COMPLETED_TAIL:]
-
         # Status → label + color mapping for collapsible_panel headers
         status_meta: dict[str, tuple[str, str]] = {
             "RUNNING": ("执行中", "blue"),
@@ -668,6 +684,13 @@ class WorkflowProgressRenderer:
             "CACHED": ("缓存", "turquoise"),
             "CANCELLED": ("已取消", "grey"),
             "PENDING": ("待执行", "grey"),
+        }
+        terminal_operations = {
+            AgentStatus.DONE: "已完成，完整输出见结果账本",
+            AgentStatus.CACHED: "已命中缓存，完整输出见结果账本",
+            AgentStatus.FAILED: "执行失败，错误与已有输出见结果账本",
+            AgentStatus.CANCELLED: "已取消",
+            AgentStatus.PENDING: "等待调度",
         }
 
         # Render status groups as collapsible panels (RUNNING/FAILED expanded, rest collapsed)
@@ -679,51 +702,55 @@ class WorkflowProgressRenderer:
             ("CANCELLED", False),
             ("PENDING", False),
         ]
-        for key, expanded in display_order:
-            group = buckets[key]
-            if not group:
-                continue
+        display_groups = [
+            (key, expanded, offset, buckets[key][offset : offset + 8])
+            for key, expanded in display_order
+            for offset in range(0, len(buckets[key]), 8)
+        ]
+        for key, expanded, group_offset, group in display_groups:
             label, color = status_meta[key]
             lines: list[str] = []
             for agent in group:
-                tool_badge = f"`{agent.tool}`" if agent.tool else ""
-                if agent.model:
-                    tool_badge += f"/`{agent.model}`"
+                tool_badge = f"`{agent.tool or '未指定工具'}` / `{agent.model or '默认模型'}`"
                 display_label = _middle_ellipsis(agent.label or "agent")
-                subagent_text = _render_subagent_lines(agent.subagents)
+                display_index = max(1, int(getattr(agent, "call_index", 0) or 0) + 1)
+                attempt = max(1, int(getattr(agent, "attempt", 1) or 1))
+                status_text = status_meta[key][0]
+                task = " ".join((agent.task_summary or "未提供任务摘要").split())
                 if agent.status == AgentStatus.RUNNING:
-                    summary_text = ""
-                    if agent.task_summary:
-                        summary_text = f"\n    > {_middle_ellipsis(agent.task_summary, 60)}"
-                    # Live elapsed suffix so a long-running agent's line keeps
-                    # advancing (paired with the engine heartbeat re-render).
-                    running_text = "执行中…"
+                    operation = " ".join(
+                        str(getattr(agent, "current_activity", "") or "等待 Agent 返回").split()
+                    )
+                    elapsed_suffix = ""
                     if agent.started_at:
                         elapsed = time.time() - agent.started_at
                         if elapsed > 0:
-                            running_text = f"执行中 {_format_duration(elapsed)}…"
-                    lines.append(
-                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} "
-                        f"{running_text}{summary_text}{subagent_text}"
-                    )
-                elif agent.error:
-                    safe_err = _strip_internal_details(agent.error[:60])
-                    dur = _format_duration(agent.duration_s) if agent.duration_s > 0 else ""
-                    lines.append(
-                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} "
-                        f"{dur} — {safe_err}{subagent_text}"
-                    )
+                            elapsed_suffix = f" · 已运行 {_format_duration(elapsed)}"
                 else:
-                    dur = _format_duration(agent.duration_s) if agent.duration_s > 0 else ""
-                    summary_hint = ""
-                    if agent.task_summary:
-                        summary_hint = f" — {_middle_ellipsis(agent.task_summary, 40)}"
-                    lines.append(
-                        f"{STATUS_ICONS.get(agent.status, '·')} {display_label} {tool_badge} "
-                        f"{dur}{summary_hint}{subagent_text}"
+                    operation = terminal_operations.get(agent.status, "等待调度")
+                    elapsed_suffix = (
+                        f" · 耗时 {_format_duration(agent.duration_s)}"
+                        if agent.duration_s > 0
+                        else ""
                     )
+                row = (
+                    f"{STATUS_ICONS.get(agent.status, '·')} #{display_index} {display_label} · "
+                    f"{status_text} · Attempt {attempt} · {tool_badge}{elapsed_suffix}\n"
+                    f"任务：{_middle_ellipsis(task, 100)}\n"
+                    f"当前操作：{_middle_ellipsis(operation, 120)}"
+                )
+                row += _render_subagent_lines(agent.subagents)
+                lines.append(row)
             header_obj: dict[str, Any] = {
-                "title": {"tag": "plain_text", "content": f"{label} ({len(group)})"},
+                "title": {
+                    "tag": "plain_text",
+                    "content": (
+                        f"{label} ({group_offset + 1}-{group_offset + len(group)}"
+                        f"/{len(buckets[key])})"
+                        if len(buckets[key]) > len(group)
+                        else f"{label} ({len(group)})"
+                    ),
+                },
             }
             panel = _collapsible_panel(
                 header_obj,
@@ -732,15 +759,6 @@ class WorkflowProgressRenderer:
                 template=color,
             )
             elements.append(panel)
-
-        # Hidden done/cached counter line
-        if hidden_done or hidden_cached:
-            hidden_total = hidden_done + hidden_cached
-            elements.append(_md_element(f"共 {hidden_total} 条已完成/缓存（已折叠）"))
-
-        if not apply_pagination and len(agents) > _PHASE_AGENT_DISPLAY_LIMIT:
-            hidden = len(agents) - _PHASE_AGENT_DISPLAY_LIMIT
-            elements.append(_md_element(f"... 另有 {hidden} 个代理"))
 
         return elements
 
@@ -817,52 +835,6 @@ class WorkflowProgressRenderer:
         if has_failed:
             return "\u274c"
         return "\u23f3"
-
-
-# ---------------------------------------------------------------------------
-# Script preview helper (module-level, used by WorkflowHandler confirm card)
-# ---------------------------------------------------------------------------
-
-_SCRIPT_PREVIEW_MAX_LINES = 80
-_SCRIPT_PREVIEW_MAX_CHARS = 2000
-
-
-def render_script_preview(
-    script: str,
-    *,
-    max_lines: int = _SCRIPT_PREVIEW_MAX_LINES,
-    max_chars: int = _SCRIPT_PREVIEW_MAX_CHARS,
-) -> str:
-    """Format a workflow script for user preview in confirmation cards.
-
-    Returns the script wrapped in a JS code fence. If the script exceeds
-    *max_lines* or *max_chars*, it is truncated with an ellipsis note.
-    """
-    if not script or not script.strip():
-        return ""
-
-    lines = script.splitlines()
-    truncated = False
-
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        truncated = True
-
-    body = "\n".join(lines)
-
-    if len(body) > max_chars:
-        body = body[:max_chars]
-        # Trim to last complete line to avoid mid-line cut in code fence
-        last_nl = body.rfind("\n")
-        if last_nl > 0:
-            body = body[:last_nl]
-        truncated = True
-
-    result = f"```javascript\n{body}\n```"
-    if truncated:
-        result += "\n\n_(脚本已截断，完整内容将在执行时使用)_"
-
-    return result
 
 
 _VERDICT_LABELS = {
@@ -1226,7 +1198,12 @@ def render_completion_cards(
 
 
 def _result_ledger_entries(project: WorkflowProject) -> list[tuple[str, str, str]]:
-    terminal = {AgentStatus.DONE, AgentStatus.CACHED, AgentStatus.FAILED}
+    terminal = {
+        AgentStatus.DONE,
+        AgentStatus.CACHED,
+        AgentStatus.FAILED,
+        AgentStatus.CANCELLED,
+    }
     flattened = [agent for phase in project.phases for agent in phase.agents]
     ordered_agents = [
         agent
@@ -1240,6 +1217,7 @@ def _result_ledger_entries(project: WorkflowProject) -> list[tuple[str, str, str
         AgentStatus.DONE: "已完成",
         AgentStatus.CACHED: "缓存命中",
         AgentStatus.FAILED: "失败",
+        AgentStatus.CANCELLED: "已取消",
     }
     entries: list[tuple[str, str, str]] = []
     for ordinal, agent in enumerate(ordered_agents, start=1):
@@ -1310,11 +1288,21 @@ def _result_ledger_entries(project: WorkflowProject) -> list[tuple[str, str, str
     return entries
 
 
-def _result_ledger_card(project: WorkflowProject, elements: list[dict[str, Any]]) -> dict[str, Any]:
+def _result_ledger_card(
+    project: WorkflowProject,
+    elements: list[dict[str, Any]],
+    *,
+    page: int = 0,
+    total: int = 0,
+) -> dict[str, Any]:
     name = _middle_ellipsis(project.name or "Workflow", 32)
+    page_suffix = f" · {page}/{total}" if total > 1 else ""
     return {
         "header": {
-            "title": {"tag": "plain_text", "content": f"📚 {name} · 结果账本"},
+            "title": {
+                "tag": "plain_text",
+                "content": f"📚 {name} · 结果账本{page_suffix}",
+            },
             "template": "blue",
         },
         "elements": elements,
@@ -1409,7 +1397,11 @@ def _render_result_ledger_cards(project: WorkflowProject) -> list[dict[str, Any]
 
     if current:
         page_elements.append(current)
-    return [_result_ledger_card(project, elements) for elements in page_elements]
+    total = len(page_elements)
+    return [
+        _result_ledger_card(project, elements, page=index, total=total)
+        for index, elements in enumerate(page_elements, start=1)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1417,52 +1409,42 @@ def _render_result_ledger_cards(project: WorkflowProject) -> list[dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def _enforce_card_size(elements: list[dict]) -> list[dict]:
-    """Truncate card elements if they would exceed Feishu's 30KB payload limit.
+def _paginate_progress_cards(
+    header: dict[str, Any],
+    elements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Split progress elements into cards without deleting scheduling rows."""
 
-    Progressive truncation strategy:
-    1. Truncate any long text content (> 500 chars) in markdown elements
-    2. Remove elements from the end (footer/metrics first, keeping phases)
-    3. If still over, aggressively truncate remaining markdown to 200 chars
+    def _card(page_elements: list[dict[str, Any]], page: int = 0, total: int = 0) -> dict[str, Any]:
+        page_header = {
+            **header,
+            "title": dict(header.get("title") or {}),
+        }
+        if total > 1:
+            title = str(page_header["title"].get("content") or "Workflow")
+            page_header["title"]["content"] = f"{title} · {page + 1}/{total}"
+        return {"header": page_header, "elements": page_elements}
 
-    Returns the (possibly trimmed) element list.
-    """
-    import json as _json
-
-    serialized = _json.dumps(elements, ensure_ascii=False)
-    byte_len = len(serialized.encode("utf-8", errors="surrogatepass"))
-    if byte_len <= _CARD_MAX_BYTES:
-        return elements
-
-    # Strategy 1: Moderate truncation of long markdown text
-    for elem in elements:
-        if isinstance(elem, dict) and elem.get("tag") == "markdown":
-            content = elem.get("content", "")
-            if isinstance(content, str) and len(content) > 500:
-                elem["content"] = content[:497] + "..."
-
-    serialized = _json.dumps(elements, ensure_ascii=False)
-    byte_len = len(serialized.encode("utf-8", errors="surrogatepass"))
-    if byte_len <= _CARD_MAX_BYTES:
-        return elements
-
-    # Strategy 2: Remove from the end (footer/metrics go first) — keeping the
-    # front which contains summary, progress, and phase details (most useful)
-    while len(elements) > 3:
-        serialized = _json.dumps(elements, ensure_ascii=False)
-        byte_len = len(serialized.encode("utf-8", errors="surrogatepass"))
-        if byte_len <= _CARD_MAX_BYTES:
-            break
-        elements.pop()
-
-    # Strategy 3: Aggressive truncation if still over
-    serialized = _json.dumps(elements, ensure_ascii=False)
-    byte_len = len(serialized.encode("utf-8", errors="surrogatepass"))
-    if byte_len > _CARD_MAX_BYTES:
-        for elem in elements:
-            if isinstance(elem, dict) and elem.get("tag") == "markdown":
-                content = elem.get("content", "")
-                if isinstance(content, str) and len(content) > 200:
-                    elem["content"] = content[:197] + "..."
-
-    return elements
+    pages: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for element in elements:
+        candidate = [*current, element]
+        encoded = json.dumps(_card(candidate), ensure_ascii=False).encode(
+            "utf-8", errors="surrogatepass"
+        )
+        if len(encoded) <= _CARD_MAX_BYTES:
+            current = candidate
+            continue
+        if current:
+            pages.append(current)
+            current = []
+        single = json.dumps(_card([element]), ensure_ascii=False).encode(
+            "utf-8", errors="surrogatepass"
+        )
+        if len(single) > _CARD_MAX_BYTES:
+            raise ValueError("Workflow progress element exceeds Feishu card limit")
+        current = [element]
+    if current or not pages:
+        pages.append(current)
+    total = len(pages)
+    return [_card(page, index, total) for index, page in enumerate(pages)]

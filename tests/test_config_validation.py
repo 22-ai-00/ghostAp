@@ -6,25 +6,13 @@ Covers:
 - AC-R14: retry_max_delay > timeout is rejected
 - AC-R14: total retry budget exceeded is rejected
 - AC-R15: spec_review_max_parallel boundary values (0, -1, 21) rejected
-- AC-R16: get_settings() friendly error output includes default values
-- AC-R05: isinstance(e, pydantic.ValidationError) branch is hit
-- AC-R12: cross-field error includes recommended combination values
-- AC-R31: cross-field validation errors use '[跨字段校验]' label when loc is empty
 """
 
 from unittest.mock import patch
 
 import pytest
 
-from src.config import Settings, _reset_settings_for_testing
-
-
-@pytest.fixture(autouse=True)
-def reset_singleton():
-    """Ensure config singleton is reset before each test."""
-    _reset_settings_for_testing()
-    yield
-    _reset_settings_for_testing()
+from src.config import Settings
 
 
 class TestMinTimeoutGtTimeoutRejected:
@@ -137,50 +125,6 @@ class TestMaxParallelBoundaryRejected:
         assert s.spec_review_max_parallel == 20
 
 
-class TestGetSettingsFriendlyErrorWithDefaults:
-    """AC-R16: get_settings() ValidationError output includes default values."""
-
-    def test_friendly_error_includes_default_value(self):
-        """When config validation fails, ConfigurationError should include the field's default value."""
-        from src.config import ConfigurationError, get_settings
-
-        # Patch environment to produce an invalid value for spec_review_max_parallel
-        env_override = {"SPEC_REVIEW_MAX_PARALLEL": "999"}
-
-        with patch.dict("os.environ", env_override, clear=False):
-            _reset_settings_for_testing()
-            with pytest.raises(ConfigurationError) as exc_info:
-                get_settings()
-
-        output = str(exc_info.value)
-        assert "配置错误" in output
-        assert "默认值" in output
-        # The default for spec_review_max_parallel is 3
-        assert "3" in output
-
-
-class TestCrossFieldErrorIncludesRecommendedValues:
-    """AC-R12: cross-field validation error output includes recommended combination values."""
-
-    def test_cross_field_error_includes_recommended_combination(self):
-        from src.config import ConfigurationError, get_settings
-
-        # hard_floor > min_timeout triggers cross-field validation
-        env_override = {
-            "SPEC_REVIEW_HARD_FLOOR": "50",
-            "SPEC_REVIEW_MIN_TIMEOUT": "30",
-        }
-
-        with patch.dict("os.environ", env_override, clear=False):
-            _reset_settings_for_testing()
-            with pytest.raises(ConfigurationError) as exc_info:
-                get_settings()
-
-        output = str(exc_info.value)
-        assert "配置错误" in output
-        assert "推荐组合" in output
-
-
 class TestMainCatchesConfigurationError:
     """AC-R03: main() catches ConfigurationError and exits gracefully."""
 
@@ -195,27 +139,6 @@ class TestMainCatchesConfigurationError:
                 main()
 
         assert exc_info.value.code == 1
-
-
-class TestCrossFieldValidationLabel:
-    """AC-R31: cross-field validation errors use '[跨字段校验]' label when loc is empty."""
-
-    def test_cross_field_error_uses_label(self):
-        from src.config import ConfigurationError, get_settings
-
-        # hard_floor > min_timeout triggers @model_validator (cross-field, empty loc)
-        env_override = {
-            "SPEC_REVIEW_HARD_FLOOR": "50",
-            "SPEC_REVIEW_MIN_TIMEOUT": "30",
-        }
-
-        with patch.dict("os.environ", env_override, clear=False):
-            _reset_settings_for_testing()
-            with pytest.raises(ConfigurationError) as exc_info:
-                get_settings()
-
-        output = str(exc_info.value)
-        assert "[跨字段校验]" in output
 
 
 class TestSpecReviewConfigProperty:

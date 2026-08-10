@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 
 TerminalStatus = Literal[
-    "running", "completed", "failed", "cancelled", "paused", "awaiting_approval", "archived", "blocked"
+    "running", "completed", "failed", "cancelled", "paused", "archived", "blocked"
 ]
 
 TerminalReason = Literal[
@@ -92,7 +92,7 @@ class FooterState:
     Only the highest-priority non-None field is rendered. Callers should set
     exactly one of these fields per dispatch to avoid ambiguity.
     """
-    status: Literal["thinking", "tool_running", "waiting_approval", "idle"] | None = None
+    status: Literal["thinking", "tool_running", "idle"] | None = None
     status_text: str | None = None
     progress: str | None = None
     progress_pct: int | None = None  # Raw percentage (0-100), rendered by footer

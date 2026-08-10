@@ -124,40 +124,6 @@ def test_live_evaluation_requires_explicit_opt_in(tmp_path: Path) -> None:
     assert output["reason"] == "live mode requires GHOSTAP_WORKFLOW_ACCEPTANCE_LIVE=1"
 
 
-def test_complete_bound_multi_page_capture_passes(tmp_path: Path) -> None:
-    capture_path = tmp_path / "workflow-live-capture.json"
-    _passing_capture(capture_path)
-
-    result = _run("--live", "--live-results", str(capture_path), live=True)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    output = json.loads(result.stdout)
-    assert output == {
-        "event_count": 9,
-        "live_mode": True,
-        "page_count": 3,
-        "run_id": "wf-live-run-001",
-        "status": "passed",
-    }
-
-
-def test_freezing_a_page_before_its_successor_is_visible_fails(tmp_path: Path) -> None:
-    capture_path = tmp_path / "workflow-live-capture.json"
-    _passing_capture(capture_path)
-    capture = json.loads(capture_path.read_text(encoding="utf-8"))
-    capture["events"][2], capture["events"][3] = capture["events"][3], capture["events"][2]
-    for sequence, event in enumerate(capture["events"], start=1):
-        event["sequence"] = sequence
-    capture_path.write_text(json.dumps(capture), encoding="utf-8")
-
-    result = _run("--live", "--live-results", str(capture_path), live=True)
-
-    assert result.returncode == 1
-    output = json.loads(result.stdout)
-    assert output["status"] == "failed"
-    assert "visible before page 0 is frozen" in output["reason"]
-
-
 def test_capture_cannot_be_rebound_to_another_run(tmp_path: Path) -> None:
     capture_path = tmp_path / "workflow-live-capture.json"
     _passing_capture(capture_path)

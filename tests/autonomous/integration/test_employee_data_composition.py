@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import secrets
 import threading
@@ -14,6 +13,7 @@ from pydantic import SecretStr
 
 from src.autonomous.data.composition import (
     EmployeeDataComposition,
+    LegacyEmployeeDataUnsupportedError,
     build_employee_data_composition,
 )
 from src.autonomous.data.models import DataKind, ExecutionAttemptContext
@@ -22,13 +22,7 @@ from src.autonomous.data.ports import (
     PublishEmployeeDocumentCommand,
 )
 from src.autonomous.data.query import AuthenticatedDataRequest, HistoryQuerySpec
-from src.autonomous.data.service import DataWriteDisabledError
 from src.autonomous.journal.writer import JournalWriter
-from tests.autonomous.workforce_helpers import (
-    commit_events,
-    employee_created,
-    replay_state,
-)
 
 
 class _InMemoryAnchor:
@@ -75,7 +69,6 @@ def composition(tmp_path: Path) -> EmployeeDataComposition:
         admin_principal_ids=frozenset({"admin_1"}),
         main_bot_app_id="main_bot",
         agents_root=tmp_path / "agents",
-        legacy_base=tmp_path / "legacy",
     )
     yield comp
     comp.service._blob_store.close()
@@ -83,78 +76,6 @@ def composition(tmp_path: Path) -> EmployeeDataComposition:
 
 
 class TestFullComposition:
-    def test_workspace_rebuild_joins_workforce_and_knowledge_projection(
-        self,
-        composition: EmployeeDataComposition,
-    ) -> None:
-        writer = composition.service._writer
-        workforce = replay_state(writer)
-        commit_events(
-            writer,
-            workforce,
-            employee_created("agt_alpha", "Alpha"),
-        )
-        for generation in (1, 2):
-            composition.publish_document(
-                PublishEmployeeDocumentCommand(
-                    agent_id="agt_alpha",
-                    tenant_key="tenant_1",
-                    owner_principal_id="principal_owner",
-                    kind=DataKind.KNOWLEDGE_INDEX,
-                    source_id=DataKind.KNOWLEDGE_INDEX.value,
-                    content=f"# Knowledge index {generation}".encode(),
-                    content_type="text/markdown",
-                    idempotency_key=f"knowledge-index-{generation}",
-                )
-            )
-
-        snapshot = composition.workspace_projector.rebuild(
-            "tenant_1",
-            "agt_alpha",
-        )
-
-        assert snapshot.knowledge_generation == 2
-        now = (
-            composition.workspace_projector.root
-            / "agt_alpha/workspace/NOW.md"
-        ).read_text(encoding="utf-8")
-        assert "Knowledge generation: 2" in now
-
-    def test_workspace_source_manifest_contains_only_latest_page_version(
-        self,
-        composition: EmployeeDataComposition,
-    ) -> None:
-        writer = composition.service._writer
-        workforce = replay_state(writer)
-        commit_events(
-            writer,
-            workforce,
-            employee_created("agt_alpha", "Alpha"),
-        )
-        contents = (b"# Old page", b"# Current page")
-        for version, content in enumerate(contents, start=1):
-            composition.publish_document(
-                PublishEmployeeDocumentCommand(
-                    agent_id="agt_alpha",
-                    tenant_key="tenant_1",
-                    owner_principal_id="principal_owner",
-                    kind=DataKind.KNOWLEDGE_PAGE,
-                    source_id="stable_page",
-                    content=content,
-                    content_type="text/markdown",
-                    idempotency_key=f"stable-page-{version}",
-                )
-            )
-
-        composition.workspace_projector.rebuild("tenant_1", "agt_alpha")
-
-        manifest = (
-            composition.workspace_projector.root
-            / "agt_alpha/workspace/sources/manifest.yaml"
-        ).read_text(encoding="utf-8")
-        assert hashlib.sha256(contents[1]).hexdigest() in manifest
-        assert hashlib.sha256(contents[0]).hexdigest() not in manifest
-
     def test_production_composition_has_independent_canonical_authority(
         self,
         composition: EmployeeDataComposition,
@@ -226,46 +147,29 @@ class TestFullComposition:
         assert audits[0].operation == "history_query"
         assert audits[0].outcome == "granted"
 
-    def test_pre_cutover_production_writer_fails_closed(self, tmp_path: Path) -> None:
+    def test_unmigrated_legacy_data_is_explicitly_unsupported(
+        self, tmp_path: Path
+    ) -> None:
         settings = _FakeSettings(tmp_path)
+        legacy = tmp_path / "manual-agents" / "agt_alpha" / "memory"
+        legacy.mkdir(parents=True)
+        (legacy / "MEMORY.md").write_text("legacy")
         writer = JournalWriter.open(
             tmp_path / "manual-journal",
             anchor=_InMemoryAnchor(),
             hmac_key=secrets.token_bytes(32),
         )
-        comp = build_employee_data_composition(
-            settings=settings,
-            writer=writer,
-            admin_principal_ids=frozenset(),
-            main_bot_app_id="main_bot",
-            agents_root=tmp_path / "manual-agents",
-            auto_cutover=False,
-        )
-        ctx = ExecutionAttemptContext(
-            tenant_key="tenant_1",
-            agent_id="agt_alpha",
-            owner_principal_id="ou_owner",
-            requester_principal_id="ou_requester",
-            task_id="task_authority",
-            run_id="run_authority",
-            attempt_id="attempt_authority",
-            message_id="om_authority",
-            thread_root_id="",
-            chat_id="oc_team",
-            tool="codex",
-            model="gpt-test",
-            effort="high",
-            started_at="2026-07-14T00:00:00+00:00",
-            terminal_epoch=1,
-        )
-
-        with pytest.raises(DataWriteDisabledError, match="authority"):
-            comp.service.start_attempt(ctx)
-
-        comp.service.cutover_to_canonical()
-        comp.service.start_attempt(ctx)
-        assert ctx.attempt_id in comp.state.execution_attempts
-        comp.close()
+        with pytest.raises(
+            LegacyEmployeeDataUnsupportedError,
+            match="offline migration",
+        ):
+            build_employee_data_composition(
+                settings=settings,
+                writer=writer,
+                admin_principal_ids=frozenset(),
+                main_bot_app_id="main_bot",
+                agents_root=tmp_path / "manual-agents",
+            )
         writer.close()
 
     def test_publish_document_materializes_file(
@@ -284,33 +188,6 @@ class TestFullComposition:
         assert len(composition.state.employee_documents) == 1
         l1 = composition.memory_facade.read_l1("agt_alpha", "tenant_1")
         assert l1 == "# Memory content"
-
-    def test_rebuild_recovers_state(
-        self, composition: EmployeeDataComposition
-    ) -> None:
-        ctx = ExecutionAttemptContext(
-            tenant_key="tenant_1",
-            agent_id="agt_alpha",
-            owner_principal_id="principal_owner",
-            requester_principal_id="principal_requester",
-            task_id="task_2",
-            run_id="run_2",
-            attempt_id="attempt_rebuild",
-            message_id="msg_2",
-            thread_root_id="",
-            chat_id="chat_1",
-            tool="codex",
-            model="gpt-test",
-            effort="high",
-            started_at="2026-07-12T02:00:00+00:00",
-            terminal_epoch=1,
-        )
-        composition.service.start_attempt(ctx)
-        composition.state.execution_attempts.clear()
-        composition.state.cursor_sequence = 0
-        composition.state.cursor_hash = ""
-        composition.rebuild_all()
-        assert "attempt_rebuild" in composition.state.execution_attempts
 
     def test_unanchored_attempt_raises(
         self, composition: EmployeeDataComposition
@@ -408,67 +285,6 @@ class TestFullComposition:
         assert [record.source_id for record in records] == ["task_alpha", "task_alpha"]
         assert [record.version for record in records] == [1, 2]
 
-    def test_rebuild_serializes_with_publish_without_losing_document(
-        self,
-        composition: EmployeeDataComposition,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        replay_entered = threading.Event()
-        release_replay = threading.Event()
-        publish_done = threading.Event()
-        errors: list[Exception] = []
-        original_replay = composition.service._writer.replay
-
-        def blocked_replay():
-            frames = tuple(original_replay())
-            replay_entered.set()
-            assert release_replay.wait(5)
-            return iter(frames)
-
-        monkeypatch.setattr(composition.service._writer, "replay", blocked_replay)
-
-        def rebuild() -> None:
-            try:
-                composition.rebuild_all()
-            except Exception as exc:
-                errors.append(exc)
-
-        command = PublishEmployeeDocumentCommand(
-            agent_id="agt_alpha",
-            tenant_key="tenant_1",
-            owner_principal_id="principal_owner",
-            kind=DataKind.L1_MEMORY,
-            source_id="l1_memory",
-            content=b"# Concurrent memory",
-            content_type="text/markdown",
-        )
-
-        def publish() -> None:
-            try:
-                composition.publish_document(command)
-            except Exception as exc:
-                errors.append(exc)
-            finally:
-                publish_done.set()
-
-        rebuild_thread = threading.Thread(target=rebuild)
-        publish_thread = threading.Thread(target=publish)
-        rebuild_thread.start()
-        assert replay_entered.wait(5)
-        publish_thread.start()
-        assert not publish_done.wait(0.1)
-        release_replay.set()
-        rebuild_thread.join(5)
-        publish_thread.join(5)
-
-        assert not rebuild_thread.is_alive()
-        assert not publish_thread.is_alive()
-        assert errors == []
-        assert composition.memory_facade.read_l1(
-            "agt_alpha",
-            "tenant_1",
-        ) == "# Concurrent memory"
-
     def test_gc_serializes_with_inflight_publish_before_quarantine(
         self,
         composition: EmployeeDataComposition,
@@ -529,68 +345,3 @@ class TestFullComposition:
             "agt_alpha",
             "tenant_1",
         ) == "# GC-safe memory"
-
-    def test_context_read_waits_for_atomic_projection_rebuild(
-        self,
-        composition: EmployeeDataComposition,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        composition.publish_document(
-            PublishEmployeeDocumentCommand(
-                agent_id="agt_alpha",
-                tenant_key="tenant_1",
-                owner_principal_id="principal_owner",
-                kind=DataKind.L1_MEMORY,
-                source_id="l1_memory",
-                content=b"# Stable memory",
-                content_type="text/markdown",
-            )
-        )
-        replay_entered = threading.Event()
-        release_replay = threading.Event()
-        read_done = threading.Event()
-        values: list[str | None] = []
-        errors: list[Exception] = []
-        original_replay = composition.service._writer.replay
-
-        def blocked_replay():
-            frames = tuple(original_replay())
-            replay_entered.set()
-            assert release_replay.wait(5)
-            return iter(frames)
-
-        monkeypatch.setattr(composition.service._writer, "replay", blocked_replay)
-
-        def rebuild() -> None:
-            try:
-                composition.rebuild_all()
-            except Exception as exc:
-                errors.append(exc)
-
-        def read() -> None:
-            try:
-                values.append(
-                    composition.memory_facade.read_l1(
-                        "agt_alpha",
-                        "tenant_1",
-                    )
-                )
-            except Exception as exc:
-                errors.append(exc)
-            finally:
-                read_done.set()
-
-        rebuild_thread = threading.Thread(target=rebuild)
-        read_thread = threading.Thread(target=read)
-        rebuild_thread.start()
-        assert replay_entered.wait(5)
-        read_thread.start()
-        assert not read_done.wait(0.1)
-        release_replay.set()
-        rebuild_thread.join(5)
-        read_thread.join(5)
-
-        assert not rebuild_thread.is_alive()
-        assert not read_thread.is_alive()
-        assert errors == []
-        assert values == ["# Stable memory"]

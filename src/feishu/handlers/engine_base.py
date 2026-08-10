@@ -119,89 +119,6 @@ class BaseEngineHandler(BaseHandler):
         set_current_thread_id(thread_root_id)
         return thread_root_id
 
-    def _pause_engine_generic(
-        self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None, status_paused_enum: Any = None
-    ):
-        """Generic pause logic."""
-        root_path = project.root_path if project else self.get_working_dir(chat_id)
-        manager = self._get_engine_manager()
-        engine = manager.get(chat_id, root_path)
-
-        if not engine:
-            engine = manager.get_active_engine(chat_id)
-
-        if engine and engine.is_running:
-            engine.pause()
-            self._show_status(message_id, chat_id, project=project)
-            return
-
-        self.reply_text(message_id, f"当前没有正在执行的 {self._get_engine_name_prefix()} 任务")
-
-    def _resume_engine_generic(
-        self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None, status_paused_enum: Any = None
-    ):
-        """Generic resume logic."""
-        if project is None:
-            project = self.project_manager.get_active_project(chat_id)
-
-        root_path = project.root_path if project else self.get_working_dir(chat_id)
-        manager = self._get_engine_manager()
-        engine = manager.get(chat_id, root_path)
-
-        if not engine:
-            paused = [e for e in manager.list_engines(chat_id) if e.project and e.project.status == status_paused_enum]
-            if len(paused) == 1:
-                engine = paused[0]
-            elif len(paused) > 1:
-                self.reply_text(
-                    message_id,
-                    f"⚠️ 有多个项目存在可恢复的 {self._get_engine_name_prefix()} 任务，请查看状态后切换项目再恢复",
-                )
-                return
-
-        if engine and engine.project and engine.project.status == status_paused_enum:
-            if project is None:
-                try:
-                    project = self.project_manager.find_project_by_path(engine.root_path, chat_id=chat_id)
-                except Exception:
-                    project = None
-
-            callbacks = self._create_callbacks(message_id, chat_id, project, engine.engine_name, engine.root_path)
-
-            def run_resume():
-                engine.resume(callbacks)
-
-            request_id = self.ensure_request_id(
-                message_id, chat_id=chat_id, project_id=(project.project_id if project else None)
-            )
-            queue_key = f"{chat_id}:{self._get_task_type()}:{project.project_id if project else root_path}"
-
-            spec = TaskSpec(
-                chat_id=chat_id,
-                queue_key=queue_key,
-                name=f"{self._get_task_type()}_resume",
-                task_type=self._get_task_type(),
-                project_id=project.project_id if project else None,
-                message_id=message_id,
-                origin_message_id=message_id,
-                request_id=request_id,
-                priority=TaskPriority.HIGH,
-            )
-            handle = self.scheduler.submit(spec, lambda ctx: run_resume())
-            try:
-                self.ctx.message_linker.link_task(message_id, handle.run_id)
-            except Exception as e:
-                logger.debug(
-                    "link_task失败(%s_resume): message_id=%s, run_id=%s, err=%s",
-                    self._get_task_type(),
-                    message_id,
-                    handle.run_id,
-                    e,
-                )
-            self._show_status(message_id, chat_id, project=project)
-        else:
-            self.reply_text(message_id, f"当前没有可恢复的 {self._get_engine_name_prefix()} 任务")
-
     def _stop_engine_generic(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         """Generic stop logic."""
         if project is None:
@@ -324,11 +241,6 @@ class BaseEngineHandler(BaseHandler):
                         detail_action={
                             "action": "show_error_details",
                             "engine_type": action_prefix,
-                            "task_id": task_id,
-                            "request_id": request_id or "",
-                        },
-                        retry_action={
-                            "action": f"{action_prefix}_resume",
                             "task_id": task_id,
                             "request_id": request_id or "",
                         },
@@ -489,11 +401,11 @@ class BaseEngineHandler(BaseHandler):
         project: Optional["ProjectContext"] = None,
     ):
         """
-        Execute lifecycle actions (pause, resume, stop) with safe error handling.
+        Execute explicit lifecycle actions with safe error handling.
 
         Args:
             action_func: Lambda or function to execute the action
-            action_name: Name of action for logging (e.g. "pause", "resume")
+            action_name: Name of action for logging (currently "stop")
             chat_id: Chat ID
             message_id: Origin message ID
             project: Project context (optional)

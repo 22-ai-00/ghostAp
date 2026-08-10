@@ -6,7 +6,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
-from ...card import CardBuilder
+from ...card.builders.project import ProjectBuilder
 from ...card.ui_text import UI_TEXT
 from ...project import ContextEntryType, ContextSourceMode
 from .base import BaseHandler
@@ -29,7 +29,7 @@ class ProjectHandler(BaseHandler):
         )
 
         if success and project:
-            msg_type, card_content = CardBuilder.build_project_created_card(project)
+            msg_type, card_content = ProjectBuilder.build_project_created_card(project)
             response_id = self.reply_card(message_id, card_content)
             if response_id:
                 self.register_message_project(response_id, project)
@@ -41,7 +41,7 @@ class ProjectHandler(BaseHandler):
         active_project = self.project_manager.get_active_project(chat_id)
         current_id = active_project.project_id if active_project else None
 
-        msg_type, content = CardBuilder.build_status_board_card(projects, current_id, page=page)
+        msg_type, content = ProjectBuilder.build_status_board_card(projects, current_id, page=page)
 
         if origin_message_id:
             if self.update_card(origin_message_id, content):
@@ -63,7 +63,7 @@ class ProjectHandler(BaseHandler):
             return
 
         global_working_dir = self.get_working_dir(chat_id)
-        msg_type, card_content = CardBuilder.build_current_project_card(project, global_working_dir)
+        msg_type, card_content = ProjectBuilder.build_current_project_card(project, global_working_dir)
         response_id = self.reply_card(message_id, card_content)
         if response_id:
             self.register_message_project(response_id, project)
@@ -80,7 +80,7 @@ class ProjectHandler(BaseHandler):
             return
 
         global_working_dir = self.get_working_dir(chat_id)
-        msg_type, card_content = CardBuilder.build_project_status_report_card(project, global_working_dir)
+        msg_type, card_content = ProjectBuilder.build_project_status_report_card(project, global_working_dir)
 
         if origin_message_id:
             if self.update_card(origin_message_id, card_content):
@@ -179,7 +179,7 @@ class ProjectHandler(BaseHandler):
                 self.reply_error(message_id, hint)
                 return
             results = self.project_manager.search_projects(name, chat_id=chat_id)
-            content = CardBuilder.build_project_not_found_content(name, results)
+            content = ProjectBuilder.build_project_not_found_content(name, results)
             self.reply_error(message_id, content, title=UI_TEXT["project_not_found_title"])
             return
 
@@ -221,7 +221,7 @@ class ProjectHandler(BaseHandler):
         if auto_enter_coco and coco_handler:
             coco_handler.enter_mode(message_id, chat_id, project=project)
         else:
-            msg_type, card_content = CardBuilder.build_project_switch_notification_card(project, restore_info)
+            msg_type, card_content = ProjectBuilder.build_project_switch_notification_card(project, restore_info)
 
             response_id = self.reply_card(message_id, card_content)
             if response_id:

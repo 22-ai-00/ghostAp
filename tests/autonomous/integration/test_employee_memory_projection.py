@@ -136,28 +136,10 @@ class TestEmployeeMemoryFacade:
         facade = EmployeeMemoryFacade(
             materializer=mat,
             state=state,
-            legacy_base_path=tmp_path / "legacy",
         )
         result = facade.read_l1("agt_alpha", "tenant_1")
         assert result == "# Canonical Memory"
 
-    def test_falls_back_to_legacy_l1(self, tmp_path: Path) -> None:
-        mat = EmployeeDocumentMaterializer(tmp_path / "agents")
-        legacy_path = tmp_path / "legacy" / "agents" / "agt_beta" / "memory"
-        legacy_path.mkdir(parents=True)
-        (legacy_path / "MEMORY.md").write_text("# Legacy Memory")
-        state = DataProjectionState()
-        facade = EmployeeMemoryFacade(
-            materializer=mat,
-            state=state,
-            legacy_base_path=tmp_path / "legacy",
-        )
-        result = facade.read_l1(
-            "agt_beta",
-            "tenant_1",
-            allow_unscoped_legacy=True,
-        )
-        assert result == "# Legacy Memory"
 
     def test_returns_none_when_no_memory_exists(self, tmp_path: Path) -> None:
         mat = EmployeeDocumentMaterializer(tmp_path / "agents")

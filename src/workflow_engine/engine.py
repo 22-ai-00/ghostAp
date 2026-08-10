@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from ..engine_base import BaseEngine, EngineRunState
-from ..spec_engine.review_agents import ReviewAgentBinding
+from ..spec_engine.models import ReviewAgentBinding
 from .bridge import RuntimeBridge
 from .constants import (
     DEFAULT_MAX_CONCURRENT,
@@ -24,7 +24,6 @@ from .constants import (
 )
 from .errors import _strip_internal_details
 from .executor import AgentExecutor
-from .history import WorkflowHistory
 from .journal import WorkflowJournal
 from .models import (
     AgentCallParams,
@@ -196,7 +195,7 @@ class WorkflowEngine(BaseEngine):
     """Orchestrates multi-step AI workflows using a Node.js runtime bridge.
 
     Lifecycle:
-        1. Handler calls execute_workflow(requirement, script_path, callbacks)
+        1. Handler calls execute_workflow(script_path=..., run_spec=..., callbacks=...)
         2. Engine creates journal, executor, bridge
         3. Bridge spawns Node.js subprocess running the workflow script
         4. Script issues agent() calls via JSON-RPC → bridge dispatches to executor
@@ -491,82 +490,21 @@ class WorkflowEngine(BaseEngine):
     # Main execution entry point
     # ------------------------------------------------------------------
 
-    def _build_legacy_run_spec(
-        self,
-        *,
-        requirement: str | None,
-        selected_tools: list[str] | None,
-        initiator_user_id: str | None,
-    ) -> WorkflowRunSpec:
-        """Adapt direct/legacy callers to a complete explicit contract.
-
-        Production confirmation never takes this path. Keeping the adapter at
-        the boundary lets existing template and engine tests use the older
-        signature without allowing a partially-bound mutable project inside
-        the engine.
-        """
-        tools = tuple(
-            dict.fromkeys(
-                str(tool or "").strip()
-                for tool in (selected_tools or [self._agent_type or "coco"])
-                if str(tool or "").strip()
-            )
-        ) or ("coco",)
-        primary_tool = tools[0]
-        configured_model = (
-            str(self._model_name).strip()
-            if primary_tool == self._agent_type and self._model_name
-            else None
-        )
-        orchestrator = ReviewAgentBinding(
-            provider="legacy",
-            tool_name=primary_tool,
-            display_name=primary_tool,
-            agent_type=primary_tool,
-            model_name=configured_model,
-            model_display_name=configured_model,
-            selection_key=f"legacy:{primary_tool}:{configured_model or 'default'}",
-            use_default_model=configured_model is None,
-        )
-        return WorkflowRunSpec(
-            orchestrator=orchestrator,
-            reviewers=(),
-            tool_model_map={
-                tool: configured_model if tool == primary_tool else None
-                for tool in tools
-            },
-            task=str(requirement or "Workflow execution").strip() or "Workflow execution",
-            chat_id=str(self.chat_id or "workflow"),
-            topic_id=None,
-            budget=MAX_TOTAL_AGENTS,
-            deadline=None,
-            auto_reviewer=True,
-            initiator_user_id=initiator_user_id,
-            allowed_tools=tools,
-            enforce_tool_allowlist=selected_tools is not None,
-        )
-
     def execute_workflow(
         self,
-        requirement: Optional[str] = None,
-        script_path: str = "",
+        script_path: str,
         callbacks: Optional[WorkflowEngineCallbacks] = None,
         *,
-        run_spec: Optional[WorkflowRunSpec] = None,
-        selected_tools: Optional[list[str]] = None,
-        initiator_user_id: Optional[str] = None,
+        run_spec: WorkflowRunSpec,
         start_owner: Any = None,
         source_script_path: Optional[str] = None,
     ) -> WorkflowProject:
         """Execute a workflow script end-to-end.
 
         Args:
-            requirement: Legacy form of the user's requirement. New handler
-                paths pass it inside ``run_spec``.
             script_path: Absolute path to the .js workflow script.
             callbacks: Optional event callbacks for progress/completion.
-            run_spec: Frozen confirmation-time execution contract.
-            selected_tools: Optional tool whitelist; agents may only use these tools.
+            run_spec: Frozen automatic-admission execution contract.
             start_owner: Optional handler lifecycle token for a queued start.
             source_script_path: Stable generated source retained for save/reuse.
 
@@ -577,20 +515,6 @@ class WorkflowEngine(BaseEngine):
             RuntimeError: If Node.js is unavailable or the bridge fails fatally.
         """
         run_callbacks = callbacks or WorkflowEngineCallbacks()
-        if run_spec is None:
-            run_spec = self._build_legacy_run_spec(
-                requirement=requirement,
-                selected_tools=selected_tools,
-                initiator_user_id=initiator_user_id,
-            )
-        else:
-            if requirement is not None and requirement.strip() != run_spec.task:
-                raise ValueError("Workflow requirement conflicts with frozen run spec")
-            if selected_tools is not None and tuple(selected_tools) != run_spec.allowed_tools:
-                raise ValueError("Workflow selected tools conflict with frozen run spec")
-            if initiator_user_id is not None and initiator_user_id != run_spec.initiator_user_id:
-                raise ValueError("Workflow initiator conflicts with frozen run spec")
-
         requirement = run_spec.task
         selected_tools = (
             list(run_spec.allowed_tools)
@@ -605,7 +529,7 @@ class WorkflowEngine(BaseEngine):
         max_concurrent = DEFAULT_MAX_CONCURRENT
         try:
             if script_path:
-                from .templates import parse_template_meta
+                from .script_gen import extract_meta_from_script
 
                 script_content = None
                 try:
@@ -614,9 +538,14 @@ class WorkflowEngine(BaseEngine):
                 except OSError:
                     script_content = None
                 if script_content:
-                    script_meta = parse_template_meta(script_content)
-            if script_meta is not None and script_meta.max_concurrent:
-                max_concurrent = int(script_meta.max_concurrent)
+                    script_meta = extract_meta_from_script(script_content)
+            if script_meta is not None:
+                configured_concurrency = script_meta.get(
+                    "maxConcurrent",
+                    script_meta.get("max_concurrent"),
+                )
+                if configured_concurrency:
+                    max_concurrent = int(configured_concurrency)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to parse workflow script meta: %s", repr(exc))
             script_meta = None
@@ -750,6 +679,7 @@ class WorkflowEngine(BaseEngine):
                 cancel_event=self._cancel_event,
                 max_workers=max_concurrent,
                 on_activity=self._handle_agent_activity,
+                on_attempt=self._handle_agent_attempt,
                 on_subagent_update=self._handle_agent_subagent_update,
             )
             self._state_manager = WorkflowStateManager(project)
@@ -786,7 +716,6 @@ class WorkflowEngine(BaseEngine):
                     on_log=self._handle_log,
                     cancel_event=self._cancel_event,
                     allowed_tools=selected_tools,
-                    initiator_user_id=project.initiator_user_id,
                     workflow_deadline_monotonic=run_spec.deadline,
                 )
                 bridge = self._bridge
@@ -1000,13 +929,6 @@ class WorkflowEngine(BaseEngine):
                 self.save_state()
             except Exception as save_err:
                 logger.debug("Failed to save workflow state: %s", save_err)
-
-            # Record in execution history
-            try:
-                history = WorkflowHistory(self.root_path)
-                history.record(project)
-            except Exception as hist_err:
-                logger.debug("Failed to record workflow history: %s", hist_err)
 
             execution_path = getattr(
                 start_owner,
@@ -1323,6 +1245,8 @@ class WorkflowEngine(BaseEngine):
                     label,
                     result.error,
                     result=_agent_card_result_text(result),
+                    token_usage=result.token_usage,
+                    duration_s=result.duration_s,
                 )
             else:
                 self._state_manager.on_agent_done(
@@ -1362,6 +1286,12 @@ class WorkflowEngine(BaseEngine):
         """
         if self._state_manager:
             self._state_manager.update_agent_activity(label, activity)
+            self._fire_progress()
+
+    def _handle_agent_attempt(self, label: str, attempt: int) -> None:
+        """Expose bounded executor retries in the authoritative agent row."""
+        if self._state_manager:
+            self._state_manager.update_agent_attempt(label, attempt)
             self._fire_progress()
 
     def _handle_agent_subagent_update(

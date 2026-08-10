@@ -60,7 +60,6 @@ class RecordedSession:
         self.last_active = self.created_at
         self.message_count = 0
         self.last_query = ""
-        self.is_resumed = False
         self.cancel_count = 0
         self._force_dead = False
         self._fail_first_attempt = bool(factory_kwargs.get("fail_first_attempt", False))
@@ -71,10 +70,6 @@ class RecordedSession:
     def start(self, startup_timeout: float = 60) -> str:
         return self.session_id
 
-    def load_session(self, session_id: str, timeout: float = 60) -> None:
-        del timeout
-        self.session_id = session_id
-        self.is_resumed = True
 
     def load_local_history(self, session_id: str | None = None, limit: int = 200) -> list[dict]:
         return []

@@ -71,8 +71,6 @@ class _CancelOnOutputProcess(_DelayedOutputProcess):
         yield "partial output\n"
 
 
-
-
 class _StubbornTimeoutProcess:
     def __init__(self) -> None:
         self.stderr = io.StringIO("")
@@ -123,7 +121,6 @@ class _TermIgnoringTimeoutProcess(_StubbornTimeoutProcess):
         self.events.append("terminate")
 
 
-
 def _claude_session() -> SyncClaudeCLISession:
     session = SyncClaudeCLISession(
         cwd="/tmp",
@@ -151,38 +148,17 @@ def test_claude_timeout_is_not_reported_as_cancelled() -> None:
     assert "超时" in result.text
 
 
-@pytest.mark.parametrize("terminal_state", ["cancelled", "timeout"])
-def test_claude_fresh_retry_propagates_second_terminal_state(
-    terminal_state: str,
-) -> None:
+def test_claude_cancel_is_reported_as_cancelled() -> None:
     session = _claude_session()
-    session.is_resumed = True
-    missing = _CompletedProcess(
-        stdout="",
-        stderr="No conversation found with session ID: session-1\n",
-        returncode=1,
-    )
-    retry = (
-        _CancelOnOutputProcess(session)
-        if terminal_state == "cancelled"
-        else _DelayedOutputProcess()
-    )
+    process = _CancelOnOutputProcess(session)
 
-    with (
-        patch(
-            "src.agent_session.claude_cli.subprocess.Popen",
-            side_effect=[missing, retry],
-        ),
-        patch(
-            "src.agent_session.claude_cli.uuid.uuid4",
-            return_value="fresh-session",
-        ),
+    with patch(
+        "src.agent_session.claude_cli.subprocess.Popen",
+        return_value=process,
     ):
-        result = session.send_prompt("work", timeout=0.01)
+        result = session.send_prompt("work", timeout=1)
 
-    assert result.stop_reason == terminal_state
-
-
+    assert result.stop_reason == "cancelled"
 
 
 def test_claude_timeout_kills_stubborn_process_and_stays_timeout() -> None:
@@ -200,8 +176,6 @@ def test_claude_timeout_kills_stubborn_process_and_stays_timeout() -> None:
     assert process.kill_calls == 1
     assert process.poll() == -9
     assert session._proc is None
-
-
 
 
 def test_claude_watchdog_kills_term_ignoring_process_with_blocked_stdout() -> None:
@@ -232,8 +206,6 @@ def test_claude_watchdog_kills_term_ignoring_process_with_blocked_stdout() -> No
     assert process.kill_calls == 1
     assert process.events[-2:] == ["kill", "wait"]
     assert session._proc is None
-
-
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")

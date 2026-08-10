@@ -12,6 +12,16 @@ from src.feishu.ws_client import (
 )
 
 
+def _bind_reply_transport(client, *, return_value=None):
+    from unittest.mock import MagicMock
+
+    reply_text = MagicMock(return_value=return_value)
+    client._handler_ctx = SimpleNamespace(
+        handlers={"coco": SimpleNamespace(reply_text=reply_text)}
+    )
+    return reply_text
+
+
 def test_scheduler_factory_does_not_publish_service_identity_during_construction(
     tmp_path,
     monkeypatch,
@@ -137,7 +147,7 @@ def test_connected_readiness_does_not_wait_for_employee_recovery() -> None:
     client._employee_runtime_recovery_error = None
     client._employee_runtime_init_cleanup_done = False
     client._closed = False
-    client._reply_text = lambda *_args, **_kwargs: None
+    _bind_reply_transport(client)
 
     client._record_ws_activity("connected")
 
@@ -154,7 +164,6 @@ def _make_connected_recovery_client(*, recover=None):
     runtime = SimpleNamespace(
         recover=recover or MagicMock(),
         close=MagicMock(),
-        fail_recovery=MagicMock(),
         membership_service=SimpleNamespace(
             reconcile_projected_memberships=MagicMock(
                 return_value=SimpleNamespace(removed=0, degraded=0)
@@ -171,7 +180,7 @@ def _make_connected_recovery_client(*, recover=None):
     client._employee_runtime_recovery_error = None
     client._employee_runtime_init_cleanup_done = False
     client._closed = False
-    client._reply_text = MagicMock()
+    _bind_reply_transport(client)
     return client
 
 
@@ -203,9 +212,6 @@ def test_employee_recovery_failure_keeps_main_ws_ready() -> None:
 
     client._restart_gate.mark_ready.assert_called_once_with(service_pid=os.getpid())
     assert client._employee_runtime_recovery_error is failure
-    client._employee_department_runtime.fail_recovery.assert_called_once_with(
-        "background_recovery"
-    )
     client._employee_department_runtime.close.assert_not_called()
 
 
@@ -247,18 +253,14 @@ def test_employee_hire_status_uuid_is_stable_per_intent_and_status() -> None:
     assert _employee_hire_status_uuid("hire-intent-1", "ready") != expected
 
 
-def test_main_dispatcher_consumes_p2p_chat_entered_event_without_error() -> None:
-    """The Channel SDK still delivers this subscribed informational event."""
+def test_main_dispatcher_acknowledges_p2p_chat_entered_event() -> None:
+    """Subscribed informational events are explicitly consumed as no-ops."""
     from src.feishu.ws_client import FeishuWSClient
 
     client = object.__new__(FeishuWSClient)
-    entered = []
     client._handle_message = lambda _event: None
-    client._handle_reaction_created = lambda _event: None
     client._handle_bot_deleted = lambda _event: None
-    client._handle_message_read = lambda _event: None
     client._handle_card_action = lambda _event: None
-    client._handle_chat_entered = entered.append
 
     event_handler = client._build_event_handler()
     payload = {
@@ -279,8 +281,6 @@ def test_main_dispatcher_consumes_p2p_chat_entered_event_without_error() -> None
     )
 
     assert result is None
-    assert len(entered) == 1
-    assert entered[0].event == payload["event"]
 
 
 
@@ -431,7 +431,7 @@ def test_recovered_hire_notification_restores_trusted_recipient_scope() -> None:
     client = FeishuWSClient.__new__(FeishuWSClient)
     client._message_linker = MessageLinker()
     client._get_chat_mode = MagicMock(return_value="p2p")
-    client._reply_text = MagicMock(return_value="om_status")
+    reply_text = _bind_reply_transport(client, return_value="om_status")
     state = SimpleNamespace(
         intent_id="hire_1",
         tenant_key="tenant-a",
@@ -449,7 +449,7 @@ def test_recovered_hire_notification_restores_trusted_recipient_scope() -> None:
     assert origin["sender_id"] == "ou_requester"
     assert origin["chat_type"] == "p2p"
     assert origin["tenant_key"] == "tenant-a"
-    client._reply_text.assert_called_once()
+    reply_text.assert_called_once()
     assert get_current_tenant_key() is None
 
 
@@ -468,7 +468,7 @@ def test_recovered_hire_notification_rejects_conflicting_recipient_scope() -> No
         chat_type="p2p",
     )
     client._get_chat_mode = MagicMock(return_value="p2p")
-    client._reply_text = MagicMock()
+    reply_text = _bind_reply_transport(client)
     state = SimpleNamespace(
         intent_id="hire_1",
         tenant_key="tenant-a",
@@ -479,7 +479,7 @@ def test_recovered_hire_notification_rejects_conflicting_recipient_scope() -> No
     )
 
     assert client._reply_employee_hire_status(state, "ready") is None
-    client._reply_text.assert_not_called()
+    reply_text.assert_not_called()
     client._get_chat_mode.assert_not_called()
 
 
@@ -493,7 +493,7 @@ def test_recovered_team_notification_restores_trusted_recipient_scope() -> None:
     client = FeishuWSClient.__new__(FeishuWSClient)
     client._message_linker = MessageLinker()
     client._get_chat_mode = MagicMock(return_value="group")
-    client._reply_text = MagicMock(return_value="om_team_result")
+    reply_text = _bind_reply_transport(client, return_value="om_team_result")
 
     assert client._reply_employee_team_message(
         "om_team_task",
@@ -510,7 +510,7 @@ def test_recovered_team_notification_restores_trusted_recipient_scope() -> None:
     assert origin["sender_id"] == "ou_requester"
     assert origin["chat_type"] == "group"
     assert origin["tenant_key"] == "tenant-a"
-    client._reply_text.assert_called_once_with(
+    reply_text.assert_called_once_with(
         "om_team_task",
         "团队任务已完成",
         idempotency_key="team-notify-key",
@@ -528,7 +528,7 @@ def test_recovered_team_notification_transport_failure_is_retryable() -> None:
     client = FeishuWSClient.__new__(FeishuWSClient)
     client._message_linker = MessageLinker()
     client._get_chat_mode = MagicMock(return_value="group")
-    client._reply_text = MagicMock(return_value=None)
+    _bind_reply_transport(client)
 
     with pytest.raises(RuntimeError, match="delivery failed"):
         client._reply_employee_team_message(
@@ -558,7 +558,7 @@ def test_recovered_team_notification_scope_conflict_is_not_committed() -> None:
         chat_type="group",
     )
     client._get_chat_mode = MagicMock(return_value="group")
-    client._reply_text = MagicMock()
+    reply_text = _bind_reply_transport(client)
 
     with pytest.raises(RuntimeError, match="recipient scope"):
         client._reply_employee_team_message(
@@ -570,7 +570,7 @@ def test_recovered_team_notification_scope_conflict_is_not_committed() -> None:
             idempotency_key="team-notify-key",
         )
 
-    client._reply_text.assert_not_called()
+    reply_text.assert_not_called()
     client._get_chat_mode.assert_not_called()
 
 
@@ -584,13 +584,16 @@ def test_employee_runtime_recovery_requires_bound_reply_transport() -> None:
         recover=MagicMock(),
         close=MagicMock(),
     )
+    client._handler_ctx = SimpleNamespace(handlers={})
 
     with pytest.raises(RuntimeError, match="reply transport"):
         client._recover_employee_runtime_after_handler_binding()
     client._employee_department_runtime.recover.assert_not_called()
     client._employee_department_runtime.close.assert_called_once_with()
 
-    client._reply_text = MagicMock()
+    client._handler_ctx.handlers["coco"] = SimpleNamespace(
+        reply_text=MagicMock()
+    )
     client._employee_department_runtime.close.reset_mock()
     client._recover_employee_runtime_after_handler_binding()
 
@@ -609,7 +612,7 @@ def test_employee_runtime_recovery_failure_closes_runtime_once() -> None:
     )
     client = FeishuWSClient.__new__(FeishuWSClient)
     client._employee_department_runtime = runtime
-    client._reply_text = MagicMock()
+    _bind_reply_transport(client)
 
     with pytest.raises(RuntimeError, match="journal replay failed"):
         client._recover_employee_runtime_after_handler_binding()

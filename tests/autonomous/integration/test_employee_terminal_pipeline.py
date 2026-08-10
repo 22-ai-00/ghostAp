@@ -4,6 +4,14 @@ from __future__ import annotations
 
 import pytest
 
+from src.autonomous.gateway.coordinator import (
+    EmployeeDispatchCoordinator,
+    EmployeeDispatchError,
+)
+from src.autonomous.gateway.models import (
+    GatewayExecutionResult,
+    GatewayExecutionStatus,
+)
 from src.autonomous.journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
 
 _FRAME_KEY = b"gateway-test-frame-key-at-least-32-bytes"
@@ -29,20 +37,19 @@ def test_every_started_attempt_has_one_terminal_or_action_required(tmp_path) -> 
 
     from unittest.mock import patch
 
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
 
-    for status in dispatch.GatewayExecutionStatus:
+    for status in GatewayExecutionStatus:
         harness = _real_coordinator_harness(tmp_path / status.value)
         harness.data._shard_timezone = "Asia/Shanghai"
         prepared = harness.coordinator.prepare_next()
         assert prepared is not None
-        result = dispatch.GatewayExecutionResult(
+        result = GatewayExecutionResult(
             status=status,
-            output="done" if status is dispatch.GatewayExecutionStatus.COMPLETED else "",
-            safe_error_code="" if status is dispatch.GatewayExecutionStatus.COMPLETED else "safe",
+            output="done" if status is GatewayExecutionStatus.COMPLETED else "",
+            safe_error_code="" if status is GatewayExecutionStatus.COMPLETED else "safe",
         )
         prepare_sequence = harness.writer.anchor.read().sequence
         original_stage = harness.data.stage_history_payload
@@ -79,12 +86,12 @@ def test_every_started_attempt_has_one_terminal_or_action_required(tmp_path) -> 
             )
             == finalized
         )
-        conflicting = dispatch.GatewayExecutionResult(
+        conflicting = GatewayExecutionResult(
             status=status,
-            output="different" if status is dispatch.GatewayExecutionStatus.COMPLETED else "",
-            safe_error_code="different" if status is not dispatch.GatewayExecutionStatus.COMPLETED else "",
+            output="different" if status is GatewayExecutionStatus.COMPLETED else "",
+            safe_error_code="different" if status is not GatewayExecutionStatus.COMPLETED else "",
         )
-        with pytest.raises(dispatch.EmployeeDispatchError, match="conflicts"):
+        with pytest.raises(EmployeeDispatchError, match="conflicts"):
             harness.coordinator.finalize_attempt(
                 prepared.binding.attempt_id,
                 conflicting,
@@ -96,15 +103,12 @@ def test_history_blob_is_staged_before_atomic_terminal_commit() -> None:
     """Task 6 must not call BlobStore while holding the data/Journal locks."""
 
     from src.autonomous.data.service import EmployeeDataService
-    from src.autonomous.ingress import dispatch
 
     assert hasattr(EmployeeDataService, "stage_history_payload")
-    assert hasattr(dispatch, "EmployeeDispatchCoordinator")
-    assert hasattr(dispatch.EmployeeDispatchCoordinator, "finalize_attempt")
+    assert hasattr(EmployeeDispatchCoordinator, "finalize_attempt")
 
 
 def test_employee_terminal_card_hook_runs_after_atomic_terminal_anchor(tmp_path) -> None:
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
@@ -134,8 +138,8 @@ def test_employee_terminal_card_hook_runs_after_atomic_terminal_anchor(tmp_path)
         assert prepared is not None
         harness.coordinator.finalize_attempt(
             prepared.binding.attempt_id,
-            dispatch.GatewayExecutionResult(
-                dispatch.GatewayExecutionStatus.COMPLETED,
+            GatewayExecutionResult(
+                GatewayExecutionStatus.COMPLETED,
                 output="done",
             ),
             request_text=prepared.prompt,
@@ -149,7 +153,6 @@ def test_employee_terminal_card_hook_runs_after_atomic_terminal_anchor(tmp_path)
 def test_recovery_rebuilds_missing_terminal_snapshot_without_rerunning_acp(
     tmp_path,
 ) -> None:
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
@@ -172,8 +175,8 @@ def test_recovery_rebuilds_missing_terminal_snapshot_without_rerunning_acp(
     with pytest.raises(RuntimeError, match="crash after terminal anchor"):
         harness.coordinator.finalize_attempt(
             prepared.binding.attempt_id,
-            dispatch.GatewayExecutionResult(
-                dispatch.GatewayExecutionStatus.COMPLETED,
+            GatewayExecutionResult(
+                GatewayExecutionStatus.COMPLETED,
                 output="durable result",
             ),
             request_text=prepared.prompt,
@@ -206,7 +209,6 @@ def test_terminal_commit_section_never_replays_full_journal(
 ) -> None:
     from contextlib import contextmanager
 
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
@@ -236,12 +238,12 @@ def test_terminal_commit_section_never_replays_full_journal(
     monkeypatch.setattr(harness.writer, "replay", checked_replay)
     finalized = harness.coordinator.finalize_attempt(
         prepared.binding.attempt_id,
-        dispatch.GatewayExecutionResult(
-            dispatch.GatewayExecutionStatus.COMPLETED,
+        GatewayExecutionResult(
+            GatewayExecutionStatus.COMPLETED,
             output="done",
         ),
     )
-    assert finalized.status is dispatch.GatewayExecutionStatus.COMPLETED
+    assert finalized.status is GatewayExecutionStatus.COMPLETED
     harness.close()
 
 
@@ -249,7 +251,6 @@ def test_terminal_head_race_retries_without_restaging_or_rerunning_acp(
     tmp_path,
     monkeypatch,
 ) -> None:
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
@@ -293,12 +294,12 @@ def test_terminal_head_race_retries_without_restaging_or_rerunning_acp(
     monkeypatch.setattr(harness.data, "stage_history_payload", counting_stage)
     finalized = harness.coordinator.finalize_attempt(
         prepared.binding.attempt_id,
-        dispatch.GatewayExecutionResult(
-            dispatch.GatewayExecutionStatus.COMPLETED,
+        GatewayExecutionResult(
+            GatewayExecutionStatus.COMPLETED,
             output="already executed once",
         ),
     )
-    assert finalized.status is dispatch.GatewayExecutionStatus.COMPLETED
+    assert finalized.status is GatewayExecutionStatus.COMPLETED
     assert presync_calls == 2
     assert stage_calls == 1
     harness.close()
@@ -309,7 +310,6 @@ def test_history_failure_blocks_false_success_and_recovery_requires_action(
     monkeypatch,
 ) -> None:
     from src.autonomous.data.service import DataBlobError
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
@@ -325,8 +325,8 @@ def test_history_failure_blocks_false_success_and_recovery_requires_action(
     with pytest.raises(DataBlobError, match="fault"):
         harness.coordinator.finalize_attempt(
             prepared.binding.attempt_id,
-            dispatch.GatewayExecutionResult(
-                dispatch.GatewayExecutionStatus.COMPLETED,
+            GatewayExecutionResult(
+                GatewayExecutionStatus.COMPLETED,
                 output="must not become success",
             ),
         )
@@ -340,32 +340,7 @@ def test_history_failure_blocks_false_success_and_recovery_requires_action(
 
     recovered = harness.restart().recover_incomplete_attempts()
     assert len(recovered) == 1
-    assert recovered[0].status is dispatch.GatewayExecutionStatus.ACTION_REQUIRED
-    harness.close()
-
-
-def test_legacy_router_only_dispatch_recovers_to_action_required(tmp_path) -> None:
-    """A pre-coordinator dispatch is disposed safely and never re-executed."""
-
-    from tests.autonomous.integration.test_employee_router_queues import (
-        _commit_dispatch,
-    )
-    from tests.autonomous.integration.test_employee_team_gateway import (
-        _real_coordinator_harness,
-    )
-
-    harness = _real_coordinator_harness(tmp_path)
-    acceptance_id = next(iter(harness.router.state.by_acceptance_id))
-    _commit_dispatch(harness.router, harness.writer, acceptance_id)
-    assert harness.router.state.by_acceptance_id[acceptance_id].state == "dispatching"
-
-    restarted = harness.restart()
-    assert restarted.recover_incomplete_attempts() == ()
-    terminal = harness.router.state.by_acceptance_id[acceptance_id]
-    assert terminal.state == "terminal"
-    assert terminal.reason_code == "action_required"
-    assert restarted.recover_incomplete_attempts() == ()
-    assert not restarted.state.attempts
+    assert recovered[0].status is GatewayExecutionStatus.ACTION_REQUIRED
     harness.close()
 
 
@@ -375,7 +350,6 @@ def test_anchored_terminal_apply_failure_keeps_live_history_blob(
 ) -> None:
     """Once the frame anchors, its referenced blob is live despite apply failure."""
 
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import (
         _real_coordinator_harness,
     )
@@ -400,8 +374,8 @@ def test_anchored_terminal_apply_failure_keeps_live_history_blob(
     with pytest.raises(RuntimeError, match="apply fault"):
         harness.coordinator.finalize_attempt(
             prepared.binding.attempt_id,
-            dispatch.GatewayExecutionResult(
-                dispatch.GatewayExecutionStatus.COMPLETED,
+            GatewayExecutionResult(
+                GatewayExecutionStatus.COMPLETED,
                 output="durable output",
             ),
             request_text=prepared.prompt,
@@ -420,10 +394,9 @@ def test_anchored_terminal_apply_failure_keeps_live_history_blob(
 def test_gateway_result_has_explicit_timeout_cancel_and_failure_states() -> None:
     """The Team runner's Optional[str] must never be interpreted as success."""
 
-    from src.autonomous.ingress import dispatch
 
-    assert hasattr(dispatch, "GatewayExecutionResult")
-    statuses = {status.value for status in dispatch.GatewayExecutionStatus}
+    assert GatewayExecutionResult
+    statuses = {status.value for status in GatewayExecutionStatus}
     assert statuses == {
         "completed",
         "failed",
@@ -441,10 +414,9 @@ def test_attempt_binding_and_dispatch_commit_require_one_frame() -> None:
         GatewayProjectionState,
         reduce_gateway_frame,
     )
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import _binding
 
-    binding = _binding(dispatch)
+    binding = _binding()
     bound = JournalEvent(
         event_type=ATTEMPT_BOUND,
         aggregate_id=binding.attempt_id,
@@ -486,10 +458,9 @@ def test_first_attempt_terminal_wins_and_identical_replay_is_idempotent() -> Non
         GatewayProjectionState,
         reduce_gateway_frame,
     )
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import _binding
 
-    binding = _binding(dispatch)
+    binding = _binding()
     state = GatewayProjectionState()
     first_frame = _frame(
         [
@@ -590,10 +561,9 @@ def test_terminal_history_requires_exact_record_identity(mismatch) -> None:
         GatewayProjectionState,
         reduce_gateway_frame,
     )
-    from src.autonomous.ingress import dispatch
     from tests.autonomous.integration.test_employee_team_gateway import _binding
 
-    binding = _binding(dispatch)
+    binding = _binding()
     state = GatewayProjectionState()
     first = _frame(
         [

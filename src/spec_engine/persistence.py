@@ -216,88 +216,6 @@ def truncate_output(text: str, settings) -> str:
     return text[:max_chars] + "\n...\n(已截断，完整内容见落盘产物)"
 
 
-def save_failed_task(
-    *,
-    project: Optional[SpecProject],
-    root_path: str,
-    chat_id: str,
-    agent_type: str,
-    settings,
-    models_tried: list[str],
-    build_runtime_context_fn,
-    project_to_compact_dict_fn,
-    saved_task_id: Optional[str],
-    saved_task_signature: Optional[tuple[int, str, str]],
-    error: str,
-    cycle_num: int,
-    phase,
-    callbacks,
-) -> tuple[str, Optional[str], Optional[tuple[int, str, str]]]:
-    from .task_persistence import SpecTaskState, generate_task_id, save_task_state
-
-    error = str(error or "")
-    task_id_override = None
-    try:
-        from ..config import get_settings
-        env_override = get_settings().spec_failed_task_id_override.strip()
-        if env_override and hasattr(phase, "value") and phase.value == "build" and "internal error" in (error or "").lower():
-            task_id_override = env_override
-    except Exception:
-        logger.debug("Failed to read spec_failed_task_id_override from Settings", exc_info=True)
-        task_id_override = None
-
-    task_id = task_id_override or (project.task_id if project and project.task_id else generate_task_id())
-
-    phase_value = str(getattr(phase, "value", phase) or "")
-    sig = (int(cycle_num or 0), phase_value, str(task_id))
-    if saved_task_id and saved_task_signature == sig:
-        return saved_task_id, saved_task_id, saved_task_signature
-
-    failure_reason = f"Phase {phase_value} 失败: {error}" if phase_value and (error or "") else (error or "")
-    try:
-        if len(failure_reason) > 2000:
-            failure_reason = failure_reason[:2000] + "…(truncated)"
-    except Exception:
-        logger.debug("failure_reason truncation error", exc_info=True)
-
-    state = SpecTaskState(
-        task_id=task_id,
-        created_at=time.time(),
-        requirement=project.requirement if project else "",
-        project_path=root_path,
-        chat_id=chat_id,
-        agent_type=agent_type,
-        current_cycle=cycle_num,
-        current_phase=phase_value,
-        last_error=error,
-        retry_count=settings.spec_max_retries,
-        status="失败",
-        failure_reason=failure_reason,
-        models_tried=list(models_tried),
-        project_snapshot=project_to_compact_dict_fn() if project else None,
-        runtime_context=build_runtime_context_fn(),
-    )
-    saved_path = ""
-    try:
-        saved_path = save_task_state(state)
-    except Exception as e:
-        logger.warning("[Spec] 任务保存失败, task_id=%s, phase=%s, err=%s", task_id, phase_value, get_error_detail(e))
-        saved_path = ""
-
-    if saved_path:
-        new_saved_task_id = task_id
-        new_saved_task_signature = sig
-        logger.info("[Spec] 任务已保存, task_id=%s, phase=%s, error=%s", task_id, phase_value, error[:100])
-        if callbacks.on_task_saved:
-            callbacks.on_task_saved(task_id)
-    else:
-        new_saved_task_id = saved_task_id
-        new_saved_task_signature = saved_task_signature
-        logger.warning("[Spec] 任务未落盘, task_id=%s, phase=%s, error=%s", task_id, phase_value, error[:100])
-
-    return task_id, new_saved_task_id, new_saved_task_signature
-
-
 def project_to_compact_dict(
     project: SpecProject,
     settings,
@@ -325,6 +243,7 @@ def project_to_compact_dict(
         "started_at": project.started_at,
         "completed_at": project.completed_at,
         "error": project.error,
+        "auto_recovery_attempts": project.auto_recovery_attempts,
         "cycle_count_total": cycle_count_total,
         "work_items_total": work_items_total,
         "cycles": [c.to_dict() for c in (project.cycles[-tail_cycles:] if tail_cycles > 0 else [])],

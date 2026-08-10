@@ -17,7 +17,6 @@ if TYPE_CHECKING:
     from src.acp.models import ACPEvent
 
     from .payloads import (
-        BlockedPayload,
         CardSplitPayload,
         CompletedPayload,
         CriteriaUpdatedPayload,
@@ -27,7 +26,6 @@ if TYPE_CHECKING:
         ImagePayload,
         PhaseDonePayload,
         PhaseStartedPayload,
-        PlanUpdatedPayload,
         ProgressPayload,
         ReasoningBlockPayload,
         ReviewResultUpdatedPayload,
@@ -36,8 +34,6 @@ if TYPE_CHECKING:
         SpecTasksUpdatedPayload,
         TextBlockPayload,
         ToolDeltaPayload,
-        ToolDonePayload,
-        ToolFailedPayload,
         ToolModelChangedPayload,
         ToolStartedPayload,
         WarningPayload,
@@ -203,20 +199,6 @@ class CardEvent(Generic[P]):
         return cls(type=CardEventType.ARCHIVED, payload=payload)
 
     @classmethod
-    def blocked(cls, reason: str = "") -> CardEvent[BlockedPayload]:
-        """Signal that the engine session is blocked and cannot proceed.
-
-        Payload: {reason?: str} — optional reason explaining why the task is blocked.
-        Triggered when: Engine encounters a blocking condition (e.g. lock conflict, awaiting external input).
-        """
-        if not isinstance(reason, str):
-            raise TypeError(f"reason must be str, got {type(reason).__name__}")
-        payload = {}
-        if reason:
-            payload["reason"] = reason
-        return cls(type=CardEventType.BLOCKED, payload=payload)
-
-    @classmethod
     def text_started(
         cls,
         block_id: str,
@@ -282,17 +264,6 @@ class CardEvent(Generic[P]):
         return cls(type=CardEventType.REASONING_STARTED, payload={"block_id": block_id})
 
     @classmethod
-    def reasoning_delta(cls, block_id: str, text: str) -> CardEvent[ReasoningBlockPayload]:
-        """Append content to an active reasoning block.
-
-        Payload: {block_id: str, text: str}
-        Triggered when: Model streams a reasoning chunk.
-        """
-        if not block_id:
-            raise ValueError("block_id is required for reasoning_delta")
-        return cls(type=CardEventType.REASONING_DELTA, payload={"block_id": block_id, "text": text})
-
-    @classmethod
     def reasoning_done(cls, block_id: str) -> CardEvent[ReasoningBlockPayload]:
         """Signal that a reasoning block has finished.
 
@@ -328,30 +299,6 @@ class CardEvent(Generic[P]):
         if not block_id:
             raise ValueError("block_id is required for tool_delta")
         return cls(type=CardEventType.TOOL_DELTA, payload={"block_id": block_id, "content": content})
-
-    @classmethod
-    def tool_done(cls, block_id: str, tool_output: str = "", tool_summary: str = "") -> CardEvent[ToolDonePayload]:
-        """Signal successful completion of a tool call.
-
-        Payload: {block_id: str, tool_output: str, tool_summary: str}
-        Triggered when: Tool finishes execution successfully.
-        """
-        if not block_id:
-            raise ValueError("block_id is required for tool_done")
-        return cls(type=CardEventType.TOOL_DONE, payload={
-            "block_id": block_id, "tool_output": tool_output, "tool_summary": tool_summary,
-        })
-
-    @classmethod
-    def tool_failed(cls, block_id: str, error: str = "") -> CardEvent[ToolFailedPayload]:
-        """Signal that a tool call has failed.
-
-        Payload: {block_id: str, error: str}
-        Triggered when: Tool execution encounters an error.
-        """
-        if not block_id:
-            raise ValueError("block_id is required for tool_failed")
-        return cls(type=CardEventType.TOOL_FAILED, payload={"block_id": block_id, "error": error})
 
     @classmethod
     def image_added(
@@ -398,17 +345,6 @@ class CardEvent(Generic[P]):
                 ),
             },
         )
-
-    @classmethod
-    def plan_updated(cls, content: str) -> CardEvent[PlanUpdatedPayload]:
-        """Update the plan/checklist display in the card.
-
-        Payload: {content: str} — formatted plan text (markdown checklist).
-        Triggered when: Agent updates its execution plan.
-        """
-        if not isinstance(content, str):
-            raise TypeError(f"content must be str, got {type(content).__name__}")
-        return cls(type=CardEventType.PLAN_UPDATED, payload={"content": content})
 
     @classmethod
     def tool_model_changed(

@@ -37,6 +37,7 @@ from acp.schema import (
     DeniedOutcome,
     EmbeddedResourceContentBlock,
     ImageContentBlock,
+    KillTerminalResponse,
     ReadTextFileResponse,
     ReleaseTerminalResponse,
     RequestPermissionResponse,
@@ -50,11 +51,6 @@ from acp.schema import (
     WaitForTerminalExitResponse,
     WriteTextFileResponse,
 )
-
-try:
-    from acp.schema import KillTerminalCommandResponse
-except ImportError:
-    from acp.schema import KillTerminalResponse as KillTerminalCommandResponse
 
 from ..sandbox.executor import DangerousPatternCheckStrategy, SandboxExecutor
 from ..utils.errors import get_error_detail
@@ -293,19 +289,13 @@ def _safe_session_filename(session_id: str) -> str:
 
 
 class ACPHistoryStore:
-    """Local persistence for ACP session history (jsonl).
+    """Local jsonl persistence for ACP command and file history."""
 
-    Stores command execution results and file operations so that GhostAP can
-    display/recover historical info even if the agent-side session store is
-    unavailable.
-    """
-
-    def __init__(self, base_dir: Optional[str] = None):
+    def __init__(self):
         from ..config import get_settings
-        settings_dir = get_settings().acp_history_dir.strip()
-        root = base_dir or settings_dir
-        if not root:
-            root = str(Path.home() / ".ghostap" / "acp_history")
+        root = get_settings().acp_history_dir.strip() or str(
+            Path.home() / ".ghostap" / "acp_history"
+        )
         self._base = Path(root).expanduser()
 
     def _path_for(self, session_id: str) -> Path:
@@ -338,18 +328,6 @@ class ACPHistoryStore:
         except Exception as e:
             logger.info("[ACP] history read failed: %s", get_error_detail(e))
             return []
-
-        raw_strip = raw.lstrip()
-        # Backward compatibility: accept a single JSON array file.
-        if raw_strip.startswith("["):
-            try:
-                data = json.loads(raw)
-                if isinstance(data, list):
-                    items = [x for x in data if isinstance(x, dict)]
-                    return items[-limit:] if limit > 0 else items
-            except (ValueError, json.JSONDecodeError):
-                # Fall through to jsonl parsing
-                pass
 
         items: list[dict] = []
         for line in raw.splitlines():
@@ -609,55 +587,6 @@ def _local_image_candidates(value: Any) -> list[str]:
     return list(dict.fromkeys(candidate for candidate in candidates if candidate))
 
 
-def _iter_local_image_files(
-    root_dir: str,
-    scan_complete: list[bool] | None = None,
-) -> list[Path]:
-    """Enumerate local raster candidates without following links or huge trees."""
-    def _mark_incomplete() -> None:
-        if scan_complete is not None:
-            scan_complete[0] = False
-
-    try:
-        root = Path(root_dir).expanduser().resolve()
-    except (OSError, RuntimeError):
-        _mark_incomplete()
-        return []
-    if not root.is_dir():
-        _mark_incomplete()
-        return []
-
-    found: list[Path] = []
-    stack = [root]
-    inspected = 0
-    while stack:
-        directory = stack.pop()
-        try:
-            entries = os.scandir(directory)
-        except OSError:
-            _mark_incomplete()
-            continue
-        with entries:
-            for entry in entries:
-                if inspected >= _MAX_IMAGE_SCAN_ENTRIES:
-                    _mark_incomplete()
-                    return found
-                inspected += 1
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name not in _IMAGE_SCAN_IGNORED_DIRS:
-                            stack.append(Path(entry.path))
-                    elif (
-                        entry.is_file(follow_symlinks=False)
-                        and Path(entry.name).suffix.casefold() in _IMAGE_FILE_SUFFIXES
-                    ):
-                        found.append(Path(entry.path))
-                except OSError:
-                    _mark_incomplete()
-                    continue
-    return found
-
-
 def _resolve_image_scan_root(root_dir: str) -> Path | None:
     try:
         root = Path(root_dir).expanduser().resolve()
@@ -670,19 +599,47 @@ def _capture_local_image_artifacts(
     root_dir: str,
     scan_complete: list[bool] | None = None,
 ) -> dict[str, _ImageArtifactSignature]:
+    """Capture bounded raster metadata without following links."""
+    root = _resolve_image_scan_root(root_dir)
+    if root is None:
+        if scan_complete is not None:
+            scan_complete[0] = False
+        return {}
     snapshot: dict[str, _ImageArtifactSignature] = {}
-    for path in _iter_local_image_files(root_dir, scan_complete):
+    stack = [root]
+    inspected = 0
+    while stack:
+        directory = stack.pop()
         try:
-            stat = path.stat()
-            snapshot[str(path)] = (
-                int(stat.st_mtime_ns),
-                int(stat.st_ctime_ns),
-                int(stat.st_size),
-            )
+            entries = os.scandir(directory)
         except OSError:
             if scan_complete is not None:
                 scan_complete[0] = False
             continue
+        with entries:
+            for entry in entries:
+                if inspected >= _MAX_IMAGE_SCAN_ENTRIES:
+                    if scan_complete is not None:
+                        scan_complete[0] = False
+                    return snapshot
+                inspected += 1
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in _IMAGE_SCAN_IGNORED_DIRS:
+                            stack.append(Path(entry.path))
+                    elif (
+                        entry.is_file(follow_symlinks=False)
+                        and Path(entry.name).suffix.casefold() in _IMAGE_FILE_SUFFIXES
+                    ):
+                        file_stat = entry.stat(follow_symlinks=False)
+                        snapshot[entry.path] = (
+                            int(file_stat.st_mtime_ns),
+                            int(file_stat.st_ctime_ns),
+                            int(file_stat.st_size),
+                        )
+                except OSError:
+                    if scan_complete is not None:
+                        scan_complete[0] = False
     return snapshot
 
 
@@ -692,20 +649,15 @@ def snapshot_local_image_artifacts(
     """Capture a prompt baseline and mark overlapping same-root scans unsafe."""
     root = _resolve_image_scan_root(root_dir)
     if root is None:
-        return LocalImageArtifactSnapshot(
-            root_key="",
-            files={},
-            complete=False,
-            active=False,
-        )
+        return LocalImageArtifactSnapshot("", {}, complete=False, active=False)
 
     snapshot = LocalImageArtifactSnapshot(root_key=str(root), files={})
     with _IMAGE_SNAPSHOT_LOCK:
         overlapping = [
-            other
-            for root_key, snapshots in _ACTIVE_IMAGE_SNAPSHOTS.items()
-            if _image_roots_overlap(snapshot.root_key, root_key)
-            for other in snapshots
+            item
+            for key, snapshots in _ACTIVE_IMAGE_SNAPSHOTS.items()
+            if _image_roots_overlap(snapshot.root_key, key)
+            for item in snapshots
         ]
         if overlapping:
             snapshot.conflicted = True
@@ -1054,62 +1006,18 @@ def _parse_subagent_metadata(update: Any) -> tuple[str, str, str]:
     return source_id, path, activity
 
 
-_COMPATIBLE_COLLABORATION_TOOLS = frozenset(
-    {
-        "followup_task",
-        "interrupt_agent",
-        "list_agents",
-        "send_message",
-        "spawn_agent",
-        "wait_agent",
-    }
-)
-
-
-def _compatible_collaboration_tool(
-    update: Any,
-    raw_input: Any,
-    raw_output: Any,
-) -> str:
-    """Recognize allowlisted Codex frames that predate namespaced metadata."""
-    title = getattr(update, "title", None)
-    normalized_title = (
-        title.strip().casefold().replace("-", "_").replace(" ", "_")
-        if isinstance(title, str)
-        else ""
-    )
-    if normalized_title not in _COMPATIBLE_COLLABORATION_TOOLS:
-        return ""
-    has_lifecycle_payload = any(
-        isinstance(payload, Mapping)
-        and (
-            "agentsStates" in payload
-            or "receiverThreadIds" in payload
-        )
-        for payload in (raw_input, raw_output)
-    )
-    return normalized_title if has_lifecycle_payload else ""
-
-
 def _parse_collaboration_metadata(
     update: Any,
     raw_input: Any,
     raw_output: Any,
 ) -> tuple[str, tuple[str, ...], str, tuple[dict, ...]]:
     """Normalize Codex collaboration state without exposing provider ids."""
-    _, collaboration, metadata_malformed = _codex_namespaced_metadata(update)
-    if collaboration:
-        raw_tool = collaboration.get("tool")
-        tool = raw_tool.strip() if isinstance(raw_tool, str) else ""
-    elif not metadata_malformed:
-        tool = _compatible_collaboration_tool(
-            update,
-            raw_input,
-            raw_output,
-        )
-        if not tool:
-            return "", (), "", ()
-    else:
+    _, collaboration, _ = _codex_namespaced_metadata(update)
+    if not collaboration:
+        return "", (), "", ()
+    raw_tool = collaboration.get("tool")
+    tool = raw_tool.strip() if isinstance(raw_tool, str) else ""
+    if not tool:
         return "", (), "", ()
 
     receiver_containers: list[object] = []
@@ -1125,11 +1033,11 @@ def _parse_collaboration_metadata(
         if not isinstance(raw_receivers, (list, tuple)):
             receiver_malformed = True
             continue
-        for item in raw_receivers:
-            if not isinstance(item, str) or not item.strip():
+        for value in raw_receivers:
+            if not isinstance(value, str) or not value.strip():
                 receiver_malformed = True
                 continue
-            receiver = item.strip()
+            receiver = value.strip()
             if receiver not in normalized_receivers:
                 normalized_receivers.append(receiver)
     receivers = tuple(normalized_receivers)
@@ -1159,31 +1067,14 @@ def _parse_collaboration_metadata(
                 malformed_identity = True
                 continue
             normalized_states[source_id] = raw_state
-        ordered_ids = list(receivers)
-        ordered_ids.extend(
-            source_id
-            for source_id in normalized_states
-            if source_id not in ordered_ids
-        )
+        ordered_ids = [*receivers, *(key for key in normalized_states if key not in receivers)]
         for source_id in ordered_ids:
             if source_id not in normalized_states:
-                states.append(
-                    {
-                        "source_id": source_id,
-                        "status": "pending",
-                        "message": "",
-                    }
-                )
+                states.append({"source_id": source_id, "status": "pending", "message": ""})
                 continue
             raw_state = normalized_states[source_id]
             if not isinstance(raw_state, Mapping):
-                states.append(
-                    {
-                        "source_id": source_id,
-                        "status": "malformed",
-                        "message": "",
-                    }
-                )
+                states.append({"source_id": source_id, "status": "malformed", "message": ""})
                 continue
             raw_status = raw_state.get("status")
             states.append(
@@ -1200,9 +1091,7 @@ def _parse_collaboration_metadata(
                 }
             )
         if malformed_identity:
-            states.append(
-                {"source_id": "", "status": "malformed", "message": ""}
-            )
+            states.append({"source_id": "", "status": "malformed", "message": ""})
     elif raw_states is None:
         states.extend(
             {"source_id": source_id, "status": "pending", "message": ""}
@@ -1214,15 +1103,9 @@ def _parse_collaboration_metadata(
             for source_id in receivers
         )
         if not receivers:
-            states.append(
-                {"source_id": "", "status": "malformed", "message": ""}
-            )
+            states.append({"source_id": "", "status": "malformed", "message": ""})
     if receiver_malformed:
-        malformed_receiver = {
-            "source_id": "",
-            "status": "malformed",
-            "message": "",
-        }
+        malformed_receiver = {"source_id": "", "status": "malformed", "message": ""}
         if malformed_receiver not in states:
             states.append(malformed_receiver)
     return tool, receivers, model, tuple(states)
@@ -1230,10 +1113,7 @@ def _parse_collaboration_metadata(
 
 def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
     """Extract ToolCallInfo from a ToolCallStart or ToolCallProgress."""
-    locations: list[str] = []
-    if update.locations:
-        locations = [loc.path for loc in update.locations]
-
+    locations = [loc.path for loc in (update.locations or [])]
     title = update.title or ""
     raw_input = getattr(update, "raw_input", None)
     raw_output = getattr(update, "raw_output", None)
@@ -1249,17 +1129,14 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
         subagent_states,
     ) = _parse_collaboration_metadata(update, raw_input, raw_output)
 
-    def _json_dump(obj: Any) -> str:
+    def _text(obj: Any) -> str:
         try:
             return json.dumps(obj, ensure_ascii=False, indent=2)
         except Exception:
             return str(obj)
 
-    def _truncate(s: str, max_chars: int) -> str:
-        s = s or ""
-        if len(s) <= max_chars:
-            return s
-        return s[:max_chars] + "\n... (truncated)"
+    def _truncate(value: str, limit: int) -> str:
+        return value if len(value) <= limit else value[:limit] + "\n... (truncated)"
 
     # Prefer tool kind for rendering decisions; fall back to title heuristics.
     kind = (update.kind or "other").strip() or "other"
@@ -1274,20 +1151,13 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
         or (isinstance(raw_input, dict) and any(k in raw_input for k in ("subagent_type", "description", "prompt")))
     )
 
-    # Decide which side to render into ToolCallInfo.content.
-    # NOTE: tests rely on conservative rendering: only TodoWrite and execute-like
-    # tools populate content on the input side; read/list/etc keep it empty.
     use_output = status in ("completed", "failed")
-
     content = ""
-
-    # TodoWrite: always extract checklist from raw_input, regardless of status.
     if raw_input and _is_todo_tool(title, raw_input):
         content = _format_todo_content(raw_input)
         use_output = False
 
     if not use_output and not content:
-        # ---- input side ----
         if is_execute:
             if isinstance(raw_input, dict):
                 content = str(
@@ -1299,18 +1169,15 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
             elif isinstance(raw_input, str):
                 content = raw_input
             elif raw_input is not None:
-                content = _json_dump(raw_input)
+                content = _text(raw_input)
 
         elif is_agent_task:
             if isinstance(raw_input, dict):
                 description = str(raw_input.get("description") or "").strip()
                 prompt = str(raw_input.get("prompt") or "").strip()
                 subagent_type = str(raw_input.get("subagent_type") or "").strip()
-                parts = []
-                if description:
-                    parts.append(description)
-                if subagent_type:
-                    parts.append(f"子代理：{subagent_type}")
+                parts = [description] if description else []
+                parts += [f"子代理：{subagent_type}"] if subagent_type else []
                 if prompt:
                     prompt_first_line = prompt.splitlines()[0].strip()
                     if prompt_first_line and prompt_first_line != description:
@@ -1319,49 +1186,33 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
             elif isinstance(raw_input, str):
                 content = raw_input
 
-        # For other non-execute tools, keep content empty to reduce noise.
-
         content = _truncate((content or "").strip("\n"), 4000)
     else:
-        # ---- output side ----
         if is_execute:
             if isinstance(raw_output, dict):
-                # Best-effort normalize common shapes
                 out = raw_output.get("output")
                 if isinstance(out, str) and out.strip():
                     content = out
                 else:
                     stdout = raw_output.get("stdout") or ""
                     stderr = raw_output.get("stderr") or ""
-                    parts = []
-                    if isinstance(stdout, str) and stdout:
-                        parts.append(stdout)
-                    if isinstance(stderr, str) and stderr:
-                        parts.append(stderr)
+                    parts = [value for value in (stdout, stderr) if isinstance(value, str) and value]
                     content = "\n".join(parts).strip("\n")
                     if not content:
-                        content = _json_dump(raw_output)
+                        content = _text(raw_output)
             elif isinstance(raw_output, str):
                 content = raw_output
             elif raw_output is not None:
-                content = _json_dump(raw_output)
+                content = _text(raw_output)
         else:
             if isinstance(raw_output, str):
                 content = raw_output
             elif raw_output is not None:
-                content = _json_dump(raw_output)
+                content = _text(raw_output)
 
         content = _truncate((content or "").strip("\n"), 12000)
 
-    # Collaboration output is normalized separately into per-child states.
-    # Keep the input prompt as the stable user-facing child label instead of
-    # rendering provider result JSON. Failed calls retain raw output so the
-    # ordinary error path can expose a sanitized failure reason.
-    if (
-        collaboration_tool
-        and status != "failed"
-        and isinstance(raw_input, Mapping)
-    ):
+    if collaboration_tool and status != "failed" and isinstance(raw_input, Mapping):
         prompt = str(raw_input.get("prompt") or "").strip()
         if prompt:
             content = _truncate(prompt.splitlines()[0].strip(), 4000)
@@ -1393,8 +1244,6 @@ def _parse_plan(update: AgentPlanUpdate) -> PlanInfo:
             content = ("" if raw_content is None else str(raw_content)).strip()
         except Exception:
             content = ""
-        # Some agents may emit placeholder entries with empty content; skip them to
-        # avoid rendering "✅" lines without text.
         if not content:
             continue
 
@@ -1420,8 +1269,6 @@ def _extract_update_source_id(update: Any) -> str | None:
     if subagent_source_id:
         return subagent_source_id
 
-    # 注意：不要包含"id"，因为这通常是每个块的唯一标识符，而不是源标识符
-    # 我们需要保留源标识符，以便将来自同一源的连续块合并到同一个文本块中
     candidates = ("source_id", "source", "agent_id", "task_id", "tool_call_id")
 
     def _from_obj(obj: Any) -> str | None:
@@ -1431,7 +1278,6 @@ def _extract_update_source_id(update: Any) -> str | None:
                 return str(value)
         meta = getattr(obj, "_meta", None) or getattr(obj, "field_meta", None)
         if isinstance(meta, dict):
-            # 明确排除"id"字段，确保不会将块ID误用作源ID
             if "id" in meta:
                 logger.debug(f"Ignoring generic chunk id as source: {meta['id']}")
             for key in candidates:
@@ -1539,17 +1385,15 @@ class GhostAPClient(Client):
         on_session_info: Callable[[str, ACPSessionInfo], None] | None = None,
         auto_approve: bool = True,
         root_dir: str = ".",
-        sandbox: Optional[SandboxExecutor] = None,
-        history_store: Optional[ACPHistoryStore] = None,
     ):
         self._on_event = on_event
         self._on_session_info = on_session_info
         self._auto_approve = auto_approve
         self._root_dir = os.path.abspath(os.path.expanduser(root_dir or "."))
-        self._sandbox = sandbox or SandboxExecutor()
+        self._sandbox = SandboxExecutor()
         self._terminals: dict[str, _TerminalRecord] = {}
         self._terminals_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-        self._history = history_store or ACPHistoryStore()
+        self._history = ACPHistoryStore()
         self._tool_filter: Optional[Callable[[str, dict | None], bool]] = None
         self._image_snapshot_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._active_image_snapshot: LocalImageArtifactSnapshot | None = None
@@ -1557,10 +1401,6 @@ class GhostAPClient(Client):
     def set_tool_filter(self, filter_fn: Optional[Callable[[str, dict | None], bool]]) -> None:
         """Install or clear a per-session tool filter."""
         self._tool_filter = filter_fn
-
-    def get_tool_filter(self) -> Optional[Callable[[str, dict | None], bool]]:
-        """Return the current per-session tool filter, if any."""
-        return self._tool_filter
 
     def snapshot_local_images(self) -> LocalImageArtifactSnapshot:
         """Capture bounded image file metadata before a prompt starts."""
@@ -1624,26 +1464,32 @@ class GhostAPClient(Client):
                     )
                 ):
                     self._on_session_info(session_id, info)
-            elif isinstance(update, AgentMessageChunk):
-                self._handle_message_chunk(update)
-            elif isinstance(update, AgentThoughtChunk):
-                self._handle_thought_chunk(update)
+            elif isinstance(update, (AgentMessageChunk, AgentThoughtChunk)):
+                event_type = (
+                    ACPEventType.TEXT_CHUNK
+                    if isinstance(update, AgentMessageChunk)
+                    else ACPEventType.THOUGHT_CHUNK
+                )
+                self._handle_chunk(update, event_type)
             elif isinstance(update, ToolCallStart):
                 self._handle_tool_call_start(update)
             elif isinstance(update, ToolCallProgress):
                 self._handle_tool_call_progress(update)
             elif isinstance(update, AgentPlanUpdate):
                 self._handle_plan_update(update)
-            # Other update types (UsageUpdate, etc.) are silently ignored
         except Exception as e:
             logger.debug("Error processing ACP session_update: %s", get_error_detail(e))
 
-    def _handle_message_chunk(self, update: AgentMessageChunk) -> None:
+    def _handle_chunk(
+        self,
+        update: AgentMessageChunk | AgentThoughtChunk,
+        event_type: ACPEventType,
+    ) -> None:
         content = update.content
         if isinstance(content, TextContentBlock):
             self._on_event(
                 ACPEvent(
-                    event_type=ACPEventType.TEXT_CHUNK,
+                    event_type=event_type,
                     text=content.text,
                     source_id=_extract_update_source_id(update),
                 )
@@ -1661,32 +1507,7 @@ class GhostAPClient(Client):
                 )
             )
         else:
-            logger.debug(f"Unhandled content type in message chunk: {type(content)}")
-
-    def _handle_thought_chunk(self, update: AgentThoughtChunk) -> None:
-        content = update.content
-        if isinstance(content, TextContentBlock):
-            self._on_event(
-                ACPEvent(
-                    event_type=ACPEventType.THOUGHT_CHUNK,
-                    text=content.text,
-                    source_id=_extract_update_source_id(update),
-                )
-            )
-        elif image := _parse_acp_image_content(
-            content,
-            root_dir=self._root_dir,
-            image_snapshot=self._current_image_snapshot(),
-        ):
-            self._on_event(
-                ACPEvent(
-                    event_type=ACPEventType.IMAGE_CHUNK,
-                    image=image,
-                    source_id=_extract_update_source_id(update),
-                )
-            )
-        else:
-            logger.debug(f"Unhandled content type in thought chunk: {type(content)}")
+            logger.debug("Unhandled ACP chunk content: %s", type(content))
 
     def _handle_tool_call_start(self, update: ToolCallStart) -> None:
         tool_info = _parse_tool_call(update)
@@ -1744,18 +1565,28 @@ class GhostAPClient(Client):
     # ------------------------------------------------------------------
     # Permission handling
     # ------------------------------------------------------------------
+    def _deny_permission(
+        self,
+        session_id: str,
+        reason: str,
+        **data: Any,
+    ) -> RequestPermissionResponse:
+        self._record(
+            session_id,
+            "permission",
+            {"outcome": "cancelled", "reason": reason, **data},
+        )
+        return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+
     async def request_permission(
         self, session_id: str, tool_call, options, **kwargs: Any
     ) -> RequestPermissionResponse:
         """Handle permission requests from agent."""
         if not self._auto_approve:
-            self._record(session_id, "permission", {"outcome": "cancelled", "reason": "auto_approve_disabled"})
-            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+            return self._deny_permission(session_id, "auto_approve_disabled")
 
         if not options:
-            # Defensive: some agents might ask with empty options.
-            self._record(session_id, "permission", {"outcome": "cancelled", "reason": "empty_options"})
-            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+            return self._deny_permission(session_id, "empty_options")
 
         # Permission filters apply to every ACP kind before auto-approval.
         safety_stage = "tool_request"
@@ -1767,16 +1598,11 @@ class GhostAPClient(Client):
             )
             safety_stage = "tool_filter"
             if not self._is_tool_allowed(permission_tool, tool_args):
-                denied_data = {
-                    "outcome": "cancelled",
-                    "reason": "tool_filter_denied",
-                    "tool": permission_tool,
-                }
+                denied_data = {"tool": permission_tool}
                 if command is not None:
                     denied_data["command"] = command
-                self._record(session_id, "permission", denied_data)
-                return RequestPermissionResponse(
-                    outcome=DeniedOutcome(outcome="cancelled")
+                return self._deny_permission(
+                    session_id, "tool_filter_denied", **denied_data
                 )
 
             # Keep the existing hard and sandbox checks for executable commands.
@@ -1785,32 +1611,22 @@ class GhostAPClient(Client):
                 hard_ok, hard_reason = _ACP_PERMISSION_DANGEROUS_CHECK.check(command, None)
                 if not hard_ok:
                     logger.info("[ACP] Reject dangerous auto-approved command: %s (%s)", command, hard_reason)
-                    self._record(
+                    return self._deny_permission(
                         session_id,
-                        "permission",
-                        {
-                            "outcome": "cancelled",
-                            "reason": "dangerous_execute",
-                            "command": command,
-                            "detail": hard_reason,
-                        },
+                        "dangerous_execute",
+                        command=command,
+                        detail=hard_reason,
                     )
-                    return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
                 safety_stage = "sandbox"
                 ok, reason = self._sandbox.is_command_safe(command)
                 if not ok:
                     logger.info("[ACP] Reject unsafe command: %s (%s)", command, reason)
-                    self._record(
+                    return self._deny_permission(
                         session_id,
-                        "permission",
-                        {
-                            "outcome": "cancelled",
-                            "reason": "unsafe_execute",
-                            "command": command,
-                            "detail": reason,
-                        },
+                        "unsafe_execute",
+                        command=command,
+                        detail=reason,
                     )
-                    return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         except Exception as e:
             logger.warning(
                 "[ACP] Permission safety check failed closed: error=%s stage=%s kind=%s command_shape=%s",
@@ -1819,27 +1635,26 @@ class GhostAPClient(Client):
                 permission_kind,
                 command_shape,
             )
-            self._record(
+            return self._deny_permission(
                 session_id,
-                "permission",
-                {
-                    "outcome": "cancelled",
-                    "reason": "permission_safety_check_failed",
-                    "stage": safety_stage,
-                    "kind": permission_kind,
-                    "command_shape": command_shape,
-                },
+                "permission_safety_check_failed",
+                stage=safety_stage,
+                kind=permission_kind,
+                command_shape=command_shape,
             )
-            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
 
-        # Find an "allow_once" option, or use the first option.
+        # Only an explicit one-shot grant is eligible for automatic selection.
+        # Provider-specific or future option kinds are denied by default.
         allow_option_id = ""
         for opt in options:
-            if getattr(opt, "kind", None) == "allow_once":
-                allow_option_id = opt.option_id
+            if (
+                getattr(opt, "kind", None) == "allow_once"
+                and getattr(opt, "option_id", None)
+            ):
+                allow_option_id = str(opt.option_id)
                 break
-        if not allow_option_id and options:
-            allow_option_id = options[0].option_id
+        if not allow_option_id:
+            return self._deny_permission(session_id, "missing_allow_once")
 
         return RequestPermissionResponse(outcome=AllowedOutcome(option_id=allow_option_id, outcome="selected"))
 
@@ -1912,7 +1727,6 @@ class GhostAPClient(Client):
         output_byte_limit: Optional[int] = None,
         **kwargs: Any,
     ) -> CreateTerminalResponse:
-        # Lazy cleanup of expired terminals to prevent unbounded growth
         self._cleanup_expired_terminals()
 
         shell_command = shlex.join([command, *(args or [])]) if args else command
@@ -1965,14 +1779,7 @@ class GhostAPClient(Client):
             interactive=False,
             env_overrides=env_overrides or None,
         )
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
-        output_parts: list[str] = []
-        if stdout:
-            output_parts.append(stdout)
-        if stderr:
-            output_parts.append(stderr)
-        output = "\n".join(output_parts).strip("\n")
+        output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip("\n")
         output, byte_truncated = _truncate_utf8_tail(output, output_byte_limit)
         truncated = byte_truncated or ("输出被截断" in output) or ("错误输出被截断" in output)
 
@@ -1991,15 +1798,17 @@ class GhostAPClient(Client):
             },
         )
 
-        term_id = f"term_{uuid.uuid4().hex[:8]}"
+        return CreateTerminalResponse(
+            terminal_id=self._store_terminal(output, result.return_code, truncated)
+        )
+
+    def _store_terminal(self, output: str, exit_code: int, truncated: bool) -> str:
+        terminal_id = f"term_{uuid.uuid4().hex[:8]}"
         with self._terminals_lock:
-            self._terminals[term_id] = _TerminalRecord(
-                output=output,
-                exit_code=result.return_code,
-                truncated=truncated,
-                created_at=time.time(),
+            self._terminals[terminal_id] = _TerminalRecord(
+                output, exit_code, truncated, created_at=time.time()
             )
-        return CreateTerminalResponse(terminal_id=term_id)
+        return terminal_id
 
     def _create_failed_terminal(
         self,
@@ -2009,15 +1818,8 @@ class GhostAPClient(Client):
         message: str,
         reason: str,
     ) -> CreateTerminalResponse:
-        """Create a virtual terminal for a denied ACP operation without executing it."""
-        term_id = f"term_{uuid.uuid4().hex[:8]}"
-        with self._terminals_lock:
-            self._terminals[term_id] = _TerminalRecord(
-                output=message,
-                exit_code=1,
-                truncated=False,
-                created_at=time.time(),
-            )
+        """Create a virtual terminal for a denied operation without executing it."""
+        term_id = self._store_terminal(message, 1, False)
         self._record(
             session_id,
             "execute",
@@ -2062,10 +1864,10 @@ class GhostAPClient(Client):
 
     async def kill_terminal(
         self, session_id: str, terminal_id: str, **kwargs: Any
-    ) -> Optional[KillTerminalCommandResponse]:
+    ) -> Optional[KillTerminalResponse]:
         with self._terminals_lock:
             self._terminals.pop(terminal_id, None)
-        return KillTerminalCommandResponse()
+        return KillTerminalResponse()
 
     async def release_terminal(
         self, session_id: str, terminal_id: str, **kwargs: Any
@@ -2078,6 +1880,4 @@ class GhostAPClient(Client):
     # Lifecycle
     # ------------------------------------------------------------------
     def on_connect(self, conn: Agent) -> None:
-        # NOTE: ACP SDK calls `on_connect()` synchronously.
-        # Keep this hook sync to avoid "coroutine was never awaited" warnings.
         return None

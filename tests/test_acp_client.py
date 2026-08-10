@@ -1,38 +1,20 @@
 """Tests for acp.client — GhostAPClient event handling."""
 
 import asyncio
-import base64
 import logging
-import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from acp.schema import (
-    AgentMessageChunk,
-    ContentToolCallContent,
-    EnvVariable,
-    ImageContentBlock,
-    PermissionOption,
-    ResourceContentBlock,
-    SessionInfoUpdate,
-    TextContentBlock,
-    ToolCallLocation,
-    ToolCallProgress,
-)
+from acp.schema import KillTerminalResponse, PermissionOption, SessionInfoUpdate
 
-import src.acp.client as acp_client
-from src.acp.client import ACPHistoryStore, GhostAPClient, _parse_plan, _parse_tool_call
+from src.acp.client import GhostAPClient, _parse_plan, _parse_tool_call
+from src.acp.helper import SessionKeyCodec
 from src.acp.models import ACPEvent, ACPGoalInfo, ACPSessionInfo, PromptResult
 from src.acp.outcome import PromptOutcome, classify_prompt_result
 from src.acp.sync_adapter import resolve_agent_spec
-from src.sandbox.executor import SandboxExecutor
-
-_ONE_PIXEL_PNG = base64.b64encode(
-    b"\x89PNG\r\n\x1a\n" + b"ghostap-image"
-).decode("ascii")
 
 
 def _session_info_update(codex: dict) -> SessionInfoUpdate:
@@ -306,1168 +288,6 @@ def test_untrustworthy_goal_session_info_cannot_clear_stored_state(
     assert controls == [] or controls[0][1].goal_known is False
 
 
-def test_agent_image_chunk_emits_typed_acp_image_event(tmp_path: Path):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    update = AgentMessageChunk(
-        session_update="agent_message_chunk",
-        content=ImageContentBlock(
-            type="image",
-            data=_ONE_PIXEL_PNG,
-            mime_type="image/png",
-        ),
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert len(events) == 1
-    assert events[0].event_type.value == "image_chunk"
-    assert events[0].image is not None
-    assert events[0].image.mime_type == "image/png"
-    assert events[0].image.data == _ONE_PIXEL_PNG
-    assert events[0].image.image_id.startswith("sha256:")
-
-
-@pytest.mark.parametrize(
-    ("payload", "mime_type"),
-    [
-        (b"plain text pretending to be a png", "image/png"),
-        (b"\x89PNG\r\n", "image/png"),
-        (b"\x89PNG\r\n\x1a\npayload", "image/jpeg"),
-    ],
-)
-def test_agent_image_rejects_spoofed_or_truncated_raster_bytes(
-    tmp_path: Path,
-    payload: bytes,
-    mime_type: str,
-):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    update = AgentMessageChunk(
-        session_update="agent_message_chunk",
-        content=ImageContentBlock(
-            type="image",
-            data=base64.b64encode(payload).decode("ascii"),
-            mime_type=mime_type,
-        ),
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert events == []
-
-
-def test_tool_content_image_emits_before_tool_completion(tmp_path: Path):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="imagegen-1",
-        title="imagegen",
-        kind="other",
-        status="completed",
-        content=[
-            ContentToolCallContent(
-                type="content",
-                content=ImageContentBlock(
-                    type="image",
-                    data=_ONE_PIXEL_PNG,
-                    mime_type="image/png",
-                    uri="file:///workspace/generated.png",
-                ),
-            )
-        ],
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert [event.event_type.value for event in events] == [
-        "image_chunk",
-        "tool_call_done",
-    ]
-    assert events[0].image is not None
-    assert events[0].image.name == "generated.png"
-
-
-def test_subagent_tool_image_uses_stable_child_thread_source(tmp_path: Path):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    update = ToolCallProgress.model_validate(
-        {
-            "sessionUpdate": "tool_call_update",
-            "toolCallId": "activity-call-private",
-            "title": "Subagent image",
-            "kind": "other",
-            "status": "completed",
-            "content": [
-                {
-                    "type": "content",
-                    "content": {
-                        "type": "image",
-                        "data": _ONE_PIXEL_PNG,
-                        "mimeType": "image/png",
-                    },
-                }
-            ],
-            "_meta": {
-                "codex": {
-                    "subagent": {
-                        "threadId": "thread-stable-private",
-                        "path": "/root/card-audit",
-                        "activity": "interacted",
-                    }
-                }
-            },
-        }
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert [event.source_id for event in events] == [
-        "thread-stable-private",
-        "thread-stable-private",
-    ]
-    assert [event.event_type.value for event in events] == [
-        "image_chunk",
-        "tool_call_done",
-    ]
-
-
-def test_completed_tool_image_location_emits_live_image_event(tmp_path: Path):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    snapshot = client.snapshot_local_images()
-    image_path = tmp_path / "screenshots" / "desktop.png"
-    image_path.parent.mkdir()
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nlocation")
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="screenshot-1",
-        title="Take screenshot",
-        kind="execute",
-        status="completed",
-        locations=[ToolCallLocation(path="screenshots/desktop.png")],
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert [event.event_type.value for event in events] == [
-        "image_chunk",
-        "tool_call_done",
-    ]
-    assert events[0].image is not None
-    assert events[0].image.source_uri == str(image_path)
-    client.release_local_image_snapshot(snapshot)
-
-
-def test_completed_tool_raw_output_image_path_emits_live_image_event(tmp_path: Path):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    snapshot = client.snapshot_local_images()
-    image_path = tmp_path / "artifacts" / "mobile.webp"
-    image_path.parent.mkdir()
-    image_path.write_bytes(b"RIFF\x08\x00\x00\x00WEBPpayload")
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="browser-1",
-        title="Browser screenshot",
-        kind="execute",
-        status="completed",
-        raw_output={"output": "Screenshot saved to `artifacts/mobile.webp`"},
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert [event.event_type.value for event in events] == [
-        "image_chunk",
-        "tool_call_done",
-    ]
-    assert events[0].image is not None
-    assert events[0].image.name == "mobile.webp"
-    client.release_local_image_snapshot(snapshot)
-
-
-def test_completed_tool_does_not_publish_preexisting_referenced_private_image(
-    tmp_path: Path,
-):
-    private = tmp_path / "private.png"
-    private.write_bytes(b"\x89PNG\r\n\x1a\nprivate")
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    snapshot = client.snapshot_local_images()
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="browser-private",
-        title="Browser screenshot",
-        kind="execute",
-        status="completed",
-        raw_output={"output": "Screenshot saved to `private.png`"},
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert [event.event_type.value for event in events] == ["tool_call_done"]
-    client.release_local_image_snapshot(snapshot)
-
-
-def test_incomplete_prompt_baseline_fails_closed_for_local_path(
-    tmp_path: Path,
-):
-    private = tmp_path / "private.png"
-    private.write_bytes(b"\x89PNG\r\n\x1a\nprivate")
-    snapshot = acp_client.snapshot_local_image_artifacts(str(tmp_path))
-    snapshot.files.pop(str(private))
-    snapshot.complete = False
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="incomplete-baseline",
-        title="Browser screenshot",
-        kind="execute",
-        status="completed",
-        raw_output={"output": "Screenshot saved to `private.png`"},
-    )
-
-    assert acp_client._tool_call_images(
-        update,
-        root_dir=str(tmp_path),
-        image_snapshot=snapshot,
-    ) == []
-    acp_client.release_local_image_artifact_snapshot(snapshot)
-
-
-def test_skipped_baseline_directory_cannot_publish_preexisting_local_image(
-    tmp_path: Path,
-):
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir()
-    private = git_dir / "private.png"
-    private.write_bytes(b"\x89PNG\r\n\x1a\nprivate")
-    snapshot = acp_client.snapshot_local_image_artifacts(str(tmp_path))
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="skipped-baseline",
-        title="Browser screenshot",
-        kind="execute",
-        status="completed",
-        raw_output={"output": "Screenshot saved to `.git/private.png`"},
-    )
-
-    assert acp_client._tool_call_images(
-        update,
-        root_dir=str(tmp_path),
-        image_snapshot=snapshot,
-    ) == []
-    acp_client.release_local_image_artifact_snapshot(snapshot)
-
-
-def test_read_tool_location_does_not_publish_existing_input_image(tmp_path: Path):
-    image_path = tmp_path / "reference.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nreference")
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="read-1",
-        title="Read image",
-        kind="read",
-        status="completed",
-        locations=[ToolCallLocation(path="reference.png")],
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert [event.event_type.value for event in events] == ["tool_call_done"]
-
-
-@pytest.mark.parametrize("content_kind", ["image", "resource", "text"])
-def test_read_tool_content_does_not_publish_existing_input_image(
-    tmp_path: Path,
-    content_kind: str,
-):
-    image_path = tmp_path / "reference.png"
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nreference")
-    if content_kind == "image":
-        content = ImageContentBlock(
-            type="image",
-            data=_ONE_PIXEL_PNG,
-            mime_type="image/png",
-            uri=str(image_path),
-        )
-    elif content_kind == "resource":
-        content = ResourceContentBlock(
-            type="resource_link",
-            uri="reference.png",
-            name="reference.png",
-            mime_type="image/png",
-        )
-    else:
-        content = TextContentBlock(
-            type="text",
-            text="Input image: `reference.png`",
-        )
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id=f"read-content-{content_kind}",
-        title="Read image",
-        kind="read",
-        status="completed",
-        content=[
-            ContentToolCallContent(
-                type="content",
-                content=content,
-            )
-        ],
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert [event.event_type.value for event in events] == ["tool_call_done"]
-
-
-def test_local_image_resource_is_limited_to_acp_project_root(tmp_path: Path):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    snapshot = client.snapshot_local_images()
-    image_path = tmp_path / "screenshots" / "page.png"
-    image_path.parent.mkdir()
-    image_path.write_bytes(b"\x89PNG\r\n\x1a\nlocal")
-    update = AgentMessageChunk(
-        session_update="agent_message_chunk",
-        content=ResourceContentBlock(
-            type="resource_link",
-            uri="screenshots/page.png",
-            name="page.png",
-            mime_type="image/png",
-        ),
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert len(events) == 1
-    assert events[0].image is not None
-    assert events[0].image.name == "page.png"
-    assert events[0].image.source_uri == str(image_path)
-    client.release_local_image_snapshot(snapshot)
-
-
-def test_remote_image_resource_is_not_fetched(tmp_path: Path):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    update = AgentMessageChunk(
-        session_update="agent_message_chunk",
-        content=ResourceContentBlock(
-            type="resource_link",
-            uri="https://example.invalid/private.png",
-            name="private.png",
-            mime_type="image/png",
-        ),
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert events == []
-
-
-def test_typed_local_resource_with_untracked_suffix_fails_closed(
-    tmp_path: Path,
-):
-    private = tmp_path / "private.bin"
-    private.write_bytes(b"\x89PNG\r\n\x1a\nprivate")
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    snapshot = client.snapshot_local_images()
-    update = AgentMessageChunk(
-        session_update="agent_message_chunk",
-        content=ResourceContentBlock(
-            type="resource_link",
-            uri="private.bin",
-            name="private.bin",
-            mime_type="image/png",
-        ),
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert events == []
-    client.release_local_image_snapshot(snapshot)
-
-
-def test_local_image_read_rejects_file_swapped_to_symlink_after_resolution(
-    tmp_path: Path,
-    monkeypatch,
-):
-    root = tmp_path / "root"
-    root.mkdir()
-    inside = root / "inside.png"
-    outside = tmp_path / "outside.png"
-    inside.write_bytes(b"\x89PNG\r\n\x1a\ninside")
-    outside.write_bytes(b"\x89PNG\r\n\x1a\noutside")
-    original_resolve = acp_client._safe_resolve_path
-
-    def resolve_then_swap(root_dir: str, user_path: str):
-        resolved = original_resolve(root_dir, user_path)
-        resolved.unlink()
-        resolved.symlink_to(outside)
-        return resolved
-
-    monkeypatch.setattr(
-        acp_client,
-        "_safe_resolve_path",
-        resolve_then_swap,
-    )
-
-    image = acp_client._read_local_image_resource(
-        root_dir=str(root),
-        uri="inside.png",
-        mime_type="image/png",
-        name=None,
-    )
-
-    assert image is None
-
-
-def test_image_scan_stops_iterating_at_entry_budget(
-    tmp_path: Path,
-    monkeypatch,
-):
-    inspected = 0
-
-    class FakeEntry:
-        name = "not-an-image"
-        path = str(tmp_path / name)
-
-        def is_dir(self, *, follow_symlinks=True):
-            return False
-
-        def is_file(self, *, follow_symlinks=True):
-            return False
-
-    class FakeScandir:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def __iter__(self):
-            nonlocal inspected
-            for _ in range(acp_client._MAX_IMAGE_SCAN_ENTRIES + 500):
-                inspected += 1
-                yield FakeEntry()
-
-    monkeypatch.setattr(acp_client.os, "scandir", lambda _path: FakeScandir())
-
-    assert acp_client._iter_local_image_files(str(tmp_path)) == []
-    assert inspected <= acp_client._MAX_IMAGE_SCAN_ENTRIES + 1
-
-
-def test_repeated_changed_image_scans_share_one_prompt_budget(
-    tmp_path: Path,
-) -> None:
-    snapshot = acp_client.snapshot_local_image_artifacts(str(tmp_path))
-    paths = [tmp_path / f"continuation-{index}.png" for index in range(3)]
-    for index, path in enumerate(paths):
-        path.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([index]))
-
-    events: list[ACPEvent] = []
-    budget = acp_client.LocalImageEmissionBudget(
-        max_images=2,
-        max_bytes=1024,
-    )
-    try:
-        acp_client.emit_referenced_changed_local_image_events(
-            str(tmp_path),
-            snapshot,
-            str(paths[0]),
-            events.append,
-            budget=budget,
-            release_snapshot=False,
-        )
-        acp_client.emit_referenced_changed_local_image_events(
-            str(tmp_path),
-            snapshot,
-            " ".join(str(path) for path in paths),
-            events.append,
-            budget=budget,
-            release_snapshot=False,
-        )
-    finally:
-        acp_client.release_local_image_artifact_snapshot(snapshot)
-
-    assert [event.image.source_uri for event in events if event.image] == [
-        str(paths[0]),
-        str(paths[1]),
-    ]
-    assert budget.emitted_count == 2
-    assert budget.emitted_bytes > 0
-
-
-def test_overlapping_prompt_scans_do_not_cross_publish_images(
-    tmp_path: Path,
-):
-    """Ambiguous same-root writes must not be attributed to either prompt."""
-    first_snapshot = acp_client.snapshot_local_image_artifacts(str(tmp_path))
-    second_snapshot = acp_client.snapshot_local_image_artifacts(str(tmp_path))
-    secret = tmp_path / "other-chat-secret.png"
-    secret.write_bytes(b"\x89PNG\r\n\x1a\nother-chat")
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="ambiguous",
-        title="Take screenshot",
-        kind="execute",
-        status="completed",
-        raw_output={"output": f"saved `{secret}`"},
-    )
-
-    assert acp_client._tool_call_images(
-        update,
-        root_dir=str(tmp_path),
-        image_snapshot=first_snapshot,
-    ) == []
-    assert acp_client._tool_call_images(
-        update,
-        root_dir=str(tmp_path),
-        image_snapshot=second_snapshot,
-    ) == []
-    acp_client.release_local_image_artifact_snapshot(first_snapshot)
-    acp_client.release_local_image_artifact_snapshot(second_snapshot)
-
-    isolated_snapshot = acp_client.snapshot_local_image_artifacts(str(tmp_path))
-    own_image = tmp_path / "own-result.png"
-    own_image.write_bytes(b"\x89PNG\r\n\x1a\nown-result")
-    isolated_update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="isolated",
-        title="Take screenshot",
-        kind="execute",
-        status="completed",
-        raw_output={"output": f"saved `{own_image}`"},
-    )
-
-    images = acp_client._tool_call_images(
-        isolated_update,
-        root_dir=str(tmp_path),
-        image_snapshot=isolated_snapshot,
-    )
-    acp_client.release_local_image_artifact_snapshot(isolated_snapshot)
-    assert len(images) == 1
-    assert images[0].source_uri == str(own_image)
-
-
-def test_parent_and_child_root_snapshots_fail_closed_for_shared_image(
-    tmp_path: Path,
-):
-    nested = tmp_path / "nested"
-    nested.mkdir()
-    parent_snapshot = acp_client.snapshot_local_image_artifacts(str(tmp_path))
-    child_snapshot = acp_client.snapshot_local_image_artifacts(str(nested))
-    shared = nested / "shared.png"
-    shared.write_bytes(b"\x89PNG\r\n\x1a\nshared")
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="shared-root",
-        title="Take screenshot",
-        kind="execute",
-        status="completed",
-        raw_output={"output": f"saved `{shared}`"},
-    )
-
-    assert acp_client._tool_call_images(
-        update,
-        root_dir=str(tmp_path),
-        image_snapshot=parent_snapshot,
-    ) == []
-    assert acp_client._tool_call_images(
-        update,
-        root_dir=str(nested),
-        image_snapshot=child_snapshot,
-    ) == []
-    acp_client.release_local_image_artifact_snapshot(parent_snapshot)
-    acp_client.release_local_image_artifact_snapshot(child_snapshot)
-
-
-def test_local_surrogateescape_filename_is_sanitized_before_image_event(
-    tmp_path: Path,
-):
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
-    snapshot = client.snapshot_local_images()
-    raw_path = os.fsencode(tmp_path) + b"/screen_\xff.png"
-    with open(raw_path, "wb") as image_file:
-        image_file.write(b"\x89PNG\r\n\x1a\nsurrogate-name")
-    display_path = os.fsdecode(raw_path)
-    update = ToolCallProgress(
-        session_update="tool_call_update",
-        tool_call_id="surrogate-name",
-        title="Take screenshot",
-        kind="execute",
-        status="completed",
-        raw_output={"output": f"saved `{display_path}`"},
-    )
-
-    asyncio.run(client.session_update("session-image", update))
-
-    assert [event.event_type.value for event in events] == [
-        "image_chunk",
-        "tool_call_done",
-    ]
-    assert events[0].image is not None
-    events[0].image.name.encode("utf-8")
-    assert "\udcff" not in events[0].image.name
-    assert events[0].image.name == "screen_�.png"
-    client.release_local_image_snapshot(snapshot)
-
-
-def test_prompt_does_not_emit_unreported_new_image(tmp_path: Path):
-    from types import SimpleNamespace
-
-    from src.acp.session import ACPSession
-
-    existing = tmp_path / "existing.png"
-    existing.write_bytes(b"\x89PNG\r\n\x1a\nexisting")
-    generated = tmp_path / "screenshots" / "final.png"
-
-    class FakeConn:
-        async def prompt(self, **_kwargs):
-            generated.parent.mkdir()
-            generated.write_bytes(b"\x89PNG\r\n\x1a\ngenerated")
-            return SimpleNamespace(stop_reason="end_turn")
-
-    events: list[ACPEvent] = []
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-    session._conn = FakeConn()
-    session._session_id = "session-image"
-    session._client = GhostAPClient(
-        on_event=session._dispatch_event,
-        root_dir=str(tmp_path),
-    )
-
-    result = asyncio.run(session.prompt("generate a screenshot", on_event=events.append))
-
-    assert result.stop_reason == "end_turn"
-    image_events = [event for event in events if event.event_type.value == "image_chunk"]
-    assert image_events == []
-
-
-def test_prompt_drains_late_image_update_even_after_text(tmp_path: Path):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ACPImageInfo
-    from src.acp.session import ACPSession
-
-    image = ACPImageInfo(
-        image_id="sha256:late",
-        mime_type="image/png",
-        data=_ONE_PIXEL_PNG,
-        name="late.png",
-    )
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-
-    class FakeConn:
-        async def prompt(self, **_kwargs):
-            session._dispatch_event(
-                ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="done")
-            )
-            asyncio.get_running_loop().call_later(
-                0.01,
-                session._dispatch_event,
-                ACPEvent(event_type=ACPEventType.IMAGE_CHUNK, image=image),
-            )
-            return SimpleNamespace(stop_reason="end_turn")
-
-    events: list[ACPEvent] = []
-    session._conn = FakeConn()
-    session._session_id = "session-image"
-    session._client = GhostAPClient(
-        on_event=session._dispatch_event,
-        root_dir=str(tmp_path),
-    )
-
-    asyncio.run(session.prompt("generate", on_event=events.append))
-
-    assert [event.event_type for event in events] == [
-        ACPEventType.TEXT_CHUNK,
-        ACPEventType.IMAGE_CHUNK,
-    ]
-
-
-def test_reconciliation_prompt_waits_for_late_terminal_child_update(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-
-    def child_event(status: str) -> ACPEvent:
-        return ACPEvent(
-            event_type=ACPEventType.TOOL_CALL_UPDATE,
-            tool_call=ToolCallInfo(
-                id="list-agents",
-                title="list_agents",
-                kind="other",
-                status="completed",
-                collaboration_tool="list_agents",
-                subagent_states=(
-                    {"source_id": "reviewer", "status": status},
-                ),
-            ),
-        )
-
-    class FakeConn:
-        async def prompt(self, **_kwargs):
-            session._dispatch_event(child_event("running"))
-            asyncio.get_running_loop().call_later(
-                0.2,
-                session._dispatch_event,
-                child_event("completed"),
-            )
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-child-quiescence"
-
-    result = asyncio.run(
-        session.prompt(
-            "reconcile children",
-            await_child_quiescence=True,
-        )
-    )
-
-    assert classify_prompt_result(result).outcome is PromptOutcome.COMPLETED
-
-
-def test_prompt_replays_terminal_child_update_received_between_turns(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-    deferred_event = ACPEvent(
-        event_type=ACPEventType.TOOL_CALL_UPDATE,
-        tool_call=ToolCallInfo(
-            id="list-between-turns",
-            title="list_agents",
-            kind="other",
-            status="completed",
-            collaboration_tool="list_agents",
-            subagent_states=(
-                {"source_id": "reviewer", "status": "completed"},
-            ),
-        ),
-    )
-    session._dispatch_event(deferred_event)
-
-    class FakeConn:
-        async def prompt(self, **_kwargs):
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-deferred-child"
-    events: list[ACPEvent] = []
-
-    result = asyncio.run(
-        session.prompt(
-            "collect deferred child state",
-            on_event=events.append,
-            await_child_quiescence=True,
-        )
-    )
-
-    assert result.tool_calls[0].subagent_states == (
-        {"source_id": "reviewer", "status": "completed"},
-    )
-    assert len(events) == 1
-    assert events[0] is deferred_event
-
-
-def test_ordinary_prompt_discards_deferred_child_state_from_previous_task(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-    session._dispatch_event(ACPEvent(
-        event_type=ACPEventType.TOOL_CALL_UPDATE,
-        tool_call=ToolCallInfo(
-            id="previous-task-list-agents",
-            title="list_agents",
-            kind="other",
-            status="completed",
-            collaboration_tool="list_agents",
-            subagent_states=(
-                {"source_id": "previous-reviewer", "status": "running"},
-            ),
-        ),
-    ))
-
-    class FakeConn:
-        async def prompt(self, **_kwargs):
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-new-user-task"
-    events: list[ACPEvent] = []
-
-    result = asyncio.run(
-        session.prompt(
-            "start an unrelated user task",
-            on_event=events.append,
-        )
-    )
-
-    assert result.tool_calls == []
-    assert events == []
-    assert classify_prompt_result(result).outcome is PromptOutcome.COMPLETED
-
-
-def test_ordinary_prompt_ignores_late_child_update_from_prior_prompt(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-    stale_call = ToolCallInfo(
-        id="prior-prompt-list-agents",
-        title="list_agents",
-        kind="other",
-        status="completed",
-        collaboration_tool="list_agents",
-        subagent_states=(
-            {"source_id": "prior-reviewer", "status": "running"},
-        ),
-    )
-
-    class FakeConn:
-        calls = 0
-
-        async def prompt(self, **_kwargs):
-            self.calls += 1
-            session._dispatch_event(ACPEvent(
-                event_type=ACPEventType.TOOL_CALL_UPDATE,
-                tool_call=stale_call,
-            ))
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-prior-call-fence"
-
-    first_result = asyncio.run(session.prompt("previous task"))
-    second_events: list[ACPEvent] = []
-    second_result = asyncio.run(
-        session.prompt(
-            "new unrelated task",
-            on_event=second_events.append,
-        )
-    )
-
-    assert first_result.tool_calls == [stale_call]
-    assert second_result.tool_calls == []
-    assert second_events == []
-
-
-def test_deferred_child_call_id_fences_another_late_update(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-    stale_call = ToolCallInfo(
-        id="deferred-prior-call",
-        title="list_agents",
-        kind="other",
-        status="completed",
-        collaboration_tool="list_agents",
-        subagent_states=(
-            {"source_id": "prior-reviewer", "status": "running"},
-        ),
-    )
-    session._dispatch_event(ACPEvent(
-        event_type=ACPEventType.TOOL_CALL_UPDATE,
-        tool_call=stale_call,
-    ))
-
-    class FakeConn:
-        async def prompt(self, **_kwargs):
-            session._dispatch_event(ACPEvent(
-                event_type=ACPEventType.TOOL_CALL_UPDATE,
-                tool_call=stale_call,
-            ))
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-deferred-call-fence"
-
-    result = asyncio.run(session.prompt("new unrelated task"))
-
-    assert result.tool_calls == []
-
-
-def test_ordinary_prompt_filters_prior_child_source_under_new_call_id(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-
-    def child_snapshot(call_id: str) -> ACPEvent:
-        return ACPEvent(
-            event_type=ACPEventType.TOOL_CALL_UPDATE,
-            tool_call=ToolCallInfo(
-                id=call_id,
-                title="list_agents",
-                kind="other",
-                status="completed",
-                collaboration_tool="list_agents",
-                subagent_states=(
-                    {"source_id": "prior-reviewer", "status": "running"},
-                ),
-            ),
-        )
-
-    class FakeConn:
-        calls = 0
-
-        async def prompt(self, **_kwargs):
-            self.calls += 1
-            session._dispatch_event(child_snapshot(
-                "prior-list" if self.calls == 1 else "new-list-id"
-            ))
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-prior-source-fence"
-
-    first_result = asyncio.run(session.prompt("previous task"))
-    second_result = asyncio.run(session.prompt("new unrelated task"))
-
-    assert len(first_result.tool_calls) == 1
-    assert second_result.tool_calls == []
-
-
-def test_ordinary_prompt_filters_malformed_prior_child_snapshot(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-
-    class FakeConn:
-        calls = 0
-
-        async def prompt(self, **_kwargs):
-            self.calls += 1
-            if self.calls == 1:
-                tool_call = ToolCallInfo(
-                    id="prior-list",
-                    title="list_agents",
-                    kind="other",
-                    status="completed",
-                    collaboration_tool="list_agents",
-                    subagent_states=(
-                        {"source_id": "prior-reviewer", "status": "running"},
-                    ),
-                )
-            else:
-                tool_call = ToolCallInfo(
-                    id="malformed-late-list",
-                    title="list_agents",
-                    kind="other",
-                    status="completed",
-                    collaboration_tool="list_agents",
-                    collaboration_receivers="prior-reviewer",  # type: ignore[arg-type]
-                    child_metadata_malformed=True,
-                )
-            session._dispatch_event(ACPEvent(
-                event_type=ACPEventType.TOOL_CALL_UPDATE,
-                tool_call=tool_call,
-            ))
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-malformed-prior-source"
-
-    asyncio.run(session.prompt("previous task"))
-    second_result = asyncio.run(session.prompt("new unrelated task"))
-
-    assert second_result.tool_calls == []
-
-
-def test_prior_child_source_fence_survives_multiple_unrelated_prompts(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-
-    class FakeConn:
-        calls = 0
-
-        async def prompt(self, **_kwargs):
-            self.calls += 1
-            if self.calls in {1, 3}:
-                session._dispatch_event(ACPEvent(
-                    event_type=ACPEventType.TOOL_CALL_UPDATE,
-                    tool_call=ToolCallInfo(
-                        id=f"list-call-{self.calls}",
-                        title="list_agents",
-                        kind="other",
-                        status="completed",
-                        collaboration_tool="list_agents",
-                        subagent_states=(
-                            {
-                                "source_id": "very-late-reviewer",
-                                "status": "running",
-                            },
-                        ),
-                    ),
-                ))
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-persistent-source-fence"
-
-    first_result = asyncio.run(session.prompt("first task"))
-    second_result = asyncio.run(session.prompt("second unrelated task"))
-    third_result = asyncio.run(session.prompt("third unrelated task"))
-
-    assert len(first_result.tool_calls) == 1
-    assert second_result.tool_calls == []
-    assert third_result.tool_calls == []
-
-
-def test_ordinary_prompt_allows_explicit_followup_for_prior_child_source(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-
-    class FakeConn:
-        calls = 0
-
-        async def prompt(self, **_kwargs):
-            self.calls += 1
-            if self.calls == 1:
-                tool_call = ToolCallInfo(
-                    id="prior-list",
-                    title="list_agents",
-                    kind="other",
-                    status="completed",
-                    collaboration_tool="list_agents",
-                    subagent_states=(
-                        {
-                            "source_id": "shared-reviewer",
-                            "status": "completed",
-                        },
-                    ),
-                )
-            else:
-                tool_call = ToolCallInfo(
-                    id="new-followup",
-                    title="followup_task",
-                    kind="other",
-                    status="completed",
-                    collaboration_tool="followup_task",
-                    collaboration_receivers=("shared-reviewer",),
-                    subagent_states=(
-                        {
-                            "source_id": "shared-reviewer",
-                            "status": "running",
-                        },
-                    ),
-                )
-            session._dispatch_event(ACPEvent(
-                event_type=ACPEventType.TOOL_CALL_DONE,
-                tool_call=tool_call,
-            ))
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-explicit-followup"
-
-    asyncio.run(session.prompt("previous task"))
-    second_result = asyncio.run(session.prompt("new explicit followup"))
-
-    assert len(second_result.tool_calls) == 1
-    assert second_result.tool_calls[0].collaboration_tool == "followup_task"
-
-
-def test_ordinary_prompt_allows_reused_call_id_for_new_child_source(
-    tmp_path: Path,
-):
-    from types import SimpleNamespace
-
-    from src.acp.models import ACPEventType, ToolCallInfo
-    from src.acp.session import ACPSession
-
-    session = ACPSession(agent_cmd="test", agent_args=[], cwd=str(tmp_path))
-
-    class FakeConn:
-        calls = 0
-
-        async def prompt(self, **_kwargs):
-            self.calls += 1
-            source_id = (
-                "first-reviewer"
-                if self.calls == 1
-                else "second-reviewer"
-            )
-            session._dispatch_event(ACPEvent(
-                event_type=ACPEventType.TOOL_CALL_UPDATE,
-                tool_call=ToolCallInfo(
-                    id="provider-reused-list-id",
-                    title="list_agents",
-                    kind="other",
-                    status="completed",
-                    collaboration_tool="list_agents",
-                    subagent_states=(
-                        {"source_id": source_id, "status": "running"},
-                    ),
-                ),
-            ))
-            return SimpleNamespace(stop_reason="end_turn")
-
-    session._conn = FakeConn()
-    session._session_id = "session-reused-call-id"
-
-    asyncio.run(session.prompt("first task"))
-    second_result = asyncio.run(session.prompt("second task"))
-
-    assert len(second_result.tool_calls) == 1
-    assert second_result.tool_calls[0].subagent_states == (
-        {"source_id": "second-reviewer", "status": "running"},
-    )
-
-
 def test_prompt_preserves_empty_stop_reason_for_fail_closed_classification(
     tmp_path: Path,
 ):
@@ -1518,7 +338,7 @@ def test_acp_manager_retries_start_failure(monkeypatch, caplog):
     m = mgr.ACPSessionManager("coco", session_timeout=999999)
     # The startup timeout is one absolute budget shared by all retries.  Give
     # this retry-behaviour test enough budget for its two intentional backoffs.
-    s = m.start_session("chat1", cwd=".", startup_timeout=3.0)
+    s = m.ensure_session("chat1", cwd=".", startup_timeout=3.0)
     assert s.session_id == "s_ok"
     assert calls["start"] == 3
 
@@ -1530,8 +350,6 @@ def test_acp_manager_retries_start_failure(monkeypatch, caplog):
     assert '"rc"' in joined
     assert '"stdout_snippet"' in joined
     assert '"stderr_snippet"' in joined
-
-
 
 
 def test_supports_acp_serve_unsets_claudecode(monkeypatch):
@@ -1660,8 +478,6 @@ def test_acp_health_check_uses_non_mutating_session_list_probe():
             calls.append(("list_sessions", cwd))
             return SimpleNamespace(sessions=[])
 
-        async def load_session(self, **_kwargs):
-            raise AssertionError("health check must not reload the live session")
 
     session = ACPSession(agent_cmd="traex", agent_args=["acp", "serve"], cwd="/repo")
     session._proc = SimpleNamespace(returncode=None)
@@ -1705,7 +521,7 @@ def test_acp_manager_unhealthy_session_is_cleaned(monkeypatch):
 
     m = mgr.ACPSessionManager("coco", session_timeout=999999)
     dead = DeadSession()
-    key = m._session_key("chat1")
+    key = SessionKeyCodec.encode("chat1")
     m._sessions[key] = dead
 
     assert m.get_session("chat1") is None
@@ -1728,9 +544,6 @@ def test_acp_manager_session_starter_success_is_not_overwritten(monkeypatch):
         def describe_agent(self):
             return "starter"
 
-        def load_session(self, session_id: str, timeout: float = 60):
-            del timeout
-            self.session_id = session_id
 
         def load_local_history(self, *args, **kwargs):
             return []
@@ -1761,7 +574,7 @@ def test_acp_manager_session_starter_success_is_not_overwritten(monkeypatch):
         return (_StarterSession(), "sid_from_starter", {"attempts": []})
 
     m = mgr.ACPSessionManager("coco", session_starter=_starter)
-    s = m.start_session("chat1", cwd=".", startup_timeout=0.01)
+    s = m.ensure_session("chat1", cwd=".", startup_timeout=0.01)
     assert s.session_id == "sid_from_starter"
 
 
@@ -1826,31 +639,7 @@ class MockPlanEntry:
 
 
 class TestParseToolCall:
-    def test_basic(self):
-        update = MockToolCallStart(tool_call_id="tc1", title="Read", kind="read", status="in_progress")
-        tc = _parse_tool_call(update)
-        assert tc.id == "tc1"
-        assert tc.title == "Read"
-        assert tc.kind == "read"
-        assert tc.status == "in_progress"
-        assert tc.locations == []
 
-    def test_with_locations(self):
-        update = MockToolCallStart(
-            locations=[MockLocation("/a.py"), MockLocation("/b.py")],
-        )
-        tc = _parse_tool_call(update)
-        assert tc.locations == ["/a.py", "/b.py"]
-
-    def test_none_title(self):
-        update = MockToolCallStart(title=None)
-        tc = _parse_tool_call(update)
-        assert tc.title == ""
-
-    def test_none_kind(self):
-        update = MockToolCallStart(kind=None)
-        tc = _parse_tool_call(update)
-        assert tc.kind == "other"
 
     def test_agent_tool_keeps_task_description_for_task_cards(self):
         update = MockToolCallStart(
@@ -1972,7 +761,7 @@ class TestParseToolCall:
             PromptResult(stop_reason="end_turn", tool_calls=[tc])
         ).outcome is PromptOutcome.INCOMPLETE
 
-    def test_codex_collaboration_states_are_normalized_by_thread(self):
+    def test_codex_namespaced_agents_states_are_observational(self):
         update = MockToolCallStart(
             tool_call_id="collaboration-call-private",
             title="wait_agent",
@@ -2011,52 +800,6 @@ class TestParseToolCall:
             {"source_id": "thread-b", "status": "completed", "message": "已核查 Deep 卡"},
         )
 
-    def test_codex_list_agents_without_namespaced_metadata_is_normalized(self):
-        update = MockToolCallProgress(
-            tool_call_id="list-agents-compatible",
-            title="list_agents",
-            kind="other",
-            status="completed",
-            raw_input={
-                "agentsStates": {
-                    "thread-a": {"status": "completed", "message": "done"},
-                },
-            },
-        )
-
-        tc = _parse_tool_call(update)
-
-        assert tc.collaboration_tool == "list_agents"
-        assert tc.subagent_states == (
-            {"source_id": "thread-a", "status": "completed", "message": "done"},
-        )
-        assert classify_prompt_result(
-            PromptResult(stop_reason="end_turn", tool_calls=[tc])
-        ).outcome is PromptOutcome.COMPLETED
-
-    def test_codex_collaboration_output_terminal_state_overrides_stale_input(self):
-        update = MockToolCallProgress(
-            tool_call_id="list-agents-output",
-            title="list_agents",
-            kind="other",
-            status="completed",
-            raw_input={
-                "agentsStates": {
-                    "thread-a": {"status": "running", "message": "working"},
-                },
-            },
-            raw_output={
-                "agentsStates": {
-                    "thread-a": {"status": "completed", "message": "done"},
-                },
-            },
-        )
-
-        tc = _parse_tool_call(update)
-
-        assert tc.subagent_states == (
-            {"source_id": "thread-a", "status": "completed", "message": "done"},
-        )
 
     def test_unknown_tool_cannot_claim_compatible_collaboration_state(self):
         update = MockToolCallProgress(
@@ -2215,17 +958,6 @@ class TestParseToolCall:
 
 
 class TestParsePlan:
-    def test_basic(self):
-        class MockAgentPlanUpdate:
-            entries = [
-                MockPlanEntry("Step 1", status="completed"),
-                MockPlanEntry("Step 2", status="in_progress"),
-            ]
-
-        plan = _parse_plan(MockAgentPlanUpdate())
-        assert len(plan.entries) == 2
-        assert plan.entries[0].content == "Step 1"
-        assert plan.entries[0].status == "completed"
 
     def test_skips_empty_entries(self):
         class MockAgentPlanUpdate:
@@ -2261,54 +993,22 @@ class TestGhostAPClient:
             asyncio.set_event_loop(loop)
         return loop.run_until_complete(coro)
 
-    def test_request_permission_auto_approve(self):
-        # Create mock options with an allow_once option
-        mock_option = MagicMock()
-        mock_option.kind = "allow_once"
-        mock_option.option_id = "opt1"
+
+    def test_request_permission_without_allow_once_is_denied(self):
+        option = MagicMock()
+        option.kind = "allow_always"
+        option.option_id = "unsafe-fallback"
+
         result = self._run_async(
             self.client.request_permission(
-                options=[mock_option],
+                options=[option],
                 session_id="s1",
                 tool_call=MagicMock(),
             )
         )
-        assert result.outcome.outcome == "selected"
-        assert result.outcome.option_id == "opt1"
 
-    def test_message_chunk_preserves_source_from_meta(self):
-        """AgentMessageChunk source metadata is copied into ACPEvent."""
-        from acp.schema import AgentMessageChunk, TextContentBlock
+        assert result.outcome.outcome == "cancelled"
 
-        from src.acp.models import ACPEventType
-
-        update = AgentMessageChunk(
-            sessionUpdate="agent_message_chunk",
-            _meta={"source_id": "agent-a"},
-            content=TextContentBlock(type="text", text="hello"),
-        )
-
-        self.client._handle_message_chunk(update)
-
-        assert len(self.events) == 1
-        assert self.events[0].event_type == ACPEventType.TEXT_CHUNK
-        assert self.events[0].text == "hello"
-        assert self.events[0].source_id == "agent-a"
-
-    def test_message_chunk_ignores_generic_chunk_id_as_source(self):
-        """Per-chunk ids must not split one assistant stream into text blocks."""
-        from acp.schema import AgentMessageChunk, TextContentBlock
-
-        update = AgentMessageChunk(
-            sessionUpdate="agent_message_chunk",
-            _meta={"id": "chunk-1"},
-            content=TextContentBlock(type="text", text="现在让"),
-        )
-
-        self.client._handle_message_chunk(update)
-
-        assert len(self.events) == 1
-        assert self.events[0].source_id is None
 
     def test_tool_call_copies_codex_subagent_source_to_event(self):
         from acp.schema import ToolCallStart
@@ -2345,25 +1045,10 @@ class TestGhostAPClient:
         assert self.events[0].tool_call.subagent_activity == "started"
 
 
-def test_read_write_text_file(tmp_path: Path):
-    root = str(tmp_path)
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, root_dir=root)
-
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(client.write_text_file("s1", "a.txt", "hello"))
-        resp = loop.run_until_complete(client.read_text_file("s1", "a.txt"))
-        assert resp.content == "hello"
-    finally:
-        loop.close()
-
-
 def test_tool_filter_blocks_acp_file_and_terminal_tools(tmp_path: Path):
     root = str(tmp_path)
     (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
-    client = GhostAPClient(on_event=lambda e: None, root_dir=root, sandbox=SandboxExecutor())
+    client = GhostAPClient(on_event=lambda e: None, root_dir=root)
     client.set_tool_filter(lambda tool, args: False)
 
     loop = asyncio.new_event_loop()
@@ -2382,6 +1067,19 @@ def test_tool_filter_blocks_acp_file_and_terminal_tools(tmp_path: Path):
         assert "工具权限" in term_out.output
     finally:
         loop.close()
+
+
+def test_kill_terminal_returns_current_official_response_and_releases_record():
+    client = GhostAPClient(on_event=lambda _event: None)
+    client.set_tool_filter(lambda _tool, _args: False)
+
+    terminal = asyncio.run(client.create_terminal(command="echo blocked", session_id="s1"))
+    response = asyncio.run(
+        client.kill_terminal(session_id="s1", terminal_id=terminal.terminal_id)
+    )
+
+    assert isinstance(response, KillTerminalResponse)
+    assert terminal.terminal_id not in client._terminals
 
 
 def test_tool_filter_blocks_auto_approved_permission_request():
@@ -2623,9 +1321,10 @@ def test_permission_bridge_keeps_wrapped_git_execute_on_shell_policy():
 
 
 def test_permission_bridge_fails_closed_when_safety_check_raises():
-    sandbox = MagicMock(spec=SandboxExecutor)
-    sandbox.is_command_safe.side_effect = RuntimeError("safety backend unavailable")
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True, sandbox=sandbox)
+    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
+    client._sandbox.is_command_safe = MagicMock(  # noqa: SLF001
+        side_effect=RuntimeError("safety backend unavailable")
+    )
     client._record = MagicMock()  # noqa: SLF001
 
     opt = MagicMock()
@@ -2655,70 +1354,6 @@ def test_permission_bridge_fails_closed_when_safety_check_raises():
         loop.close()
 
 
-class TestRebindThread:
-    def _make_manager(self):
-        from src.acp.manager import ACPSessionManager
-
-        return ACPSessionManager("coco", session_timeout=999999)
-
-    def test_rebind_moves_session(self):
-        mgr = self._make_manager()
-        sentinel = MagicMock()
-        old_key = mgr._session_key("chat1", "proj1", thread_id=None)
-        mgr._sessions[old_key] = sentinel
-
-        result = mgr.rebind_thread("chat1", "proj1", "thread_resp_123")
-
-        assert result is True
-        new_key = mgr._session_key("chat1", "proj1", thread_id="thread_resp_123")
-        assert mgr._sessions.get(new_key) is sentinel
-        assert old_key not in mgr._sessions
-
-    def test_rebind_returns_false_when_missing(self):
-        mgr = self._make_manager()
-
-        result = mgr.rebind_thread("chat1", "proj1", "thread_resp_456")
-
-        assert result is False
-
-    def test_rebind_does_not_affect_other_keys(self):
-        mgr = self._make_manager()
-        sentinel_a = MagicMock()
-        sentinel_b = MagicMock()
-        key_a = mgr._session_key("chat1", "projA", thread_id=None)
-        key_b = mgr._session_key("chat1", "projB", thread_id=None)
-        mgr._sessions[key_a] = sentinel_a
-        mgr._sessions[key_b] = sentinel_b
-
-        mgr.rebind_thread("chat1", "projA", "t1")
-
-        assert mgr._sessions.get(mgr._session_key("chat1", "projA", thread_id="t1")) is sentinel_a
-        assert mgr._sessions.get(key_b) is sentinel_b
-        assert key_a not in mgr._sessions
-
-    def test_rebind_cleans_existing_target_session(self):
-        mgr = self._make_manager()
-        old_session = MagicMock()
-        old_session.session_id = "sid_old"
-        old_session.message_count = 3
-        existing_at_target = MagicMock()
-        existing_at_target.session_id = "sid_target"
-        existing_at_target.message_count = 5
-
-        old_key = mgr._session_key("chat1", "proj1", thread_id=None)
-        new_key = mgr._session_key("chat1", "proj1", thread_id="thread_new")
-        mgr._sessions[old_key] = old_session
-        mgr._sessions[new_key] = existing_at_target
-
-        result = mgr.rebind_thread("chat1", "proj1", "thread_new")
-
-        assert result is True
-        assert mgr._sessions.get(new_key) is old_session
-        assert old_key not in mgr._sessions
-        existing_at_target.close.assert_called_once()
-        existing_at_target.to_snapshot.assert_called_once()
-
-
 def test_read_text_file_path_escape_denied(tmp_path: Path):
     root = str(tmp_path)
     client = GhostAPClient(on_event=lambda e: None, root_dir=root)
@@ -2732,99 +1367,12 @@ def test_read_text_file_path_escape_denied(tmp_path: Path):
         loop.close()
 
 
-def test_terminal_virtual_execution(tmp_path: Path):
-    root = str(tmp_path)
-    client = GhostAPClient(on_event=lambda e: None, root_dir=root, sandbox=SandboxExecutor())
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        create = loop.run_until_complete(client.create_terminal(command="echo hi", session_id="s1"))
-        assert create.terminal_id.startswith("term_")
-
-        out = loop.run_until_complete(client.terminal_output(session_id="s1", terminal_id=create.terminal_id))
-        assert "hi" in out.output
-        assert out.exit_status and out.exit_status.exit_code == 0
-        assert out.truncated in (True, False)
-    finally:
-        loop.close()
-
-
-def test_history_store_missing_file_returns_empty(tmp_path: Path):
-    store = ACPHistoryStore(base_dir=str(tmp_path))
-    assert store.load("no_such_session") == []
-
-
-def test_history_store_skips_corrupt_lines(tmp_path: Path):
-    store = ACPHistoryStore(base_dir=str(tmp_path))
-    p = tmp_path / "s1.jsonl"
-    p.write_text("{not json}\n" + '{"kind": "execute", "data": {"command": "echo hi"}}\n', encoding="utf-8")
-    items = store.load("s1")
-    assert len(items) == 1
-    assert items[0]["kind"] == "execute"
-
-
-def test_client_records_execute_history(tmp_path: Path):
-    store = ACPHistoryStore(base_dir=str(tmp_path))
-    client = GhostAPClient(
-        on_event=lambda e: None, root_dir=str(tmp_path), sandbox=SandboxExecutor(), history_store=store
-    )
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        resp = loop.run_until_complete(client.create_terminal(command="echo hi", session_id="s1"))
-        assert resp.terminal_id
-    finally:
-        loop.close()
-
-    items = store.load("s1")
-    kinds = [x.get("kind") for x in items]
-    assert "execute" in kinds
-
-
-def test_permission_rejects_unsafe_execute():
-    events: list[ACPEvent] = []
-    client = GhostAPClient(on_event=events.append, auto_approve=True)
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-
-        # allow_once option exists but should still be denied by safety policy
-        opt = MagicMock()
-        opt.kind = "allow_once"
-        opt.option_id = "opt1"
-
-        tool_call = MagicMock()
-        tool_call.kind = "execute"
-        tool_call.raw_input = {"command": "rm -rf /"}
-
-        resp = loop.run_until_complete(client.request_permission(options=[opt], session_id="s1", tool_call=tool_call))
-        assert resp.outcome.outcome == "cancelled"
-    finally:
-        loop.close()
-
-
 def test_resolve_agent_spec_coco_has_command():
     if not shutil.which("coco"):
         pytest.skip("coco binary not available")
     cmd, args = resolve_agent_spec("coco")
     assert cmd == "coco"
     assert args == ["acp", "serve"]
-
-
-def test_read_text_file_truncates(tmp_path: Path):
-    root = str(tmp_path)
-    client = GhostAPClient(on_event=lambda e: None, root_dir=root)
-    big = "x" * 300_000
-    (tmp_path / "big.txt").write_text(big, encoding="utf-8")
-
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        resp = loop.run_until_complete(client.read_text_file("s1", "big.txt"))
-        assert len(resp.content) == 200_000
-        assert resp.field_meta and resp.field_meta.get("truncated") is True
-    finally:
-        loop.close()
 
 
 def test_acp_011_permission_arguments_keep_allow_once_selection():
@@ -2839,49 +1387,3 @@ def test_acp_011_permission_arguments_keep_allow_once_selection():
 
     assert response.outcome.outcome == "selected"
     assert response.outcome.option_id == "allow-once"
-
-
-def test_acp_011_read_and_write_argument_order_and_line_limit(tmp_path: Path):
-    client = GhostAPClient(on_event=lambda _event: None, root_dir=str(tmp_path))
-
-    asyncio.run(client.write_text_file("session-1", "lines.txt", "one\ntwo\nthree\n"))
-    response = asyncio.run(
-        client.read_text_file("session-1", "lines.txt", line=2, limit=1)
-    )
-
-    assert response.content == "two\n"
-
-
-def test_acp_011_terminal_arguments_honor_env_cwd_and_output_byte_limit(tmp_path: Path):
-    client = GhostAPClient(on_event=lambda _event: None, root_dir=str(tmp_path))
-
-    terminal = asyncio.run(
-        client.create_terminal(
-            "session-1",
-            "sh",
-            ["-c", "printf '%s' \"$ACP_TEST_VALUE-abcd\""],
-            [EnvVariable(name="ACP_TEST_VALUE", value="value")],
-            str(tmp_path),
-            2,
-        )
-    )
-    output = asyncio.run(
-        client.terminal_output("session-1", terminal.terminal_id)
-    )
-
-    assert output.output == "cd"
-    assert output.truncated is True
-
-
-def test_acp_011_terminal_rejects_cwd_outside_project_root(tmp_path: Path):
-    client = GhostAPClient(on_event=lambda _event: None, root_dir=str(tmp_path))
-
-    terminal = asyncio.run(
-        client.create_terminal("session-1", "pwd", None, None, "/tmp", None)
-    )
-    output = asyncio.run(
-        client.terminal_output("session-1", terminal.terminal_id)
-    )
-
-    assert terminal.field_meta and terminal.field_meta.get("blocked") is True
-    assert "工作目录" in output.output

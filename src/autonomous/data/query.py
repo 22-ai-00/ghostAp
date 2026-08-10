@@ -318,7 +318,6 @@ class EmployeeMemoryQuery:
             content = self._memory.read_l1(
                 request.requested_agent_id,
                 request.tenant_key,
-                allow_unscoped_legacy=False,
             )
             self._audit_result(context, "granted", "full_l1")
             return MemoryQueryResult(content=content or "", scope="full_l1")

@@ -1,10 +1,4 @@
-"""TTL callback handlers extracted from CardSession for size reduction.
-
-TTLHandler manages idle-timeout expiration and prewarning logic.
-It interacts with the owning session exclusively through the
-TTLDecider + TTLActuator protocols — no direct access to private attributes.
-All methods are designed to be called as timer callbacks (from daemon threads).
-"""
+"""Idle timeout and terminal-delivery recovery for ``CardSession``."""
 
 from __future__ import annotations
 
@@ -12,189 +6,331 @@ import logging
 from typing import TYPE_CHECKING
 
 from src.card.events import CardEvent
+from src.card.protocols import TTLState
+from src.card.render.renderer import render_card
 from src.card.session._constants import TTL_ENGINE_KEY_MAP
 from src.card.session.ttl_activity import has_active_card_work
+from src.card.state.reducer import reduce_card_state
 from src.card.ui_text import UI_TEXT
 
 if TYPE_CHECKING:
-    from src.card.protocols import TTLActuator, TTLDecider
+    from src.card.session.core import CardSession
 
 logger = logging.getLogger(__name__)
 
 
+def _with_now(event: CardEvent, now: float) -> CardEvent:
+    if "_now" in event.payload:
+        return event
+    return CardEvent(type=event.type, payload={**event.payload, "_now": now})
+
+
 class TTLHandler:
-    """Handles TTL expiration and prewarning callbacks for a CardSession."""
+    """Own the timeout lifecycle for one card session."""
 
-    __slots__ = ("_d", "_a", "_reduce_failure_count")
+    __slots__ = ("_session", "_reduce_failure_count")
 
-    _MAX_REDUCE_FAILURES: int = 3
-    _MAX_TERMINAL_STATE_RETRIES: int = 3
+    _LOCK_ACQUIRE_TIMEOUT = 1.0
+    _MAX_REDUCE_FAILURES = 3
+    _MAX_TERMINAL_STATE_RETRIES = 3
+    _PREWARNING_THRESHOLD = 0.75
 
-    def __init__(self, decider: TTLDecider, actuator: TTLActuator) -> None:
-        self._d = decider
-        self._a = actuator
-        self._reduce_failure_count: int = 0
+    def __init__(self, session: CardSession) -> None:
+        self._session = session
+        self._reduce_failure_count = 0
+
+    def _snapshot(self) -> TTLState | None:
+        s = self._session
+        if not s._lock.acquire(timeout=self._LOCK_ACQUIRE_TIMEOUT):
+            return None
+        try:
+            return TTLState(
+                closed=s._closed.is_set(),
+                ttl_warned=s._ttl_warned,
+                idle_seconds=s._clock() - s._last_dispatch_time,
+                ttl_seconds=s._ttl_seconds,
+                session_id=s._session_id,
+                state_snapshot=s._state,
+            )
+        finally:
+            s._lock.release()
+
+    def _defer(self) -> None:
+        s = self._session
+        with s._lock:
+            if s._closed.is_set():
+                return
+            s._last_dispatch_time = s._clock()
+            s._ttl_warned = False
+            s._timers.reset_ttl_timer(
+                on_expired=self.on_ttl_expired,
+                on_prewarning=self.on_ttl_prewarning,
+            )
+
+    def _reduce_and_render(self, events: list[CardEvent]) -> list:
+        s = self._session
+        with s._lock:
+            snapshot = s._state
+            now = s._clock()
+            try:
+                for event in events:
+                    s._state = reduce_card_state(
+                        s._state, _with_now(event, now), s._metadata
+                    )
+                assert s._state is not None
+                return render_card(s._state, s._budget)
+            except Exception:
+                s._state = snapshot
+                raise
+
+    def _notify_user(self, text: str) -> None:
+        s = self._session
+        if s._notify_callback:
+            try:
+                s._notify_callback(s._chat_id, text)
+            except Exception as exc:
+                logger.debug(
+                    "CardSession %s: notify callback failed: %s",
+                    s._session_id,
+                    repr(exc),
+                )
+        elif s._reply_text_fn and s._reply_to:
+            try:
+                s._reply_text_fn(s._reply_to, text)
+            except Exception as exc:
+                logger.debug(
+                    "CardSession %s: reply fallback failed: %s",
+                    s._session_id,
+                    repr(exc),
+                )
+        else:
+            logger.warning(
+                "CardSession %s: no timeout notification channel", s._session_id
+            )
+
+    def _close_delivery(self) -> None:
+        s = self._session
+        try:
+            s._delivery.close(s._session_id)
+        except Exception as exc:
+            logger.debug(
+                "CardSession %s: delivery close failed: %s",
+                s._session_id,
+                repr(exc),
+            )
+
+    def _force_deliver(self, rendered: list) -> None:
+        s = self._session
+        outcomes = s._delivery.deliver(
+            session_id=s._session_id,
+            chat_id=s._chat_id,
+            rendered=rendered,
+            reply_to=s._reply_to,
+            is_terminal=True,
+        )
+        failed = [outcome for outcome in outcomes if outcome.kind in {"rejected", "reconcile"}]
+        if failed:
+            raise RuntimeError(
+                f"terminal retry delivery failed: {failed[0].kind}:{failed[0].message}"
+            )
+
+    def _force_close(self) -> None:
+        s = self._session
+        reason = "ttl_expired"
+        logger.warning("CardSession %s: force-close (reason=%s)", s._session_id, reason)
+        s._closed.set()
+        s._timers.close()
+        delivered = False
+        terminal_state = s._state
+        acquired = s._lock.acquire(timeout=0)
+        try:
+            ttl_key = TTL_ENGINE_KEY_MAP.get(s.engine_cmd, "card_session_ttl_expired")
+            effective_cmd = s.engine_cmd
+            if (
+                ttl_key == "card_session_ttl_expired"
+                and effective_cmd == UI_TEXT.get("card_session_fallback_cmd", "")
+            ):
+                effective_cmd = UI_TEXT["card_session_ttl_expired_commands"]
+            text = UI_TEXT[ttl_key].format(
+                engine_cmd=effective_cmd, engine_name=s.engine_name
+            )
+            snapshot = reduce_card_state(
+                s._state,
+                _with_now(CardEvent.warning_updated(text), s._clock()),
+                s._metadata,
+            )
+            snapshot = reduce_card_state(
+                snapshot,
+                _with_now(CardEvent.cancelled(reason=reason), s._clock()),
+                s._metadata,
+            )
+            terminal_state = snapshot
+            if acquired:
+                s._state = snapshot
+                s._terminal_reason = reason
+            rendered = render_card(snapshot, s._budget)
+            self._force_deliver(rendered)
+            delivered = True
+        except Exception as exc:
+            logger.debug(
+                "CardSession %s: force-close card update failed: %s",
+                s._session_id,
+                repr(exc),
+            )
+        finally:
+            if acquired:
+                s._lock.release()
+        self._close_delivery()
+        if not delivered:
+            self._notify_user(
+                UI_TEXT["card_session_ttl_force_close_notice"].format(
+                    engine_cmd=s.engine_cmd, engine_name=s.engine_name
+                )
+            )
+        s._hook_firer.fire_terminal(terminal_state, reason)
 
     def on_ttl_expired(self) -> None:
-        """Timer callback: proactively close session on idle timeout."""
-        d, a = self._d, self._a
-        state = d.get_ttl_state()
-
-        # Lock contention — schedule retry or force-close
+        """Close an abandoned session, but never interrupt active card work."""
+        s = self._session
+        state = self._snapshot()
         if state is None:
-            if not a.schedule_ttl_retry(self.on_ttl_expired):
+            if not s._timers.schedule_ttl_retry(self.on_ttl_expired):
                 self._force_close()
             return
-
-        if state.closed or state.ttl_warned:
-            return
-        if state.idle_seconds <= state.ttl_seconds:
+        if state.closed or state.ttl_warned or state.idle_seconds <= state.ttl_seconds:
             return
         if has_active_card_work(state.state_snapshot):
             logger.info(
                 "CardSession %s: TTL deferred because card still has active work",
                 state.session_id,
             )
-            a.defer_idle_timeout(self.on_ttl_expired, self.on_ttl_prewarning)
+            self._defer()
             return
 
-        # Mark as expired before attempting reduce/render
-        a.mark_ttl_expired()
-        logger.info("CardSession %s: TTL expired (%.0fs idle)", state.session_id, state.ttl_seconds)
-
-        # Select engine-specific expired text key
-        ttl_key = TTL_ENGINE_KEY_MAP.get(d.engine_cmd, "card_session_ttl_expired")
-        # Generic fallback uses {expired_commands} placeholder (full command list);
-        # engine-specific keys use {engine_cmd} and {engine_name}.
+        with s._lock:
+            s._ttl_warned = True
+            s._terminal_reason = "ttl_expired"
+        ttl_key = TTL_ENGINE_KEY_MAP.get(s.engine_cmd, "card_session_ttl_expired")
         if ttl_key == "card_session_ttl_expired":
-            ttl_text = UI_TEXT[ttl_key].format(
-                expired_commands=UI_TEXT["card_session_ttl_expired_commands"],
+            text = UI_TEXT[ttl_key].format(
+                expired_commands=UI_TEXT["card_session_ttl_expired_commands"]
             )
         else:
-            ttl_text = UI_TEXT[ttl_key].format(engine_cmd=d.engine_cmd, engine_name=d.engine_name)
-        events = [
-            CardEvent.warning_updated(ttl_text),
-            CardEvent.cancelled(reason="ttl_expired"),
-        ]
+            text = UI_TEXT[ttl_key].format(
+                engine_cmd=s.engine_cmd, engine_name=s.engine_name
+            )
         try:
-            rendered = a.reduce_and_render(events)
+            rendered = self._reduce_and_render(
+                [CardEvent.warning_updated(text), CardEvent.cancelled(reason="ttl_expired")]
+            )
         except Exception as exc:
-            logger.error("CardSession %s: TTL reduce/render failed: %s", state.session_id, exc, exc_info=True)
-            a.rollback_ttl_warned()
+            logger.error(
+                "CardSession %s: TTL reduce/render failed: %s",
+                state.session_id,
+                exc,
+                exc_info=True,
+            )
+            with s._lock:
+                s._ttl_warned = False
             self._reduce_failure_count += 1
             if self._reduce_failure_count >= self._MAX_REDUCE_FAILURES:
-                logger.warning("CardSession %s: TTL reduce failed %d times, force-closing", state.session_id, self._reduce_failure_count)
                 self._force_close()
-                return
-            a.schedule_retry(self.on_ttl_expired)
+            else:
+                s._timers.schedule_retry(self.on_ttl_expired)
             return
-
         self._reduce_failure_count = 0
-        a.deliver_terminal(rendered)
-
-    def _force_close(self) -> None:
-        """Force-close when lock cannot be acquired after retries.
-
-        Delegates the entire force-close operation to the session's
-        force_terminate() method which handles stale-state, delivery,
-        notification, and hook firing internally.
-        """
-        self._a.force_terminate("ttl_expired")
-
-    # Prewarning fires when this fraction of TTL has elapsed in idle
-    _PREWARNING_THRESHOLD = 0.75
+        s._deliver_and_track(rendered, is_terminal=True)
 
     def on_ttl_prewarning(self) -> None:
-        """Timer callback: show prewarning banner when ~25% TTL remains.
-
-        The threshold (0.75) means prewarning fires when 75% of idle TTL
-        has elapsed, giving users ~25% remaining time to resume activity
-        before the hard expiry fires.
-        """
-        d, a = self._d, self._a
-        state = d.get_ttl_state()
-
-        # Lock contention — schedule retry
+        """Show one warning when an inactive session approaches expiry."""
+        s = self._session
+        state = self._snapshot()
         if state is None:
-            if not a.schedule_ttl_retry(self.on_ttl_prewarning):
-                logger.debug("CardSession: TTL prewarning retry exhausted, force expiring")
-                a.mark_ttl_expired()
-                a.notify_user(UI_TEXT["card_session_ttl_lock_contention"].format(engine_cmd=d.engine_cmd))
+            if not s._timers.schedule_ttl_retry(self.on_ttl_prewarning):
+                with s._lock:
+                    s._ttl_warned = True
+                self._notify_user(
+                    UI_TEXT["card_session_ttl_lock_contention"].format(
+                        engine_cmd=s.engine_cmd
+                    )
+                )
             return
-
-        if state.closed or state.ttl_warned:
-            return
-        if state.idle_seconds < state.ttl_seconds * self._PREWARNING_THRESHOLD:
+        if (
+            state.closed
+            or state.ttl_warned
+            or state.idle_seconds < state.ttl_seconds * self._PREWARNING_THRESHOLD
+        ):
             return
         if has_active_card_work(state.state_snapshot):
-            logger.debug(
-                "CardSession %s: TTL prewarning deferred because card still has active work",
-                state.session_id,
-            )
-            a.defer_idle_timeout(self.on_ttl_expired, self.on_ttl_prewarning)
+            self._defer()
             return
-
-        remaining_min = max(1, int((state.ttl_seconds - state.idle_seconds) / 60))
-        warning_text = UI_TEXT["card_session_ttl_prewarning"].format(minutes=remaining_min, engine_name=d.engine_name)
-
-        events = [CardEvent.warning_updated(warning_text)]
+        remaining = max(1, int((state.ttl_seconds - state.idle_seconds) / 60))
+        text = UI_TEXT["card_session_ttl_prewarning"].format(
+            minutes=remaining, engine_name=s.engine_name
+        )
         try:
-            rendered = a.reduce_and_render(events)
+            rendered = self._reduce_and_render([CardEvent.warning_updated(text)])
         except Exception as exc:
-            logger.debug("CardSession %s: TTL prewarning render failed: %s", state.session_id, repr(exc))
-            # Fallback: notify user via text even if card rendering failed
-            notify_text = UI_TEXT["card_session_ttl_prewarning"].format(minutes=remaining_min, engine_name=d.engine_name)
-            a.notify_user(notify_text)
+            logger.debug(
+                "CardSession %s: TTL prewarning render failed: %s",
+                state.session_id,
+                repr(exc),
+            )
+            self._notify_user(text)
             return
-
-        # Deliver as non-terminal (prewarning only — no separate chat notification
-        # to avoid dual-notification; card banner + keep-alive button is sufficient)
-        a.deliver_update(rendered)
+        s._deliver_and_track(rendered, is_terminal=False)
 
     def schedule_terminal_retry(self, rendered: list) -> None:
-        """Schedule a single delayed retry for terminal event delivery failure."""
-        d, a = self._d, self._a
-        a.flag_retry_pending()
-        state_retry_count = 0
+        """Retry a terminal render once delivery becomes available."""
+        s = self._session
+        with s._lock:
+            s._tracker.flag_retry_pending()
+        state_retries = 0
 
-        def _retry() -> None:
-            nonlocal state_retry_count
-            # Check if already closed (state=None means lock contention, skip)
-            state = d.get_ttl_state()
+        def retry() -> None:
+            nonlocal state_retries
+            state = self._snapshot()
             if state is None:
-                if state_retry_count < self._MAX_TERMINAL_STATE_RETRIES:
-                    state_retry_count += 1
-                    a.schedule_retry(_retry)
+                if state_retries < self._MAX_TERMINAL_STATE_RETRIES:
+                    state_retries += 1
+                    s._timers.schedule_retry(retry)
                     return
-                logger.error(
-                    "CardSession terminal retry state remained contended after %d retries",
-                    state_retry_count,
-                )
+                s._closed.set()
                 try:
-                    a.mark_closed()
-                    notice_text = UI_TEXT["card_session_terminal_fallback_notice"].format(
-                        engine_cmd=d.engine_cmd
+                    self._notify_user(
+                        UI_TEXT["card_session_terminal_fallback_notice"].format(
+                            engine_cmd=s.engine_cmd
+                        )
                     )
-                    a.notify_user(notice_text)
-                    a.close_delivery()
+                    self._close_delivery()
                 finally:
-                    d.release_terminal_resources()
+                    s.release_terminal_resources()
                 return
             if state.closed:
                 return
             try:
                 try:
-                    reason = getattr(state.state_snapshot, "terminal_reason", None) or "completed"
-                    a.force_deliver(rendered)
-                    a.mark_closed()
-                    a.fire_terminal_hook(reason)
+                    reason = (
+                        getattr(state.state_snapshot, "terminal_reason", None)
+                        or "completed"
+                    )
+                    self._force_deliver(rendered)
+                    s._closed.set()
+                    s._hook_firer.fire_terminal(s._state, reason)
                 except Exception as exc:
-                    logger.error("CardSession %s: terminal retry failed: %s", state.session_id, repr(exc))
-                    a.mark_closed()
-                    notice_text = UI_TEXT["card_session_terminal_fallback_notice"].format(engine_cmd=d.engine_cmd)
-                    a.notify_user(notice_text)
-                a.close_delivery()
+                    logger.error(
+                        "CardSession %s: terminal retry failed: %s",
+                        state.session_id,
+                        repr(exc),
+                    )
+                    s._closed.set()
+                    self._notify_user(
+                        UI_TEXT["card_session_terminal_fallback_notice"].format(
+                            engine_cmd=s.engine_cmd
+                        )
+                    )
+                self._close_delivery()
             finally:
-                d.release_terminal_resources()
+                s.release_terminal_resources()
 
-        a.schedule_retry(_retry)
+        s._timers.schedule_retry(retry)

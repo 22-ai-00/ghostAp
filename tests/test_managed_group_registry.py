@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta, tzinfo
 
 import pytest
 
-from src.trust.models import ManagedGroupOrigin, ManagedGroupStatus
+from src.trust.models import ManagedGroupOrigin
 from src.trust.registry import (
     ManagedGroupConflictError,
     ManagedGroupRegistry,
@@ -85,33 +85,6 @@ def test_expected_employee_rotation_updates_revision_without_prompt(tmp_path):
     assert registry.grant_for_chat("oc_managed") == before_grant
 
 
-def test_owner_p2p_can_adopt_existing_group_once_without_per_message_enrollment(tmp_path):
-    registry = ManagedGroupRegistry(tmp_path / "managed-groups.json")
-    kwargs = {
-        "chat_id": "oc_existing",
-        "owner_id": "ou_owner",
-        "receiving_bot_ref": "cli_main_bot",
-        "project_id": "project-7",
-        "canonical_root_ref": "/srv/project-7",
-        "created_at": NOW,
-    }
-
-    first_record, first_grant = registry.adopt_existing(
-        **kwargs,
-        validator=lambda facts: facts["chat_id"] == "oc_existing",
-    )
-    second_record, second_grant = registry.adopt_existing(
-        **kwargs,
-        validator=lambda facts: facts["chat_id"] == "oc_existing",
-    )
-
-    assert first_record.origin is ManagedGroupOrigin.OWNER_ADOPTED
-    assert second_record == first_record
-    assert second_grant == first_grant
-    assert registry.managed_groups() == (first_record,)
-    assert registry.project_grants() == (first_grant,)
-
-
 def test_registry_strict_version_and_corruption_fail_closed(tmp_path):
     path = tmp_path / "managed-groups.json"
     path.write_text('{"schema":"ghostap.managed_groups","version":999}', encoding="utf-8")
@@ -121,25 +94,6 @@ def test_registry_strict_version_and_corruption_fail_closed(tmp_path):
     path.write_text("{not-json", encoding="utf-8")
     with pytest.raises(RegistryCorruptionError):
         ManagedGroupRegistry(path)
-
-
-def test_registry_snapshot_uses_exact_versioned_schema(tmp_path):
-    path = tmp_path / "managed-groups.json"
-    registry = ManagedGroupRegistry(path)
-    _activate(registry)
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert set(payload) == {
-        "groups",
-        "migration_dispositions",
-        "provision_intents",
-        "revoke_intents",
-        "revision",
-        "schema",
-        "version",
-    }
-    assert payload["schema"] == "ghostap.managed_groups"
-    assert payload["version"] == 1
 
 
 def test_dangling_provision_retry_keeps_original_timestamp(tmp_path):
@@ -173,21 +127,6 @@ def test_two_registry_instances_merge_mutations_without_lost_updates(tmp_path):
         "oc_first",
         "oc_second",
     }
-
-
-def test_stale_registry_instance_cannot_overwrite_a_durable_tombstone(tmp_path):
-    path = tmp_path / "managed-groups.json"
-    writer = ManagedGroupRegistry(path)
-    _activate(writer, chat_id="oc_retired")
-    stale = ManagedGroupRegistry(path)
-
-    writer.tombstone("oc_retired")
-    _activate(stale, chat_id="oc_new")
-
-    replayed = ManagedGroupRegistry(path)
-    assert replayed.active_record("oc_retired") is None
-    assert replayed.record("oc_retired").status is ManagedGroupStatus.TOMBSTONED
-    assert replayed.active_record("oc_new") is not None
 
 
 def test_post_replace_fsync_failure_stays_fail_closed_until_reconciled(
@@ -275,31 +214,6 @@ def test_migration_owner_notification_is_marked_only_after_durable_success(tmp_p
     )
 
 
-def test_create_dispatch_outcome_unknown_is_durable_and_age_bounded(tmp_path):
-    path = tmp_path / "managed-groups.json"
-    registry = ManagedGroupRegistry(path)
-    registry.begin_provision(
-        provision_id="create:unknown",
-        owner_id="ou_owner",
-        origin=ManagedGroupOrigin.GHOSTAP_CREATED,
-        receiving_bot_ref="cli_bot",
-        project_id="project",
-        canonical_root_ref="/srv/project",
-        created_at=NOW,
-    )
-
-    assert registry.prepare_create_dispatch("create:unknown", dispatched_at=NOW)
-    registry.mark_create_outcome_unknown("create:unknown")
-    replayed = ManagedGroupRegistry(path)
-    assert replayed.provision_create_state("create:unknown") == "outcome_unknown"
-    assert replayed.prepare_create_dispatch(
-        "create:unknown", dispatched_at=NOW + timedelta(hours=9)
-    )
-    assert not replayed.prepare_create_dispatch(
-        "create:unknown", dispatched_at=NOW + timedelta(hours=11)
-    )
-
-
 def test_registry_rejects_symlink_target_or_parent(tmp_path):
     real_path = tmp_path / "real.json"
     ManagedGroupRegistry(real_path)
@@ -363,15 +277,11 @@ def test_provision_intent_binds_one_remote_chat_across_restart(tmp_path):
 def test_pending_revoke_fails_closed_across_restart_until_resolved(tmp_path):
     path = tmp_path / "managed-groups.json"
     registry = ManagedGroupRegistry(path)
-    active, _ = _activate(registry)
+    _activate(registry)
 
     registry.begin_revoke("oc_managed", requested_at=NOW)
     assert registry.active_record("oc_managed") is None
-    assert ManagedGroupRegistry(path).pending_revokes() == ("oc_managed",)
-
-    registry.cancel_revoke("oc_managed")
-    assert registry.active_record("oc_managed") == active
-    registry.begin_revoke("oc_managed", requested_at=NOW)
-    tombstone = registry.complete_revoke("oc_managed")
-    assert tombstone.status is ManagedGroupStatus.TOMBSTONED
-    assert registry.pending_revokes() == ()
+    replayed = ManagedGroupRegistry(path)
+    assert replayed.active_record("oc_managed") is None
+    assert replayed.grant_for_chat("oc_managed") is None
+    assert replayed.pending_revokes() == ("oc_managed",)

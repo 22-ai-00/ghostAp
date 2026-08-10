@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 from src.card.builders.system import SystemBuilder
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
-from src.feishu.ws_client import FeishuWSClient
 
 
 class TestRefactorRobustness(unittest.TestCase):
@@ -82,62 +81,6 @@ class TestRefactorRobustness(unittest.TestCase):
             mock_reply.assert_called_once()
             self.assertIn("未知命令", mock_reply.call_args.args[1])
             mock_help.assert_not_called()
-
-    def test_ws_client_refactor_structure(self):
-        """Test that the refactored WSClient methods exist and validate basic message."""
-        # We can't easily instantiate WSClient fully without many mocks,
-        # but we can test the specific logic by partial mocking or just checking attributes if we could.
-        # Instead, let's use the ExitStack approach from before to instantiate it safely.
-        from contextlib import ExitStack
-
-        with ExitStack() as stack:
-            stack.enter_context(patch("src.feishu.ws_client.get_settings"))
-            stack.enter_context(patch("src.feishu.ws_client.ACPSessionManager"))
-            stack.enter_context(patch("src.feishu.ws_client.IntentRecognizer"))
-            stack.enter_context(patch("src.feishu.ws_client.TaskScheduler"))
-            stack.enter_context(patch("src.feishu.ws_client.ProjectManager"))
-            stack.enter_context(patch("src.feishu.ws_client.MessageProjectMapper"))
-            stack.enter_context(patch("src.feishu.ws_client.MessageLinker"))
-            stack.enter_context(patch("src.mode.ModeManager"))
-            stack.enter_context(patch("src.feishu.ws_client.ProjectContextManager"))
-            stack.enter_context(patch("src.feishu.ws_client.DeepEngineManager"))
-            stack.enter_context(patch("src.feishu.ws_client.SpecEngineManager"))
-            stack.enter_context(patch("src.feishu.ws_client.HandlerContext"))
-            stack.enter_context(patch("src.feishu.ws_client.ActionDispatcher"))
-            stack.enter_context(patch("src.feishu.ws_client.CocoModeHandler"))
-            stack.enter_context(patch("src.feishu.ws_client.ClaudeModeHandler"))
-            stack.enter_context(patch("src.feishu.ws_client.DeepHandler"))
-            stack.enter_context(patch("src.feishu.ws_client.SpecHandler"))
-            stack.enter_context(patch("src.feishu.ws_client.ProjectHandler"))
-            stack.enter_context(patch("src.feishu.ws_client.SystemHandler"))
-            stack.enter_context(patch("src.feishu.ws_client.DiagnosticsHandler"))
-
-            client = FeishuWSClient(lambda *args: None)
-
-            # Test _clean_at_text
-            self.assertEqual(client._clean_at_text("hello"), "hello")
-            self.assertEqual(client._clean_at_text("@bot hello"), "hello")
-            self.assertEqual(client._clean_at_text("  @bot   hello  "), "hello")
-            self.assertEqual(client._clean_at_text("@bot"), "")
-
-            # Test _validate_message
-            mock_msg = MagicMock()
-            mock_msg.create_time = None
-            mock_msg.message_id = "mid"
-            mock_msg.message_type = "text"
-
-            # Mock dependencies
-            client._is_message_expired = MagicMock(return_value=False)
-            client._is_duplicate_message = MagicMock(return_value=False)
-
-            self.assertTrue(client._validate_message(mock_msg, "req_id"))
-
-            # Test invalid type
-            mock_msg.message_type = "audio"
-            client._reply_text = MagicMock()
-            self.assertFalse(client._validate_message(mock_msg, "req_id"))
-            client._reply_text.assert_called()
-
 
 if __name__ == "__main__":
     unittest.main()

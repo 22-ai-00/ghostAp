@@ -35,7 +35,6 @@ class _FakeProgrammingCardSession:
     def __init__(self, *_args, **kwargs):
         self.failed_text = None
         self.finished = False
-        self.waiting_reason = None
         self.cancelled_reason = None
         self.continuation_boundaries = 0
         self.kwargs = kwargs
@@ -62,6 +61,9 @@ class _FakeProgrammingCardSession:
     def on_event(self, _event):
         return None
 
+    def on_text(self, text):
+        self.final_text = text
+
     def get_final_text(self):
         return getattr(self, "final_text", "")
 
@@ -76,10 +78,6 @@ class _FakeProgrammingCardSession:
 
     def begin_continuation_turn(self):
         self.continuation_boundaries += 1
-
-    def wait_for_user_confirmation(self, reason):
-        self.waiting_reason = reason
-
 
 class _QueuedPromptSession:
     def __init__(
@@ -155,10 +153,6 @@ def _incomplete_execution(
         result=result,
         assessment=assessment,
         automatic_continuations=0,
-        awaiting_user_input=(
-            not entered_finalization
-            and goal_status in {"paused", "blocked"}
-        ),
         entered_finalization=entered_finalization,
     )
 
@@ -218,7 +212,6 @@ def test_prompt_execution_log_identifies_child_only_incompleteness(
         result=result,
         assessment=assessment,
         automatic_continuations=0,
-        awaiting_user_input=False,
         entered_finalization=False,
     )
 
@@ -262,7 +255,6 @@ def test_prompt_execution_log_allowlists_provider_controlled_categories(
         result=result,
         assessment=assessment,
         automatic_continuations=0,
-        awaiting_user_input=False,
         entered_finalization=False,
     )
 
@@ -291,7 +283,6 @@ def test_prompt_execution_log_allowlists_provider_goal_status(
         result=result,
         assessment=assessment,
         automatic_continuations=0,
-        awaiting_user_input=False,
         entered_finalization=False,
     )
 
@@ -365,7 +356,6 @@ def test_streaming_pending_plan_continues_on_same_session_and_finishes():
     assert adapter.continuation_boundaries == 1
     assert adapter.finished is True
     assert adapter.failed_text is None
-    assert adapter.waiting_reason is None
     assert callable(adapter.kwargs["session_factory"])
     assert adapter.kwargs["continuation_visibility_timeout"] >= 2.0
 
@@ -396,7 +386,6 @@ def test_streaming_retries_pending_plan_three_times_then_reports_incomplete():
     assert adapter.continuation_boundaries == 3
     assert adapter.finished is False
     assert adapter.failed_text is not None
-    assert adapter.waiting_reason is None
 
 
 def test_non_streaming_pending_plan_continues_and_replies_with_success():
@@ -539,7 +528,7 @@ def test_non_streaming_finalization_provenance_controls_incomplete_copy(
 
 
 @pytest.mark.parametrize("goal_status", ["paused", "blocked"])
-def test_provider_goal_waits_only_outside_finalization(
+def test_provider_goal_fails_after_automatic_recovery_is_exhausted(
     goal_status: str,
 ) -> None:
     handler = _make_handler()
@@ -569,9 +558,8 @@ def test_provider_goal_waits_only_outside_finalization(
         )
 
     adapter = _FakeProgrammingCardSession.last
-    assert adapter.waiting_reason is not None
     assert adapter.finished is False
-    assert adapter.failed_text is None
+    assert adapter.failed_text is not None
     assert adapter.continuation_boundaries == 0
 
 
@@ -606,7 +594,6 @@ def test_provider_goal_after_finalization_fails_with_timeout_truth(
         )
 
     adapter = _FakeProgrammingCardSession.last
-    assert adapter.waiting_reason is None
     assert adapter.finished is False
     assert adapter.continuation_boundaries == 0
     assert "执行窗口已耗尽" in adapter.failed_text

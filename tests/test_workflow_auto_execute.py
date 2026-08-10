@@ -1,34 +1,87 @@
-"""Workflow automatic-start configuration contract."""
+"""Contracts for the gate-free Workflow generation path."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-from src.config.settings import Settings
+import pytest
+
 from src.feishu.handlers.workflow import WorkflowHandler
+from src.workflow_engine.models import PendingWorkflow, WorkflowProject, WorkflowStatus
+
+_VALID_SCRIPT = """
+export const meta = {
+  name: "auto-run",
+  description: "automatic workflow",
+  phases: [{ title: "Run", detail: "Do work" }],
+  tools: ["coco"],
+};
+export default async function main() {
+  const result = await agent("do work", { tool: "coco", timeout: 120 });
+  if (result && result.error) return result;
+  return result;
+}
+"""
 
 
-def _handler(value: bool | None) -> WorkflowHandler:
+def _handler() -> WorkflowHandler:
     handler = WorkflowHandler.__new__(WorkflowHandler)
-    settings = SimpleNamespace()
-    if value is not None:
-        settings.workflow_auto_execute = value
-    handler.ctx = SimpleNamespace(settings=settings)
+    handler.ctx = SimpleNamespace(
+        settings=SimpleNamespace(workflow_script_gen_timeout_s=5)
+    )
     return handler
 
 
-def test_workflow_auto_execute_defaults_on() -> None:
-    assert Settings(_env_file=None).workflow_auto_execute is True
-    assert _handler(None)._auto_execute_workflow() is True
+def _engine() -> SimpleNamespace:
+    return SimpleNamespace(
+        project=WorkflowProject(
+            status=WorkflowStatus.GENERATING_SCRIPT,
+            pending=PendingWorkflow(
+                requirement="do work",
+                orchestrator_agent="coco",
+                selected_tools=["coco"],
+            ),
+        )
+    )
 
 
-def test_workflow_auto_execute_can_be_disabled_by_settings() -> None:
-    assert _handler(False)._auto_execute_workflow() is False
+def test_script_generation_retries_then_accepts_valid_output(tmp_path) -> None:
+    session = MagicMock()
+    session.send_prompt.side_effect = [
+        SimpleNamespace(text="not javascript"),
+        SimpleNamespace(text=_VALID_SCRIPT),
+    ]
+    with (
+        patch("src.agent_session.create_engine_session", return_value=session),
+        patch("src.workflow_engine.tool_registry.get_available_tools", return_value={"coco": "Coco"}),
+    ):
+        script_path, meta = _handler()._generate_script_via_ai(
+            "implement the automatic workflow",
+            str(tmp_path),
+            ["coco"],
+            _engine(),
+            output_path=str(tmp_path / ".ghostap" / "workflow_scripts" / "generated.js"),
+        )
+
+    assert session.send_prompt.call_count == 2
+    assert meta["tools"] == ["coco"]
+    assert script_path.endswith(".js")
 
 
-def test_workflow_auto_execute_reads_validated_environment(monkeypatch) -> None:
-    monkeypatch.setenv("WORKFLOW_AUTO_EXECUTE", "false")
-    settings = Settings(_env_file=None)
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = SimpleNamespace(settings=settings)
+def test_unsupported_generated_tool_fails_after_bounded_retries(tmp_path) -> None:
+    unsupported = _VALID_SCRIPT.replace('["coco"]', '["missing"]', 1)
+    session = MagicMock()
+    session.send_prompt.return_value = SimpleNamespace(text=unsupported)
+    with (
+        patch("src.agent_session.create_engine_session", return_value=session),
+        patch("src.workflow_engine.tool_registry.get_available_tools", return_value={"coco": "Coco"}),
+        pytest.raises(RuntimeError, match="3 次尝试"),
+    ):
+        _handler()._generate_script_via_ai(
+            "implement the automatic workflow",
+            str(tmp_path),
+            ["coco"],
+            _engine(),
+            output_path=str(tmp_path / ".ghostap" / "workflow_scripts" / "generated.js"),
+        )
 
-    assert settings.workflow_auto_execute is False
-    assert handler._auto_execute_workflow() is False
+    assert session.send_prompt.call_count == 3

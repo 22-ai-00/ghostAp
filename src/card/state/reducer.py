@@ -9,7 +9,6 @@ from dataclasses import replace
 from ..events import CardEvent, CardEventType
 from .models import CardMetadata, CardState, EngineExtState
 from .reducers._shared import build_header
-from .reducers.approval import reduce_approval
 from .reducers.criteria import reduce_criteria
 from .reducers.cycle import reduce_cycle
 from .reducers.image import reduce_image
@@ -162,9 +161,6 @@ _REDUCER_DISPATCH: dict[CardEventType, Callable[[CardState, CardEvent], CardStat
     CardEventType.RESUMED: reduce_lifecycle,
     CardEventType.ARCHIVED: reduce_lifecycle,
     CardEventType.BLOCKED: reduce_lifecycle,
-    # Approval events
-    CardEventType.APPROVAL_REQUESTED: reduce_approval,
-    CardEventType.APPROVAL_RESOLVED: reduce_approval,
     # Cycle events
     CardEventType.CYCLE_STARTED: reduce_cycle,
     CardEventType.CYCLE_DONE: reduce_cycle,
@@ -213,9 +209,6 @@ _STRUCTURAL_EVENTS = frozenset({
     CardEventType.RESUMED,
     CardEventType.BLOCKED,
     CardEventType.ARCHIVED,
-    # Approval (adds buttons)
-    CardEventType.APPROVAL_REQUESTED,
-    CardEventType.APPROVAL_RESOLVED,
     # NOTE: TOOL_MODEL_CHANGED is conditionally structural — see _is_structural_event().
     # Tool/model/subagents change → structural (header/buttons change);
     # live_ticker_frame-only updates → non-structural (only footer markdown update).

@@ -14,11 +14,10 @@ from src.card.tool_display import summarize_tool_call_content
 
 if TYPE_CHECKING:
     from src.acp.models import PlanEntryInfo
-    from src.spec_engine.models import SpecTask
 
 TaskStatus = Literal["pending", "in_progress", "completed", "failed", "cancelled"]
 
-StatusCallback = Callable[["str", "TaskStatus"], None]
+StatusCallback = Callable[[str, TaskStatus], None]
 
 
 @dataclass(frozen=True)
@@ -28,16 +27,6 @@ class TaskItem:
     task_id: str
     name: str
     status: TaskStatus = "pending"
-    session_id: str | None = None
-
-
-@dataclass(frozen=True)
-class TaskSnapshot:
-    """Immutable snapshot of a task for payload/rendering."""
-
-    task_id: str
-    name: str
-    status: TaskStatus
 
 
 class TaskRegistry:
@@ -58,10 +47,9 @@ class TaskRegistry:
         name: str,
         *,
         status: TaskStatus = "pending",
-        session_id: str | None = None,
     ) -> TaskItem:
         """Register a new task. Idempotent — updates if already exists."""
-        item = TaskItem(task_id=task_id, name=name, status=status, session_id=session_id)
+        item = TaskItem(task_id=task_id, name=name, status=status)
         with self._lock:
             if task_id not in self._tasks:
                 self._order.append(task_id)
@@ -79,48 +67,30 @@ class TaskRegistry:
 
         Notifies subscribers after status change unless notify=False.
         """
-        with self._lock:
-            if task_id not in self._tasks:
-                return None
-            old = self._tasks[task_id]
-            if old.status == status:
-                return old
-            updated = replace(old, status=status)
-            self._tasks[task_id] = updated
-            subscribers = self._subscribers.copy() if notify else []
-
-        # Notify outside lock to avoid deadlock
-        for cb in subscribers:
-            try:
-                cb(task_id, status)
-            except Exception:
-                pass
-
-        return updated
-
-    def update_session_id(self, task_id: str, session_id: str) -> TaskItem | None:
-        """Update the session_id binding for a task."""
-        with self._lock:
-            if task_id not in self._tasks:
-                return None
-            old = self._tasks[task_id]
-            updated = replace(old, session_id=session_id)
-            self._tasks[task_id] = updated
-        return updated
+        return self._replace(task_id, notify=notify, status=status)
 
     def update_name(self, task_id: str, name: str) -> TaskItem | None:
         """Update the display name for a task."""
         name = (name or "").strip()
         if not name:
             return None
+        return self._replace(task_id, name=name)
+
+    def _replace(self, task_id: str, *, notify: bool = False, **changes: object) -> TaskItem | None:
         with self._lock:
-            if task_id not in self._tasks:
+            old = self._tasks.get(task_id)
+            if old is None:
                 return None
-            old = self._tasks[task_id]
-            if old.name == name:
+            updated = replace(old, **changes)
+            if updated == old:
                 return old
-            updated = replace(old, name=name)
             self._tasks[task_id] = updated
+            subscribers = tuple(self._subscribers) if notify else ()
+        for callback in subscribers:
+            try:
+                callback(task_id, updated.status)
+            except Exception:
+                pass
         return updated
 
     def get(self, task_id: str) -> TaskItem | None:
@@ -128,18 +98,10 @@ class TaskRegistry:
         with self._lock:
             return self._tasks.get(task_id)
 
-    def get_snapshot(self) -> list[TaskSnapshot]:
+    def get_snapshot(self) -> list[TaskItem]:
         """Get an ordered snapshot of all tasks (immutable, safe to share)."""
         with self._lock:
-            return [
-                TaskSnapshot(
-                    task_id=self._tasks[tid].task_id,
-                    name=self._tasks[tid].name,
-                    status=self._tasks[tid].status,
-                )
-                for tid in self._order
-                if tid in self._tasks
-            ]
+            return [self._tasks[task_id] for task_id in self._order if task_id in self._tasks]
 
     def subscribe(self, callback: StatusCallback) -> None:
         """Subscribe to status change notifications."""
@@ -160,19 +122,6 @@ class TaskRegistry:
         with self._lock:
             return len(self._tasks)
 
-    def clear(self) -> None:
-        """Clear all tasks and subscribers."""
-        with self._lock:
-            self._tasks.clear()
-            self._order.clear()
-            self._subscribers.clear()
-
-
-# ---------------------------------------------------------------------------
-# Factory helpers: convert engine-specific plan structures to task dicts
-# ---------------------------------------------------------------------------
-
-
 def tasks_from_plan_entries(entries: list[PlanEntryInfo]) -> list[dict]:
     """Convert ACP PlanEntryInfo list to task dicts for TaskOrchestrator.
 
@@ -184,33 +133,10 @@ def tasks_from_plan_entries(entries: list[PlanEntryInfo]) -> list[dict]:
         content = (entry.content or "").strip()
         if not content:
             continue
-        # Map PlanEntryInfo.status to TaskStatus
         status = entry.status if entry.status in ("pending", "in_progress", "completed", "failed") else "pending"
         name = summarize_tool_call_content(content, max_chars=120) or content[:120]
         tasks.append({
             "task_id": f"step_{idx}",
-            "name": name,
-            "status": status,
-        })
-    return tasks
-
-
-def tasks_from_spec_tasks(spec_tasks: list[SpecTask]) -> list[dict]:
-    """Convert SpecTask list to task dicts for TaskOrchestrator.
-
-    Uses SpecTask.task_id (int) and SpecTask.description as task name.
-    """
-    tasks: list[dict] = []
-    for t in spec_tasks:
-        desc = (t.description or "").strip()
-        if not desc:
-            continue
-        # Map SpecTaskStatus to TaskStatus string
-        status_map = {"pending": "pending", "in_progress": "in_progress", "completed": "completed", "failed": "failed"}
-        status = status_map.get(t.status.value, "pending")
-        name = summarize_tool_call_content(desc, max_chars=120) or desc[:120]
-        tasks.append({
-            "task_id": f"spec_task_{t.task_id}",
             "name": name,
             "status": status,
         })

@@ -1,4 +1,4 @@
-"""Tests for phase summary, collapsible panel headers, and completion card layout."""
+"""Tests for phase summaries, result delivery, and current operation display."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from src.workflow_engine.models import (
 )
 from src.workflow_engine.renderer import (
     WorkflowProgressRenderer,
-    render_completion_card,
 )
 
 
@@ -215,15 +214,6 @@ def test_terminal_status_page_never_labels_stale_activity_as_running() -> None:
     assert "STALEACTIVITY" not in status_text
 
 
-def test_singular_progress_renderer_api_remains_available() -> None:
-    project = _make_project("Compatible", [_make_agent("running", AgentStatus.RUNNING)])
-    card = WorkflowProgressRenderer(project).render_progress_card(project)
-
-    assert isinstance(card, dict)
-    assert isinstance(card.get("header"), dict)
-    assert isinstance(card.get("elements"), list)
-
-
 def test_small_phase_renders_everything() -> None:
     """Small phase (5 agents, ≤ 8) — render everything unchanged."""
     agents: list[AgentProgress] = [
@@ -252,54 +242,6 @@ def test_empty_phase_renders_summary_zero_over_zero() -> None:
     text = _flatten_text(card["elements"])
 
     assert "进行中 0/0" in text
-
-
-# ---------------------------------------------------------------------------
-# Completion card: stats column_set should be stretch + centered text
-# ---------------------------------------------------------------------------
-
-
-def _make_completion_project(status) -> WorkflowProject:
-    return WorkflowProject(
-        name="audit",
-        status=status,
-        started_at=1_700_000_000.0,
-        finished_at=1_700_000_060.0,
-        phases=[
-            PhaseProgress(
-                title="Analyze",
-                agents=[
-                    AgentProgress(label="scan", tool="coco", status=AgentStatus.DONE, duration_s=5.0),
-                    AgentProgress(label="verify", tool="claude", status=AgentStatus.DONE, duration_s=5.0),
-                ],
-            )
-        ],
-    )
-
-
-def test_completion_card_stats_use_stretch_flex_mode() -> None:
-    """Stats column_sets in render_completion_card should use flex_mode='stretch'."""
-    project = _make_completion_project(WorkflowStatus.COMPLETED)
-    card = render_completion_card(project)
-    stats_column_sets = [el for el in card["elements"] if isinstance(el, dict) and el.get("tag") == "column_set"]
-    assert stats_column_sets, "Expected at least one column_set in completion card"
-    for cs in stats_column_sets:
-        assert cs.get("flex_mode") == "stretch", f"Expected flex_mode='stretch', got {cs.get('flex_mode')!r}"
-
-
-def test_completion_card_stats_columns_centered_text() -> None:
-    """Stat column markdown elements should set text_align='center'."""
-    project = _make_completion_project(WorkflowStatus.COMPLETED)
-    card = render_completion_card(project)
-    stats_column_sets = [el for el in card["elements"] if isinstance(el, dict) and el.get("tag") == "column_set"]
-    assert stats_column_sets, "Expected stats column_sets"
-    for cs in stats_column_sets:
-        for col in cs.get("columns", []):
-            for inner in col.get("elements", []):
-                if inner.get("tag") == "markdown":
-                    assert inner.get("text_align") == "center", (
-                        f"Expected text_align='center' on markdown element, got {inner}"
-                    )
 
 
 # ---------------------------------------------------------------------------

@@ -222,7 +222,7 @@ def render_card(
         )
 
         # Post-render node count check (early warning for regressions)
-        from src.card.render.payload_truncator import count_tagged_nodes
+        from src.card.shared.truncation import count_tagged_nodes
         node_count = count_tagged_nodes(card_json)
         if node_count > 200:
             logger.warning(

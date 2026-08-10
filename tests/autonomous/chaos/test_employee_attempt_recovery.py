@@ -139,11 +139,7 @@ def test_actor_terminal_is_preserved_when_gateway_recovery_follows_process_death
     assert result.state is CommitState.ANCHORED
     harness.close()
 
-    reopened = _reopen_recovery_harness(
-        tmp_path,
-        harness,
-        employee_runtime_mode="actor",
-    )
+    reopened = _reopen_recovery_harness(tmp_path, harness)
     runtime = reopened.coordinator.employee_runtime
     assert runtime is not None
     try:
@@ -209,11 +205,7 @@ def test_actor_completed_digest_without_result_is_action_required_after_restart(
     assert result.state is CommitState.ANCHORED
     harness.close()
 
-    reopened = _reopen_recovery_harness(
-        tmp_path,
-        harness,
-        employee_runtime_mode="actor",
-    )
+    reopened = _reopen_recovery_harness(tmp_path, harness)
     runtime = reopened.coordinator.employee_runtime
     assert runtime is not None
     try:
@@ -232,12 +224,7 @@ def test_actor_completed_digest_without_result_is_action_required_after_restart(
         reopened.close()
 
 
-def _reopen_recovery_harness(
-    tmp_path,
-    prior,
-    *,
-    employee_runtime_mode="legacy_one_shot",
-):
+def _reopen_recovery_harness(tmp_path, prior):
     """Open new Writer/Blob/Router/Data/Hire projection owners from disk."""
 
     from contextlib import contextmanager
@@ -319,7 +306,6 @@ def _reopen_recovery_harness(
             return self.projection_state
 
     coordinator_kwargs = dict(
-        employee_runtime_mode=employee_runtime_mode,
         writer=writer,
         hire_service=_Hire(),
         ingress_service=ingress,
@@ -378,10 +364,10 @@ def test_dispatch_lock_prefix_is_exposed_in_one_forward_order() -> None:
 def test_committed_attempt_recovery_has_no_execution_entrypoint() -> None:
     """An unknown external outcome is terminalized without another ACP call."""
 
-    from src.autonomous.ingress import dispatch
+    from src.autonomous.gateway import coordinator
 
-    assert hasattr(dispatch, "EmployeeDispatchCoordinator")
-    assert hasattr(dispatch.EmployeeDispatchCoordinator, "recover_incomplete_attempts")
+    assert hasattr(coordinator, "EmployeeDispatchCoordinator")
+    assert hasattr(coordinator.EmployeeDispatchCoordinator, "recover_incomplete_attempts")
 
 
 def test_recovery_commit_section_never_replays_full_journal(
@@ -424,67 +410,9 @@ def test_recovery_commit_section_never_replays_full_journal(
 def test_unknown_dispatch_recovery_has_no_public_terminal_event_builder() -> None:
     """Only the coordinator may build and commit recovery terminal events."""
 
-    from src.autonomous.ingress import dispatch
+    from src.autonomous.gateway import coordinator
 
-    assert not hasattr(dispatch, "build_unknown_dispatch_terminal_events")
-
-
-def test_hire_entrypoints_follow_workforce_hire_writer_lock_trace(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    """Activation, revalidation, recovery, and close never invert the prefix."""
-
-    import src.autonomous.workforce.projection as workforce_projection
-    from tests.autonomous.integration.test_employee_hire_composition import (
-        _activate_employee,
-        _Channels,
-        _Registrar,
-        _runtime,
-        _settings,
-        _Slash,
-    )
-
-    channels = _Channels()
-    runtime = _runtime(
-        _settings(tmp_path, limit=1),
-        release_evidence_ready=True,
-        registrar=_Registrar(),
-        channel_supervisor=channels,
-        slash_reconciler_factory=lambda _app_id, _secret: _Slash(),
-        notification_link=lambda *_args: None,
-    )
-    assert runtime.hire_service is not None
-    service = runtime.hire_service
-    held = {}
-    trace = []
-    monkeypatch.setattr(
-        workforce_projection,
-        "_WORKFORCE_COMMIT_LOCK",
-        _TraceRLock("workforce", 0, held, trace),
-    )
-    service._mutex = _TraceRLock("hire", 1, held, trace)  # noqa: SLF001
-    service._writer._mutex = _TraceRLock(  # noqa: SLF001
-        "writer",
-        2,
-        held,
-        trace,
-    )
-
-    active = _activate_employee(runtime, channels)
-    service.begin_channel_revalidation(
-        active.intent_id,
-        observed_generation=active.channel_generation,
-    )
-    service.recover()
-    runtime.close()
-
-    acquired_stacks = [item[3] for item in trace if item[1] == "acquire"]
-    assert ("workforce", "hire", "writer") in acquired_stacks
-    assert all(
-        not (stack[0] == "hire" and len(stack) > 1)
-        for stack in acquired_stacks
-    )
+    assert not hasattr(coordinator, "build_unknown_dispatch_terminal_events")
 
 
 def test_coordinator_prepare_and_finalize_follow_complete_lock_order(

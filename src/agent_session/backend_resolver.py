@@ -2,20 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
-
-def resolve_backend_kind(agent_type: str) -> Literal["acp", "cli"]:
-    """Determine transport backend for given agent type."""
-    normalized = agent_type.lower().strip()
-    if normalized == "claude":
-        return "cli"
-    return "acp"
-
 
 def is_cli_backend(agent_type: str) -> bool:
     """Shorthand: does this agent type use CLI bridge?"""
-    return resolve_backend_kind(agent_type) == "cli"
+    return agent_type.lower().strip() == "claude"
 
 
 def resolve_cwd(agent_type: str, root_path: str) -> str:

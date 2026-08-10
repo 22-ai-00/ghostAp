@@ -2,20 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from src.feishu.handlers.workflow import WorkflowHandler
-from src.feishu.handlers.workflow_script import WorkflowScriptMixin
 from src.workflow_engine.models import WorkflowProject, WorkflowStatus
-
-_CALLBACK_BUILDERS = (
-    pytest.param(WorkflowHandler._build_workflow_callbacks, id="workflow-handler"),
-    pytest.param(WorkflowScriptMixin._build_workflow_callbacks, id="workflow-script-mixin"),
-)
 
 
 def _renderer_page(label: str, *, include_stop: bool = False) -> dict[str, Any]:
@@ -57,12 +48,14 @@ def _make_handler(*, continuation_results: list[object]) -> WorkflowHandler:
     return handler
 
 
-def _build_callbacks(
-    builder: Callable[..., Any],
-    handler: WorkflowHandler,
-) -> Any:
+def _build_callbacks(handler: WorkflowHandler) -> Any:
     project = MagicMock(project_id="project-1")
-    return builder(handler, "status-message", "chat-1", project)
+    return WorkflowHandler._build_workflow_callbacks(
+        handler,
+        "status-message",
+        "chat-1",
+        project,
+    )
 
 
 def _updated_message_ids(handler: WorkflowHandler) -> list[str]:
@@ -73,14 +66,11 @@ def _sent_payload_labels(handler: WorkflowHandler) -> list[str]:
     return [str(call.args[1]) for call in handler.send_card_to_chat.call_args_list]
 
 
-@pytest.mark.parametrize("builder", _CALLBACK_BUILDERS)
-def test_paged_callbacks_replace_status_append_results_reuse_pages_and_finalize(
-    builder: Callable[..., Any],
-) -> None:
+def test_paged_callbacks_replace_status_append_results_reuse_pages_and_finalize() -> None:
     handler = _make_handler(
         continuation_results=["result-message-1", "result-message-2"],
     )
-    callbacks = _build_callbacks(builder, handler)
+    callbacks = _build_callbacks(handler)
 
     callbacks.on_progress(
         [
@@ -126,7 +116,7 @@ def test_paged_callbacks_replace_status_append_results_reuse_pages_and_finalize(
         result='{"final_report": "complete"}',
     )
     with patch(
-        "src.workflow_engine.renderer.render_completion_card",
+        "src.workflow_engine.renderer.render_completion_cards",
         return_value=terminal_pages,
     ):
         callbacks.on_done(done_project)
@@ -142,10 +132,40 @@ def test_paged_callbacks_replace_status_append_results_reuse_pages_and_finalize(
         assert "workflow_stop_running" not in str(update_call.args[1])
 
 
-@pytest.mark.parametrize("builder", _CALLBACK_BUILDERS)
-def test_paged_callbacks_keep_existing_pages_when_continuation_create_fails(
-    builder: Callable[..., Any],
-) -> None:
+def test_terminal_page_failure_uses_report_then_exposes_retryable_double_failure() -> None:
+    handler = _make_handler(continuation_results=[None, None])
+    handler.update_card.return_value = False
+    handler._send_workflow_completion_report.return_value = {
+        "generated": True,
+        "attachment_sent": False,
+        "html_filename": "workflow-report.html",
+        "error": "attachment unavailable",
+    }
+    callbacks = _build_callbacks(handler)
+    done_project = WorkflowProject(
+        name="paged workflow",
+        requirement="deliver every result",
+        status=WorkflowStatus.COMPLETED,
+        result='{"final_report": "complete"}',
+    )
+    terminal_pages = [
+        _renderer_page("terminal-status"),
+        _renderer_page("terminal-result"),
+    ]
+
+    with patch(
+        "src.workflow_engine.renderer.render_completion_cards",
+        return_value=terminal_pages,
+    ):
+        callbacks.on_done(done_project)
+
+    handler._send_workflow_completion_report.assert_called_once()
+    handler._reply_workflow_completion_fallback.assert_called_once()
+    fallback_kwargs = handler._reply_workflow_completion_fallback.call_args.kwargs
+    assert fallback_kwargs["failed_page_indexes"]
+
+
+def test_paged_callbacks_keep_existing_pages_when_continuation_create_fails() -> None:
     handler = _make_handler(
         continuation_results=[
             "result-message-1",
@@ -153,7 +173,7 @@ def test_paged_callbacks_keep_existing_pages_when_continuation_create_fails(
             "result-message-2",
         ],
     )
-    callbacks = _build_callbacks(builder, handler)
+    callbacks = _build_callbacks(handler)
 
     callbacks.on_progress(
         [

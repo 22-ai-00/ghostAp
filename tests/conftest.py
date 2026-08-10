@@ -2,36 +2,37 @@
 from __future__ import annotations
 
 import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# ACP compatibility shim — bridge renamed symbols between acp versions.
-# The source code uses KillTerminalCommandResponse (acp >=0.11) but the
-# installed version may only expose KillTerminalResponse (acp 0.10.x).
-# ---------------------------------------------------------------------------
-try:
-    import acp.schema as _acp_schema
-
-    if not hasattr(_acp_schema, "KillTerminalCommandResponse") and hasattr(_acp_schema, "KillTerminalResponse"):
-        _acp_schema.KillTerminalCommandResponse = _acp_schema.KillTerminalResponse
-except ImportError:
-    pass
-
 from src.card.delivery.engine import CardDelivery
-from src.card.delivery.registry import delivery_registry
+from src.card.delivery.registry import DeliveryRegistry
 from src.card.session import CardSession
 from src.card.state.models import CardMetadata
 from src.utils.retry import RetryPolicy
 
 
 @pytest.fixture(autouse=True)
-def _reset_delivery_registry():
-    """Reset DeliveryRegistry state between tests for isolation."""
-    delivery_registry.reset()
-    yield
-    delivery_registry.reset()
+def _isolate_delivery_registry(monkeypatch, request):
+    """Give each test an isolated registry and close it through production APIs."""
+    real_monotonic = time.monotonic
+    registry = DeliveryRegistry()
+    monkeypatch.setattr(registry, "install_atexit", lambda: None)
+    monkeypatch.setattr("src.card.delivery.registry.delivery_registry", registry)
+    monkeypatch.setattr("src.card.delivery.engine.delivery_registry", registry)
+    if hasattr(request.module, "delivery_registry"):
+        monkeypatch.setattr(request.module, "delivery_registry", registry)
+
+    yield registry
+
+    with monkeypatch.context() as teardown_patch:
+        teardown_patch.setattr(time, "monotonic", real_monotonic)
+        try:
+            registry.drain_in_flight(timeout=5.0)
+        finally:
+            registry.shutdown_all()
 
 
 @pytest.fixture(autouse=True)
@@ -405,18 +406,9 @@ def _clear_caches():
         _compute_sig_cached.cache_clear()
     except Exception:
         pass
-    # atoms block kind handlers cache
-    # Important: Use sys.modules to get the latest module object, as some tests
-    # (like test_no_runtime_warning_on_import) delete and reimport modules.
-    try:
-        if 'src.card.render.atoms' in sys.modules:
-            atoms_mod = sys.modules['src.card.render.atoms']
-            atoms_mod._block_kind_handlers = None
-        else:
-            from src.card.render.atoms import invalidate_atom_handlers
-            invalidate_atom_handlers()
-    except Exception:
-        pass
+    atoms_mod = sys.modules.get("src.card.render.atoms")
+    if atoms_mod is not None:
+        atoms_mod._block_kind_handlers = None
 
 
 # ---------------------------------------------------------------------------
@@ -427,11 +419,6 @@ def _clear_caches():
 def _reset_all_singletons():
     """Reset all known global singletons after each test."""
     yield
-    try:
-        from src.config import _reset_settings_for_testing
-        _reset_settings_for_testing()
-    except Exception:
-        pass
     try:
         from src.coco_model.manager import _reset_coco_model_manager_for_testing
         _reset_coco_model_manager_for_testing()

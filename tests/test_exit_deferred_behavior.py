@@ -1,8 +1,11 @@
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from src.feishu.slash_command_parser import SlashCommandParser
 from src.feishu.ws_client import FeishuWSClient
+from src.mode import InteractionMode
 from src.tasking import TaskSpec
 
 
@@ -37,7 +40,6 @@ def test_exit_is_deferred_until_running_task_finishes():
         mock_get_settings.return_value = mock_settings
 
         client = FeishuWSClient(MagicMock())
-        client._reply_text = MagicMock()
 
         started = threading.Event()
         unblock = threading.Event()
@@ -56,9 +58,12 @@ def test_exit_is_deferred_until_running_task_finishes():
             exit_time["t"] = time.time()
             return True
 
-        client._exit_current_mode = MagicMock(side_effect=on_exit)
+        exit_current_mode = MagicMock(side_effect=on_exit)
+        system_handler = client._handler_ctx.handlers["system"]
+        system_handler.exit_current_mode = exit_current_mode
+        client._control_plane._exit_handler_fn = system_handler.exit_current_mode
 
-        h1 = client._scheduler.submit(
+        client._scheduler.submit(
             TaskSpec(chat_id="chat", name="normal", task_type="feishu_message", project_id="p1"),
             long_task,
         )
@@ -68,17 +73,17 @@ def test_exit_is_deferred_until_running_task_finishes():
 
         # Should not exit while task is still running
         time.sleep(0.1)
-        client._exit_current_mode.assert_not_called()
+        exit_current_mode.assert_not_called()
 
         unblock.set()
-        assert h1.wait(timeout=2).status.name == "SUCCEEDED"
+        assert finished.wait(timeout=2)
 
         # Wait for control-plane thread to schedule deferred exit
         deadline = time.time() + 2
-        while time.time() < deadline and not client._exit_current_mode.called:
+        while time.time() < deadline and not exit_current_mode.called:
             time.sleep(0.01)
 
-        client._exit_current_mode.assert_called_once()
+        exit_current_mode.assert_called_once()
         assert finished.is_set()
         assert finished_time["t"] is not None
         assert exit_time["t"] is not None
@@ -122,20 +127,39 @@ def test_exit_is_immediate_when_no_running_task():
         def short_task(_ctx):
             return "done"
 
-        h = client._scheduler.submit(
+        completed = threading.Event()
+
+        def mark_completed(event):
+            if event.name == "short" and event.status.name == "SUCCEEDED":
+                completed.set()
+
+        client._scheduler.add_listener(mark_completed)
+        client._scheduler.submit(
             TaskSpec(chat_id="chat", name="short", task_type="feishu_message", project_id="p1"),
             short_task,
         )
-        assert h.wait(timeout=2).status.name == "SUCCEEDED"
+        assert completed.wait(timeout=2)
 
         assert client._control_plane.should_defer_exit(chat_id="chat", project_id="p1") is False
 
-        client._exit_current_mode = MagicMock()
-        # mimic the core decision branch: no running task -> exit immediately
-        if client._control_plane.should_defer_exit(chat_id="chat", project_id="p1"):
-            client._control_plane.request_deferred_exit(message_id="m_exit", chat_id="chat", project_id="p1")
-        else:
-            client._exit_current_mode("m_exit", "chat", project=None)
-        client._exit_current_mode.assert_called_once()
+        exit_current_mode = MagicMock()
+        client._handler_ctx.handlers["system"].exit_current_mode = exit_current_mode
+        client._handler_ctx.handlers["coco"].add_reaction = MagicMock()
+        client._get_effective_mode = MagicMock(
+            return_value=(InteractionMode.COCO, True)
+        )
+        project = SimpleNamespace(project_id="p1")
+
+        client._message_dispatcher.process_with_intent(
+            "m_exit",
+            "chat",
+            "/exit",
+            project,
+            command_match=SlashCommandParser.parse("/exit"),
+        )
+
+        exit_current_mode.assert_called_once_with(
+            "m_exit", "chat", project=project
+        )
 
         client.close()

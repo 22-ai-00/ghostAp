@@ -318,7 +318,7 @@ class SpecReporter:
                 f"🔁 总循环: {project.current_cycle_number} 轮",
                 f"✅ 验收标准: {project.satisfied_count}/{project.total_criteria} 全部满足",
             ]
-        elif project.status == SpecProjectStatus.ABORTED:
+        elif project.status == SpecProjectStatus.FAILED:
             lines = [
                 "⚠️ **Spec 模式终止**\n",
                 f"📂 项目: {project.name}",
@@ -369,18 +369,15 @@ class SpecReporter:
                 lines.append("\n**下一步建议：**")
                 for t in tips:
                     lines.append(f"- {t}")
-        elif project.status == SpecProjectStatus.CLARIFYING:
-            # Legacy: CLARIFYING 状态不再由正常流程产生，保留用于向后兼容旧持久化状态
+        elif project.status == SpecProjectStatus.CANCELLED:
             lines = [
-                "⏸️ **Spec 模式暂停**（旧版澄清状态）\n",
+                "⏹️ **Spec 模式已停止**\n",
                 f"📂 项目: {project.name}",
                 f"📊 验收标准: {project.satisfied_count}/{project.total_criteria} 满足",
             ]
-            lines.append("\n**继续方式：**")
-            lines.append("- 发送 `/spec_resume` 继续执行")
         else:
             lines = [
-                "⏸️ **Spec 模式暂停**\n",
+                "🔄 **Spec 模式执行中**\n",
                 f"📂 项目: {project.name}",
                 f"📊 验收标准: {project.satisfied_count}/{project.total_criteria} 满足",
             ]
@@ -485,10 +482,9 @@ class SpecReporter:
             SpecProjectStatus.IDLE: "⏳ 等待开始",
             SpecProjectStatus.ANALYZING: "🧠 正在分析需求",
             SpecProjectStatus.RUNNING: "🔄 循环执行中",
-            SpecProjectStatus.CLARIFYING: "❓ 等待澄清输入",
-            SpecProjectStatus.PAUSED: "⏸️ 已暂停",
             SpecProjectStatus.COMPLETED: "✅ 已完成",
-            SpecProjectStatus.ABORTED: "⚠️ 已终止",
+            SpecProjectStatus.FAILED: "❌ 已失败",
+            SpecProjectStatus.CANCELLED: "⏹️ 已停止",
         }.get(project.status, "❓ 未知状态")
 
         done_items = sum(1 for w in getattr(project, "work_items", []) if w.status == SpecWorkItemStatus.DONE)
@@ -654,11 +650,11 @@ class SpecReporter:
     def get_project_done_title(self, project: SpecProject) -> str:
         if project.status == SpecProjectStatus.COMPLETED:
             return "🎉 Spec 模式完成！"
-        elif project.status == SpecProjectStatus.ABORTED:
+        elif project.status == SpecProjectStatus.FAILED:
             return "⚠️ Spec 模式终止"
-        elif project.status == SpecProjectStatus.CLARIFYING:
-            return "❓ 需要澄清"
-        return "⏸️ Spec 模式暂停"
+        elif project.status == SpecProjectStatus.CANCELLED:
+            return "⏹️ Spec 模式已停止"
+        return "🔄 Spec 模式执行中"
 
     def format_goal_rewritten(self, guidance: str, new_requirement: str) -> str:
         # 截断过长的新目标，避免卡片内容过长
@@ -695,10 +691,9 @@ class SpecReporter:
             SpecProjectStatus.IDLE: "⏳ 等待开始",
             SpecProjectStatus.ANALYZING: "🧠 分析中",
             SpecProjectStatus.RUNNING: "🔄 循环执行中",
-            SpecProjectStatus.CLARIFYING: "❓ 等待澄清",
-            SpecProjectStatus.PAUSED: "⏸️ 已暂停",
             SpecProjectStatus.COMPLETED: "✅ 已完成",
-            SpecProjectStatus.ABORTED: "⚠️ 已终止",
+            SpecProjectStatus.FAILED: "❌ 已失败",
+            SpecProjectStatus.CANCELLED: "⏹️ 已停止",
         }
         status_text = status_map.get(project.status, "❓ 未知")
         cycle_info = f"循环 {project.current_cycle_number}"
@@ -746,5 +741,5 @@ class SpecReporter:
             "project_name": project.name,
             "project_id": project.project_id,
             "is_running": project.status == SpecProjectStatus.RUNNING,
-            "is_paused": project.status in (SpecProjectStatus.PAUSED, SpecProjectStatus.CLARIFYING),
+            "is_paused": False,
         }

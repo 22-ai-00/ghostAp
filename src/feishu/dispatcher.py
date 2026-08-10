@@ -1,12 +1,10 @@
 import logging
 import os
 import time
-from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
-    from ..agent.intent_recognizer import IntentResult, TaskStep
+    from ..agent.intent_recognizer import TaskStep
     from ..project import ProjectContext
     from ..trust.models import EffectiveTrust
 
@@ -16,51 +14,10 @@ from ..card.ui_text import UI_TEXT
 from ..utils.errors import get_error_detail
 from .emoji import EmojiReaction
 from .message_formatter import FeishuMessageFormatter as fmt
-from .request_context import RequestContext
-from .route_decision import CommandRouter, RouteDecision, RouteTarget
+from .route_decision import CommandRouter
 from .slash_command_parser import CommandMatch
 
 logger = logging.getLogger(__name__)
-
-
-class DispatchErrorAction(str, Enum):
-    FALLBACK_TO_SHELL = "fallback_to_shell"
-    FALLBACK_TO_DIRECT_ENTER = "fallback_to_direct_enter"
-    LOG_AND_CONTINUE = "log_and_continue"
-    STOP_MULTI_TASK = "stop_multi_task"
-    RAISE = "raise"
-
-
-@dataclass(frozen=True)
-class DispatchErrorClassification:
-    action: DispatchErrorAction
-    phase: str
-    user_reachable: bool = True
-
-
-def classify_dispatch_error(error: Exception, *, phase: str) -> DispatchErrorClassification:
-    if phase == "intent_recognition":
-        return DispatchErrorClassification(DispatchErrorAction.FALLBACK_TO_SHELL, phase, True)
-    if phase == "coco_model_card":
-        return DispatchErrorClassification(DispatchErrorAction.FALLBACK_TO_DIRECT_ENTER, phase, True)
-    if phase == "pending_prompt_forward":
-        return DispatchErrorClassification(DispatchErrorAction.LOG_AND_CONTINUE, phase, False)
-    if phase == "multi_task_step":
-        return DispatchErrorClassification(DispatchErrorAction.STOP_MULTI_TASK, phase, True)
-    return DispatchErrorClassification(DispatchErrorAction.RAISE, phase, False)
-
-
-@dataclass(frozen=True)
-class FeishuRequestContext:
-    """Request-scoped message context for dispatcher core paths."""
-    message_id: str
-    chat_id: str
-    text: str
-    project: Optional['ProjectContext'] = None
-    command_match: CommandMatch | None = None
-    shell_fast_tracked: bool = False
-    chat_type: str = "group"
-    effective_trust: Optional['EffectiveTrust'] = None
 
 
 class MessageDispatcher:
@@ -68,60 +25,11 @@ class MessageDispatcher:
 
     def __init__(self, client: Any):
         self.client = client
+        self.handlers = client._handler_ctx.handlers
+        self.base = self.handlers["coco"]
+        self.system = self.handlers["system"]
+        self.project = self.handlers["project"]
         self._router = CommandRouter()
-
-    # ------------------------------------------------------------------
-    # Pure routing: produces RouteDecision without side effects
-    # ------------------------------------------------------------------
-
-    def resolve_command_route(self, ctx: RequestContext) -> Optional[RouteDecision]:
-        """Determine routing target from command detection alone.
-
-        Returns a RouteDecision if a control-plane command matches,
-        or None if the message should proceed to intent recognition.
-        This method is side-effect-free and independently testable.
-        """
-        text = ctx.text
-
-        # Control-plane engine commands
-        if CommandRouter.is_deep_command(text):
-            return RouteDecision(target=RouteTarget.DEEP_ENGINE)
-        if CommandRouter.is_spec_command(text):
-            return RouteDecision(target=RouteTarget.SPEC_ENGINE)
-        if CommandRouter.is_workflow_command(text):
-            return RouteDecision(target=RouteTarget.WORKFLOW_ENGINE)
-
-        # Team command
-
-        # Exit command while in programming mode
-        if ctx.is_in_programming and CommandRouter.is_exit_command(text):
-            return RouteDecision(target=RouteTarget.EXIT_MODE)
-
-        # Interceptable slash command
-        if ctx.command_match is not None:
-            return RouteDecision(
-                target=RouteTarget.SYSTEM_COMMAND,
-                payload={"command_match": ctx.command_match},
-            )
-
-        # Active programming mode
-        if ctx.is_in_programming:
-            return RouteDecision(target=RouteTarget.PROGRAMMING_MODE)
-
-        return None  # Proceed to intent recognition
-
-    def process_request(self, request: FeishuRequestContext):
-        """Dispatch using a request context while preserving legacy entrypoint behavior."""
-        return self.process_with_intent(
-            request.message_id,
-            request.chat_id,
-            request.text,
-            request.project,
-            command_match=request.command_match,
-            shell_fast_tracked=request.shell_fast_tracked,
-            chat_type=request.chat_type,
-            effective_trust=request.effective_trust,
-        )
 
     def process_with_intent(
         self,
@@ -171,30 +79,30 @@ class MessageDispatcher:
         )
 
         # Control-plane commands: handle consistently in all modes
-        if self.client._is_deep_command(text):
+        if self._router.is_deep_command(text):
             if not current_dispatch_allowed():
                 return
-            self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
-            self.client._add_reaction(message_id, EmojiReaction.on_processing())
-            self.client._handle_deep_command(message_id, chat_id, text, project)
+            self.base.add_reaction(message_id, EmojiReaction.on_smart_mode())
+            self.base.add_reaction(message_id, EmojiReaction.on_processing())
+            self.handlers["deep"].handle_deep_command(message_id, chat_id, text, project)
             return
 
-        if self.client._is_spec_command(text):
+        if self._router.is_spec_command(text):
             if not current_dispatch_allowed():
                 return
-            self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
-            self.client._add_reaction(message_id, EmojiReaction.on_processing())
-            self.client._handle_spec_command(message_id, chat_id, text, project)
+            self.base.add_reaction(message_id, EmojiReaction.on_smart_mode())
+            self.base.add_reaction(message_id, EmojiReaction.on_processing())
+            self.handlers["spec"].handle_spec_command(message_id, chat_id, text, project)
             return
 
-        if self.client._is_workflow_command(text):
+        if self._router.is_workflow_command(text):
             if not current_dispatch_allowed():
                 return
             # Workflow mode entry: /wf is the top-level orchestrator agent entry point
             # (agent → tools → roles → script confirm → execute), no prior /coco needed
-            self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
-            self.client._add_reaction(message_id, EmojiReaction.on_processing())
-            self.client._handle_workflow_command(message_id, chat_id, text, project)
+            self.base.add_reaction(message_id, EmojiReaction.on_smart_mode())
+            self.base.add_reaction(message_id, EmojiReaction.on_processing())
+            self.handlers["workflow"].handle_workflow_command(message_id, chat_id, text, project)
             return
 
         # Topic engine context routing: workflow mode free-text goes to WorkflowHandler
@@ -209,33 +117,33 @@ class MessageDispatcher:
                     if command_match is None and project is not None:
                         if not current_dispatch_allowed():
                             return
-                        self.client._add_reaction(message_id, EmojiReaction.on_processing())
-                        self.client._workflow_handler.handle_message(message_id, chat_id, text, project)
+                        self.base.add_reaction(message_id, EmojiReaction.on_processing())
+                        self.handlers["workflow"].handle_message(message_id, chat_id, text, project)
                         return
 
-        if is_in_programming and self.client._is_exit_command(text):
+        if is_in_programming and self._router.is_exit_command(text):
             if not current_dispatch_allowed():
                 return
-            self.client._add_reaction(message_id, EmojiReaction.on_coco_mode())
+            self.base.add_reaction(message_id, EmojiReaction.on_coco_mode())
             if self.client._control_plane.should_defer_exit(chat_id=chat_id, project_id=_pid):
                 self.client._control_plane.request_deferred_exit(message_id=message_id, chat_id=chat_id, project_id=_pid)
-                self.client._reply_text(message_id, UI_TEXT["ws_exit_deferred_msg"])
+                self.base.reply_text(message_id, UI_TEXT["ws_exit_deferred_msg"])
                 return
-            self.client._exit_current_mode(message_id, chat_id, project=project)
+            self.system.exit_current_mode(message_id, chat_id, project=project)
             return
 
         # Request-scoped slash parsing: direct system commands must not fall
         # through to intent recognition, which can be slow or ambiguous.
-        if self.client._is_interceptable_command_match(command_match):
+        if self.system.is_interceptable_command_match(command_match):
             if not current_dispatch_allowed():
                 return
-            self.client._handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
+            self.system.handle_intercepted_command(message_id, chat_id, text, project, command_match=command_match)
             return
 
         if command_match is not None:
             if not current_dispatch_allowed():
                 return
-            self.client._handle_intercepted_command(
+            self.system.handle_intercepted_command(
                 message_id,
                 chat_id,
                 text,
@@ -248,13 +156,13 @@ class MessageDispatcher:
         if is_in_programming:
             if not current_dispatch_allowed():
                 return
-            self.client._add_reaction(message_id, EmojiReaction.on_coco_mode())
-            self.client._add_reaction(message_id, EmojiReaction.on_processing())
+            self.base.add_reaction(message_id, EmojiReaction.on_coco_mode())
+            self.base.add_reaction(message_id, EmojiReaction.on_processing())
             handler = self.client._get_mode_handler(current_mode)
             if handler:
                 handler.handle_message(message_id, chat_id, text, project)
             else:
-                self.client._show_help(message_id, chat_id)
+                self.system.show_help(message_id, chat_id)
             return
 
         # SMART mode: image-only messages bypass intent recognition
@@ -263,48 +171,28 @@ class MessageDispatcher:
         if is_image_only:
             if not current_dispatch_allowed():
                 return
-            self.client._add_reaction(message_id, EmojiReaction.on_coco_mode())
-            self.client._add_reaction(message_id, EmojiReaction.on_processing())
-            self.client._handle_coco_message(message_id, chat_id, text, project)
+            self.base.add_reaction(message_id, EmojiReaction.on_coco_mode())
+            self.base.add_reaction(message_id, EmojiReaction.on_processing())
+            self.base.handle_message(message_id, chat_id, text, project)
             return
 
         # SMART mode: intent recognition
-        self.client._add_reaction(message_id, EmojiReaction.on_smart_mode())
-        self.client._add_reaction(message_id, EmojiReaction.on_processing())
+        self.base.add_reaction(message_id, EmojiReaction.on_smart_mode())
+        self.base.add_reaction(message_id, EmojiReaction.on_processing())
 
         try:
             intent_result = self.client._intent_recognizer.recognize(text, current_mode.value)
         except (RuntimeError, TimeoutError, ValueError, TypeError) as e:
-            classification = classify_dispatch_error(e, phase="intent_recognition")
-            if classification.action == DispatchErrorAction.FALLBACK_TO_SHELL:
-                if not self._action_matrix_allows(
-                    effective_trust,
-                    action_name="host_shell",
-                ):
-                    return
-                if not current_dispatch_allowed():
-                    return
-                logger.warning("意图识别异常，回退到 shell: %s", get_error_detail(e))
-                working_dir = self.client._get_working_dir(chat_id)
-                self.client._submit_shell_command(message_id, chat_id, text, working_dir, project)
-                return
-            elif classification.action == DispatchErrorAction.LOG_AND_CONTINUE:
-                logger.debug("意图识别 best-effort 失败: %s", get_error_detail(e))
-                return
-            elif classification.action == DispatchErrorAction.RAISE:
-                logger.error("意图识别异常: %s", get_error_detail(e), exc_info=True)
-                raise
-            # Default: log and fallback to shell
-            logger.error("意图识别异常: %s", get_error_detail(e))
             if not self._action_matrix_allows(
                 effective_trust,
                 action_name="host_shell",
             ):
                 return
-            working_dir = self.client._get_working_dir(chat_id)
             if not current_dispatch_allowed():
                 return
-            self.client._submit_shell_command(message_id, chat_id, text, working_dir, project)
+            logger.warning("意图识别异常，回退到 shell: %s", get_error_detail(e))
+            working_dir = self.base.get_working_dir(chat_id)
+            self.system.submit_shell_command(message_id, chat_id, text, working_dir, project)
             return
 
         logger.info(
@@ -314,38 +202,14 @@ class MessageDispatcher:
             len(intent_result.tasks),
         )
 
-        if intent_result.is_multi_task:
-            if not current_dispatch_allowed():
+        tasks = intent_result.tasks
+        if any(task.intent is IntentType.SHELL_COMMAND for task in tasks):
+            if not self._action_matrix_allows(effective_trust, action_name="host_shell"):
                 return
-            if any(
-                task.intent is IntentType.SHELL_COMMAND
-                for task in intent_result.tasks
-            ) and not self._action_matrix_allows(
-                effective_trust,
-                action_name="host_shell",
-            ):
-                return
-            multi_kwargs = {}
-            if effective_trust is not None:
-                multi_kwargs["effective_trust"] = effective_trust
-            self.execute_multi_tasks(
-                message_id,
-                chat_id,
-                intent_result,
-                project,
-                **multi_kwargs,
-            )
-        else:
-            task = intent_result.tasks[0] if intent_result.tasks else None
-            if (
-                task is not None
-                and task.intent is IntentType.SHELL_COMMAND
-                and not self._action_matrix_allows(
-                    effective_trust,
-                    action_name="host_shell",
-                )
-            ):
-                return
+        if not tasks:
+            self.execute_single_task(message_id, chat_id, None, text, project)
+            return
+        for task in tasks:
             if not current_dispatch_allowed():
                 return
             self.execute_single_task(
@@ -356,6 +220,8 @@ class MessageDispatcher:
                 project,
                 shell_fast_tracked=shell_fast_tracked,
             )
+            if task.intent.name.startswith("ENTER_") and task.intent.name[6:].lower() in self._PROGRAMMING_MODES:
+                break
 
     @staticmethod
     def _action_matrix_allows(
@@ -385,104 +251,21 @@ class MessageDispatcher:
             )
         ) is ActionDecision.ALLOW
 
-    def execute_multi_tasks(
-        self,
-        message_id: str,
-        chat_id: str,
-        intent_result: 'IntentResult',
-        project: Optional['ProjectContext'] = None,
-        *,
-        effective_trust: Optional['EffectiveTrust'] = None,
-    ):
-        """执行多任务计划（逐步执行；遇到失败停止后续步骤）。"""
-        tasks = intent_result.tasks
-
-        task_list = [{"description": task.description or self.get_task_description(task)} for task in tasks]
-        plan_msg = fmt.format_multi_task_plan(task_list)
-        self.client._reply_text(message_id, plan_msg)
-
-        self.client._add_reaction(message_id, EmojiReaction.on_multi_task_start())
-
-        all_success = True
-        for i, task in enumerate(tasks, 1):
-            if effective_trust is not None:
-                gate = getattr(self.client, "_current_trust_can_dispatch", None)
-                if not callable(gate) or gate(
-                    effective_trust,
-                    project=project,
-                ) is not True:
-                    all_success = False
-                    break
-            success = self.execute_task_step(
-                message_id, chat_id, task, step_num=i, total_steps=len(tasks), project=project
-            )
-
-            if task.intent in {
-                IntentType.ENTER_COCO,
-                IntentType.ENTER_CLAUDE,
-                IntentType.ENTER_AIDEN,
-                IntentType.ENTER_CODEX,
-                IntentType.ENTER_GEMINI,
-                IntentType.ENTER_TRAEX,
-            }:
-                break
-
-            if not success:
-                all_success = False
-                self.client._reply_text(message_id, UI_TEXT["multi_task_step_failed"].format(step=i))
-                break
-
-        if all_success:
-            self.client._add_reaction(message_id, EmojiReaction.on_multi_task_done())
-        else:
-            self.client._add_reaction(message_id, EmojiReaction.on_error())
-
-    # ------------------------------------------------------------------
-    # Dict-driven dispatch tables for execute_single_task
-    # ------------------------------------------------------------------
-    _MODE_ENTER_MAP: dict = {
-        IntentType.ENTER_CLAUDE: "claude",
-        IntentType.ENTER_AIDEN: "aiden",
-        IntentType.ENTER_CODEX: "codex",
-        IntentType.ENTER_GEMINI: "gemini",
-        IntentType.ENTER_TRAEX: "traex",
-    }
-
-    _MODE_EXIT_MAP: dict = {
-        IntentType.EXIT_COCO: "coco",
-        IntentType.EXIT_CLAUDE: "claude",
-        IntentType.EXIT_AIDEN: "aiden",
-        IntentType.EXIT_CODEX: "codex",
-        IntentType.EXIT_GEMINI: "gemini",
-        IntentType.EXIT_TRAEX: "traex",
-    }
-
-    _MODE_MESSAGE_MAP: dict = {
-        IntentType.COCO_MESSAGE: "coco",
-        IntentType.CLAUDE_MESSAGE: "claude",
-        IntentType.AIDEN_MESSAGE: "aiden",
-        IntentType.CODEX_MESSAGE: "codex",
-        IntentType.GEMINI_MESSAGE: "gemini",
-        IntentType.TRAEX_MESSAGE: "traex",
-    }
-
-    _MODEL_SELECT_ENTER_MODES: set[str] = {"codex", "traex"}
+    _PROGRAMMING_MODES = frozenset({"coco", "claude", "aiden", "codex", "gemini", "traex"})
 
     _ENGINE_ENTER_MAP: dict = {
-        IntentType.ENTER_DEEP: "_start_deep_engine",
-        IntentType.ENTER_SPEC: "_start_spec_engine",
+        IntentType.ENTER_DEEP: ("deep", "start_deep_engine"),
+        IntentType.ENTER_SPEC: ("spec", "start_spec_engine"),
     }
 
     _SIMPLE_ENGINE_DISPATCH: dict = {
-        IntentType.SPEC_STATUS: "_show_spec_status",
-        IntentType.STOP_SPEC: "_stop_spec_engine",
-        IntentType.SPEC_PAUSE: "_pause_spec_engine",
-        IntentType.SPEC_RESUME: "_resume_spec_engine",
+        IntentType.SPEC_STATUS: ("spec", "show_spec_status"),
+        IntentType.STOP_SPEC: ("spec", "stop_spec_engine"),
     }
 
     _ENGINE_GUIDE_MAP: dict = {
-        IntentType.DEEP_UPDATE: ("_update_deep_context", "📝 请提供上下文信息\n\n用法: `/deep_update <上下文描述>`"),
-        IntentType.SPEC_GUIDE: ("_update_spec_guidance", "📝 请提供引导信息\n\n用法: `/spec_guide <引导描述>`"),
+        IntentType.DEEP_UPDATE: ("deep", "update_deep_context", "📝 请提供上下文信息\n\n用法: `/deep_update <上下文描述>`"),
+        IntentType.SPEC_GUIDE: ("spec", "update_spec_guidance", "📝 请提供引导信息\n\n用法: `/spec_guide <引导描述>`"),
     }
 
     _PROJECT_INTENTS: set = {
@@ -508,49 +291,46 @@ class MessageDispatcher:
 
         intent = task.intent
         data = task.data
+        intent_name = intent.name
 
-        # Mode enter
-        if intent == IntentType.ENTER_COCO:
-            if data.get("auto_forward") is True:
-                self._auto_enter_and_forward("coco", message_id, chat_id, original_text, project)
-            else:
-                self._handle_enter_coco(message_id, chat_id, project)
-        elif intent in self._MODE_ENTER_MAP:
-            mode = self._MODE_ENTER_MAP[intent]
+        if intent_name.startswith("ENTER_") and intent_name[6:].lower() in self._PROGRAMMING_MODES:
+            mode = intent_name[6:].lower()
             if data.get("auto_forward") is True:
                 self._auto_enter_and_forward(mode, message_id, chat_id, original_text, project)
-            elif mode in self._MODEL_SELECT_ENTER_MODES:
-                self._handle_enter_acp_mode(mode, message_id, chat_id, project)
+            elif mode == "coco":
+                self._handle_enter_coco(message_id, chat_id, project)
             else:
-                getattr(self.client, f"_enter_{mode}_mode")(message_id, chat_id, project=project)
-        # Mode exit
-        elif intent == IntentType.EXIT_MODE:
-            self.client._exit_current_mode(message_id, chat_id, project=project)
-        elif intent in self._MODE_EXIT_MAP:
-            mode = self._MODE_EXIT_MAP[intent]
-            getattr(self.client, f"_exit_{mode}_mode")(message_id, chat_id, project=project)
-        # Mode message
-        elif intent in self._MODE_MESSAGE_MAP:
-            self._handle_mode_message(self._MODE_MESSAGE_MAP[intent], data, message_id, chat_id, original_text, project)
-        # System commands
+                self._handle_enter_acp_mode(mode, message_id, chat_id, project)
+            return
+        if intent_name.startswith("EXIT_") and intent_name[5:].lower() in self._PROGRAMMING_MODES:
+            self.handlers[intent_name[5:].lower()].exit_mode(message_id, chat_id, project=project)
+            return
+        if intent_name.endswith("_MESSAGE") and intent_name[:-8].lower() in self._PROGRAMMING_MODES:
+            self._handle_mode_message(intent_name[:-8].lower(), data, message_id, chat_id, original_text, project)
+            return
+
+        if intent == IntentType.EXIT_MODE:
+            self.system.exit_current_mode(message_id, chat_id, project=project)
         elif intent == IntentType.CHANGE_DIR:
-            self.client._change_directory(message_id, chat_id, data.get("path", ""), project)
+            self.system.change_directory(message_id, chat_id, data.get("path", ""), project)
         elif intent == IntentType.SHOW_HELP:
-            self.client._show_full_help(message_id, chat_id, project)
+            self.system.show_full_help(message_id, chat_id, project)
         elif intent == IntentType.SHOW_TOOLS:
-            self.client._system_handler.show_tools_list(message_id, chat_id, project)
+            self.system.show_tools_list(message_id, chat_id, project)
         elif intent == IntentType.TOOLS_STATUS:
-            self.client._system_handler.show_tools_status(message_id, chat_id, project)
+            self.system.show_tools_status(message_id, chat_id, project)
         # Project commands
         elif intent in self._PROJECT_INTENTS:
             self._dispatch_project(intent, data, message_id, chat_id, project)
         # Engine enter
         elif intent in self._ENGINE_ENTER_MAP:
             requirement = data.get("requirement") or original_text
-            getattr(self.client, self._ENGINE_ENTER_MAP[intent])(message_id, chat_id, requirement, project)
+            handler, method = self._ENGINE_ENTER_MAP[intent]
+            getattr(self.handlers[handler], method)(message_id, chat_id, requirement, project)
         # Engine status/control (simple)
         elif intent in self._SIMPLE_ENGINE_DISPATCH:
-            getattr(self.client, self._SIMPLE_ENGINE_DISPATCH[intent])(message_id, chat_id, project)
+            handler, method = self._SIMPLE_ENGINE_DISPATCH[intent]
+            getattr(self.handlers[handler], method)(message_id, chat_id, project)
         # Deep status/stop (arg parsing)
         elif intent in (IntentType.DEEP_STATUS, IntentType.STOP_DEEP):
             self._handle_deep_status_or_stop(intent, data, message_id, chat_id, project)
@@ -562,7 +342,7 @@ class MessageDispatcher:
             self._dispatch_shell(data, message_id, chat_id, original_text, project, shell_fast_tracked)
         # Unknown
         elif intent == IntentType.UNKNOWN:
-            self.client._reply_text(message_id, fmt.format_unknown_intent())
+            self.base.reply_text(message_id, fmt.format_unknown_intent())
 
     # ------------------------------------------------------------------
     # Extracted helpers for execute_single_task
@@ -574,15 +354,16 @@ class MessageDispatcher:
             active_thread = self.client._find_active_thread(chat_id)
             if active_thread:
                 mode_display = active_thread.mode.upper() if active_thread.mode else "编程"
-                self.client._reply_text(
+                self.base.reply_text(
                     message_id,
                     UI_TEXT["ws_active_topic_msg"].format(name=mode_display),
                 )
                 return
-        self.client._reply_text(message_id, "🤔 无法理解你的意图")
+        self.base.reply_text(message_id, "🤔 无法理解你的意图")
 
     def _handle_enter_coco(self, message_id: str, chat_id: str, project, *, pending_prompt: Optional[str] = None):
-        # If already in coco mode, skip model selection — just forward the pending prompt
+        # Programming entry is automatic. Explicit /model and /acp only update
+        # saved project configuration and never interrupt a running task.
         _pid = project.project_id if project else None
         if self.client._mode_manager.is_coco_mode(chat_id, project_id=_pid):
             if pending_prompt:
@@ -592,25 +373,11 @@ class MessageDispatcher:
                 if handler:
                     handler.handle_message(message_id, chat_id, pending_prompt, project)
             return
-
-        try:
-            self.client._system_handler.handle_select_acp_tool(
-                message_id, chat_id, "coco", project_id=_pid,
-                pending_prompt=pending_prompt,
+        self.base.enter_mode(message_id, chat_id, project=project)
+        if pending_prompt:
+            self.base.handle_message(
+                message_id, chat_id, pending_prompt, project
             )
-        except (RuntimeError, OSError, TimeoutError, TypeError, ValueError) as e:
-            classify_dispatch_error(e, phase="coco_model_card")
-            logger.warning("展示 Coco 模型选择卡失败，回退直接进入: %s", get_error_detail(e))
-            self.client._enter_coco_mode(message_id, chat_id, project=project)
-            # Best-effort: forward the pending prompt after fallback entry.
-            if pending_prompt:
-                handle_fn = getattr(self.client, "_handle_coco_message", None)
-                if handle_fn:
-                    try:
-                        handle_fn(message_id, chat_id, pending_prompt, project)
-                    except (RuntimeError, OSError, TimeoutError, TypeError, ValueError) as fwd_err:
-                        classify_dispatch_error(fwd_err, phase="pending_prompt_forward")
-                        logger.warning("fallback 转发 pending prompt 失败: %s", str(fwd_err))
 
     def _handle_enter_acp_mode(self, mode: str, message_id: str, chat_id: str, project, *, pending_prompt: Optional[str] = None):
         _pid = project.project_id if project else None
@@ -624,32 +391,20 @@ class MessageDispatcher:
                     handler.handle_message(message_id, chat_id, pending_prompt, project)
             return
 
-        try:
-            self.client._system_handler.handle_select_acp_tool(
-                message_id, chat_id, mode, project_id=_pid,
-                pending_prompt=pending_prompt,
-            )
-        except (RuntimeError, OSError, TimeoutError, TypeError, ValueError) as e:
-            classify_dispatch_error(e, phase=f"{mode}_model_card")
-            logger.warning("展示 %s 模型选择卡失败，回退直接进入: %s", mode, get_error_detail(e))
-            enter_fn = getattr(self.client, f"_enter_{mode}_mode", None)
-            if enter_fn:
-                enter_fn(message_id, chat_id, project=project)
-            if pending_prompt:
-                handle_fn = getattr(self.client, f"_handle_{mode}_message", None)
-                if handle_fn:
-                    try:
-                        handle_fn(message_id, chat_id, pending_prompt, project)
-                    except (RuntimeError, OSError, TimeoutError, TypeError, ValueError) as fwd_err:
-                        classify_dispatch_error(fwd_err, phase="pending_prompt_forward")
-                        logger.warning("fallback 转发 pending prompt 失败: %s", str(fwd_err))
+        enter_fn = getattr(self.handlers[mode], "enter_mode", None)
+        if enter_fn:
+            enter_fn(message_id, chat_id, project=project)
+        if pending_prompt:
+            handle_fn = getattr(self.handlers[mode], "handle_message", None)
+            if handle_fn:
+                handle_fn(message_id, chat_id, pending_prompt, project)
 
     def _auto_enter_and_forward(self, mode: str, message_id: str, chat_id: str, text: str, project):
         """Auto-enter programming mode and forward message (default ACP tool)."""
-        enter_fn = getattr(self.client, f"_enter_{mode}_mode", None)
+        enter_fn = getattr(self.handlers[mode], "enter_mode", None)
         if enter_fn:
             enter_fn(message_id, chat_id, silent=True, project=project)
-        handle_fn = getattr(self.client, f"_handle_{mode}_message", None)
+        handle_fn = getattr(self.handlers[mode], "handle_message", None)
         if handle_fn:
             handle_fn(message_id, chat_id, text, project)
         else:
@@ -657,70 +412,76 @@ class MessageDispatcher:
 
     def _handle_mode_message(self, mode: str, data: dict, message_id: str, chat_id: str, original_text: str, project):
         if data.get("command") == "info":
-            getattr(self.client, f"_show_{mode}_info")(message_id, chat_id, project)
+            self.handlers[mode].show_info(message_id, chat_id, project)
         else:
-            getattr(self.client, f"_handle_{mode}_message")(message_id, chat_id, original_text, project)
+            self.handlers[mode].handle_message(message_id, chat_id, original_text, project)
 
     def _dispatch_project(self, intent, data: dict, message_id: str, chat_id: str, project):
         if intent == IntentType.CREATE_PROJECT:
             name = data.get("name", "")
             path = data.get("path", "")
-            working_dir = self.client._get_working_dir(chat_id)
+            working_dir = self.base.get_working_dir(chat_id)
             if not path:
                 path = working_dir
             if not name:
                 name = os.path.basename(os.path.normpath(path))
                 if not name or name in (".", "/", "~"):
                     name = f"project_{int(time.time())}"
-            self.client._create_project(message_id, chat_id, name, path)
+            self.project.create_project(message_id, chat_id, name, path)
         elif intent == IntentType.SWITCH_PROJECT:
             name = data.get("name", "")
             if name:
-                self.client._switch_project(message_id, chat_id, name)
+                self.project.switch_project(
+                    message_id,
+                    chat_id,
+                    name,
+                    coco_handler=self.base,
+                    claude_handler=self.handlers["claude"],
+                )
             else:
-                self.client._show_project_board(message_id, chat_id)
+                self.project.show_project_board(message_id, chat_id)
         elif intent == IntentType.LIST_PROJECTS:
-            self.client._show_project_board(message_id, chat_id)
+            self.project.show_project_board(message_id, chat_id)
         elif intent == IntentType.CLOSE_PROJECT:
             name = data.get("name", "")
             if name:
-                self.client._close_project(message_id, chat_id, name)
+                self.project.close_project(message_id, chat_id, name)
             else:
-                self.client._reply_text(message_id, "❌ 请指定要关闭的项目名称")
+                self.base.reply_text(message_id, "❌ 请指定要关闭的项目名称")
         elif intent == IntentType.PROJECT_STATUS:
-            self.client._show_project_status(message_id, chat_id, project)
+            self.project.show_project_status(message_id, chat_id, project)
         elif intent == IntentType.NEW_CHAT_PROJECT:
-            self.client._handle_new_chat_project(message_id, chat_id, data)
+            self.project.handle_new_chat_project(message_id, chat_id, data)
 
     def _handle_deep_status_or_stop(self, intent, data: dict, message_id: str, chat_id: str, project):
         arg = (data.get("arg") or "").strip().lower()
         is_all = arg in ("all", "-a", "--all")
         if intent == IntentType.DEEP_STATUS:
             if is_all:
-                self.client._show_deep_board(message_id, chat_id)
+                self.handlers["deep"].show_deep_board(message_id, chat_id)
             else:
-                self.client._show_deep_status(message_id, chat_id, project)
+                self.handlers["deep"].show_deep_status(message_id, chat_id, project)
         else:  # STOP_DEEP
             if is_all:
-                self.client._stop_all_deep_engines(message_id, chat_id)
+                self.handlers["deep"].stop_all_deep_engines(message_id, chat_id)
             else:
-                self.client._stop_deep_engine(message_id, chat_id, project)
+                self.handlers["deep"].stop_deep_engine(message_id, chat_id, project)
 
     def _handle_engine_guide(self, intent, data: dict, message_id: str, chat_id: str, project):
-        method_name, hint = self._ENGINE_GUIDE_MAP[intent]
+        handler, method_name, hint = self._ENGINE_GUIDE_MAP[intent]
         guide_message = data.get("message")
         if guide_message:
-            getattr(self.client, method_name)(message_id, chat_id, guide_message, project)
+            getattr(self.handlers[handler], method_name)(message_id, chat_id, guide_message, project)
         else:
-            self.client._reply_text(message_id, hint)
+            self.base.reply_text(message_id, hint)
 
     def _dispatch_shell(self, data: dict, message_id: str, chat_id: str, original_text: str, project, shell_fast_tracked: bool):
-        working_dir = self.client._get_working_dir(chat_id)
+        working_dir = self.base.get_working_dir(chat_id)
         cmd = data.get("command") or original_text
         if shell_fast_tracked:
-            self.client._system_handler.execute_shell_and_reply(message_id, chat_id, cmd, working_dir, project)
+            self.system.execute_shell_and_reply(message_id, chat_id, cmd, working_dir, project)
         else:
-            self.client._submit_shell_command(message_id, chat_id, cmd, working_dir, project)
+            self.system.submit_shell_command(message_id, chat_id, cmd, working_dir, project)
         if project:
             project.add_conversation("user", cmd, message_id)
             self.client._context_manager.update_context(
@@ -728,125 +489,3 @@ class MessageDispatcher:
                 conversation={"role": "user", "content": cmd, "source_mode": "shell", "message_id": message_id},
                 chat_id=chat_id,
             )
-
-    def execute_task_step(
-        self,
-        message_id: str,
-        chat_id: str,
-        task: 'TaskStep',
-        step_num: int,
-        total_steps: int,
-        project: Optional['ProjectContext'] = None,
-    ) -> bool:
-        """执行一个 TaskStep，并返回是否成功。"""
-        intent = task.intent
-        data = task.data
-        desc = task.description or self.get_task_description(task)
-
-        logger.info("执行步骤 %d/%d: %s", step_num, total_steps, desc)
-
-        try:
-            if intent == IntentType.ENTER_COCO:
-                self.client._enter_coco_mode(message_id, chat_id, silent=True, project=project)
-                self.client._reply_text(message_id, UI_TEXT["multi_task_step_success"].format(step=step_num, desc="已进入 Coco 模式"))
-                return True
-
-            elif intent == IntentType.EXIT_COCO:
-                success = self.client._coco_manager.end_session(chat_id)
-                if success:
-                    self.client._reply_text(message_id, UI_TEXT["multi_task_step_success"].format(step=step_num, desc="已退出 Coco 模式"))
-                return success
-
-            elif intent == IntentType.CHANGE_DIR:
-                path = data.get("path", "")
-                if not path:
-                    current_dir = self.client._get_working_dir(chat_id)
-                    self.client._reply_text(message_id, f"✅ 步骤 {step_num}: 当前目录 {current_dir}")
-                    return True
-
-                success, result = self.client._set_working_dir(chat_id, path)
-                if success:
-                    self.client._reply_text(message_id, UI_TEXT["multi_task_step_success"].format(step=step_num, desc=f"已切换到 {result}"))
-                else:
-                    self.client._reply_text(message_id, UI_TEXT["multi_task_step_error"].format(step=step_num, error=result))
-                return success
-
-            elif intent == IntentType.CREATE_PROJECT:
-                name = data.get("name", "")
-                path = data.get("path", "")
-                if not name:
-                    name = f"project_{int(time.time())}"
-                if not path:
-                    path = self.client._get_working_dir(chat_id)
-                project_id = name.lower().replace(" ", "_").replace("-", "_")
-                success, msg, new_project = self.client._project_manager.create_project(
-                    project_id=project_id, project_name=name, root_path=path, chat_id=chat_id
-                )
-                if success:
-                    self.client._reply_text(message_id, f"✅ 步骤 {step_num}: 已创建项目 {name}")
-                    project = new_project
-                else:
-                    self.client._reply_text(message_id, f"❌ 步骤 {step_num}: {msg}")
-                return success
-
-            elif intent == IntentType.SWITCH_PROJECT:
-                name = data.get("name", "")
-                if name:
-                    found_project = self.client._project_manager.find_project_by_name(name, chat_id=chat_id)
-                    if found_project:
-                        success, msg = self.client._project_manager.set_active_project(chat_id, found_project.project_id)
-                        if success:
-                            self.client._reply_text(message_id, f"✅ 步骤 {step_num}: 已切换到项目 {name}")
-                        return success
-                return False
-
-            elif intent == IntentType.SHELL_COMMAND:
-                cmd = data.get("command", task.description)
-                if cmd:
-                    working_dir = self.client._get_working_dir(chat_id)
-                    self.client._system_handler.execute_shell_and_reply(message_id, chat_id, cmd, working_dir, project)
-                return True
-            else:
-                return False
-
-        except (RuntimeError, OSError, TimeoutError, TypeError, ValueError) as e:
-            classify_dispatch_error(e, phase="multi_task_step")
-            logger.error("执行步骤 %d 异常: %s", step_num, get_error_detail(e))
-            return False
-
-    _TASK_DESCRIPTIONS: dict = {
-        IntentType.ENTER_COCO: "进入 Coco 编程模式",
-        IntentType.ENTER_CLAUDE: "进入 Claude 编程模式",
-        IntentType.ENTER_AIDEN: "进入 Aiden 编程模式",
-        IntentType.ENTER_CODEX: "进入 Codex 编程模式",
-        IntentType.ENTER_GEMINI: "进入 Gemini 编程模式",
-        IntentType.EXIT_COCO: "退出 Coco 模式",
-        IntentType.EXIT_CLAUDE: "退出 Claude 模式",
-        IntentType.EXIT_AIDEN: "退出 Aiden 模式",
-        IntentType.EXIT_CODEX: "退出 Codex 模式",
-        IntentType.EXIT_GEMINI: "退出 Gemini 模式",
-        IntentType.LIST_PROJECTS: "查看项目列表",
-        IntentType.PROJECT_STATUS: "查看项目状态",
-        IntentType.SHELL_COMMAND: "执行命令",
-    }
-
-    # Intents whose description uses ``data["name"]`` or ``data["path"]``
-    _TASK_DESC_WITH_DATA: dict = {
-        IntentType.CHANGE_DIR: ("path", "切换到目录: {v}", "查看当前目录"),
-        IntentType.CREATE_PROJECT: ("name", "创建项目: {v}", "创建新项目"),
-        IntentType.SWITCH_PROJECT: ("name", "切换到项目: {v}", "切换项目"),
-        IntentType.CLOSE_PROJECT: ("name", "关闭项目: {v}", "关闭项目"),
-    }
-
-    def get_task_description(self, task: 'TaskStep') -> str:
-        """为 TaskStep 生成可读描述（用于多任务计划展示）。"""
-        intent = task.intent
-        desc = self._TASK_DESCRIPTIONS.get(intent)
-        if desc:
-            return desc
-        tpl = self._TASK_DESC_WITH_DATA.get(intent)
-        if tpl:
-            key, fmt, fallback = tpl
-            v = task.data.get(key, "")
-            return fmt.format(v=v) if v else fallback
-        return UI_TEXT["task_desc_unknown"]

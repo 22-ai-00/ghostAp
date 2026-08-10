@@ -6,8 +6,7 @@ import json
 import math
 import time
 
-from src.card.render.atoms import RenderAtom, estimate_atom_size
-from src.card.state.models import CardMetadata, CardState, ContentBlock
+from src.card.state.models import CardState, ContentBlock
 from src.card.tool_display import is_unhelpful_display_label
 from src.card.ui_text import UI_TEXT
 from src.utils.text import format_elapsed_clock
@@ -144,24 +143,9 @@ _SUBTASK_TERMINAL_STATUS = {
     "failed": "❌ 执行失败",
     "cancelled": "⚪ 已取消",
     "paused": "⏸ 已暂停",
-    "awaiting_approval": "⏳ 等待确认",
     "archived": "📦 已封存",
     "blocked": "⛔ 已阻塞",
 }
-
-
-def _format_duration(seconds: float) -> str:
-    """Format seconds into human-readable duration string."""
-    seconds = max(0, int(seconds))
-    if seconds <= 1:
-        return UI_TEXT["duration_sub_second"]
-    if seconds < 60:
-        return UI_TEXT["duration_secs"].format(seconds=seconds)
-    minutes, secs = divmod(seconds, 60)
-    if minutes < 60:
-        return UI_TEXT["duration_mins_secs"].format(minutes=minutes, seconds=secs)
-    hours, mins = divmod(minutes, 60)
-    return UI_TEXT["duration_hours_mins_secs"].format(hours=hours, minutes=mins, seconds=secs)
 
 
 def _total_elapsed_from_session(state: CardState) -> float | None:
@@ -211,53 +195,6 @@ def render_now_tool_hint(tool) -> str:
     return f"⚙ **{name}** · {brief}"
 
 
-def _uses_unified_execution_flow(state: CardState) -> bool:
-    return not state.metadata.is_subagent and state.metadata.engine_type is None
-
-
-def render_subagent_badge(metadata: CardMetadata) -> str:
-    """Retain the public helper while child identity lives in the header."""
-    return ""
-
-
-def build_footer_atoms(state: CardState) -> list[RenderAtom]:
-    """Build footer-specific atoms for tests and future appendices.
-
-    The production renderer still emits Feishu elements directly from
-    ``render_footer`` because footer elements are appended only on the final
-    page. This helper centralizes the v2 footer text contract so that both
-    the atoms path and the render path emit the same user-visible text set
-    (main-card tool hint and frozen continuation).
-    """
-    atoms: list[RenderAtom] = []
-
-    # Child cards already show their active action and relationship above.
-    if (
-        not state.metadata.is_subagent
-        and not _uses_unified_execution_flow(state)
-    ):
-        running_tool = _find_running_tool(state)
-        tool_hint = render_now_tool_hint(running_tool)
-        if tool_hint:
-            atom = RenderAtom(kind="text", content=tool_hint, node_count=1)
-            atom.byte_size = estimate_atom_size(atom)
-            atoms.append(atom)
-
-    # Frozen continuation hint — mirrors render_footer's continuation line
-    if (
-        not state.metadata.is_subagent
-        and state.metadata.frozen
-        and state.metadata.continuation_seq > 0
-    ):
-        next_seq = state.metadata.continuation_seq + 1
-        continuation_text = UI_TEXT["card_footer_frozen_continuation"].format(next_seq=next_seq)
-        atom = RenderAtom(kind="text", content=continuation_text, node_count=1)
-        atom.byte_size = estimate_atom_size(atom)
-        atoms.append(atom)
-
-    return atoms
-
-
 def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[dict]:
     """Generate footer elements.
 
@@ -277,7 +214,10 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
         state,
         is_final_terminal=is_final_terminal,
     )
-    uses_unified_execution = _uses_unified_execution_flow(state)
+    uses_unified_execution = (
+        not state.metadata.is_subagent
+        and state.metadata.engine_type is None
+    )
     hide_tool_status = (
         uses_unified_execution
         and state.footer.status == "tool_running"
@@ -434,21 +374,12 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
     ):
         warn_before = state.metadata.warn_before_seconds if hasattr(state.metadata, "warn_before_seconds") and state.metadata.warn_before_seconds else state.metadata.idle_timeout_seconds
         idle_remaining = getattr(state.footer, "idle_remaining_seconds", None)
-        show_hint = idle_remaining is not None and idle_remaining <= warn_before
-        if show_hint or idle_remaining is None:
-            # Fallback: show hint when we can't determine remaining (legacy behavior)
-            if idle_remaining is None:
-                timeout_display = _format_idle_timeout(state.metadata.idle_timeout_seconds)
-                hint = UI_TEXT["card_footer_idle_timeout_hint"].format(timeout_display=timeout_display)
-                elements.append(
-                    {"tag": "markdown", "content": hint, "text_size": "notation"}
-                )
-            else:
-                timeout_display = _format_idle_timeout(state.metadata.idle_timeout_seconds)
-                hint = UI_TEXT["card_footer_idle_timeout_hint"].format(timeout_display=timeout_display)
-                elements.append(
-                    {"tag": "markdown", "content": hint, "text_size": "notation"}
-                )
+        if idle_remaining is None or idle_remaining <= warn_before:
+            timeout_display = _format_idle_timeout(state.metadata.idle_timeout_seconds)
+            hint = UI_TEXT["card_footer_idle_timeout_hint"].format(timeout_display=timeout_display)
+            elements.append(
+                {"tag": "markdown", "content": hint, "text_size": "notation"}
+            )
 
     # Last updated timestamp on non-terminal (active) cards
     if not state.terminal and state.footer.last_updated_at:

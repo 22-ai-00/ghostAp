@@ -11,7 +11,6 @@ from ..acp.models import ACPEvent, PromptResult
 from ..acp.sync_adapter import SyncACPSession
 from ..config import get_settings
 from ..utils.errors import get_error_detail
-from ..utils.retry import RetryPolicy, prompt_with_retry
 from .model_diagnostics import (
     _default_compaction_action,
     _detect_rate_limit,
@@ -19,12 +18,12 @@ from .model_diagnostics import (
     _replace_model_in_agent_args,
     classify_model_failure,
 )
-from .protocol import SyncSession
+from .protocol import SyncSession, _SessionWrapper
 
 logger = logging.getLogger(__name__)
 
 
-class RateLimitAwareSession:
+class RateLimitAwareSession(_SessionWrapper):
     """Wraps a SyncSession with rate-limit-aware retry on send_prompt().
 
     Implements the full SyncSession protocol by explicit delegation (no __getattr__).
@@ -36,91 +35,11 @@ class RateLimitAwareSession:
         on_rate_limit: Optional[Callable[[int], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ):
-        self._inner = inner
+        super().__init__(inner, cancel_event)
         self._on_rate_limit = on_rate_limit
-        self._cancel_event = cancel_event or threading.Event()
         self._settings = get_settings()
         # Rate-limit state visible to status queries
         self.rate_limit_until: Optional[float] = None  # monotonic deadline
-
-    def __getattr__(self, name: str):
-        """Best-effort proxy for non-protocol attributes.
-
-        说明：本类以"显式 delegation"实现 SyncSession 协议，避免隐藏行为。
-        但仓内部分测试/诊断会读取 `_model_name` / `_agent_args` 等私有字段。
-        为保持兼容，这里将未知属性透传给 inner。
-        """
-        return getattr(self._inner, name)
-
-    # --- Explicit SyncSession protocol delegation ---
-
-    @property
-    def session_id(self) -> str:
-        return self._inner.session_id
-
-    @session_id.setter
-    def session_id(self, value: str):
-        self._inner.session_id = value
-
-    @property
-    def created_at(self) -> float:
-        return self._inner.created_at
-
-    @property
-    def last_active(self) -> float:
-        return self._inner.last_active
-
-    @last_active.setter
-    def last_active(self, value: float):
-        self._inner.last_active = value
-
-    @property
-    def message_count(self) -> int:
-        return self._inner.message_count
-
-    @property
-    def last_query(self) -> str:
-        return self._inner.last_query
-
-    @property
-    def is_resumed(self) -> bool:
-        return self._inner.is_resumed
-
-    def describe_agent(self) -> str:
-        return self._inner.describe_agent()
-
-    def start(self, startup_timeout: float = 60) -> str:
-        return self._inner.start(startup_timeout=startup_timeout)
-
-    def load_session(self, session_id: str, timeout: float) -> None:
-        self._inner.load_session(session_id, timeout=timeout)
-
-    def load_local_history(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict]:
-        return self._inner.load_local_history(session_id=session_id, limit=limit)
-
-    def cancel(self, wait: bool = False, timeout: float = 2.0) -> bool | None:
-        self._cancel_event.set()
-        try:
-            return self._inner.cancel(wait=wait, timeout=timeout)
-        except TypeError:
-            return self._inner.cancel()
-
-    def close(self) -> None:
-        self._inner.close()
-
-    def to_snapshot(self) -> dict:
-        return self._inner.to_snapshot()
-
-    def get_session_info(self) -> str:
-        return self._inner.get_session_info()
-
-    def is_server_running(self) -> bool:
-        return self._inner.is_server_running()
-
-    def is_server_healthy(self, healthcheck_timeout: float = 2.0) -> bool:
-        return self._inner.is_server_healthy(healthcheck_timeout=healthcheck_timeout)
-
-    # --- Rate-limit-aware send_prompt ---
 
     def send_prompt(
         self,
@@ -179,25 +98,7 @@ class RateLimitAwareSession:
             raise last_error
         return self._inner.send_prompt(text, on_event=on_event, timeout=timeout)
 
-    def send_prompt_with_retry(
-        self,
-        text: str,
-        on_event: Optional[Callable[[ACPEvent], None]] = None,
-        timeout: Optional[int] = None,
-        retry_policy: Optional[RetryPolicy] = None,
-        before_retry: Optional[Callable[[int, Exception], None]] = None,
-        total_timeout: Optional[float] = None,
-    ) -> PromptResult:
-        return prompt_with_retry(
-            lambda: self.send_prompt(text, on_event=on_event, timeout=timeout),
-            self._cancel_event,
-            retry_policy=retry_policy,
-            before_retry=before_retry,
-            total_timeout=total_timeout,
-        )
-
-
-class ModelFailureAwareSession:
+class ModelFailureAwareSession(_SessionWrapper):
     """在 send_prompt 阶段处理模型侧错误（need compaction / loop / failover）。
 
     当前阶段（任务 4）：仅处理 need compaction：执行一次 compaction 动作并用同模型重试一次。
@@ -212,12 +113,10 @@ class ModelFailureAwareSession:
         on_rate_limit: Optional[Callable[[int], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ):
-        self._inner = inner
+        super().__init__(inner, cancel_event)
         self._settings = get_settings()
         self._compaction_action = compaction_action
         self._on_rate_limit = on_rate_limit
-        self._cancel_event = cancel_event or threading.Event()
-
         # compaction loop detector (per wrapper instance)
         self._compaction_loop_events: list[float] = []
 
@@ -251,85 +150,6 @@ class ModelFailureAwareSession:
             self._compaction_loop_events.append(now)
         n = len(self._compaction_loop_events)
         return (n >= max_count, n)
-
-    def __getattr__(self, name: str):
-        """Proxy unknown attributes to inner session.
-
-        Needed so that callers (e.g. employeeEngine._apply_tool_restrictions) can
-        access set_tool_filter / get_tool_filter / describe_agent etc. through
-        the wrapper chain without explicit delegation for every method.
-        """
-        return getattr(self._inner, name)
-
-    # --- Explicit SyncSession protocol delegation ---
-
-    @property
-    def session_id(self) -> str:
-        return self._inner.session_id
-
-    @session_id.setter
-    def session_id(self, value: str):
-        self._inner.session_id = value
-
-    @property
-    def created_at(self) -> float:
-        return self._inner.created_at
-
-    @property
-    def last_active(self) -> float:
-        return self._inner.last_active
-
-    @last_active.setter
-    def last_active(self, value: float):
-        self._inner.last_active = value
-
-    @property
-    def message_count(self) -> int:
-        return self._inner.message_count
-
-    @property
-    def last_query(self) -> str:
-        return self._inner.last_query
-
-    @property
-    def is_resumed(self) -> bool:
-        return self._inner.is_resumed
-
-    def describe_agent(self) -> str:
-        return self._inner.describe_agent()
-
-    def start(self, startup_timeout: float = 60) -> str:
-        return self._inner.start(startup_timeout=startup_timeout)
-
-    def load_session(self, session_id: str, timeout: float) -> None:
-        self._inner.load_session(session_id, timeout=timeout)
-
-    def load_local_history(self, session_id: Optional[str] = None, limit: int = 200) -> list[dict]:
-        return self._inner.load_local_history(session_id=session_id, limit=limit)
-
-    def cancel(self, wait: bool = False, timeout: float = 2.0) -> bool | None:
-        self._cancel_event.set()
-        try:
-            return self._inner.cancel(wait=wait, timeout=timeout)
-        except TypeError:
-            return self._inner.cancel()
-
-    def close(self) -> None:
-        self._inner.close()
-
-    def to_snapshot(self) -> dict:
-        return self._inner.to_snapshot()
-
-    def get_session_info(self) -> str:
-        return self._inner.get_session_info()
-
-    def is_server_running(self) -> bool:
-        return self._inner.is_server_running()
-
-    def is_server_healthy(self, healthcheck_timeout: float = 2.0) -> bool:
-        return self._inner.is_server_healthy(healthcheck_timeout=healthcheck_timeout)
-
-    # --- Internal helpers ---
 
     def _unwrap_rate_limit(self) -> tuple[SyncSession, Callable[[SyncSession], SyncSession]]:
         """若 inner 是 RateLimitAwareSession，则解包到其底层 session，并提供 rewrap 函数。"""
@@ -554,20 +374,3 @@ class ModelFailureAwareSession:
                         if ok:
                             continue
                 raise
-
-    def send_prompt_with_retry(
-        self,
-        text: str,
-        on_event: Optional[Callable[[ACPEvent], None]] = None,
-        timeout: Optional[int] = None,
-        retry_policy: Optional[RetryPolicy] = None,
-        before_retry: Optional[Callable[[int, Exception], None]] = None,
-        total_timeout: Optional[float] = None,
-    ) -> PromptResult:
-        return prompt_with_retry(
-            lambda: self.send_prompt(text, on_event=on_event, timeout=timeout),
-            self._cancel_event,
-            retry_policy=retry_policy,
-            before_retry=before_retry,
-            total_timeout=total_timeout,
-        )

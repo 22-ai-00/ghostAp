@@ -581,10 +581,10 @@ class TestWorkflowEngineManagerScoping(unittest.TestCase):
 class TestWorkflowTopicRoutingAC22(unittest.TestCase):
     """AC22: Workflow topic 自由文本路由到 WorkflowHandler，不经过 intent recognition。
 
-    Validates the dispatch logic at src/feishu/ws_client.py:1558-1590:
+    Validates the dispatch logic in ``FeishuWSClient._dispatch_message_logic``:
     When auto_enter_mode='workflow', command_match=None, and project is present,
     free-text messages are routed directly to WorkflowHandler.handle_message()
-    WITHOUT going through _process_with_intent / intent recognition.
+    WITHOUT going through MessageDispatcher.process_with_intent().
     """
 
     def setUp(self):
@@ -597,40 +597,21 @@ class TestWorkflowTopicRoutingAC22(unittest.TestCase):
         """Create a FeishuWSClient instance with all necessary mocks."""
         from src.feishu.ws_client import FeishuWSClient
 
-        # Create client instance without __init__
         client = FeishuWSClient.__new__(FeishuWSClient)
-
-        # Mock all attributes needed by _dispatch_message_logic
-        client.ctx = MagicMock()
-        client._reply_if_topic_engine_switch_blocked = MagicMock(return_value=False)
-        client._is_exit_command = MagicMock(return_value=False)
-        client._is_interceptable_command_match = MagicMock(return_value=False)
-        client._is_programming_entry_command = MagicMock(return_value=False)
-        client._is_deep_command = MagicMock(return_value=False)
-        client._is_spec_command = MagicMock(return_value=False)
-        client._add_reaction = MagicMock()
-        client._process_with_intent = MagicMock()
-        client._execute_single_task = MagicMock()
-        client._workflow_handler = MagicMock()
-        client._start_deep_engine = MagicMock()
-        client._start_spec_engine = MagicMock()
-        client._get_mode_handler = MagicMock()
+        client._handler_ctx = MagicMock()
+        client._handler_ctx.handlers = {
+            "coco": MagicMock(),
+            "system": MagicMock(),
+            "workflow": MagicMock(),
+        }
+        client._current_trust_can_dispatch = MagicMock(return_value=True)
+        client._message_dispatcher = MagicMock()
         client._intent_recognizer = MagicMock()
         client._intent_recognizer.looks_like_shell = MagicMock(return_value=False)
         client._project_manager = MagicMock()
         client._project_manager.find_by_bound_chat_id = MagicMock(return_value=None)
-        client._get_effective_mode = MagicMock()
-        client._system_handler = MagicMock()
-        client._message_dispatcher = MagicMock()
-        client._control_plane = MagicMock()
-        client._control_plane.should_defer_exit = MagicMock(return_value=False)
-        client._exit_current_mode = MagicMock()
-        client._reply_text = MagicMock()
-        client._show_help = MagicMock()
         client.settings = MagicMock()
-        client.settings.thread_programming_enabled = True
         client.settings.default_acp_tool = "coco"
-        client._thread_manager = MagicMock()
 
         return client
 
@@ -639,8 +620,8 @@ class TestWorkflowTopicRoutingAC22(unittest.TestCase):
 
         验证：
         1. auto_enter_mode='workflow', command_match=None, project present
-        2. _workflow_handler.handle_message(message_id, chat_id, text, project) 被调用
-        3. _process_with_intent / intent recognition 不被调用
+        2. workflow handler 的 handle_message 被调用
+        3. MessageDispatcher.process_with_intent 不被调用
         """
         client = self._make_client_with_mocks()
 
@@ -655,25 +636,27 @@ class TestWorkflowTopicRoutingAC22(unittest.TestCase):
         )
 
         # Verify workflow handler was called with correct arguments
-        client._workflow_handler.handle_message.assert_called_once_with(
+        handlers = client._handler_ctx.handlers
+        handlers["workflow"].handle_message.assert_called_once_with(
             self.message_id, self.chat_id, self.text, self.project
         )
 
         # Verify intent recognition was NOT called
-        client._process_with_intent.assert_not_called()
-        client._execute_single_task.assert_not_called()
+        client._message_dispatcher.process_with_intent.assert_not_called()
 
         # Verify processing reaction was added
-        client._add_reaction.assert_called_once()
+        handlers["coco"].add_reaction.assert_called_once()
 
     def test_workflow_topic_routing_no_command_match(self):
         """AC22: Workflow topic 路由仅在无命令匹配时生效。
 
         When command_match is NOT None, the message should go through
-        _process_with_intent instead of being routed to workflow handler.
+        MessageDispatcher.process_with_intent instead of being routed directly.
         """
         client = self._make_client_with_mocks()
         mock_command_match = MagicMock()
+        mock_command_match.command = "/wf_status"
+        mock_command_match.args = ""
 
         client._dispatch_message_logic(
             message_id=self.message_id,
@@ -685,8 +668,8 @@ class TestWorkflowTopicRoutingAC22(unittest.TestCase):
         )
 
         # Should go to intent recognition, NOT workflow handler
-        client._workflow_handler.handle_message.assert_not_called()
-        client._process_with_intent.assert_called_once()
+        client._handler_ctx.handlers["workflow"].handle_message.assert_not_called()
+        client._message_dispatcher.process_with_intent.assert_called_once()
 
     def test_workflow_topic_routing_no_project(self):
         """Workflow topic fails closed when its bound project is unavailable."""
@@ -701,9 +684,10 @@ class TestWorkflowTopicRoutingAC22(unittest.TestCase):
             command_match=None,
         )
 
-        client._workflow_handler.handle_message.assert_not_called()
-        client._reply_text.assert_called_once()
-        client._process_with_intent.assert_not_called()
+        handlers = client._handler_ctx.handlers
+        handlers["workflow"].handle_message.assert_not_called()
+        handlers["coco"].reply_text.assert_called_once()
+        client._message_dispatcher.process_with_intent.assert_not_called()
 
     def test_workflow_topic_routing_wrong_mode(self):
         """AC22: Workflow topic 路由仅在 auto_enter_mode='workflow' 时生效。
@@ -723,9 +707,8 @@ class TestWorkflowTopicRoutingAC22(unittest.TestCase):
         )
 
         # Should NOT go to workflow handler
-        client._workflow_handler.handle_message.assert_not_called()
-        # _process_with_intent may or may not be called depending on other logic,
-        # but the key assertion is that workflow handler is not called
+        client._handler_ctx.handlers["workflow"].handle_message.assert_not_called()
+        client._message_dispatcher.process_with_intent.assert_called_once()
 
 
 if __name__ == "__main__":

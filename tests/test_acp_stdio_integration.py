@@ -27,7 +27,7 @@ _FAKE_AGENT_CODE = textwrap.dedent(
     import uuid
 
     from acp.helpers import update_agent_message_text
-    from acp.schema import InitializeResponse, ListSessionsResponse, LoadSessionResponse, NewSessionResponse, PromptResponse
+    from acp.schema import InitializeResponse, ListSessionsResponse, NewSessionResponse, PromptResponse
     from acp.stdio import AgentSideConnection
 
 
@@ -47,9 +47,6 @@ _FAKE_AGENT_CODE = textwrap.dedent(
             self._sessions.add(sid)
             return NewSessionResponse(session_id=sid)
 
-        async def load_session(self, cwd: str, session_id: str, mcp_servers=None, **kwargs):
-            self._sessions.add(session_id)
-            return LoadSessionResponse()
 
         async def list_sessions(self, cwd=None, cursor=None, **kwargs):
             return ListSessionsResponse(sessions=[])

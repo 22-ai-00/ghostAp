@@ -5,11 +5,11 @@ Validates:
 """
 
 import unittest
-from unittest.mock import MagicMock
 
 from src.workflow_engine.script_gen import (
     _get_agent_capability_note,
     build_script_gen_prompt,
+    extract_meta_from_script,
     generate_simple_script,
     validate_generated_script,
 )
@@ -94,70 +94,6 @@ class TestBridgeArgsPassthrough(unittest.TestCase):
         self.assertEqual(bridge._args, {})
 
 
-class TestBridgeBackpressure(unittest.TestCase):
-    """Test queue backpressure in _handle_agent_call."""
-
-    def setUp(self):
-        self._bridges = []
-
-    def tearDown(self):
-        for bridge in self._bridges:
-            try:
-                bridge.stop()
-            except Exception:
-                pass
-        self._bridges.clear()
-
-    def _make_bridge(self):
-        import threading
-
-        from src.workflow_engine.bridge import RuntimeBridge
-
-        bridge = RuntimeBridge(
-            script_path="/tmp/test.js",
-            cwd="/tmp",
-        )
-        self._bridges.append(bridge)
-        # Manually set up internals normally created by start()
-        bridge._executor = MagicMock()
-        bridge._on_agent_call = MagicMock()
-        bridge._write_lock = threading.Lock()
-        bridge._process = MagicMock()
-        bridge._process.stdin = MagicMock()
-        return bridge
-
-    def test_rejects_when_queue_full(self):
-        from src.workflow_engine.constants import MAX_QUEUE_SIZE
-
-        bridge = self._make_bridge()
-        # Fill the queue to capacity
-        for _ in range(MAX_QUEUE_SIZE):
-            bridge._msg_queue.append({"test": True})
-
-        # Track what gets sent
-        bridge._send_error_response = MagicMock()
-
-        bridge._handle_agent_call(
-            {"prompt": "test", "tool": "coco"},
-            request_id="req_1",
-        )
-
-        # Should have sent error response about backpressure
-        bridge._send_error_response.assert_called_once()
-        args = bridge._send_error_response.call_args
-        self.assertEqual(args[0][0], "req_1")  # request_id
-        self.assertIn("backpressure", args[1]["message"].lower())
-
-    def test_accepts_when_queue_not_full(self):
-        bridge = self._make_bridge()
-        # Queue is empty — should proceed (submit to executor)
-        bridge._handle_agent_call(
-            {"prompt": "test", "tool": "coco"},
-            request_id="req_2",
-        )
-        bridge._executor.submit.assert_called_once()
-
-
 class TestBuildScriptGenPromptInjection(unittest.TestCase):
     """Test that build_script_gen_prompt injects SUBAGENT_ENCOURAGEMENT."""
 
@@ -222,14 +158,14 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
         is_valid, messages = validate_generated_script(script)
         self.assertTrue(is_valid, f"Expected valid fallback script, got: {messages}")
 
-    def test_script_uses_race_instead_of_llm_classify_for_fallback_routing(self):
+    def test_simple_script_uses_one_backend_without_race_or_llm_routing(self):
         script = generate_simple_script(
             "分析 spec 模式目标完成度如何把控，先不要动手改代码",
             selected_tools=["traex", "codex", "coco"],
         )
 
-        self.assertIn("race(", script)
-        self.assertIn("candidateTools", script)
+        self.assertNotIn("race(", script)
+        self.assertNotIn("candidateTools", script)
         self.assertNotIn("await classify(", script)
         self.assertNotIn('label: "route"', script)
         self.assertNotIn("route-classify", script)
@@ -245,6 +181,23 @@ class TestGenerateSimpleScriptEncouragement(unittest.TestCase):
 
         self.assertIn("If the user asks for analysis only", script)
         self.assertIn("do not change code", script)
+
+    def test_meta_parser_preserves_apostrophes_inside_double_quoted_strings(self):
+        script = '''
+export const meta = {
+  name: "reviewer's workflow",
+  description: "don't rewrite 'quoted' content",
+  phases: [{ title: "It's safe", detail: "owner's evidence" }],
+};
+export default async function main() { return {}; }
+'''
+
+        meta = extract_meta_from_script(script)
+
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["name"], "reviewer's workflow")
+        self.assertEqual(meta["description"], "don't rewrite 'quoted' content")
+        self.assertEqual(meta["phases"][0]["title"], "It's safe")
 
 
 class TestAgentCapabilityNotes(unittest.TestCase):

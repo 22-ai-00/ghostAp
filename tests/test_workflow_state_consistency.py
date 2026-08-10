@@ -11,10 +11,14 @@ from src.feishu.handlers.workflow import (
     _WorkflowGenerationCancelled,
     _WorkflowLifecycleOwner,
 )
-from src.project.mapper import MessageLinker
 from src.workflow_engine.engine import WorkflowEngine, WorkflowEngineCallbacks
-from src.workflow_engine.models import PendingConfirmation, WorkflowProject, WorkflowStatus
-from src.workflow_engine.selection_flow import SelectionFlowController
+from src.workflow_engine.models import (
+    PendingWorkflow,
+    ReviewAgentBinding,
+    WorkflowProject,
+    WorkflowStatus,
+)
+from src.workflow_engine.run_spec import WorkflowRunSpec
 
 
 class _Project:
@@ -22,6 +26,32 @@ class _Project:
         self.project_id = "proj_1"
         self.project_name = "ghostAp"
         self.root_path = root_path
+
+
+def _run_spec(task: str) -> WorkflowRunSpec:
+    orchestrator = ReviewAgentBinding(
+        provider="cli",
+        tool_name="coco",
+        display_name="Coco",
+        agent_type="coco",
+        model_name=None,
+        model_display_name=None,
+        selection_key="coco:default",
+        use_default_model=True,
+    )
+    return WorkflowRunSpec(
+        orchestrator=orchestrator,
+        reviewers=(),
+        tool_model_map={"coco": None},
+        task=task,
+        chat_id="chat_1",
+        topic_id=None,
+        budget=16,
+        deadline=None,
+        auto_reviewer=True,
+        initiator_user_id="user_1",
+        allowed_tools=("coco",),
+    )
 
 
 def _walk_card_text(node):
@@ -71,7 +101,10 @@ export default async function workflow() { return "ok"; }
     engine.cancel_event.set()
 
     with patch("src.workflow_engine.engine.RuntimeBridge", FakeBridge):
-        project = engine.execute_workflow("run cleanly", str(script_path))
+        project = engine.execute_workflow(
+            str(script_path),
+            run_spec=_run_spec("run cleanly"),
+        )
 
     assert project.status == WorkflowStatus.COMPLETED
     assert not engine.cancel_event.is_set()
@@ -107,7 +140,10 @@ export default async function workflow() { return "never"; }
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
 
     with patch("src.workflow_engine.engine.RuntimeBridge", FakeBridge):
-        project = engine.execute_workflow("cancel cleanly", str(script_path))
+        project = engine.execute_workflow(
+            str(script_path),
+            run_spec=_run_spec("cancel cleanly"),
+        )
 
     assert project.status == WorkflowStatus.CANCELLED
     assert project.error == "Workflow cancelled"
@@ -136,8 +172,8 @@ export default async function workflow() { return "ok"; }
         side_effect=AssertionError("cancelled queued start reached runtime setup"),
     ):
         result = engine.execute_workflow(
-            "must not run",
             str(script_path),
+            run_spec=_run_spec("must not run"),
             start_owner=start_owner,
         )
 
@@ -148,196 +184,17 @@ export default async function workflow() { return "ok"; }
     assert engine._workflow_start_owner is None
 
 
-def test_fresh_workflow_agent_selection_does_not_restore_previous_selection(tmp_path):
-    project = _Project(str(tmp_path))
-
-    stale = SelectionFlowController(step=2)
-    stale.add_or_update_selection(
-        {
-            "tool_name": "coco",
-            "display_name": "Coco",
-            "model_name": "old-model",
-            "supports_model": True,
-        },
-        is_review=False,
-    )
-    project._wf_selection_snapshot = stale.snapshot()
-
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
-    handler.get_engine_name = MagicMock(return_value="Coco")
-    handler._resolve_tool_lists = MagicMock(
-        return_value=({"coco": "Coco tool"}, ["coco"], [], ["coco"])
-    )
-    handler._get_workflow_models_for_tool = MagicMock(return_value=[])
-    handler.send_card_to_chat = MagicMock(return_value="card_msg_1")
-
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        handler._show_agent_selection_card(
-            message_id="msg_1",
-            chat_id="chat_1",
-            requirement="build something new",
-            project=project,
-            root_path=str(tmp_path),
-        )
-
-    sent_card = handler.send_card_to_chat.call_args.args[1]
-    rendered_text = "\n".join(_walk_card_text(sent_card))
-
-    assert "old-model" not in rendered_text
-    assert "**已选**" not in rendered_text
-    assert project._wf_selection_snapshot["orchestrator_selections"] == {}
-    assert project._wf_selection_snapshot["review_selections"] == {}
 
 
-def test_first_workflow_selection_card_links_to_original_inbound_message(tmp_path):
-    """The first outbound card must retain the trusted /wf origin in MessageLinker."""
-    project = _Project(str(tmp_path))
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    linker = MessageLinker()
-    linker.register_origin(
-        "inbound_wf",
-        request_id="request_1",
-        chat_id="chat_1",
-        chat_type="group",
-        sender_id="user_1",
-    )
-    response = MagicMock()
-    response.success.return_value = True
-    response.data.message_id = "selection_card"
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.managed_group_registry = None
-    handler.ctx.message_linker = linker
-    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
-    handler.im_client = MagicMock()
-    handler.im_client.send_message.return_value = response
-    handler.get_engine_name = MagicMock(return_value="Coco")
-    handler._resolve_tool_lists = MagicMock(
-        return_value=({"coco": "Coco tool"}, ["coco"], [], ["coco"])
-    )
-    handler._get_workflow_models_for_tool = MagicMock(return_value=[])
-    handler._preheat_workflow_models = MagicMock()
-    handler.format_ref_note = MagicMock(return_value="")
-
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        handler._show_agent_selection_card(
-            message_id="inbound_wf",
-            chat_id="chat_1",
-            requirement="build something new",
-            project=project,
-            root_path=str(tmp_path),
-        )
-
-    assert linker.resolve_origin(reply_message_id="selection_card") == "inbound_wf"
-    assert handler._resolve_origin("selection_card") == "inbound_wf"
-    assert handler._reply_audit_aliases("inbound_wf") == ("chat_1",)
-
-    patch_failure = MagicMock()
-    patch_failure.success.return_value = False
-    fallback_response = MagicMock()
-    fallback_response.success.return_value = True
-    fallback_response.data.message_id = "fallback_card"
-    handler.im_client.patch_message.return_value = patch_failure
-    handler.im_client.send_message.return_value = fallback_response
-
-    fallback_id = handler._replace_or_send_workflow_rendered_card(
-        card_message_id="selection_card",
-        chat_id="chat_1",
-        card_data={
-            "header": {
-                "title": {"tag": "plain_text", "content": "Workflow"},
-                "template": "blue",
-            },
-            "elements": [],
-        },
-        origin_message_id=handler._resolve_origin("selection_card"),
-    )
-
-    assert fallback_id == "fallback_card"
-    assert linker.resolve_origin(reply_message_id="fallback_card") == "inbound_wf"
-
-    patch_success = MagicMock()
-    patch_success.success.return_value = True
-    handler.im_client.patch_message.return_value = patch_success
-    assert handler.update_card(
-        "fallback_card",
-        {"schema": "2.0", "body": {"elements": []}},
-    )
-    assert handler.im_client.patch_message.call_args.kwargs["audit_aliases"] == (
-        "chat_1",
-    )
 
 
-def test_concurrent_same_user_starts_publish_only_the_newest_selection_card(tmp_path):
-    """An older card build that finishes late must fail its final owner CAS."""
-    project = _Project(str(tmp_path))
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    first_resolver_entered = threading.Event()
-    release_first_resolver = threading.Event()
-    resolver_lock = threading.Lock()
-    resolver_calls = 0
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
-    handler.get_engine_name = MagicMock(return_value="Coco")
-    handler._get_workflow_models_for_tool = MagicMock(return_value=[])
-    handler._preheat_workflow_models = MagicMock()
-    handler._resolve_origin = MagicMock(side_effect=lambda message_id: message_id)
-    handler.send_card_to_chat = MagicMock(return_value="selection_card")
-
-    def resolve_tools():
-        nonlocal resolver_calls
-        with resolver_lock:
-            resolver_calls += 1
-            call_number = resolver_calls
-        if call_number == 1:
-            first_resolver_entered.set()
-            assert release_first_resolver.wait(timeout=2)
-        return {"coco": "Coco"}, ["coco"], [], ["coco"]
-
-    handler._resolve_tool_lists = MagicMock(side_effect=resolve_tools)
-
-    old_thread = threading.Thread(
-        target=handler._show_agent_selection_card,
-        kwargs={
-            "message_id": "old_msg",
-            "chat_id": "chat_1",
-            "requirement": "old requirement",
-            "project": project,
-            "root_path": str(tmp_path),
-        },
-    )
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        old_thread.start()
-        assert first_resolver_entered.wait(timeout=1)
-        handler._show_agent_selection_card(
-            message_id="new_msg",
-            chat_id="chat_1",
-            requirement="new requirement",
-            project=project,
-            root_path=str(tmp_path),
-        )
-        release_first_resolver.set()
-        old_thread.join(timeout=2)
-
-    assert not old_thread.is_alive()
-    handler.send_card_to_chat.assert_called_once()
-    sent_card = handler.send_card_to_chat.call_args.args[1]
-    assert "new requirement" in "\n".join(_walk_card_text(sent_card))
-    assert engine.project.pending.requirement == "new requirement"
 
 
 def test_old_script_generation_task_does_not_apply_after_session_changes(tmp_path):
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
     engine._project = WorkflowProject(
         status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
+        pending=PendingWorkflow(
             requirement="old task",
             engine_session_key="old_session",
             initiator_user_id="user_1",
@@ -353,10 +210,10 @@ def test_old_script_generation_task_does_not_apply_after_session_changes(tmp_pat
     handler._submit_engine_task = MagicMock(
         side_effect=lambda fn, *args, **kwargs: captured.setdefault("task", fn)
     )
-    handler._generate_and_show_confirm_card = MagicMock()
+    handler._generate_and_start_workflow = MagicMock()
     handler._reply_workflow_error = MagicMock()
 
-    handler._schedule_generate_and_show_confirm_card(
+    handler._schedule_generate_and_start_workflow(
         message_id="old_card",
         chat_id="chat_1",
         requirement="old task",
@@ -367,8 +224,8 @@ def test_old_script_generation_task_does_not_apply_after_session_changes(tmp_pat
         expected_session_key="old_session",
     )
 
-    engine.project.status = WorkflowStatus.AWAITING_AGENT_SELECT
-    engine.project.pending = PendingConfirmation(
+    engine.project.status = WorkflowStatus.GENERATING_SCRIPT
+    engine.project.pending = PendingWorkflow(
         requirement="new task",
         engine_session_key="new_session",
         initiator_user_id="user_1",
@@ -376,8 +233,8 @@ def test_old_script_generation_task_does_not_apply_after_session_changes(tmp_pat
 
     captured["task"]()
 
-    handler._generate_and_show_confirm_card.assert_not_called()
-    assert engine.project.status == WorkflowStatus.AWAITING_AGENT_SELECT
+    handler._generate_and_start_workflow.assert_not_called()
+    assert engine.project.status == WorkflowStatus.GENERATING_SCRIPT
     assert engine.project.pending.requirement == "new task"
 
 
@@ -386,7 +243,7 @@ def test_stale_generation_schedule_cannot_adopt_the_new_session(tmp_path):
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
     engine._project = WorkflowProject(
         status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
+        pending=PendingWorkflow(
             requirement="new task",
             engine_session_key="new_session",
             initiator_user_id="user_1",
@@ -397,7 +254,7 @@ def test_stale_generation_schedule_cannot_adopt_the_new_session(tmp_path):
     handler.ctx.workflow_engine_manager.get.return_value = engine
     handler._submit_engine_task = MagicMock()
 
-    handler._schedule_generate_and_show_confirm_card(
+    handler._schedule_generate_and_start_workflow(
         message_id="old_card",
         chat_id="chat_1",
         requirement="old task",
@@ -413,109 +270,6 @@ def test_stale_generation_schedule_cannot_adopt_the_new_session(tmp_path):
     assert engine.project.pending.engine_session_key == "new_session"
 
 
-def test_cancel_drains_generation_owner_even_after_pending_key_rotates(tmp_path):
-    """Generation CAS rotates the confirm key; cancel still owns the live token."""
-    project = _Project(str(tmp_path))
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    engine._project = WorkflowProject(
-        status=WorkflowStatus.AWAITING_CONFIRM,
-        pending=PendingConfirmation(
-            requirement="task",
-            engine_session_key="confirm_session",
-            initiator_user_id="user_1",
-        ),
-    )
-    owner = _WorkflowLifecycleOwner("selection_session")
-    engine._script_generation_owner = owner
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get.return_value = engine
-    handler._resolve_project_from_id = MagicMock(return_value=project)
-    handler._get_root_path = MagicMock(return_value=str(tmp_path))
-    handler._reply_workflow_error = MagicMock()
-    handler.update_card = MagicMock(return_value=True)
-
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        handler.handle_workflow_cancel(
-            "confirm_card",
-            "chat_1",
-            "proj_1",
-            {"engine_session_key": "confirm_session"},
-        )
-
-    assert owner.stop_event.is_set()
-    assert engine._script_generation_owner is None
-    assert engine.project.status == WorkflowStatus.IDLE
-    handler._reply_workflow_error.assert_not_called()
-    handler.update_card.assert_called_once()
-
-
-def test_stale_review_finish_cannot_mutate_or_schedule_new_session(tmp_path):
-    """A callback paused after validation must lose its final session CAS."""
-    project = _Project(str(tmp_path))
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    engine._project = WorkflowProject(
-        status=WorkflowStatus.AWAITING_TOOL_SELECT,
-        pending=PendingConfirmation(
-            requirement="old task",
-            engine_session_key="old_session",
-            initiator_user_id="user_1",
-            orchestrator_agent="coco",
-        ),
-    )
-    ctrl = SelectionFlowController(step=2)
-    ctrl.add_or_update_selection(
-        {
-            "tool_name": "coco",
-            "display_name": "Coco",
-            "use_default_model": True,
-        },
-        is_review=True,
-    )
-
-    def replace_with_new_session(*, is_review):
-        assert is_review is True
-        engine._project = WorkflowProject(
-            status=WorkflowStatus.AWAITING_TOOL_SELECT,
-            pending=PendingConfirmation(
-                requirement="new task",
-                engine_session_key="new_session",
-                initiator_user_id="user_1",
-                orchestrator_agent="claude",
-            ),
-        )
-        return True, ""
-
-    ctrl.validate_non_empty = MagicMock(side_effect=replace_with_new_session)
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get.return_value = engine
-    handler._resolve_project_from_id = MagicMock(return_value=project)
-    handler._get_selection_controller = MagicMock(return_value=ctrl)
-    handler._schedule_generate_and_show_confirm_card = MagicMock()
-    handler._reply_workflow_error = MagicMock()
-    handler.update_card = MagicMock()
-
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        handler.handle_workflow_review_finish(
-            "old_card",
-            "chat_1",
-            "proj_1",
-            {
-                "project_id": "proj_1",
-                "engine_session_key": "old_session",
-            },
-        )
-
-    assert engine.project.status == WorkflowStatus.AWAITING_TOOL_SELECT
-    assert engine.project.pending.requirement == "new task"
-    assert engine.project.pending.orchestrator_agent == "claude"
-    assert engine.project.pending.review_agents is None
-    handler.update_card.assert_not_called()
-    handler._schedule_generate_and_show_confirm_card.assert_not_called()
-
-
 def test_script_generation_result_is_ignored_if_session_changes_mid_generation(tmp_path):
     script_path = tmp_path / "generated.js"
     script_path.write_text(
@@ -529,7 +283,7 @@ export default async function workflow() { return await agent("do it", { tool: "
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
     engine._project = WorkflowProject(
         status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
+        pending=PendingWorkflow(
             requirement="old task",
             engine_session_key="old_session",
             initiator_user_id="user_1",
@@ -549,15 +303,14 @@ export default async function workflow() { return await agent("do it", { tool: "
     def generation_finishes_after_cancel(*args, **kwargs):
         engine.project.status = WorkflowStatus.IDLE
         engine.project.pending = None
-        return str(script_path), {"name": "generated", "tools": ["coco"]}, False
+        return str(script_path), {"name": "generated", "tools": ["coco"]}
 
     handler._generate_script_via_ai = MagicMock(side_effect=generation_finishes_after_cancel)
 
     with (
         patch("src.thread.get_current_sender_id", return_value="user_1"),
-        patch("src.workflow_engine.templates.discover_templates", return_value=[]),
     ):
-        handler._generate_and_show_confirm_card(
+        handler._generate_and_start_workflow(
             message_id="old_card",
             chat_id="chat_1",
             requirement="old task",
@@ -576,7 +329,7 @@ def test_stale_generation_task_does_not_cancel_current_generation_heartbeat(tmp_
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
     engine._project = WorkflowProject(
         status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
+        pending=PendingWorkflow(
             requirement="new task",
             engine_session_key="new_session",
             initiator_user_id="user_1",
@@ -593,7 +346,7 @@ def test_stale_generation_task_does_not_cancel_current_generation_heartbeat(tmp_
     handler.update_card = MagicMock()
 
     with patch("threading.Thread") as thread_cls:
-        handler._generate_and_show_confirm_card(
+        handler._generate_and_start_workflow(
             message_id="old_card",
             chat_id="chat_1",
             requirement="old task",
@@ -615,7 +368,7 @@ def test_generation_result_cas_cannot_commit_after_stop_acknowledgement(tmp_path
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
     engine._project = WorkflowProject(
         status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
+        pending=PendingWorkflow(
             requirement="old task",
             engine_session_key="old_session",
             initiator_user_id="user_1",
@@ -623,7 +376,7 @@ def test_generation_result_cas_cannot_commit_after_stop_acknowledgement(tmp_path
     )
     owner = _WorkflowLifecycleOwner("old_session")
     engine._script_generation_owner = owner
-    prepared_pending = PendingConfirmation(
+    prepared_pending = PendingWorkflow(
         requirement="generated task",
         engine_session_key="next_session",
         initiator_user_id="user_1",
@@ -641,7 +394,7 @@ def test_generation_result_cas_cannot_commit_after_stop_acknowledgement(tmp_path
 
     def commit_result():
         commit_attempted.set()
-        result["value"] = handler._commit_generation_result_if_current(
+        result["value"] = handler._commit_generated_workflow_if_current(
             engine,
             owner,
             prepared_pending,
@@ -663,145 +416,10 @@ def test_generation_result_cas_cannot_commit_after_stop_acknowledgement(tmp_path
     handler.reply_text.assert_called_once_with("stop_msg", "Workflow 任务已停止。")
 
 
-def test_new_workflow_supersedes_owned_incomplete_generation(tmp_path):
-    project = _Project(str(tmp_path))
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    old_script = tmp_path / ".ghostap" / "workflow_scripts" / "generated-workflow-old.js"
-    old_script.parent.mkdir(parents=True)
-    old_script.write_text("old", encoding="utf-8")
-    engine._project = WorkflowProject(
-        status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
-            requirement="old task",
-            script_path=str(old_script),
-            engine_session_key="old_session",
-            initiator_user_id="user_1",
-        ),
-    )
-    old_owner = _WorkflowLifecycleOwner("old_session")
-    engine._script_generation_owner = old_owner
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get.return_value = engine
-    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
-    handler.ctx.settings.admin_user_ids = []
-    handler.add_reaction = MagicMock()
-    handler._ensure_topic_engine_context = MagicMock()
-    handler._show_agent_selection_card = MagicMock()
-    handler._reply_workflow_error = MagicMock()
-    handler._ensure_project = MagicMock(return_value=project)
-
-    with (
-        patch("src.thread.get_current_sender_id", return_value="user_1"),
-        patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True),
-        patch("src.workflow_engine.templates.discover_templates", return_value=[]),
-    ):
-        handler.start_workflow("msg_1", "chat_1", "new task", project)
-
-    assert old_owner.stop_event.is_set()
-    assert engine._script_generation_owner is None
-    assert not old_script.exists()
-    handler._reply_workflow_error.assert_not_called()
-    handler._show_agent_selection_card.assert_not_called()
-    assert engine.project.status == WorkflowStatus.GENERATING_SCRIPT
-    assert engine.project.pending is not None
-    assert engine.project.pending.requirement == "new task"
-    assert engine.project.pending.auto_reviewer is True
-    assert engine.project.pending.orchestrator_agent
 
 
-def test_new_workflow_cancels_old_queued_start_before_it_can_claim_engine(tmp_path):
-    """Newest-wins must include the RUNNING-before-scheduler-claim window."""
-    project = _Project(str(tmp_path))
-    old_script = tmp_path / "ghostap-confirmed-old.js"
-    old_script.write_text(
-        """
-export const meta = { name: "old", description: "", phases: [], tools: [] };
-export default async function workflow() { return "old"; }
-""",
-        encoding="utf-8",
-    )
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    engine._project = WorkflowProject(
-        status=WorkflowStatus.RUNNING,
-        requirement="old task",
-        script_path=str(old_script),
-        initiator_user_id="user_1",
-    )
-    old_owner = _WorkflowLifecycleOwner("old_session")
-    engine._workflow_start_owner = old_owner
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get.return_value = engine
-    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
-    handler.ctx.settings.admin_user_ids = []
-    handler.add_reaction = MagicMock()
-    handler._ensure_topic_engine_context = MagicMock()
-    handler._show_agent_selection_card = MagicMock()
-    handler._reply_workflow_error = MagicMock()
-    handler._ensure_project = MagicMock(return_value=project)
-
-    with (
-        patch("src.thread.get_current_sender_id", return_value="user_1"),
-        patch("src.workflow_engine.bridge.RuntimeBridge.check_node_available", return_value=True),
-        patch("src.workflow_engine.templates.discover_templates", return_value=[]),
-    ):
-        handler.start_workflow("new_msg", "chat_1", "new task", project)
-
-    assert old_owner.stop_event.is_set()
-    assert engine._workflow_start_owner is None
-    handler._show_agent_selection_card.assert_not_called()
-    assert engine.project.status == WorkflowStatus.GENERATING_SCRIPT
-    assert engine.project.pending is not None
-    assert engine.project.pending.requirement == "new task"
-    assert engine.project.pending.auto_reviewer is True
-
-    with patch(
-        "src.workflow_engine.engine.RuntimeBridge.check_node_available",
-        side_effect=AssertionError("superseded queued workflow reached runtime"),
-    ):
-        result = engine.execute_workflow(
-            "old task",
-            str(old_script),
-            start_owner=old_owner,
-        )
-
-    assert result.status != WorkflowStatus.RUNNING
-    assert engine.project.status != WorkflowStatus.RUNNING
 
 
-def test_new_workflow_cannot_supersede_another_users_pending_session(tmp_path):
-    project = _Project(str(tmp_path))
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    engine._project = WorkflowProject(
-        status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
-            requirement="owned task",
-            engine_session_key="owned_session",
-            initiator_user_id="user_1",
-        ),
-    )
-    owner = _WorkflowLifecycleOwner("owned_session")
-    engine._script_generation_owner = owner
-
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get.return_value = engine
-    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
-    handler.ctx.settings.admin_user_ids = []
-    handler._ensure_project = MagicMock(return_value=project)
-    handler._reply_workflow_error = MagicMock()
-    handler._show_agent_selection_card = MagicMock()
-
-    with patch("src.thread.get_current_sender_id", return_value="user_2"):
-        handler.start_workflow("msg_2", "chat_1", "new task", project)
-
-    assert not owner.stop_event.is_set()
-    assert engine._script_generation_owner is owner
-    handler._reply_workflow_error.assert_called_once()
-    handler._show_agent_selection_card.assert_not_called()
 
 
 def test_runtime_stop_fences_all_late_progress_and_terminal_delivery(tmp_path):
@@ -861,16 +479,14 @@ export default async function workflow() { return "never"; }
     execution_thread = threading.Thread(
         target=engine.execute_workflow,
         kwargs={
-            "requirement": "stop me",
             "script_path": str(script_path),
             "callbacks": callbacks,
-            "initiator_user_id": "user_1",
+            "run_spec": _run_spec("stop me"),
             "start_owner": owner,
         },
     )
     with (
         patch("src.workflow_engine.engine.RuntimeBridge", FakeBridge),
-        patch("src.workflow_engine.engine.WorkflowHistory.record"),
     ):
         execution_thread.start()
         assert bridge_started.wait(timeout=1)
@@ -895,7 +511,7 @@ def test_stop_workflow_clears_generating_script_state(tmp_path):
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
     engine._project = WorkflowProject(
         status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
+        pending=PendingWorkflow(
             requirement="old task",
             engine_session_key="old_session",
             initiator_user_id="user_1",
@@ -928,7 +544,7 @@ def test_pending_workflow_stop_authorizes_the_pending_initiator_not_prior_run(tm
     engine._project = WorkflowProject(
         status=WorkflowStatus.GENERATING_SCRIPT,
         initiator_user_id="previous_user",
-        pending=PendingConfirmation(
+        pending=PendingWorkflow(
             requirement="new task",
             engine_session_key="new_session",
             initiator_user_id="current_user",
@@ -958,7 +574,7 @@ def test_stopped_generation_rejects_late_direct_progress_callback(tmp_path):
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
     engine._project = WorkflowProject(
         status=WorkflowStatus.GENERATING_SCRIPT,
-        pending=PendingConfirmation(
+        pending=PendingWorkflow(
             requirement="old task",
             engine_session_key="old_session",
             initiator_user_id="user_1",
@@ -980,7 +596,13 @@ def test_stopped_generation_rejects_late_direct_progress_callback(tmp_path):
     handler.update_card = MagicMock(return_value=True)
     handler.reply_text = MagicMock()
     handler._reply_workflow_error = MagicMock()
-    handler._start_pending_workflow_execution = MagicMock(return_value=True)
+    handler._queue_generated_workflow = MagicMock(
+        side_effect=lambda **_kwargs: setattr(
+            engine.project,
+            "status",
+            WorkflowStatus.RUNNING,
+        )
+    )
 
     def block_generation(*_args, progress_callback, **_kwargs):
         callback_ready.set()
@@ -988,12 +610,12 @@ def test_stopped_generation_rejects_late_direct_progress_callback(tmp_path):
             raise AssertionError("timed out waiting to finish script generation")
         progress_callback("late model progress")
         callback_invoked.set()
-        return str(tmp_path / "generated.js"), {"name": "generated", "tools": ["coco"]}, False
+        return str(tmp_path / "generated.js"), {"name": "generated", "tools": ["coco"]}
 
     handler._generate_script_via_ai = MagicMock(side_effect=block_generation)
 
     generation_thread = threading.Thread(
-        target=handler._generate_and_show_confirm_card,
+        target=handler._generate_and_start_workflow,
         kwargs={
             "message_id": "old_card",
             "chat_id": "chat_1",
@@ -1259,137 +881,10 @@ class TestStateManagerMetricsAtomicity:
         assert snap.metrics.total_tokens == n_done * 2
 
 
-def test_admission_token_rejects_older_request_that_reaches_selection_late(
-    tmp_path,
-):
-    """The latest ingress owner wins even before either request builds a card."""
-    project = _Project(str(tmp_path))
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.settings.admin_user_ids = []
-    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
-    handler.get_engine_name = MagicMock(return_value="Coco")
-    handler._resolve_tool_lists = MagicMock(
-        return_value=({"coco": "Coco"}, ["coco"], [], ["coco"])
-    )
-    handler._get_workflow_models_for_tool = MagicMock(return_value=[])
-    handler._preheat_workflow_models = MagicMock()
-    handler._resolve_origin = MagicMock(side_effect=lambda value: value)
-    handler.send_card_to_chat = MagicMock(return_value="selection_card")
-
-    ok, error, old_owner = handler._supersede_incomplete_workflow(
-        engine,
-        root_path=str(tmp_path),
-        current_user="user_1",
-    )
-    assert ok and error is None and old_owner is not None
-    ok, error, new_owner = handler._supersede_incomplete_workflow(
-        engine,
-        root_path=str(tmp_path),
-        current_user="user_1",
-    )
-    assert ok and error is None and new_owner is not None
-    assert old_owner.stop_event.is_set()
-
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        handler._show_agent_selection_card(
-            message_id="new_msg",
-            chat_id="chat_1",
-            requirement="new requirement",
-            project=project,
-            root_path=str(tmp_path),
-            admission_owner=new_owner,
-        )
-        handler._show_agent_selection_card(
-            message_id="old_msg",
-            chat_id="chat_1",
-            requirement="old requirement",
-            project=project,
-            root_path=str(tmp_path),
-            admission_owner=old_owner,
-        )
-
-    handler.send_card_to_chat.assert_called_once()
-    assert engine.project.pending.requirement == "new requirement"
 
 
-def test_stale_selection_controller_cannot_overwrite_new_snapshot(tmp_path):
-    project = _Project(str(tmp_path))
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-
-    new_controller = SelectionFlowController(step=1)
-    new_controller.add_or_update_selection(
-        {"tool_name": "coco", "use_default_model": True},
-        is_review=False,
-    )
-    project._wf_selection_session_key = "new_session"
-    project._wf_selection_snapshot = new_controller.snapshot()
-    expected_snapshot = project._wf_selection_snapshot
-
-    old_controller = handler._get_selection_controller(
-        project,
-        session_key="old_session",
-    )
-    old_controller.add_or_update_selection(
-        {"tool_name": "claude", "use_default_model": True},
-        is_review=False,
-    )
-
-    assert handler._persist_selection_controller(
-        project,
-        old_controller,
-    ) is False
-    assert project._wf_selection_snapshot == expected_snapshot
 
 
-def test_stale_tool_callback_cannot_toggle_new_pending_session(tmp_path):
-    project = _Project(str(tmp_path))
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    engine._project = WorkflowProject(
-        status=WorkflowStatus.AWAITING_CONFIRM,
-        pending=PendingConfirmation(
-            engine_session_key="old_session",
-            initiator_user_id="user_1",
-            selected_tools=["coco"],
-        ),
-    )
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get.return_value = engine
-    handler._resolve_project_from_id = MagicMock(return_value=project)
-    handler._get_root_path = MagicMock(return_value=str(tmp_path))
-    handler._reply_workflow_error = MagicMock()
-    handler.update_card = MagicMock()
-
-    def replace_session(_candidate_tools):
-        engine._project = WorkflowProject(
-            status=WorkflowStatus.AWAITING_CONFIRM,
-            pending=PendingConfirmation(
-                engine_session_key="new_session",
-                initiator_user_id="user_1",
-                selected_tools=["coco"],
-            ),
-        )
-        return ["claude"], []
-
-    handler._validate_tools_against_registry = MagicMock(
-        side_effect=replace_session
-    )
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        handler.handle_workflow_select_tool(
-            "old_card",
-            "chat_1",
-            "proj_1",
-            {
-                "engine_session_key": "old_session",
-                "tool_name": "claude",
-            },
-        )
-
-    assert engine.project.pending.engine_session_key == "new_session"
-    assert engine.project.pending.selected_tools == ["coco"]
-    handler.update_card.assert_not_called()
 
 
 def test_cancelled_generator_does_not_recreate_owned_script(tmp_path):
@@ -1489,12 +984,11 @@ export default async function workflow() { return "never"; }
             "src.workflow_engine.engine.WorkflowJournal",
             side_effect=RuntimeError("journal unavailable"),
         ),
-        patch("src.workflow_engine.engine.WorkflowHistory.record"),
     ):
         result = engine.execute_workflow(
-            "fail during construction",
             str(script_path),
             callbacks=WorkflowEngineCallbacks(on_error=on_error),
+            run_spec=_run_spec("fail during construction"),
         )
 
     assert result.status == WorkflowStatus.FAILED
@@ -1571,13 +1065,12 @@ export default async function workflow() { return "ok"; }
 
     def execute_first():
         first_result["project"] = engine.execute_workflow(
-            "first",
             str(script_path),
+            run_spec=_run_spec("first"),
         )
 
     with (
         patch("src.workflow_engine.engine.RuntimeBridge", FakeBridge),
-        patch("src.workflow_engine.engine.WorkflowHistory.record"),
     ):
         first_thread = threading.Thread(target=execute_first)
         first_thread.start()
@@ -1586,8 +1079,8 @@ export default async function workflow() { return "ok"; }
 
         active_project = engine.project
         duplicate_result = engine.execute_workflow(
-            "must not replace first",
             str(script_path),
+            run_spec=_run_spec("must not replace first"),
         )
 
         assert duplicate_result is active_project
@@ -1644,11 +1137,10 @@ export default async function workflow() { return "ok"; }
             "src.workflow_engine.engine.AgentExecutor",
             return_value=fake_executor,
         ),
-        patch("src.workflow_engine.engine.WorkflowHistory.record"),
     ):
         result = engine.execute_workflow(
-            "do not reuse",
             str(script_path),
+            run_spec=_run_spec("do not reuse"),
             start_owner=owner,
         )
 
@@ -1718,8 +1210,8 @@ export default async function workflow() { return "never"; }
 
     def execute():
         engine.execute_workflow(
-            "cancel while starting",
             str(script_path),
+            run_spec=_run_spec("cancel while starting"),
             start_owner=owner,
         )
 
@@ -1729,7 +1221,6 @@ export default async function workflow() { return "never"; }
 
     with (
         patch("src.workflow_engine.engine.RuntimeBridge", FakeBridge),
-        patch("src.workflow_engine.engine.WorkflowHistory.record"),
     ):
         execution_thread = threading.Thread(target=execute)
         execution_thread.start()
@@ -1745,85 +1236,3 @@ export default async function workflow() { return "never"; }
     assert stopped_while_start_waited
     assert not stop_thread.is_alive()
     assert not execution_thread.is_alive()
-
-
-def test_legacy_tool_callbacks_serialize_selection_snapshot_updates(tmp_path):
-    """Two same-session callbacks must preserve both controller selections."""
-    project = _Project(str(tmp_path))
-    project._wf_selection_session_key = "same_session"
-    project._wf_selection_snapshot = SelectionFlowController().snapshot()
-    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
-    engine._project = WorkflowProject(
-        status=WorkflowStatus.AWAITING_TOOL_SELECT,
-        pending=PendingConfirmation(
-            requirement="parallel selection",
-            engine_session_key="same_session",
-            initiator_user_id="user_1",
-            selected_tools=["seed"],
-        ),
-    )
-    handler = WorkflowHandler.__new__(WorkflowHandler)
-    handler.ctx = MagicMock()
-    handler.ctx.workflow_engine_manager.get.return_value = engine
-    handler._resolve_project_from_id = MagicMock(return_value=project)
-    handler._get_root_path = MagicMock(return_value=str(tmp_path))
-    handler._reply_workflow_error = MagicMock()
-    handler._validate_tools_against_registry = MagicMock(
-        side_effect=lambda tools: (tools, []),
-    )
-    handler._send_combined_selection_card = MagicMock()
-
-    first_persist_entered = threading.Event()
-    allow_first_persist = threading.Event()
-    second_done = threading.Event()
-    persist_count = 0
-    count_lock = threading.Lock()
-    original_persist = handler._persist_selection_controller
-
-    def delayed_persist(target_project, controller):
-        nonlocal persist_count
-        with count_lock:
-            persist_count += 1
-            call_number = persist_count
-        if call_number == 1:
-            first_persist_entered.set()
-            assert allow_first_persist.wait(timeout=2)
-        return original_persist(target_project, controller)
-
-    handler._persist_selection_controller = delayed_persist
-
-    def select(tool_name):
-        handler.handle_workflow_select_tool(
-            "card_1",
-            "chat_1",
-            "proj_1",
-            {
-                "engine_session_key": "same_session",
-                "tool_name": tool_name,
-            },
-        )
-
-    with patch("src.thread.get_current_sender_id", return_value="user_1"):
-        first = threading.Thread(target=select, args=("coco",))
-        first.start()
-        assert first_persist_entered.wait(timeout=1)
-
-        def select_second():
-            select("claude")
-            second_done.set()
-
-        second = threading.Thread(target=select_second)
-        second.start()
-        second_completed_before_release = second_done.wait(timeout=0.1)
-        allow_first_persist.set()
-        first.join(timeout=2)
-        second.join(timeout=2)
-
-    assert not second_completed_before_release
-    assert not first.is_alive()
-    assert not second.is_alive()
-    selections = project._wf_selection_snapshot["review_selections"]
-    assert {
-        selection["tool_name"]
-        for selection in selections.values()
-    } == {"coco", "claude"}

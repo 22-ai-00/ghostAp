@@ -17,9 +17,7 @@ from .security_posture import (
 from .settings import Settings
 from .singleton import (
     _post_validate_warnings,
-    _reset_settings_for_testing,
     get_settings,
-    set_settings,
 )
 from .spec import SpecReviewConfig
 
@@ -35,7 +33,5 @@ __all__ = [
     "SpecReviewConfig",
     "evaluate_security_posture",
     "get_settings",
-    "set_settings",
     "_post_validate_warnings",
-    "_reset_settings_for_testing",
 ]

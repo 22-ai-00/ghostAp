@@ -13,7 +13,7 @@ from ..models import CardMetadata, HeaderState
 def build_header(metadata: CardMetadata, terminal: str) -> HeaderState:
     """Build header state from metadata and terminal status.
 
-    Shared across lifecycle and approval reducers.
+    Shared across lifecycle reducers.
     """
     # Title
     if metadata.project_name:

@@ -111,7 +111,3 @@ class TTLSet:
             else:
                 break
         return evicted
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._entries)

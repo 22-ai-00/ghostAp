@@ -197,9 +197,11 @@ class FeishuMessageFormatter:
 
     @staticmethod
     def safe_truncate_markdown(content: str, max_length: int = 25000, keep_head: bool = True) -> str:
-        """带 Markdown 闭合保护的安全截断机制。
-
-        .. deprecated:: 委托至 ``src.utils.markdown.safe_truncate_markdown``，保持向后兼容。
-        """
-        from ..utils.markdown import safe_truncate_markdown as _impl
-        return _impl(content, max_length=max_length, keep_head=keep_head)
+        if not content or len(content) <= max_length:
+            return content or ""
+        notice = f"\n\n> ⚠️ 内容过长（超过 {max_length} 字符），已自动截断。"
+        available = max_length - len(notice)
+        truncated = content[:available] if keep_head else content[-available:]
+        if truncated.count("```") % 2:
+            truncated = truncated + "\n```" if keep_head else "```\n" + truncated
+        return truncated + notice if keep_head else notice + "\n\n" + truncated

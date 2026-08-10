@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.agent_session.claude_cli import ClaudeCLIConfig, SyncClaudeCLISession
-from src.agent_session.factory import create_engine_session, create_sync_session
+from src.agent_session.factory import create_engine_session
 
 
 def _completed_process() -> MagicMock:
@@ -42,16 +44,6 @@ def test_selected_claude_model_reaches_real_cli_argv() -> None:
     argv = popen.call_args.args[0]
     assert argv[argv.index("--model") + 1] == "claude-sonnet-4-5"
     assert argv[-2:] == ["--", "implement the task"]
-
-
-def test_sync_factory_passes_selected_model_to_claude_cli() -> None:
-    with patch("src.agent_session.factory.SyncClaudeCLISession") as cli_session:
-        create_sync_session("claude", "/tmp", model_name="claude-sonnet-4-5")
-
-    cli_session.assert_called_once_with(
-        cwd="/tmp",
-        model_name="claude-sonnet-4-5",
-    )
 
 
 def test_engine_factory_passes_selected_model_to_claude_cli() -> None:
@@ -109,3 +101,19 @@ def test_sandboxed_claude_1m_uses_wrapped_base_model_and_copied_env() -> None:
         "existing-beta,context-1m-2025-08-07"
     )
     assert original_env == original_snapshot
+
+
+def test_unsandboxed_claude_permission_bypass_fails_closed() -> None:
+    session = SyncClaudeCLISession(
+        cwd="/tmp",
+        config=ClaudeCLIConfig(add_dir=False, bypass_permissions=True),
+    )
+    session.session_id = "session-1"
+
+    with (
+        patch("src.agent_session.claude_cli.subprocess.Popen") as popen,
+        pytest.raises(RuntimeError, match="受控员工沙箱"),
+    ):
+        session.send_prompt("inspect the project")
+
+    popen.assert_not_called()

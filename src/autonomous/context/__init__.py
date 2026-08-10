@@ -34,16 +34,11 @@ from .service import (
 )
 from .source import (
     CredentialResolver,
-    EmployeeClientBuilder,
     EmployeeMessageSourceFactory,
     EmployeeScopedMessageSource,
     MessagePage,
     ResolvedThread,
 )
-
-# Temporary public compatibility name. The contract itself is now strict and
-# employee-scoped; production callers must not use the removed loose arguments.
-FeishuMessageSource = EmployeeScopedMessageSource
 
 __all__ = [
     "AssembledContext",
@@ -59,7 +54,6 @@ __all__ = [
     "CredentialResolver",
     "ContextPreparingExecutionPort",
     "EmployeeContextService",
-    "EmployeeClientBuilder",
     "EmployeeExecutionAuthorityFence",
     "EmployeeExecutionInput",
     "EmployeeMessageSourceFactory",
@@ -71,7 +65,6 @@ __all__ = [
     "GroupEventPayload",
     "GroupEventRecord",
     "GroupLedgerError",
-    "FeishuMessageSource",
     "MessagePage",
     "MessageRevision",
     "MessageSourceError",

@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from enum import Enum
 
 from src.card.orchestrator import TaskIdResolver
-from src.card.task_registry import tasks_from_plan_entries, tasks_from_spec_tasks
+from src.card.task_registry import tasks_from_plan_entries
 
 # ---------------------------------------------------------------------------
 # Fake models for testing (avoid importing full ACP/Spec dependencies)
@@ -23,35 +22,6 @@ class FakePlanEntry:
 @dataclass
 class FakePlanInfo:
     entries: list = field(default_factory=list)
-
-
-class FakeSpecTaskStatus(Enum):
-    PENDING = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-@dataclass
-class FakeSpecTask:
-    task_id: int
-    description: str
-    status: FakeSpecTaskStatus = FakeSpecTaskStatus.PENDING
-    dependencies: list = field(default_factory=list)
-    output: str = ""
-
-
-class FakeACPEventType(Enum):
-    PLAN_UPDATE = "plan_update"
-    TEXT_CHUNK = "text_chunk"
-    TOOL_CALL_START = "tool_call_start"
-
-
-@dataclass
-class FakeACPEvent:
-    event_type: FakeACPEventType
-    plan: FakePlanInfo | None = None
-    text: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -118,51 +88,6 @@ class TestTasksFromPlanEntries:
 
     def test_empty_list(self):
         result = tasks_from_plan_entries([])
-        assert result == []
-
-
-# ---------------------------------------------------------------------------
-# Tests: tasks_from_spec_tasks
-# ---------------------------------------------------------------------------
-
-
-class TestTasksFromSpecTasks:
-    def test_basic_conversion(self):
-        tasks = [
-            FakeSpecTask(task_id=1, description="Implement feature A"),
-            FakeSpecTask(task_id=2, description="Fix bug B"),
-        ]
-        result = tasks_from_spec_tasks(tasks)
-        assert len(result) == 2
-        assert result[0] == {"task_id": "spec_task_1", "name": "Implement feature A", "status": "pending"}
-        assert result[1] == {"task_id": "spec_task_2", "name": "Fix bug B", "status": "pending"}
-
-    def test_preserves_status(self):
-        tasks = [
-            FakeSpecTask(task_id=1, description="Done", status=FakeSpecTaskStatus.COMPLETED),
-            FakeSpecTask(task_id=2, description="Active", status=FakeSpecTaskStatus.IN_PROGRESS),
-        ]
-        result = tasks_from_spec_tasks(tasks)
-        assert result[0]["status"] == "completed"
-        assert result[1]["status"] == "in_progress"
-
-    def test_skips_empty_description(self):
-        tasks = [
-            FakeSpecTask(task_id=1, description=""),
-            FakeSpecTask(task_id=2, description="  "),
-            FakeSpecTask(task_id=3, description="Valid"),
-        ]
-        result = tasks_from_spec_tasks(tasks)
-        assert len(result) == 1
-        assert result[0]["task_id"] == "spec_task_3"
-
-    def test_truncates_long_descriptions(self):
-        tasks = [FakeSpecTask(task_id=1, description="y" * 200)]
-        result = tasks_from_spec_tasks(tasks)
-        assert len(result[0]["name"]) == 120
-
-    def test_empty_list(self):
-        result = tasks_from_spec_tasks([])
         assert result == []
 
 

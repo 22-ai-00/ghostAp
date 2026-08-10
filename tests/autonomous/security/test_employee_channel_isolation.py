@@ -18,7 +18,6 @@ from src.autonomous.supervisor.employee_channels import (
     EmployeeChannelSupervisor,
     SandboxAttestation,
     _read_sandbox_metadata,
-    attest_macos_sandbox_proof,
 )
 
 
@@ -343,72 +342,6 @@ def test_bwrap_info_metadata_is_bounded_and_strictly_typed() -> None:
             _read_sandbox_metadata(read_fd)
     finally:
         os.close(read_fd)
-
-
-def test_macos_seatbelt_contract_is_deny_default_and_proof_is_exact(
-    tmp_path: Path,
-) -> None:
-    supervisor = EmployeeChannelSupervisor(
-        secret_resolver=lambda *_: "unused",
-        platform_name="darwin",
-        launcher=subprocess.Popen,
-    )
-    contract = supervisor.launch_contract(
-        bootstrap_fd=41,
-        control_fd=42,
-        event_fd=43,
-        sandbox_proof_fd=44,
-        sandbox_proof_nonce="a" * 32,
-        sandbox_temp_dir=tmp_path,
-    )
-
-    assert contract.argv[0] == "/usr/bin/sandbox-exec"
-    assert any("(deny default)" in argument for argument in contract.argv)
-    assert any("(allow network-outbound)" in argument for argument in contract.argv)
-    assert "GHOSTAP_SOURCE_ROOT=" in " ".join(contract.argv)
-    assert f"GHOSTAP_TEMP={tmp_path}" in contract.argv
-    assert contract.argv[-5:] == ("41", "42", "43", "44", "a" * 32)
-    assert contract.pass_fds == (41, 42, 43, 44)
-    assert contract.env["GHOSTAP_CHANNEL_TMP"] == str(tmp_path)
-    assert contract.env["TMPDIR"] == str(tmp_path)
-
-    proof = {
-        "schema_version": 1,
-        "nonce": "a" * 32,
-        "pid": 987,
-        "source_readable": True,
-        "runtime_readable": True,
-        "repository_canary_errno": errno.EACCES,
-    }
-    accepted = attest_macos_sandbox_proof(
-        proof,
-        nonce="a" * 32,
-        expected_pid=987,
-    )
-    assert accepted.verified is True
-    assert accepted.pid == 987
-    assert accepted.mechanism == "seatbelt-filesystem"
-
-    assert attest_macos_sandbox_proof(
-        proof,
-        nonce="b" * 32,
-        expected_pid=987,
-    ).verified is False
-    assert attest_macos_sandbox_proof(
-        {**proof, "repository_canary_errno": errno.ENOENT},
-        nonce="a" * 32,
-        expected_pid=987,
-    ).verified is False
-    assert attest_macos_sandbox_proof(
-        {**proof, "unexpected": True},
-        nonce="a" * 32,
-        expected_pid=987,
-    ).verified is False
-    assert attest_macos_sandbox_proof(
-        {**proof, "pid": 988},
-        nonce="a" * 32,
-        expected_pid=987,
-    ).verified is False
 
 
 def test_missing_macos_seatbelt_fails_before_secret_resolution(tmp_path: Path) -> None:

@@ -14,7 +14,7 @@ import pytest
 from src.feishu.handlers.lock_helper import LockHelper
 from src.feishu.handlers.system import SystemHandler
 from src.repo_lock import LockConflictError, RepoLockManager
-from src.tasking import TaskScheduler, TaskSpec, TaskStatus
+from src.tasking import TaskScheduler, TaskSpec
 from src.thread import set_current_is_p2p
 from src.utils.signing import VerifyResult, verify_command_sig
 
@@ -48,7 +48,9 @@ def test_strict_shell_same_chat_cannot_overlap_programming_run(tmp_path) -> None
     helper = LockHelper(_LockHandler(manager))
     scheduler = TaskScheduler(max_concurrent=2, per_key_concurrency=1)
     programming_started = threading.Event()
+    programming_finished = threading.Event()
     release_programming = threading.Event()
+    shell_finished = threading.Event()
     shell_body = MagicMock()
 
     def programming(_ctx):
@@ -56,9 +58,12 @@ def test_strict_shell_same_chat_cannot_overlap_programming_run(tmp_path) -> None
             programming_started.set()
             assert release_programming.wait(timeout=2)
 
-        return helper._with_repo_lock_strict(str(tmp_path), "same-chat", body)
+        try:
+            return helper._with_repo_lock_strict(str(tmp_path), "same-chat", body)
+        finally:
+            programming_finished.set()
 
-    programming_handle = scheduler.submit(
+    scheduler.submit(
         TaskSpec(
             chat_id="same-chat",
             name="programming",
@@ -69,15 +74,18 @@ def test_strict_shell_same_chat_cannot_overlap_programming_run(tmp_path) -> None
     assert programming_started.wait(timeout=1)
 
     def shell(_ctx):
-        with pytest.raises(LockConflictError):
-            helper._with_repo_lock_strict(
-                str(tmp_path),
-                "same-chat",
-                shell_body,
-            )
-        return "blocked"
+        try:
+            with pytest.raises(LockConflictError):
+                helper._with_repo_lock_strict(
+                    str(tmp_path),
+                    "same-chat",
+                    shell_body,
+                )
+            return "blocked"
+        finally:
+            shell_finished.set()
 
-    shell_handle = scheduler.submit(
+    scheduler.submit(
         TaskSpec(
             chat_id="same-chat",
             name="shell-fast",
@@ -87,11 +95,11 @@ def test_strict_shell_same_chat_cannot_overlap_programming_run(tmp_path) -> None
     )
 
     try:
-        assert shell_handle.wait(timeout=2).status == TaskStatus.SUCCEEDED
+        assert shell_finished.wait(timeout=2)
         shell_body.assert_not_called()
     finally:
         release_programming.set()
-        programming_handle.wait(timeout=2)
+        assert programming_finished.wait(timeout=2)
         scheduler.stop(wait=True, shutdown_executor=True)
         manager.shutdown()
 

@@ -21,7 +21,6 @@ from src.autonomous.data.facades import (
     EmployeeDocumentMaterializer,
     EmployeeMemoryFacade,
     MemoryAccessError,
-    MemoryConflictError,
     MemoryIntegrityError,
 )
 from src.autonomous.data.models import DataKind
@@ -68,7 +67,6 @@ def _facade(
     *,
     content: bytes | None,
     tenant_key: str = "tenant_1",
-    legacy: bytes | None = None,
 ) -> tuple[EmployeeMemoryFacade, Path, EmployeeDocumentMaterializer]:
     materializer = EmployeeDocumentMaterializer(tmp_path / "canonical")
     state = DataProjectionState()
@@ -87,15 +85,10 @@ def _facade(
             content,
             content_hash,
         )
-    if legacy is not None:
-        legacy_path = tmp_path / "legacy" / "agents" / "agt_1" / "memory"
-        legacy_path.mkdir(parents=True)
-        (legacy_path / "MEMORY.md").write_bytes(legacy)
     return (
         EmployeeMemoryFacade(
             materializer=materializer,
             state=state,
-            legacy_base_path=tmp_path / "legacy",
         ),
         canonical,
         materializer,
@@ -216,58 +209,6 @@ def test_materializer_rejects_symlinked_parent_on_write(tmp_path: Path) -> None:
 
     assert not (outside / "memory" / "MEMORY.md").exists()
 
-
-def test_l1_rejects_legacy_by_default_and_any_dual_source(
-    tmp_path: Path,
-) -> None:
-    legacy_only_root = tmp_path / "legacy-only"
-    materializer = EmployeeDocumentMaterializer(legacy_only_root / "canonical")
-    legacy_path = (
-        legacy_only_root / "legacy" / "agents" / "agt_1" / "memory"
-    )
-    legacy_path.mkdir(parents=True)
-    (legacy_path / "MEMORY.md").write_text("same")
-    legacy_only = EmployeeMemoryFacade(
-        materializer=materializer,
-        state=DataProjectionState(),
-        legacy_base_path=legacy_only_root / "legacy",
-    )
-    with pytest.raises(MemoryConflictError, match="not authorized"):
-        legacy_only.read_l1("agt_1", "tenant_1")
-
-    dual, _, _ = _facade(tmp_path / "dual", content=b"same", legacy=b"same")
-    with pytest.raises(MemoryConflictError, match="both exist"):
-        dual.read_l1("agt_1", "tenant_1", allow_unscoped_legacy=True)
-
-
-def test_canonical_path_nested_under_legacy_root_is_not_a_second_source(
-    tmp_path: Path,
-) -> None:
-    base = tmp_path / "team"
-    materializer = EmployeeDocumentMaterializer(base / "agents")
-    state = DataProjectionState()
-    content = b"canonical"
-    content_hash = hashlib.sha256(content).hexdigest()
-    _project_l1(state, content_hash=content_hash)
-    materializer.materialize(
-        "agt_1",
-        DataKind.L1_MEMORY,
-        "l1_memory",
-        content,
-        content_hash,
-    )
-    facade = EmployeeMemoryFacade(
-        materializer=materializer,
-        state=state,
-        legacy_base_path=base,
-    )
-
-    assert facade.read_l1("agt_1", "tenant_1") == "canonical"
-
-    distinct_legacy = base / "agents" / "agt_1" / "MEMORY.md"
-    distinct_legacy.write_text("legacy")
-    with pytest.raises(MemoryConflictError, match="both exist"):
-        facade.read_l1("agt_1", "tenant_1")
 
 
 def _request(**changes) -> AuthorizedContextRequest:

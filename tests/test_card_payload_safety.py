@@ -73,7 +73,7 @@ class TestDefaultBudgetTruncation(unittest.TestCase):
     """Integration test: verify truncation works with real 27KB (27*1024) budget."""
 
     def setUp(self):
-        from src.card.render.payload_truncator import check_and_truncate_payload
+        from src.card.shared.truncation import check_and_truncate_payload
         self.truncate = check_and_truncate_payload
 
     def test_oversized_payload_truncated_within_feishu_limit(self):

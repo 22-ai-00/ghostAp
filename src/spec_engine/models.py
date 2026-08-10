@@ -5,12 +5,14 @@ spec → plan → task → build → review 五个阶段，
 review 产生的建议驱动下一轮循环，直到所有验收标准满足且无新建议。
 """
 
+import hashlib
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from ..engine_base import CriteriaTracker, PerspectiveReview, ReviewPerspective, ReviewResult
 
@@ -33,7 +35,252 @@ __all__ = [
     "ReviewResult",
     "PerspectiveReview",
     "ReviewPerspective",
+    "ReviewAgentBinding",
+    "ReviewRoleSpec",
+    "RoleSuggestion",
+    "RoleReviewOutcome",
+    "AggregatedSuggestion",
+    "AggregatedReview",
+    "AdaptiveReviewResult",
+    "ReviewCircuitState",
+    "ReviewContext",
 ]
+
+
+@dataclass(frozen=True)
+class ReviewAgentBinding:
+    """Concrete reviewer backend and model binding."""
+
+    provider: str
+    tool_name: str
+    display_name: str
+    agent_type: str
+    model_name: str | None = None
+    model_display_name: str | None = None
+    selection_key: str = ""
+    use_default_model: bool = True
+
+    @property
+    def display_label(self) -> str:
+        return f"{self.display_name or self.tool_name} / {self.model_display_name or self.model_name or '默认模型'}"
+
+    def to_dict(self) -> dict:
+        return {
+            "provider": self.provider,
+            "tool_name": self.tool_name,
+            "display_name": self.display_name,
+            "agent_type": self.agent_type,
+            "model_name": self.model_name,
+            "model_display_name": self.model_display_name,
+            "selection_key": self.selection_key,
+            "use_default_model": self.use_default_model,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> "ReviewAgentBinding | None":
+        if not isinstance(data, dict):
+            return None
+        agent = str(data.get("agent_type") or "").strip().lower()
+        tool = str(data.get("tool_name") or "").strip().lower()
+        if not agent and not tool:
+            return None
+        return cls(
+            provider=str(data.get("provider") or "").strip().lower(),
+            tool_name=tool,
+            display_name=str(data.get("display_name") or tool or agent).strip(),
+            agent_type=agent or tool or "coco",
+            model_name=str(data.get("model_name") or "").strip() or None,
+            model_display_name=str(data.get("model_display_name") or "").strip() or None,
+            selection_key=str(data.get("selection_key") or "").strip(),
+            use_default_model=bool(data.get("use_default_model", True)),
+        )
+
+
+@dataclass(frozen=True)
+class ReviewRoleSpec:
+    role_id: str
+    display_name: str
+    category: str
+    mission: str
+    review_focus: list[str]
+    must_check: list[str]
+    blocking: bool = True
+    max_suggestions: int = 5
+    base_perspective: ReviewPerspective | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "role_id": self.role_id,
+            "display_name": self.display_name,
+            "category": self.category,
+            "mission": self.mission,
+            "review_focus": self.review_focus,
+            "must_check": self.must_check,
+            "blocking": self.blocking,
+            "max_suggestions": self.max_suggestions,
+            "base_perspective": self.base_perspective.value if self.base_perspective else None,
+        }
+
+
+@dataclass
+class RoleSuggestion:
+    severity: str
+    confidence: str
+    evidence: str
+    recommendation: str
+    target: str = ""
+    blocking: bool = False
+
+    def normalized_key(self) -> str:
+        return " ".join(self.recommendation.strip().lower().split())
+
+
+@dataclass
+class RoleReviewOutcome:
+    role_id: str
+    role_display_name: str
+    role_category: str
+    passed: bool
+    summary: str = ""
+    suggestions: list[RoleSuggestion] = field(default_factory=list)
+    raw_preview: str = ""
+    error: str = ""
+    blocking: bool = True
+    skipped: bool = False
+    base_perspective_value: str = ""
+    goal_verdict: str = ""
+    goal_confidence: str = ""
+    goal_evidence: str = ""
+
+
+@dataclass
+class AggregatedSuggestion:
+    suggestion_id: str
+    severity: str
+    confidence: str
+    role_ids: list[str]
+    evidence: list[str]
+    recommendation: str
+    target: str = ""
+    blocking: bool = False
+
+    def to_repair_text(self, role_names: dict[str, str]) -> str:
+        names = ", ".join(role_names.get(role_id, role_id) for role_id in self.role_ids)
+        details = ([f"evidence: {' | '.join(self.evidence)}"] if self.evidence else [])
+        if self.target:
+            details.append(f"target: {self.target}")
+        return f"[{names}] {self.recommendation}" + (f" ({'; '.join(details)})" if details else "")
+
+
+@dataclass
+class AggregatedReview:
+    blocking_suggestions: list[AggregatedSuggestion]
+    observations: list[AggregatedSuggestion]
+    role_names: dict[str, str]
+
+    def blocking_hash(self) -> str:
+        rows = [(item.recommendation, item.role_ids, item.target, item.severity) for item in self.blocking_suggestions]
+        return hashlib.sha256(repr(rows).encode()).hexdigest()[:16] if rows else ""
+
+
+@dataclass
+class AdaptiveReviewResult(ReviewResult):
+    role_outcomes: list[RoleReviewOutcome] = field(default_factory=list)
+    aggregated: AggregatedReview | None = None
+    role_plan_hash: str = ""
+    blocking_suggestion_hash: str = ""
+    blocking_review_passed: bool = False
+    skipped_roles_count: int = 0
+    completion_gate_met: bool = False
+    completion_gate_confidence: str = ""
+    completion_gate_evidence: str = ""
+    completion_gate_enabled: bool = False
+    completion_gate_valid: bool = True
+    completion_gate_error: str = ""
+
+    @property
+    def all_passed(self) -> bool:
+        return bool(self.reviews) and all(review.passed for review in self.reviews) and (
+            not self.completion_gate_enabled or self.completion_gate_valid
+        )
+
+
+@dataclass
+class ReviewCircuitState:
+    last_review_failure_diag: Optional[dict] = None
+    review_failure_consecutive: int = 0
+    review_circuit_open_until_cycle: int = 0
+    backoff_level: int = 0
+    consecutive_timeouts: int = 0
+    consecutive_skips: int = 0
+    last_review_elapsed_ms: int = 0
+    last_failure_timestamp: float = 0.0
+    recent_outcomes: list[str] = field(default_factory=list)
+
+    def _remember(self, outcome: str) -> None:
+        self.recent_outcomes.append(outcome)
+        del self.recent_outcomes[:-20]
+
+    def reset_on_success(self) -> None:
+        self.review_failure_consecutive = 0
+        self.review_circuit_open_until_cycle = 0
+        self.backoff_level = 0
+        self.consecutive_timeouts = 0
+        self.consecutive_skips = 0
+        self.last_review_failure_diag = None
+        self._remember("success")
+
+    def on_failure(self, all_timeout: bool) -> None:
+        self.review_failure_consecutive += 1
+        self.consecutive_timeouts += int(all_timeout)
+        self.last_failure_timestamp = time.monotonic()
+        self._remember("failure")
+
+    def to_dict(self) -> dict:
+        return {
+            "review_failure_consecutive": self.review_failure_consecutive,
+            "review_circuit_open_until_cycle": self.review_circuit_open_until_cycle,
+            "backoff_level": self.backoff_level,
+            "consecutive_timeouts": self.consecutive_timeouts,
+            "consecutive_skips": self.consecutive_skips,
+            "last_review_elapsed_ms": self.last_review_elapsed_ms,
+            "last_failure_timestamp": self.last_failure_timestamp,
+            "recent_outcomes": self.recent_outcomes[-20:],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ReviewCircuitState":
+        return cls(
+            review_failure_consecutive=int(data.get("review_failure_consecutive") or 0),
+            review_circuit_open_until_cycle=int(data.get("review_circuit_open_until_cycle") or 0),
+            backoff_level=int(data.get("backoff_level") or 0),
+            consecutive_timeouts=int(data.get("consecutive_timeouts") or 0),
+            consecutive_skips=int(data.get("consecutive_skips") or 0),
+            last_review_elapsed_ms=int(data.get("last_review_elapsed_ms") or 0),
+            last_failure_timestamp=float(data.get("last_failure_timestamp") or 0),
+            recent_outcomes=[str(value) for value in data.get("recent_outcomes", [])][-20:],
+        )
+
+
+@dataclass
+class ReviewContext:
+    cycle: int
+    session: Any
+    settings: Any
+    project: Any
+    send_prompt_with_retry_fn: Callable
+    build_review_exception_diagnostics_fn: Callable[..., dict]
+    circuit: ReviewCircuitState
+    on_review_done: Optional[Callable] = None
+    artifacts: Any = None
+    cancel_event: Optional[threading.Event] = None
+    on_retry_status: Optional[Callable] = None
+    agent_type: str = "coco"
+    model_name: Optional[str] = None
+    prompt_runner_factory: Optional[Callable] = None
+    role_plan_override: Optional[list[ReviewRoleSpec]] = None
+    review_agents: Optional[list[ReviewAgentBinding]] = None
+    review_agent_rng: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -158,10 +405,9 @@ class SpecProjectStatus(Enum):
     IDLE = "idle"
     ANALYZING = "analyzing"
     RUNNING = "running"
-    CLARIFYING = "clarifying"
-    PAUSED = "paused"
     COMPLETED = "completed"
-    ABORTED = "aborted"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class SpecTaskStatus(Enum):
@@ -463,6 +709,7 @@ class SpecProject:
     review_pass_streak: int = 0
     last_review_role_plan_hash: str = ""
     last_review_blocking_suggestion_hash: str = ""
+    auto_recovery_attempts: int = 0
 
     @classmethod
     def create(cls, name: str = "", root_path: str = "") -> "SpecProject":
@@ -478,18 +725,17 @@ class SpecProject:
         self.status = SpecProjectStatus.RUNNING
         self.started_at = time.time()
 
-    def pause(self):
-        self.status = SpecProjectStatus.PAUSED
-
-    def resume(self):
-        self.status = SpecProjectStatus.RUNNING
-
     def complete(self):
         self.status = SpecProjectStatus.COMPLETED
         self.completed_at = time.time()
 
-    def abort(self, reason: str):
-        self.status = SpecProjectStatus.ABORTED
+    def fail(self, reason: str):
+        self.status = SpecProjectStatus.FAILED
+        self.completed_at = time.time()
+        self.error = reason
+
+    def cancel(self, reason: str = "用户停止"):
+        self.status = SpecProjectStatus.CANCELLED
         self.completed_at = time.time()
         self.error = reason
 
@@ -546,17 +792,23 @@ class SpecProject:
             "review_pass_streak": self.review_pass_streak,
             "last_review_role_plan_hash": self.last_review_role_plan_hash,
             "last_review_blocking_suggestion_hash": self.last_review_blocking_suggestion_hash,
+            "auto_recovery_attempts": self.auto_recovery_attempts,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "SpecProject":
+        raw_status = {
+            "aborted": "failed",
+            "paused": "running",
+            "clarifying": "running",
+        }.get(str(data.get("status", "idle") or "idle"), str(data.get("status", "idle") or "idle"))
         project = cls(
             project_id=data["project_id"],
             name=data["name"],
             root_path=data["root_path"],
             requirement=data.get("requirement", ""),
             acceptance_criteria=data.get("acceptance_criteria", []),
-            status=SpecProjectStatus(data.get("status", "idle")),
+            status=SpecProjectStatus(raw_status),
             created_at=data.get("created_at", time.time()),
             started_at=data.get("started_at"),
             completed_at=data.get("completed_at"),
@@ -571,6 +823,7 @@ class SpecProject:
             review_pass_streak=int(data.get("review_pass_streak") or 0),
             last_review_role_plan_hash=str(data.get("last_review_role_plan_hash") or ""),
             last_review_blocking_suggestion_hash=str(data.get("last_review_blocking_suggestion_hash") or ""),
+            auto_recovery_attempts=max(0, int(data.get("auto_recovery_attempts") or 0)),
         )
         if data.get("cycles"):
             project.cycles = [SpecCycle.from_dict(c) for c in data["cycles"]]

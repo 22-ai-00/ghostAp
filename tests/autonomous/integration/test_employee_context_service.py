@@ -27,10 +27,14 @@ from src.autonomous.domain import (
 )
 from src.autonomous.journal.projections import ProjectionState
 from src.autonomous.workforce.registry import ProjectedAgentRegistry
-from tests.autonomous.unit.test_employee_thread_context import (
-    _FakeSource,
-    _pages,
-    _stable_thread,
+from tests.autonomous.helpers import (
+    FakeEmployeeMessageSource as _FakeSource,
+)
+from tests.autonomous.helpers import (
+    message_pages as _pages,
+)
+from tests.autonomous.helpers import (
+    stable_thread as _stable_thread,
 )
 
 
@@ -100,16 +104,14 @@ class _Acl:
 class _MemoryFacade:
     def __init__(self, content: str | None = "L1") -> None:
         self.content = content
-        self.calls: list[tuple[str, str, bool]] = []
+        self.calls: list[tuple[str, str]] = []
 
     def read_l1(
         self,
         agent_id: str,
         tenant_key: str,
-        *,
-        allow_unscoped_legacy: bool,
     ) -> str | None:
-        self.calls.append((agent_id, tenant_key, allow_unscoped_legacy))
+        self.calls.append((agent_id, tenant_key))
         return self.content
 
 
@@ -233,7 +235,7 @@ def test_assembles_once_from_projected_authority_and_canonical_memories() -> Non
     assert snapshot.l2_summary == "L2"
     assert snapshot.system_prompt_tokens_reserved == 2
     assert snapshot.constraints_digest == "a" * 64
-    assert built.memory.calls == [("agt_1", "tenant_1", False)]
+    assert built.memory.calls == [("agt_1", "tenant_1")]
     assert built.backend.calls == ["oc_1"]
     assert len(built.source_factory.calls) == 1
     scope, principal = built.source_factory.calls[0]
@@ -261,13 +263,12 @@ def test_context_close_rejects_new_work_and_drains_admitted_assembly() -> None:
     closed = threading.Event()
 
     class BlockingMemory(_MemoryFacade):
-        def read_l1(self, agent_id, tenant_key, *, allow_unscoped_legacy):
+        def read_l1(self, agent_id, tenant_key):
             entered.set()
             assert release.wait(2)
             return super().read_l1(
                 agent_id,
                 tenant_key,
-                allow_unscoped_legacy=allow_unscoped_legacy,
             )
 
     built = _composition(memory=BlockingMemory())
@@ -390,7 +391,7 @@ def test_projection_head_catchup_retries_before_external_reads() -> None:
     snapshot = built.service.assemble(_request())
 
     assert snapshot.l1_summary == "L1"
-    assert built.memory.calls == [("agt_1", "tenant_1", False)]
+    assert built.memory.calls == [("agt_1", "tenant_1")]
     assert built.backend.calls == ["oc_1"]
     assert len(built.source_factory.calls) == 1
 
@@ -407,14 +408,11 @@ def test_semantically_unchanged_projection_advance_retries_snapshot() -> None:
     def read_and_advance(
         agent_id: str,
         tenant_key: str,
-        *,
-        allow_unscoped_legacy: bool,
     ) -> str | None:
         nonlocal advanced
         content = original_read(
             agent_id,
             tenant_key,
-            allow_unscoped_legacy=allow_unscoped_legacy,
         )
         if not advanced:
             advanced = True
@@ -429,8 +427,8 @@ def test_semantically_unchanged_projection_advance_retries_snapshot() -> None:
 
     assert snapshot.l1_summary == "L1"
     assert built.memory.calls == [
-        ("agt_1", "tenant_1", False),
-        ("agt_1", "tenant_1", False),
+        ("agt_1", "tenant_1"),
+        ("agt_1", "tenant_1"),
     ]
     assert built.backend.calls == ["oc_1", "oc_1"]
     assert len(built.source_factory.calls) == 1
@@ -446,13 +444,10 @@ def test_projection_retry_does_not_accept_membership_revocation() -> None:
     def read_and_revoke(
         agent_id: str,
         tenant_key: str,
-        *,
-        allow_unscoped_legacy: bool,
     ) -> str | None:
         content = original_read(
             agent_id,
             tenant_key,
-            allow_unscoped_legacy=allow_unscoped_legacy,
         )
         state.employees["agt_1"] = replace(
             state.employees["agt_1"],
@@ -469,7 +464,7 @@ def test_projection_retry_does_not_accept_membership_revocation() -> None:
         built.service.assemble(_request())
 
     assert raised.value.reason is ContextUnavailableReason.SCOPE
-    assert built.memory.calls == [("agt_1", "tenant_1", False)]
+    assert built.memory.calls == [("agt_1", "tenant_1")]
     assert built.backend.calls == []
     assert built.source_factory.calls == []
 

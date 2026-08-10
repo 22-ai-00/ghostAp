@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING
 
-from ...card import CardBuilder
+from ...card.builders.diagnostics import DiagnosticsBuilder
 from ...card.models import EngineStatusEntry
 from ...card.ui_text import UI_TEXT
 
@@ -25,7 +25,7 @@ class DiagnosticsHelper:
             if not include_done and status_val in ("completed", "failed"):
                 continue
             tid = p.task_id or ""
-            info = CardBuilder.format_engine_status_info(deep_label, p)
+            info = DiagnosticsBuilder.format_engine_status_info(deep_label, p)
             entries.append(EngineStatusEntry(
                 mode=deep_label,
                 task_id=tid,
@@ -44,7 +44,7 @@ class DiagnosticsHelper:
             if not include_done and status_val in ("completed", "aborted"):
                 continue
             tid = p.task_id or ""
-            info = CardBuilder.format_engine_status_info(spec_label, p)
+            info = DiagnosticsBuilder.format_engine_status_info(spec_label, p)
             entries.append(EngineStatusEntry(
                 mode=spec_label,
                 task_id=tid,

@@ -159,10 +159,7 @@ def restore_runtime_context(
     models_tried: list[str],
     infer_engine_name_fn: Callable,
     initialize_model_context_fn: Callable,
-    saved_task_id: Optional[str] = None,
     on_rate_limit: Optional[Callable[[int], None]] = None,
-    existing_saved_task_id: Optional[str] = None,
-    project=None,
 ) -> dict:
     runtime = dict(runtime_context or {})
     new_agent_type = str(runtime.get("agent_type") or agent_type or "coco").strip().lower() or "coco"
@@ -188,10 +185,6 @@ def restore_runtime_context(
     if not new_models_tried and new_agent_type != "claude":
         new_current_model, new_models_tried = initialize_model_context_fn()
 
-    new_saved_task_id = saved_task_id or existing_saved_task_id
-    if project and new_saved_task_id:
-        project.task_id = new_saved_task_id
-
     return {
         "agent_type": new_agent_type,
         "engine_name": new_engine_name,
@@ -199,5 +192,4 @@ def restore_runtime_context(
         "current_model": new_current_model,
         "models_tried": new_models_tried,
         "on_rate_limit": on_rate_limit,
-        "saved_task_id": new_saved_task_id,
     }

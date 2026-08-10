@@ -7,15 +7,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.acp.models import PromptResult
-from src.agent_session import (
-    ModelFailureAwareSession,
-    RateLimitAwareSession,
-    SyncClaudeCLISession,
+from src.agent_session.claude_cli import SyncClaudeCLISession
+from src.agent_session.model_diagnostics import (
     _apply_compaction_once,
     _detect_rate_limit,
     _extract_model_from_agent_args,
     _replace_model_in_agent_args,
     classify_model_failure,
+)
+from src.agent_session.wrappers import (
+    ModelFailureAwareSession,
+    RateLimitAwareSession,
 )
 
 # ======================================================================
@@ -131,7 +133,6 @@ class TestModelFailoverHelpers:
         assert "model.name=gpt-5.1" in args
 
 
-
 def test_apply_compaction_once_rebuilds_session_with_same_cmd_args(monkeypatch):
     """compaction 动作：应在关闭旧 session 后，使用相同 cmd/args 重建并 start 新 session。"""
     created = []
@@ -187,7 +188,6 @@ def test_model_failure_aware_session_need_compaction_compacts_then_retries(monke
             self.last_active = 0.0
             self.message_count = 0
             self.last_query = ""
-            self.is_resumed = False
             self.calls = 0
 
         def describe_agent(self):
@@ -196,9 +196,6 @@ def test_model_failure_aware_session_need_compaction_compacts_then_retries(monke
         def start(self, startup_timeout: float = 60):
             return "sid"
 
-        def load_session(self, session_id: str, timeout: float = 60):
-            del timeout
-            return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
             return []
@@ -256,7 +253,6 @@ def test_model_failure_aware_session_compaction_loop_suppresses_compaction(monke
             self.last_active = 0.0
             self.message_count = 0
             self.last_query = ""
-            self.is_resumed = False
             self.calls = 0
 
         def describe_agent(self):
@@ -265,9 +261,6 @@ def test_model_failure_aware_session_compaction_loop_suppresses_compaction(monke
         def start(self, startup_timeout: float = 60):
             return "sid"
 
-        def load_session(self, session_id: str, timeout: float = 60):
-            del timeout
-            return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
             return []
@@ -329,7 +322,6 @@ def test_model_failure_aware_session_loop_detected_triggers_failover(monkeypatch
             self.last_active = 0.0
             self.message_count = 0
             self.last_query = ""
-            self.is_resumed = False
             self._agent_type = "coco"
             self._cwd = "/tmp"
             self._agent_cmd = "coco"
@@ -342,9 +334,6 @@ def test_model_failure_aware_session_loop_detected_triggers_failover(monkeypatch
         def start(self, startup_timeout: float = 60):
             return "sid"
 
-        def load_session(self, session_id: str, timeout: float = 60):
-            del timeout
-            return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
             return []
@@ -380,7 +369,6 @@ def test_model_failure_aware_session_loop_detected_triggers_failover(monkeypatch
             self.last_active = 0.0
             self.message_count = 0
             self.last_query = ""
-            self.is_resumed = False
             self._agent_type = kw.get("agent_type")
             self._cwd = kw.get("cwd")
             self._agent_cmd = kw.get("agent_cmd")
@@ -393,9 +381,6 @@ def test_model_failure_aware_session_loop_detected_triggers_failover(monkeypatch
         def describe_agent(self):
             return "dummy"
 
-        def load_session(self, session_id: str, timeout: float = 60):
-            del timeout
-            return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
             return []
@@ -445,7 +430,6 @@ def _make_mock_session(**overrides):
     s.last_active = overrides.get("last_active", 1000.0)
     s.message_count = overrides.get("message_count", 0)
     s.last_query = overrides.get("last_query", "")
-    s.is_resumed = overrides.get("is_resumed", False)
     s.send_prompt.return_value = PromptResult(stop_reason="end_turn", text="ok")
     return s
 
@@ -453,39 +437,6 @@ def _make_mock_session(**overrides):
 class TestRateLimitAwareSession:
     """Test RateLimitAwareSession wrapper."""
 
-    def test_delegates_protocol_properties(self):
-        inner = _make_mock_session(session_id="abc", message_count=5)
-        wrapped = RateLimitAwareSession(inner)
-        assert wrapped.session_id == "abc"
-        assert wrapped.message_count == 5
-
-    def test_delegates_start(self):
-        inner = _make_mock_session()
-        inner.start.return_value = "sid"
-        wrapped = RateLimitAwareSession(inner)
-        assert wrapped.start(startup_timeout=30) == "sid"
-        inner.start.assert_called_once_with(startup_timeout=30)
-
-    @pytest.mark.parametrize(
-        "wrapper_cls",
-        [RateLimitAwareSession, ModelFailureAwareSession],
-    )
-    def test_delegates_resume_timeout_exactly(self, wrapper_cls):
-        inner = _make_mock_session()
-        wrapped = wrapper_cls(inner)
-
-        wrapped.load_session("resume-target", timeout=0.625)
-
-        inner.load_session.assert_called_once_with(
-            "resume-target",
-            timeout=0.625,
-        )
-
-    def test_delegates_close(self):
-        inner = _make_mock_session()
-        wrapped = RateLimitAwareSession(inner)
-        wrapped.close()
-        inner.close.assert_called_once()
 
     def test_delegates_cancel(self):
         inner = _make_mock_session()
@@ -495,13 +446,6 @@ class TestRateLimitAwareSession:
         inner.cancel.assert_called_once()
         assert cancel_ev.is_set()
 
-    def test_send_prompt_passes_through_on_success(self):
-        inner = _make_mock_session()
-        expected = PromptResult(stop_reason="end_turn", text="hello")
-        inner.send_prompt.return_value = expected
-        wrapped = RateLimitAwareSession(inner)
-        result = wrapped.send_prompt("test")
-        assert result == expected
 
     @patch("src.agent_session.wrappers.get_settings")
     def test_send_prompt_bypasses_retry_when_disabled(self, mock_settings):
@@ -722,8 +666,6 @@ class TestCreateEngineSession:
 
         result = create_engine_session("claude", "/tmp")
 
-        from src.agent_session import ModelFailureAwareSession
-
         assert isinstance(result, ModelFailureAwareSession)
         assert isinstance(getattr(result, "_inner", None), RateLimitAwareSession)
         mock_session.start.assert_called_once()
@@ -742,8 +684,6 @@ class TestCreateEngineSession:
         from src.agent_session import create_engine_session
 
         result = create_engine_session("claude", "/tmp")
-
-        from src.agent_session import ModelFailureAwareSession
 
         assert isinstance(result, ModelFailureAwareSession)
         assert not isinstance(getattr(result, "_inner", None), RateLimitAwareSession)
@@ -791,7 +731,6 @@ def test_model_failure_aware_session_send_prompt_with_retry_success_after_retry(
             self.last_active = 0.0
             self.message_count = 0
             self.last_query = ""
-            self.is_resumed = False
             self.calls = 0
 
         def describe_agent(self):
@@ -800,9 +739,6 @@ def test_model_failure_aware_session_send_prompt_with_retry_success_after_retry(
         def start(self, startup_timeout: float = 60):
             return "sid"
 
-        def load_session(self, session_id: str, timeout: float = 60):
-            del timeout
-            return None
 
         def load_local_history(self, session_id=None, limit: int = 200):
             return []

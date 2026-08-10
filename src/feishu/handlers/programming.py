@@ -18,7 +18,9 @@ from ...acp.manager import ACPSessionManager
 from ...acp.outcome import PromptAssessment, PromptOutcome
 from ...acp.providers import normalize_acp_model_name
 from ...agent_session import SyncSession
-from ...card import CardBuilder
+from ...card.builders.core import CoreBuilder
+from ...card.builders.project import ProjectBuilder
+from ...card.builders.system import SystemBuilder
 from ...card.hooks import EmojiHook
 from ...card.session.config import SessionCallbacks
 from ...card.ui_text import UI_TEXT
@@ -250,23 +252,13 @@ class ProgrammingModeHandler(BaseHandler):
         if project is None:
             return
         session_id = str(getattr(session, "session_id", "") or "")
-        compare_and_clear = getattr(
-            type(project),
-            "clear_programming_snapshot_if_matches",
-            None,
-        )
-        if callable(compare_and_clear):
-            cleared = bool(compare_and_clear(project, self.mode_key, session_id))
-        else:
-            snapshot = self._get_snapshot(project)
-            snapshot_id = str(getattr(snapshot, "session_id", "") or "")
-            cleared = bool(
-                snapshot_id
-                and session_id
-                and snapshot_id == session_id
+        cleared = bool(
+            session_id
+            and project.clear_programming_snapshot_if_matches(
+                self.mode_key,
+                session_id,
             )
-            if cleared:
-                setattr(project, f"{self.mode_key}_session_snapshot", None)
+        )
         if cleared:
             self._persist_project_context(
                 project,
@@ -337,12 +329,6 @@ class ProgrammingModeHandler(BaseHandler):
     def _get_interaction_mode(self):
         return self.interaction_mode
 
-    def _get_snapshot(self, project: "ProjectContext"):
-        getter = getattr(type(project), "get_programming_snapshot", None)
-        if callable(getter):
-            return getter(project, self.mode_key)
-        return getattr(project, f"{self.mode_key}_session_snapshot")
-
     def _set_mode_on_project(self, project: "ProjectContext", active: bool, session_id: str = "", count: int = 0):
         if active:
             project.set_programming_mode(self.mode_key, True, session_id, count)
@@ -353,20 +339,6 @@ class ProgrammingModeHandler(BaseHandler):
 
     def _update_snapshot_on_project(self, project: "ProjectContext", query: str, count: int, session_id: str = ""):
         project.update_programming_snapshot(self.mode_key, query, count, session_id)
-
-    def _clear_snapshot_on_project(self, project: "ProjectContext"):
-        clear = getattr(type(project), "clear_programming_snapshot", None)
-        if callable(clear):
-            changed = bool(clear(project, self.mode_key))
-        else:
-            changed = getattr(
-                project,
-                f"{self.mode_key}_session_snapshot",
-                None,
-            ) is not None
-            setattr(project, f"{self.mode_key}_session_snapshot", None)
-        if changed:
-            self._persist_project_context(project)
 
     def _get_model_name_override(self, project: Optional["ProjectContext"] = None) -> Optional[str]:
         if project and getattr(project, "acp_tool_name", "") == self.mode_key:
@@ -394,18 +366,9 @@ class ProgrammingModeHandler(BaseHandler):
         if not project:
             return
         current = self._get_interaction_mode()
-        if current != InteractionMode.COCO:
-            project.set_coco_mode(False)
-        if current != InteractionMode.CLAUDE:
-            project.set_claude_mode(False)
-        if current != InteractionMode.AIDEN:
-            project.set_aiden_mode(False)
-        if current != InteractionMode.CODEX:
-            project.set_codex_mode(False)
-        if current != InteractionMode.GEMINI:
-            project.set_gemini_mode(False)
-        if current != InteractionMode.TRAEX:
-            project.set_traex_mode(False)
+        for mode, _predicate, key in self._PROGRAMMING_MODE_KEYS:
+            if mode != current:
+                project.set_programming_mode(key, False)
 
     def _iter_other_programming_mode_entries(self):
         current = self._get_interaction_mode()
@@ -510,8 +473,6 @@ class ProgrammingModeHandler(BaseHandler):
         startup_timeout = getattr(self.settings, "acp_startup_timeout", 20)
         agent_type_override = None
         model_name = None
-        target_session_id = None
-        snapshot = self._get_snapshot(project) if project else None
 
         try:
             agent_type_override = self._get_agent_type_override(project)
@@ -520,15 +481,9 @@ class ProgrammingModeHandler(BaseHandler):
                 if model_override is _MODEL_OVERRIDE_UNSET
                 else model_override
             )
-            if snapshot and snapshot.is_resumable and not thread_id:
-                if model_name:
-                    snapshot = None
-                else:
-                    target_session_id = snapshot.session_id
             session = self._get_session_manager().ensure_session(
                 chat_id,
                 cwd=cwd,
-                session_id=target_session_id,
                 startup_timeout=startup_timeout,
                 project_id=project_id,
                 agent_type_override=agent_type_override,
@@ -569,42 +524,15 @@ class ProgrammingModeHandler(BaseHandler):
             self._enter_mode_on_manager(chat_id, project_id=project_id)
         self.add_reaction(message_id, EmojiReaction.on_coco_enter())
 
-        # If resume was requested but failed (session expired on backend),
-        # clear the stale snapshot so we don't retry on next entry.
-        if target_session_id and not session.is_resumed:
-            snapshot = None
-            if project and commit_project_state:
-                self._clear_snapshot_on_project(project)
-
-        if project and snapshot and snapshot.is_resumable:
-            if not thread_id and commit_project_state:
-                self._deactivate_other_project_modes(project)
-                self._set_mode_on_project(project, True, snapshot.session_id, snapshot.query_count)
-            if not silent:
-                mode_hint = UI_TEXT["mode_resume_hint_default"]
-                content = UI_TEXT["mode_resume_msg"].format(name=self.mode_name, session_id=session.session_id, query_count=snapshot.query_count, hint=mode_hint)
-
-                banner = CardBuilder._build_banner_element(UI_TEXT["mode_resume_banner"].format(name=self.mode_name), type="success")
-                msg_type, card_content = CardBuilder.build_project_response_card(
-                    project,
-                    UI_TEXT["mode_card_programming_title"].format(emoji=self.mode_emoji, name=self.mode_name),
-                    content,
-                    show_buttons=True,
-                    footer=UI_TEXT["mode_project_dir_label"].format(path=project.root_path),
-                    banner=banner,
-                )
-                response_id = self.reply_card(message_id, card_content)
-                if response_id:
-                    self.register_message_project(response_id, project)
-        elif project:
+        if project:
             if not thread_id and commit_project_state:
                 self._deactivate_other_project_modes(project)
                 self._set_mode_on_project(project, True, session.session_id)
             if not silent:
                 content = UI_TEXT["mode_enter_msg"].format(emoji=self.mode_emoji, name=self.mode_name)
 
-                banner = CardBuilder._build_banner_element(UI_TEXT["mode_enter_banner"].format(name=self.mode_name), type="success")
-                msg_type, card_content = CardBuilder.build_project_response_card(
+                banner = CoreBuilder._build_banner_element(UI_TEXT["mode_enter_banner"].format(name=self.mode_name), type="success")
+                msg_type, card_content = ProjectBuilder.build_project_response_card(
                     project,
                     UI_TEXT["mode_card_programming_title"].format(emoji=self.mode_emoji, name=self.mode_name),
                     content,
@@ -647,14 +575,10 @@ class ProgrammingModeHandler(BaseHandler):
     ) -> bool:
         """Switch the model for the active programming session.
 
-        Strategy:
-        1. Try ACP protocol `session/setModel` — no restart, context preserved.
-        2. Fall back to session restart: end existing session, then call
-           ensure_session() with the new model_name (bypasses enter_mode's
-           "already in mode" early-return guard).
+        Active sessions only use ACP ``session/setModel``. Session replacement
+        belongs to task startup/recovery, not to this configuration command.
         """
         project_id = project.project_id if project else None
-        cwd = (project.root_path if project else None) or self.get_working_dir(chat_id)
         mgr = self._get_session_manager()
         backend_model_name = (
             model_name
@@ -670,48 +594,28 @@ class ProgrammingModeHandler(BaseHandler):
             )
 
         session = mgr.get_session(chat_id, project_id=project_id)
-        if session:
-            # Attempt protocol-level model switch (preserves conversation context).
-            set_model_fn = getattr(session, "set_model", None)
-            if backend_model_name and callable(set_model_fn):
-                try:
-                    if set_model_fn(backend_model_name):
-                        logger.info("[%s] Model switched via ACP protocol: %s", self.mode_name, backend_model_name)
-
-                        banner = CardBuilder._build_banner_element(UI_TEXT["mode_model_switched_banner"].format(name=self.mode_name, model=model_name), type="success")
-                        msg_type, card_content = CardBuilder.build_project_response_card(
-                            project,
-                            UI_TEXT["mode_model_switched_title"].format(name=self.mode_name),
-                            UI_TEXT["mode_model_switch_context_kept"],
-                            banner=banner,
-                        )
-                        self.reply_card(message_id, card_content)
-                        return True
-                except Exception as e:
-                    logger.warning("[%s] ACP set_model failed, will restart session: %s", self.mode_name, get_error_detail(e))
-
-            # Fall back: end session so ensure_session restarts with new model arg.
-            mgr.end_session(chat_id, project_id=project_id)
-
-        # Start new session with the requested model (mode stays active).
-        startup_timeout = float(getattr(self.settings, "acp_startup_timeout", 20) or 20)
+        set_model_fn = getattr(session, "set_model", None) if session else None
         try:
-            agent_type_override = self._get_agent_type_override(project)
-            mgr.ensure_session(
-                chat_id,
-                cwd=cwd,
-                startup_timeout=startup_timeout,
-                project_id=project_id,
-                agent_type_override=agent_type_override,
-                model_name=backend_model_name,
+            if not backend_model_name or not callable(set_model_fn):
+                raise RuntimeError("当前 ACP 会话不支持在线切换模型")
+            if not set_model_fn(backend_model_name):
+                raise RuntimeError("ACP 后端拒绝了模型切换")
+            logger.info(
+                "[%s] Model switched via ACP protocol: %s",
+                self.mode_name,
+                backend_model_name,
             )
-
-            display_model = model_name or UI_TEXT["system_acp_default_model_option"]
-            banner = CardBuilder._build_banner_element(UI_TEXT["mode_model_switched_banner"].format(name=self.mode_name, model=display_model), type="success")
-            msg_type, card_content = CardBuilder.build_project_response_card(
+            banner = CoreBuilder._build_banner_element(
+                UI_TEXT["mode_model_switched_banner"].format(
+                    name=self.mode_name,
+                    model=model_name,
+                ),
+                type="success",
+            )
+            msg_type, card_content = ProjectBuilder.build_project_response_card(
                 project,
                 UI_TEXT["mode_model_switched_title"].format(name=self.mode_name),
-                UI_TEXT["mode_model_switch_restarted"],
+                UI_TEXT["mode_model_switch_context_kept"],
                 banner=banner,
             )
             self.reply_card(message_id, card_content)
@@ -837,8 +741,8 @@ class ProgrammingModeHandler(BaseHandler):
                     if is_pending_slot or is_mode_only_exit:
                         content = UI_TEXT["mode_exit_pending_msg"].format(name=self.mode_name)
 
-                    banner = CardBuilder._build_banner_element(UI_TEXT["mode_exit_banner"].format(name=self.mode_name), type="info")
-                    msg_type, card_content = CardBuilder.build_project_response_card(
+                    banner = CoreBuilder._build_banner_element(UI_TEXT["mode_exit_banner"].format(name=self.mode_name), type="info")
+                    msg_type, card_content = ProjectBuilder.build_project_response_card(
                         project,
                         UI_TEXT["mode_exit_card_title"],
                         content,
@@ -943,12 +847,12 @@ class ProgrammingModeHandler(BaseHandler):
         needs_release = False
         try:
             _, repo_lock_mgr, needs_release = self._acquire_repo_lock(root_path, chat_id)
-        except LockConflictError as err:
-            self.send_lock_conflict_card(
-                err,
+        except LockConflictError:
+            self.reply_text(
                 message_id,
-                text,
-                chat_id=chat_id,
+                fmt.format_warning(
+                    "仓库当前被其他任务占用，本次任务已安全终止。"
+                ),
             )
             return
 
@@ -977,7 +881,6 @@ class ProgrammingModeHandler(BaseHandler):
         *, _repo_lock_mgr=None, _root_path: str | None = None,
         _finalization_task_text: str | None = None,
     ):
-        from ...acp.models import ACPEvent
         from ...card.delivery.channel_client import LarkChannelCardAPIClient
         from ...card.delivery.factory import create_card_delivery
         from ...card.programming_adapter import ProgrammingCardSession, build_programming_metadata
@@ -987,29 +890,16 @@ class ProgrammingModeHandler(BaseHandler):
         project_path = project.root_path if project else global_working_dir
         project_id = project.project_id if project else None
 
-        with self.ctx.pending_image_lock:
-            self.ctx.pending_image_keys.get(message_id)
-
         logger.info("开始 %s 输出: project=%s, path=%s", self.mode_name, project_name, project_path)
-
-        from ...thread import get_current_thread_id as _get_tid
-        _thread_id = _get_tid()
-
-        # Build metadata for new card system
-        tool_name = None
         model_name = self._get_model_name_override(project)
 
         metadata = build_programming_metadata(
             self.mode_name,
-            tool_name=tool_name,
             model_name=model_name,
             project_name=project_name,
             working_dir=project_path,
         )
 
-        # Ordinary programming cards use the shared official Channel SDK.
-        # If it could not be initialized, preserve command execution through
-        # the existing text fallback instead of silently reverting transports.
         channel_client_factory = self.ctx.channel_client_factory
         if not callable(channel_client_factory):
             logger.warning("lark-channel 客户端不可用，回退到非流式文本输出")
@@ -1044,7 +934,6 @@ class ProgrammingModeHandler(BaseHandler):
             )
             return
 
-        # Create card delivery + session
         delivery = create_card_delivery(
             api_client,
             payload_transform=lambda target_chat_id, payload: (
@@ -1055,7 +944,7 @@ class ProgrammingModeHandler(BaseHandler):
             ),
             trust_revision_provider=self._managed_card_trust_revisions,
         )
-        from src.card.session.config import SessionConfig
+        from ...card.session.config import SessionConfig
         card_callbacks = build_programming_session_callbacks(
             reply_text_fn=self.reply_text,
             add_reaction=self.add_reaction,
@@ -1093,12 +982,11 @@ class ProgrammingModeHandler(BaseHandler):
             continuation_visibility_timeout=delivery_timeout,
         )
 
-        # Start card (creates in Feishu)
         try:
             prog_session.start()
         except Exception as e:
             logger.warning("创建流式卡片失败: %s", str(e))
-            # Fallback to non-streaming text mode
+            prog_session.abort()
             self._handle_response_non_streaming(
                 message_id, chat_id, text, session, project, global_working_dir,
                 _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
@@ -1116,7 +1004,6 @@ class ProgrammingModeHandler(BaseHandler):
             )
             return
 
-        # Message linking
         card_message_id = prog_session.get_message_id()
         if card_message_id:
             try:
@@ -1128,60 +1015,105 @@ class ProgrammingModeHandler(BaseHandler):
             except Exception as e:
                 logger.debug("link消息失败(programming): %s", e)
 
-        # Streaming execution
+        self._execute_programming_response(
+            message_id,
+            chat_id,
+            text,
+            session,
+            project,
+            cwd,
+            global_working_dir,
+            prog_session=prog_session,
+            card_message_id=card_message_id,
+            delivery_timeout=delivery_timeout,
+            _repo_lock_mgr=_repo_lock_mgr,
+            _root_path=_root_path,
+            _finalization_task_text=_finalization_task_text,
+        )
+
+    def _execute_programming_response(
+        self,
+        message_id: str,
+        chat_id: str,
+        text: str,
+        session: SyncSession,
+        project,
+        cwd: str,
+        global_working_dir: str,
+        *,
+        prog_session=None,
+        card_message_id: str | None = None,
+        delivery_timeout: float = 12.0,
+        _repo_lock_mgr=None,
+        _root_path: str | None = None,
+        _finalization_task_text: str | None = None,
+    ) -> None:
+        """Run one automatic ACP task, independent of its output transport."""
+        from ...acp.models import ACPEventType
+        from ...repo_lock import get_repo_lock_heartbeat_interval
+        from ...tasking import get_current_task_run_id
+        from ...thread import get_current_thread_id
+        from ...utils.heartbeat import RepoLockHeartbeat
+
         timeout = self.settings.coco_execution_timeout if self.is_coco else self.settings.claude_execution_timeout
         update_count = [0]
-        _last_touch = [time.monotonic()]
-        from ...repo_lock import get_repo_lock_heartbeat_interval
-
-        _TOUCH_INTERVAL = get_repo_lock_heartbeat_interval(_repo_lock_mgr)
-        from ...tasking import get_current_task_run_id
-
+        touch_interval = get_repo_lock_heartbeat_interval(_repo_lock_mgr)
         _repo_lock_owner_id = get_current_task_run_id()
-
-        # Heartbeat for repo lock
-        _streaming_hb_stop = threading.Event()
-
+        heartbeat_stop = threading.Event()
         if _repo_lock_mgr and _root_path:
-            from ...utils.heartbeat import RepoLockHeartbeat
-            _streaming_hb = RepoLockHeartbeat(
-                _streaming_hb_stop,
+            heartbeat = RepoLockHeartbeat(
+                heartbeat_stop,
                 lambda: _repo_lock_mgr.touch(
                     _root_path,
                     chat_id,
                     owner_id=_repo_lock_owner_id,
                 ),
-                interval=_TOUCH_INTERVAL,
-                name=f"prog-stream-{_root_path}",
+                interval=touch_interval,
+                name=f"prog-{_root_path}",
             )
-            _streaming_hb.start()
+            heartbeat.start()
         else:
-            _streaming_hb = None
+            heartbeat = None
 
-        def on_event(event: ACPEvent):
+        renderer = ACPEventRenderer() if prog_session is None else None
+        image_keys: list[str] = []
+        seen_image_ids: set[str] = set()
+        image_failures = [0]
+
+        def on_event(event) -> None:
             update_count[0] += 1
-            # Heartbeat touch
-            if _repo_lock_mgr and _root_path:
-                now = time.monotonic()
-                if now - _last_touch[0] >= _TOUCH_INTERVAL:
-                    _repo_lock_mgr.touch(
-                        _root_path,
-                        chat_id,
-                        owner_id=_repo_lock_owner_id,
+            if prog_session is not None:
+                try:
+                    prog_session.on_event(event)
+                except Exception as exc:
+                    logger.warning(
+                        "card session event处理失败: %s",
+                        str(exc),
+                        exc_info=True,
                     )
-                    _last_touch[0] = now
-            # Dispatch to new card session
-            try:
-                prog_session.on_event(event)
-            except Exception as e:
-                logger.warning("card session event处理失败: %s", str(e), exc_info=True)
+                return
+            if event.event_type is ACPEventType.IMAGE_CHUNK:
+                image = event.image
+                if image is None or image.image_id in seen_image_ids:
+                    return
+                seen_image_ids.add(image.image_id)
+                image_key = self.upload_acp_image(image)
+                if image_key:
+                    image_keys.append(image_key)
+                else:
+                    image_failures[0] += 1
+                return
+            renderer.process_event(event)
 
         final_response = ""
         prompt_outcome = PromptOutcome.INCOMPLETE
         prompt_stop_reason = "exception"
+        terminal_notice = ""
+        terminal_exception: Exception | None = None
         active_session = [session]
         entered_finalization = [False]
         retirement_completed = [False]
+        thread_id = get_current_thread_id()
 
         def _start_finalization() -> None:
             entered_finalization[0] = True
@@ -1197,7 +1129,7 @@ class ProgrammingModeHandler(BaseHandler):
                 chat_id=chat_id,
                 project=project,
                 cwd=cwd,
-                thread_id=_thread_id,
+                thread_id=thread_id,
                 timed_out_session=active_session[0],
                 startup_budget_s=startup_budget_s,
             )
@@ -1217,7 +1149,7 @@ class ProgrammingModeHandler(BaseHandler):
             self._retire_finalization_session(
                 chat_id=chat_id,
                 project=project,
-                thread_id=_thread_id,
+                thread_id=thread_id,
                 active_session=active,
                 retirement_budget_s=retirement_budget_s,
             )
@@ -1234,7 +1166,11 @@ class ProgrammingModeHandler(BaseHandler):
                 ),
                 finalization_task_text=_finalization_task_text,
                 on_finalization_start=_start_finalization,
-                on_continuation_start=prog_session.begin_continuation_turn,
+                on_continuation_start=(
+                    prog_session.begin_continuation_turn
+                    if prog_session is not None
+                    else None
+                ),
                 replace_dead_session=_replace_dead_session,
                 retire_finalization_session=_retire_session,
             )
@@ -1243,43 +1179,50 @@ class ProgrammingModeHandler(BaseHandler):
             _log_prompt_execution(self.mode_name, execution)
             prompt_outcome = assessment.outcome
             prompt_stop_reason = assessment.stop_reason
-            streamed_response = prog_session.get_final_text()
             result_text = (getattr(result, "text", None) or "").strip()
-            response_text = streamed_response or result_text
-            if execution.awaiting_user_input:
-                notice = UI_TEXT["mode_exec_waiting_msg"].format(
-                    reason=assessment.detail,
-                )
-                final_response = _append_execution_notice(response_text, notice)
-                prog_session.wait_for_user_confirmation(notice)
-            elif assessment.outcome is PromptOutcome.COMPLETED:
-                prog_session.finish(
-                    fallback_text=result_text,
-                    unfinished_subagent_status="cancelled",
-                )
-                final_response = (
-                    prog_session.get_final_text()
-                    or result_text
-                    or UI_TEXT["mode_exec_complete"]
-                )
+            streamed_response = (
+                prog_session.get_final_text()
+                if prog_session is not None
+                else renderer.get_final_content()
+            )
+            response_text = (
+                streamed_response or result_text
+                if prog_session is not None
+                else result_text or streamed_response
+            )
+            if assessment.outcome is PromptOutcome.COMPLETED:
+                if prog_session is not None and not streamed_response and result_text:
+                    prog_session.on_text(result_text)
+                final_response = response_text or UI_TEXT["mode_exec_complete"]
+                if prog_session is not None:
+                    prog_session.finish()
             elif assessment.outcome is PromptOutcome.CANCELLED:
-                notice = UI_TEXT["mode_exec_cancelled_msg"].format(
+                terminal_notice = UI_TEXT["mode_exec_cancelled_msg"].format(
                     reason=assessment.detail,
                 )
-                final_response = _append_execution_notice(response_text, notice)
-                prog_session.cancel(reason=assessment.stop_reason)
-            else:
-                notice = _incomplete_notice(execution)
-                final_response = _append_execution_notice(response_text, notice)
-                prog_session.fail(
-                    notice,
-                    unfinished_subagent_status=(
-                        "cancelled"
-                        if execution.entered_finalization
-                        else "failed"
-                    ),
+                final_response = _append_execution_notice(
+                    response_text,
+                    terminal_notice,
                 )
+                if prog_session is not None:
+                    prog_session.cancel(reason=assessment.stop_reason)
+            else:
+                terminal_notice = _incomplete_notice(execution)
+                final_response = _append_execution_notice(
+                    response_text,
+                    terminal_notice,
+                )
+                if prog_session is not None:
+                    prog_session.fail(
+                        terminal_notice,
+                        unfinished_subagent_status=(
+                            "cancelled"
+                            if execution.entered_finalization
+                            else "failed"
+                        ),
+                    )
         except TimeoutError as e:
+            terminal_exception = e
             try:
                 _retire_session(active_session[0])
             except Exception:
@@ -1289,19 +1232,21 @@ class ProgrammingModeHandler(BaseHandler):
                     exc_info=True,
                 )
             prompt_stop_reason = "timeout"
-            notice = UI_TEXT["mode_exec_timeout_msg"].format(
+            terminal_notice = UI_TEXT["mode_exec_timeout_msg"].format(
                 error=get_error_detail(e)
             )
             final_response = _append_execution_notice(
-                prog_session.get_final_text(),
-                notice,
+                prog_session.get_final_text() if prog_session is not None else renderer.get_final_content(),
+                terminal_notice,
             )
             log_exception(logger, f"{self.mode_name} ACP执行超时", e, level=logging.WARNING)
-            prog_session.fail(
-                notice,
-                unfinished_subagent_status="cancelled",
-            )
+            if prog_session is not None:
+                prog_session.fail(
+                    terminal_notice,
+                    unfinished_subagent_status="cancelled",
+                )
         except Exception as e:
+            terminal_exception = e
             if (
                 entered_finalization[0]
                 or getattr(active_session[0], "_force_dead", False) is True
@@ -1313,38 +1258,79 @@ class ProgrammingModeHandler(BaseHandler):
                         "%s ACP安全收尾会话退休失败",
                         self.mode_name,
                         exc_info=True,
-                    )
+                )
             prompt_stop_reason = "exception"
-            notice = UI_TEXT["mode_exec_exception_msg"].format(
+            terminal_notice = UI_TEXT["mode_exec_exception_msg"].format(
                 error=get_error_detail(e)
             )
             final_response = _append_execution_notice(
-                prog_session.get_final_text(),
-                notice,
+                prog_session.get_final_text() if prog_session is not None else renderer.get_final_content(),
+                terminal_notice,
             )
             log_exception(logger, f"{self.mode_name} ACP执行异常", e)
-            prog_session.fail(
-                notice,
-                unfinished_subagent_status=(
-                    "cancelled" if entered_finalization[0] else "failed"
-                ),
-            )
+            if prog_session is not None:
+                prog_session.fail(
+                    terminal_notice,
+                    unfinished_subagent_status=(
+                        "cancelled" if entered_finalization[0] else "failed"
+                    ),
+                )
             from ...utils.errors import GhostAPError
-            if isinstance(e, GhostAPError) and e.quick_actions:
+            if prog_session is not None and isinstance(e, GhostAPError) and e.quick_actions:
                 self.send_error_card(chat_id, e, title=UI_TEXT["mode_exec_exception_title"], origin_message_id=message_id)
         finally:
-            _streaming_hb_stop.set()
-            if _streaming_hb is not None:
-                _streaming_hb.join(timeout=2)
-            delivery_idle = prog_session.wait_delivery_idle(delivery_timeout)
-            terminal_delivered = (
-                delivery_idle and prog_session.terminal_delivery_succeeded()
-            )
-            if not terminal_delivered:
-                logger.warning("lark-channel 编程卡片终态投递失败，改发文本结果")
-                prog_session.abort()
-                if final_response:
-                    self.reply_text(message_id, final_response)
+            heartbeat_stop.set()
+            if heartbeat is not None:
+                heartbeat.join(timeout=2)
+            if prog_session is not None:
+                terminal_delivered = (
+                    prog_session.wait_delivery_idle(delivery_timeout)
+                    and prog_session.terminal_delivery_succeeded()
+                )
+                if not terminal_delivered:
+                    logger.warning("lark-channel 编程卡片终态投递失败，改发文本结果")
+                    prog_session.abort()
+                    if final_response:
+                        self.reply_text(message_id, final_response)
+
+        if prog_session is None:
+            if terminal_exception is not None:
+                title = (
+                    UI_TEXT["mode_exec_timeout_title"]
+                    if prompt_stop_reason == "timeout"
+                    else UI_TEXT["mode_exec_exception_title"]
+                )
+                _msg_type, content = SystemBuilder.build_error_card(
+                    terminal_exception,
+                    title=title,
+                    project=project,
+                )
+                self.reply_card(message_id, content)
+            else:
+                title_key = {
+                    PromptOutcome.COMPLETED: "mode_exec_complete",
+                    PromptOutcome.CANCELLED: "mode_exec_cancelled_title",
+                    PromptOutcome.INCOMPLETE: "mode_exec_incomplete_title",
+                }[prompt_outcome]
+                response_with_dir = (
+                    f"{final_response}\n\n---\n"
+                    f"{UI_TEXT['mode_working_dir_label'].format(path=global_working_dir)}"
+                )
+                if image_failures[0]:
+                    response_with_dir += "\n\n🖼️ 部分图片产物暂时无法展示。"
+                if image_keys:
+                    _msg_type, content = ProjectBuilder.build_project_response_card(
+                        project,
+                        f"{self.mode_name} · {UI_TEXT[title_key]}",
+                        response_with_dir,
+                        show_buttons=bool(project),
+                        image_keys=image_keys,
+                    )
+                    self.reply_card(message_id, content)
+                else:
+                    self.reply_text(message_id, response_with_dir)
+                if prompt_outcome is PromptOutcome.COMPLETED:
+                    self.add_reaction(message_id, EmojiHook.SUCCESS_EMOJI_DEFAULT)
 
         logger.info(
             "%s ACP输出结束: outcome=%s, stop_reason=%s, 事件数=%d, 最终长度=%d",
@@ -1355,7 +1341,6 @@ class ProgrammingModeHandler(BaseHandler):
             len(final_response),
         )
 
-        # Post-processing (non-critical, must not block emoji reaction)
         try:
             if project:
                 final_session = active_session[0]
@@ -1397,199 +1382,20 @@ class ProgrammingModeHandler(BaseHandler):
         *, _repo_lock_mgr=None, _root_path: str | None = None,
         _finalization_task_text: str | None = None,
     ):
-        """Fallback: handle response in non-streaming text mode."""
-        timeout = self.settings.coco_execution_timeout if self.is_coco else self.settings.claude_execution_timeout
-        from ...thread import get_current_thread_id
-
-        thread_id = get_current_thread_id()
+        """Run the same automatic pipeline through the text/card fallback."""
         cwd = project.root_path if project else global_working_dir
-        active_session = [session]
-        retirement_completed = [False]
-
-        def _replace_dead_session(startup_budget_s: float) -> SyncSession:
-            replacement = self._replace_timed_out_session(
-                chat_id=chat_id,
-                project=project,
-                cwd=cwd,
-                thread_id=thread_id,
-                timed_out_session=active_session[0],
-                startup_budget_s=startup_budget_s,
-            )
-            active_session[0] = replacement
-            return replacement
-
-        def _retire_session(
-            active: SyncSession,
-            retirement_budget_s: float = 0.001,
-        ) -> None:
-            if retirement_completed[0]:
-                return
-            try:
-                setattr(active, "_force_dead", True)
-            except Exception:
-                logger.warning("failed to poison-mark timed-out ACP session")
-            self._retire_finalization_session(
-                chat_id=chat_id,
-                project=project,
-                thread_id=thread_id,
-                active_session=active,
-                retirement_budget_s=retirement_budget_s,
-            )
-            retirement_completed[0] = True
-
-        # Heartbeat
-        from ...repo_lock import get_repo_lock_heartbeat_interval
-
-        _TOUCH_INTERVAL = get_repo_lock_heartbeat_interval(_repo_lock_mgr)
-        _hb_stop = threading.Event()
-        from ...tasking import get_current_task_run_id
-
-        _repo_lock_owner_id = get_current_task_run_id()
-
-        if _repo_lock_mgr and _root_path:
-            from ...utils.heartbeat import RepoLockHeartbeat
-            _hb = RepoLockHeartbeat(
-                _hb_stop,
-                lambda: _repo_lock_mgr.touch(
-                    _root_path,
-                    chat_id,
-                    owner_id=_repo_lock_owner_id,
-                ),
-                interval=_TOUCH_INTERVAL,
-                name=f"prog-nonstream-{_root_path}",
-            )
-            _hb.start()
-        else:
-            _hb = None
-
-        try:
-            renderer = ACPEventRenderer()
-            image_keys: list[str] = []
-            seen_image_ids: set[str] = set()
-            image_failures = [0]
-
-            def on_event(event):
-                from ...acp.models import ACPEventType
-
-                if event.event_type is ACPEventType.IMAGE_CHUNK:
-                    image = event.image
-                    if image is None or image.image_id in seen_image_ids:
-                        return
-                    seen_image_ids.add(image.image_id)
-                    image_key = self.upload_acp_image(image)
-                    if image_key:
-                        image_keys.append(image_key)
-                    else:
-                        image_failures[0] += 1
-                    return
-                renderer.process_event(event)
-
-            execution = run_prompt_with_continuation(
-                session,
-                text,
-                on_event=on_event,
-                timeout_s=timeout,
-                finalization_reserve_s=_configured_finalization_reserve(
-                    self.settings
-                ),
-                finalization_task_text=_finalization_task_text,
-                on_finalization_start=lambda: logger.warning(
-                    "%s ACP任务进入安全收尾阶段: total_timeout=%ss reserve=%ss",
-                    self.mode_name,
-                    timeout,
-                    _configured_finalization_reserve(self.settings),
-                ),
-                replace_dead_session=_replace_dead_session,
-                retire_finalization_session=_retire_session,
-            )
-            result = execution.result
-            assessment = execution.assessment
-            _log_prompt_execution(self.mode_name, execution)
-            final_response = (
-                (getattr(result, "text", None) or "").strip()
-                or renderer.get_final_content()
-            )
-            if assessment.outcome is PromptOutcome.COMPLETED:
-                final_response = final_response or UI_TEXT["mode_exec_complete"]
-                response_title = f"{self.mode_name} · {UI_TEXT['mode_exec_complete']}"
-            elif assessment.outcome is PromptOutcome.CANCELLED:
-                final_response = _append_execution_notice(
-                    final_response,
-                    UI_TEXT["mode_exec_cancelled_msg"].format(
-                        reason=assessment.detail,
-                    ),
-                )
-                response_title = (
-                    f"{self.mode_name} · {UI_TEXT['mode_exec_cancelled_title']}"
-                )
-            elif execution.awaiting_user_input:
-                final_response = _append_execution_notice(
-                    final_response,
-                    UI_TEXT["mode_exec_waiting_msg"].format(
-                        reason=assessment.detail,
-                    ),
-                )
-                response_title = (
-                    f"{self.mode_name} · {UI_TEXT['mode_exec_waiting_title']}"
-                )
-            else:
-                final_response = _append_execution_notice(
-                    final_response,
-                    _incomplete_notice(execution),
-                )
-                response_title = (
-                    f"{self.mode_name} · {UI_TEXT['mode_exec_incomplete_title']}"
-                )
-            response_with_dir = f"{final_response}\n\n---\n{UI_TEXT['mode_working_dir_label'].format(path=global_working_dir)}"
-            if image_failures[0]:
-                response_with_dir += "\n\n🖼️ 部分图片产物暂时无法展示。"
-            if image_keys:
-                _, card_content = CardBuilder.build_project_response_card(
-                    project,
-                    response_title,
-                    response_with_dir,
-                    show_buttons=bool(project),
-                    image_keys=image_keys,
-                )
-                self.reply_card(message_id, card_content)
-            else:
-                self.reply_text(message_id, response_with_dir)
-            if assessment.outcome is PromptOutcome.COMPLETED:
-                self.add_reaction(
-                    message_id,
-                    EmojiHook.SUCCESS_EMOJI_DEFAULT,
-                )
-        except TimeoutError as e:
-            try:
-                _retire_session(active_session[0])
-            except Exception:
-                logger.error(
-                    "%s ACP超时会话退休失败；会话已标记为不可复用",
-                    self.mode_name,
-                    exc_info=True,
-                )
-            log_exception(logger, f"{self.mode_name} ACP执行超时", e, level=logging.WARNING)
-            msg_type, content = CardBuilder.build_error_card(e, title=UI_TEXT["mode_exec_timeout_title"], project=project)
-            self.reply_card(message_id, content)
-        except Exception as e:
-            if (
-                getattr(active_session[0], "_force_dead", False) is True
-                and not retirement_completed[0]
-            ):
-                try:
-                    _retire_session(active_session[0])
-                except Exception:
-                    logger.error(
-                        "%s ACP安全收尾会话退休失败",
-                        self.mode_name,
-                        exc_info=True,
-                    )
-            msg_type, content = CardBuilder.build_error_card(e, title=UI_TEXT["mode_exec_exception_title"], project=project)
-            self.reply_card(message_id, content)
-        finally:
-            _hb_stop.set()
-            if _hb is not None:
-                _hb.join(timeout=2)
+        self._execute_programming_response(
+            message_id,
+            chat_id,
+            text,
+            session,
+            project,
+            cwd,
+            global_working_dir,
+            _repo_lock_mgr=_repo_lock_mgr,
+            _root_path=_root_path,
+            _finalization_task_text=_finalization_task_text,
+        )
 
     # ------------------------------------------------------------------
     # show_info
@@ -1602,7 +1408,7 @@ class ProgrammingModeHandler(BaseHandler):
         info = self._get_session_manager().get_session_info(chat_id, project_id=project_id, thread_id=thread_id)
         if info:
             if project:
-                msg_type, card_content = CardBuilder.build_project_response_card(
+                msg_type, card_content = ProjectBuilder.build_project_response_card(
                     project,
                     UI_TEXT["mode_session_info_title"].format(name=self.mode_name),
                     info,
@@ -1624,18 +1430,6 @@ class ProgrammingModeHandler(BaseHandler):
             project = self.project_manager.get_project_for_chat(project_id, chat_id)
             if project:
                 self.project_manager.set_active_project(chat_id, project_id)
-
-                snapshot = self._get_snapshot(project)
-                if snapshot and snapshot.is_resumable:
-                    msg_type, card_content = CardBuilder._build_resume_card(
-                        project,
-                        self.mode_key,
-                    )
-                    response_id = self.reply_card(message_id, card_content)
-                    if response_id:
-                        self.register_message_project(response_id, project)
-                    return
-
                 self.enter_mode(message_id, chat_id, project=project)
                 return
 
@@ -1650,108 +1444,6 @@ class ProgrammingModeHandler(BaseHandler):
             self.exit_mode(message_id, chat_id, project=project)
             return
         self.exit_mode(message_id, chat_id)
-
-    def handle_card_resume(self, message_id: str, chat_id: str, project_id: str, session_id: str):
-        from ...thread import get_current_thread_id
-
-        thread_id = get_current_thread_id()
-        project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else None
-        pid = project.project_id if project else None
-        if project:
-            self.project_manager.set_active_project(chat_id, project_id)
-
-        self.add_reaction(message_id, EmojiReaction.on_coco_enter())
-
-        previous_mode = self.mode_manager.get_mode(chat_id)
-
-        cwd = project.root_path if project else self.get_working_dir(chat_id)
-        if self._uses_claude_cli():
-            # Claude resume: start_session with session_id, set resumed
-            try:
-                agent_type_override = self._get_agent_type_override(project)
-                model_name = self._get_model_name_override(project)
-                session = self.ctx.claude_manager.start_session(
-                    chat_id,
-                    cwd=cwd,
-                    session_id=session_id,
-                    project_id=pid,
-                    agent_type_override=agent_type_override,
-                    model_name=model_name,
-                    thread_id=thread_id,
-                )
-            except Exception as e:
-                self.send_error_card(
-                    chat_id,
-                    e,
-                    title=UI_TEXT["mode_resume_fail_title"].format(name="Claude"),
-                    origin_message_id=message_id,
-                )
-                return
-            session.is_resumed = True
-
-            if thread_id and project:
-                self._register_thread_context(thread_id, chat_id, project, session)
-            if not thread_id:
-                self._enter_mode_on_manager(chat_id, project_id=pid)
-        else:
-            try:
-                agent_type_override = self._get_agent_type_override(project)
-                model_name = self._get_model_name_override(project)
-                session = self._get_session_manager().start_session(
-                    chat_id,
-                    cwd=cwd,
-                    session_id=session_id,
-                    project_id=pid,
-                    agent_type_override=agent_type_override,
-                    model_name=model_name,
-                    thread_id=thread_id,
-                )
-            except Exception as e:
-                self.send_error_card(
-                    chat_id,
-                    e,
-                    title=UI_TEXT["mode_resume_fail_title"].format(name=self.mode_name),
-                    origin_message_id=message_id,
-                )
-                return
-            if thread_id and project:
-                self._register_thread_context(thread_id, chat_id, project, session)
-            if not thread_id:
-                self._enter_mode_on_manager(chat_id, project_id=pid)
-
-        if project:
-            if not thread_id:
-                self._deactivate_other_project_modes(project)
-                self._set_mode_on_project(project, True, session_id)
-            self.record_mode_transition(
-                project.project_id,
-                previous_mode,
-                self._get_interaction_mode(),
-                reason=f"resume_{self.mode_name.lower()}_session",
-                chat_id=chat_id,
-            )
-            content = UI_TEXT["mode_resume_card_content"].format(name=self.mode_name, session_id=session_id)
-            msg_type, card_content = CardBuilder.build_project_response_card(
-                project,
-                UI_TEXT["mode_resume_card_title"].format(name=self.mode_name),
-                content,
-                show_buttons=True,
-            )
-            response_id = self.reply_card(message_id, card_content)
-            if response_id:
-                self.register_message_project(response_id, project)
-        else:
-            self.reply_text(message_id, UI_TEXT["mode_resume_no_project_msg"].format(name=self.mode_name, session_id=session_id))
-
-    def handle_card_new(self, message_id: str, chat_id: str, project_id: str, value: Optional[dict] = None):
-        project = self.project_manager.get_project_for_chat(project_id, chat_id) if project_id else None
-        if project:
-            self.project_manager.set_active_project(chat_id, project_id)
-            self._clear_snapshot_on_project(project)
-            self.enter_mode(message_id, chat_id, project=project)
-            return
-        self.enter_mode(message_id, chat_id)
-
 
 # ======================================================================
 # Concrete subclasses
