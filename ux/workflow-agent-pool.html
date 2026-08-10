@@ -76,6 +76,48 @@
       text-transform: none;
     }
 
+    .preview-switcher {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin: 0 0 14px;
+      padding: 4px;
+      border: 1px solid rgba(15, 118, 110, 0.18);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.74);
+      box-shadow: 0 10px 32px rgba(15, 48, 45, 0.07);
+      backdrop-filter: blur(12px);
+    }
+
+    .preview-switch {
+      min-height: 34px;
+      padding: 0 14px;
+      border: 0;
+      border-radius: 999px;
+      background: transparent;
+      color: #58706d;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 760;
+      letter-spacing: 0.02em;
+      cursor: pointer;
+      transition: color 160ms ease, background 160ms ease, transform 160ms ease;
+    }
+
+    .preview-switch:hover {
+      color: #124f49;
+    }
+
+    .preview-switch:active {
+      transform: scale(0.97);
+    }
+
+    .preview-switch.active {
+      color: #fff;
+      background: #146d64;
+      box-shadow: 0 4px 12px rgba(20, 109, 100, 0.2);
+    }
+
     .workflow-card {
       overflow: hidden;
       border: 1px solid rgba(180, 207, 201, 0.75);
@@ -575,6 +617,309 @@
       cursor: not-allowed;
     }
 
+    .generation-state[hidden] {
+      display: none;
+    }
+
+    .generation-state {
+      display: grid;
+      gap: 16px;
+      animation: generation-enter 220ms ease-out both;
+    }
+
+    @keyframes generation-enter {
+      from {
+        opacity: 0;
+        transform: translateY(6px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .generation-banner {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 13px;
+      padding: 17px 18px;
+      border: 1px solid rgba(20, 109, 100, 0.19);
+      border-radius: 16px;
+      background:
+        radial-gradient(circle at 92% 0%, rgba(44, 167, 151, 0.14), transparent 42%),
+        linear-gradient(135deg, #f7fffd 0%, #eef8f5 100%);
+    }
+
+    .generation-loader {
+      width: 34px;
+      height: 34px;
+      border: 3px solid rgba(20, 109, 100, 0.16);
+      border-top-color: #168477;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+
+    .generation-kicker,
+    .generation-label {
+      display: block;
+      margin: 0 0 4px;
+      color: #64807c;
+      font-size: 10px;
+      font-weight: 820;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .generation-banner h2 {
+      margin: 0;
+      color: #123d39;
+      font-family: "Noto Serif SC", "Songti SC", Georgia, serif;
+      font-size: 20px;
+      line-height: 1.3;
+    }
+
+    .generation-banner p {
+      margin: 5px 0 0;
+      color: #617572;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .readonly-badge {
+      align-self: start;
+      padding: 6px 9px;
+      border: 1px solid rgba(20, 109, 100, 0.16);
+      border-radius: 999px;
+      color: #27645e;
+      background: rgba(255, 255, 255, 0.72);
+      font-size: 10px;
+      font-weight: 780;
+      white-space: nowrap;
+    }
+
+    .generation-task {
+      padding: 13px 15px;
+      border-left: 3px solid #e1a848;
+      border-radius: 4px 12px 12px 4px;
+      background: #fffaf0;
+    }
+
+    .generation-task p {
+      margin: 0;
+      color: #344c49;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .generation-summary-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(180px, 0.65fr);
+      gap: 10px;
+    }
+
+    .generation-fact {
+      min-width: 0;
+      padding: 13px 14px;
+      border: 1px solid #dfeae7;
+      border-radius: 13px;
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .generation-fact strong {
+      display: block;
+      overflow: hidden;
+      color: #1c4641;
+      font-size: 13px;
+      line-height: 1.5;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .generation-section {
+      overflow: hidden;
+      border: 1px solid #dce9e6;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.66);
+    }
+
+    .generation-section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 11px 14px;
+      border-bottom: 1px solid #e5eeec;
+      color: #2f504c;
+      font-size: 11px;
+      font-weight: 780;
+    }
+
+    .generation-pool-list {
+      display: grid;
+    }
+
+    .generation-agent-row {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 11px 14px;
+      border-bottom: 1px solid #edf2f1;
+    }
+
+    .generation-agent-row:last-child {
+      border-bottom: 0;
+    }
+
+    .generation-agent-id {
+      color: #116d63;
+      font-size: 12px;
+      font-weight: 850;
+    }
+
+    .generation-agent-binding {
+      min-width: 0;
+      overflow: hidden;
+      color: #294945;
+      font-size: 12px;
+      font-weight: 720;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .generation-agent-meta {
+      padding: 4px 7px;
+      border-radius: 7px;
+      color: #627773;
+      background: #f1f6f5;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 9px;
+      white-space: nowrap;
+    }
+
+    .generation-stages {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 7px;
+    }
+
+    .generation-stage {
+      position: relative;
+      min-height: 64px;
+      padding: 10px;
+      border: 1px solid #e1eae8;
+      border-radius: 11px;
+      color: #748480;
+      background: #f8faf9;
+      font-size: 10px;
+      line-height: 1.4;
+    }
+
+    .generation-stage b {
+      display: block;
+      margin-bottom: 5px;
+      color: inherit;
+      font-size: 9px;
+      letter-spacing: 0.08em;
+    }
+
+    .generation-stage.done {
+      color: #47716b;
+      background: #f0f7f5;
+    }
+
+    .generation-stage.current {
+      border-color: rgba(20, 109, 100, 0.32);
+      color: #155e56;
+      background: #eaf6f3;
+      box-shadow: inset 0 3px 0 #168477;
+    }
+
+    .current-activity {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 13px;
+      padding: 17px;
+      border: 1px solid rgba(20, 109, 100, 0.32);
+      border-radius: 16px;
+      background: #123f3a;
+      box-shadow: 0 15px 34px rgba(18, 63, 58, 0.16);
+    }
+
+    .activity-beacon {
+      position: relative;
+      width: 10px;
+      height: 10px;
+      margin-top: 5px;
+      border-radius: 50%;
+      background: #64dfca;
+      box-shadow: 0 0 0 5px rgba(100, 223, 202, 0.13);
+    }
+
+    .current-activity .generation-label {
+      color: #8ac7bd;
+    }
+
+    .current-activity strong {
+      display: block;
+      color: #fff;
+      font-size: 14px;
+      line-height: 1.4;
+    }
+
+    .current-activity p {
+      margin: 5px 0 0;
+      color: #c6ddd9;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .generation-wait {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: #6c7c79;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 10px;
+    }
+
+    .generation-wait strong {
+      color: #31534f;
+      font-weight: 750;
+    }
+
+    @media (max-width: 700px) {
+      .generation-banner {
+        grid-template-columns: auto minmax(0, 1fr);
+      }
+
+      .readonly-badge {
+        grid-column: 2;
+        justify-self: start;
+      }
+
+      .generation-summary-grid,
+      .generation-stages {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .generation-agent-row {
+        grid-template-columns: 36px minmax(0, 1fr);
+      }
+
+      .generation-agent-meta {
+        grid-column: 2;
+        justify-self: start;
+      }
+
+      .generation-wait {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+
     .footer {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -786,6 +1131,11 @@
       <span>Agent pool selection</span>
     </div>
 
+    <nav class="preview-switcher" aria-label="预览状态">
+      <button class="preview-switch active" type="button" data-preview-state="selection" aria-selected="true">选择态</button>
+      <button class="preview-switch" type="button" data-preview-state="generation" aria-selected="false">生成态</button>
+    </nav>
+
     <article class="workflow-card" aria-labelledby="page-title">
       <header class="hero">
         <div class="hero-mark" aria-hidden="true">WF</div>
@@ -874,11 +1224,6 @@
           </div>
         </section>
 
-        <div class="run-state" id="runState" role="status">
-          <span class="spinner" aria-hidden="true"></span>
-          <span>Agent 池已锁定。正在自动生成并验证 Workflow，无需第二次确认。</span>
-        </div>
-
         <footer class="footer">
           <div class="footer-note">
             <strong id="footerSummary">将以 3 个 Agent、自动编排器开始</strong>
@@ -886,6 +1231,63 @@
           </div>
           <button class="primary-action" id="startWorkflow" type="button">使用此池开始编排</button>
         </footer>
+
+        <section class="generation-state" id="generationState" aria-labelledby="generationTitle" aria-live="polite" hidden>
+          <div class="generation-banner">
+            <span class="generation-loader" aria-hidden="true"></span>
+            <div>
+              <span class="generation-kicker">Pool locked · read only</span>
+              <h2 id="generationTitle">生成并验证编排脚本</h2>
+              <p>池和主编排 Agent 已冻结，验证通过后将自动执行，无需再次确认。</p>
+            </div>
+            <span class="readonly-badge">只读 · 无需操作</span>
+          </div>
+
+          <div class="generation-task">
+            <span class="generation-label">任务摘要</span>
+            <p id="generationTaskSummary"></p>
+          </div>
+
+          <div class="generation-summary-grid">
+            <div class="generation-fact">
+              <span class="generation-label">主编排 Agent</span>
+              <strong id="generationOrchestrator"></strong>
+            </div>
+            <div class="generation-fact">
+              <span class="generation-label">当前阶段</span>
+              <strong>2 / 4 · 生成脚本</strong>
+            </div>
+          </div>
+
+          <section class="generation-section" aria-labelledby="generationPoolTitle">
+            <header class="generation-section-head">
+              <span id="generationPoolTitle">已锁定 Agent Pool</span>
+              <span id="generationPoolCount"></span>
+            </header>
+            <div class="generation-pool-list" id="generationPoolList"></div>
+          </section>
+
+          <div class="generation-stages" aria-label="Workflow 阶段">
+            <div class="generation-stage done"><b>01 · 完成</b>锁定 Agent Pool</div>
+            <div class="generation-stage current"><b>02 · 当前</b>生成编排脚本</div>
+            <div class="generation-stage"><b>03 · 等待</b>安全与结构验证</div>
+            <div class="generation-stage"><b>04 · 等待</b>执行 Workflow</div>
+          </div>
+
+          <article class="current-activity">
+            <span class="activity-beacon" aria-hidden="true"></span>
+            <div>
+              <span class="generation-label">唯一当前活动</span>
+              <strong id="generationActivityAgent"></strong>
+              <p>正在根据需求生成受已确认 Agent Pool 约束的 Workflow 脚本</p>
+            </div>
+          </article>
+
+          <div class="generation-wait">
+            <strong id="generationWaitTime">已等待 00:00</strong>
+            <span>activity idle 120s · hard deadline 600s</span>
+          </div>
+        </section>
       </div>
     </article>
   </main>
@@ -921,7 +1323,20 @@
       var orchestratorBadge = document.getElementById("orchestratorBadge");
       var footerSummary = document.getElementById("footerSummary");
       var startWorkflow = document.getElementById("startWorkflow");
-      var runState = document.getElementById("runState");
+    var generationState = document.getElementById("generationState");
+    var generationTaskSummary = document.getElementById("generationTaskSummary");
+    var generationOrchestrator = document.getElementById("generationOrchestrator");
+    var generationPoolList = document.getElementById("generationPoolList");
+    var generationPoolCount = document.getElementById("generationPoolCount");
+    var generationActivityAgent = document.getElementById("generationActivityAgent");
+    var generationWaitTime = document.getElementById("generationWaitTime");
+    var previewSwitches = document.querySelectorAll("[data-preview-state]");
+    var selectionNodes = Array.prototype.filter.call(
+      document.querySelector(".content").children,
+      function (node) { return node !== generationState; }
+    );
+    var generationStartedAt = null;
+    var generationTimer = null;
 
       function getTool(key) {
         return catalog.filter(function (tool) { return tool.key === key; })[0];
@@ -1094,19 +1509,126 @@
 
       memberSelect.addEventListener("change", updateSummary);
 
-      startWorkflow.addEventListener("click", function () {
-        if (!pool.length) {
-          return;
-        }
-        runState.classList.add("visible");
-        startWorkflow.textContent = "Agent 池已锁定";
-        startWorkflow.disabled = true;
-        document.querySelectorAll("button, select, input").forEach(function (control) {
-          if (control !== startWorkflow) {
-            control.disabled = true;
-          }
-        });
+    function generationProfile(agent, index) {
+      return agent.profile || (index === 0 ? "balanced" : "default");
+    }
+
+    function generationEffort(agent, index) {
+      if (agent.effort) {
+        return agent.effort;
+      }
+      if (agent.tool === "codex") {
+        return index === 0 ? "high" : "medium";
+      }
+      return "adaptive";
+    }
+
+    function getGenerationOrchestrator() {
+      var fixed = pool.find(function (agent) {
+        return agent.id === memberSelect.value;
       });
+      return fixed || pool[0] || null;
+    }
+
+    function appendGenerationAgent(agent, index) {
+      var row = document.createElement("div");
+      var id = document.createElement("span");
+      var binding = document.createElement("span");
+      var profile = document.createElement("span");
+      var effort = document.createElement("span");
+
+      row.className = "generation-agent-row";
+      id.className = "generation-agent-id";
+      binding.className = "generation-agent-binding";
+      profile.className = "generation-agent-meta";
+      effort.className = "generation-agent-meta";
+
+      id.textContent = agent.id;
+      binding.textContent = agent.toolLabel + " / " + agent.model;
+      profile.textContent = "profile: " + generationProfile(agent, index);
+      effort.textContent = "effort: " + generationEffort(agent, index);
+
+      row.appendChild(id);
+      row.appendChild(binding);
+      row.appendChild(profile);
+      row.appendChild(effort);
+      generationPoolList.appendChild(row);
+    }
+
+    function renderGenerationState() {
+      var orchestrator = getGenerationOrchestrator();
+      var taskSource = document.querySelector(".task-strip");
+      var isAuto = memberSelect.disabled;
+
+      generationTaskSummary.textContent = taskSource
+        ? taskSource.textContent.replace(/\s+/g, " ").trim()
+        : "当前 Workflow 需求";
+      generationPoolCount.textContent = pool.length + " / 8 Agents";
+      generationPoolList.innerHTML = "";
+      pool.forEach(appendGenerationAgent);
+
+      if (!orchestrator) {
+        generationOrchestrator.textContent = "未锁定";
+        generationActivityAgent.textContent = "无可用 Agent";
+        return;
+      }
+
+      generationOrchestrator.textContent = (isAuto ? "Auto → " : "指定 · ")
+        + orchestrator.id + " · " + orchestrator.toolLabel + " / " + orchestrator.model;
+      generationActivityAgent.textContent = orchestrator.id + " · "
+        + orchestrator.toolLabel + " / " + orchestrator.model;
+    }
+
+    function updateGenerationWait() {
+      var elapsed = generationStartedAt
+        ? Math.max(0, Math.floor((Date.now() - generationStartedAt) / 1000))
+        : 0;
+      var minutes = String(Math.floor(elapsed / 60)).padStart(2, "0");
+      var seconds = String(elapsed % 60).padStart(2, "0");
+      generationWaitTime.textContent = "已等待 " + minutes + ":" + seconds;
+    }
+
+    function showPreviewState(state) {
+      var showGeneration = state === "generation";
+
+      selectionNodes.forEach(function (node) {
+        node.hidden = showGeneration;
+      });
+      generationState.hidden = !showGeneration;
+      previewSwitches.forEach(function (button) {
+        var isActive = button.dataset.previewState === state;
+        button.classList.toggle("active", isActive);
+        button.setAttribute("aria-selected", String(isActive));
+      });
+
+      if (generationTimer) {
+        window.clearInterval(generationTimer);
+        generationTimer = null;
+      }
+
+      if (showGeneration) {
+        renderGenerationState();
+        if (!generationStartedAt) {
+          generationStartedAt = Date.now();
+        }
+        updateGenerationWait();
+        generationTimer = window.setInterval(updateGenerationWait, 1000);
+      }
+    }
+
+    previewSwitches.forEach(function (button) {
+      button.addEventListener("click", function () {
+        showPreviewState(button.dataset.previewState);
+      });
+    });
+
+    startWorkflow.addEventListener("click", function () {
+      if (!pool.length) {
+        return;
+      }
+      generationStartedAt = Date.now();
+      showPreviewState("generation");
+    });
 
       renderTools();
       renderModels();

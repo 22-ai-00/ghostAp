@@ -54,6 +54,10 @@ class _WorkflowLifecycleOwner:
         default=None,
         compare=False,
     )
+    card_message_id: str | None = field(
+        default=None,
+        compare=False,
+    )
 
 
 class _WorkflowGenerationCancelled(RuntimeError):
@@ -626,6 +630,30 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             model_state=model_state,
         ).render()
 
+    @staticmethod
+    def _workflow_generation_card_data(
+        *,
+        requirement: str,
+        agent_pool: Any,
+        orchestrator_agent_id: str,
+        orchestrator_was_auto: bool,
+        current_activity: str | None = None,
+        elapsed_seconds: int = 0,
+        terminal_status: str | None = None,
+    ) -> dict[str, Any]:
+        from ...workflow_engine.renderer import WorkflowGenerationRenderer
+
+        return WorkflowGenerationRenderer(
+            requirement=requirement,
+            agent_pool=agent_pool,
+            orchestrator_agent_id=orchestrator_agent_id,
+            orchestrator_was_auto=orchestrator_was_auto,
+        ).render(
+            current_activity=current_activity,
+            elapsed_seconds=elapsed_seconds,
+            terminal_status=terminal_status,
+        )
+
     def _start_workflow_agent_selection(
         self,
         message_id: str,
@@ -715,11 +743,23 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             root_path=root_path,
             available_tools=available_tools,
         )
-        self.send_card_to_chat(
+        selection_card_id = self.send_card_to_chat(
             chat_id,
             self._build_workflow_card_from_renderer_data(card_data),
             origin_message_id=message_id,
         )
+        if selection_card_id:
+            with engine._lock:
+                if (
+                    vars(engine).get("_workflow_selection_owner") is admission_owner
+                    and engine.project is not None
+                    and engine.project.status == WorkflowStatus.SELECTING_AGENTS
+                ):
+                    object.__setattr__(
+                        admission_owner,
+                        "card_message_id",
+                        selection_card_id,
+                    )
 
     def handle_workflow_agent_action(
         self,
@@ -1040,8 +1080,32 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             release_owner = getattr(engine, "release_lifecycle_owner", None)
             if callable(release_owner):
                 release_owner(owner)
+            generation_message_id = message_id
+            with generation_owner.delivery_lock:
+                if not self._generation_owner_is_active(engine, generation_owner):
+                    return
+                generation_card_data = self._workflow_generation_card_data(
+                    requirement=pending.requirement or "",
+                    agent_pool=pending.agent_pool,
+                    orchestrator_agent_id=pending.orchestrator_agent_id or "",
+                    orchestrator_was_auto=pending.orchestrator_was_auto,
+                )
+                generation_message_id = (
+                    self._replace_or_send_workflow_rendered_card(
+                        card_message_id=message_id,
+                        chat_id=chat_id,
+                        card_data=generation_card_data,
+                        origin_message_id=self._resolve_origin(message_id),
+                    )
+                    or message_id
+                )
+                object.__setattr__(
+                    generation_owner,
+                    "card_message_id",
+                    generation_message_id,
+                )
             self._schedule_generate_and_start_workflow(
-                message_id=message_id,
+                message_id=generation_message_id,
                 chat_id=chat_id,
                 requirement=pending.requirement or "",
                 project=project,
@@ -1218,8 +1282,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             expected_session_key: str | None = None,
         ) -> None:
             """Generate, validate, adopt registered tools, and start execution."""
-            from ...card.builders.core import CoreBuilder
-            from ...card.ui_text import UI_TEXT
             from ...thread import get_current_sender_id
             from ...workflow_engine.constants import DEFAULT_ORCHESTRATOR_AGENT
             from ...workflow_engine.models import PendingWorkflow, WorkflowStatus
@@ -1386,14 +1448,25 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         return
                     elapsed = int(time.time() - heartbeat_start)
                     status = status_hint or "正在生成编排脚本..."
-                    progress_content = f"{status}\n\n**需求**: {requirement[:200]}\n\n⏱ 已等待 {elapsed} 秒"
-                    progress_card = CoreBuilder._wrap_card(
-                        header_title="🔄 Workflow — 生成脚本中...",
-                        header_template=UI_TEXT["workflow_header_colors"].get("generating", "blue"),
-                        elements=[{"tag": "markdown", "content": progress_content}],
+                    progress_card_data = self._workflow_generation_card_data(
+                        requirement=requirement,
+                        agent_pool=generation_context["agent_pool"],
+                        orchestrator_agent_id=(
+                            generation_context["orchestrator_agent_id"] or ""
+                        ),
+                        orchestrator_was_auto=generation_context[
+                            "orchestrator_was_auto"
+                        ],
+                        current_activity=status,
+                        elapsed_seconds=elapsed,
                     )
                     if gen_msg_id:
-                        self.update_card(gen_msg_id, progress_card)
+                        self.update_card(
+                            gen_msg_id,
+                            self._build_workflow_card_from_renderer_data(
+                                progress_card_data
+                            ),
+                        )
 
             def _heartbeat_loop() -> None:
                 while not owner.stop_event.is_set() and not owner.heartbeat_stop_event.is_set():
@@ -1412,24 +1485,26 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             script_path: str
             meta: dict[str, Any] | None = None
             try:
-                gen_card = CoreBuilder._wrap_card(
-                    header_title="🔄 Workflow — 生成脚本中...",
-                    header_template=UI_TEXT["workflow_header_colors"].get("generating", "blue"),
-                    elements=[
-                        {
-                            "tag": "markdown",
-                            "content": (f"正在基于推荐工具生成并验证编排脚本，请稍候...\n\n**需求**: {requirement[:200]}"),
-                        }
+                gen_card_data = self._workflow_generation_card_data(
+                    requirement=requirement,
+                    agent_pool=generation_context["agent_pool"],
+                    orchestrator_agent_id=(
+                        generation_context["orchestrator_agent_id"] or ""
+                    ),
+                    orchestrator_was_auto=generation_context[
+                        "orchestrator_was_auto"
                     ],
                 )
                 with owner.delivery_lock:
                     if not _owner_can_deliver():
                         return
-                    gen_msg_id = self.send_card_to_chat(
-                        chat_id,
-                        gen_card,
+                    gen_msg_id = self._replace_or_send_workflow_rendered_card(
+                        card_message_id=message_id,
+                        chat_id=chat_id,
+                        card_data=gen_card_data,
                         origin_message_id=origin_message_id,
-                    )
+                    ) or message_id
+                    object.__setattr__(owner, "card_message_id", gen_msg_id)
                 if not _owner_can_deliver():
                     return
 
@@ -1518,14 +1593,61 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 if not started and _owner_can_deliver():
                     raise RuntimeError("Workflow 自动启动失败")
             except _WorkflowGenerationCancelled as exc:
+                safe_error = self._sanitize_generation_error(exc)
                 with owner.delivery_lock:
-                    if _owner_can_deliver():
-                        with engine._lock:
-                            if not self._is_current_generation_session(engine, owner.session_key):
-                                return
+                    with engine._lock:
+                        current_pending = engine.project.pending if engine.project else None
+                        same_session = bool(
+                            current_pending is not None
+                            and current_pending.engine_session_key == owner.session_key
+                        )
+                        owner_is_current = bool(
+                            vars(engine).get("_script_generation_owner") is owner
+                        )
+                        if (
+                            owner_is_current
+                            and same_session
+                            and engine.project.status == WorkflowStatus.GENERATING_SCRIPT
+                        ):
                             engine.project.status = WorkflowStatus.CANCELLED
-                            engine.project.error = self._sanitize_generation_error(exc)
+                            engine.project.error = safe_error
                             engine.project.finished_at = time.time()
+                        should_deliver = bool(
+                            same_session
+                            and engine.project is not None
+                            and engine.project.status == WorkflowStatus.CANCELLED
+                        )
+                    if should_deliver and current_pending is not None:
+                        cancelled_card_data = self._workflow_generation_card_data(
+                            requirement=current_pending.requirement or requirement,
+                            agent_pool=current_pending.agent_pool,
+                            orchestrator_agent_id=(
+                                current_pending.orchestrator_agent_id or ""
+                            ),
+                            orchestrator_was_auto=(
+                                current_pending.orchestrator_was_auto
+                            ),
+                            current_activity=safe_error,
+                            elapsed_seconds=int(time.time() - heartbeat_start),
+                            terminal_status="cancelled",
+                        )
+                        target_message_id = (
+                            gen_msg_id or owner.card_message_id or message_id
+                        )
+                        final_message_id = (
+                            self._replace_or_send_workflow_rendered_card(
+                                card_message_id=target_message_id,
+                                chat_id=chat_id,
+                                card_data=cancelled_card_data,
+                                origin_message_id=origin_message_id,
+                            )
+                            or target_message_id
+                        )
+                        object.__setattr__(
+                            owner,
+                            "card_message_id",
+                            final_message_id,
+                        )
             except Exception as exc:
                 logger.error(
                     "Workflow script generation failed: %s",
@@ -1787,10 +1909,19 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     object.__setattr__(lifecycle_owner, "active_generation_session", None)
                     self._retire_workflow_owner(engine, lifecycle_owner)
                     engine._script_generation_owner = None
-                self._reply_workflow_error(
-                    message_id,
+                error_card = self._build_error_card(
                     "internal_error",
                     detail=f"脚本生成失败: {safe_error}",
+                )
+                try:
+                    origin_message_id = self._resolve_origin(message_id)
+                except Exception:
+                    origin_message_id = message_id
+                self._replace_or_send_workflow_card(
+                    card_message_id=message_id,
+                    chat_id=chat_id,
+                    card=error_card,
+                    origin_message_id=origin_message_id,
                 )
             lifecycle_owner.done_event.set()
             release_owner = getattr(engine, "release_lifecycle_owner", None)
@@ -1816,6 +1947,8 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     expected_session_key=expected_session_key,
                 )
             except _WorkflowGenerationCancelled as exc:
+                cancelled_pending = None
+                should_deliver = False
                 with lifecycle_owner.delivery_lock:
                     with engine._lock:
                         current_pending = engine.project.pending if engine.project else None
@@ -1830,6 +1963,43 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             engine.project.error = self._sanitize_generation_error(exc)
                             engine.project.finished_at = time.time()
                             engine._script_generation_owner = None
+                            cancelled_pending = current_pending
+                            should_deliver = True
+                    if should_deliver and cancelled_pending is not None:
+                        target_message_id = (
+                            lifecycle_owner.card_message_id or message_id
+                        )
+                        cancelled_card_data = self._workflow_generation_card_data(
+                            requirement=cancelled_pending.requirement or requirement,
+                            agent_pool=cancelled_pending.agent_pool,
+                            orchestrator_agent_id=(
+                                cancelled_pending.orchestrator_agent_id or ""
+                            ),
+                            orchestrator_was_auto=(
+                                cancelled_pending.orchestrator_was_auto
+                            ),
+                            current_activity=self._sanitize_generation_error(exc),
+                            terminal_status="cancelled",
+                        )
+                        final_message_id = (
+                            self._replace_or_send_workflow_rendered_card(
+                                card_message_id=target_message_id,
+                                chat_id=chat_id,
+                                card_data=cancelled_card_data,
+                                origin_message_id=message_id,
+                            )
+                            or target_message_id
+                        )
+                        object.__setattr__(
+                            lifecycle_owner,
+                            "card_message_id",
+                            final_message_id,
+                        )
+                if should_deliver:
+                    lifecycle_owner.done_event.set()
+                    release_owner = getattr(engine, "release_lifecycle_owner", None)
+                    if callable(release_owner):
+                        release_owner(lifecycle_owner)
             except Exception as exc:
                 logger.error("Workflow script generation task failed: %s", exc, exc_info=True)
                 fail_once(exc)
@@ -2058,6 +2228,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         admin_ids: list[str] = getattr(self.ctx.settings, "admin_user_ids", []) or []
         error: tuple[str, str] | None = None
         delivery_owners: list[_WorkflowLifecycleOwner] = []
+        cancel_card_message_ids: list[str] = []
         sessions_to_close: list[tuple[_WorkflowLifecycleOwner, Any]] = []
         artifacts_to_remove: list[str] = []
         runtime_active = False
@@ -2147,6 +2318,14 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     )
                     if lifecycle_owner not in delivery_owners:
                         delivery_owners.append(lifecycle_owner)
+                    if (
+                        lifecycle_owner.card_message_id
+                        and lifecycle_owner.card_message_id
+                        not in cancel_card_message_ids
+                    ):
+                        cancel_card_message_ids.append(
+                            lifecycle_owner.card_message_id
+                        )
                     active_session = lifecycle_owner.active_generation_session
                     if active_session is not None and not any(
                         existing_session is active_session
@@ -2263,6 +2442,24 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             if callable(release_owner):
                 release_owner(lifecycle_owner)
 
+        if not runtime_active and pending is not None and cancel_card_message_ids:
+            cancelled_card_data = self._workflow_generation_card_data(
+                requirement=pending.requirement or "",
+                agent_pool=pending.agent_pool,
+                orchestrator_agent_id=pending.orchestrator_agent_id or "",
+                orchestrator_was_auto=pending.orchestrator_was_auto,
+                current_activity="Workflow 任务已由用户停止",
+                terminal_status="cancelled",
+            )
+            for card_message_id in cancel_card_message_ids:
+                self._replace_or_send_workflow_rendered_card(
+                    card_message_id=card_message_id,
+                    chat_id=chat_id,
+                    card_data=cancelled_card_data,
+                    origin_message_id=message_id,
+                    fallback_to_new=False,
+                )
+
         for artifact in dict.fromkeys(artifacts_to_remove):
             self._remove_owned_workflow_artifact(
                 artifact,
@@ -2342,12 +2539,37 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             vars(engine).get("_script_generation_owner") is generation_owner
                             and not generation_owner.stop_event.is_set()
                         )
-                    if owner_is_current:
-                        self._reply_workflow_error(
-                            message_id,
-                            category,
-                            detail=detail,
-                        )
+                    if not owner_is_current:
+                        return
+                    safe_error = self._sanitize_generation_error(
+                        detail or f"Workflow 自动启动失败: {category}"
+                    )
+                    with engine._lock:
+                        if (
+                            vars(engine).get("_script_generation_owner")
+                            is not generation_owner
+                            or generation_owner.stop_event.is_set()
+                        ):
+                            return
+                        engine.project.status = WorkflowStatus.FAILED
+                        engine.project.error = safe_error
+                        engine.project.finished_at = time.time()
+                    error_card = self._build_error_card(
+                        category,
+                        detail=safe_error,
+                    )
+                    try:
+                        origin_message_id = self._resolve_origin(message_id)
+                    except Exception:
+                        origin_message_id = message_id
+                    self._replace_or_send_workflow_card(
+                        card_message_id=(
+                            generation_owner.card_message_id or message_id
+                        ),
+                        chat_id=chat_id,
+                        card=error_card,
+                        origin_message_id=origin_message_id,
+                    )
 
             with engine._lock:
                 current_project = engine.project
@@ -2487,6 +2709,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 chat_id=chat_id,
                 project_id=pending.project_id or "",
                 root_path=root_path,
+                card_message_id=message_id,
                 stop_event=generation_owner.stop_event,
                 heartbeat_stop_event=generation_owner.heartbeat_stop_event,
                 delivery_lock=generation_owner.delivery_lock,

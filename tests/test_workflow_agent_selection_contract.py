@@ -427,3 +427,111 @@ def test_action_registry_wires_all_selection_actions() -> None:
         actions[action] is workflow.handle_workflow_agent_action
         for action in _SELECTION_ACTIONS
     )
+
+
+def _workflow_card_nodes(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _workflow_card_nodes(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _workflow_card_nodes(child)
+
+
+def test_generation_renderer_is_read_only_and_shows_complete_agent_bindings() -> None:
+    from src.workflow_engine.renderer import WorkflowGenerationRenderer
+
+    pool = (
+        WorkflowAgentBinding(
+            agent_id="A1",
+            tool_name="codex",
+            model_name="gpt-5.6-sol",
+            display_name="OpenAI Codex",
+            profile="standard",
+            effort="high",
+        ),
+        WorkflowAgentBinding(
+            agent_id="A2",
+            tool_name="traex",
+            model_name="openrouter-3o/max/xhigh",
+            display_name="TRAE CLI",
+            profile="max",
+            effort="xhigh",
+        ),
+    )
+    card = WorkflowGenerationRenderer(
+        requirement="精简免费模式的安装流程",
+        agent_pool=pool,
+        orchestrator_agent_id="A2",
+        orchestrator_was_auto=True,
+    ).render(
+        current_activity="A2 正在生成并验证 Workflow 脚本",
+        elapsed_seconds=73,
+    )
+    serialized = json.dumps(card, ensure_ascii=False)
+    nodes = list(_workflow_card_nodes(card))
+    markdown = "\n".join(
+        str(node.get("content") or "")
+        for node in nodes
+        if node.get("tag") == "markdown"
+    )
+
+    for expected in (
+        "精简免费模式的安装流程",
+        "Auto → A2",
+        "A1",
+        "A2",
+        "codex",
+        "traex",
+        "gpt-5.6-sol",
+        "standard",
+        "high",
+        "openrouter-3o",
+        "max",
+        "xhigh",
+        "73 秒",
+    ):
+        assert expected in serialized
+    assert serialized.count("A2 正在生成并验证 Workflow 脚本") == 1
+    assert "openrouter-3o/max/xhigh" not in markdown
+    assert markdown.count("openrouter-3o") == 1
+    assert markdown.count("`max`") == 1
+    assert markdown.count("`xhigh`") == 1
+    assert not any(node.get("tag") in {"select_static", "button"} for node in nodes)
+    assert not any("behaviors" in node or "value" in node for node in nodes)
+
+
+def test_confirm_replaces_selection_card_and_propagates_fallback_message_id(tmp_path) -> None:
+    for patch_ok, replacement_id, expected_id in (
+        (True, None, "selection-card"),
+        (False, "generation-card", "generation-card"),
+    ):
+        handler, engine, project = _selection_context(tmp_path)
+        engine.project.pending.agent_pool = (
+            _binding("A1", "fast"),
+            _binding("A2", "deep"),
+        )
+        handler.update_card.return_value = patch_ok
+        handler.send_card_to_chat.return_value = replacement_id
+        handler.update_card.reset_mock()
+        handler.send_card_to_chat.reset_mock()
+
+        _act(handler, project, "workflow_confirm_agents")
+
+        handler.update_card.assert_called_once()
+        assert handler.update_card.call_args.args[0] == "selection-card"
+        rendered = handler.update_card.call_args.args[1]
+        rendered_nodes = list(_workflow_card_nodes(rendered))
+        assert not any(
+            node.get("tag") in {"select_static", "button"}
+            for node in rendered_nodes
+        )
+        if patch_ok:
+            handler.send_card_to_chat.assert_not_called()
+        else:
+            handler.send_card_to_chat.assert_called_once()
+        assert (
+            handler._schedule_generate_and_start_workflow.call_args.kwargs["message_id"]
+            == expected_id
+        )

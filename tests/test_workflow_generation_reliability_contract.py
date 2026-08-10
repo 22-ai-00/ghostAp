@@ -459,6 +459,9 @@ def test_three_generation_failures_commit_failed_and_emit_one_error_card(tmp_pat
     handler._generate_and_start_workflow = MagicMock(
         side_effect=RuntimeError("token=super-secret exhausted after 3 attempts")
     )
+    handler._build_error_card = MagicMock(return_value={"schema": "2.0", "body": {"elements": []}})
+    handler.update_card = MagicMock(return_value=True)
+    handler.send_card_to_chat = MagicMock()
     handler._reply_workflow_error = MagicMock()
 
     handler._schedule_generate_and_start_workflow(
@@ -481,7 +484,10 @@ def test_three_generation_failures_commit_failed_and_emit_one_error_card(tmp_pat
     assert engine.project.finished_at is not None
     assert engine.project.error
     assert "super-secret" not in engine.project.error
-    assert handler._reply_workflow_error.call_count == 1
+    handler.update_card.assert_called_once()
+    assert handler.update_card.call_args.args[0] == "origin-1"
+    handler.send_card_to_chat.assert_not_called()
+    handler._reply_workflow_error.assert_not_called()
 
 
 def test_scheduler_pre_callback_failure_reconciles_generation_once(tmp_path) -> None:
@@ -497,6 +503,9 @@ def test_scheduler_pre_callback_failure_reconciles_generation_once(tmp_path) -> 
         error="run guard failed",
     )
     handler._submit_engine_task = MagicMock(return_value=SimpleNamespace(run_id="run-1"))
+    handler._build_error_card = MagicMock(return_value={"schema": "2.0", "body": {"elements": []}})
+    handler.update_card = MagicMock(return_value=True)
+    handler.send_card_to_chat = MagicMock()
     handler._reply_workflow_error = MagicMock()
 
     handler._schedule_generate_and_start_workflow(
@@ -516,7 +525,143 @@ def test_scheduler_pre_callback_failure_reconciles_generation_once(tmp_path) -> 
 
     assert engine.project.status is WorkflowStatus.FAILED
     assert engine.project.finished_at is not None
-    assert handler._reply_workflow_error.call_count == 1
+    handler.update_card.assert_called_once()
+    assert handler.update_card.call_args.args[0] == "origin-1"
+    handler.send_card_to_chat.assert_not_called()
+    handler._reply_workflow_error.assert_not_called()
+
+
+def test_generation_worker_cancellation_replaces_same_card_with_terminal_state(
+    tmp_path,
+) -> None:
+    from src.feishu.handlers.workflow import _WorkflowGenerationCancelled
+
+    engine = _engine(tmp_path)
+    pending = engine.project.pending
+    pending.engine_session_key = "generation-1"
+    owner = _WorkflowLifecycleOwner(
+        "generation-1",
+        "user-1",
+        chat_id="chat-1",
+        project_id=pending.project_id or "project-1",
+        root_path=str(tmp_path),
+        source_script_path=str(tmp_path / "cancelled.js"),
+    )
+    engine._script_generation_owner = owner
+    handler = _handler()
+    handler.ctx.workflow_engine_manager = MagicMock()
+    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
+    handler.get_engine_name = MagicMock(return_value="codex")
+    handler._resolve_origin = MagicMock(return_value="origin-1")
+    handler.update_card = MagicMock(return_value=True)
+    handler.send_card_to_chat = MagicMock(return_value="unexpected-new-card")
+    handler._remove_owned_workflow_artifact = MagicMock()
+    handler._generate_script_via_ai = MagicMock(
+        side_effect=_WorkflowGenerationCancelled("Workflow generation cancelled")
+    )
+
+    with patch("src.feishu.handlers.workflow.threading.Thread"):
+        handler._generate_and_start_workflow(
+            message_id="generation-card",
+            chat_id="chat-1",
+            requirement=pending.requirement or "build",
+            project=SimpleNamespace(
+                project_id=pending.project_id or "project-1",
+                project_name="Project",
+                root_path=str(tmp_path),
+            ),
+            root_path=str(tmp_path),
+            selected_tools=list(pending.selected_tools or ["codex"]),
+            expected_session_key="generation-1",
+        )
+
+    assert engine.project.status is WorkflowStatus.CANCELLED
+    assert len(handler.update_card.call_args_list) == 2
+    terminal_update = handler.update_card.call_args_list[-1]
+    assert terminal_update.args[0] == "generation-card"
+    assert "取消" in str(terminal_update.args[1])
+    assert "生成编排中" not in str(terminal_update.args[1])
+    handler.send_card_to_chat.assert_not_called()
+
+
+def test_scheduler_cancellation_replaces_same_card_with_terminal_state(tmp_path) -> None:
+    from src.feishu.handlers.workflow import _WorkflowGenerationCancelled
+
+    engine = _engine(tmp_path)
+    owner = _WorkflowLifecycleOwner("generation-1", "user-1")
+    engine._script_generation_owner = owner
+    handler = _handler()
+    handler.ctx.workflow_engine_manager = MagicMock()
+    handler.ctx.workflow_engine_manager.get.return_value = engine
+    queued: dict[str, Any] = {}
+    handler._submit_engine_task = MagicMock(
+        side_effect=lambda run_fn, *_args, **_kwargs: queued.setdefault("run", run_fn)
+        or SimpleNamespace(run_id="run-1")
+    )
+    handler._generate_and_start_workflow = MagicMock(
+        side_effect=_WorkflowGenerationCancelled("Workflow generation cancelled")
+    )
+    handler.update_card = MagicMock(return_value=True)
+    handler.send_card_to_chat = MagicMock()
+    handler._reply_workflow_error = MagicMock()
+
+    handler._schedule_generate_and_start_workflow(
+        message_id="generation-card",
+        chat_id="chat-1",
+        requirement="build",
+        project=SimpleNamespace(
+            project_id="project-1",
+            project_name="Project",
+            root_path=str(tmp_path),
+        ),
+        root_path=str(tmp_path),
+        selected_tools=["codex"],
+        expected_session_key="generation-1",
+        engine=engine,
+    )
+    queued["run"]()
+
+    assert engine.project.status is WorkflowStatus.CANCELLED
+    handler.update_card.assert_called_once()
+    assert handler.update_card.call_args.args[0] == "generation-card"
+    assert "取消" in str(handler.update_card.call_args.args[1])
+    assert "生成编排中" not in str(handler.update_card.call_args.args[1])
+    handler.send_card_to_chat.assert_not_called()
+    handler._reply_workflow_error.assert_not_called()
+
+
+def test_generated_workflow_validation_failure_does_not_reply_a_second_card(
+    tmp_path,
+) -> None:
+    engine = _engine(tmp_path)
+    pending = engine.project.pending
+    pending.script_path = None
+    owner = _WorkflowLifecycleOwner(
+        pending.engine_session_key or "generation-1",
+        pending.initiator_user_id or "user-1",
+        chat_id="chat-1",
+        project_id=pending.project_id or "project-1",
+        root_path=str(tmp_path),
+    )
+    pending.engine_session_key = owner.session_key
+    engine._script_generation_owner = owner
+    handler = _handler()
+    handler._reply_workflow_error = MagicMock()
+
+    handler._queue_generated_workflow(
+        message_id="generation-card",
+        chat_id="chat-1",
+        project=SimpleNamespace(
+            project_id=pending.project_id or "project-1",
+            project_name="Project",
+            root_path=str(tmp_path),
+        ),
+        root_path=str(tmp_path),
+        engine=engine,
+        generation_owner=owner,
+    )
+
+    handler._reply_workflow_error.assert_not_called()
 
 
 def test_submit_engine_task_returns_scheduler_handle(tmp_path) -> None:

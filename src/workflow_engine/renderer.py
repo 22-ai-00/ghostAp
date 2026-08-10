@@ -336,6 +336,196 @@ def _unicode_progress_bar(ratio: float, *, length: int = 20) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _binding_value(binding: Any, *names: str, default: Any = None) -> Any:
+    if isinstance(binding, dict):
+        for name in names:
+            if name in binding and binding[name] is not None:
+                return binding[name]
+        return default
+    for name in names:
+        value = getattr(binding, name, None)
+        if value is not None:
+            return value
+    return default
+
+
+def _binding_model_parts(binding: Any) -> tuple[str, str, str | None, str | None]:
+    """Return a display-only tool/model/profile/effort tuple without duplication."""
+    tool_name = str(
+        _binding_value(binding, "tool_name", "toolName", "tool", default="?")
+    )
+    profile_value = _binding_value(binding, "profile")
+    effort_value = _binding_value(binding, "effort")
+    profile = str(profile_value) if profile_value else None
+    effort = str(effort_value) if effort_value else None
+    raw_model = str(
+        _binding_value(
+            binding,
+            "model_name",
+            "modelName",
+            "model",
+            default="default",
+        )
+        or "default"
+    )
+
+    # ACP model selections may encode profile/effort in model_name while also
+    # exposing the structured fields. Strip only the exact structured suffix;
+    # model families that legitimately contain slashes remain untouched.
+    structured_suffix = "/".join(value for value in (profile, effort) if value)
+    suffix = f"/{structured_suffix}" if structured_suffix else ""
+    model_name = raw_model[: -len(suffix)] if suffix and raw_model.endswith(suffix) else raw_model
+    return tool_name, model_name or "default", profile, effort
+
+
+def _binding_config_markdown(binding: Any) -> str:
+    tool_name, model_name, profile, effort = _binding_model_parts(binding)
+    parts = [f"`{tool_name}`", f"模型 `{model_name}`"]
+    if profile:
+        parts.append(f"Profile `{profile}`")
+    if effort:
+        parts.append(f"Effort `{effort}`")
+    return " · ".join(parts)
+
+
+class WorkflowGenerationRenderer:
+    """Render the immutable Agent Pool while the workflow script is generated."""
+
+    def __init__(
+        self,
+        *,
+        requirement: str,
+        agent_pool: Any,
+        orchestrator_agent_id: str,
+        orchestrator_was_auto: bool = False,
+    ) -> None:
+        self.requirement = str(requirement or "")
+        self.agent_pool = tuple(agent_pool or ())
+        self.orchestrator_agent_id = str(orchestrator_agent_id or "")
+        self.orchestrator_was_auto = bool(orchestrator_was_auto)
+
+    @staticmethod
+    def _one_line(value: Any, *, limit: int) -> str:
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)].rstrip() + "…"
+
+    def render(
+        self,
+        *,
+        current_activity: str | None = None,
+        elapsed_seconds: int = 0,
+        terminal_status: str | None = None,
+    ) -> dict[str, Any]:
+        orchestrator = next(
+            (
+                binding
+                for binding in self.agent_pool
+                if str(_binding_value(binding, "agent_id", "agentId", default=""))
+                == self.orchestrator_agent_id
+            ),
+            None,
+        )
+        orchestrator_label = (
+            f"Auto → {self.orchestrator_agent_id}"
+            if self.orchestrator_was_auto
+            else self.orchestrator_agent_id
+        ) or "未解析"
+        orchestrator_name = str(
+            _binding_value(
+                orchestrator,
+                "display_name",
+                "displayName",
+                default=_binding_value(orchestrator, "tool_name", "toolName", default=""),
+            )
+            or ""
+        )
+        is_cancelled = str(terminal_status or "").lower() == "cancelled"
+        default_activity = (
+            "Workflow 任务已由用户停止"
+            if is_cancelled
+            else
+            f"{self.orchestrator_agent_id} 正在生成并验证 Workflow 编排脚本"
+            if self.orchestrator_agent_id
+            else "正在生成并验证 Workflow 编排脚本"
+        )
+        activity = self._one_line(current_activity or default_activity, limit=240)
+        requirement = self._one_line(self.requirement, limit=600)
+        elapsed = max(0, int(elapsed_seconds or 0))
+
+        pool_lines: list[str] = []
+        for binding in self.agent_pool:
+            agent_id = str(
+                _binding_value(binding, "agent_id", "agentId", default="?")
+            )
+            display_name = str(
+                _binding_value(
+                    binding,
+                    "display_name",
+                    "displayName",
+                    default=_binding_value(binding, "tool_name", "toolName", default="?"),
+                )
+            )
+            role = " · 主编排" if agent_id == self.orchestrator_agent_id else ""
+            pool_lines.append(
+                f"- **{agent_id}** · {display_name}{role}\n  {_binding_config_markdown(binding)}"
+            )
+
+        status_content = (
+            "**CANCELLED** · Workflow 已取消\n"
+            f"**最终状态** · {activity}\n"
+            f"⏱ 结束于启动后 {elapsed} 秒"
+            if is_cancelled
+            else
+            "**当前阶段** · 生成并验证编排脚本\n"
+            f"**当前操作** · {activity}\n"
+            f"⏱ 已等待 {elapsed} 秒\n\n"
+            "① 生成脚本（进行中） → ② 验证计划 → ③ 执行节点 → ④ 汇总结果"
+        )
+        elements: list[dict[str, Any]] = [
+            {
+                "tag": "markdown",
+                "content": status_content,
+            },
+            {"tag": "hr"},
+            {
+                "tag": "markdown",
+                "content": f"**任务**\n{requirement or '未提供任务描述'}",
+            },
+            {"tag": "hr"},
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**主编排 Agent** · {orchestrator_label}"
+                    f"{f' · {orchestrator_name}' if orchestrator_name else ''}"
+                ),
+            },
+            {
+                "tag": "markdown",
+                "content": (
+                    f"**已锁定 Agent Pool** · {len(self.agent_pool)} 个\n"
+                    + ("\n".join(pool_lines) if pool_lines else "暂无 Agent")
+                    + "\n\n后续节点只会从此池分配；执行期间无需再次选择。"
+                ),
+            },
+        ]
+        return {
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": "Workflow · 已取消" if is_cancelled else "Workflow · 生成编排中",
+                },
+                "subtitle": {
+                    "tag": "plain_text",
+                    "content": "执行已停止" if is_cancelled else "Agent Pool 已锁定",
+                },
+                "template": "grey" if is_cancelled else "blue",
+            },
+            "elements": elements,
+        }
+
+
 class WorkflowAgentSelectionRenderer:
     """Render the owner-bound Agent Pool selection control surface."""
 
@@ -500,17 +690,12 @@ class WorkflowAgentSelectionRenderer:
                 }
             )
         for binding in pool:
-            qualifiers = [binding.model_name or "default"]
-            if binding.profile:
-                qualifiers.append(binding.profile)
-            if binding.effort:
-                qualifiers.append(binding.effort)
             elements.append(
                 {
                     "tag": "markdown",
                     "content": (
                         f"**{binding.agent_id}** · {binding.display_name}\n"
-                        f"`{binding.tool_name}` / `{' / '.join(qualifiers)}`"
+                        f"{_binding_config_markdown(binding)}"
                     ),
                 }
             )
@@ -696,30 +881,13 @@ class WorkflowProgressRenderer:
             )
             lines.append(f"- 主编排: {orchestrator_label}")
         for binding in raw_pool:
-            if isinstance(binding, dict):
-                agent_id = str(binding.get("agentId") or binding.get("agent_id") or "?")
-                tool_name = str(binding.get("toolName") or binding.get("tool_name") or "?")
-                model = (
-                    binding.get("model_name")
-                    or binding.get("modelName")
-                    or binding.get("model")
-                    or "default"
-                )
-                profile = binding.get("profile")
-                effort = binding.get("effort")
-            else:
-                agent_id = binding.agent_id
-                tool_name = binding.tool_name
-                model = binding.model_name or "default"
-                profile = binding.profile
-                effort = binding.effort
+            agent_id = str(
+                _binding_value(binding, "agentId", "agent_id", default="?")
+            )
             suffix = " (orchestrator)" if agent_id == orchestrator_agent_id else ""
-            qualifiers = [str(model)]
-            if profile:
-                qualifiers.append(str(profile))
-            if effort:
-                qualifiers.append(str(effort))
-            lines.append(f"- `{agent_id}` · {tool_name} · {' / '.join(qualifiers)}{suffix}")
+            lines.append(
+                f"- `{agent_id}` · {_binding_config_markdown(binding)}{suffix}"
+            )
 
         if raw_plan:
             lines.append("\n**Agent plan**")

@@ -372,8 +372,97 @@ def test_stale_generation_task_does_not_cancel_current_generation_heartbeat(tmp_
 
     assert current_generation_owner.stop_event.is_set() is False
     assert engine._script_generation_owner is current_generation_owner
+    handler.update_card.assert_not_called()
     handler.send_card_to_chat.assert_not_called()
     thread_cls.assert_not_called()
+
+
+def test_generation_worker_reuses_confirmed_selection_card_without_extra_send(tmp_path):
+    from types import SimpleNamespace
+
+    from src.feishu.handlers.workflow import _WorkflowLifecycleOwner
+    from src.workflow_engine.agent_pool import WorkflowAgentBinding
+
+    script_path = tmp_path / "generated.js"
+    script_path.write_text(
+        "export const meta = { name: 'generated', tools: ['codex'] };\n",
+        encoding="utf-8",
+    )
+    engine = WorkflowEngine(chat_id="chat-1", root_path=str(tmp_path))
+    engine._project = WorkflowProject(
+        status=WorkflowStatus.GENERATING_SCRIPT,
+        requirement="build",
+        pending=PendingWorkflow(
+            requirement="build",
+            engine_session_key="generation-1",
+            initiator_user_id="user-1",
+            project_id="project-1",
+            selected_tools=["codex"],
+            agent_pool=(
+                WorkflowAgentBinding(
+                    agent_id="A1",
+                    tool_name="codex",
+                    model_name="gpt-5.6-sol",
+                    display_name="Codex",
+                ),
+            ),
+            orchestrator_agent_id="A1",
+        ),
+    )
+    owner = _WorkflowLifecycleOwner(
+        "generation-1",
+        "user-1",
+        chat_id="chat-1",
+        project_id="project-1",
+        root_path=str(tmp_path),
+        source_script_path=str(script_path),
+    )
+    engine._script_generation_owner = owner
+    handler = WorkflowHandler.__new__(WorkflowHandler)
+    handler.ctx = SimpleNamespace(workflow_engine_manager=MagicMock())
+    handler.ctx.workflow_engine_manager.get_or_create.return_value = engine
+    handler.get_engine_name = MagicMock(return_value="codex")
+    handler._resolve_origin = MagicMock(return_value="origin-1")
+    handler.update_card = MagicMock(return_value=True)
+    handler.send_card_to_chat = MagicMock(return_value="unexpected-new-card")
+    handler._remove_owned_workflow_artifact = MagicMock()
+    handler._generate_script_via_ai = MagicMock(
+        return_value=(
+            str(script_path),
+            {
+                "name": "generated",
+                "description": "generated",
+                "phases": [],
+                "tools": ["codex"],
+                "agentPlan": [{"node": "main", "role": "lead", "agentId": "A1"}],
+            },
+        )
+    )
+
+    def mark_running(**_kwargs):
+        engine.project.status = WorkflowStatus.RUNNING
+
+    handler._queue_generated_workflow = MagicMock(side_effect=mark_running)
+    project = SimpleNamespace(
+        project_id="project-1",
+        project_name="Project",
+        root_path=str(tmp_path),
+    )
+
+    with patch("src.feishu.handlers.workflow.threading.Thread"):
+        handler._generate_and_start_workflow(
+            message_id="selection-card",
+            chat_id="chat-1",
+            requirement="build",
+            project=project,
+            root_path=str(tmp_path),
+            selected_tools=["codex"],
+            expected_session_key="generation-1",
+        )
+
+    assert handler.update_card.call_args_list[0].args[0] == "selection-card"
+    handler.send_card_to_chat.assert_not_called()
+    assert handler._queue_generated_workflow.call_args.kwargs["message_id"] == "selection-card"
 
 
 def test_generation_result_cas_cannot_commit_after_stop_acknowledgement(tmp_path):
@@ -654,7 +743,11 @@ def test_stopped_generation_rejects_late_direct_progress_callback(tmp_path):
 
     assert not generation_thread.is_alive()
     assert callback_invoked.is_set()
-    handler.update_card.assert_not_called()
+    handler.update_card.assert_called_once()
+    updated_message_id, updated_card = handler.update_card.call_args.args
+    assert updated_message_id == "old_card"
+    assert "CANCELLED" in str(updated_card)
+    assert "late model progress" not in str(updated_card)
     handler.reply_text.assert_called_once_with("stop_msg", "Workflow 任务已停止。")
     handler._reply_workflow_error.assert_not_called()
 
