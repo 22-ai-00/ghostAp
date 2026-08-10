@@ -68,7 +68,10 @@ def test_employee_roster_command_aliases_share_tenant_scoped_handler(command: st
     handler.list_employees_roster("om_request", "oc_chat")
 
     ctx.tenant_key_resolver.assert_called_once_with()
-    ctx.employee_hire_service.list_employee_roster.assert_called_once_with("tenant-a")
+    ctx.employee_hire_service.list_employee_roster.assert_called_once_with(
+        "tenant-a",
+        include_archived=False,
+    )
     handler.reply_card.assert_called_once()
     handler.reply_text.assert_not_called()
 
@@ -78,7 +81,10 @@ def test_employee_roster_empty_is_not_reported_as_unavailable() -> None:
 
     handler.list_employees_roster("om_request", "oc_chat")
 
-    ctx.employee_hire_service.list_employee_roster.assert_called_once_with("tenant-a")
+    ctx.employee_hire_service.list_employee_roster.assert_called_once_with(
+        "tenant-a",
+        include_archived=False,
+    )
     handler.reply_card.assert_called_once()
     handler.reply_text.assert_not_called()
     rendered = json.dumps(handler.reply_card.call_args.args[1], ensure_ascii=False)
@@ -184,6 +190,7 @@ def _roster_entries() -> list[dict[str, object]]:
 
 def test_employee_roster_card_counts_states_sorts_stably_and_redacts_authority() -> None:
     entries = _roster_entries()
+    entries[3]["role"] = ""
 
     msg_type, content = SystemBuilder.build_employee_roster_card(entries)
     reverse_type, reverse_content = SystemBuilder.build_employee_roster_card(
@@ -195,13 +202,23 @@ def test_employee_roster_card_counts_states_sorts_stably_and_redacts_authority()
     card = json.loads(content)
     assert card["schema"] == "2.0"
     rendered = json.dumps(card, ensure_ascii=False)
-    assert "共 6" in rendered
+    assert "当前员工 · 2" in rendered
+    assert "共 2" in rendered
     assert "在职 0" in rendered
     assert "需处理 2" in rendered
-    assert "已归档 4" in rendered
+    assert "已归档" not in rendered
 
-    positions = [rendered.index(name) for name in ("Ops", "Security", "Alpha", "Beta", "Gamma", "Zulu")]
+    positions = [rendered.index(name) for name in ("Ops", "Security")]
     assert positions == sorted(positions)
+    for archived_name in ("Alpha", "Beta", "Gamma", "Zulu"):
+        assert archived_name not in rendered
+
+    assert "/employee-role Ops 职责" in rendered
+    assert "/employee-role Security 职责" not in rendered
+
+    unescaped = rendered.replace("\\", "")
+    for entry in entries:
+        assert str(entry["agent_id"]) not in unescaped
 
     for forbidden in (
         "tenant-secret",
@@ -211,6 +228,35 @@ def test_employee_roster_card_counts_states_sorts_stably_and_redacts_authority()
         "permission-secret",
     ):
         assert forbidden not in rendered
+
+
+def test_employee_roster_card_never_exposes_ids_for_duplicate_names() -> None:
+    entries = [
+        {
+            "agent_id": "agt_same_name_alpha",
+            "name": "同名员工",
+            "state": "active",
+            "role": "coder",
+            "tool": "codex",
+            "model": "gpt-5.6-sol",
+        },
+        {
+            "agent_id": "agt_same_name_beta",
+            "name": "同名员工",
+            "state": "action_required",
+            "role": "reviewer",
+            "tool": "claude",
+            "model": "default",
+        },
+    ]
+
+    _msg_type, content = SystemBuilder.build_employee_roster_card(entries)
+
+    rendered = json.dumps(json.loads(content), ensure_ascii=False)
+    assert rendered.count("同名员工") == 2
+    unescaped = rendered.replace("\\", "")
+    for entry in entries:
+        assert str(entry["agent_id"]) not in unescaped
 
 
 def test_employee_roster_card_has_distinct_empty_state() -> None:
@@ -256,4 +302,3 @@ def test_employee_roster_natural_language_does_not_steal_programming_tasks(text:
     result = IntentRecognizer().recognize(text, "smart")
 
     assert result.primary_intent is not IntentType.LIST_EMPLOYEES
-

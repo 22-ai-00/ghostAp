@@ -128,6 +128,9 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/setadmin": lambda m, c, t, p: self._handle_setadmin_command(m, c, ""),
             "/access": lambda m, c, t, p: self._handle_access_command(m, c, ""),
             "/employees": lambda m, c, t, p: self.employee.list_employees_roster(m, c),
+            "/employee-role": lambda m, c, t, p: self.employee.update_employee_role(
+                m, c, ""
+            ),
         }
 
         # Prefix match handlers: prefix -> handler_func(message_id, chat_id, text, project)
@@ -139,6 +142,14 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             ("/trace", lambda m, c, t, p: self.get_handler("diagnostics").show_message_trace(m, c, t, p)),
             ("/acp", self.handle_acp_command),
             ("/model", self.handle_model_command),
+            (
+                "/employee-role",
+                lambda m, c, t, p: self.employee.update_employee_role(
+                    m,
+                    c,
+                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
+                ),
+            ),
         ]
 
     def _handle_direct_mode_enter(
@@ -346,6 +357,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/setadmin",
             "/access",
             "/employees",
+            "/employee-role",
             "/btw",
             "/goals",
             "/runs",
@@ -366,6 +378,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/btw",
             "/setadmin",
             "/access",
+            "/employee-role",
             "/goal",
             "/approve",
             "/runs",

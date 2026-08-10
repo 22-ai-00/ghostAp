@@ -35,6 +35,17 @@ class EmployeeHireRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class EmployeeRoleUpdateRequest:
+    """Authorized request to change one employee's Journal-backed role label."""
+
+    tenant_key: str
+    employee: str
+    role: str
+    requester_principal_id: str
+    message_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class EmployeeProfileTemplate:
     role: str
     persona: str
@@ -227,6 +238,7 @@ __all__ = [
     "EmployeeHireRequest",
     "EmployeeHireService",
     "EmployeeProfileTemplate",
+    "EmployeeRoleUpdateRequest",
     "complete_employee_hire_request",
     "recommended_employee_profile",
 ]

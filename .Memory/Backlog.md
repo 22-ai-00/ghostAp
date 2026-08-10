@@ -30,3 +30,7 @@
 - 2026-08-10 [中/可靠性] `SPEC_EXECUTION_TIMEOUT` 当前被复用为各阶段 prompt timeout 与卡片 TTL，不是真正的 Spec 总运行 deadline；应增加 monotonic 总 SLA，并从其推导 phase timeout，避免自动任务无限循环或名称误导。
 
 - 2026-08-10 [高/产品闭环] Slock 退役还遗留 `/fire`、`/history`、`/employee-memory` 三个 catalog 孤儿命令；当前 Journal services 仍在，应迁移为独立 EmployeeHandler 并恢复 admin/tenant/audit fail-closed 门禁。`/hire` 还缺 3ed4bcec 删除的 durable admission/start_hire，必须重建幂等、容量、唯一性、anchor-before-submit 与全自动默认工具模型流程，不能只补路由或复活旧 Slock UI。
+
+## 员工 ACTION_REQUIRED 恢复入口（2026-08-10）
+
+- 当前 `ACTION_REQUIRED` 员工的原因为 Slash Command reconciliation `recovery_exhausted`，现有控制面没有明确的重试/修复/重新授权转移路径。应补充可审计的恢复工作流，并恢复或替代当前孤立的 `/hire`、`/fire` 操作入口；职责标签更新不能替代生命周期恢复。

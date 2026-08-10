@@ -26,7 +26,7 @@ from ..workforce.projection import (
     workforce_projection_guard,
 )
 from .callback_bridge import AsyncCallbackBridge
-from .hire_port import EmployeeHireRequest
+from .hire_port import EmployeeHireRequest, EmployeeRoleUpdateRequest
 from .hire_state import (
     DurableHireState,
     HireEffectState,
@@ -121,6 +121,7 @@ class ProductionEmployeeHireService:
         provisioning_submitter: Callable[[str], object] | None = None,
         runtime_recovery_ready: bool = True,
         workspace_projector: Any = None,
+        admin_principal_ids_provider: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         if (
             isinstance(visible_employee_limit, bool)
@@ -140,6 +141,9 @@ class ProductionEmployeeHireService:
         self._provisioning_submitter = provisioning_submitter
         self._runtime_recovery_ready = runtime_recovery_ready is True
         self._workspace_projector = workspace_projector
+        self._admin_principal_ids_provider = (
+            admin_principal_ids_provider or (lambda: frozenset())
+        )
         self._mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._activities: dict[str, asyncio.Task[DurableHireState]] = {}
         self._admission_closed = False
@@ -186,6 +190,78 @@ class ProductionEmployeeHireService:
             employees,
             key=lambda employee: (employee.name.casefold(), employee.agent_id),
         )
+
+    def update_employee_role(
+        self,
+        request: EmployeeRoleUpdateRequest,
+    ) -> EmployeeDefinition:
+        """Commit one tenant-scoped role change through the workforce Journal."""
+
+        if not isinstance(request, EmployeeRoleUpdateRequest):
+            raise HireAdmissionError("invalid employee role update request")
+        required = (
+            request.tenant_key,
+            request.employee,
+            request.requester_principal_id,
+            request.message_id,
+        )
+        if any(
+            not isinstance(value, str) or not value or value != value.strip()
+            for value in required
+        ):
+            raise HireAdmissionError("invalid employee role update request")
+        if not isinstance(request.role, str):
+            raise HireAdmissionError("employee role is invalid")
+        normalized_role = " ".join(request.role.split())
+        if not normalized_role or len(normalized_role) > 80:
+            raise HireAdmissionError("employee role is invalid")
+
+        with self.employee_dispatch_guard(), self._writer.transaction_guard():
+            self._synchronize_projection_to_journal_locked()
+            try:
+                raw_admins = self._admin_principal_ids_provider()
+                if not isinstance(raw_admins, (frozenset, set, tuple, list)):
+                    raise TypeError("invalid admin provider result")
+                admins = frozenset(raw_admins)
+                if any(
+                    not isinstance(admin, str)
+                    or not admin
+                    or admin != admin.strip()
+                    for admin in admins
+                ):
+                    raise TypeError("invalid admin provider result")
+            except Exception:
+                raise HireAdmissionError(
+                    "employee role update is not authorized"
+                ) from None
+            if request.requester_principal_id not in admins:
+                raise HireAdmissionError("employee role update is not authorized")
+
+            matches = tuple(
+                employee
+                for employee in self._projection_state.employees.values()
+                if employee.tenant_key == request.tenant_key
+                and employee.worker_type is WorkerType.VISIBLE
+                and employee.state is not EmployeeState.ARCHIVED
+                and request.employee in {employee.agent_id, employee.name}
+            )
+            if len(matches) != 1:
+                raise HireAdmissionError("employee role target is unavailable or ambiguous")
+            employee = matches[0]
+            if employee.role == normalized_role:
+                return employee
+
+            event = JournalEvent(
+                event_type="employee.profile_changed",
+                aggregate_id=employee.agent_id,
+                payload={"role": normalized_role},
+            )
+            commit_workforce_events_unlocked(
+                self._writer,
+                self._projection_state,
+                (event,),
+            )
+            return self._projection_state.employees[employee.agent_id]
 
     def synchronize_projection_unlocked(self) -> ProjectionState:
         """Advance views while the caller owns ``employee_dispatch_guard``."""

@@ -162,6 +162,11 @@ PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/hire", "雇佣持久数字员工", "/hire <名字> [选项]", aliases=("/h",)),
     _action("/fire", "退役持久数字员工", "/fire <名字>"),
     _action("/employees", "查看在职数字员工", aliases=("/roster",)),
+    _action(
+        "/employee-role",
+        "设置数字员工职责",
+        "/employee-role <员工名> <职责>",
+    ),
     _action("/history", "查看数字员工执行历史", "/history [员工名]"),
     _action("/employee-memory", "查看数字员工记忆摘要", "/employee-memory <员工名>"),
 )

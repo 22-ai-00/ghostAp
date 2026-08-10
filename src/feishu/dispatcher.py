@@ -64,7 +64,8 @@ class MessageDispatcher:
             command_match = SlashCommandParser.parse(text)
         if (
             command_match is not None
-            and command_match.command in {"/access", "/setadmin", "/hire", "/fire"}
+            and command_match.command
+            in {"/access", "/setadmin", "/hire", "/fire", "/employee-role"}
             and not self._action_matrix_allows(
                 effective_trust,
                 action_name="grant_admin",

@@ -1388,6 +1388,7 @@ class FeishuWSClient:
             "/setadmin",
             "/hire",
             "/fire",
+            "/employee-role",
         }:
             action = ActionKind.GRANT_ADMIN
         if action is None:

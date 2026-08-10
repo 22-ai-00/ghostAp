@@ -665,6 +665,9 @@ class EmployeeDepartmentRuntime:
                     if runtime._data is not None
                     else None
                 ),
+                admin_principal_ids_provider=lambda: frozenset(
+                    getattr(settings, "admin_user_ids", ()) or ()
+                ),
             )
             runtime._service = service
             runtime._compose_membership(

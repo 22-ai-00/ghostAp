@@ -1096,7 +1096,6 @@ class SystemBuilder:
         state_labels = {
             "active": "🟢 在职",
             "action_required": "🟠 需要处理",
-            "archived": "⚪ 已归档",
             "retiring": "🟡 退役中",
             "draft": "🔵 草稿",
             "provisioning_app": "🔵 创建应用中",
@@ -1115,12 +1114,13 @@ class SystemBuilder:
             "validating": 2,
             "ready_pending_verification": 2,
             "retiring": 3,
-            "archived": 4,
         }
 
         normalized: list[dict[str, object]] = []
         for entry in entries:
             state = str(entry.get("state") or "").strip().lower()
+            if state == "archived":
+                continue
             raw_group_count = entry.get("group_count", 0)
             group_count = (
                 raw_group_count
@@ -1134,6 +1134,21 @@ class SystemBuilder:
                 and not isinstance(raw_created_at, bool)
                 else 0.0
             )
+            name = SystemBuilder._employee_roster_text(
+                entry.get("name"),
+                fallback="未命名员工",
+                limit=80,
+            )
+            raw_role = str(entry.get("role") or "").strip()
+            role = (
+                SystemBuilder._employee_roster_text(
+                    raw_role,
+                    fallback="未设置职责",
+                    limit=100,
+                )
+                if raw_role
+                else f"未设置（发送 /employee-role {name} 职责）"
+            )
             normalized.append(
                 {
                     "agent_id": SystemBuilder._employee_roster_text(
@@ -1141,11 +1156,7 @@ class SystemBuilder:
                         fallback="unknown",
                         limit=96,
                     ),
-                    "name": SystemBuilder._employee_roster_text(
-                        entry.get("name"),
-                        fallback="未命名员工",
-                        limit=80,
-                    ),
+                    "name": name,
                     "emoji": SystemBuilder._employee_roster_text(
                         entry.get("emoji"),
                         fallback="🤖",
@@ -1153,11 +1164,7 @@ class SystemBuilder:
                     ),
                     "state": state,
                     "state_label": state_labels.get(state, "🔵 状态处理中"),
-                    "role": SystemBuilder._employee_roster_text(
-                        entry.get("role"),
-                        fallback="未设置职责",
-                        limit=100,
-                    ),
+                    "role": role,
                     "tool": SystemBuilder._employee_roster_text(
                         entry.get("tool"),
                         fallback="未设置工具",
@@ -1195,16 +1202,14 @@ class SystemBuilder:
         action_count = sum(
             item["state"] == "action_required" for item in normalized
         )
-        archived_count = sum(item["state"] == "archived" for item in normalized)
-        other_count = len(normalized) - active_count - action_count - archived_count
+        other_count = len(normalized) - active_count - action_count
 
         elements: list[dict] = [
             {
                 "tag": "markdown",
                 "content": (
                     f"**共 {len(normalized)}** · 在职 {active_count} · "
-                    f"需处理 {action_count} · 已归档 {archived_count} · "
-                    f"其他生命周期 {other_count}"
+                    f"需处理 {action_count} · 其他生命周期 {other_count}"
                 ),
             }
         ]
@@ -1225,7 +1230,7 @@ class SystemBuilder:
                             f"{item['emoji']} **{item['name']}** · {item['state_label']}\n"
                             f"职责 {item['role']} · 后端 `{item['tool']}/{item['model']}`\n"
                             f"配置 `{item['profile']}/{item['effort']}` · "
-                            f"协作群 {item['group_count']} · ID `{item['agent_id']}`"
+                            f"协作群 {item['group_count']}"
                         ),
                     }
                 )
@@ -1246,7 +1251,7 @@ class SystemBuilder:
             "👥 数字员工目录",
             "blue",
             elements,
-            subtitle=f"VISIBLE · {len(normalized)}",
+            subtitle=f"当前员工 · {len(normalized)}",
         )
         return "interactive", json.dumps(card, ensure_ascii=False)
 
