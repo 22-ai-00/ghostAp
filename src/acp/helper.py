@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import shutil
 import threading
 import time
 from collections.abc import Sequence
@@ -17,7 +18,7 @@ from ..utils.text import get_acp_result_header_text
 from .client import GhostAPClient
 from .model_selection import CODEX_REASONING_EFFORTS, compose_codex_model_selection
 from .options import ACPModelOption, ACPModelSelectionVariant, ACPToolOption
-from .providers import get_providers
+from .providers import get_providers, tool_registry
 from .traex_selection import (
     TraexModelMetadata,
     compose_traex_model_selection,
@@ -114,6 +115,47 @@ def invalidate_acp_model_cache(
         _negative_cache.pop(key, None)
 
 
+def is_programming_tool_available(
+    name: str,
+    *,
+    allow_sync_probe: bool = False,
+    trigger_async_probe: bool = True,
+) -> bool:
+    """Return runtime availability without confusing CLI and ACP transports."""
+    tool = str(name or "").strip().lower()
+    if tool not in _TOOLS:
+        return False
+
+    try:
+        if get_providers().get(tool) is None:
+            return False
+
+        # Keep this import local: agent_session imports ACP modules while it is
+        # initialized, so a module-level dependency would create an import cycle.
+        from ..agent_session.backend_resolver import is_cli_backend
+
+        if is_cli_backend(tool):
+            from ..agent_session.claude_cli import ClaudeCLIConfig
+
+            command = str(ClaudeCLIConfig().command or "").strip()
+            return bool(command and shutil.which(command))
+
+        return bool(
+            tool_registry.get_availability(
+                tool,
+                allow_sync_probe=allow_sync_probe,
+                trigger_async_probe=trigger_async_probe,
+            )
+        )
+    except Exception:
+        logger.debug(
+            "[ACP] programming tool availability check failed for %s",
+            tool,
+            exc_info=True,
+        )
+        return False
+
+
 def list_acp_tools() -> list[ACPToolOption]:
     """Return the available members of the six supported ACP backends."""
     providers = get_providers()
@@ -123,11 +165,11 @@ def list_acp_tools() -> list[ACPToolOption]:
         provider = providers.get(name)
         if provider is None:
             continue
-        try:
-            available = bool(provider.check_availability())
-        except Exception:
-            available = False
-            logger.debug("[ACP] availability check failed for %s", name)
+        available = is_programming_tool_available(
+            name,
+            allow_sync_probe=True,
+            trigger_async_probe=False,
+        )
         if available:
             tools.append(
                 ACPToolOption(
@@ -461,6 +503,14 @@ def fetch_acp_models(
         models = _coco_models(current_model)
         if models:
             return models
+
+    # CLI backends do not expose an ACP session model catalog. Preserve a
+    # saved explicit model when present; an empty result represents the
+    # backend default without attempting an unsupported ACP server process.
+    from ..agent_session.backend_resolver import is_cli_backend
+
+    if is_cli_backend(tool):
+        return _fallback(tool, current_model)
 
     key = _key(tool, cwd)
     models, failed = _cached(key, tool)

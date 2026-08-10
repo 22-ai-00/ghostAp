@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from ..acp.providers import normalize_acp_model_name
 from ..config import get_settings
 from ..utils.errors import get_error_detail
+from .backend_resolver import is_cli_backend
 from .claude_cli import SyncClaudeCLISession
 from .protocol import SyncSession
 from .tool_permissions import apply_auxiliary_tool_profile
@@ -200,6 +201,10 @@ def create_auxiliary_session(
     startup_log_failures: Optional[bool] = None,
 ) -> SyncSession:
     """Create a coordination session with a mandatory deny-all tool filter."""
+    if is_cli_backend(agent_type):
+        raise RuntimeError(
+            "Claude CLI backend does not support auxiliary ACP transport"
+        )
     agent, normalized_cwd, model = _resolve_inputs(agent_type, cwd, model_name)
     logger.info(
         "[SessionFactory] auxiliary agent=%s cwd=%s model=%s thread=%s profile=deny_all",

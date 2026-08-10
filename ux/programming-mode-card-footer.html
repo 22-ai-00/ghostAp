@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Programming card footer preview</title>
+  <style>
+    :root {
+      --ink: #172033;
+      --muted: #667085;
+      --line: #d8deea;
+      --paper: #fffdfa;
+      --blue: #1459d9;
+      --blue-soft: #eaf1ff;
+      --green: #137a3a;
+      --green-soft: #e8f7ed;
+      --shadow: 0 18px 55px rgba(38, 55, 86, 0.14);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "Avenir Next", "Source Han Sans SC", "Noto Sans CJK SC", sans-serif;
+      background:
+        radial-gradient(circle at 12% 10%, rgba(20, 89, 217, 0.13), transparent 28rem),
+        linear-gradient(135deg, #eef3f9 0%, #f7f3ec 100%);
+    }
+
+    main {
+      width: min(1100px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 56px 0 72px;
+    }
+
+    h1 {
+      margin: 0;
+      font-family: "Iowan Old Style", "Songti SC", serif;
+      font-size: clamp(32px, 5vw, 58px);
+      letter-spacing: -0.04em;
+    }
+
+    .lede {
+      max-width: 720px;
+      margin: 12px 0 32px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 1.7;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 24px;
+    }
+
+    .sample {
+      display: grid;
+      gap: 10px;
+    }
+
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    .card {
+      overflow: hidden;
+      border: 1px solid rgba(113, 126, 151, 0.32);
+      border-radius: 18px;
+      background: var(--paper);
+      box-shadow: var(--shadow);
+    }
+
+    .header {
+      padding: 22px 24px;
+      color: var(--blue);
+      background: var(--blue-soft);
+      font-size: 22px;
+      font-weight: 750;
+    }
+
+    .body { padding: 24px; }
+
+    .path {
+      display: inline-block;
+      max-width: 100%;
+      overflow: hidden;
+      padding: 8px 11px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      color: #35405a;
+      background: #f5f7fa;
+      font-family: "SFMono-Regular", "Cascadia Code", monospace;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .status {
+      margin: 20px 0;
+      padding: 15px 16px;
+      border-left: 4px solid var(--green);
+      border-radius: 8px;
+      color: var(--green);
+      background: var(--green-soft);
+      font-weight: 700;
+    }
+
+    .body p {
+      margin: 12px 0;
+      line-height: 1.65;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .footer {
+      margin-top: 22px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+
+    button {
+      padding: 10px 16px;
+      border: 1px solid #b9c3d5;
+      border-radius: 9px;
+      color: var(--ink);
+      background: #fff;
+      font: inherit;
+      font-weight: 650;
+    }
+
+    .decision {
+      margin-top: 28px;
+      padding: 18px 20px;
+      border: 1px dashed #9aabc8;
+      border-radius: 14px;
+      color: #42516e;
+      background: rgba(255, 255, 255, 0.55);
+      line-height: 1.6;
+    }
+
+    @media (max-width: 760px) {
+      main { padding-top: 32px; }
+      .grid { grid-template-columns: 1fr; }
+      .card { border-radius: 14px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>编程卡片 footer 收敛</h1>
+    <p class="lede">
+      模型选择仍是显式配置入口；进入或完成普通编程模式后，不再用 Coco、Claude、Gemini、Traex
+      的跨工具按钮占据卡片底部，也不暗示用户需要再次选择模式。
+    </p>
+
+    <section class="grid" aria-label="card previews">
+      <article class="sample">
+        <div class="label">Explicit model ready</div>
+        <div class="card">
+          <div class="header">Codex 编程模式已就绪</div>
+          <div class="body">
+            <div class="status">已启用 gpt-5.6-sol / ultra</div>
+            <p>现在可以直接描述任务，执行会自动推进到完成或明确失败。</p>
+            <p class="meta">项目 ghostAp · 模型配置可通过 /model 再次打开</p>
+            <div class="footer">
+              <button type="button">刷新模型</button>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <article class="sample">
+        <div class="label">Ordinary programming card</div>
+        <div class="card">
+          <div class="header">Codex 编程模式已开启</div>
+          <div class="body">
+            <span class="path">/data00/home/jiataorui/work/github/ghostAp</span>
+            <div class="status">会话已经初始化，可以直接发送需求</div>
+            <p>模式卡仅说明当前状态与项目范围；退出仍使用 /exit。</p>
+            <p class="meta">此卡片底部不显示任何跨工具“进入模式”按钮。</p>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <aside class="decision">
+      保留：显式模型选择、刷新模型、活动模式自身的退出与项目切换。<br>
+      移除：默认、SMART、Codex、Aiden 卡片中的 enter_coco / enter_claude /
+      enter_gemini / enter_traex 引导。
+    </aside>
+  </main>
+</body>
+</html>

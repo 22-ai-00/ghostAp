@@ -124,6 +124,65 @@ class TestGetAvailableTools(unittest.TestCase):
         self.assertEqual(tools, {"traex": "Traex OK"})
         self.assertTrue(all(not call.get("allow_sync_probe") for call in seen))
 
+    def test_claude_cli_binary_does_not_trigger_acp_warmup(self):
+        """Claude uses its CLI transport; only ACP tools receive ACP warmup."""
+        availability = unittest.mock.MagicMock(return_value=True)
+
+        with patch(
+            "src.acp.providers.get_providers",
+            return_value={"claude": object(), "codex": object()},
+        ), patch(
+            "shutil.which",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        ), patch(
+            "src.acp.providers.tool_registry.get_availability",
+            side_effect=availability,
+        ), patch(
+            "src.utils.text.get_acp_result_header_text",
+            return_value={
+                "tool_desc_claude": "Claude CLI",
+                "tool_desc_codex": "Codex ACP",
+            },
+        ):
+            tools = _discover_acp_tools(require_available=True)
+
+        self.assertEqual(
+            tools,
+            {"claude": "Claude CLI", "codex": "Codex ACP"},
+        )
+        self.assertEqual(
+            [call.args[0] for call in availability.call_args_list],
+            ["codex"],
+        )
+
+    def test_missing_claude_cli_does_not_fall_back_to_acp_probe(self):
+        """A missing Claude CLI is unavailable rather than an ACP candidate."""
+        availability = unittest.mock.MagicMock(return_value=True)
+
+        with patch(
+            "src.acp.providers.get_providers",
+            return_value={"claude": object(), "codex": object()},
+        ), patch(
+            "shutil.which",
+            side_effect=lambda name: "/usr/bin/codex" if name == "codex" else None,
+        ), patch(
+            "src.acp.providers.tool_registry.get_availability",
+            side_effect=availability,
+        ), patch(
+            "src.utils.text.get_acp_result_header_text",
+            return_value={
+                "tool_desc_claude": "Claude CLI",
+                "tool_desc_codex": "Codex ACP",
+            },
+        ):
+            tools = _discover_acp_tools(require_available=True)
+
+        self.assertEqual(tools, {"codex": "Codex ACP"})
+        self.assertEqual(
+            [call.args[0] for call in availability.call_args_list],
+            ["codex"],
+        )
+
 
 class TestInvalidateCache(unittest.TestCase):
     """Test cache invalidation."""

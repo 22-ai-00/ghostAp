@@ -413,6 +413,218 @@ def test_model_command_without_arguments_opens_the_shared_selector(
     system.reply_text.assert_not_called()
 
 
+def _install_single_tool_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    registered_tool: str = "codex",
+) -> None:
+    def _global_scan_is_forbidden():
+        raise AssertionError("single-tool model selection must not enumerate ACP tools")
+
+    monkeypatch.setattr(
+        "src.feishu.handlers.system.list_acp_tools",
+        _global_scan_is_forbidden,
+    )
+    monkeypatch.setattr(
+        "src.feishu.handlers.system.get_providers",
+        lambda: {registered_tool: SimpleNamespace(name=registered_tool)},
+    )
+
+
+def test_codex_initial_selector_does_not_enumerate_other_providers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _storage, _projects, project, _second, _ctx, system = _configuration_lane(
+        tmp_path
+    )
+    _install_single_tool_registration(monkeypatch)
+    models = [ACPModelOption(name="gpt-5.6-sol", is_default=True)]
+    system._fetch_acp_models = MagicMock(return_value=models)
+    system.reply_card.return_value = "om-loading"
+    system.update_card = MagicMock(return_value=True)
+
+    system.show_explicit_acp_model_selection(
+        "entry",
+        "chat-first",
+        "codex",
+        project,
+    )
+
+    system._fetch_acp_models.assert_called_once_with(
+        "codex",
+        cwd=project.root_path,
+        current_model=None,
+    )
+    system.update_card.assert_called_once()
+
+
+def test_codex_cascade_redraw_does_not_enumerate_other_providers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _storage, _projects, project, _second, _ctx, system = _configuration_lane(
+        tmp_path
+    )
+    _install_single_tool_registration(monkeypatch)
+    system._fetch_acp_models = MagicMock(
+        return_value=[ACPModelOption(name="gpt-5.6-sol", is_default=True)]
+    )
+    system.update_card = MagicMock(return_value=True)
+
+    system.handle_acp_model_cascade_select(
+        "om-selector",
+        "chat-first",
+        project.project_id,
+        {
+            "action": action_ids.SELECT_ACP_MODEL_GROUP,
+            "tool_name": "codex",
+            "project_id": project.project_id,
+            "_option": "gpt-5.6-sol",
+        },
+    )
+
+    system._fetch_acp_models.assert_called_once_with(
+        "codex",
+        cwd=project.root_path,
+        current_model=None,
+    )
+    system.update_card.assert_called_once()
+
+
+def test_codex_final_confirmation_does_not_enumerate_other_providers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _storage, _projects, project, _second, _ctx, system = _configuration_lane(
+        tmp_path
+    )
+    _install_single_tool_registration(monkeypatch)
+    monkeypatch.setattr(
+        "src.feishu.handlers.system.invalidate_acp_model_cache",
+        MagicMock(),
+    )
+    system._fetch_acp_models = MagicMock(
+        return_value=[ACPModelOption(name="gpt-5.6-sol", is_default=True)]
+    )
+    system._activate_acp_selection = MagicMock()
+
+    system.handle_select_acp_model(
+        "om-selector",
+        "chat-first",
+        project.project_id,
+        {
+            "action": action_ids.SELECT_ACP_MODEL,
+            "tool_name": "codex",
+            "project_id": project.project_id,
+            "model_name": None,
+            "use_default_model": True,
+        },
+    )
+
+    system._fetch_acp_models.assert_called_once_with(
+        "codex",
+        cwd=project.root_path,
+        current_model=None,
+    )
+    system._activate_acp_selection.assert_called_once()
+
+
+def test_forged_unregistered_tool_is_rejected_without_global_provider_scan(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _storage, _projects, project, _second, _ctx, system = _configuration_lane(
+        tmp_path
+    )
+    _install_single_tool_registration(monkeypatch)
+    system._fetch_acp_models = MagicMock()
+    system._activate_acp_selection = MagicMock()
+
+    system.handle_select_acp_model(
+        "om-selector",
+        "chat-first",
+        project.project_id,
+        {
+            "action": action_ids.SELECT_ACP_MODEL,
+            "tool_name": "forged-provider",
+            "project_id": project.project_id,
+            "model_name": None,
+            "use_default_model": True,
+        },
+    )
+
+    system.reply_error.assert_called_once()
+    system._fetch_acp_models.assert_not_called()
+    system._activate_acp_selection.assert_not_called()
+
+
+def test_tools_list_uses_programming_availability_without_acp_probe(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _storage, _projects, project, _second, _ctx, system = _configuration_lane(
+        tmp_path
+    )
+    availability = MagicMock(side_effect=lambda name, **_kwargs: name == "codex")
+    monkeypatch.setattr(
+        "src.feishu.handlers.system.is_programming_tool_available",
+        availability,
+    )
+    system.reply_interactive_card = MagicMock()
+
+    system.show_tools_list("tools", "chat-first", project)
+
+    assert [call.args[0] for call in availability.call_args_list] == [
+        "coco",
+        "claude",
+        "aiden",
+        "codex",
+        "gemini",
+        "traex",
+    ]
+    assert all(
+        call.kwargs
+        == {"allow_sync_probe": False, "trigger_async_probe": True}
+        for call in availability.call_args_list
+    )
+    system.reply_interactive_card.assert_called_once()
+
+
+def test_tools_status_uses_programming_availability_without_acp_probe(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _storage, _projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    availability = MagicMock(side_effect=lambda name, **_kwargs: name == "codex")
+    monkeypatch.setattr(
+        "src.feishu.handlers.system.is_programming_tool_available",
+        availability,
+    )
+    for name in ("coco", "claude", "aiden", "codex", "gemini", "traex"):
+        getattr(ctx, f"{name}_manager").list_active_sessions.return_value = []
+    system.reply_interactive_card = MagicMock()
+
+    system.show_tools_status("tools-status", "chat-first", project)
+
+    assert [call.args[0] for call in availability.call_args_list] == [
+        "coco",
+        "claude",
+        "aiden",
+        "codex",
+        "gemini",
+        "traex",
+    ]
+    assert all(
+        call.kwargs
+        == {"allow_sync_probe": False, "trigger_async_probe": True}
+        for call in availability.call_args_list
+    )
+    system.reply_interactive_card.assert_called_once()
+
+
 def test_explicit_selector_builds_one_cascade_card_with_the_saved_model(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

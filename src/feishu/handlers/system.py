@@ -15,9 +15,10 @@ from ...acp.claude_capabilities import (
 from ...acp.helper import (
     fetch_acp_models,
     invalidate_acp_model_cache,
+    is_programming_tool_available,
     list_acp_tools,
 )
-from ...acp.providers import tool_registry
+from ...acp.providers import get_providers
 from ...card.builders.project import ProjectBuilder
 from ...card.builders.system import SystemBuilder
 from ...card.render.model_cascade import compose_model_selection, parse_model_selection
@@ -985,8 +986,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
     def _available_acp_tool_names(self) -> set[str]:
         return {
             name
-            for item in list_acp_tools()
-            if (name := str(getattr(item, "name", "") or "").strip().lower())
+            for raw_name in get_providers()
+            if (name := str(raw_name or "").strip().lower())
         }
 
     def show_explicit_acp_model_selection(
@@ -1792,7 +1793,11 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         # Cached-first availability check: avoid blocking user-path on external probe.
         tools = []
         for name in names:
-            is_available = tool_registry.get_availability(name, allow_sync_probe=False, trigger_async_probe=True)
+            is_available = is_programming_tool_available(
+                name,
+                allow_sync_probe=False,
+                trigger_async_probe=True,
+            )
             desc = UI_TEXT[f"system_acp_tool_desc_{name}"]
             tools.append(
                 {
@@ -1866,7 +1871,11 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         for meta in tool_defs:
             name = meta["name"]
             manager = meta["manager"]
-            is_available = tool_registry.get_availability(name, allow_sync_probe=False, trigger_async_probe=True)
+            is_available = is_programming_tool_available(
+                name,
+                allow_sync_probe=False,
+                trigger_async_probe=True,
+            )
 
             sessions = []
             try:

@@ -14,7 +14,7 @@ import pytest
 # Import acp.models first to break circular import chain
 from src.acp.models import ACPEvent, ACPEventType
 from src.agent_session.claude_cli import SyncClaudeCLISession
-from src.agent_session.factory import create_engine_session
+from src.agent_session.factory import create_auxiliary_session, create_engine_session
 from src.agent_session.model_diagnostics import classify_model_failure
 from src.agent_session.wrappers import ModelFailureAwareSession
 
@@ -51,6 +51,33 @@ def test_engine_factory_supports_every_programming_backend(
     args, kwargs = start.call_args
     assert args == (agent_type, str(tmp_path), "selected-model")
     assert kwargs["allow_cli"] is True
+
+
+def test_auxiliary_factory_rejects_claude_before_acp_resolution(tmp_path) -> None:
+    resolver = MagicMock(
+        side_effect=AssertionError("auxiliary Claude must fail before input resolution")
+    )
+    provider_resolution = MagicMock(
+        side_effect=AssertionError("auxiliary Claude must not resolve ACP providers")
+    )
+    auto_update = MagicMock(
+        side_effect=AssertionError("auxiliary Claude must not trigger auto-update")
+    )
+    with (
+        patch("src.agent_session.factory._resolve_inputs", resolver),
+        patch("src.acp.providers.get_providers", provider_resolution),
+        patch("src.acp.sync_adapter._resolve_with_auto_update", auto_update),
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="Claude CLI backend does not support auxiliary ACP transport",
+        ):
+            create_auxiliary_session("claude", str(tmp_path))
+
+    resolver.assert_not_called()
+    provider_resolution.assert_not_called()
+    auto_update.assert_not_called()
+
 
 # ── SyncClaudeCLISession ─────────────────────────────────────────────
 

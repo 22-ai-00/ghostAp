@@ -146,8 +146,8 @@ def _discover_acp_tools(*, require_available: bool = False) -> dict[str, str]:
     tools: dict[str, str] = {}
 
     try:
+        from ..acp.helper import is_programming_tool_available
         from ..acp.providers import get_providers
-        from ..acp.providers import tool_registry as acp_tool_registry
     except ImportError:
         logger.debug("Cannot import ACP providers module")
         return tools
@@ -180,7 +180,7 @@ def _discover_acp_tools(*, require_available: bool = False) -> dict[str, str]:
             if shutil.which(name) is not None:
                 available = True
                 try:
-                    acp_tool_registry.get_availability(
+                    is_programming_tool_available(
                         name,
                         allow_sync_probe=False,
                         trigger_async_probe=True,
@@ -195,11 +195,11 @@ def _discover_acp_tools(*, require_available: bool = False) -> dict[str, str]:
                     available = False
                 if not available:
                     try:
-                        available = bool(acp_tool_registry.get_availability(
+                        available = is_programming_tool_available(
                             name,
                             allow_sync_probe=False,
                             trigger_async_probe=True,
-                        ))
+                        )
                     except Exception:
                         available = False
 

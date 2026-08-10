@@ -79,11 +79,6 @@ def build_mode_buttons(
     elif mode == InteractionMode.TRAEX:
         buttons.append(_create_mode_button("exit_traex", "exit_traex", project_id, thread_root_id, button_size=button_size))
         buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
-    else:
-        buttons.append(_create_mode_button("enter_coco", "enter_coco", project_id, thread_root_id, button_size=button_size))
-        buttons.append(_create_mode_button("enter_claude", "enter_claude", project_id, thread_root_id, button_size=button_size))
-        buttons.append(_create_mode_button("enter_gemini", "enter_gemini", project_id, thread_root_id, button_size=button_size))
-        buttons.append(_create_mode_button("enter_traex", "enter_traex", project_id, thread_root_id, button_size=button_size))
 
     return [b for b in buttons if b]
 
