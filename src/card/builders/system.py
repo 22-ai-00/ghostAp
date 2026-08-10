@@ -1088,6 +1088,29 @@ class SystemBuilder:
         return text[:limit].rstrip("\\") or fallback
 
     @staticmethod
+    def _employee_roster_code_value(
+        value: object,
+        *,
+        fallback: str,
+        limit: int = 100,
+    ) -> str:
+        """Return bounded literal text for a roster inline-code value."""
+
+        text = " ".join(str(value or "").split()).strip() or fallback
+        return text[:limit] or fallback
+
+    @staticmethod
+    def _employee_roster_inline_code(value: str) -> str:
+        """Render a safe code span, falling back to prose for backtick values."""
+
+        if "`" not in value:
+            return f"`{value}`"
+        value = value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        for marker in ("\\", "`", "*", "_", "[", "]"):
+            value = value.replace(marker, f"\\{marker}")
+        return value
+
+    @staticmethod
     def build_employee_roster_card(
         entries: Sequence[Mapping[str, object]],
     ) -> tuple[str, str]:
@@ -1165,22 +1188,22 @@ class SystemBuilder:
                     "state": state,
                     "state_label": state_labels.get(state, "🔵 状态处理中"),
                     "role": role,
-                    "tool": SystemBuilder._employee_roster_text(
+                    "tool": SystemBuilder._employee_roster_code_value(
                         entry.get("tool"),
                         fallback="未设置工具",
                         limit=40,
                     ),
-                    "model": SystemBuilder._employee_roster_text(
+                    "model": SystemBuilder._employee_roster_code_value(
                         entry.get("model"),
                         fallback="默认模型",
                         limit=80,
                     ),
-                    "profile": SystemBuilder._employee_roster_text(
+                    "profile": SystemBuilder._employee_roster_code_value(
                         entry.get("profile"),
                         fallback="default",
                         limit=40,
                     ),
-                    "effort": SystemBuilder._employee_roster_text(
+                    "effort": SystemBuilder._employee_roster_code_value(
                         entry.get("effort"),
                         fallback="default",
                         limit=40,
@@ -1223,13 +1246,19 @@ class SystemBuilder:
         else:
             elements.append({"tag": "hr"})
             for index, item in enumerate(normalized):
+                backend = SystemBuilder._employee_roster_inline_code(
+                    f"{item['tool']}/{item['model']}"
+                )
+                configuration = SystemBuilder._employee_roster_inline_code(
+                    f"{item['profile']}/{item['effort']}"
+                )
                 elements.append(
                     {
                         "tag": "markdown",
                         "content": (
                             f"{item['emoji']} **{item['name']}** · {item['state_label']}\n"
-                            f"职责 {item['role']} · 后端 `{item['tool']}/{item['model']}`\n"
-                            f"配置 `{item['profile']}/{item['effort']}` · "
+                            f"职责 {item['role']} · 后端 {backend}\n"
+                            f"配置 {configuration} · "
                             f"协作群 {item['group_count']}"
                         ),
                     }

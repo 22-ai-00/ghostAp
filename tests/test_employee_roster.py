@@ -269,6 +269,71 @@ def test_employee_roster_card_has_distinct_empty_state() -> None:
     assert "暂不可用" not in rendered
 
 
+def test_employee_roster_card_preserves_underscores_inside_code_spans() -> None:
+    _msg_type, content = SystemBuilder.build_employee_roster_card(
+        [
+            {
+                "agent_id": "agt_visible",
+                "name": "可见员工",
+                "state": "active",
+                "role": "coder",
+                "tool": "tra_ex",
+                "model": "c_o_new_thinking",
+                "profile": "max_mode",
+                "effort": "very_high",
+            }
+        ]
+    )
+
+    assert "`tra_ex/c_o_new_thinking`" in content
+    assert "`max_mode/very_high`" in content
+    assert r"\\_" not in content
+
+
+def test_employee_roster_card_falls_back_to_safe_text_for_backtick_tokens() -> None:
+    _msg_type, content = SystemBuilder.build_employee_roster_card(
+        [
+            {
+                "agent_id": "agt_visible",
+                "name": "可见员工",
+                "state": "active",
+                "role": "coder",
+                "tool": "traex",
+                "model": "bad`model",
+                "profile": "standard",
+                "effort": "high",
+            }
+        ]
+    )
+
+    json.loads(content)
+    assert "后端 traex/bad\\\\`model" in content
+    assert "后端 `traex/bad" not in content
+    assert "配置 `standard/high`" in content
+
+
+def test_employee_roster_code_spans_preserve_raw_symbols_and_truncate_first() -> None:
+    profile = "p" * 39 + "<tail"
+    _msg_type, content = SystemBuilder.build_employee_roster_card(
+        [
+            {
+                "agent_id": "agt_visible",
+                "name": "可见员工",
+                "state": "active",
+                "role": "coder",
+                "tool": "tra&ex",
+                "model": "m<o>d",
+                "profile": profile,
+                "effort": "e&<>",
+            }
+        ]
+    )
+
+    assert "`tra&ex/m<o>d`" in content
+    assert f"`{'p' * 39}</e&<>`" in content
+    assert all(entity not in content for entity in ("&amp;", "&lt;", "&gt;"))
+
+
 @pytest.mark.parametrize(
     "text",
     [
