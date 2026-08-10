@@ -3105,7 +3105,6 @@ class EmployeeDepartmentRuntime:
                 )
                 if isinstance(result, BaseException)
             ]
-        self._start_monitor_in_loop()
         if failed_intents:
             retry_results = await asyncio.gather(
                 *(
@@ -3136,6 +3135,7 @@ class EmployeeDepartmentRuntime:
                     "employee recovery isolated %d exhausted intent(s) as action_required",
                     failures,
                 )
+        self._start_monitor_in_loop()
         await self._retry_terminal_notifications()
         if not base_summary.failed:
             self._require_service().mark_runtime_recovered()
@@ -3310,6 +3310,51 @@ class EmployeeDepartmentRuntime:
         for launch_attempt in range(2):
             state = service.get_state(intent_id) or state
             generation = self._target_channel_generation(state)
+            selected_slash_effect_id = service.select_slash_reconcile_effect(
+                state.intent_id,
+                generation=generation,
+                force_refresh=force_slash_refresh,
+                allow_action_required_refresh=allow_action_required_refresh,
+            )
+            current_effect_ids = {
+                selected_slash_effect_id,
+                f"channel-start:{generation}",
+            }
+            effect_types = dict(state.effect_types)
+            for effect_id, effect_state in state.effects:
+                if (
+                    effect_state
+                    not in {HireEffectState.PREPARED, HireEffectState.EXECUTING}
+                    or effect_id in current_effect_ids
+                ):
+                    continue
+                effect_type = effect_types.get(effect_id, "")
+                parts = effect_id.split(":")
+                effect_generation = (
+                    int(parts[1])
+                    if (
+                        effect_type == "slash_reconciliation"
+                        and len(parts) == 3
+                        and parts[0] == "slash-reconcile"
+                        and parts[1].isdigit()
+                    )
+                    or (
+                        effect_type == "employee_channel_start"
+                        and len(parts) == 2
+                        and parts[0] == "channel-start"
+                        and parts[1].isdigit()
+                    )
+                    else None
+                )
+                if effect_generation is None or effect_generation > generation:
+                    continue
+                state = service.commit_effect_transition(
+                    state.intent_id,
+                    effect_id=effect_id,
+                    effect_type=effect_type,
+                    next_state=HireEffectState.ACTION_REQUIRED,
+                    metadata={"error_code": "superseded_reconfiguration"},
+                )
             await self._reconcile_slash(
                 state,
                 generation=generation,

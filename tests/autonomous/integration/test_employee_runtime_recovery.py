@@ -182,6 +182,187 @@ def _seed_active_employee(
     return service
 
 
+def test_normal_channel_revalidation_automatic_activation_replays_after_restart(
+    tmp_path: Path,
+) -> None:
+    _seed_active_employee(tmp_path)
+    service = _service(_writer(tmp_path, 2))
+    try:
+        for next_state in (
+            HireEffectState.PREPARED,
+            HireEffectState.EXECUTING,
+            HireEffectState.COMMITTED,
+        ):
+            service.commit_effect_transition(
+                "hire_recover",
+                effect_id="slash-reconcile:2:1",
+                effect_type="slash_reconciliation",
+                next_state=next_state,
+                metadata={
+                    "slash_spec_hash": "slash_hash",
+                    "slash_observed_hash": "slash_hash",
+                    "slash_verified_at": "200.0",
+                }
+                if next_state is HireEffectState.COMMITTED
+                else None,
+            )
+        for next_state in (
+            HireEffectState.PREPARED,
+            HireEffectState.EXECUTING,
+            HireEffectState.COMMITTED,
+        ):
+            service.commit_effect_transition(
+                "hire_recover",
+                effect_id="channel-start:2",
+                effect_type="employee_channel_start",
+                next_state=next_state,
+                metadata={
+                    "app_id": "cli_employee",
+                    "generation": "2",
+                    "identity_app_id": "cli_employee",
+                    "connection_id": "conn_generation_2",
+                    "channel_verified_at": "201.0",
+                }
+                if next_state is HireEffectState.COMMITTED
+                else None,
+            )
+        service.prepare_automatic_activation("hire_recover")
+        activated = service.commit_automatic_activation(
+            "hire_recover",
+            activated_at=202.0,
+        )
+        assert activated.phase is HirePhase.ACTIVE
+        assert activated.automatic_reactivation_generation == 0
+    finally:
+        service.close()
+
+    reopened = _service(_writer(tmp_path, 3))
+    try:
+        state = reopened.get_state("hire_recover")
+        assert state is not None
+        assert state.phase is HirePhase.ACTIVE
+        assert state.channel_generation == 2
+        assert state.verification_consumed is True
+        assert state.automatic_reactivation_generation == 0
+    finally:
+        reopened.close()
+
+
+def test_effect_replay_accepts_exact_duplicate_and_rejects_conflict(
+    tmp_path: Path,
+) -> None:
+    from src.autonomous.provisioning.hire_state import (
+        HireProjection,
+        HireProjectionError,
+    )
+
+    _seed_active_employee(tmp_path)
+    service = _service(_writer(tmp_path, 2))
+    try:
+        service.commit_effect_transition(
+            "hire_recover",
+            effect_id="slash-reconcile:2:1",
+            effect_type="slash_reconciliation",
+            next_state=HireEffectState.PREPARED,
+        )
+    finally:
+        service.close()
+
+    writer = _writer(tmp_path, 3)
+    exact_payload = {
+        "effect_id": "slash-reconcile:2:1",
+        "effect_type": "slash_reconciliation",
+    }
+    try:
+        writer.commit(
+            (JournalEvent("hire.effect.prepared", "hire_recover", exact_payload),),
+            writer.get_aggregate_versions(("hire_recover",)),
+        )
+        HireProjection.rebuild(writer.replay())
+
+        writer.commit(
+            (
+                JournalEvent(
+                    "hire.effect.prepared",
+                    "hire_recover",
+                    {
+                        **exact_payload,
+                        "effect_type": "channel_start",
+                    },
+                ),
+            ),
+            writer.get_aggregate_versions(("hire_recover",)),
+        )
+        with pytest.raises(
+            HireProjectionError,
+            match="conflicting duplicate hire effect transition",
+        ):
+            HireProjection.rebuild(writer.replay())
+    finally:
+        writer.close()
+
+
+def test_reconfigure_disposes_superseded_effect_before_automatic_activation(
+    tmp_path: Path,
+) -> None:
+    _seed_active_employee(tmp_path)
+    service = _service(_writer(tmp_path, 2))
+    service.commit_effect_transition(
+        "hire_recover",
+        effect_id="slash-reconcile:1:2",
+        effect_type="slash_reconciliation",
+        next_state=HireEffectState.PREPARED,
+    )
+
+    class Slash:
+        async def reconcile(self):
+            return SimpleNamespace(
+                spec_hash="slash_hash",
+                observed_hash="slash_hash",
+                observed=(),
+            )
+
+    class Channels:
+        def start(
+            self,
+            _agent_id,
+            _app_id,
+            _credential_ref,
+            generation,
+            _on_event,
+        ):
+            return SimpleNamespace(
+                state=ChannelProcessState.READY,
+                identity={"app_id": "cli_employee"},
+                ready_metadata={"connection_id": f"conn_generation_{generation}"},
+                error_code="",
+            )
+
+    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
+    runtime._service = service  # noqa: SLF001
+    runtime._vault = SimpleNamespace(resolve=lambda *_args: "secret")  # noqa: SLF001
+    runtime._slash_factory = lambda *_args: Slash()  # noqa: SLF001
+    runtime._channels = Channels()  # type: ignore[assignment]  # noqa: SLF001
+    try:
+        before = service.get_state("hire_recover")
+        assert before is not None
+        assert before.automatic_reactivation_generation == 1
+
+        asyncio.run(runtime._configure_intent("hire_recover"))  # noqa: SLF001
+
+        state = service.get_state("hire_recover")
+        assert state is not None
+        assert state.phase is HirePhase.ACTIVE
+        assert state.channel_generation == 2
+        assert state.effect_state("slash-reconcile:1:2") is HireEffectState.ACTION_REQUIRED
+        assert dict(state.metadata_for("slash-reconcile:1:2")) == {
+            "error_code": "superseded_reconfiguration"
+        }
+        assert state.automatic_reactivation_generation == 0
+    finally:
+        service.close()
+
+
 def _seed_action_required(
     tmp_path: Path,
     *,
@@ -357,6 +538,95 @@ def test_repaired_intent_reaches_active_with_fresh_effects_and_one_worker(
         for frame in service._writer.replay()  # noqa: SLF001
         for event in frame.events
     )
+
+
+def test_projection_consumes_phase_only_automatic_activation_proof_once(
+    tmp_path: Path,
+) -> None:
+    from src.autonomous.provisioning.hire_state import HireProjectionError
+
+    service = _seed_action_required(tmp_path)
+    try:
+        repaired = service.recover_replay_safe_action_required()
+
+        class Slash:
+            async def reconcile(self):
+                return SimpleNamespace(
+                    spec_hash="slash_hash",
+                    observed_hash="slash_hash",
+                    observed=(),
+                )
+
+        class Channels:
+            def start(
+                self,
+                _agent_id,
+                _app_id,
+                _credential_ref,
+                generation,
+                _on_event,
+            ):
+                return SimpleNamespace(
+                    state=ChannelProcessState.READY,
+                    identity={"app_id": "cli_employee"},
+                    ready_metadata={"connection_id": f"conn_generation_{generation}"},
+                    error_code="",
+                )
+
+        runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
+        runtime._service = service  # noqa: SLF001
+        runtime._vault = SimpleNamespace(resolve=lambda *_args: "secret")  # noqa: SLF001
+        runtime._slash_factory = lambda *_args: Slash()  # noqa: SLF001
+        runtime._channels = Channels()  # type: ignore[assignment]  # noqa: SLF001
+        asyncio.run(
+            runtime._configure_intent(  # noqa: SLF001
+                repaired.repaired_intent_ids[0],
+                force_slash_refresh=True,
+                allow_action_required_refresh=True,
+            )
+        )
+
+        state = service.get_state("hire_recover")
+        assert state is not None
+        assert state.phase is HirePhase.ACTIVE
+        assert state.automatic_reactivation_generation == 0
+        state = service._commit_phase_transition(  # noqa: SLF001
+            state,
+            HirePhase.VALIDATING,
+        )
+        state = service._commit_phase_transition(  # noqa: SLF001
+            state,
+            HirePhase.READY_PENDING_VERIFICATION,
+        )
+
+        class Frame:
+            def __init__(self, sequence, events):
+                self.sequence = sequence
+                self.events = tuple(events)
+
+        frames = list(service._writer.replay())  # noqa: SLF001
+        duplicate = JournalEvent(
+            "hire.activation.automatic",
+            state.intent_id,
+            {
+                "tenant_key": state.tenant_key,
+                "app_id": state.app_id,
+                "agent_id": state.agent_id,
+                "generation": state.channel_generation,
+                "slash_spec_hash": state.slash_spec_hash,
+                "channel_connection_id": state.channel_connection_id,
+                "requester_principal_id": state.requester_principal_id,
+                "requester_union_id": state.requester_union_id,
+                "source": "channel_ready",
+                "activated_at": state.channel_verified_at + 1.0,
+            },
+        )
+        with pytest.raises(HireProjectionError, match="invalid automatic activation"):
+            HireProjection.rebuild(  # type: ignore[arg-type]
+                (*frames, Frame(frames[-1].sequence + 1, (duplicate,)))
+            )
+    finally:
+        service.close()
 
 
 def test_later_generation_exhaustion_ignores_disposed_prior_generation(
@@ -988,7 +1258,12 @@ def test_runtime_summary_preserves_active_intent_when_peer_isolation_fails(
     runtime._service = Service()  # type: ignore[assignment]  # noqa: SLF001
     runtime._execution_blockers = ("test-isolation",)  # noqa: SLF001
     monkeypatch.setattr(runtime, "_refresh_context_bindings", lambda _projection: True)
-    monkeypatch.setattr(runtime, "_start_monitor_in_loop", lambda: None)
+    monitor_starts: list[bool] = []
+    monkeypatch.setattr(
+        runtime,
+        "_start_monitor_in_loop",
+        lambda: monitor_starts.append(True),
+    )
     runtime._start_loop()  # noqa: SLF001
 
     async def configure(intent_id, **_kwargs):
@@ -1004,6 +1279,7 @@ def test_runtime_summary_preserves_active_intent_when_peer_isolation_fails(
     monkeypatch.setattr(runtime, "_retry_recovery_intent", fail_isolation)
     try:
         assert runtime.recover() == composition.EmployeeRecoverySummary(2, 1, 0, 1)
+        assert monitor_starts == []
     finally:
         runtime._closing = True  # noqa: SLF001
         assert runtime._loop is not None  # noqa: SLF001

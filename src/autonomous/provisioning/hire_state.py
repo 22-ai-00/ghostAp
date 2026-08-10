@@ -67,6 +67,7 @@ class DurableHireState:
     slash_observed_hash: str = ""
     slash_verified_at: float = 0.0
     channel_generation: int = 0
+    automatic_reactivation_generation: int = 0
     channel_identity_app_id: str = ""
     channel_connection_id: str = ""
     channel_verified_at: float = 0.0
@@ -275,7 +276,6 @@ class HireProjection:
         agent_intents: dict[str, str] = {}
         bot_intents: dict[str, str] = {}
         existing_app_intents: dict[str, str] = {}
-        phase_only_recovery_generations: dict[str, int] = {}
         for frame in frames:
             phase_only_recovery_intents: set[str] = set()
             phase_only_recovery_frame = any(
@@ -330,6 +330,32 @@ class HireProjection:
                 if intent_id is None:
                     continue
                 current = states[intent_id]
+                if event.event_type == "hire.channel.crashed":
+                    generation = event.payload.get("generation")
+                    if (
+                        set(event.payload) != {"generation"}
+                        or event.aggregate_id != current.intent_id
+                        or current.phase
+                        not in {
+                            HirePhase.CONFIGURING,
+                            HirePhase.VALIDATING,
+                            HirePhase.ACTIVE,
+                            HirePhase.READY_PENDING_VERIFICATION,
+                        }
+                        or isinstance(generation, bool)
+                        or not isinstance(generation, int)
+                        or generation <= 0
+                        or generation != current.channel_generation
+                    ):
+                        raise HireProjectionError(
+                            "invalid Channel revalidation binding"
+                        )
+                    states[intent_id] = replace(
+                        current,
+                        automatic_reactivation_generation=generation,
+                        last_sequence=frame.sequence,
+                    )
+                    continue
                 if event.event_type == "hire.channel.phase_only_recovery":
                     generation = event.payload.get("generation")
                     companion = (
@@ -354,9 +380,13 @@ class HireProjection:
                     ):
                         raise HireProjectionError(
                             "invalid phase-only channel recovery marker"
-                        )
+                    )
                     phase_only_recovery_intents.add(intent_id)
-                    phase_only_recovery_generations[intent_id] = generation
+                    states[intent_id] = replace(
+                        current,
+                        automatic_reactivation_generation=generation,
+                        last_sequence=frame.sequence,
+                    )
                     continue
                 if event.event_type == "hire.requester_identity_bound":
                     if set(event.payload) != {"requester_union_id"}:
@@ -637,13 +667,11 @@ class HireProjection:
                         "activated_at",
                     }
                     activated_at = event.payload.get("activated_at")
-                    recovery_generation = phase_only_recovery_generations.get(
-                        intent_id
-                    )
-                    recovery_reactivation = (
+                    automatic_reactivation = (
                         current.verification_consumed
-                        and recovery_generation is not None
-                        and current.channel_generation > recovery_generation
+                        and current.automatic_reactivation_generation > 0
+                        and current.channel_generation
+                        > current.automatic_reactivation_generation
                     )
                     if (
                         set(event.payload) != expected_keys
@@ -651,7 +679,7 @@ class HireProjection:
                         or current.phase is not HirePhase.READY_PENDING_VERIFICATION
                         or (
                             current.verification_consumed
-                            and not recovery_reactivation
+                            and not automatic_reactivation
                         )
                         or event.payload["tenant_key"] != current.tenant_key
                         or event.payload["app_id"] != current.app_id
@@ -674,12 +702,12 @@ class HireProjection:
                         raise HireProjectionError("invalid automatic activation binding")
                     states[intent_id] = replace(
                         current,
+                        automatic_reactivation_generation=0,
                         verification_consumed=True,
                         activation_source="channel_ready",
                         activation_verified_at=float(activated_at),
                         last_sequence=frame.sequence,
                     )
-                    phase_only_recovery_generations.pop(intent_id, None)
                     continue
                 next_effect = _EFFECT_EVENTS.get(event.event_type)
                 if next_effect is None:
@@ -689,12 +717,26 @@ class HireProjection:
                 effect_types = dict(current.effect_types)
                 effect_metadata = dict(current.effect_metadata)
                 previous = effects.get(effect_id)
+                previous_type = effect_types.get(effect_id)
+                previous_metadata_items = effect_metadata.get(effect_id, ())
+                if previous is next_effect:
+                    if (
+                        previous_type != effect_type
+                        or previous_metadata_items != metadata_items
+                    ):
+                        raise HireProjectionError(
+                            "conflicting duplicate hire effect transition"
+                        )
+                    states[intent_id] = replace(
+                        current,
+                        last_sequence=frame.sequence,
+                    )
+                    continue
                 if previous not in _ALLOWED_EFFECT_PREDECESSORS[next_effect]:
                     raise HireProjectionError("invalid hire effect transition")
-                previous_type = effect_types.get(effect_id)
                 if previous_type not in (None, effect_type):
                     raise HireProjectionError("hire effect type changed")
-                previous_metadata = dict(effect_metadata.get(effect_id, ()))
+                previous_metadata = dict(previous_metadata_items)
                 metadata = dict(metadata_items)
                 for key, value in previous_metadata.items():
                     if key in metadata and metadata[key] != value:

@@ -769,6 +769,14 @@ class ProductionEmployeeHireService:
                 or state.slash_verified_at <= 0
                 or state.channel_verified_at < state.slash_verified_at
                 or float(activated_at) < state.channel_verified_at
+                or (
+                    state.verification_consumed
+                    and not (
+                        state.automatic_reactivation_generation > 0
+                        and state.channel_generation
+                        > state.automatic_reactivation_generation
+                    )
+                )
                 or any(
                     effect_state in {
                         HireEffectState.PREPARED,
