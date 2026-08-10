@@ -351,6 +351,8 @@ class ProductionEmployeeHireService:
         cls,
         state: DurableHireState,
         frames: tuple[TransactionFrame, ...],
+        *,
+        recovery_writer_epoch: int,
     ) -> bool:
         """Accept only the known Slash exhaustion after a prior clean activation."""
 
@@ -476,7 +478,7 @@ class ProductionEmployeeHireService:
             )
             and tail[0].writer_epoch == tail[1].writer_epoch
             and len({frame.writer_epoch for frame in tail[2:]}) == 1
-            and tail[0].writer_epoch != tail[2].writer_epoch
+            and tail[5].writer_epoch != recovery_writer_epoch
         ):
             return False
 
@@ -526,6 +528,7 @@ class ProductionEmployeeHireService:
                     and self._has_exact_replay_safe_recovery_exhausted_history(
                         state,
                         frames,
+                        recovery_writer_epoch=self._writer.writer_epoch,
                     )
                 )
             )

@@ -169,6 +169,12 @@ class JournalWriter:
     def __enter__(self) -> JournalWriter:
         return self
 
+    @property
+    def writer_epoch(self) -> int:
+        """Return the immutable epoch stamped on frames committed by this writer."""
+
+        return self._writer_epoch
+
     def __exit__(self, *_args: object) -> None:
         self.close()
 

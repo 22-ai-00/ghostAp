@@ -49,7 +49,11 @@ def _service(writer: JournalWriter) -> ProductionEmployeeHireService:
     )
 
 
-def _seed_active_employee(tmp_path: Path) -> ProductionEmployeeHireService:
+def _seed_active_employee(
+    tmp_path: Path,
+    *,
+    begin_revalidation: bool = True,
+) -> ProductionEmployeeHireService:
     writer = _writer(tmp_path, 1)
     projection = ProjectionState()
     commit_workforce_events(
@@ -172,7 +176,8 @@ def _seed_active_employee(tmp_path: Path) -> ProductionEmployeeHireService:
         HirePhase.READY_PENDING_VERIFICATION,
     )
     service.commit_automatic_activation(intent_id, activated_at=102.0)
-    service.begin_channel_revalidation(intent_id, observed_generation=1)
+    if begin_revalidation:
+        service.begin_channel_revalidation(intent_id, observed_generation=1)
     service.close()
     return service
 
@@ -258,6 +263,40 @@ def test_recovery_exhausted_slash_is_atomically_reopened_and_uses_fresh_attempt(
     ]
     assert marker_frames[0].events[0].payload == {"generation": 1}
     assert marker_frames[0].events[1].payload == {"state": "validating"}
+
+
+def test_same_epoch_crash_and_exhaustion_requires_restart_then_recovers(
+    tmp_path: Path,
+) -> None:
+    _seed_active_employee(tmp_path, begin_revalidation=False)
+    writer_two = _writer(tmp_path, 2)
+    assert writer_two.writer_epoch == 2
+    same_epoch = _service(writer_two)
+    same_epoch.begin_channel_revalidation("hire_recover", observed_generation=1)
+    for next_state in (HireEffectState.PREPARED, HireEffectState.EXECUTING):
+        same_epoch.commit_effect_transition(
+            "hire_recover",
+            effect_id="slash-reconcile:2:1",
+            effect_type="slash_reconciliation",
+            next_state=next_state,
+        )
+    same_epoch.mark_recovery_action_required(
+        "hire_recover",
+        error_code="recovery_exhausted",
+    )
+
+    assert same_epoch.recover_replay_safe_action_required() == (
+        hire_service.ActionRequiredRecoveryResult(0, (), 1, 0)
+    )
+    same_epoch.close()
+
+    writer_three = _writer(tmp_path, 3)
+    assert writer_three.writer_epoch == 3
+    restarted = _service(writer_three)
+
+    assert restarted.recover_replay_safe_action_required() == (
+        hire_service.ActionRequiredRecoveryResult(1, ("hire_recover",), 0, 0)
+    )
 
 
 def test_repaired_intent_reaches_active_with_fresh_effects_and_one_worker(
@@ -882,7 +921,9 @@ def test_batch_recovery_uses_one_journal_commit_on_anchor_failure(
     monkeypatch.setattr(
         service,
         "_has_exact_replay_safe_recovery_exhausted_history",
-        lambda _state, _frames: True,
+        lambda _state, _frames, *, recovery_writer_epoch: (
+            recovery_writer_epoch == service._writer.writer_epoch  # noqa: SLF001
+        ),
     )
     monkeypatch.setattr(hire_service, "validate_workforce_events", lambda *_args: None)
     commits: list[tuple[JournalEvent, ...]] = []
