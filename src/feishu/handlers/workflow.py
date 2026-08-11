@@ -11,6 +11,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
+from ...card.text_stream import append_stream_text
 from ...utils.text import generate_task_id
 from ..emoji import EmojiReaction
 from .engine_base import BaseEngineHandler
@@ -23,6 +24,51 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SCRIPT_GENERATION_MAX_ATTEMPTS = 3
+_GENERATION_ACTIVITY_MAX_CHARS = 180
+_GENERATION_ACTIVITY_BREAKS = frozenset("。！？.!?；;\n")
+
+
+@dataclass(slots=True)
+class _WorkflowGenerationActivityBuffer:
+    """Coalesce provider text tokens into readable generation activities."""
+
+    pending: str = ""
+
+    def feed(self, text: str) -> tuple[str, ...]:
+        if not text:
+            return ()
+        self.pending = append_stream_text(self.pending, text)
+        completed: list[str] = []
+        while self.pending:
+            boundary = self._first_boundary(self.pending)
+            if boundary < 0 and len(self.pending) < _GENERATION_ACTIVITY_MAX_CHARS:
+                break
+            end = (
+                boundary + 1
+                if boundary >= 0
+                else _GENERATION_ACTIVITY_MAX_CHARS
+            )
+            segment = self.pending[:end].strip()
+            self.pending = self.pending[end:].lstrip()
+            if segment:
+                completed.append(segment)
+        return tuple(completed)
+
+    def flush(self) -> tuple[str, ...]:
+        segment = self.pending.strip()
+        self.pending = ""
+        return (segment,) if segment else ()
+
+    @staticmethod
+    def _first_boundary(value: str) -> int:
+        return next(
+            (
+                index
+                for index, char in enumerate(value)
+                if char in _GENERATION_ACTIVITY_BREAKS
+            ),
+            -1,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3642,6 +3688,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     )
                 session = None
                 should_fallback = False
+                activity_buffer = _WorkflowGenerationActivityBuffer()
                 try:
                     session_owner = current_generation_owner()
                     if session_owner is None:
@@ -3680,23 +3727,37 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         )
 
                     def on_event(event: Any) -> None:
-                        text = str(getattr(event, "text", "") or "").strip()
+                        text = str(getattr(event, "text", "") or "")
                         event_type = getattr(event, "event_type", None)
                         event_name = str(getattr(event_type, "value", event_type) or "").lower()
                         meaningful = self._workflow_generation_event_is_meaningful(event)
-                        if meaningful and progress_callback:
-                            summary = text or event_name.replace("_", " ")
+                        if not meaningful or not progress_callback:
+                            return
+                        summaries = activity_buffer.feed(text) if text else ()
+                        if not text:
+                            summaries = (
+                                *activity_buffer.flush(),
+                                event_name.replace("_", " "),
+                            )
+                        for summary in summaries:
                             progress_callback(
                                 f"{binding.agent_id} last activity: {summary[:180]}"
                             )
 
-                    result = session.send_prompt(
-                        base_prompt + retry_note,
-                        timeout=max(0.001, min(600.0, remaining)),
-                        idle_timeout=max(0.001, min(120.0, remaining)),
-                        on_event=on_event,
-                        activity_predicate=self._workflow_generation_event_is_meaningful,
-                    )
+                    try:
+                        result = session.send_prompt(
+                            base_prompt + retry_note,
+                            timeout=max(0.001, min(600.0, remaining)),
+                            idle_timeout=max(0.001, min(120.0, remaining)),
+                            on_event=on_event,
+                            activity_predicate=self._workflow_generation_event_is_meaningful,
+                        )
+                    finally:
+                        if progress_callback:
+                            for summary in activity_buffer.flush():
+                                progress_callback(
+                                    f"{binding.agent_id} last activity: {summary[:180]}"
+                                )
                     try:
                         ensure_current()
                     except Exception:

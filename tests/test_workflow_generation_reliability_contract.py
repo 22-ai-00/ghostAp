@@ -287,6 +287,39 @@ def test_activity_aware_idle_and_shared_hard_cap_across_attempts(tmp_path) -> No
     assert not any("heartbeat" in item.lower() for item in progress)
 
 
+def test_generation_activity_coalesces_token_chunks_into_complete_sentences(
+    tmp_path,
+) -> None:
+    progress: list[str] = []
+    session = _Session(
+        PromptResult(stop_reason="end_turn", text=_script("A-2", "gemini")),
+        name="A-2",
+        streamed_events=[
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="首先"),
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="，"),
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="我会"),
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="分析"),
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="现有卡片。"),
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="然后"),
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="给出方案。"),
+        ],
+    )
+
+    _generate(
+        _handler(),
+        _engine(tmp_path),
+        tmp_path,
+        MagicMock(return_value=session),
+        progress_callback=progress.append,
+    )
+
+    live_activity = [item for item in progress if "last activity:" in item]
+    assert live_activity == [
+        "A-2 last activity: 首先，我会分析现有卡片。",
+        "A-2 last activity: 然后给出方案。",
+    ]
+
+
 @pytest.mark.parametrize("stop_reason", [None, "", "timeout", "cancelled", "error"])
 def test_bad_stop_reason_rejects_valid_looking_script(tmp_path, stop_reason) -> None:
     only = (_binding("A-1", "codex", "fast"),)

@@ -490,7 +490,7 @@ def test_generation_renderer_is_read_only_and_shows_complete_agent_bindings() ->
         "openrouter-3o",
         "max",
         "xhigh",
-        "73 秒",
+        "1 分钟 13 秒",
     ):
         assert expected in serialized
     assert serialized.count("A2 正在生成并验证 Workflow 脚本") == 1
@@ -500,6 +500,27 @@ def test_generation_renderer_is_read_only_and_shows_complete_agent_bindings() ->
     assert markdown.count("`xhigh`") == 1
     assert not any(node.get("tag") in {"select_static", "button"} for node in nodes)
     assert not any("behaviors" in node or "value" in node for node in nodes)
+
+
+def test_generation_card_formats_wait_time_as_hours_minutes_and_seconds() -> None:
+    from src.workflow_engine.renderer import WorkflowGenerationRenderer
+
+    renderer = WorkflowGenerationRenderer(
+        requirement="检查 Workflow 卡片",
+        agent_pool=(),
+        orchestrator_agent_id="A1",
+    )
+
+    for elapsed, expected in (
+        (32, "已等待 32 秒"),
+        (128, "已等待 2 分钟 8 秒"),
+        (3789, "已等待 1 小时 3 分钟 9 秒"),
+    ):
+        serialized = json.dumps(
+            renderer.render(elapsed_seconds=elapsed),
+            ensure_ascii=False,
+        )
+        assert expected in serialized
 
 
 def test_confirm_replaces_selection_card_and_propagates_fallback_message_id(tmp_path) -> None:

@@ -20,7 +20,7 @@ from src.card.state.models import (
 )
 from src.card.state.runtime_stats import RuntimeStats
 from src.card.tool_display import sanitize_tool_failure_detail
-from src.utils.text import format_elapsed_clock
+from src.utils.text import format_duration, format_elapsed_clock
 
 from .errors import _strip_internal_details
 from .models import (
@@ -467,6 +467,7 @@ class WorkflowGenerationRenderer:
         activity = self._one_line(current_activity or default_activity, limit=240)
         requirement = self._one_line(self.requirement, limit=600)
         elapsed = max(0, int(elapsed_seconds or 0))
+        elapsed_text = format_duration(elapsed)
 
         pool_lines: list[str] = []
         for binding in self.agent_pool:
@@ -489,12 +490,12 @@ class WorkflowGenerationRenderer:
         status_content = (
             "**CANCELLED** · Workflow 已取消\n"
             f"**最终状态** · {activity}\n"
-            f"⏱ 结束于启动后 {elapsed} 秒"
+            f"⏱ 结束于启动后 {elapsed_text}"
             if is_cancelled
             else
             "**当前阶段** · 生成并验证编排脚本\n"
             f"**当前操作** · {activity}\n"
-            f"⏱ 已等待 {elapsed} 秒\n\n"
+            f"⏱ 已等待 {elapsed_text}\n\n"
             "① 生成脚本（进行中） → ② 验证计划 → ③ 执行节点 → ④ 汇总结果"
         )
         elements: list[dict[str, Any]] = [

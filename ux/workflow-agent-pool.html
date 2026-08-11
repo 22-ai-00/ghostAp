@@ -1284,7 +1284,7 @@
           </article>
 
           <div class="generation-wait">
-            <strong id="generationWaitTime">已等待 00:00</strong>
+            <strong id="generationWaitTime">已等待 0 秒</strong>
             <span>activity idle 120s · hard deadline 600s</span>
           </div>
         </section>
@@ -1583,9 +1583,14 @@
       var elapsed = generationStartedAt
         ? Math.max(0, Math.floor((Date.now() - generationStartedAt) / 1000))
         : 0;
-      var minutes = String(Math.floor(elapsed / 60)).padStart(2, "0");
-      var seconds = String(elapsed % 60).padStart(2, "0");
-      generationWaitTime.textContent = "已等待 " + minutes + ":" + seconds;
+      var hours = Math.floor(elapsed / 3600);
+      var minutes = Math.floor((elapsed % 3600) / 60);
+      var seconds = elapsed % 60;
+      var parts = [];
+      if (hours) parts.push(hours + " 小时");
+      if (minutes) parts.push(minutes + " 分钟");
+      if (seconds || !parts.length) parts.push(seconds + " 秒");
+      generationWaitTime.textContent = "已等待 " + parts.join(" ");
     }
 
     function showPreviewState(state) {
