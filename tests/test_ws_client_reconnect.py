@@ -405,6 +405,68 @@ def test_observed_ws_client_uses_official_channel_sdk() -> None:
     assert issubclass(ObservedLarkWSClient, ChannelWSClient)
 
 
+def test_observed_ws_client_dispatches_latest_card_callback_frames() -> None:
+    import base64
+
+    from lark_channel.core.json import JSON
+    from lark_channel.ws.pb.pbbp2_pb2 import Frame
+
+    from src.feishu.ws_lifecycle import ObservedLarkWSClient
+
+    payload = {
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt-card",
+            "event_type": "card.action.trigger",
+        },
+        "event": {"action": {"value": {"action": "workflow_select_tool"}}},
+    }
+    dispatched = []
+    written = []
+
+    class _Dispatcher:
+        def _do_without_validation(self, raw):
+            dispatched.append(json.loads(raw))
+            return {"toast": {"type": "info", "content": "accepted"}}
+
+    frame = Frame()
+    frame.SeqID = 1
+    frame.LogID = 1
+    frame.service = 1
+    frame.method = 1
+    for key, value in (
+        ("type", "card"),
+        ("message_id", "msg-card"),
+        ("trace_id", "trace-card"),
+        ("sum", "1"),
+        ("seq", "0"),
+    ):
+        header = frame.headers.add()
+        header.key = key
+        header.value = value
+    frame.payload = json.dumps(payload).encode()
+
+    client = ObservedLarkWSClient.__new__(ObservedLarkWSClient)
+    client._on_activity = lambda _kind: None
+    client._event_handler = _Dispatcher()
+    client._conn_id = ""
+
+    async def _write_message(raw):
+        written.append(raw)
+
+    client._write_message = _write_message
+
+    asyncio.run(client._handle_data_frame(frame))
+
+    assert dispatched == [payload]
+    assert len(written) == 1
+    response = JSON.unmarshal(frame.payload.decode(), dict)
+    assert response["code"] == 200
+    assert json.loads(base64.b64decode(response["data"])) == {
+        "toast": {"type": "info", "content": "accepted"}
+    }
+
+
 def test_observed_ws_disconnect_forwards_expected_connection(monkeypatch) -> None:
     from lark_channel.ws import Client as ChannelWSClient
 

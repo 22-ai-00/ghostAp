@@ -214,6 +214,34 @@ def test_server_consumes_trusted_options_and_builds_same_tool_different_model_po
     ]
 
 
+def test_tool_callback_atomically_refreshes_the_matching_model_catalog(tmp_path) -> None:
+    pending = PendingWorkflow(
+        requirement="build",
+        initiator_user_id="user-1",
+        selection_session_key="selection-1",
+        project_id="project-1",
+        draft_tool_name="traex",
+    )
+    handler, engine, project = _selection(tmp_path, pending=pending)
+
+    _act(handler, project, "workflow_select_tool", option="codex")
+
+    assert engine.project.pending.draft_tool_name == "codex"
+    card = handler.update_card.call_args.args[1]
+    model_select = next(
+        item
+        for item in _walk(card)
+        if item.get("tag") == "select_static"
+        and item.get("name") == "model_selection"
+    )
+    assert {option["value"] for option in model_select["options"]} == {
+        "default",
+        "gpt/standard/low",
+        "gpt/standard/high",
+    }
+    assert "traex-pro" not in json.dumps(model_select, ensure_ascii=False)
+
+
 def test_forged_or_stale_capability_values_fail_closed_with_inline_error(tmp_path) -> None:
     handler, engine, project = _selection(tmp_path)
 

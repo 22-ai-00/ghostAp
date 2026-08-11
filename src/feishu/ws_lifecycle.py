@@ -6,13 +6,29 @@ This module keeps low-level lark-channel WebSocket lifecycle observation out of
 
 from __future__ import annotations
 
+import base64
+import http
+import logging
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
 from lark_channel import ws
-from lark_channel.ws.const import HEADER_TYPE
+from lark_channel.core.const import UTF_8
+from lark_channel.core.json import JSON
+from lark_channel.ws.const import (
+    HEADER_BIZ_RT,
+    HEADER_MESSAGE_ID,
+    HEADER_SEQ,
+    HEADER_SUM,
+    HEADER_TRACE_ID,
+    HEADER_TYPE,
+)
 from lark_channel.ws.enum import MessageType
+from lark_channel.ws.model import Response
+
+logger = logging.getLogger(__name__)
 
 
 class WSLifecycleAction(str, Enum):
@@ -68,4 +84,51 @@ class ObservedLarkWSClient(ws.Client):
 
     async def _handle_data_frame(self, frame):
         self._on_activity("data")
+        if frame_header_value(frame, HEADER_TYPE) == MessageType.CARD.value:
+            return await self._handle_card_callback_frame(frame)
         return await super()._handle_data_frame(frame)
+
+    async def _handle_card_callback_frame(self, frame: Any) -> None:
+        """Dispatch callback frames that the upstream WS client drops.
+
+        Feishu can transport ``card.action.trigger`` over a ``card`` data
+        frame.  ``lark_channel.ws.Client`` currently returns without either
+        dispatching or acknowledging that frame, which makes the client show
+        error 200530.  The payload is still the latest P2 callback envelope, so
+        route it through the same typed event dispatcher used for ``event``
+        frames and preserve the official response encoding.
+        """
+
+        headers = frame.headers
+        message_id = frame_header_value(frame, HEADER_MESSAGE_ID) or ""
+        trace_id = frame_header_value(frame, HEADER_TRACE_ID) or ""
+        part_count = int(frame_header_value(frame, HEADER_SUM) or "1")
+        sequence = int(frame_header_value(frame, HEADER_SEQ) or "0")
+        payload = frame.payload
+        if part_count > 1:
+            payload = self._combine(message_id, part_count, sequence, payload)
+            if payload is None:
+                return
+
+        response = Response(code=http.HTTPStatus.OK)
+        started_ms = int(round(time.time() * 1000))
+        try:
+            result = self._event_handler._do_without_validation(payload)
+            elapsed_ms = int(round(time.time() * 1000)) - started_ms
+            header = headers.add()
+            header.key = HEADER_BIZ_RT
+            header.value = str(elapsed_ms)
+            if result is not None:
+                response.data = base64.b64encode(JSON.marshal(result).encode(UTF_8))
+        except Exception as exc:
+            logger.error(
+                "card callback frame dispatch failed: message_id=%s trace_id=%s err=%s",
+                message_id,
+                trace_id,
+                type(exc).__name__,
+                exc_info=True,
+            )
+            response = Response(code=http.HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        frame.payload = JSON.marshal(response).encode(UTF_8)
+        await self._write_message(frame.SerializeToString())
