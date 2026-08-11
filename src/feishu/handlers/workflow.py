@@ -891,26 +891,29 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     pending.draft_profile = None
                     pending.draft_effort = None
             elif authorized and action == "workflow_select_model":
-                model_selection = str(selected_option or "").strip()
-                if model_selection == "default":
+                model_name = str(selected_option or "").strip()
+                tool_name = str(pending.draft_tool_name or "").strip().lower()
+                if tool_name not in available_tools:
+                    error = ("invalid_argument", "请先选择当前可用的工具。")
+                elif model_name == "default":
                     pending.draft_model_name = None
                     pending.draft_profile = None
                     pending.draft_effort = None
                 else:
-                    from ...card.render.model_cascade import parse_model_selection
-
-                    models, _state = self._workflow_selection_model_state(
-                        tool_name=pending.draft_tool_name or "",
+                    _models, state = self._workflow_selection_model_state(
+                        tool_name=tool_name,
                         root_path=root_path,
                         pending=pending,
+                        selected_model=model_name,
+                        selected_profile="",
+                        selected_effort="",
                     )
-                    parsed = parse_model_selection(models, model_selection)
-                    if parsed is None:
-                        error = ("invalid_argument", "所选模型配置当前不可用。")
+                    if model_name not in state.model_names:
+                        error = ("invalid_argument", "所选模型族当前不可用。")
                     else:
-                        pending.draft_model_name = parsed.model
-                        pending.draft_profile = parsed.profile
-                        pending.draft_effort = parsed.effort
+                        pending.draft_model_name = state.selected_model
+                        pending.draft_profile = state.selected_profile
+                        pending.draft_effort = state.selected_effort
             elif authorized and action == "workflow_select_profile":
                 profile = str(selected_option or "").strip().lower()
                 _models, state = self._workflow_selection_model_state(

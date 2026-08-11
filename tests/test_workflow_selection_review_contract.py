@@ -160,18 +160,32 @@ def test_renderer_uses_callback_selects_without_cardkit_form_submit() -> None:
     ).render()
 
     selects = {item.get("name"): item for item in _walk(card) if item.get("tag") == "select_static"}
-    assert set(selects) == {"tool_name", "model_selection"}
+    assert set(selects) == {
+        "tool_name",
+        "model_group",
+        "model_profile",
+        "model_effort",
+    }
     assert {option["value"] for option in selects["tool_name"]["options"]} == {
         "codex",
         "gemini",
     }
-    assert {option["value"] for option in selects["model_selection"]["options"]} == {
+    assert {option["value"] for option in selects["model_group"]["options"]} == {
         "default",
-        "gpt/standard/low",
-        "gpt/standard/high",
+        "gpt",
     }
-    assert selects["model_selection"]["behaviors"] == [
-        {"type": "callback", "value": selects["model_selection"]["value"]}
+    assert [option["value"] for option in selects["model_profile"]["options"]] == [
+        "standard"
+    ]
+    assert [option["value"] for option in selects["model_effort"]["options"]] == [
+        "low",
+        "high",
+    ]
+    assert selects["model_group"]["initial_option"] == "gpt"
+    assert selects["model_profile"]["initial_option"] == "standard"
+    assert selects["model_effort"]["initial_option"] == "high"
+    assert selects["model_group"]["behaviors"] == [
+        {"type": "callback", "value": selects["model_group"]["value"]}
     ]
     forms = [item for item in _walk(card) if item.get("tag") == "form"]
     assert forms == []
@@ -197,9 +211,10 @@ def test_server_consumes_trusted_options_and_builds_same_tool_different_model_po
     handler, engine, project = _selection(tmp_path)
 
     _act(handler, project, "workflow_select_tool", option="codex")
-    _act(handler, project, "workflow_select_model", option="gpt/standard/high")
+    _act(handler, project, "workflow_select_model", option="gpt")
+    _act(handler, project, "workflow_select_effort", option="high")
     _act(handler, project, "workflow_add_agent")
-    _act(handler, project, "workflow_select_model", option="gpt/standard/low")
+    _act(handler, project, "workflow_select_effort", option="low")
     _act(handler, project, "workflow_add_agent")
 
     assert [binding.model_name for binding in engine.project.pending.agent_pool] == [
@@ -226,14 +241,17 @@ def test_tool_callback_atomically_refreshes_the_matching_model_catalog(tmp_path)
         item
         for item in _walk(card)
         if item.get("tag") == "select_static"
-        and item.get("name") == "model_selection"
+        and item.get("name") == "model_group"
     )
     assert {option["value"] for option in model_select["options"]} == {
         "default",
-        "gpt/standard/low",
-        "gpt/standard/high",
+        "gpt",
     }
     assert "traex-pro" not in json.dumps(model_select, ensure_ascii=False)
+    assert not any(
+        item.get("name") in {"model_profile", "model_effort"}
+        for item in _walk(card)
+    )
 
 
 def test_forged_or_stale_capability_values_fail_closed_with_inline_error(tmp_path) -> None:
@@ -349,3 +367,7 @@ def test_ux_preview_uses_production_agent_ids_and_explicit_pool_cap() -> None:
 
     assert "A1、A2" in preview
     assert "最多 8 个" in preview
+    assert 'id="modelSelect"' in preview
+    assert 'id="profileSelect"' in preview
+    assert 'id="effortSelect"' in preview
+    assert "选择精确配置" not in preview

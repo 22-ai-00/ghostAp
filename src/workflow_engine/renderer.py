@@ -651,32 +651,63 @@ class WorkflowAgentSelectionRenderer:
             action="workflow_select_tool",
         )
         model_options = [("default", "Backend default")]
-        selections = tuple(getattr(self.model_state, "selections", ()) or ())
-        if selections:
-            for selection in selections:
-                parts = [selection.model, selection.profile, selection.effort]
-                model_options.append(
-                    (selection.value, " · ".join(part for part in parts if part))
-                )
-        elif self.model_state is not None:
-            model_options.extend((name, name) for name in self.model_state.model_names)
-        exact_selection = (
-            str(getattr(self.model_state, "selection", "") or "")
-            if draft_model
-            else "default"
-        )
+        if self.model_state is not None:
+            model_options.extend(
+                (name, name) for name in self.model_state.model_names
+            )
         model_select = self._select_static(
-            name="model_selection",
-            placeholder="选择模型 / Profile / Effort",
+            name="model_group",
+            placeholder="选择模型族",
             options=model_options,
-            selected=exact_selection or draft_model or "default",
+            selected=draft_model or "default",
             action="workflow_select_model",
         )
         add_button = self._button(
             "+ 添加 Agent",
             self._value("workflow_add_agent"),
         )
-        elements.extend([tool_select, model_select, add_button])
+        elements.extend(
+            [
+                {"tag": "markdown", "content": "**工具**"},
+                tool_select,
+                {"tag": "markdown", "content": "**模型族**"},
+                model_select,
+            ]
+        )
+        if draft_model and self.model_state is not None:
+            if self.model_state.profiles:
+                elements.extend(
+                    [
+                        {"tag": "markdown", "content": "**Profile**"},
+                        self._select_static(
+                            name="model_profile",
+                            placeholder="选择 Profile",
+                            options=[
+                                (profile, profile)
+                                for profile in self.model_state.profiles
+                            ],
+                            selected=self.model_state.selected_profile,
+                            action="workflow_select_profile",
+                        ),
+                    ]
+                )
+            if self.model_state.efforts:
+                elements.extend(
+                    [
+                        {"tag": "markdown", "content": "**Effort**"},
+                        self._select_static(
+                            name="model_effort",
+                            placeholder="选择 Effort",
+                            options=[
+                                (effort, effort)
+                                for effort in self.model_state.efforts
+                            ],
+                            selected=self.model_state.selected_effort,
+                            action="workflow_select_effort",
+                        ),
+                    ]
+                )
+        elements.append(add_button)
         elements.extend(
             build_responsive_layout(
                 [

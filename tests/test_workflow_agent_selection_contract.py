@@ -342,7 +342,9 @@ def test_selection_renderer_carries_full_pool_auto_and_cas_coordinates(tmp_path)
         model_state=SimpleNamespace(
             model_names=("fast", "deep"),
             profiles=("standard",),
+            selected_profile="standard",
             efforts=("medium",),
+            selected_effort="medium",
         ),
     ).render()
     serialized = json.dumps(card, ensure_ascii=False)
@@ -362,10 +364,7 @@ def test_selection_renderer_carries_full_pool_auto_and_cas_coordinates(tmp_path)
         elif isinstance(item, list):
             stack.extend(item)
     workflow_values = [value for value in values if value.get("action") in _SELECTION_ACTIONS]
-    assert {value["action"] for value in workflow_values} == _SELECTION_ACTIONS - {
-        "workflow_select_profile",
-        "workflow_select_effort",
-    }
+    assert {value["action"] for value in workflow_values} == _SELECTION_ACTIONS
     assert all(value.get("project_id") == "project-1" for value in workflow_values)
     assert all(value.get("selection_session_key") == "selection-1" for value in workflow_values)
 

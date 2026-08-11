@@ -359,9 +359,10 @@
 
     .compose-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
       gap: 10px;
       margin-top: 13px;
+      align-items: end;
     }
 
     .model-select,
@@ -1158,7 +1159,7 @@
           <div class="section-heading">
             <div>
               <h2 class="section-title" id="add-title"><span class="section-index">1</span> 添加 tool + model</h2>
-              <p class="section-help">模型、Profile 与 Effort 合并为精确配置；工具和模型选择即时生效，再点击添加。完全相同的组合不会重复进入池。</p>
+              <p class="section-help">像普通编程模式一样依次选择模型族、Profile 与 Effort。只有完全相同的工具和最终配置才会判重。</p>
             </div>
           </div>
 
@@ -1167,8 +1168,16 @@
             <div class="tool-tabs" id="toolTabs" role="group" aria-label="选择工具"></div>
             <div class="compose-row">
               <label>
-                <span class="field-label">选择精确配置</span>
-                <select class="model-select" id="modelSelect" aria-label="选择模型、Profile 与 Effort 的精确配置"></select>
+                <span class="field-label">模型族</span>
+                <select class="model-select" id="modelSelect" aria-label="选择模型族"></select>
+              </label>
+              <label id="profileField">
+                <span class="field-label">Profile</span>
+                <select class="model-select" id="profileSelect" aria-label="选择 Profile"></select>
+              </label>
+              <label id="effortField">
+                <span class="field-label">Effort</span>
+                <select class="model-select" id="effortSelect" aria-label="选择 Effort"></select>
               </label>
               <button class="secondary-add" id="addAgent" type="button">＋ 添加到池</button>
             </div>
@@ -1295,12 +1304,15 @@
   <script>
     (function () {
       var catalog = [
-        { key: "codex", label: "Codex", models: ["gpt-5.2-codex · standard · high", "gpt-5.2-codex · standard · medium", "gpt-5.1-codex-mini · standard · high", "default"] },
-        { key: "claude", label: "Claude", models: ["claude-sonnet-4-5", "claude-opus-4-1", "default"] },
-        { key: "gemini", label: "Gemini", models: ["gemini-2.5-pro", "gemini-2.5-flash", "default"] },
-        { key: "coco", label: "Coco", models: ["default", "glm-4.5"] },
-        { key: "aiden", label: "Aiden", models: ["default", "qwen3-coder"] },
-        { key: "traex", label: "Traex", models: ["default", "deepseek-v3.1"] }
+        { key: "codex", label: "Codex", models: [
+          { name: "gpt-5.6-sol", profiles: ["standard"], efforts: ["medium", "high", "xhigh"] },
+          { name: "gpt-5.3-codex-spark", profiles: [], efforts: ["high", "xhigh"] }
+        ] },
+        { key: "claude", label: "Claude", models: [{ name: "claude-sonnet-4-5", profiles: [], efforts: [] }, { name: "claude-opus-4-1", profiles: [], efforts: [] }] },
+        { key: "gemini", label: "Gemini", models: [{ name: "gemini-2.5-pro", profiles: [], efforts: [] }, { name: "gemini-2.5-flash", profiles: [], efforts: [] }] },
+        { key: "coco", label: "Coco", models: [{ name: "glm-4.5", profiles: [], efforts: [] }] },
+        { key: "aiden", label: "Aiden", models: [{ name: "qwen3-coder", profiles: [], efforts: [] }] },
+        { key: "traex", label: "Traex", models: [{ name: "deepseek-v3.1", profiles: [], efforts: [] }] }
       ];
 
       var pool = [
@@ -1313,6 +1325,10 @@
 
       var toolTabs = document.getElementById("toolTabs");
       var modelSelect = document.getElementById("modelSelect");
+      var profileSelect = document.getElementById("profileSelect");
+      var effortSelect = document.getElementById("effortSelect");
+      var profileField = document.getElementById("profileField");
+      var effortField = document.getElementById("effortField");
       var poolList = document.getElementById("poolList");
       var poolEmpty = document.getElementById("poolEmpty");
       var poolCount = document.getElementById("poolCount");
@@ -1365,10 +1381,44 @@
         modelSelect.innerHTML = "";
         tool.models.forEach(function (model) {
           var option = document.createElement("option");
-          option.value = model;
-          option.textContent = model === "default" ? "后端默认模型" : model;
+          option.value = model.name;
+          option.textContent = model.name;
           modelSelect.appendChild(option);
         });
+        renderDimensions();
+      }
+
+      function selectedModelConfig() {
+        var tool = getTool(selectedTool);
+        return tool.models.filter(function (model) { return model.name === modelSelect.value; })[0];
+      }
+
+      function renderSelectOptions(select, values) {
+        select.innerHTML = "";
+        values.forEach(function (value) {
+          var option = document.createElement("option");
+          option.value = value;
+          option.textContent = value;
+          select.appendChild(option);
+        });
+      }
+
+      function renderDimensions() {
+        var model = selectedModelConfig();
+        var profiles = model ? model.profiles : [];
+        var efforts = model ? model.efforts : [];
+        profileField.hidden = profiles.length === 0;
+        effortField.hidden = efforts.length === 0;
+        renderSelectOptions(profileSelect, profiles);
+        renderSelectOptions(effortSelect, efforts);
+      }
+
+      function exactModelSelection() {
+        return [
+          modelSelect.value,
+          profileField.hidden ? "" : profileSelect.value,
+          effortField.hidden ? "" : effortSelect.value
+        ].filter(Boolean).join("/");
       }
 
       function removeAgent(id) {
@@ -1472,7 +1522,7 @@
           return;
         }
         var tool = getTool(selectedTool);
-        var model = modelSelect.value;
+        var model = exactModelSelection();
         var duplicate = pool.some(function (agent) {
           return agent.tool === selectedTool && agent.model === model;
         });
@@ -1499,6 +1549,8 @@
         duplicateAlert.classList.remove("visible");
         renderPool();
       });
+
+      modelSelect.addEventListener("change", renderDimensions);
 
       document.querySelectorAll('input[name="orchestratorMode"]').forEach(function (radio) {
         radio.addEventListener("change", function () {
