@@ -583,7 +583,6 @@ class WorkflowAgentSelectionRenderer:
         options: list[tuple[str, str]],
         selected: str | None,
         action: str,
-        emit_callback: bool = True,
     ) -> dict[str, Any]:
         callback_value = self._value(action)
         element: dict[str, Any] = {
@@ -597,14 +596,9 @@ class WorkflowAgentSelectionRenderer:
                 }
                 for value, label in options
             ],
-            "behaviors": (
-                [{"type": "callback", "value": callback_value}]
-                if emit_callback
-                else []
-            ),
+            "value": callback_value,
+            "behaviors": [{"type": "callback", "value": callback_value}],
         }
-        if emit_callback:
-            element["value"] = callback_value
         option_values = {value for value, _label in options}
         if selected in option_values:
             element["initial_option"] = selected
@@ -677,28 +671,12 @@ class WorkflowAgentSelectionRenderer:
             options=model_options,
             selected=exact_selection or draft_model or "default",
             action="workflow_select_model",
-            emit_callback=False,
         )
         add_button = self._button(
             "+ 添加 Agent",
             self._value("workflow_add_agent"),
         )
-        add_button.update(
-            {
-                "action_type": "form_submit",
-                "form_action_type": "submit",
-                "form_name": "workflow_agent_binding",
-            }
-        )
-        elements.append(
-            {
-                "tag": "form",
-                "name": "workflow_agent_binding",
-                "direction": "vertical",
-                "vertical_spacing": "8px",
-                "elements": [tool_select, model_select, add_button],
-            }
-        )
+        elements.extend([tool_select, model_select, add_button])
         elements.extend(
             build_responsive_layout(
                 [

@@ -363,7 +363,6 @@ def test_selection_renderer_carries_full_pool_auto_and_cas_coordinates(tmp_path)
             stack.extend(item)
     workflow_values = [value for value in values if value.get("action") in _SELECTION_ACTIONS]
     assert {value["action"] for value in workflow_values} == _SELECTION_ACTIONS - {
-        "workflow_select_model",
         "workflow_select_profile",
         "workflow_select_effort",
     }

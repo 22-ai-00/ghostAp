@@ -135,7 +135,7 @@ def _walk(value):
             yield from _walk(child)
 
 
-def test_renderer_batches_exact_model_selection_into_one_form_submit() -> None:
+def test_renderer_uses_callback_selects_without_cardkit_form_submit() -> None:
     pending = PendingWorkflow(
         requirement="build",
         selection_session_key="selection-1",
@@ -170,10 +170,11 @@ def test_renderer_batches_exact_model_selection_into_one_form_submit() -> None:
         "gpt/standard/low",
         "gpt/standard/high",
     }
-    assert selects["model_selection"]["behaviors"] == []
+    assert selects["model_selection"]["behaviors"] == [
+        {"type": "callback", "value": selects["model_selection"]["value"]}
+    ]
     forms = [item for item in _walk(card) if item.get("tag") == "form"]
-    assert len(forms) == 1
-    assert forms[0]["name"] == "workflow_agent_binding"
+    assert forms == []
     primary = [item for item in _walk(card) if item.get("type") == "primary"]
     assert len(primary) == 1
     assert primary[0]["text"]["content"] == "使用此池开始编排"
@@ -183,9 +184,10 @@ def test_renderer_batches_exact_model_selection_into_one_form_submit() -> None:
         for item in _walk(card)
         if item.get("tag") == "button" and item.get("value", {}).get("action") == "workflow_add_agent"
     )
-    assert add["action_type"] == "form_submit"
-    assert add["form_action_type"] == "submit"
-    assert add["form_name"] == "workflow_agent_binding"
+    assert "action_type" not in add
+    assert "form_action_type" not in add
+    assert "form_name" not in add
+    assert add["behaviors"] == [{"type": "callback", "value": add["value"]}]
     assert selects["tool_name"]["behaviors"] == [
         {"type": "callback", "value": selects["tool_name"]["value"]}
     ]
@@ -195,18 +197,10 @@ def test_server_consumes_trusted_options_and_builds_same_tool_different_model_po
     handler, engine, project = _selection(tmp_path)
 
     _act(handler, project, "workflow_select_tool", option="codex")
-    _act(
-        handler,
-        project,
-        "workflow_add_agent",
-        _form_value={"model_selection": "gpt/standard/high"},
-    )
-    _act(
-        handler,
-        project,
-        "workflow_add_agent",
-        _form_value={"model_selection": "gpt/standard/low"},
-    )
+    _act(handler, project, "workflow_select_model", option="gpt/standard/high")
+    _act(handler, project, "workflow_add_agent")
+    _act(handler, project, "workflow_select_model", option="gpt/standard/low")
+    _act(handler, project, "workflow_add_agent")
 
     assert [binding.model_name for binding in engine.project.pending.agent_pool] == [
         "gpt/standard/high",
