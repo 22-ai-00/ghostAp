@@ -292,13 +292,14 @@ def run_low_level_employee_channel(
 
     import lark_oapi as lark
     from lark_channel.core.enum import LogLevel
-    from lark_channel.event.callback.model.p2_card_action_trigger import (
-        P2CardActionTriggerResponse,
-    )
     from lark_channel.event.dispatcher_handler import EventDispatcherHandler
     from lark_channel.ws import Client as WSClient
 
     from src.autonomous.provisioning.lark_outbound import LarkEmployeeOutbound
+    from src.feishu.card_callback_contract import (
+        empty_card_action_response,
+        validate_card_action_trigger,
+    )
 
     security = _strict_sdk_security_config()
     lark_client = (
@@ -388,8 +389,9 @@ def run_low_level_employee_channel(
         wait_for_parent(event, kind="message")
 
     def on_card_action(event: Any) -> Any:
+        validate_card_action_trigger(event)
         wait_for_parent(event, kind="card")
-        return P2CardActionTriggerResponse({})
+        return empty_card_action_response()
 
     def on_bot_added(event: Any) -> None:
         wait_for_parent(event, kind="membership_added")

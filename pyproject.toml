@@ -4,13 +4,13 @@ version = "0.2.1"
 description = "飞书原生 Agent Department 控制面与研发执行网关"
 requires-python = ">=3.11"
 dependencies = [
-    "lark-oapi==1.7.1",
+    "lark-oapi==1.7.2",
     "agent-client-protocol>=0.11.0",
     "pydantic-settings>=2.6.0",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0.0",
     "psutil>=7.2.2",
-    "lark-channel-sdk==1.1.0",
+    "lark-channel-sdk==1.2.0",
     "cryptography==49.0.0",
 ]
 

@@ -15,11 +15,19 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **官方飞书 SDK 升级**：`lark-channel-sdk` 从 1.1.0 升至 1.2.0，
+  `lark-oapi` 从 1.7.1 升至 1.7.2；Employee Channel 的 wheel、RECORD
+  与运行时 payload 完整性哈希同步重新锁定。
 - **`BaseRenderer._create_session()` → `BaseRenderer.create_session()`**: Renamed to public API (no underscore prefix). All renderer subclasses and test patch targets updated.
 - **`CardDelivery.drain_in_flight()`**: Now uses O(1) counter-based wait instead of O(n) lock iteration.
 
 ### ⚠️ Breaking Changes
 
+- **飞书卡片回调仅支持最新版**：主 Bot 与 Employee Bot 只注册
+  `card.action.trigger`，回调 ACK/toast/raw-card 更新统一使用官方 2.0 响应结构；
+  出站交互卡只接受 `schema: "2.0"` + `body.elements`。旧
+  `card.action.trigger_v1`、Card JSON 1.0、schema-less 卡片和根级
+  `elements` 自动升级均已移除。部署时须在开放平台删除旧回调订阅并发布新版本。
 - **Worktree mode removed**: `/worktree` and `/wt`, the Worktree engine, its cards, and its dedicated tests are gone. Existing historical cards are read-only and non-executable; use `/wf` as the supported multi-Agent orchestration entry. Legacy local branches and worktree directories are not deleted or migrated automatically.
 - **TTADK backend removed**: `/ttadk` and `/enter_ttadk`, TTADK CLI/session startup, model selection, cards, project state, configuration, implementation modules, and dedicated tests are gone. Surviving programming tools continue through their existing ACP or CLI transports.
 - **`DirectCardSession` 已删除**: `src/card/direct_session.py` 已移除。所有引擎渲染器现使用 `BaseRenderer.create_session()` → `CardSession.dispatch()`。

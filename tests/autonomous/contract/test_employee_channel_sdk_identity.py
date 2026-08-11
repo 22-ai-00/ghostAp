@@ -28,10 +28,10 @@ def test_installed_sdk_record_and_runtime_payload_are_verified() -> None:
     assert identity.path_basis == "site-packages-relative-posix"
     assert len(identity.project_lock_sha256) == 64
     assert identity.installed_record_sha256 == (
-        "832add283a7ba9800978e6e94b37bab223aa266ddc0d6163ff93d564fc06ee27"
+        "d539f31b6457104d5a345c0e5188deef857a6fca3a386ee7544478e735f4b4eb"
     )
     assert identity.runtime_payload_sha256 == (
-        "845e6c04019aefd54ec56c37a435d45a1f5e1cff8a81b7eb5382049ad3e05c88"
+        "1f9017d0511043c3a7dffbcc0df110619d22782cc9e957f1227a4075b1963abe"
     )
 
 

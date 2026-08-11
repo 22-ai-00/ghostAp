@@ -836,6 +836,7 @@ def test_dispatcher_intercepts_engine_command_before_intent_recognition(
 
 def _card_action_data(*, event_id: str, message_id: str, chat_id: str, operator_id: str):
     data = MagicMock()
+    data.schema = "2.0"
     data.header.event_id = event_id
     data.header.event_type = "card.action.trigger"
     data.header.tenant_key = "tenant_card"
@@ -850,6 +851,23 @@ def _card_action_data(*, event_id: str, message_id: str, chat_id: str, operator_
     data.event.operator.user_id = None
     data.event.operator.union_id = None
     return data
+
+
+def test_card_action_rejects_old_callback_before_scheduling(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    data = _card_action_data(
+        event_id="evt_old_callback",
+        message_id="msg_old_card",
+        chat_id="chat_old",
+        operator_id="ou_admin",
+    )
+    data.schema = "1.0"
+
+    response = mock_ws_client._handle_card_action(data)
+
+    assert response.__class__.__name__ == "P2CardActionTriggerResponse"
+    mock_ws_client._scheduler.submit.assert_not_called()
 
 
 def test_card_action_restores_p2p_from_trusted_message_origin(mock_ws_client: FeishuWSClient):
@@ -876,10 +894,10 @@ def test_card_action_restores_p2p_from_trusted_message_origin(mock_ws_client: Fe
     assert spec.is_p2p is True
 
 
-def test_card_action_fallback_uses_chat_mode_not_visibility_chat_type(
+def test_card_action_after_restart_fails_closed_without_chat_api_lookup(
     mock_ws_client: FeishuWSClient,
 ):
-    """After an in-memory provenance miss, Chat API chat_mode is authoritative."""
+    """The three-second callback path never performs a remote provenance lookup."""
     response = MagicMock()
     response.success.return_value = True
     response.data.chat_mode = "p2p"
@@ -897,30 +915,7 @@ def test_card_action_fallback_uses_chat_mode_not_visibility_chat_type(
     mock_ws_client._handle_card_action(data)
 
     spec, _ = mock_ws_client._scheduler.submit.call_args.args
-    assert spec.is_p2p is True
-    request = api_client.im.v1.chat.get.call_args.args[0]
-    assert request.chat_id == "chat_dm"
-    fallback_origin = mock_ws_client._message_linker.query("msg_card_after_restart")
-    assert fallback_origin is not None
-    assert fallback_origin["chat_id"] == "chat_dm"
-    assert fallback_origin["sender_id"] == "ou_admin"
-    assert fallback_origin["chat_type"] == "p2p"
-
-    mock_ws_client._message_linker.link_reply(
-        "msg_card_after_restart",
-        "msg_next_hire_card",
-    )
-    api_client.im.v1.chat.get.reset_mock()
-    next_data = _card_action_data(
-        event_id="evt_after_restart_next_step",
-        message_id="msg_next_hire_card",
-        chat_id="chat_dm",
-        operator_id="ou_admin",
-    )
-    mock_ws_client._handle_card_action(next_data)
-
-    next_spec, _ = mock_ws_client._scheduler.submit.call_args.args
-    assert next_spec.is_p2p is True
+    assert spec.is_p2p is False
     api_client.im.v1.chat.get.assert_not_called()
 
 
@@ -1031,15 +1026,10 @@ def test_card_action_api_fallback_rejects_empty_operator(mock_ws_client: FeishuW
     mock_ws_client._get_api_client.assert_not_called()
 
 
-def test_card_action_api_fallback_requires_atomic_provenance_write(
+def test_card_action_missing_origin_never_attempts_remote_provenance_write(
     mock_ws_client: FeishuWSClient,
 ):
-    response = MagicMock()
-    response.success.return_value = True
-    response.data.chat_mode = "p2p"
-    api_client = MagicMock()
-    api_client.im.v1.chat.get.return_value = response
-    mock_ws_client._get_api_client = MagicMock(return_value=api_client)
+    mock_ws_client._get_api_client = MagicMock()
     mock_ws_client._message_linker = MagicMock()
     mock_ws_client._message_linker.query.return_value = None
     mock_ws_client._message_linker.register_trusted_origin_if_absent.return_value = None
@@ -1049,6 +1039,8 @@ def test_card_action_api_fallback_requires_atomic_provenance_write(
         open_chat_id="chat_dm",
         operator_id="ou_admin",
     ) is False
+    mock_ws_client._get_api_client.assert_not_called()
+    mock_ws_client._message_linker.register_trusted_origin_if_absent.assert_not_called()
 
 
 def test_card_action_rejects_provenance_for_different_origin(

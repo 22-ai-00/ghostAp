@@ -16,8 +16,8 @@ def settings() -> Settings:
 def test_locked_lark_dependencies() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text())
 
-    assert "lark-oapi==1.7.1" in project["project"]["dependencies"]
-    assert "lark-channel-sdk==1.1.0" in project["project"]["dependencies"]
+    assert "lark-oapi==1.7.2" in project["project"]["dependencies"]
+    assert "lark-channel-sdk==1.2.0" in project["project"]["dependencies"]
     assert "cryptography==49.0.0" in project["project"]["dependencies"]
 
 

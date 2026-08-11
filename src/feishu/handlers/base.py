@@ -599,36 +599,24 @@ class BaseHandler:
     # ------------------------------------------------------------------
     @staticmethod
     def _normalize_interactive_card_content(content_str) -> str:
-        """Normalize outgoing interactive card JSON to Feishu-accepted shape.
+        """Validate outgoing content as a complete Card JSON 2.0 payload.
 
-        Accepts both str (JSON) and dict inputs. Always returns a JSON string.
+        Renderer fragments and legacy root-level ``elements`` are intentionally
+        rejected. Their owning handler must assemble a full card first.
         """
+        from ...card.schema import require_card_json_2
+
         if isinstance(content_str, dict):
             card = content_str
         elif isinstance(content_str, str):
             try:
                 card = json.loads(content_str)
-            except Exception:
-                return content_str
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Card JSON 2.0 payload must be valid JSON") from exc
         else:
-            return json.dumps(content_str, ensure_ascii=False) if content_str is not None else ""
+            raise ValueError("Card JSON 2.0 payload must be a dict or JSON string")
 
-        if not isinstance(card, dict):
-            return json.dumps(card, ensure_ascii=False) if card is not None else ""
-        if str(card.get("schema") or "").strip() != "2.0":
-            return json.dumps(card, ensure_ascii=False)
-
-        root_elements = card.get("elements")
-        if isinstance(root_elements, list):
-            body = card.get("body")
-            if not isinstance(body, dict):
-                body = {}
-                card["body"] = body
-            if not isinstance(body.get("elements"), list):
-                body["elements"] = root_elements
-            card.pop("elements", None)
-
-        return json.dumps(card, ensure_ascii=False)
+        return json.dumps(require_card_json_2(card), ensure_ascii=False)
 
     @staticmethod
     def _inject_ref_note(content_str, msg_type: str, ref_note: str) -> str:

@@ -63,8 +63,11 @@ uv sync --group dev
 1. 获取 `APP_ID` 和 `APP_SECRET`。
 2. 在“事件与回调”中启用“使用长连接接收事件”。
 3. 订阅 `im.message.receive_v1`。
-4. 授权消息接收、消息发送和卡片更新相关权限。
-5. 授权 `application:app_slash_command:read` 和
+4. 在“回调订阅”中只保留新版 `card.action.trigger`（卡片回传交互）；
+   删除旧版 `card.action.trigger_v1` 或旧请求地址配置。GhostAP 不再接收旧回调，
+   也不再发送 Card JSON 1.0。回调配置以[飞书官方最新版说明](https://open.larkoffice.com/document/feishu-cards/card-callback-communication)为准。
+5. 授权消息接收、消息发送和卡片更新相关权限。
+6. 授权 `application:app_slash_command:read` 和
    `application:app_slash_command:write`，然后创建并发布新的应用版本。
 
 服务启动后会在后台通过官方 OpenAPI 对账主 Bot 的 Slash Command 面板，
@@ -269,8 +272,8 @@ handler -> session -> render
 生产 Employee Department 使用 Journal-backed 持久化架构，所有状态变更通过事务帧记录，并通过 Vault、Blob、独立员工 Channel 和 Durable Outbox 完成恢复。生产组装根位于 `provisioning/composition.py`，现役执行面由 `gateway/coordinator.py`、`runtime/employee_actor.py` 和 `supervisor/employee_channels.py` 构成；旧 Goal/Run Manager 不再是产品入口。
 
 **关键依赖：**
-- `lark-oapi==1.7.1`：REST API 消息发送、卡片更新、机器人管理
-- `lark-channel-sdk==1.1.0`：WebSocket 事件订阅（持久收件箱）
+- `lark-oapi==1.7.2`：REST API 消息发送、卡片更新、机器人管理
+- `lark-channel-sdk==1.2.0`：WebSocket 事件订阅（持久收件箱）
 
 **测试：**
 

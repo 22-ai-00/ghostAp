@@ -93,6 +93,11 @@ from ..utils.errors import get_error_detail
 from ..utils.rate_limit import RateLimiter, RateLimitExceededException
 from ..utils.restart_gate import RestartGate
 from ..utils.trace import TraceContext, configure_logging_with_trace
+from .card_callback_contract import (
+    build_card_action_response,
+    empty_card_action_response,
+    validate_card_action_trigger,
+)
 from .emoji import EmojiReaction
 from .handler_context import HandlerContext
 from .handlers import (
@@ -628,8 +633,9 @@ class FeishuWSClient:
                         "value": {"action": "retry_command", "_t": "/status", "_s": _compute_command_sig("/status")},
                     }
                     _card = _json.dumps({
+                        "schema": "2.0",
                         "config": {"wide_screen_mode": True},
-                        "elements": [
+                        "body": {"elements": [
                             {"tag": "markdown", "content": _text},
                             {
                                 "tag": "column_set",
@@ -644,7 +650,7 @@ class FeishuWSClient:
                                     }
                                 ],
                             },
-                        ],
+                        ]},
                     }, ensure_ascii=False)
                     for _cid in blocked_chat_ids:
                         try:
@@ -2469,8 +2475,17 @@ class FeishuWSClient:
             logger.warning("managed stale card refresh failed closed", exc_info=True)
             return False
 
-    def _handle_card_action(self, data: P2CardActionTrigger) -> Optional[P2CardActionTriggerResponse]:
-        """飞书卡片回调入口：做去重 + 任务入队（system action 走快通道）。"""
+    def _handle_card_action(
+        self,
+        data: P2CardActionTrigger,
+    ) -> P2CardActionTriggerResponse:
+        """Consume one latest Card 2.0 callback and enqueue its business action."""
+        try:
+            validate_card_action_trigger(data)
+        except ValueError as exc:
+            logger.warning("拒绝非最新版飞书卡片回调: %s", get_error_detail(exc))
+            return empty_card_action_response()
+
         try:
             open_message_id = data.event.context.open_message_id
             open_chat_id = data.event.context.open_chat_id
@@ -2482,7 +2497,7 @@ class FeishuWSClient:
                 or ""
             )
         except (AttributeError, TypeError):
-            return None
+            return empty_card_action_response()
 
         effective_trust = self._resolve_effective_trust(
             sender_id=operator_id,
@@ -2526,7 +2541,7 @@ class FeishuWSClient:
                         effective_trust
                     )
             if not card_is_p2p:
-                return None
+                return empty_card_action_response()
 
         if (
             effective_trust is not None
@@ -2551,14 +2566,14 @@ class FeishuWSClient:
                     open_chat_id,
                     effective_trust,
                 )
-                return None
+                return empty_card_action_response()
 
         try:
             header = data.header
             event_id = header.event_id
             if self._card_event_cache.is_duplicate(event_id):
                 logger.warning("跳过重复卡片回调事件: %s", event_id)
-                return None
+                return empty_card_action_response()
 
             event = data.event
             action = event.action
@@ -2602,7 +2617,7 @@ class FeishuWSClient:
             ):
                 if open_message_id:
                     self._handler_ctx.handlers["coco"].reply_text(open_message_id, UI_TEXT["ws_system_cmd_gate_blocked"])
-                return None
+                return empty_card_action_response()
         except (RuntimeError, OSError, TypeError, ValueError):
             classify_card_action_error(RuntimeError("system command gate failed"), phase="dispatch")
             logger.debug("failed to check system command gate", exc_info=True)
@@ -2624,7 +2639,10 @@ class FeishuWSClient:
             dedupe_key = f"{open_chat_id}:{open_message_id}:{operator_id}:{action_type_preview}:{dedupe_fingerprint}"
             try:
                 if self._card_action_dedup_cache.is_duplicate(dedupe_key):
-                    return {"toast": {"type": "info", "content": UI_TEXT["card_session_toast_dedup"]}}
+                    return build_card_action_response(
+                        toast_type="info",
+                        toast_content=UI_TEXT["card_session_toast_dedup"],
+                    )
 
 
             except (RuntimeError, OSError, TypeError, ValueError):
@@ -2641,7 +2659,10 @@ class FeishuWSClient:
             if isinstance(_val, dict) and _val.get("_ul"):
                 undo_expires = _val.get("_ue", 0)
                 if undo_expires and time.time() > undo_expires:
-                    return {"toast": {"type": "warning", "content": "撤销窗口已过期，请使用 /unlock 解锁"}}
+                    return build_card_action_response(
+                        toast_type="warning",
+                        toast_content="撤销窗口已过期，请使用 /unlock 解锁",
+                    )
         except (json.JSONDecodeError, TypeError, ValueError):
             classify_card_action_error(RuntimeError("undo payload parse failed"), phase="payload_parse")
 
@@ -2715,13 +2736,11 @@ class FeishuWSClient:
                     "link_task失败(card_action): origin=%s, run_id=%s, err=%s", origin_message_id, handle.run_id, e
                 )
         if action_type_preview in WORKFLOW_AGENT_SELECTION_ACTIONS:
-            return {
-                "toast": {
-                    "type": "info",
-                    "content": UI_TEXT["workflow_selection_toast_processing"],
-                }
-            }
-        return None
+            return build_card_action_response(
+                toast_type="info",
+                toast_content=UI_TEXT["workflow_selection_toast_processing"],
+            )
+        return empty_card_action_response()
 
     def _resolve_card_is_p2p(
         self,
@@ -2732,10 +2751,10 @@ class FeishuWSClient:
     ) -> bool:
         """Resolve card DM provenance without trusting callback payload fields.
 
-        Card callbacks do not carry a structural chat type. Prefer metadata
-        captured from ``im.message.receive_v1``; after a process restart, fall
-        back to the Chat API's ``chat_mode`` field. Any provenance mismatch or
-        lookup failure is denied.
+        Card callbacks do not carry a structural chat type, so only metadata
+        captured from ``im.message.receive_v1`` may grant P2P provenance. The
+        callback's three-second response path must not perform a remote Chat
+        API lookup; a missing or mismatched local origin is denied.
         """
         if not origin_message_id:
             return False
@@ -2777,22 +2796,7 @@ class FeishuWSClient:
                 return False
             return origin_chat_type == "p2p"
 
-        if not isinstance(operator_id, str) or not operator_id:
-            return False
-        chat_mode = self._get_chat_mode(open_chat_id)
-        if chat_mode is None:
-            return False
-        try:
-            registered = self._message_linker.register_trusted_origin_if_absent(
-                origin_message_id,
-                chat_id=open_chat_id,
-                chat_type="topic_group" if chat_mode == "topic" else chat_mode,
-                sender_id=operator_id,
-            )
-        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
-            logger.warning("failed to persist Chat API provenance", exc_info=True)
-            return False
-        return registered is True and chat_mode == "p2p"
+        return False
 
     def _reply_employee_hire_status(self, state: object, status: str) -> object | None:
         text = _employee_hire_status_text(

@@ -17,9 +17,19 @@ def _make_card_action_data(
     if value_extra:
         value.update(value_extra)
     return SimpleNamespace(
+        schema="2.0",
+        header=SimpleNamespace(
+            event_id=f"evt_{open_message_id}",
+            event_type="card.action.trigger",
+            tenant_key="tenant_test",
+        ),
         event=SimpleNamespace(
             action=SimpleNamespace(value=value, tag="button", name=action),
-            operator=SimpleNamespace(open_id="ou_x", user_id="u_x"),
+            operator=SimpleNamespace(
+                open_id="ou_x",
+                user_id="u_x",
+                union_id=None,
+            ),
             context=SimpleNamespace(open_message_id=open_message_id, open_chat_id=open_chat_id),
         )
     )
@@ -129,16 +139,15 @@ def test_button_rapid_clicks_are_deduped_and_only_one_task_is_submitted():
             action="workflow_select_tool",
         )
         first = client._handle_card_action(data)
+        data.header.event_id = "evt_rapid_click_2"
         duplicate = client._handle_card_action(data)
 
         # first click -> submit once; second click within TTL -> ignored
         assert client._scheduler.submit.call_count == 1
         assert reply_text.call_count == 0
-        assert first == {
-            "toast": {"type": "info", "content": "正在应用选择，卡片将自动更新"}
-        }
-        assert duplicate == {
-            "toast": {"type": "info", "content": "操作已受理，请勿重复点击"}
-        }
+        assert first.toast.type == "info"
+        assert first.toast.content == "正在应用选择，卡片将自动更新"
+        assert duplicate.toast.type == "info"
+        assert duplicate.toast.content == "操作已受理，请勿重复点击"
 
         client.close()
