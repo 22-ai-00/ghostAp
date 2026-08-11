@@ -37,7 +37,7 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
     spec = handlers["spec"]
     workflow = handlers["workflow"]
 
-    for mode in ("coco", "claude", "aiden", "codex", "gemini", "traex"):
+    for mode in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok"):
         def _show_model_selector(mid, cid, pid, val, *, _mode=mode):
             system.show_explicit_acp_model_selection(
                 mid,

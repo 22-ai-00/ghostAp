@@ -27,7 +27,7 @@ from .traex_selection import (
 
 logger = logging.getLogger(__name__)
 
-_TOOLS = ("coco", "claude", "aiden", "codex", "gemini", "traex")
+_TOOLS = ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok")
 _PROBE_TTL = 300.0
 _CODEX_PROBE_TTL = 1800.0
 _NEGATIVE_TTL = 45.0
@@ -157,7 +157,7 @@ def is_programming_tool_available(
 
 
 def list_acp_tools() -> list[ACPToolOption]:
-    """Return the available members of the six supported ACP backends."""
+    """Return the available members of the supported ACP backends."""
     providers = get_providers()
     descriptions = get_acp_result_header_text()
     tools: list[ACPToolOption] = []

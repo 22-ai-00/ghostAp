@@ -23,6 +23,8 @@ class IntentType(Enum):
     EXIT_GEMINI = "exit_gemini"
     ENTER_TRAEX = "enter_traex"
     EXIT_TRAEX = "exit_traex"
+    ENTER_GROK = "enter_grok"
+    EXIT_GROK = "exit_grok"
     EXIT_MODE = "exit_mode"
     CHANGE_DIR = "change_dir"
     SHELL_COMMAND = "shell"
@@ -32,6 +34,7 @@ class IntentType(Enum):
     CODEX_MESSAGE = "codex_message"
     GEMINI_MESSAGE = "gemini_message"
     TRAEX_MESSAGE = "traex_message"
+    GROK_MESSAGE = "grok_message"
     CREATE_PROJECT = "create_project"
     SWITCH_PROJECT = "switch_project"
     LIST_PROJECTS = "list_projects"
@@ -136,6 +139,8 @@ class IntentRecognizer:
         "exit_gemini": IntentType.EXIT_GEMINI,
         "enter_traex": IntentType.ENTER_TRAEX,
         "exit_traex": IntentType.EXIT_TRAEX,
+        "enter_grok": IntentType.ENTER_GROK,
+        "exit_grok": IntentType.EXIT_GROK,
         "exit_mode": IntentType.EXIT_MODE,
         "coco_message": IntentType.COCO_MESSAGE,
         "claude_message": IntentType.CLAUDE_MESSAGE,
@@ -143,6 +148,7 @@ class IntentRecognizer:
         "codex_message": IntentType.CODEX_MESSAGE,
         "gemini_message": IntentType.GEMINI_MESSAGE,
         "traex_message": IntentType.TRAEX_MESSAGE,
+        "grok_message": IntentType.GROK_MESSAGE,
         "change_dir": IntentType.CHANGE_DIR,
         "shell": IntentType.SHELL_COMMAND,
         "create_project": IntentType.CREATE_PROJECT,
@@ -191,6 +197,10 @@ class IntentRecognizer:
         "/enter_traex": (IntentType.ENTER_TRAEX, "进入 Traex 编程模式"),
         "/end_traex": (IntentType.EXIT_TRAEX, "退出 Traex 编程模式"),
         "/exit_traex": (IntentType.EXIT_TRAEX, "退出 Traex 编程模式"),
+        "/grok": (IntentType.ENTER_GROK, "进入 Grok 编程模式"),
+        "/enter_grok": (IntentType.ENTER_GROK, "进入 Grok 编程模式"),
+        "/end_grok": (IntentType.EXIT_GROK, "退出 Grok 编程模式"),
+        "/exit_grok": (IntentType.EXIT_GROK, "退出 Grok 编程模式"),
         "/exit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/quit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/projects": (IntentType.LIST_PROJECTS, "查看项目列表"),
@@ -382,6 +392,7 @@ class IntentRecognizer:
     ENTER_CODEX_KEYWORDS = {"进入codex模式", "codex模式", "进入codex", "使用codex"}
     ENTER_GEMINI_KEYWORDS = {"进入gemini模式", "gemini模式", "进入gemini", "使用gemini"}
     ENTER_TRAEX_KEYWORDS = {"进入traex模式", "traex模式", "进入traex", "使用traex"}
+    ENTER_GROK_KEYWORDS = {"进入grok模式", "grok模式", "进入grok", "使用grok"}
     EXIT_MODE_KEYWORDS = {"退出模式", "退出编程模式"}
 
     DEEP_MODE_KEYWORDS = {"deep模式", "深度模式", "deep agent", "复杂任务", "大任务"}
@@ -442,6 +453,7 @@ class IntentRecognizer:
             ("enter_codex_keyword", IntentRecognizer._match_enter_codex_keyword),
             ("enter_gemini_keyword", IntentRecognizer._match_enter_gemini_keyword),
             ("enter_traex_keyword", IntentRecognizer._match_enter_traex_keyword),
+            ("enter_grok_keyword", IntentRecognizer._match_enter_grok_keyword),
             ("programming_exit_keyword", IntentRecognizer._match_programming_exit_keyword),
             ("project_list_keyword", IntentRecognizer._match_project_list_keyword),
             ("cd_command", IntentRecognizer._match_cd_command),
@@ -706,6 +718,7 @@ class IntentRecognizer:
             "/codex_info": (IntentType.CODEX_MESSAGE, "Codex"),
             "/gemini_info": (IntentType.GEMINI_MESSAGE, "Gemini"),
             "/traex_info": (IntentType.TRAEX_MESSAGE, "Traex"),
+            "/grok_info": (IntentType.GROK_MESSAGE, "Grok"),
         }
         if text_lower in info_commands:
             intent, name = info_commands[text_lower]
@@ -767,9 +780,21 @@ class IntentRecognizer:
             )
         return None
 
+    def _match_enter_grok_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
+        text_lower = self._lower(text)
+        if any(kw in text_lower for kw in self.ENTER_GROK_KEYWORDS):
+            return IntentResult.single(
+                intent=IntentType.ENTER_GROK,
+                confidence=0.95,
+                original_text=text,
+                reasoning="检测到进入 Grok 编程模式关键词",
+                description="进入 Grok 编程模式",
+            )
+        return None
+
     def _match_programming_exit_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
         text_lower = self._lower(text)
-        is_programming = current_mode in ("coco", "claude", "aiden", "codex", "gemini", "traex")
+        is_programming = current_mode in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok")
         if is_programming and len(text) < 20:
             if any(kw in text_lower for kw in self.EXIT_KEYWORDS):
                 return IntentResult.single(
@@ -921,6 +946,8 @@ class IntentRecognizer:
             return IntentType.GEMINI_MESSAGE
         elif current_mode == "traex":
             return IntentType.TRAEX_MESSAGE
+        elif current_mode == "grok":
+            return IntentType.GROK_MESSAGE
         else:
             return IntentType.SHELL_COMMAND
 
@@ -938,6 +965,8 @@ class IntentRecognizer:
                 "aiden": IntentType.ENTER_AIDEN,
                 "codex": IntentType.ENTER_CODEX,
                 "gemini": IntentType.ENTER_GEMINI,
+                "traex": IntentType.ENTER_TRAEX,
+                "grok": IntentType.ENTER_GROK,
             }
             intent = _TOOL_INTENT_MAP.get(default_tool.lower())
             if intent:

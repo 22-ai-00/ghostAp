@@ -85,6 +85,9 @@ class ProjectContext:
     traex_session_snapshot: Optional[SessionSnapshot] = None
     traex_mode: bool = False
 
+    grok_session_snapshot: Optional[SessionSnapshot] = None
+    grok_mode: bool = False
+
     acp_tool_name: Optional[str] = None
     acp_model_name: Optional[str] = None
 
@@ -250,6 +253,7 @@ class ProjectContext:
         "codex": ("codex_mode", "codex_session_snapshot"),
         "gemini": ("gemini_mode", "gemini_session_snapshot"),
         "traex": ("traex_mode", "traex_session_snapshot"),
+        "grok": ("grok_mode", "grok_session_snapshot"),
     }
 
     def set_programming_mode(self, mode_type: str, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
@@ -524,6 +528,7 @@ class ProjectContext:
             codex_mode=data.get("codex_mode", False),
             gemini_mode=data.get("gemini_mode", False),
             traex_mode=data.get("traex_mode", False),
+            grok_mode=data.get("grok_mode", False),
             acp_tool_name=acp_tool_name,
             acp_model_name=data.get("acp_model_name") if acp_tool_name else None,
             theme_color=data.get("theme_color", "green"),

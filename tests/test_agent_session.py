@@ -21,7 +21,7 @@ from src.agent_session.wrappers import ModelFailureAwareSession
 
 @pytest.mark.parametrize(
     "agent_type",
-    ["coco", "claude", "aiden", "codex", "gemini", "traex"],
+    ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok"],
 )
 def test_engine_factory_supports_every_programming_backend(
     agent_type: str,

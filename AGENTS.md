@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-GhostAP 是一个飞书/Lark 机器人服务，用于通过出站 WebSocket 连接进行安全的远程 shell 执行和 AI 辅助开发。用户可以通过聊天运行 shell 命令、管理项目，并驱动 Coco、Claude、Aiden、Codex、Gemini 和 Traex 等编程工具。
+GhostAP 是一个飞书/Lark 机器人服务，用于通过出站 WebSocket 连接进行安全的远程 shell 执行和 AI 辅助开发。用户可以通过聊天运行 shell 命令、管理项目，并驱动 Coco、Claude、Aiden、Codex、Gemini、Traex 和 Grok 等编程工具。
 
 ## 命令
 
@@ -45,7 +45,7 @@ uv run python scripts/test_inventory.py tests/
 - 优先选择特定的失败衍生规则而非通用建议。
 - 如果规则可以通过测试、钩子或类型化 API 强制执行，就在那里强制执行，并在此处只保留简短指针。
 - 当代码库或工具不再需要时，删除过时规则。
-- 将 Coco/Claude/Aiden/Codex/Gemini/Traex 视为 GhostAP 编程抽象背后的工具后端。除非传输或功能确实不同，否则避免添加后端特定分支。
+- 将 Coco/Claude/Aiden/Codex/Gemini/Traex/Grok 视为 GhostAP 编程抽象背后的工具后端。除非传输或功能确实不同，否则避免添加后端特定分支。
 - 机器人管理员引导是单向的：仅当 `ADMIN_USER_IDS` 为空时，才接受任意用户在主 Bot 私聊中发送 `/setadmin`；群聊中的首次设置一律拒绝。之后只有配置的管理员可以替换 `.env` 中的单个管理员。
 
 ## 架构指针
@@ -101,12 +101,12 @@ GhostAP 有两个独立的维度：
 - 执行策略：普通编程、Deep、Spec、Workflow 和 Autonomous。
 - 工具传输：ACP 直接模式和 shell CLI 桥接模式。
 
-保持这些维度分离。新的编程功能通常应在 Coco、Claude、Aiden、Codex、Gemini 和 Traex 上工作，除非用户明确限定范围或后端不支持。
+保持这些维度分离。新的编程功能通常应在 Coco、Claude、Aiden、Codex、Gemini、Traex 和 Grok 上工作，除非用户明确限定范围或后端不支持。
 
 状态范围也是产品合约：
 
 - SMART 是默认聊天/项目状态，可直接路由简单意图或类 shell 命令。
-- 普通工具入口如 `/coco`、`/codex`、`/aiden`、`/claude`、`/gemini` 和 `/traex` 设置持久聊天+项目编程状态，直到 `/exit`。
+- 普通工具入口如 `/coco`、`/codex`、`/aiden`、`/claude`、`/gemini`、`/traex` 和 `/grok` 设置持久聊天+项目编程状态，直到 `/exit`。
 - Deep、Spec 和 Workflow 是作用于飞书话题/根线程的引擎策略；它们不得替换聊天+项目编程状态。Autonomous 同理。
 - SMART 中的类 shell 文本必须保持 shell 执行，包括 `./restart.sh rr` 等命令，而不是被项目聊天自由文本编程路由窃取。
 

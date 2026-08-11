@@ -252,7 +252,7 @@ class MessageDispatcher:
             )
         ) is ActionDecision.ALLOW
 
-    _PROGRAMMING_MODES = frozenset({"coco", "claude", "aiden", "codex", "gemini", "traex"})
+    _PROGRAMMING_MODES = frozenset({"coco", "claude", "aiden", "codex", "gemini", "traex", "grok"})
 
     _ENGINE_ENTER_MAP: dict = {
         IntentType.ENTER_DEEP: ("deep", "start_deep_engine"),

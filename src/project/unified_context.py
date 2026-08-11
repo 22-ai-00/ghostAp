@@ -30,6 +30,7 @@ class ContextSourceMode(Enum):
     CODEX = "codex"
     GEMINI = "gemini"
     TRAEX = "traex"
+    GROK = "grok"
     SHELL = "shell"
     DEEP_ENGINE = "deep_engine"
 

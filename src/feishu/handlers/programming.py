@@ -171,6 +171,7 @@ class ProgrammingModeHandler(BaseHandler):
         (InteractionMode.CODEX, "is_codex_mode", "codex"),
         (InteractionMode.GEMINI, "is_gemini_mode", "gemini"),
         (InteractionMode.TRAEX, "is_traex_mode", "traex"),
+        (InteractionMode.GROK, "is_grok_mode", "grok"),
     )
 
     def __init__(self, ctx):
@@ -351,7 +352,7 @@ class ProgrammingModeHandler(BaseHandler):
     def _set_mode_on_project(self, project: "ProjectContext", active: bool, session_id: str = "", count: int = 0):
         if active:
             project.set_programming_mode(self.mode_key, True, session_id, count)
-            if self.mode_key in {"coco", "claude", "aiden", "codex", "gemini", "traex"}:
+            if self.mode_key in {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok"}:
                 project.acp_tool_name = self.mode_key
         else:
             project.set_programming_mode(self.mode_key, False)
@@ -1582,3 +1583,12 @@ class TraexModeHandler(ProgrammingModeHandler):
     mode_key = "traex"
     context_source = ContextSourceMode.TRAEX
     thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🚀", name="Traex")
+
+
+class GrokModeHandler(ProgrammingModeHandler):
+    mode_name = "Grok"
+    mode_emoji = "🌌"
+    interaction_mode = InteractionMode.GROK
+    mode_key = "grok"
+    context_source = ContextSourceMode.GROK
+    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🌌", name="Grok")

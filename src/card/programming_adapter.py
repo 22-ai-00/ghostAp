@@ -48,6 +48,7 @@ _MODE_DISPLAY: dict[str, tuple[str, str]] = {
     "codex": ("📝", "Codex"),
     "gemini": ("💎", "Gemini"),
     "traex": ("🚀", "Traex"),
+    "grok": ("🌌", "Grok"),
 }
 
 _TOOL_CARD_EVENT_TYPES = frozenset({

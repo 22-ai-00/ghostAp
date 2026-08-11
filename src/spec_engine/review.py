@@ -579,7 +579,7 @@ def _build_result(outcomes, cycle, completion_enabled):
 
 
 def _annotate(result, assignments, ctx):
-    names = {"coco": "Coco", "codex": "Codex", "aiden": "Aiden", "claude": "Claude", "gemini": "Gemini", "traex": "Traex"}
+    names = {"coco": "Coco", "codex": "Codex", "aiden": "Aiden", "claude": "Claude", "gemini": "Gemini", "traex": "Traex", "grok": "Grok"}
     agent = str(ctx.agent_type or "coco")
     default = f"{names.get(agent.lower(), agent.title())} / {ctx.model_name or '默认模型'}"
     for review in result.reviews:

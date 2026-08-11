@@ -41,6 +41,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "claude": "Anthropic 深度推理",
     "traex": "高并发推理·轻量任务",
     "gemini": "Google 多模态推理",
+    "grok": "xAI 原生 ACP 编程",
 }
 
 # --- Journal ---

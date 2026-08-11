@@ -237,4 +237,5 @@ def get_acp_result_header_text() -> dict[str, str]:
         "tool_desc_codex": "OpenAI Codex",
         "tool_desc_gemini": "Google Gemini CLI",
         "tool_desc_traex": "TRAE CLI",
+        "tool_desc_grok": "xAI Grok Build",
     }

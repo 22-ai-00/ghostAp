@@ -72,6 +72,7 @@ _CAPABILITY_NOTES = {
     "codex": "Codex 擅长快速代码生成；指令应简洁直接。",
     "gemini": "Gemini 擅长多模态推理和图像理解。",
     "traex": "Traex 擅长高并发轻量任务。",
+    "grok": "Grok Build 擅长原生 ACP 编程与代码库任务。",
 }
 
 

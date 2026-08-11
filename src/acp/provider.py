@@ -292,7 +292,7 @@ class ToolRegistry:
                     return
                 self._preheated = True
 
-            targets = [n.lower() for n in (names or ["coco", "aiden", "codex", "traex"])]
+            targets = [n.lower() for n in (names or ["coco", "aiden", "codex", "traex", "grok"])]
             # fan-out probes
             for n in targets:
                 try:

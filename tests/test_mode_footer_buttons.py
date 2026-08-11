@@ -38,6 +38,7 @@ def test_inactive_or_unhandled_mode_footer_has_no_cross_tool_entry_guidance(
         (InteractionMode.CLAUDE, "exit_claude"),
         (InteractionMode.GEMINI, "exit_gemini"),
         (InteractionMode.TRAEX, "exit_traex"),
+        (InteractionMode.GROK, "exit_grok"),
     ],
 )
 def test_active_mode_footer_keeps_exit_and_project_switch(
@@ -54,4 +55,3 @@ def test_active_mode_footer_keeps_exit_and_project_switch(
     exit_value = buttons[0]["behaviors"][0]["value"]
     assert exit_value["project_id"] == "project-1"
     assert exit_value["thread_root_id"] == "thread-1"
-

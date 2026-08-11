@@ -10,6 +10,7 @@ from .programming import (
     CocoModeHandler,
     CodexModeHandler,
     GeminiModeHandler,
+    GrokModeHandler,
     ProgrammingModeHandler,
     TraexModeHandler,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "AidenModeHandler",
     "CodexModeHandler",
     "GeminiModeHandler",
+    "GrokModeHandler",
     "TraexModeHandler",
     "DeepHandler",
     "SpecHandler",

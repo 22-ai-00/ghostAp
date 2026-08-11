@@ -13,7 +13,7 @@ Agent。
 | 能力 | 产品边界 |
 | --- | --- |
 | 主 Bot 控制面 | 管理项目、员工、团队、任务、审批和审计，不冒充员工输出 |
-| 直接编程 | Coco、Claude、Aiden、Codex、Gemini、Traex 后端保持多轮直连 |
+| 直接编程 | Coco、Claude、Aiden、Codex、Gemini、Traex、Grok 后端保持多轮直连 |
 | Agent Department | 持久员工拥有独立飞书 Bot、Channel、历史、记忆和停止语义 |
 | 飞书交互 | 卡片持续展示任务状态、工具调用、模型选择和错误诊断 |
 | Host Shell | 特权宿主机执行，只能关闭或显式授权；超时、截断和命令过滤不构成操作系统沙箱 |
@@ -168,7 +168,7 @@ PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就�
 | 命令 | 作用 |
 | --- | --- |
 | `/help` | 查看完整帮助 |
-| `/coco`、`/claude`、`/aiden`、`/codex`、`/gemini`、`/traex` | 进入对应编程模式 |
+| `/coco`、`/claude`、`/aiden`、`/codex`、`/gemini`、`/traex`、`/grok` | 进入对应编程模式 |
 | `/model`、`/model list`、`/model <name>` | 查看或切换当前 ACP 工具模型 |
 | `/acp` | 查看 ACP 工具选择入口 |
 | `/exit` | 退出当前模式，回到 Smart |

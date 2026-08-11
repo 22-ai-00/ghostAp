@@ -122,6 +122,7 @@ def select_auto_orchestrator(
         "traex",
         "claude",
         "codex",
+        "grok",
         "aiden",
         "gemini",
         "coco",

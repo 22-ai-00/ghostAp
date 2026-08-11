@@ -180,6 +180,8 @@ class ProjectBuilder:
                 effective_mode = InteractionMode.GEMINI
             elif getattr(project, "traex_mode", False):
                 effective_mode = InteractionMode.TRAEX
+            elif getattr(project, "grok_mode", False):
+                effective_mode = InteractionMode.GROK
             elif getattr(project, "coco_mode", False):
                 effective_mode = InteractionMode.COCO
 

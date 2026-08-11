@@ -54,6 +54,7 @@ class HandlerContext:
     codex_manager: "ACPSessionManager"
     gemini_manager: "ACPSessionManager"
     traex_manager: "ACPSessionManager"
+    grok_manager: "ACPSessionManager"
 
     # Core services
     intent_recognizer: "IntentRecognizer"

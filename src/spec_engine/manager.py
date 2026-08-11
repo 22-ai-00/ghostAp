@@ -51,6 +51,7 @@ class SpecEngineManager(BaseEngineManager["SpecEngine"]):
             "codex": InteractionMode.CODEX,
             "gemini": InteractionMode.GEMINI,
             "traex": InteractionMode.TRAEX,
+            "grok": InteractionMode.GROK,
         }
         backend = normalized_agent or next(
             (name for name in mode_map if normalized_name.lower().startswith(name)),

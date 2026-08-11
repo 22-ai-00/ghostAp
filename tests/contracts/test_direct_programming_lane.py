@@ -26,6 +26,7 @@ from src.feishu.handlers.programming import (
     CocoModeHandler,
     CodexModeHandler,
     GeminiModeHandler,
+    GrokModeHandler,
     TraexModeHandler,
 )
 from src.feishu.handlers.system import SystemHandler
@@ -43,6 +44,7 @@ BACKENDS = (
     ("codex", CodexModeHandler, "codex-model"),
     ("gemini", GeminiModeHandler, "gemini-model"),
     ("traex", TraexModeHandler, "traex-model"),
+    ("grok", GrokModeHandler, "grok-build"),
 )
 
 
@@ -74,6 +76,7 @@ def _context(backend: str, manager) -> HandlerContext:
         codex_manager=managers["codex"],
         gemini_manager=managers["gemini"],
         traex_manager=managers["traex"],
+        grok_manager=managers["grok"],
         intent_recognizer=MagicMock(),
         scheduler=MagicMock(),
         project_manager=project_manager,
@@ -582,6 +585,7 @@ def test_tools_list_uses_programming_availability_without_acp_probe(
         "codex",
         "gemini",
         "traex",
+        "grok",
     ]
     assert all(
         call.kwargs
@@ -603,7 +607,7 @@ def test_tools_status_uses_programming_availability_without_acp_probe(
         "src.feishu.handlers.system.is_programming_tool_available",
         availability,
     )
-    for name in ("coco", "claude", "aiden", "codex", "gemini", "traex"):
+    for name in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok"):
         getattr(ctx, f"{name}_manager").list_active_sessions.return_value = []
     system.reply_interactive_card = MagicMock()
 
@@ -616,6 +620,7 @@ def test_tools_status_uses_programming_availability_without_acp_probe(
         "codex",
         "gemini",
         "traex",
+        "grok",
     ]
     assert all(
         call.kwargs

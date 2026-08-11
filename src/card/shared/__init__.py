@@ -79,6 +79,9 @@ def build_mode_buttons(
     elif mode == InteractionMode.TRAEX:
         buttons.append(_create_mode_button("exit_traex", "exit_traex", project_id, thread_root_id, button_size=button_size))
         buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
+    elif mode == InteractionMode.GROK:
+        buttons.append(_create_mode_button("exit_grok", "exit_grok", project_id, thread_root_id, button_size=button_size))
+        buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
 
     return [b for b in buttons if b]
 
@@ -147,11 +150,13 @@ def resolve_title_and_template(
         mode_icon, header_template = "✨", "turquoise"
     elif mode == InteractionMode.TRAEX:
         mode_icon, header_template = "🚀", "blue"
+    elif mode == InteractionMode.GROK:
+        mode_icon, header_template = "🌌", "indigo"
     else:
         mode_icon, header_template = "🧠", "turquoise"
 
     # If a theme_color is provided (from project), use it for the template
-    if theme_color and mode not in [InteractionMode.CLAUDE, InteractionMode.COCO, InteractionMode.GEMINI, InteractionMode.TRAEX]:
+    if theme_color and mode not in [InteractionMode.CLAUDE, InteractionMode.COCO, InteractionMode.GEMINI, InteractionMode.TRAEX, InteractionMode.GROK]:
         header_template = get_theme(theme_color).header_template
 
     if project_name:
@@ -163,6 +168,8 @@ def resolve_title_and_template(
             title = f"✨ {project_name} · Gemini"
         elif mode == InteractionMode.TRAEX:
             title = f"🚀 {project_name} · Traex"
+        elif mode == InteractionMode.GROK:
+            title = f"🌌 {project_name} · Grok"
         else:
             title = f"🧠 {project_name}"
     else:
@@ -174,6 +181,8 @@ def resolve_title_and_template(
             mode_name = UI_TEXT["mode_name_gemini"]
         elif mode == InteractionMode.TRAEX:
             mode_name = UI_TEXT["mode_name_traex"]
+        elif mode == InteractionMode.GROK:
+            mode_name = UI_TEXT["mode_name_grok"]
         else:
             mode_name = UI_TEXT["mode_name_smart"]
         title = f"{mode_icon} {mode_name}"

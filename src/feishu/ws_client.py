@@ -108,6 +108,7 @@ from .handlers import (
     DeepHandler,
     DiagnosticsHandler,
     GeminiModeHandler,
+    GrokModeHandler,
     ProjectHandler,
     SpecHandler,
     SystemHandler,
@@ -329,6 +330,7 @@ class FeishuWSClient:
             "codex": self.settings.coco_session_timeout,
             "gemini": self.settings.coco_session_timeout,
             "traex": self.settings.coco_session_timeout,
+            "grok": self.settings.coco_session_timeout,
         }
         acp_managers = {
             name: ACPSessionManager(
@@ -499,6 +501,7 @@ class FeishuWSClient:
             codex_manager=acp_managers["codex"],
             gemini_manager=acp_managers["gemini"],
             traex_manager=acp_managers["traex"],
+            grok_manager=acp_managers["grok"],
             intent_recognizer=self._intent_recognizer,
             scheduler=self._scheduler,
             project_manager=self._project_manager,
@@ -575,6 +578,7 @@ class FeishuWSClient:
             "codex": CodexModeHandler,
             "gemini": GeminiModeHandler,
             "traex": TraexModeHandler,
+            "grok": GrokModeHandler,
             "deep": DeepHandler,
             "spec": SpecHandler,
             "project": ProjectHandler,
@@ -1188,7 +1192,7 @@ class FeishuWSClient:
 
                     # Resolve mode from ModeManager (single source of truth).
                     _proj_mode = self._mode_manager.get_mode(chat_id, project_id=project_id)
-                    if _proj_mode.value in {"coco", "claude", "aiden", "codex", "gemini", "traex"}:
+                    if _proj_mode.value in {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok"}:
                         auto_enter_mode = _proj_mode.value
 
                     if auto_enter_mode:
@@ -2267,6 +2271,7 @@ class FeishuWSClient:
             InteractionMode.CODEX,
             InteractionMode.GEMINI,
             InteractionMode.TRAEX,
+            InteractionMode.GROK,
         }:
             if project is None:
                 project = self._project_manager.get_active_project(chat_id)
@@ -2398,7 +2403,7 @@ class FeishuWSClient:
                     or getattr(self.settings, "default_acp_tool", None)
                     or "coco"
                 ).strip().lower()
-                supported = {"coco", "claude", "aiden", "codex", "gemini", "traex"}
+                supported = {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok"}
                 handler = handlers[tool if tool in supported else "coco"]
                 if not self._current_trust_can_dispatch(
                     effective_trust, project=bound_project

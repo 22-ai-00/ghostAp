@@ -312,6 +312,22 @@ class CodexACPProvider(GenericACPProvider):
         return "npx", ["--yes", self._fallback_package]
 
 
+class GrokACPProvider(GenericACPProvider):
+    """Native Grok Build ACP provider.
+
+    Grok exposes ACP as ``grok agent stdio``.  ``--model`` is an option of
+    ``grok agent`` and therefore must precede the ``stdio`` subcommand.
+    """
+
+    def get_serve_command(self, model_name: Optional[str] = None) -> tuple[str, list[str]]:
+        args = ["agent"]
+        model = self.normalize_model_name(model_name)
+        if model:
+            args.extend(["--model", model])
+        args.append("stdio")
+        return self._config.tool_name, args
+
+
 def _make_custom_help_checker_with_cache_handle(
     help_cmd: list[str],
     required_keywords: Sequence[str],
@@ -367,12 +383,23 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
             ["traex", "acp", "serve", "--help"],
             ["usage:", "acp serve"],
         )
-        _checkers = {"aiden": aiden, "codex": codex, "gemini": gemini, "traex": traex}
+        grok = _make_custom_help_checker_with_cache_handle(
+            ["grok", "agent", "--help"],
+            ["usage:", "grok agent", "stdio"],
+        )
+        _checkers = {
+            "aiden": aiden,
+            "codex": codex,
+            "gemini": gemini,
+            "traex": traex,
+            "grok": grok,
+        }
 
         _aiden_checker, _aiden_help_loader, _ = aiden
         _codex_checker, _codex_help_loader, _ = codex
         _gemini_checker, _gemini_help_loader, _ = gemini
         _traex_checker, _traex_help_loader, _ = traex
+        _grok_checker, _grok_help_loader, _ = grok
 
         # --- 2) build configs ---
         configs = [
@@ -422,6 +449,12 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
                 model_style="config_model",
                 help_blob_loader=_traex_help_loader,
             ),
+            _ProviderConfig(
+                tool_name="grok",
+                serve_args=["agent", "stdio"],
+                availability_checker=_grok_checker,
+                help_blob_loader=_grok_help_loader,
+            ),
         ]
 
         # --- 3) build and register providers ---
@@ -431,6 +464,8 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
                 p = CodexACPProvider(cfg)
             elif cfg.tool_name == "traex":
                 p = TraexACPProvider(cfg)
+            elif cfg.tool_name == "grok":
+                p = GrokACPProvider(cfg)
             else:
                 p = GenericACPProvider(cfg)
             result[cfg.tool_name] = p
@@ -501,6 +536,7 @@ AidenProvider = type("AidenProvider", (), {"__new__": lambda cls: _ensure_provid
 CodexProvider = type("CodexProvider", (), {"__new__": lambda cls: _ensure_providers()["codex"]})
 GeminiProvider = type("GeminiProvider", (), {"__new__": lambda cls: _ensure_providers()["gemini"]})
 TraexProvider = type("TraexProvider", (), {"__new__": lambda cls: _ensure_providers()["traex"]})
+GrokProvider = type("GrokProvider", (), {"__new__": lambda cls: _ensure_providers()["grok"]})
 
 
 def _get_aiden_acp_serve_help_blob() -> str:
@@ -531,6 +567,13 @@ def _get_traex_acp_serve_help_blob() -> str:
 _get_traex_acp_serve_help_blob.cache_clear = lambda: _get_checker("traex")[2]()  # type: ignore[attr-defined]
 
 
+def _get_grok_acp_serve_help_blob() -> str:
+    _, loader, _ = _get_checker("grok")
+    return loader()
+
+_get_grok_acp_serve_help_blob.cache_clear = lambda: _get_checker("grok")[2]()  # type: ignore[attr-defined]
+
+
 __all__ = [
     "ACPProvider",
     "ToolRegistry",
@@ -544,11 +587,14 @@ __all__ = [
     "CodexProvider",
     "GeminiProvider",
     "TraexProvider",
+    "GrokProvider",
     "GenericACPProvider",
     "CodexACPProvider",
+    "GrokACPProvider",
     "CODEX_ACP_NPM_PACKAGE",
     "_get_aiden_acp_serve_help_blob",
     "_get_codex_acp_serve_help_blob",
     "_get_gemini_acp_serve_help_blob",
     "_get_traex_acp_serve_help_blob",
+    "_get_grok_acp_serve_help_blob",
 ]
