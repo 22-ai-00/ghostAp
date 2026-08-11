@@ -65,6 +65,10 @@ class CardMetadata:
     live_ticker_frame: str | None = None
     subagents: tuple[dict, ...] = ()
     programming_text_sections: bool = False
+    # Preserve every semantic text/reasoning/tool block in event order while
+    # retaining ordinary programming-card visuals. Workflow direct-call cards
+    # opt in; the default compact execution digest remains unchanged.
+    full_execution_blocks: bool = False
 
     def __post_init__(self) -> None:
         if self.continuation_seq > 0 and self.card_sequence == 1:

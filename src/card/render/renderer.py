@@ -141,9 +141,13 @@ def render_card(
     atoms = flatten_to_atoms(
         state.blocks,
         budget,
-        unified_execution=is_programming_card,
+        unified_execution=(
+            is_programming_card
+            and not state.metadata.full_execution_blocks
+        ),
         terminal=state.terminal != "running",
         segmented_text=segmented_text,
+        full_execution_blocks=state.metadata.full_execution_blocks,
     )
     if state.metadata and state.metadata.compact:
         atoms = _compact_reasoning_atoms(atoms)
@@ -313,6 +317,8 @@ def compute_structure_signature(state: CardState) -> str:
         parts.append(f"model:{state.metadata.model_name}")
     if state.metadata.programming_text_sections:
         parts.append("programming-text-sections:v1")
+    if state.metadata.full_execution_blocks:
+        parts.append("full-execution-blocks:v1")
     if state.metadata.iteration_index:
         parts.append(f"iter:{state.metadata.iteration_index}/{state.metadata.iteration_total or ''}")
     if state.metadata.unit_label:
@@ -403,12 +409,16 @@ def _render_atom_text(atom: RenderAtom, state: CardState, budget: RenderBudget, 
 
 
 def _render_atom_tool_panel(atom: RenderAtom, state: CardState, budget: RenderBudget, block_index: dict) -> dict | None:
+    block = block_index.get(atom.block_id)
+    if state.metadata.full_execution_blocks and block is not None:
+        return render_tool_panel(block, content_override=atom.content)
+    if atom.elements:
+        return atom.elements[0]
     # In the new activity_digest flow, tool_panel atoms are only emitted for
     # active (running) tools with pre-rendered compact content.
     # Keep compact lines at normal size; mobile Feishu can render notation too small.
     if atom.content:
         return _build_column_banner(content=atom.content, background_style="wathet")
-    block = block_index.get(atom.block_id)
     if block is not None:
         return render_tool_panel(block)
     return None
@@ -764,7 +774,10 @@ def _build_section_layout(state: CardState, atoms: list[RenderAtom]) -> SectionL
         else:
             body_atoms.append(atom)
 
-    if state.metadata.engine_type is None:
+    if (
+        state.metadata.engine_type is None
+        and not state.metadata.full_execution_blocks
+    ):
         execution_atoms = [
             atom
             for atom in body_atoms

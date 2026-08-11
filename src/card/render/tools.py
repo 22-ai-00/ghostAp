@@ -124,7 +124,11 @@ def _is_empty_data(value) -> bool:
     return False
 
 
-def render_tool_panel(block: ContentBlock) -> dict | None:
+def render_tool_panel(
+    block: ContentBlock,
+    *,
+    content_override: str | None = None,
+) -> dict | None:
     """Render a single tool call as a collapsible_panel.
 
     Returns None if both tool_input and tool_output are empty.
@@ -135,7 +139,11 @@ def render_tool_panel(block: ContentBlock) -> dict | None:
             no empty output section appears in the card JSON.
     """
     # AC7: suppress entirely when both sides are empty
-    if _is_empty_data(block.tool_input) and _is_empty_data(block.tool_output):
+    if (
+        content_override is None
+        and _is_empty_data(block.tool_input)
+        and _is_empty_data(block.tool_output)
+    ):
         return None
 
     icon = _STATUS_ICONS.get(block.status, "⏳")
@@ -149,7 +157,11 @@ def render_tool_panel(block: ContentBlock) -> dict | None:
     expanded = _should_expand_tool(block)
     border_color = PANEL_STYLES["border_failed"] if block.status == "failed" else PANEL_STYLES["border_normal"]
 
-    detail_content = _render_detail(block)
+    detail_content = (
+        content_override
+        if content_override is not None
+        else render_tool_detail(block)
+    )
 
     return {
         "tag": "collapsible_panel",
@@ -159,10 +171,10 @@ def render_tool_panel(block: ContentBlock) -> dict | None:
             "vertical_align": "center",
             "icon": {
                 "tag": "standard_icon",
-                "token": "down-small-ccm_outlined",
-                "size": "16px 16px",
+                "token": "down_outlined",
+                "color": "grey",
             },
-            "icon_position": "follow_text",
+            "icon_position": "right",
             "icon_expanded_angle": -180,
         },
         "border": {"color": border_color, "corner_radius": PANEL_STYLES["corner_radius"]},
@@ -448,7 +460,13 @@ def _truncate_output(output: str) -> str:
     return "…" + output[-_MAX_OUTPUT_CHARS:]
 
 
-def _render_detail(block: ContentBlock) -> str:
+def render_tool_detail(
+    block: ContentBlock,
+    *,
+    truncate_output: bool = True,
+    compact: bool = True,
+    include_updates: bool = False,
+) -> str:
     """Render detail content based on tool type.
 
     AC8 enforcement: output_empty flag is passed to sub-renderers which skip the
@@ -456,23 +474,47 @@ def _render_detail(block: ContentBlock) -> str:
     """
     tool_name = (block.tool_name or "").lower()
     tool_input = block.tool_input or ""
+    tool_updates = block.content or ""
     tool_output = block.tool_output or ""
     output_empty = _is_empty_data(block.tool_output)
 
     # Compact tools (task, todowrite): single-line description only
-    if tool_name in _COMPACT_TOOLS:
+    if compact and tool_name in _COMPACT_TOOLS:
         return _render_compact_detail(tool_input)
 
     if tool_name in _BASH_TOOLS:
-        return _render_bash_detail(tool_input, tool_output, output_empty)
-    return _render_generic_detail(tool_input, tool_output, output_empty)
+        return _render_bash_detail(
+            tool_input,
+            tool_output,
+            output_empty,
+            tool_updates=tool_updates if include_updates else "",
+            truncate_output=truncate_output,
+        )
+    return _render_generic_detail(
+        tool_input,
+        tool_output,
+        output_empty,
+        tool_updates=tool_updates if include_updates else "",
+        truncate_output=truncate_output,
+    )
 
 
-def _render_bash_detail(tool_input: str, tool_output: str, output_empty: bool = False) -> str:
+def _render_bash_detail(
+    tool_input: str,
+    tool_output: str,
+    output_empty: bool = False,
+    *,
+    tool_updates: str = "",
+    truncate_output: bool = True,
+) -> str:
     """Render bash-specific detail."""
     parts = [f"{UI_TEXT['tool_label_command']}\n```bash\n{tool_input}\n```"]
+    if tool_updates and tool_updates != tool_output:
+        parts.append(
+            f"{UI_TEXT['tool_label_progress']}\n```\n{tool_updates}\n```"
+        )
     if not output_empty:
-        output = _truncate_output(tool_output)
+        output = _truncate_output(tool_output) if truncate_output else tool_output
         parts.append(f"{UI_TEXT['tool_label_result']}\n```\n{output}\n```")
     return "\n".join(parts)
 
@@ -493,11 +535,22 @@ def _render_compact_detail(tool_input: str) -> str:
     return ""
 
 
-def _render_generic_detail(tool_input: str, tool_output: str, output_empty: bool = False) -> str:
+def _render_generic_detail(
+    tool_input: str,
+    tool_output: str,
+    output_empty: bool = False,
+    *,
+    tool_updates: str = "",
+    truncate_output: bool = True,
+) -> str:
     """Render generic tool detail."""
     parts = [f"{UI_TEXT['tool_label_input']}\n```json\n{tool_input}\n```"]
+    if tool_updates and tool_updates != tool_output:
+        parts.append(
+            f"{UI_TEXT['tool_label_progress']}\n```\n{tool_updates}\n```"
+        )
     if not output_empty:
-        output = _truncate_output(tool_output)
+        output = _truncate_output(tool_output) if truncate_output else tool_output
         parts.append(f"{UI_TEXT['tool_label_output']}\n```\n{output}\n```")
     return "\n".join(parts)
 

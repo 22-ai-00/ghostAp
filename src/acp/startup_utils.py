@@ -563,6 +563,43 @@ class SessionStartupCoordinator:
 
         time.sleep(seconds)
 
+    def _resume_requested_session(
+        self,
+        result: SessionStartupResult,
+        *,
+        request: SessionStartupRequest,
+        deadline: float,
+    ) -> SessionStartupResult:
+        target_session_id = str(request.session_id or "").strip()
+        if not target_session_id:
+            return result
+        current_session_id = str(
+            getattr(result.session, "session_id", "") or ""
+        ).strip()
+        if current_session_id == target_session_id:
+            return replace(result, actual_id=target_session_id)
+
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            AcpRetryStarter._close_session(result.session)
+            raise TimeoutError("ACP resume deadline exhausted")
+        load_session = getattr(result.session, "load_session", None)
+        if not callable(load_session):
+            AcpRetryStarter._close_session(result.session)
+            raise RuntimeError("ACP session backend does not support resume")
+        try:
+            load_session(target_session_id, timeout=remaining)
+        except Exception:
+            AcpRetryStarter._close_session(result.session)
+            raise
+        loaded_session_id = str(
+            getattr(result.session, "session_id", "") or ""
+        ).strip()
+        if loaded_session_id != target_session_id:
+            AcpRetryStarter._close_session(result.session)
+            raise RuntimeError("ACP session resume returned a different session_id")
+        return replace(result, actual_id=target_session_id)
+
     def start(self, request: SessionStartupRequest) -> SessionStartupResult:
         deadline = request.deadline_monotonic
         if deadline is None:
@@ -607,11 +644,15 @@ class SessionStartupCoordinator:
                     request.key[-16:],
                     actual_id[:8],
                 )
-                return SessionStartupResult(
-                    session=session,
-                    actual_id=actual_id,
-                    effective_agent_type=effective_agent_type,
-                    model_name=model_name,
+                return self._resume_requested_session(
+                    SessionStartupResult(
+                        session=session,
+                        actual_id=actual_id,
+                        effective_agent_type=effective_agent_type,
+                        model_name=model_name,
+                    ),
+                    request=request,
+                    deadline=deadline,
                 )
 
         if self._monotonic() >= deadline:
@@ -621,11 +662,16 @@ class SessionStartupCoordinator:
         cwd = normalize_startup_cwd(cwd, normalize_fn=normalize_session_cwd)
         if self._monotonic() >= deadline:
             raise TimeoutError("ACP startup deadline exhausted")
-        return self._backend_strategies[backend].start(
+        result = self._backend_strategies[backend].start(
             request=request,
             cwd=cwd,
             model_name=model_name,
             retry_plan=retry_plan,
+        )
+        return self._resume_requested_session(
+            result,
+            request=request,
+            deadline=deadline,
         )
 
 

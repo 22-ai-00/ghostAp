@@ -1138,6 +1138,13 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
     def _truncate(value: str, limit: int) -> str:
         return value if len(value) <= limit else value[:limit] + "\n... (truncated)"
 
+    def _has_payload(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (str, bytes, bytearray, Mapping, list, tuple, set)):
+            return bool(value)
+        return True
+
     # Prefer tool kind for rendering decisions; fall back to title heuristics.
     kind = (update.kind or "other").strip() or "other"
     title_lower = title.lower()
@@ -1151,10 +1158,15 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
         or (isinstance(raw_input, dict) and any(k in raw_input for k in ("subagent_type", "description", "prompt")))
     )
 
-    use_output = status in ("completed", "failed")
+    # Providers may stream raw_output on an in-progress ToolCallProgress while
+    # repeating raw_input. Prefer the new output payload whenever it is
+    # present; otherwise cards repeatedly append the original command/input.
+    use_output = status in ("completed", "failed") or _has_payload(raw_output)
     content = ""
+    full_content: Any = None
     if raw_input and _is_todo_tool(title, raw_input):
         content = _format_todo_content(raw_input)
+        full_content = raw_input
         use_output = False
 
     if not use_output and not content:
@@ -1186,6 +1198,8 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
             elif isinstance(raw_input, str):
                 content = raw_input
 
+        if full_content is None and raw_input is not None:
+            full_content = raw_input
         content = _truncate((content or "").strip("\n"), 4000)
     else:
         if is_execute:
@@ -1210,12 +1224,15 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
             elif raw_output is not None:
                 content = _text(raw_output)
 
-        content = _truncate((content or "").strip("\n"), 12000)
+        unbounded_content = (content or "").strip("\n")
+        full_content = raw_output if raw_output is not None else unbounded_content
+        content = _truncate(unbounded_content, 12000)
 
     if collaboration_tool and status != "failed" and isinstance(raw_input, Mapping):
         prompt = str(raw_input.get("prompt") or "").strip()
         if prompt:
             content = _truncate(prompt.splitlines()[0].strip(), 4000)
+            full_content = raw_input
 
     return ToolCallInfo(
         id=update.tool_call_id,
@@ -1232,6 +1249,7 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
         collaboration_model=collaboration_model or None,
         subagent_states=subagent_states,
         child_metadata_malformed=child_metadata_malformed,
+        full_content=full_content,
     )
 
 

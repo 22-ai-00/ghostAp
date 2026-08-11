@@ -292,6 +292,115 @@
       font-size: 10px;
     }
 
+    .execution-call {
+      overflow: hidden;
+      margin-top: 14px;
+      border: 1px solid #b9caf3;
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .execution-head {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line-soft);
+      background: var(--surface-blue);
+    }
+
+    .agent-badge {
+      display: grid;
+      width: 38px;
+      height: 38px;
+      place-items: center;
+      border-radius: 9px;
+      color: #fff;
+      background: var(--blue);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .execution-title strong { display: block; font-size: 12px; }
+    .execution-title span {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .execution-state {
+      color: var(--blue-deep);
+      font-size: 10px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .stream {
+      display: grid;
+      gap: 8px;
+      padding: 11px 12px 12px;
+    }
+
+    .stream-block {
+      padding: 9px 10px;
+      border: 1px solid var(--line-soft);
+      border-radius: 6px;
+      background: var(--surface);
+      color: #35405a;
+      font-size: 11px;
+    }
+
+    .stream-block p { margin: 0; }
+    .stream-block p + p { margin-top: 5px; }
+    .stream-block.current {
+      border-color: #adc5fa;
+      border-left: 3px solid var(--blue);
+      background: var(--surface-blue);
+    }
+
+    .stream-block.reasoning {
+      border-style: dashed;
+      color: var(--muted);
+      background: #fafbfc;
+    }
+
+    .stream-block.tool {
+      border-color: #d5dbe5;
+      background: #fff;
+    }
+
+    .stream-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 5px;
+      color: var(--quiet);
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .tool-io {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 7px;
+    }
+
+    .tool-io code {
+      display: block;
+      overflow-wrap: anywhere;
+      padding: 7px;
+      border-radius: 5px;
+      background: #f4f6f8;
+      color: #3b4048;
+      font-size: 10px;
+      white-space: pre-wrap;
+    }
+
     .card-actions {
       display: flex;
       justify-content: flex-end;
@@ -378,6 +487,28 @@
 
     .terminal-footer strong { color: var(--muted); }
 
+    .message-sequence-note {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 10px 0;
+      color: var(--quiet);
+      font-size: 10px;
+      letter-spacing: .04em;
+    }
+
+    .message-sequence-note::before,
+    .message-sequence-note::after {
+      content: "";
+      height: 1px;
+      flex: 1;
+      background: var(--line-soft);
+    }
+
+    .execution-message .card-header { background: #eef3fb; color: #334155; }
+    .execution-message .status-dot { background: var(--blue); }
+    .execution-message .execution-call { margin-top: 0; }
+
     @media (max-width: 900px) {
       .page-head { align-items: start; flex-direction: column; }
       .page-intro { text-align: left; }
@@ -386,15 +517,19 @@
     }
 
     @media (max-width: 620px) {
-      .page { width: min(100% - 20px, 520px); padding-top: 20px; }
+      .page { width: calc(100% - 20px); max-width: 520px; padding-top: 20px; }
       .section-head { align-items: start; flex-direction: column; gap: 3px; }
       .section-head p { text-align: left; }
       .task-summary { grid-template-columns: 1fr; }
-      .summary-metrics { grid-template-columns: repeat(3, 1fr); }
+      .summary-metrics { width: 100%; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .metric { min-width: 0; }
       .result-item { grid-template-columns: 36px minmax(0, 1fr); }
-      .result-copy { grid-column: 2; }
+      .result-copy { grid-column: 2; overflow-wrap: anywhere; }
       .current-step { grid-template-columns: auto minmax(0, 1fr); }
       .current-time { grid-column: 2; }
+      .execution-head { grid-template-columns: auto minmax(0, 1fr); }
+      .execution-state { grid-column: 2; }
+      .tool-io { grid-template-columns: 1fr; }
       .detail-grid { grid-template-columns: 1fr; }
       .terminal-footer { align-items: start; flex-direction: column; }
     }
@@ -407,13 +542,13 @@
         <p class="eyebrow">GhostAP / Workflow</p>
         <h1>消息卡片状态预览</h1>
       </div>
-      <p class="page-intro">最终结果只追加并完整保留；过程信息始终写入唯一的“当前单步”槽位，避免长任务把卡片撑满。</p>
+      <p class="page-intro">首条消息保留 Workflow 总览；每次直接 Agent 调用紧随一张普通编程样式执行卡，文本、思考与工具调用按发生顺序完整保留。</p>
     </header>
 
     <section class="preview-section" aria-labelledby="running-title">
       <div class="section-head">
         <h2 id="running-title">1. 运行态</h2>
-        <p>已完成结果稳定累积，当前单步原位更新</p>
+        <p>总览卡与执行卡分开更新；活动块原位增长，完成块冻结</p>
       </div>
       <article class="card" aria-label="Workflow 运行态卡片">
         <header class="card-header">
@@ -460,19 +595,56 @@
             </ol>
           </section>
 
-          <section class="current-step" id="current-step-slot" role="status" aria-live="polite" aria-label="唯一当前单步槽位">
-            <span class="current-marker" aria-hidden="true"></span>
-            <div>
-              <strong>当前单步 · implementation-agent</strong>
-              <p>正在合并 session 写入路径，并保持旧 token 的兼容读取。</p>
-              <p class="slot-note">此位置只替换当前一步，不累积思考过程。</p>
-            </div>
-            <span class="current-time">运行 01:18</span>
-          </section>
-
           <div class="card-actions">
             <button class="stop-button" type="button">停止 Workflow</button>
           </div>
+        </div>
+      </article>
+
+      <div class="message-sequence-note">同一任务流的下一条消息 · 稳定绑定 #004 / A2</div>
+
+      <article class="card execution-message" aria-label="直接 Agent 调用完整执行卡">
+        <header class="card-header">
+          <div class="title-wrap">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="header-title">#004 · A2 · implementation-agent</span>
+          </div>
+          <span class="header-meta">Codex · 执行中</span>
+        </header>
+        <div class="card-body">
+          <section class="execution-call" role="status" aria-live="polite" aria-label="直接 Agent 调用完整执行流">
+            <header class="execution-head">
+              <span class="agent-badge">A2</span>
+              <span class="execution-title">
+                <strong>#004 · implementation-agent</strong>
+                <span>codex / gpt-5.2-codex · attempt 1</span>
+              </span>
+              <span class="execution-state">● 执行中 · 01:18</span>
+            </header>
+            <div class="stream">
+              <div class="stream-block">
+                <div class="stream-label"><span>Agent 文本</span><span>已完成</span></div>
+                <p>我先检查认证写入路径和现有测试，确认兼容边界后再修改。</p>
+              </div>
+              <div class="stream-block reasoning">
+                <div class="stream-label"><span>思考过程</span><span>可折叠 · 已完成</span></div>
+                <p>旧 token 仍需单次迁移读取；session 写入应收敛到 service 层，并保留路由返回契约。</p>
+              </div>
+              <div class="stream-block tool">
+                <div class="stream-label"><span>工具调用 · rg</span><span>✓ 完成</span></div>
+                <div class="tool-io">
+                  <code><strong>输入</strong><br>rg -n "write_session" src tests</code>
+                  <code><strong>过程</strong><br>正在扫描 src 与 tests</code>
+                  <code><strong>输出</strong><br>src/auth/service.py:88<br>tests/test_auth.py:142</code>
+                </div>
+              </div>
+              <div class="stream-block current">
+                <div class="stream-label"><span>Agent 文本</span><span>正在生成</span></div>
+                <p>定位完成。现在合并 session 写入路径，并补充 OAuth state 的一次性消费回归测试……</p>
+              </div>
+            </div>
+          </section>
+
         </div>
       </article>
     </section>
@@ -480,19 +652,19 @@
     <section class="preview-section" aria-labelledby="continuation-title">
       <div class="section-head">
         <h2 id="continuation-title">2. 容量续接态</h2>
-        <p>新卡可见后冻结前卡，结果编号跨卡连续且不省略</p>
+        <p>仅当单次 Agent 执行卡超出容量才续页；新页可见后冻结前页，代码围栏不被截断</p>
       </div>
       <div class="continuation-grid">
         <article class="card frozen-card" aria-label="Workflow 容量续接前卡">
           <header class="card-header frozen">
             <div class="title-wrap">
               <span class="status-dot" aria-hidden="true"></span>
-              <span class="header-title">Workflow 结果记录</span>
+              <span class="header-title">#004 · A2 执行流</span>
             </div>
             <span class="header-meta">第 1 / 2 卡 · 已冻结</span>
           </header>
           <div class="card-body">
-            <div class="continuation-note"><strong>前页已冻结。</strong> 后续更新只进入第 2 卡，本页结果保持原样。</div>
+            <div class="continuation-note"><strong>前页已冻结。</strong> 本页完整保留先前文本、思考和工具调用，后续内容只进入第 2 卡。</div>
             <ol class="result-list">
               <li class="result-item" data-result-index="001">
                 <span class="result-index">#001</span>
@@ -521,12 +693,12 @@
           <header class="card-header">
             <div class="title-wrap">
               <span class="status-dot" aria-hidden="true"></span>
-              <span class="header-title">Workflow 结果续接</span>
+              <span class="header-title">#004 · A2 执行流续接</span>
             </div>
             <span class="header-meta">第 2 / 2 卡 · 当前卡</span>
           </header>
           <div class="card-body">
-            <div class="continuation-note"><strong>从 #004 连续记录。</strong> 所有前序结果保留在第 1 卡，没有截断或合并。</div>
+            <div class="continuation-note"><strong>从下一语义块继续。</strong> 所有前序执行内容保留在第 1 卡，没有截断或合并。</div>
             <ol class="result-list" start="4">
               <li class="result-item" data-result-index="004">
                 <span class="result-index">#004</span>

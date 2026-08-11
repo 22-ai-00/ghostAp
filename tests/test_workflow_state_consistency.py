@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from unittest.mock import MagicMock, patch
 
+from src.card.events import CardEvent
 from src.engine_base import EngineRunState
 from src.feishu.handlers.workflow import (
     WorkflowHandler,
@@ -148,15 +149,20 @@ export default async function workflow() { return "never"; }
             return None
 
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
+    on_cancelled = MagicMock()
 
     with patch("src.workflow_engine.engine.RuntimeBridge", FakeBridge):
         project = engine.execute_workflow(
             str(script_path),
+            callbacks=WorkflowEngineCallbacks(on_cancelled=on_cancelled),
             run_spec=_run_spec("cancel cleanly"),
         )
 
     assert project.status == WorkflowStatus.CANCELLED
     assert project.error == "Workflow cancelled"
+    on_cancelled.assert_called_once()
+    terminal_project = on_cancelled.call_args.args[0]
+    assert terminal_project.status == WorkflowStatus.CANCELLED
 
 
 def test_workflow_engine_rejects_cancelled_queued_start_atomically(tmp_path):
@@ -910,6 +916,29 @@ class TestStateManagerStickyTerminal:
         )
         assert snap.error == "user cancelled"
 
+    def test_workflow_cancel_closes_open_agents_as_cancelled(self):
+        sm = _make_state_manager()
+        label = sm.on_agent_started("agent1", "coco", "phase1")
+        assert sm.record_agent_card_event(
+            label,
+            CardEvent.text_started("answer"),
+        )
+        assert sm.record_agent_card_event(
+            label,
+            CardEvent.text_delta("answer", "LAST_CANCELLED_STREAM_FRAME"),
+        )
+
+        sm.on_workflow_cancelled("user cancelled")
+
+        snap = sm.snapshot()
+        agent = snap.phases[0].agents[0]
+        assert snap.status == WorkflowStatus.CANCELLED
+        assert agent.status == AgentStatus.CANCELLED
+        assert agent.error == "user cancelled"
+        assert agent.execution_blocks[0].content == "LAST_CANCELLED_STREAM_FRAME"
+        assert snap.metrics.completed_agents == 1
+        assert snap.metrics.failed_agents == 0
+
 
 class TestStateManagerMetricsAtomicity:
     """Metrics counters must be consistent even under concurrent updates."""
@@ -1129,6 +1158,75 @@ export default async function workflow() { return "never"; }
     prior_state_manager.on_workflow_failed.assert_not_called()
     prior_state_manager.on_workflow_cancelled.assert_not_called()
     on_error.assert_called_once()
+
+
+def test_engine_error_callback_includes_authoritative_terminal_snapshot(tmp_path):
+    script_path = tmp_path / "workflow.js"
+    script_path.write_text(
+        """
+export const meta = { name: "fail", phases: [], tools: [] };
+export default async function workflow() { return "never"; }
+""",
+        encoding="utf-8",
+    )
+    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
+    on_error = MagicMock()
+
+    class FailingBridge:
+        @staticmethod
+        def check_node_available():
+            return True
+
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def start(self):
+            return None
+
+        def run(self):
+            manager = engine._state_manager
+            assert manager is not None
+            manager.on_phase_changed("build")
+            label = manager.on_agent_started(
+                "implementation",
+                "codex",
+                "build",
+                agent_id="A1",
+            )
+            assert manager.record_agent_card_event(
+                label,
+                CardEvent.text_started("answer"),
+            )
+            assert manager.record_agent_card_event(
+                label,
+                CardEvent.text_delta(
+                    "answer",
+                    "LAST_UNFLUSHED_ENGINE_MARKER",
+                ),
+            )
+            raise RuntimeError("runtime bridge failed")
+
+        def stop(self):
+            return None
+
+    with patch("src.workflow_engine.engine.RuntimeBridge", FailingBridge):
+        result = engine.execute_workflow(
+            str(script_path),
+            callbacks=WorkflowEngineCallbacks(on_error=on_error),
+            run_spec=_run_spec("fail after a streamed block"),
+        )
+
+    assert result.status == WorkflowStatus.FAILED
+    on_error.assert_called_once()
+    error_message, terminal_project = on_error.call_args.args
+    assert error_message == "runtime bridge failed"
+    assert terminal_project is not result
+    assert terminal_project.status == WorkflowStatus.FAILED
+    terminal_agent = terminal_project.phases[0].agents[0]
+    assert terminal_agent.status == AgentStatus.FAILED
+    assert terminal_agent.execution_blocks[0].content == (
+        "LAST_UNFLUSHED_ENGINE_MARKER"
+    )
 
 
 def test_engine_cleanup_removes_queued_owner_artifacts(tmp_path):

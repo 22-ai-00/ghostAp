@@ -235,6 +235,53 @@ class TestPerKeyLockSerialization:
             allow_first_to_finish.set()
             mgr.cleanup_all()
 
+    def test_resume_retired_session_loads_exact_provider_session(self, manager):
+        """A new transport must load the exact provider session it replaces."""
+        key = SessionKeyCodec.encode("chat1", "proj1")
+        captured: list[tuple[object, ...]] = []
+        resumed = FakeSession()
+        resumed.session_id = "provider-session-1"
+
+        def start_inner(*args, **_kwargs):
+            captured.append(args)
+            with manager._acquire_lock():
+                manager._sessions[key] = resumed
+            return resumed
+
+        manager._start_session_inner = start_inner
+
+        actual = manager.resume_retired_session(
+            "chat1",
+            cwd="/repo",
+            session_id="provider-session-1",
+            startup_timeout=2,
+            project_id="proj1",
+        )
+
+        assert actual is resumed
+        assert len(captured) == 1
+        assert captured[0][0] == key
+        assert captured[0][3] == "provider-session-1"
+
+    def test_resume_retired_session_refuses_concurrent_owner(self, manager):
+        """A stale rollover must never replace a newer chat/session owner."""
+        key = SessionKeyCodec.encode("chat1", "proj1")
+        concurrent = FakeSession()
+        with manager._acquire_lock():
+            manager._sessions[key] = concurrent
+
+        with pytest.raises(RuntimeError, match="并发新会话已接管"):
+            manager.resume_retired_session(
+                "chat1",
+                cwd="/repo",
+                session_id="provider-session-1",
+                startup_timeout=2,
+                project_id="proj1",
+            )
+
+        with manager._acquire_lock():
+            assert manager._sessions[key] is concurrent
+
 
 class TestKeyLockExceptionRecovery:
     """Key lock should be released even when _start_session_inner raises."""

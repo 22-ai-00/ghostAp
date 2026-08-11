@@ -12,6 +12,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from src.card.events import CardEvent, CardEventType
+
 from ..engine_base import BaseEngine, EngineRunState
 from ..spec_engine.models import ReviewAgentBinding
 from .bridge import RuntimeBridge
@@ -19,6 +21,7 @@ from .constants import (
     DEFAULT_MAX_CONCURRENT,
     MAX_TOTAL_AGENTS,
     NODE_MIN_VERSION,
+    PROGRESS_DEBOUNCE_S,
     PROGRESS_HEARTBEAT_S,
     STATE_FILENAME,
 )
@@ -175,7 +178,13 @@ class WorkflowEngineCallbacks:
 
     on_progress: Optional[Callable[[list[dict[str, Any]]], None]] = None
     on_done: Optional[Callable[[WorkflowProject], None]] = None
-    on_error: Optional[Callable[[str], None]] = None
+    on_cancelled: Optional[Callable[[WorkflowProject], None]] = None
+    # Runtime failures include the authoritative terminal project so the
+    # delivery layer can flush every coalesced execution page. ``None`` is
+    # reserved for pre-project/setup errors raised by non-engine callers.
+    on_error: Optional[
+        Callable[[str, Optional[WorkflowProject]], None]
+    ] = None
     on_log: Optional[Callable[[str], None]] = None
     on_phase: Optional[Callable[[str], None]] = None
     on_agent_start: Optional[Callable[[str, str], None]] = None  # (label, tool)
@@ -262,6 +271,8 @@ class WorkflowEngine(BaseEngine):
         # disambiguates duplicate labels (e.g. "agent-1" → "agent-1 #2").
         self._request_to_label: dict[Any, str] = {}
         self._request_to_label_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._stream_progress_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._last_stream_progress_at = 0.0
 
     # ------------------------------------------------------------------
     # Properties
@@ -726,6 +737,7 @@ class WorkflowEngine(BaseEngine):
                     previous_source_path = previous_project.script_path
                 self._cancel_event.clear()
                 self._agent_call_count = 0
+                self._last_stream_progress_at = 0.0
                 # Per-run components must never leak into constructor-error
                 # handling for the next run.
                 self._bridge = None
@@ -767,6 +779,7 @@ class WorkflowEngine(BaseEngine):
                 on_activity=self._handle_agent_activity,
                 on_attempt=self._handle_agent_attempt,
                 on_subagent_update=self._handle_agent_subagent_update,
+                on_card_event=self._handle_agent_card_event,
             )
             self._state_manager = WorkflowStateManager(project)
             self._renderer_wf = WorkflowProgressRenderer(project)
@@ -863,6 +876,9 @@ class WorkflowEngine(BaseEngine):
 
             if terminal_outcome == "cancelled":
                 self._state_manager.on_workflow_cancelled("Workflow cancelled")
+                self._fire_progress()
+                if self._callbacks.on_cancelled:
+                    self._callbacks.on_cancelled(self._state_manager.snapshot())
                 return project
             if terminal_outcome == "failed":
                 sanitized_error = _strip_internal_details(terminal_failure)
@@ -872,7 +888,10 @@ class WorkflowEngine(BaseEngine):
 
                 self._fire_progress()
                 if self._callbacks.on_error:
-                    self._callbacks.on_error(sanitized_error)
+                    self._callbacks.on_error(
+                        sanitized_error,
+                        self._state_manager.snapshot(),
+                    )
                 return project
 
             # Success path
@@ -922,8 +941,20 @@ class WorkflowEngine(BaseEngine):
             logger.error("[WorkflowEngine:%s] Failed: %s", workflow_id, error_msg)
 
             self._fire_progress()
-            if self._callbacks.on_error:
-                self._callbacks.on_error(sanitized_error)
+            if runtime_cancelled and self._callbacks.on_cancelled:
+                terminal_project = (
+                    self._state_manager.snapshot()
+                    if self._state_manager is not None
+                    else project.model_copy(deep=True)
+                )
+                self._callbacks.on_cancelled(terminal_project)
+            elif not runtime_cancelled and self._callbacks.on_error:
+                terminal_project = (
+                    self._state_manager.snapshot()
+                    if self._state_manager is not None
+                    else project.model_copy(deep=True)
+                )
+                self._callbacks.on_error(sanitized_error, terminal_project)
 
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
@@ -953,8 +984,20 @@ class WorkflowEngine(BaseEngine):
             logger.exception("[WorkflowEngine:%s] Unexpected error", workflow_id)
 
             self._fire_progress()
-            if self._callbacks and self._callbacks.on_error:
-                self._callbacks.on_error(sanitized_error)
+            if runtime_cancelled and self._callbacks.on_cancelled:
+                terminal_project = (
+                    self._state_manager.snapshot()
+                    if self._state_manager is not None
+                    else project.model_copy(deep=True)
+                )
+                self._callbacks.on_cancelled(terminal_project)
+            elif not runtime_cancelled and self._callbacks.on_error:
+                terminal_project = (
+                    self._state_manager.snapshot()
+                    if self._state_manager is not None
+                    else project.model_copy(deep=True)
+                )
+                self._callbacks.on_error(sanitized_error, terminal_project)
 
         finally:
             bridge_quiesced = True
@@ -1448,6 +1491,25 @@ class WorkflowEngine(BaseEngine):
             self._state_manager.update_agent_activity(label, activity)
             self._fire_progress()
 
+    def _handle_agent_card_event(self, label: str, event: CardEvent) -> None:
+        """Persist one direct-call execution event and refresh at a safe rate."""
+        if not self._state_manager:
+            return
+        if not self._state_manager.record_agent_card_event(label, event):
+            return
+
+        if event.type in {
+            CardEventType.TEXT_DELTA,
+            CardEventType.REASONING_DELTA,
+            CardEventType.TOOL_DELTA,
+        }:
+            now = time.monotonic()
+            with self._stream_progress_lock:
+                if now - self._last_stream_progress_at < PROGRESS_DEBOUNCE_S:
+                    return
+                self._last_stream_progress_at = now
+        self._fire_progress()
+
     def _handle_agent_attempt(self, label: str, attempt: int) -> None:
         """Expose bounded executor retries in the authoritative agent row."""
         if self._state_manager:
@@ -1549,7 +1611,7 @@ class WorkflowEngine(BaseEngine):
             logger.debug("on_progress callback failed", exc_info=True)
 
     def get_progress_cards(self) -> list[dict[str, Any]]:
-        """Return the status card followed by immutable result-ledger pages."""
+        """Return status, direct-call execution streams, then result ledgers."""
         if not self._renderer_wf:
             return []
         if self._state_manager:

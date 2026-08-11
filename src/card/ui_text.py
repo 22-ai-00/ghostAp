@@ -514,6 +514,10 @@ UI_TEXT = {
         "Codex Goal 已确认暂停，未在收尾阶段继续扩张；"
         "可查看脱敏诊断后重新发起或从会话历史恢复任务。"
     ),
+    "mode_exec_window_limit_incomplete_msg": (
+        "已自动执行 {windows} 个窗口并达到配置的安全上限；{reason}\n"
+        "现有成果已安全保存，可查看脱敏诊断后继续处理。"
+    ),
     "mode_exec_timeout_title": "执行超时",
     "mode_exec_exception_title": "执行异常",
     "mode_exec_timeout_msg": "⏳ 执行超时: {error}",
@@ -638,6 +642,7 @@ UI_TEXT = {
     "tool_label_command": "**命令**",
     "tool_label_result": "**结果**",
     "tool_label_input": "**输入**",
+    "tool_label_progress": "**过程**",
     "tool_label_output": "**输出**",
     # --- Phase display names ---
     "phase_planning": "规划中",

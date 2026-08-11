@@ -79,6 +79,12 @@ def _try_split_by_separator(
     rest_content = separator.join(segments[len(first_part_segments):])
 
     parts = _make_split_atoms(atom, first_content, rest_content)
+    # A split immediately after an opening fence can consume only the fence;
+    # stabilization then prepends that fence to the remainder, making no
+    # semantic progress and causing paginate_layout to loop forever. Fall
+    # through to character splitting for one very long fenced line instead.
+    if len(parts[1].content) >= len(content):
+        return None
     if parts[0].byte_size <= remaining_bytes:
         return parts
     return None
@@ -122,7 +128,7 @@ def _make_split_atoms(
     atom: RenderAtom, first_content: str, rest_content: str
 ) -> list[RenderAtom]:
     """Create split atom parts from content pieces."""
-    if atom.kind in {"text", "reasoning"}:
+    if atom.kind in {"text", "reasoning", "tool_panel"}:
         first_content, rest_content = _stabilize_markdown_split(first_content, rest_content)
 
     first_atom = RenderAtom(

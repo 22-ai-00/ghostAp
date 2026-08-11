@@ -71,6 +71,7 @@ def flatten_to_atoms(
     unified_execution: bool = False,
     terminal: bool = False,
     segmented_text: bool = False,
+    full_execution_blocks: bool = False,
 ) -> list[RenderAtom]:
     """Convert ContentBlocks into a flat list of RenderAtoms.
 
@@ -80,7 +81,11 @@ def flatten_to_atoms(
 
     Uses a registry dispatch pattern for simple block→atom mappings.
     """
-    from src.card.render.tools import render_active_tool_line, render_activity_digest_panel
+    from src.card.render.tools import (
+        render_active_tool_line,
+        render_activity_digest_panel,
+        render_tool_detail,
+    )
 
     atoms: list[RenderAtom] = []
     pending_tools: list[ContentBlock] = []
@@ -148,6 +153,41 @@ def flatten_to_atoms(
                 _append_execution_flow()
                 process_inserted = True
             i += 1
+        elif block.kind == "tool_call" and full_execution_blocks:
+            # Workflow direct-call cards preserve one normal programming tool
+            # panel per ACP tool event instead of folding completed calls into
+            # an activity digest. Building the element here also gives the
+            # paginator its exact serialized size.
+            _flush_pending()
+            if not any(
+                str(value or "").strip()
+                for value in (
+                    getattr(block, "tool_input", None),
+                    getattr(block, "content", None),
+                    getattr(block, "tool_output", None),
+                )
+            ):
+                i += 1
+                continue
+            detail = render_tool_detail(
+                block,
+                truncate_output=False,
+                compact=False,
+                include_updates=True,
+            )
+            if detail:
+                atom = RenderAtom(
+                    kind="tool_panel",
+                    block_id=block.block_id,
+                    content=detail,
+                    splittable=True,
+                    # panel + title markdown + collapse icon + detail markdown
+                    node_count=4,
+                    structural_overhead=900,
+                )
+                atom.byte_size = estimate_atom_size(atom)
+                atoms.append(atom)
+            i += 1
         elif block.kind == "tool_call":
             if block.status == "active":
                 # Flush any pending completed tools first
@@ -212,7 +252,7 @@ def flatten_to_atoms(
                     # collapsible_panel + header markdown + body markdown.
                     # The byte overhead covers the static Card 2.0 wrapper so
                     # pagination remains conservative before actual rendering.
-                    atom.node_count = 3
+                    atom.node_count = 4
                     # Worst-case static wrapper includes a sanitized 60-char
                     # Chinese subagent title. Keep this conservative while
                     # avoiding the old UTF-8 double multiplication.

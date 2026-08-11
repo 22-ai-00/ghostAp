@@ -21,8 +21,12 @@
 | B052 | 2026-07-20 | 仓库级 Ruff 仍报告 85 条既有 Autonomous 测试告警（69 个 F401、4 个 F841、12 个 I001，分布在 31 个测试文件）；需在独立机械清理批次处理，避免与行为治理混杂。 | Low | 测试套件治理审计 | Open | — |
 | B054 | 2026-07-22 | `lark-channel-sdk==1.1.0` 在 Python 3.13 导入时仍调用 protobuf `utcfromtimestamp()` 和无当前 loop 的 `asyncio.get_event_loop()`，产生两条上游 `DeprecationWarning`；关注 SDK 升级并在上游修复后移除兼容记录，不使用过滤器掩盖。 | Low | 普通编程 Channel 迁移 | Open | — |
 
-| B061 | 2026-08-07 | 普通编程首轮耗尽约 6600 秒后虽进入预留收尾，但 provider 可把剩余约 600 秒全部用于上下文压缩，仍未返回最终答复。调整 reserve 会压缩主执行预算，单次日志不足以证明安全阈值；需增加 finalization 阶段耗时/事件观测并基于多次样本设计自适应收尾预算。 | Medium | 普通编程超时日志复盘 | Open | — |
+| B061 | 2026-08-07 | 单窗口耗尽后现已安全退休 transport、按原 provider session ID 自动恢复并续开新窗口，不再把一次 deadline 当作任务终态。仍需部署后采集真实租户 timeout → pause → retire → load_session → continue 的墙钟事件，校准 4 窗口默认值和 finalization reserve。 | Medium | 普通编程超时日志复盘 | Mitigated | — |
 | B062 | 2026-08-09 | Workflow 进度测试仍保留实现前的 RED 注释和 `object.__setattr__` 绕过，分页交付合同标题也仍标记为 RED；生产模型现已正式暴露对应字段。需在独立测试治理批次改用正常模型构造并校准文案，避免掩盖未来 schema 回归。 | Low | “继续执行”续接点调查 | Open | — |
+| B063 | 2026-08-11 | Workflow `retain_all_blocks` 会在每次进度刷新时深拷贝、序列化并重渲染完整执行历史；在 200 个直接调用与长输出下存在 O(total history) 内存/CPU 放大。需设计 append-only spool、页索引和仅渲染活动尾页，同时保持完整内容可追溯。 | Medium | Workflow 完整执行卡审查 | Open | — |
+| B064 | 2026-08-11 | Workflow 的 `ACPStreamBridge` 尚未注入 handler 图片 uploader；Agent 截图/图片只会生成 `IMAGE_FAILED` 占位。需用窄 callback 接通上传，CardState 只保存 `image_key`，并补真实图片事件回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
+| B065 | 2026-08-11 | ACP `ToolCallProgress.raw_output` 为快照语义，但 reducer 仍按 delta 拼接；连续 `A`/`AB` 会形成重复或无效内容并可能 O(n²) 膨胀。需为 full Workflow 投影使用 replace/去重语义并覆盖多 progress 回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
+| B066 | 2026-08-11 | 完整 tool input/progress/output 固定使用三反引号；载荷自带 fenced Markdown 时会提前闭合并被当作卡片 Markdown 解释。需使用动态 fence 长度并让分页保持原 fence，覆盖跨页 fenced payload。 | Medium | Workflow 完整执行卡审查 | Open | — |
 
 > **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。强化多副本档的外部验收条件由 [employee runtime profiles ADR](../docs/adr-employee-runtime-profiles.md) 持续承载，不作为本地代码已证明能力。
 

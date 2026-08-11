@@ -55,6 +55,13 @@ def render_programming_text_section(
             "background_color": background,
             "width": "fill",
             "vertical_align": "center",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down_outlined",
+                "color": "grey",
+            },
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
         },
         "elements": [body],
     }

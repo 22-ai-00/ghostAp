@@ -193,6 +193,10 @@ class AgentProgress(BaseModel):
     result: Optional[str] = None  # Sanitized terminal result used by Workflow cards only.
     call_index: int = 0
     subagents: list[SubagentProgress] = Field(default_factory=list)
+    # Standard ``src.card.state.models`` blocks projected from this direct
+    # call's ACP stream. ``Any`` deliberately accepts both live frozen
+    # dataclasses and their JSON dictionaries after WorkflowProject reload.
+    execution_blocks: list[Any] = Field(default_factory=list)
 
 
 class ReviewerEvidence(BaseModel):

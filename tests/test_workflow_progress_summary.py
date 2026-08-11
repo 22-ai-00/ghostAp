@@ -13,6 +13,7 @@ from src.workflow_engine.models import (
 )
 from src.workflow_engine.renderer import (
     WorkflowProgressRenderer,
+    render_completion_cards,
 )
 
 
@@ -135,9 +136,9 @@ def test_terminal_results_form_complete_ordered_ledger_across_cards() -> None:
         for i, marker in enumerate(markers)
     ]
     project = _make_project("Big Phase", agents)
-    project.status = WorkflowStatus.RUNNING
+    project.status = WorkflowStatus.COMPLETED
 
-    cards = WorkflowProgressRenderer(project).render_progress_cards(project)
+    cards = render_completion_cards(project)
 
     assert len(cards) >= 2
     assert all(isinstance(card, dict) and "header" in card and "elements" in card for card in cards)
@@ -145,7 +146,7 @@ def test_terminal_results_form_complete_ordered_ledger_across_cards() -> None:
     ledger_texts = [_flatten_text(card["elements"]) for card in cards[1:]]
     ledger_text = "\n".join(ledger_texts)
 
-    assert "进度 " in status_text
+    assert "执行过程" in status_text
     assert all("进度 " not in text and "当前执行中" not in text for text in ledger_texts)
     assert all(marker not in status_text for marker in markers)
     assert all(ledger_text.count(marker) == 1 for marker in markers)
@@ -158,9 +159,9 @@ def test_single_oversized_result_splits_without_losing_content() -> None:
     chunks = [f"RESULTCHUNK{i:03d} " + ("x" * 700) for i in range(72)]
     agent = _make_agent("large-result", AgentStatus.DONE, result="\n".join(chunks))
     project = _make_project("Large Result", [agent])
-    project.status = WorkflowStatus.RUNNING
+    project.status = WorkflowStatus.COMPLETED
 
-    cards = WorkflowProgressRenderer(project).render_progress_cards(project)
+    cards = render_completion_cards(project)
 
     assert len(cards[1:]) >= 2, "a single oversized result must span multiple ledger pages"
     assert all(_card_size_bytes(card) <= 28_000 for card in cards)

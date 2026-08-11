@@ -354,12 +354,22 @@ def card_state_requires_continuation(
     return False
 
 
-def reduce_card_state(state: CardState | None, event: CardEvent, metadata: CardMetadata | None = None) -> CardState:
+def reduce_card_state(
+    state: CardState | None,
+    event: CardEvent,
+    metadata: CardMetadata | None = None,
+    *,
+    retain_all_blocks: bool = False,
+) -> CardState:
     """
     Pure function: old state + event → new state. No side effects.
 
     If state is None, creates initial state (expects STARTED event or provides defaults).
     metadata is only used for initial state creation.
+
+    ``retain_all_blocks`` is reserved for durable projections whose delivery
+    layer paginates the complete history (for example one Workflow direct
+    call). Ordinary live cards keep the bounded retention windows below.
     """
     if state is None:
         # Initialize with metadata
@@ -372,6 +382,9 @@ def reduce_card_state(state: CardState | None, event: CardEvent, metadata: CardM
     # The existing retention windows only run when the reducer changed state.
     # Version advancement is the reducer's canonical signal for that condition.
     if new_state.version == previous_version:
+        return new_state
+
+    if retain_all_blocks:
         return new_state
 
     # Sliding window: trim completed tool blocks to MAX_COMPLETED_TOOL_BLOCKS.

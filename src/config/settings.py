@@ -78,6 +78,16 @@ class Settings(BaseSettings):
             "separate bounded finalization prompt; 0 disables the reserve."
         ),
     )
+    programming_max_execution_windows: int = Field(
+        default=4,
+        ge=1,
+        le=24,
+        description=(
+            "Maximum bounded ACP execution windows for one ordinary "
+            "programming task. Timeout-finalized incomplete work resumes on "
+            "a fresh transport between windows."
+        ),
+    )
 
     # ACP session history directory (empty = default ~/.ghostap/acp_history)
     acp_history_dir: str = ""

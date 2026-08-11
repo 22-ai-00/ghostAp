@@ -100,6 +100,10 @@ class ToolCallInfo:
     # carried across same-id snapshots so a later clean update cannot erase
     # evidence that the lifecycle stream was structurally ambiguous.
     child_metadata_malformed: bool = False
+    # Unbounded provider payload retained only for consumers that explicitly
+    # request a full, sanitized projection (for example Workflow pagination).
+    # Ordinary cards continue to use the bounded ``content`` field.
+    full_content: object | None = None
 
 
 @dataclass

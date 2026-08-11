@@ -603,6 +603,66 @@ class ACPSessionManager:
                 key_lock.release()
         finally:
             self._release_key_lock(key)
+
+    def resume_retired_session(
+        self,
+        chat_id: str,
+        *,
+        cwd: str = "",
+        session_id: str,
+        startup_timeout: float = 60,
+        project_id: Optional[str] = None,
+        agent_type_override: Optional[str] = None,
+        model_name: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ) -> SyncSession:
+        """Resume one retired provider session without replacing a new owner.
+
+        Timeout finalization removes and closes the old transport before an
+        execution-window rollover.  This operation claims the now-empty key
+        under the same startup lease and loads the exact provider session ID.
+        A concurrently installed session is authoritative and is never ended by
+        the stale rollover.
+        """
+        target_session_id = str(session_id or "").strip()
+        if not target_session_id:
+            raise ValueError("ACP resume session_id is required")
+        timeout = float(startup_timeout)
+        if timeout <= 0:
+            raise TimeoutError("ACP session resume timeout")
+
+        deadline = time.monotonic() + timeout
+        key = self._session_key(chat_id, project_id, thread_id=thread_id)
+        key_lock = self._get_key_lock(key)
+        try:
+            if not key_lock.acquire(
+                timeout=self._remaining_before(deadline, "resume lock")
+            ):
+                raise TimeoutError("ACP session resume lock timeout")
+            try:
+                self._wait_for_closing_session(key, deadline=deadline)
+                with self._acquire_lock(
+                    timeout=self._remaining_before(deadline, "resume owner")
+                ):
+                    if self._sessions.get(key) is not None:
+                        raise RuntimeError(
+                            "并发新会话已接管；旧任务停止跨窗口恢复，避免干扰新任务"
+                        )
+                return self._start_session_inner(
+                    key,
+                    chat_id,
+                    cwd,
+                    target_session_id,
+                    self._remaining_before(deadline, "resume start"),
+                    project_id,
+                    agent_type_override,
+                    model_name,
+                    thread_id,
+                )
+            finally:
+                key_lock.release()
+        finally:
+            self._release_key_lock(key)
     def get_session(self, chat_id: str, project_id: Optional[str] = None, thread_id: Optional[str] = None) -> Optional[SyncSession]:
         """Get active session for a chat/project (with timeout check).
         Health check is only performed when the session has been idle for a while

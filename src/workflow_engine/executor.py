@@ -8,7 +8,7 @@ import logging
 import threading
 import time
 from collections.abc import Mapping
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from src.card.tool_display import sanitize_tool_failure_detail
 
@@ -27,6 +27,9 @@ from .constants import (
 from .errors import _strip_internal_details, is_transient_error
 from .models import AgentCallParams, AgentCallResult
 from .roles import get_subagent_encouragement_prompt
+
+if TYPE_CHECKING:
+    from src.card.events import CardEvent
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +180,7 @@ class AgentExecutor:
             Callable[[str, tuple[dict[str, object], ...]], None]
         ] = None,
         on_attempt: Optional[Callable[[str, int], None]] = None,
+        on_card_event: Optional[Callable[[str, "CardEvent"], None]] = None,
     ) -> None:
         self.cwd = cwd
         self.cancel_event = cancel_event
@@ -184,6 +188,7 @@ class AgentExecutor:
         self.on_activity = on_activity
         self.on_attempt = on_attempt
         self.on_subagent_update = on_subagent_update
+        self.on_card_event = on_card_event
         pool_size = max(1, min(int(max_workers), HARD_MAX_CONCURRENT))
         self._session_pool: concurrent.futures.ThreadPoolExecutor | None = (
             concurrent.futures.ThreadPoolExecutor(
@@ -196,6 +201,8 @@ class AgentExecutor:
         self._late_close_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._startup_blacklist: dict[str, str] = {}
         self._blacklist_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._event_turn_seq = 0
+        self._event_turn_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
     def execute(
         self,
@@ -228,7 +235,6 @@ class AgentExecutor:
                 )
 
         prompt = self._build_prompt(params)
-        event_callback = self._event_callback(params.label or "")
         idle_timeout_s = _settings_int(
             "workflow_agent_idle_timeout_s",
             AGENT_IDLE_TIMEOUT_S,
@@ -270,7 +276,7 @@ class AgentExecutor:
                 output, tokens, stop_reason = self._send_prompt(
                     session,
                     prompt,
-                    event_callback,
+                    params.label or "",
                     _resolve_timeout_s(
                         params.timeout,
                         _settings_int("workflow_agent_call_timeout_s", AGENT_CALL_TIMEOUT_S),
@@ -305,7 +311,7 @@ class AgentExecutor:
                         output, tokens, stop_reason = self._send_prompt(
                             session,
                             self._build_schema_fix_prompt(output, params.output_schema),
-                            event_callback,
+                            params.label or "",
                             _resolve_timeout_s(
                                 params.timeout,
                                 _settings_int("workflow_agent_call_timeout_s", AGENT_CALL_TIMEOUT_S),
@@ -424,14 +430,23 @@ class AgentExecutor:
         self,
         session: Any,
         prompt: str,
-        on_event: Callable[[Any], None] | None,
+        label: str,
         timeout_s: float,
         idle_timeout_s: int,
     ) -> tuple[str, int, str | None]:
+        # ACP providers may retain and invoke an ``on_event`` callback after
+        # ``send_prompt`` returns. Keep each semantic turn isolated so schema
+        # repair and outer retries cannot append to a prior turn's blocks.
+        on_event = self._event_callback(label)
         kwargs: dict[str, Any] = {"on_event": on_event, "timeout": timeout_s}
         if idle_timeout_s > 0:
             kwargs["idle_timeout"] = float(idle_timeout_s)
-        result = session.send_prompt(prompt, **kwargs)
+        try:
+            result = session.send_prompt(prompt, **kwargs)
+        finally:
+            # One send_prompt call is one semantic ACP turn. Schema repair and
+            # other bounded follow-ups must start new text/reasoning blocks.
+            self._close_event_callback(on_event)
         if result is None:
             return "", 0, None
         raw_reason = getattr(result, "stop_reason", None)
@@ -444,28 +459,147 @@ class AgentExecutor:
         return tokens
 
     def _event_callback(self, label: str) -> Callable[[Any], None] | None:
-        if not label or (not self.on_activity and not self.on_subagent_update):
+        if not label or (
+            not self.on_activity
+            and not self.on_subagent_update
+            and not self.on_card_event
+        ):
             return None
 
-        def callback(event: Any) -> None:
-            try:
-                event_type = getattr(event, "event_type", None)
-                type_value = event_type.value if hasattr(event_type, "value") else str(event_type or "")
-                tool_call = getattr(event, "tool_call", None)
-                updates = _subagent_updates_from_tool_call(tool_call)
-                if updates and self.on_subagent_update:
-                    self.on_subagent_update(label, updates)
-                if _is_subagent_tool_call(tool_call) or not self.on_activity or tool_call is None:
-                    return
-                title = getattr(tool_call, "title", "") or getattr(tool_call, "kind", "")
-                if type_value == "tool_call_start":
-                    self.on_activity(label, title[:60])
-                elif type_value == "tool_call_done":
-                    self.on_activity(label, f"{title[:50]} ({getattr(tool_call, 'status', '')})")
-            except Exception:
-                logger.debug("[AgentExecutor] event callback failed", exc_info=True)
+        card_bridge = None
+        if self.on_card_event:
+            from src.card.events import CardEvent
+            from src.card.stream_bridge import ACPStreamBridge
 
+            on_card_event = self.on_card_event
+            with self._event_turn_lock:
+                self._event_turn_seq += 1
+                turn_seq = self._event_turn_seq
+
+            class _DispatchTarget:
+                def __init__(self) -> None:
+                    self._block_ids: dict[tuple[str, str], str] = {}
+                    self._tool_ids: dict[str, str] = {}
+                    self._next_block_seq = 0
+
+                def _next_id(self, family: str) -> str:
+                    self._next_block_seq += 1
+                    return f"_wf_turn_{turn_seq}_{family}_{self._next_block_seq}"
+
+                def _namespaced(self, card_event: "CardEvent") -> "CardEvent":
+                    raw_block_id = str(card_event.payload.get("block_id") or "")
+                    if not raw_block_id:
+                        return card_event
+                    type_value = card_event.type.value
+                    if type_value == "tool_started":
+                        block_id = self._next_id("tool")
+                        # A provider may recycle the same tool-call ID for a
+                        # later invocation. Every start defines a new logical
+                        # block; subsequent update/done frames follow it.
+                        self._tool_ids[raw_block_id] = block_id
+                    elif type_value.startswith("tool_"):
+                        block_id = self._tool_ids.get(raw_block_id)
+                        if block_id is None:
+                            block_id = self._next_id("tool")
+                            self._tool_ids[raw_block_id] = block_id
+                    else:
+                        family = (
+                            "reasoning"
+                            if type_value.startswith("reasoning_")
+                            else "text"
+                        )
+                        key = (family, raw_block_id)
+                        block_id = self._block_ids.get(key)
+                        if block_id is None:
+                            block_id = self._next_id(family)
+                            self._block_ids[key] = block_id
+                    return CardEvent(
+                        type=card_event.type,
+                        payload={**card_event.payload, "block_id": block_id},
+                    )
+
+                def dispatch(self, card_event: "CardEvent") -> None:
+                    on_card_event(label, self._namespaced(card_event))
+
+            card_bridge = ACPStreamBridge(
+                _DispatchTarget(),
+                preserve_tool_content=True,
+            )
+
+        callback_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        retired = False
+
+        def callback(event: Any) -> None:
+            with callback_lock:
+                if retired:
+                    return
+                if card_bridge is not None:
+                    try:
+                        card_bridge.on_event(event)
+                    except Exception:
+                        logger.debug(
+                            "[AgentExecutor] card event projection failed",
+                            exc_info=True,
+                        )
+                try:
+                    event_type = getattr(event, "event_type", None)
+                    type_value = (
+                        event_type.value
+                        if hasattr(event_type, "value")
+                        else str(event_type or "")
+                    )
+                    tool_call = getattr(event, "tool_call", None)
+                    updates = _subagent_updates_from_tool_call(tool_call)
+                    if updates and self.on_subagent_update:
+                        self.on_subagent_update(label, updates)
+                    if (
+                        _is_subagent_tool_call(tool_call)
+                        or not self.on_activity
+                        or tool_call is None
+                    ):
+                        return
+                    title = getattr(tool_call, "title", "") or getattr(
+                        tool_call, "kind", ""
+                    )
+                    if type_value == "tool_call_start":
+                        self.on_activity(label, title[:60])
+                    elif type_value == "tool_call_done":
+                        self.on_activity(
+                            label,
+                            f"{title[:50]} ({getattr(tool_call, 'status', '')})",
+                        )
+                except Exception:
+                    logger.debug(
+                        "[AgentExecutor] event callback failed",
+                        exc_info=True,
+                    )
+
+        def retire() -> None:
+            nonlocal retired
+            with callback_lock:
+                if retired:
+                    return
+                retired = True
+                if card_bridge is not None:
+                    card_bridge.close_open_blocks()
+
+        setattr(callback, "retire", retire)
         return callback
+
+    @staticmethod
+    def _close_event_callback(callback: Callable[[Any], None] | None) -> None:
+        closer = getattr(callback, "retire", None)
+        if not callable(closer):
+            closer = getattr(callback, "close_open_blocks", None)
+        if not callable(closer):
+            return
+        try:
+            closer()
+        except Exception:
+            logger.debug(
+                "[AgentExecutor] card event projection close failed",
+                exc_info=True,
+            )
 
     def _start_cancel_guard(
         self,

@@ -313,6 +313,21 @@ class TestWorkflowTimeoutSettings:
             Settings(workflow_session_create_timeout_s=5)  # ge=10
 
 
+class TestProgrammingExecutionWindowSettings:
+    def test_default_allows_four_bounded_windows(self):
+        settings = Settings(_env_file=None)
+
+        assert settings.programming_max_execution_windows == 4
+
+    @pytest.mark.parametrize("value", [0, -1, 25])
+    def test_rejects_unsafe_window_limits(self, value: int):
+        with pytest.raises(Exception):
+            Settings(
+                _env_file=None,
+                programming_max_execution_windows=value,
+            )
+
+
 class TestAutonomousTeamAndContextRetrySettings:
     def test_defaults_are_typed_and_discoverable(self):
         settings = Settings(_env_file=None)

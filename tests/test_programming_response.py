@@ -132,6 +132,8 @@ def _incomplete_execution(
     *,
     entered_finalization: bool,
     goal_status: str | None = None,
+    execution_windows: int = 1,
+    window_limit_reached: bool = False,
 ) -> PromptContinuationResult:
     goal = (
         ACPGoalInfo(objective="finish", status=goal_status)
@@ -154,6 +156,24 @@ def _incomplete_execution(
         assessment=assessment,
         automatic_continuations=0,
         entered_finalization=entered_finalization,
+        execution_windows=execution_windows,
+        window_limit_reached=window_limit_reached,
+    )
+
+
+def _completed_execution(text: str = "done") -> PromptContinuationResult:
+    result = PromptResult(
+        stop_reason="end_turn",
+        text=text,
+        plan=PlanInfo(
+            entries=[PlanEntryInfo(content="finish", status="completed")]
+        ),
+    )
+    return PromptContinuationResult(
+        result=result,
+        assessment=classify_prompt_result(result),
+        automatic_continuations=0,
+        entered_finalization=False,
     )
 
 
@@ -477,7 +497,7 @@ def test_streaming_finalization_provenance_controls_incomplete_copy(
     with (
         _streaming_environment(),
         patch(
-            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            "src.feishu.handlers.programming.run_prompt_across_execution_windows",
             return_value=_incomplete_execution(
                 entered_finalization=entered_finalization
             ),
@@ -508,7 +528,7 @@ def test_non_streaming_finalization_provenance_controls_incomplete_copy(
     session = MagicMock()
 
     with patch(
-        "src.feishu.handlers.programming.run_prompt_with_continuation",
+        "src.feishu.handlers.programming.run_prompt_across_execution_windows",
         return_value=_incomplete_execution(
             entered_finalization=entered_finalization
         ),
@@ -525,6 +545,83 @@ def test_non_streaming_finalization_provenance_controls_incomplete_copy(
     response = handler.reply_text.call_args.args[1]
     assert "仍有 3 个计划项未完成" in response
     assert ("执行窗口已耗尽" in response) is entered_finalization
+
+
+def test_timeout_incomplete_resumes_and_finishes_in_second_window() -> None:
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler.settings.programming_max_execution_windows = 4
+    manager = MagicMock()
+    handler.ctx.claude_manager = manager
+    first_session = MagicMock()
+    first_session.session_id = "provider-session-1"
+    first_session.message_count = 1
+    resumed_session = MagicMock()
+    resumed_session.session_id = "provider-session-1"
+    resumed_session.message_count = 2
+    manager.resume_retired_session.return_value = resumed_session
+
+    with (
+        _streaming_environment(),
+        patch(
+            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            side_effect=[
+                _incomplete_execution(entered_finalization=True),
+                _completed_execution("finished after rollover"),
+            ],
+        ),
+    ):
+        handler.handle_response(
+            "msg-window-rollover",
+            "chat-1",
+            "finish the task",
+            first_session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    adapter = _FakeProgrammingCardSession.last
+    assert adapter.finished is True
+    assert adapter.failed_text is None
+    assert adapter.continuation_boundaries == 1
+    manager.resume_retired_session.assert_called_once()
+    resume_kwargs = manager.resume_retired_session.call_args.kwargs
+    assert resume_kwargs["session_id"] == "provider-session-1"
+
+
+def test_window_limit_uses_total_window_terminal_copy() -> None:
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = MagicMock()
+    session.session_id = "provider-session-limit"
+    session.message_count = 4
+
+    with (
+        _streaming_environment(),
+        patch(
+            "src.feishu.handlers.programming.run_prompt_across_execution_windows",
+            return_value=_incomplete_execution(
+                entered_finalization=True,
+                execution_windows=4,
+                window_limit_reached=True,
+            ),
+        ),
+    ):
+        handler.handle_response(
+            "msg-window-limit",
+            "chat-1",
+            "finish the task",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    failed_text = _FakeProgrammingCardSession.last.failed_text
+    assert "已自动执行 4 个窗口" in failed_text
+    assert "达到配置的安全上限" in failed_text
+    assert "单个执行窗口已耗尽" not in failed_text
 
 
 @pytest.mark.parametrize("goal_status", ["paused", "blocked"])
@@ -576,7 +673,7 @@ def test_provider_goal_after_finalization_fails_with_timeout_truth(
     with (
         _streaming_environment(),
         patch(
-            "src.feishu.handlers.programming.run_prompt_with_continuation",
+            "src.feishu.handlers.programming.run_prompt_across_execution_windows",
             return_value=_incomplete_execution(
                 entered_finalization=True,
                 goal_status=goal_status,

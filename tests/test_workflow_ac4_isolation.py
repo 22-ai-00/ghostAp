@@ -10,9 +10,10 @@ into the main agent chat context.  It has three enforcement surfaces:
 2. ``WorkflowStateManager.add_context_tokens`` is the *only* authorised
    counter of how many characters the workflow pushes into the main chat.
    The engine calls it only from the final-result path.
-3. ``WorkflowRenderer`` refuses to render cards that contain sentinel
-   strings injected into agent output text — catching regressions where
-   someone would print raw agent output into a card body.
+3. ``WorkflowRenderer`` rejects explicitly configured forbidden sentinels in
+   user-visible card projections. Safe, redacted execution blocks are allowed
+   in Workflow cards; the isolation boundary is the main-agent context and
+   callback payload, not blanket suppression from the initiating user's UI.
 
 Together these three surface-tests pin down the isolation invariant:
 ``delta_context_tokens ≈ len(final_result)`` and nothing else.

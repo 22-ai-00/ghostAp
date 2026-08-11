@@ -52,7 +52,8 @@
     }
 
     .stage {
-      width: min(100%, 900px);
+      width: 100%;
+      max-width: 900px;
       margin: 0 auto;
       padding: 44px 24px 72px;
     }
@@ -80,6 +81,49 @@
       border-radius: var(--radius-lg);
       background: var(--card);
       box-shadow: var(--shadow);
+    }
+
+    .message-sequence {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 13px 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: .04em;
+    }
+
+    .message-sequence::before,
+    .message-sequence::after {
+      content: "";
+      height: 1px;
+      flex: 1;
+      background: var(--line-strong);
+    }
+
+    .hero.compact-hero {
+      grid-template-columns: 48px minmax(0, 1fr) auto;
+      padding: 19px 24px 18px;
+      background: linear-gradient(135deg, #284d78, #326ca9 58%, #295987);
+    }
+
+    .hero.compact-hero.ledger-hero {
+      background: linear-gradient(135deg, #485b68, #637786 58%, #536572);
+    }
+
+    .compact-hero .hero-mark {
+      width: 48px;
+      height: 48px;
+      border-radius: 14px;
+      font-size: 16px;
+    }
+
+    .compact-hero h2 {
+      margin: 0;
+      color: #fff;
+      font-size: 19px;
+      line-height: 1.3;
     }
 
     .hero {
@@ -729,6 +773,78 @@
       line-height: 1.45;
     }
 
+    .execution-stream {
+      display: grid;
+      gap: 8px;
+      margin: 0 15px 14px 61px;
+    }
+
+    .execution-block {
+      padding: 10px 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #f8fbfa;
+    }
+
+    .execution-block.current {
+      border-color: #9bcfc6;
+      border-left: 3px solid var(--teal);
+      background: var(--teal-soft);
+    }
+
+    .execution-block.reasoning {
+      border-style: dashed;
+      color: var(--muted);
+      background: #fbfdfc;
+    }
+
+    .execution-block.tool {
+      background: white;
+    }
+
+    .execution-block-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 5px;
+      color: var(--teal-dark);
+      font-size: 9px;
+      font-weight: 900;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+
+    .execution-block-head span:last-child {
+      color: var(--muted);
+      font-weight: 750;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    .execution-block p {
+      margin: 0;
+      color: var(--ink-soft);
+      font-size: 10px;
+      line-height: 1.55;
+    }
+
+    .tool-detail {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 7px;
+    }
+
+    .tool-detail code {
+      overflow-wrap: anywhere;
+      padding: 7px 8px;
+      border-radius: 7px;
+      background: #f3f7f6;
+      color: var(--ink-soft);
+      font-size: 8px;
+      white-space: pre-wrap;
+    }
+
     .ledger {
       display: grid;
       gap: 7px;
@@ -885,6 +1001,7 @@
 
     @media (max-width: 720px) {
       .stage {
+        width: 100%;
         padding: 14px 10px 36px;
       }
 
@@ -919,6 +1036,14 @@
         padding: 0 16px 20px;
       }
 
+      .hero-copy h1,
+      .hero-copy p,
+      .task-text,
+      .overall-subtitle,
+      .execution-block p {
+        overflow-wrap: anywhere;
+      }
+
       .snapshot {
         grid-template-columns: 1fr;
       }
@@ -935,6 +1060,15 @@
     @media (max-width: 520px) {
       .task-strip {
         grid-template-columns: auto minmax(0, 1fr);
+      }
+
+      .pool-chips {
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+
+      .pool-copy span {
+        max-width: none;
       }
 
       .elapsed {
@@ -966,6 +1100,14 @@
       .operation {
         grid-template-columns: 1fr;
         margin-left: 15px;
+      }
+
+      .execution-stream {
+        margin-left: 15px;
+      }
+
+      .tool-detail {
+        grid-template-columns: 1fr;
       }
 
       .footer {
@@ -1001,7 +1143,7 @@
         <div class="hero-copy">
           <p class="eyebrow">Workflow running</p>
           <h1 id="page-title">动态 Agent 池正在编排</h1>
-          <p>计划绑定与实际调度在同一张卡持续更新；脚本已经自动通过结构与安全验证。</p>
+          <p>计划绑定、实际调度与每次直接 Agent 调用的完整执行流持续更新；脚本已经自动通过结构与安全验证。</p>
         </div>
         <div class="live-pill"><span class="live-dot"></span> 执行中 · 02:18</div>
       </header>
@@ -1130,54 +1272,118 @@
           </div>
         </section>
 
+        <footer class="footer">
+          <div class="footer-note">
+            <strong>总览卡只承载调度、阶段与停止控制</strong>
+            每次直接 Agent 调用的完整内容在后续独立执行卡中持续更新。
+          </div>
+          <button class="stop-button" type="button">停止 Workflow</button>
+        </footer>
+      </div>
+    </article>
+
+    <div class="message-sequence">同一任务流的下一条消息 · 稳定绑定 #003 / A2</div>
+
+    <article class="workflow-card" aria-labelledby="active-card-title">
+      <header class="hero compact-hero">
+        <div class="hero-mark" aria-hidden="true">A2</div>
+        <div class="hero-copy">
+          <p class="eyebrow">Direct agent execution</p>
+          <h2 id="active-card-title">#003 · Codex · UX 实现</h2>
+          <p>普通编程卡片格式 · 文本、思考、工具输入、过程与输出按事件顺序完整保留。</p>
+        </div>
+        <div class="live-pill"><span class="live-dot"></span> 执行中 · 01:18</div>
+      </header>
+
+      <div class="content">
+
         <section class="section" aria-labelledby="active-title">
           <div class="section-heading">
-            <h2 class="section-title" id="active-title"><span class="section-index">2</span> 当前执行</h2>
-            <span class="section-note">实际绑定 · 不是计划推断</span>
+            <h2 class="section-title" id="active-title"><span class="section-index">2</span> 直接调用执行流</h2>
+            <span class="section-note">按调用隔离 · 完整事件顺序</span>
           </div>
 
           <article class="running-card">
             <div class="running-top">
               <span class="large-agent-id">A2</span>
               <span class="running-copy">
-                <strong>Codex · UX 实现</strong>
-                <span>gpt-5.1-codex-mini · N3</span>
+                <strong>#003 · Codex · UX 实现</strong>
+                <span>A2 / gpt-5.1-codex-mini · attempt 1 · N3</span>
               </span>
               <span class="running-state"><span class="live-dot"></span> 正在工作</span>
             </div>
-            <div class="operation">
-              <span class="operation-label">Current operation</span>
-              <span class="operation-copy">
-                <strong>正在更新 Agent 池选择与 Workflow Progress 预览</strong>
-                <span>已完成响应式布局，正在补充动态节点候选与实际调度结果。</span>
-              </span>
+            <div class="execution-stream">
+              <div class="execution-block">
+                <div class="execution-block-head"><span>Agent 文本</span><span>已完成</span></div>
+                <p>我会先复核现有 Workflow 进度卡的信息层级，再将运行内容接到普通编程卡片的执行块。</p>
+              </div>
+              <div class="execution-block reasoning">
+                <div class="execution-block-head"><span>思考过程</span><span>可折叠 · 已完成</span></div>
+                <p>直接调用需要稳定的 call index；同一 A2 再次执行时必须生成新的执行流，不能覆盖 #003。</p>
+              </div>
+              <div class="execution-block tool">
+                <div class="execution-block-head"><span>工具调用 · apply_patch</span><span>✓ 完成</span></div>
+                <div class="tool-detail">
+                  <code><strong>输入</strong><br>ux/workflow-progress.html</code>
+                  <code><strong>过程</strong><br>patch hunk 1/1 applied</code>
+                  <code><strong>输出</strong><br>Done · updated stream layout</code>
+                </div>
+              </div>
+              <div class="execution-block current">
+                <div class="execution-block-head"><span>Agent 文本</span><span>正在生成</span></div>
+                <p>响应式布局已经完成。现在补充跨页续接和并行调用示例，并验证 360px 宽度……</p>
+              </div>
             </div>
           </article>
         </section>
 
+        <footer class="footer">
+          <div class="footer-note">
+            <strong>只有本次调用超出飞书容量时才创建续接卡</strong>
+            续页继续使用同一 #003 / A2 标识，不覆盖其他并发 Agent。
+          </div>
+        </footer>
+      </div>
+    </article>
+
+    <div class="message-sequence">结果账本消息 · 完整正文仍以各执行卡为准</div>
+
+    <article class="workflow-card" aria-labelledby="ledger-card-title">
+      <header class="hero compact-hero ledger-hero">
+        <div class="hero-mark" aria-hidden="true">LOG</div>
+        <div class="hero-copy">
+          <p class="eyebrow">Workflow ledger</p>
+          <h2 id="ledger-card-title">Agent 调度与结果账本</h2>
+          <p>按完成顺序汇总 A-id、工具、模型、当前操作和终态结果。</p>
+        </div>
+        <div class="live-pill">3 个调用</div>
+      </header>
+
+      <div class="content">
+
         <section class="section" aria-labelledby="ledger-title">
           <div class="section-heading">
             <h2 class="section-title" id="ledger-title"><span class="section-index">3</span> Agent 调度账本</h2>
-            <span class="section-note">每个 Agent 只保留一条最新操作与结果</span>
+            <span class="section-note">账本是索引；正文保留在上方独立执行流卡片</span>
           </div>
 
           <div class="ledger">
             <div class="ledger-row">
               <span class="ledger-id">A1</span>
               <span class="ledger-binding"><strong>Codex</strong><span>gpt-5.2-codex · N1</span></span>
-              <span class="ledger-detail"><strong>操作：分析 Workflow 运行契约</strong><span>结果：确认需以 pool entry ID 取代 tool → model 映射</span></span>
+              <span class="ledger-detail"><strong>#001 · 分析 Workflow 运行契约</strong><span>完整文本、思考和工具调用保留在 #001 执行流</span></span>
               <span class="status done">完成</span>
             </div>
             <div class="ledger-row">
               <span class="ledger-id">A3</span>
               <span class="ledger-binding"><strong>Claude</strong><span>claude-sonnet-4-5 · N2</span></span>
-              <span class="ledger-detail"><strong>操作：审计选择与确认路径</strong><span>结果：收敛为单卡选池，确认后不再设置人工门</span></span>
+              <span class="ledger-detail"><strong>#002 · 审计选择与确认路径</strong><span>完整文本、思考和工具调用保留在 #002 执行流</span></span>
               <span class="status done">完成</span>
             </div>
             <div class="ledger-row running">
               <span class="ledger-id">A2</span>
               <span class="ledger-binding"><strong>Codex</strong><span>gpt-5.1-codex-mini · N3</span></span>
-              <span class="ledger-detail"><strong>操作：实现桌面与移动端预览</strong><span>结果：进行中 · 已完成池快照与计划绑定区域</span></span>
+              <span class="ledger-detail"><strong>#003 · 实现桌面与移动端预览</strong><span>进行中 · 当前块正在原位增长，历史块已经冻结</span></span>
               <span class="status running">执行中</span>
             </div>
           </div>
@@ -1186,9 +1392,8 @@
         <footer class="footer">
           <div class="footer-note">
             <strong>后续步骤会自动调度，无需继续或确认</strong>
-            仅保留主动停止入口；终态结果将在同一任务流中完整交付。
+            终态结果将在同一任务流中完整交付；停止入口只保留在总览卡。
           </div>
-          <button class="stop-button" type="button">停止 Workflow</button>
         </footer>
       </div>
     </article>

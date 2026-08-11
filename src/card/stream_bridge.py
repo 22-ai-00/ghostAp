@@ -33,12 +33,14 @@ class ACPStreamBridge:
         dispatchable: Dispatchable,
         *,
         image_uploader: Callable[["ACPImageInfo"], str | None] | None = None,
+        preserve_tool_content: bool = False,
     ) -> None:
         from src.card.media_bridge import ACPImagePublisher
 
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._dispatchable: Dispatchable = dispatchable
         self._image_publisher = ACPImagePublisher(dispatchable, image_uploader)
+        self._preserve_tool_content = preserve_tool_content
         self._text_active: bool = False
         self._reasoning_active: bool = False
         # Per-turn counters generate unique block IDs at hard stream
@@ -91,7 +93,10 @@ class ACPStreamBridge:
                 self._retire_reasoning_blocks_locked()
 
             # Override block_id in the converted CardEvent to match our per-turn ID
-            ce = card_event_from_acp(acp_event)
+            ce = card_event_from_acp(
+                acp_event,
+                preserve_tool_content=self._preserve_tool_content,
+            )
             if acp_event.event_type == ACPEventType.THOUGHT_CHUNK and ce.payload.get("block_id"):
                 reasoning_text = ce.payload.get("text", "")
                 if source_key in self._pending_reasoning_item_breaks:

@@ -9,6 +9,7 @@ from .continuation import (
     PromptContinuationResult,
     run_prompt_with_continuation,
 )
+from .execution_windows import run_prompt_across_execution_windows
 from .finalization import run_prompt_with_finalization
 from .models import (
     ACPEvent,
@@ -58,6 +59,7 @@ __all__ = [
     "PromptContinuationResult",
     "run_prompt_with_continuation",
     "run_prompt_with_finalization",
+    "run_prompt_across_execution_windows",
     "ACPEventRenderer",
     "ACPSessionManager",
     "AgentSessionManager",

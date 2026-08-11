@@ -17,6 +17,7 @@ from .engine_base import BaseEngineHandler
 
 if TYPE_CHECKING:
     from ...project import ProjectContext
+    from ...workflow_engine.models import WorkflowProject
     from ..handler_context import HandlerContext
 
 logger = logging.getLogger(__name__)
@@ -418,12 +419,15 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             root_elements = card_data.get("elements") if isinstance(card_data, dict) else None
             elements = list(root_elements) if isinstance(root_elements, list) else []
 
-        return {
+        card = {
             "schema": "2.0",
             "config": {"wide_screen_mode": True},
             "header": header,
             "body": {"elements": elements},
         }
+        from ...card.delivery.page_mutator import guard_card_payload
+
+        return guard_card_payload(card)
 
     def _replace_or_send_workflow_rendered_card(
         self,
@@ -4017,7 +4021,93 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         exc_info=True,
                     )
 
-        def on_done(wf_project) -> None:
+        def _deliver_terminal_project(
+            wf_project: "WorkflowProject",
+            *,
+            allow_stopped_owner: bool = False,
+        ) -> None:
+            """Deliver one authoritative terminal snapshot on stable pages."""
+            report_status: dict[str, Any] | None = None
+            failed_page_indexes: tuple[int, ...] = ()
+            try:
+                from ...workflow_engine.renderer import render_completion_cards
+
+                card_data = render_completion_cards(wf_project)
+                delivery_result = page_delivery.deliver(
+                    card_data,
+                    replace_or_send=self._replace_or_send_workflow_rendered_card,
+                    chat_id=chat_id,
+                    origin_message_id=origin_message_id,
+                    terminal=True,
+                )
+                if delivery_result.status_message_id:
+                    card_message_id[0] = delivery_result.status_message_id
+                if delivery_result.fully_delivered:
+                    return
+
+                failed_page_indexes = delivery_result.failed_page_indexes
+                report_status = self._send_workflow_completion_report(
+                    wf_project=wf_project,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    project=project,
+                )
+                if (
+                    not allow_stopped_owner
+                    and lifecycle_owner is not None
+                    and lifecycle_owner.stop_event.is_set()
+                ):
+                    return
+
+                # Retry every page once after the durable full report has
+                # been generated. Existing page bindings are reused and
+                # missing pages are created in order.
+                retry_cards = render_completion_cards(
+                    wf_project,
+                    report_status=report_status,
+                )
+                retry_result = page_delivery.deliver(
+                    retry_cards,
+                    replace_or_send=self._replace_or_send_workflow_rendered_card,
+                    chat_id=chat_id,
+                    origin_message_id=origin_message_id,
+                    terminal=True,
+                )
+                if retry_result.status_message_id:
+                    card_message_id[0] = retry_result.status_message_id
+                if retry_result.fully_delivered or report_status.get("attachment_sent"):
+                    return
+                failed_page_indexes = retry_result.failed_page_indexes
+            except Exception:
+                if (
+                    not allow_stopped_owner
+                    and lifecycle_owner is not None
+                    and lifecycle_owner.stop_event.is_set()
+                ):
+                    return
+                if report_status is None:
+                    report_status = self._send_workflow_completion_report(
+                        wf_project=wf_project,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        project=project,
+                    )
+                logger.warning("Workflow terminal card delivery failed", exc_info=True)
+
+            if report_status and report_status.get("attachment_sent"):
+                self._reply_workflow_completion_fallback(
+                    message_id=message_id,
+                    report_status=report_status,
+                    failed_page_indexes=failed_page_indexes,
+                )
+                return
+            self._reply_workflow_completion_fallback(
+                message_id=message_id,
+                report_status=report_status,
+                failed_page_indexes=failed_page_indexes,
+            )
+
+        def on_done(wf_project: "WorkflowProject") -> None:
             """Final completion — send a structured completion card."""
             # Wait for an in-flight PATCH, then fence every later progress
             # callback before report generation/upload and terminal delivery.
@@ -4025,84 +4115,21 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
                     return
                 terminal_sent[0] = True
-                report_status: dict[str, Any] | None = None
-                failed_page_indexes: tuple[int, ...] = ()
-                try:
-                    from ...workflow_engine.renderer import render_completion_cards
+                _deliver_terminal_project(wf_project)
 
-                    card_data = render_completion_cards(wf_project)
-                    delivery_result = page_delivery.deliver(
-                        card_data,
-                        replace_or_send=self._replace_or_send_workflow_rendered_card,
-                        chat_id=chat_id,
-                        origin_message_id=origin_message_id,
-                        terminal=True,
-                    )
-                    if delivery_result.status_message_id:
-                        card_message_id[0] = delivery_result.status_message_id
-                    if delivery_result.fully_delivered:
-                        return
-
-                    failed_page_indexes = delivery_result.failed_page_indexes
-                    report_status = self._send_workflow_completion_report(
-                        wf_project=wf_project,
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        project=project,
-                    )
-                    if lifecycle_owner is not None and lifecycle_owner.stop_event.is_set():
-                        return
-
-                    # Retry every page once after the durable full report has
-                    # been generated. Existing page bindings are reused and
-                    # missing pages are created in order.
-                    retry_cards = render_completion_cards(
-                        wf_project,
-                        report_status=report_status,
-                    )
-                    retry_result = page_delivery.deliver(
-                        retry_cards,
-                        replace_or_send=self._replace_or_send_workflow_rendered_card,
-                        chat_id=chat_id,
-                        origin_message_id=origin_message_id,
-                        terminal=True,
-                    )
-                    if retry_result.status_message_id:
-                        card_message_id[0] = retry_result.status_message_id
-                    if retry_result.fully_delivered or report_status.get("attachment_sent"):
-                        return
-                    failed_page_indexes = retry_result.failed_page_indexes
-                except Exception:
-                    if lifecycle_owner is not None and lifecycle_owner.stop_event.is_set():
-                        return
-                    if report_status is None:
-                        report_status = self._send_workflow_completion_report(
-                            wf_project=wf_project,
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            project=project,
-                        )
-                    logger.warning("Workflow terminal card delivery failed", exc_info=True)
-
-                if report_status and report_status.get("attachment_sent"):
-                    self._reply_workflow_completion_fallback(
-                        message_id=message_id,
-                        report_status=report_status,
-                        failed_page_indexes=failed_page_indexes,
-                    )
-                    return
-                self._reply_workflow_completion_fallback(
-                    message_id=message_id,
-                    report_status=report_status,
-                    failed_page_indexes=failed_page_indexes,
-                )
-
-        def on_error(error_msg: str) -> None:
-            """Error notification — sanitize before showing to user."""
+        def on_error(
+            error_msg: str,
+            wf_project: "WorkflowProject | None" = None,
+        ) -> None:
+            """Deliver an execution failure, or a project-less setup error."""
             with delivery_lock:
                 if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
                     return
                 terminal_sent[0] = True
+                if wf_project is not None:
+                    _deliver_terminal_project(wf_project)
+                    return
+
                 from ...workflow_engine.errors import _strip_internal_details
 
                 workflow_category = self._workflow_error_card_category(error_msg)
@@ -4117,12 +4144,24 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     origin_message_id=origin_message_id,
                 )
 
+        def on_cancelled(wf_project: "WorkflowProject") -> None:
+            """Deliver the stopped run's final stream despite its stop fence."""
+            with delivery_lock:
+                if terminal_sent[0]:
+                    return
+                terminal_sent[0] = True
+                _deliver_terminal_project(
+                    wf_project,
+                    allow_stopped_owner=True,
+                )
+
         def on_log(msg: str) -> None:
             logger.debug("[WorkflowHandler] log: %s", msg)
 
         return WorkflowEngineCallbacks(
             on_progress=on_progress,
             on_done=on_done,
+            on_cancelled=on_cancelled,
             on_error=on_error,
             on_log=on_log,
         )

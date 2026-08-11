@@ -14,6 +14,11 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from typing import Dict, Optional
 
+from src.card.events import CardEvent
+from src.card.state.models import CardState, ContentBlock
+from src.card.state.reducer import reduce_card_state
+
+from .card_event_safety import sanitize_workflow_stream_event
 from .models import (
     AgentProgress,
     AgentStatus,
@@ -45,12 +50,14 @@ class WorkflowStateManager:
         # map stays consistent with the project.phases[*].agents lists even
         # under heavy parallel event delivery.
         self._label_to_agent: Dict[str, AgentProgress] = {}
+        self._agent_card_states: Dict[str, CardState] = {}
         # AC4: 主 context 增量 token 计数。仅由 engine 在明确需要向主 chat
         # 注入文本的路径上累加（目前唯一合法路径是 workflow 完成时的
         # project.result）。中间结果不得通过其他路径增加此计数器。
         self._delta_context_tokens: int = 0
         self._label_counters: Dict[str, int] = {}
         self._rebuild_indexes()
+        self._rebuild_execution_states()
         self._next_agent_call_index = (
             max(
                 (
@@ -123,6 +130,7 @@ class WorkflowStateManager:
             # see a consistent view: if it is in `phases[*].agents` it is also
             # in `_label_to_agent`.
             self._label_to_agent[effective_label] = agent
+            self._agent_card_states[effective_label] = CardState()
             self._project.metrics.total_agents += 1
             return effective_label
 
@@ -220,6 +228,35 @@ class WorkflowStateManager:
                 return
             agent.current_activity = activity
             agent.activity_updated_at = time.time()
+
+    def record_agent_card_event(self, label: str, event: CardEvent) -> bool:
+        """Project one ACP-derived card event into a direct call's history.
+
+        Workflow delivery paginates the complete projection, so this path
+        deliberately opts out of ordinary programming-card retention windows.
+        Terminal calls remain immutable when late provider frames arrive.
+        """
+        event = sanitize_workflow_stream_event(event)
+        with self._write_locked():
+            agent = self._label_to_agent.get(label)
+            if agent is None or self._is_terminal_agent(agent):
+                return False
+
+            state = self._agent_card_states.get(label)
+            if state is None:
+                state = self._card_state_from_agent(agent)
+            next_state = reduce_card_state(
+                state,
+                event,
+                retain_all_blocks=True,
+            )
+            if next_state.version == state.version:
+                return False
+
+            self._agent_card_states[label] = next_state
+            agent.execution_blocks = list(next_state.blocks)
+            agent.activity_updated_at = time.time()
+            return True
 
     def update_agent_attempt(self, label: str, attempt: int) -> None:
         """Record the executor's current one-based attempt for a running agent."""
@@ -369,6 +406,7 @@ class WorkflowStateManager:
             self._close_open_agents(
                 error=f"Workflow failed before agent completed: {error}",
                 finished_at=now,
+                terminal_status=AgentStatus.FAILED,
             )
             for phase in self._project.phases:
                 if phase.finished_at is None:
@@ -386,7 +424,11 @@ class WorkflowStateManager:
             self._project.status = WorkflowStatus.CANCELLED
             self._project.error = reason
             self._project.finished_at = now
-            self._close_open_agents(error=reason, finished_at=now)
+            self._close_open_agents(
+                error=reason,
+                finished_at=now,
+                terminal_status=AgentStatus.CANCELLED,
+            )
             for phase in self._project.phases:
                 if phase.finished_at is None:
                     phase.finished_at = now
@@ -460,6 +502,7 @@ class WorkflowStateManager:
                             attempt=agent.attempt,
                             result=agent.result,
                             call_index=agent.call_index,
+                            execution_blocks=copy.deepcopy(agent.execution_blocks),
                             subagents=[
                                 item.model_copy(deep=True)
                                 for item in agent.subagents
@@ -558,6 +601,37 @@ class WorkflowStateManager:
                     continue
                 self._label_to_agent[agent.label] = agent
 
+    def _rebuild_execution_states(self) -> None:
+        """Restore reducer projections from live dataclasses or JSON mappings."""
+        for label, agent in self._label_to_agent.items():
+            self._agent_card_states[label] = self._card_state_from_agent(agent)
+
+    @staticmethod
+    def _card_state_from_agent(agent: AgentProgress) -> CardState:
+        blocks = tuple(
+            block
+            for raw in agent.execution_blocks
+            if (block := WorkflowStateManager._content_block(raw)) is not None
+        )
+        # Versions need only be monotonic within this restored projection. The
+        # block count supplies a stable non-zero baseline for subsequent events.
+        version = len(blocks)
+        return CardState(
+            blocks=blocks,
+            version=version,
+            structural_version=version,
+        )
+
+    @staticmethod
+    def _content_block(raw: object):
+        if not isinstance(raw, Mapping):
+            if hasattr(raw, "kind") and hasattr(raw, "block_id"):
+                return raw
+            return None
+        payload = dict(raw)
+        kind = str(payload.pop("kind", "text") or "text")
+        return ContentBlock(kind=kind, **payload)
+
     def _make_unique_label(self, requested: str) -> str:
         """Return a label not already present in the current project."""
         base = requested.strip() or "agent"
@@ -589,16 +663,25 @@ class WorkflowStateManager:
             WorkflowStatus.CANCELLED,
         )
 
-    def _close_open_agents(self, *, error: str, finished_at: float) -> None:
+    def _close_open_agents(
+        self,
+        *,
+        error: str,
+        finished_at: float,
+        terminal_status: AgentStatus,
+    ) -> None:
         """Move non-terminal agents out of RUNNING/PENDING for terminal cards."""
+        if terminal_status not in {AgentStatus.FAILED, AgentStatus.CANCELLED}:
+            raise ValueError("open agents may only close as failed or cancelled")
         for phase in self._project.phases:
             for agent in phase.agents:
                 if self._is_terminal_agent(agent):
                     continue
-                agent.status = AgentStatus.FAILED
+                agent.status = terminal_status
                 agent.error = error
                 agent.finished_at = finished_at
                 if agent.duration_s <= 0 and agent.started_at:
                     agent.duration_s = max(0.0, finished_at - agent.started_at)
-                self._project.metrics.failed_agents += 1
+                if terminal_status == AgentStatus.FAILED:
+                    self._project.metrics.failed_agents += 1
                 self._project.metrics.completed_agents += 1

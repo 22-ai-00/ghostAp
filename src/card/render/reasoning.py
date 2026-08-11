@@ -87,10 +87,10 @@ def render_reasoning_panel(
             "vertical_align": "center",
             "icon": {
                 "tag": "standard_icon",
-                "token": "down-small-ccm_outlined",
-                "size": "16px 16px",
+                "token": "down_outlined",
+                "color": "grey",
             },
-            "icon_position": "follow_text",
+            "icon_position": "right",
             "icon_expanded_angle": -180,
         },
         "border": {"color": PANEL_STYLES["border_normal"], "corner_radius": PANEL_STYLES["corner_radius"]},

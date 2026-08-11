@@ -118,6 +118,8 @@ class PromptContinuationResult:
     assessment: PromptAssessment
     automatic_continuations: int
     entered_finalization: bool
+    execution_windows: int = 1
+    window_limit_reached: bool = False
 
 
 def _build_continuation_prompt(pending_plan_entries: int) -> str:
@@ -291,7 +293,7 @@ def _merge_tool_calls(
     )
 
 
-def _merge_prompt_results(
+def merge_prompt_results(
     previous: PromptResult,
     current: PromptResult,
 ) -> PromptResult:
@@ -464,7 +466,7 @@ def run_prompt_with_continuation(
                     ever_entered_finalization or entered_finalization
                 )
                 automatic_continuations += 1
-                result = _merge_prompt_results(result, next_result)
+                result = merge_prompt_results(result, next_result)
                 assessment = _normalize_user_input_assessment(
                     result,
                     classify_prompt_result(result),
@@ -553,7 +555,7 @@ def run_prompt_with_continuation(
             ever_entered_finalization or entered_finalization
         )
         automatic_continuations += 1
-        result = _merge_prompt_results(result, next_result)
+        result = merge_prompt_results(result, next_result)
         if (
             reconciliation_started_at is not None
             and reconciliation_finished_at is not None
@@ -596,5 +598,6 @@ __all__ = [
     "MAX_CHILD_RECONCILIATIONS",
     "MAX_ORDINARY_CONTINUATIONS",
     "PromptContinuationResult",
+    "merge_prompt_results",
     "run_prompt_with_continuation",
 ]

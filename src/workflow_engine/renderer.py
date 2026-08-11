@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
+import threading
 import time
+from collections.abc import Mapping
 from typing import Any
 
+from src.card.render.budget import RenderBudget
+from src.card.render.renderer import render_card
+from src.card.state.models import (
+    CardMetadata,
+    CardState,
+    ContentBlock,
+    HeaderState,
+)
+from src.card.state.runtime_stats import RuntimeStats
 from src.card.tool_display import sanitize_tool_failure_detail
 from src.utils.text import format_elapsed_clock
 
@@ -77,6 +90,7 @@ def _escape_md(text: str) -> str:
 # An empty tuple means "no markers configured → no checks applied". Tests can
 # monkey-patch this to inject sentinel values and verify the defensive gate.
 _AGENT_OUTPUT_FORBIDDEN_MARKERS: tuple[str, ...] = ()
+_WORKFLOW_PAGE_KEY_FIELD = "_workflow_page_key"
 
 STATUS_ICONS: dict[AgentStatus, str] = {
     AgentStatus.PENDING: "\u23f3",
@@ -758,6 +772,193 @@ class WorkflowAgentSelectionRenderer:
         }
 
 
+def _ordered_direct_agents(project: WorkflowProject) -> list[AgentProgress]:
+    flattened = [agent for phase in project.phases for agent in phase.agents]
+    return [
+        agent
+        for _, agent in sorted(
+            enumerate(flattened),
+            key=lambda pair: (
+                int(getattr(pair[1], "call_index", pair[0]) or 0),
+                pair[0],
+            ),
+        )
+    ]
+
+
+def _set_workflow_page_key(
+    card: dict[str, Any],
+    *,
+    kind: str,
+    page_identity: int | str,
+    local_page_index: int,
+) -> dict[str, Any]:
+    """Attach delivery-only identity without changing the Feishu card body."""
+    card[_WORKFLOW_PAGE_KEY_FIELD] = (
+        kind,
+        page_identity,
+        int(local_page_index),
+    )
+    return card
+
+
+def _identified_direct_agents(
+    project: WorkflowProject,
+) -> list[tuple[AgentProgress, str]]:
+    """Pair calls with stable identities independent of mutable list position."""
+    seen: dict[str, int] = {}
+    identified: list[tuple[AgentProgress, str]] = []
+    for agent in _ordered_direct_agents(project):
+        identity_payload = json.dumps(
+            {
+                "agent_id": str(getattr(agent, "agent_id", None) or ""),
+                "call_index": int(getattr(agent, "call_index", 0) or 0),
+                "label": str(getattr(agent, "label", "") or ""),
+                "model": str(getattr(agent, "model", None) or ""),
+                "role": str(getattr(agent, "role", None) or ""),
+                "started_at": getattr(agent, "started_at", None),
+                "tool": str(getattr(agent, "tool", "") or ""),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        base_identity = "call:" + hashlib.sha256(
+            identity_payload.encode("utf-8")
+        ).hexdigest()
+        occurrence = seen.get(base_identity, 0)
+        seen[base_identity] = occurrence + 1
+        page_identity = (
+            base_identity
+            if occurrence == 0
+            else f"{base_identity}:{occurrence}"
+        )
+        identified.append((agent, page_identity))
+    return identified
+
+
+def _execution_content_block(raw: object):
+    """Normalize live frozen blocks and JSON-restored block dictionaries."""
+    if not isinstance(raw, Mapping):
+        if hasattr(raw, "kind") and hasattr(raw, "block_id"):
+            return raw
+        return None
+    payload = dict(raw)
+    kind = str(payload.pop("kind", "text") or "text")
+    return ContentBlock(kind=kind, **payload)
+
+
+def _execution_terminal(agent: AgentProgress) -> str:
+    return {
+        AgentStatus.DONE: "completed",
+        AgentStatus.CACHED: "completed",
+        AgentStatus.FAILED: "failed",
+        AgentStatus.CANCELLED: "cancelled",
+    }.get(agent.status, "running")
+
+
+def _execution_header_template(agent: AgentProgress) -> str:
+    return {
+        AgentStatus.DONE: "green",
+        AgentStatus.CACHED: "turquoise",
+        AgentStatus.FAILED: "red",
+        AgentStatus.CANCELLED: "grey",
+    }.get(agent.status, "blue")
+
+
+def _terminalize_execution_blocks(
+    blocks: tuple,
+    agent: AgentProgress,
+) -> tuple:
+    """Ensure a terminal direct call has no misleading active block chrome."""
+    if _execution_terminal(agent) == "running":
+        return blocks
+    normalized = []
+    for block in blocks:
+        if getattr(block, "status", None) != "active":
+            normalized.append(block)
+            continue
+        changes: dict[str, Any] = {"status": "completed"}
+        if getattr(block, "kind", None) == "tool_call":
+            changes["status"] = (
+                "failed" if agent.status == AgentStatus.FAILED else "completed"
+            )
+            changes["is_latest_active"] = False
+        normalized.append(dataclasses.replace(block, **changes))
+    return tuple(normalized)
+
+
+def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, Any]]:
+    """Render one ordinary-format, losslessly paginated stream per direct call."""
+    cards: list[dict[str, Any]] = []
+    for agent, page_identity in _identified_direct_agents(project):
+        raw_blocks = list(getattr(agent, "execution_blocks", ()) or ())
+        blocks = tuple(
+            block
+            for raw in raw_blocks
+            if (block := _execution_content_block(raw)) is not None
+        )
+        if not blocks:
+            continue
+        blocks = _terminalize_execution_blocks(blocks, agent)
+
+        display_index = max(1, int(getattr(agent, "call_index", 0) or 0) + 1)
+        agent_id = str(getattr(agent, "agent_id", None) or "unbound")
+        label = str(agent.label or "agent")
+        terminal = _execution_terminal(agent)
+        elapsed = max(0.0, float(agent.duration_s or 0.0))
+        if elapsed <= 0 and agent.started_at:
+            elapsed = max(
+                0.0,
+                float((agent.finished_at or time.time()) - agent.started_at),
+            )
+
+        state = CardState(
+            blocks=blocks,
+            terminal=terminal,
+            header=HeaderState(
+                title=f"#{display_index} · {agent_id} · {label}",
+                template=_execution_header_template(agent),
+            ),
+            metadata=CardMetadata(
+                project_name=project.name or "Workflow",
+                mode_name=agent.tool or "Agent",
+                tool_name=agent.tool or None,
+                model_name=agent.model,
+                unit_id=str(display_index),
+                unit_kind="workflow_agent",
+                unit_label=f"{agent_id} · {label}",
+                card_sequence=display_index,
+                session_started_at=agent.started_at,
+                programming_text_sections=True,
+                full_execution_blocks=True,
+            ),
+            runtime_stats=RuntimeStats(elapsed_seconds=elapsed),
+            version=len(blocks),
+            structural_version=len(blocks),
+        )
+        rendered_pages = render_card(
+            state,
+            RenderBudget(engine_cmd="/wf"),
+        )
+        for local_page_index, rendered in enumerate(rendered_pages):
+            card = rendered.to_feishu_json()
+            _set_workflow_page_key(
+                card,
+                kind="agent",
+                page_identity=page_identity,
+                local_page_index=local_page_index,
+            )
+            body = card.get("body") or {}
+            elements = body.get("elements") or []
+            _card_text_for_agent_output(
+                elements,
+                _AGENT_OUTPUT_FORBIDDEN_MARKERS,
+            )
+            cards.append(card)
+    return cards
+
+
 class WorkflowProgressRenderer:
     """Renders workflow execution state into Feishu card-compatible JSON.
 
@@ -768,6 +969,7 @@ class WorkflowProgressRenderer:
     def __init__(self, project: WorkflowProject) -> None:
         self._project = project
         self._start_time: float = project.started_at or time.time()
+        self._render_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
 
     # ------------------------------------------------------------------
     # Rendering — produce Feishu card elements
@@ -780,28 +982,46 @@ class WorkflowProgressRenderer:
             project: Optional snapshot to render; falls back to self._project.
                 Callers under concurrent mutation MUST pass a snapshot() for safety.
         """
-        if project is not None:
-            saved = self._project
-            self._project = project
-            try:
-                return self._render_progress_card_impl()
-            finally:
-                self._project = saved
-        return self._render_progress_card_impl()
+        with self._render_lock:
+            if project is not None:
+                saved = self._project
+                self._project = project
+                try:
+                    return self._render_progress_card_impl()
+                finally:
+                    self._project = saved
+            return self._render_progress_card_impl()
 
     def render_progress_cards(self, project: WorkflowProject | None = None) -> list[dict[str, Any]]:
-        """Render lossless status pages followed by append-only result pages."""
-        target = project or self._project
-        if project is not None:
-            saved = self._project
-            self._project = project
-            try:
+        """Render status and complete direct-call streams while running.
+
+        Result ledgers are terminal-only. Feishu messages cannot be inserted
+        before an already-created ledger, so publishing one after the first
+        completed call would force every later direct-call card below it.
+        """
+        with self._render_lock:
+            target = project or self._project
+            if project is not None:
+                saved = self._project
+                self._project = project
+                try:
+                    status_cards = self._render_progress_card_pages_impl()
+                finally:
+                    self._project = saved
+            else:
                 status_cards = self._render_progress_card_pages_impl()
-            finally:
-                self._project = saved
-        else:
-            status_cards = self._render_progress_card_pages_impl()
-        return [*status_cards, *_render_result_ledger_cards(target)]
+            return [
+                *[
+                    _set_workflow_page_key(
+                        card,
+                        kind="status",
+                        page_identity=-1,
+                        local_page_index=local_page_index,
+                    )
+                    for local_page_index, card in enumerate(status_cards)
+                ],
+                *_render_agent_execution_cards(target),
+            ]
 
     def _render_progress_card_impl(self) -> dict[str, Any]:
         return self._render_progress_card_pages_impl()[0]
@@ -1689,10 +1909,26 @@ def render_completion_cards(
     *,
     report_status: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Render one terminal status page followed by the complete result ledger."""
+    """Render terminal status, complete direct-call streams, then the ledger."""
     return [
-        render_completion_card(project, report_status=report_status),
-        *_render_result_ledger_cards(project),
+        _set_workflow_page_key(
+            render_completion_card(project, report_status=report_status),
+            kind="status",
+            page_identity=-1,
+            local_page_index=0,
+        ),
+        *_render_agent_execution_cards(project),
+        *[
+            _set_workflow_page_key(
+                card,
+                kind="ledger",
+                page_identity=-1,
+                local_page_index=local_page_index,
+            )
+            for local_page_index, card in enumerate(
+                _render_result_ledger_cards(project)
+            )
+        ],
     ]
 
 

@@ -13,7 +13,11 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
 
-from ...acp import ACPEventRenderer, run_prompt_with_continuation
+from ...acp import (
+    ACPEventRenderer,
+    run_prompt_across_execution_windows,
+    run_prompt_with_continuation,
+)
 from ...acp.manager import ACPSessionManager
 from ...acp.outcome import PromptAssessment, PromptOutcome
 from ...acp.providers import normalize_acp_model_name
@@ -54,6 +58,13 @@ def _configured_finalization_reserve(settings: object) -> int:
     return max(0, int(raw))
 
 
+def _configured_execution_windows(settings: object) -> int:
+    raw = getattr(settings, "programming_max_execution_windows", 1)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return 1
+    return min(24, max(1, raw))
+
+
 def _finalization_incomplete_reason(
     assessment: PromptAssessment,
 ) -> str:
@@ -68,6 +79,11 @@ def _finalization_incomplete_reason(
 
 def _incomplete_notice(execution: object) -> str:
     assessment = execution.assessment
+    if getattr(execution, "window_limit_reached", False):
+        return UI_TEXT["mode_exec_window_limit_incomplete_msg"].format(
+            windows=max(1, int(getattr(execution, "execution_windows", 1))),
+            reason=_finalization_incomplete_reason(assessment),
+        )
     if not execution.entered_finalization:
         return UI_TEXT["mode_exec_incomplete_msg"].format(
             reason=assessment.detail,
@@ -95,12 +111,15 @@ def _log_prompt_execution(mode_name: str, execution: object) -> None:
         else "unknown"
     )
     logger.info(
-        "%s ACP执行判定: entered_finalization=%s goal_status=%s "
+        "%s ACP执行判定: entered_finalization=%s execution_windows=%s "
+        "window_limit_reached=%s goal_status=%s "
         "automatic_continuations=%s pending_plan_entries=%s "
         "incomplete_tool_calls=%s incomplete_outer_tool_calls=%s "
         "unresolved_child_tool_calls=%s unresolved_tools=%s",
         mode_name,
         execution.entered_finalization,
+        getattr(execution, "execution_windows", 1),
+        getattr(execution, "window_limit_reached", False),
         goal_status,
         execution.automatic_continuations,
         assessment.pending_plan_entries,
@@ -1112,7 +1131,7 @@ class ProgrammingModeHandler(BaseHandler):
         terminal_exception: Exception | None = None
         active_session = [session]
         entered_finalization = [False]
-        retirement_completed = [False]
+        retired_session_objects: set[int] = set()
         thread_id = get_current_thread_id()
 
         def _start_finalization() -> None:
@@ -1140,7 +1159,8 @@ class ProgrammingModeHandler(BaseHandler):
             active: SyncSession,
             retirement_budget_s: float = 0.001,
         ) -> None:
-            if retirement_completed[0]:
+            session_object_id = id(active)
+            if session_object_id in retired_session_objects:
                 return
             try:
                 setattr(active, "_force_dead", True)
@@ -1153,12 +1173,16 @@ class ProgrammingModeHandler(BaseHandler):
                 active_session=active,
                 retirement_budget_s=retirement_budget_s,
             )
-            retirement_completed[0] = True
+            retired_session_objects.add(session_object_id)
 
-        try:
-            execution = run_prompt_with_continuation(
-                session,
-                text,
+        def _execute_window(
+            window_session: SyncSession,
+            window_prompt: str,
+        ):
+            active_session[0] = window_session
+            return run_prompt_with_continuation(
+                window_session,
+                window_prompt,
                 on_event=on_event,
                 timeout_s=timeout,
                 finalization_reserve_s=_configured_finalization_reserve(
@@ -1173,6 +1197,59 @@ class ProgrammingModeHandler(BaseHandler):
                 ),
                 replace_dead_session=_replace_dead_session,
                 retire_finalization_session=_retire_session,
+            )
+
+        def _resume_window(
+            _retired_session: SyncSession,
+            provider_session_id: str,
+        ) -> SyncSession:
+            project_id = project.project_id if project else None
+            resume_timeout = max(
+                60.0,
+                float(getattr(self.settings, "acp_startup_timeout", 60) or 60),
+            )
+            resumed = self._get_session_manager().resume_retired_session(
+                chat_id,
+                cwd=cwd,
+                session_id=provider_session_id,
+                startup_timeout=resume_timeout,
+                project_id=project_id,
+                agent_type_override=self._get_agent_type_override(project),
+                model_name=self._get_model_name_override(project),
+                thread_id=thread_id,
+            )
+            active_session[0] = resumed
+            if thread_id and project:
+                self._register_thread_context(
+                    thread_id,
+                    chat_id,
+                    project,
+                    resumed,
+                )
+            return resumed
+
+        def _on_window_rollover(
+            next_window: int,
+            max_windows: int,
+        ) -> None:
+            logger.warning(
+                "%s ACP任务自动续开执行窗口: window=%d/%d",
+                self.mode_name,
+                next_window,
+                max_windows,
+            )
+            if prog_session is not None:
+                prog_session.begin_continuation_turn()
+
+        try:
+            execution = run_prompt_across_execution_windows(
+                session,
+                text,
+                task_scope=_finalization_task_text,
+                max_windows=_configured_execution_windows(self.settings),
+                execute_window=_execute_window,
+                resume_window=_resume_window,
+                on_window_rollover=_on_window_rollover,
             )
             result = execution.result
             assessment = execution.assessment
@@ -1250,7 +1327,7 @@ class ProgrammingModeHandler(BaseHandler):
             if (
                 entered_finalization[0]
                 or getattr(active_session[0], "_force_dead", False) is True
-            ) and not retirement_completed[0]:
+            ) and id(active_session[0]) not in retired_session_objects:
                 try:
                     _retire_session(active_session[0])
                 except Exception:
@@ -1345,8 +1422,7 @@ class ProgrammingModeHandler(BaseHandler):
             if project:
                 final_session = active_session[0]
                 if (
-                    entered_finalization[0]
-                    or retirement_completed[0]
+                    id(final_session) in retired_session_objects
                     or getattr(final_session, "_force_dead", False) is True
                 ):
                     self._clear_snapshot_for_session(project, session)

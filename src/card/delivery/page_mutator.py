@@ -131,6 +131,16 @@ def _guard_payload(card_payload: dict) -> dict:
     return _sanitize_payload_for_audit(guarded_payload)
 
 
+def guard_card_payload(card_payload: dict) -> dict:
+    """Apply the shared final-wire safety guard to a card payload.
+
+    Non-session card producers, including Workflow's paged renderer, use this
+    boundary before calling the handler transport APIs. The regular CardSession
+    path invokes the same guard through :class:`PageMutator`.
+    """
+    return _guard_payload(copy.deepcopy(card_payload))
+
+
 def _find_element_content(payload: dict, element_id: str | None) -> tuple[bool, str]:
     """Return whether element_id exists and its actual markdown/plain_text content."""
     if not element_id:

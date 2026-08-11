@@ -146,6 +146,24 @@ def reduce_tool(state: CardState, event: CardEvent) -> CardState:
                 updated = replace(b, **changes)
                 blocks = state.blocks[:idx] + (updated,) + state.blocks[idx + 1:]
                 return replace(state, blocks=blocks)
+            if block_id:
+                # A reconnect may resume with ToolCallProgress before the
+                # corresponding start frame is replayed. Materialize the
+                # observed active invocation so its progress remains visible.
+                active = ToolBlock(
+                    block_id=block_id,
+                    status="active",
+                    tool_name=event.payload.get("tool_name", "") or "工具",
+                    content=content,
+                    is_latest_active=True,
+                )
+                blocks = _replace_tool_blocks(
+                    _demote_latest_tool_blocks(state.blocks),
+                    block_id=block_id,
+                    replacement=active,
+                )
+                footer = _footer_for_active_tools(state.footer, blocks)
+                return replace(state, blocks=blocks, footer=footer)
             return state
 
         case CardEventType.TOOL_DONE:
@@ -176,8 +194,23 @@ def reduce_tool(state: CardState, event: CardEvent) -> CardState:
                 blocks = _promote_last_active_tool(blocks)
                 footer = _footer_for_active_tools(state.footer, blocks)
                 return replace(state, blocks=blocks, footer=footer)
-            footer = _footer_for_active_tools(state.footer, state.blocks)
-            return replace(state, footer=footer)
+            if not block_id:
+                footer = _footer_for_active_tools(state.footer, state.blocks)
+                return replace(state, footer=footer)
+            # ACP permits a terminal progress frame without a preceding start
+            # frame. Preserve that completed invocation instead of silently
+            # dropping its only observable output.
+            terminal = ToolBlock(
+                block_id=block_id,
+                status="completed",
+                tool_name=event.payload.get("tool_name", "") or tool_summary or "工具",
+                tool_output=tool_output,
+                tool_summary=tool_summary,
+                is_latest_active=False,
+            )
+            blocks = _promote_last_active_tool(state.blocks + (terminal,))
+            footer = _footer_for_active_tools(state.footer, blocks)
+            return replace(state, blocks=blocks, footer=footer)
 
         case CardEventType.TOOL_FAILED:
             block_id = event.payload.get("block_id", "")
@@ -195,7 +228,18 @@ def reduce_tool(state: CardState, event: CardEvent) -> CardState:
                 blocks = _promote_last_active_tool(blocks)
                 footer = _footer_for_active_tools(state.footer, blocks)
                 return replace(state, blocks=blocks, footer=footer)
-            footer = _footer_for_active_tools(state.footer, state.blocks)
-            return replace(state, footer=footer)
+            if not block_id:
+                footer = _footer_for_active_tools(state.footer, state.blocks)
+                return replace(state, footer=footer)
+            terminal = ToolBlock(
+                block_id=block_id,
+                status="failed",
+                tool_name=event.payload.get("tool_name", "") or "工具",
+                tool_output=error,
+                is_latest_active=False,
+            )
+            blocks = _promote_last_active_tool(state.blocks + (terminal,))
+            footer = _footer_for_active_tools(state.footer, blocks)
+            return replace(state, blocks=blocks, footer=footer)
 
     return state

@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Any
 
 _STOP_ACTION = "workflow_stop_running"
+_PAGE_KEY_FIELD = "_workflow_page_key"
+_PAGE_KEY_KINDS = frozenset({"status", "agent", "ledger"})
+_PageIdentity = int | str
+_PageKey = tuple[str, _PageIdentity, int]
 
 
 @dataclass(frozen=True)
@@ -35,8 +39,9 @@ class WorkflowPageDeliveryResult:
 class WorkflowCardPageDelivery:
     """Keep stable message bindings for one Workflow card page sequence.
 
-    Page zero is the mutable status card. Later pages are append-only result
-    cards: an existing binding is patched and a missing binding is created.
+    Page zero is the mutable status card. Later keyed pages hold direct-call
+    execution streams or result ledgers: an existing binding is patched and a
+    missing binding is created without reassigning another page's message.
     Bindings are committed only after a successful create, so a failed create
     can be retried without losing any previously delivered page.
     """
@@ -46,6 +51,10 @@ class WorkflowCardPageDelivery:
             page_message_ids.append(None)
         self._page_message_ids = page_message_ids
         self._last_pages: list[dict[str, Any]] = []
+        self._key_to_message_id: dict[_PageKey, str | None] = {}
+        self._last_pages_by_key: dict[_PageKey, dict[str, Any]] = {}
+        self._delivered_wire_pages_by_key: dict[_PageKey, dict[str, Any]] = {}
+        self._known_page_keys: list[_PageKey] = []
         self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
 
     @property
@@ -63,9 +72,27 @@ class WorkflowCardPageDelivery:
         status_fallback_to_new: bool = True,
         terminal: bool = False,
     ) -> WorkflowPageDeliveryResult:
-        """Deliver renderer pages in index order while preserving page bindings."""
+        """Deliver renderer pages while preserving keyed or legacy bindings."""
         incoming_pages = _normalize_pages(card_data)
         with self._lock:
+            page_keys = [_page_key(page) for page in incoming_pages]
+            keyed = any(key is not None for key in page_keys)
+            if keyed and any(key is None for key in page_keys):
+                raise ValueError("Workflow renderer pages must either all be keyed or all be unkeyed")
+            if keyed and len(set(page_keys)) != len(page_keys):
+                raise ValueError("Workflow renderer page keys must be unique")
+
+            if keyed:
+                return self._deliver_keyed(
+                    incoming_pages,
+                    tuple(key for key in page_keys if key is not None),
+                    replace_or_send=replace_or_send,
+                    chat_id=chat_id,
+                    origin_message_id=origin_message_id,
+                    status_fallback_to_new=status_fallback_to_new,
+                    terminal=terminal,
+                )
+
             pages = self._pages_for_delivery(incoming_pages, terminal=terminal)
             failed: list[int] = []
             delivered: list[int] = []
@@ -124,6 +151,118 @@ class WorkflowCardPageDelivery:
                 page_count=len(pages),
             )
 
+    def _deliver_keyed(
+        self,
+        incoming_pages: list[dict[str, Any]],
+        incoming_keys: tuple[_PageKey, ...],
+        *,
+        replace_or_send: Callable[..., str | None],
+        chat_id: str,
+        origin_message_id: str | None,
+        status_fallback_to_new: bool,
+        terminal: bool,
+    ) -> WorkflowPageDeliveryResult:
+        pages = self._keyed_pages_for_delivery(
+            incoming_pages,
+            incoming_keys,
+            terminal=terminal,
+        )
+        failed: list[int] = []
+        delivered: list[int] = []
+        status_delivered = False
+        creation_blocked = False
+        status_key = ("status", -1, 0)
+
+        if status_key in self._known_page_keys and status_key not in self._key_to_message_id:
+            self._key_to_message_id[status_key] = self._page_message_ids[0]
+
+        for page_index, (page_key, page) in enumerate(pages):
+            current_message_id = self._key_to_message_id.get(page_key)
+            if current_message_id is None and creation_blocked:
+                failed.append(page_index)
+                continue
+
+            is_status = page_key == status_key
+            wire_page = _without_page_key(page)
+            if (
+                current_message_id is not None
+                and page_key in self._delivered_wire_pages_by_key
+                and self._delivered_wire_pages_by_key[page_key] == wire_page
+            ):
+                delivered.append(page_index)
+                if is_status:
+                    status_delivered = True
+                continue
+
+            fallback_to_new = (
+                status_fallback_to_new if is_status else current_message_id is None
+            )
+            call_kwargs: dict[str, Any] = {
+                "card_message_id": current_message_id,
+                "chat_id": chat_id,
+                "card_data": wire_page,
+                "fallback_to_new": fallback_to_new,
+            }
+            if origin_message_id is not None:
+                call_kwargs["origin_message_id"] = origin_message_id
+
+            try:
+                delivered_message_id = replace_or_send(**call_kwargs)
+            except Exception:
+                delivered_message_id = None
+
+            if not delivered_message_id:
+                failed.append(page_index)
+                if current_message_id is None:
+                    creation_blocked = True
+                continue
+
+            self._key_to_message_id[page_key] = delivered_message_id
+            self._delivered_wire_pages_by_key[page_key] = copy.deepcopy(wire_page)
+            if delivered_message_id not in self._page_message_ids:
+                self._page_message_ids.append(delivered_message_id)
+            delivered.append(page_index)
+            if is_status:
+                status_delivered = True
+
+        status_message_id = self._key_to_message_id.get(status_key)
+        return WorkflowPageDeliveryResult(
+            status_message_id=status_message_id,
+            status_delivered=status_delivered,
+            failed_page_indexes=tuple(failed),
+            delivered_page_indexes=tuple(delivered),
+            page_count=len(pages),
+        )
+
+    def _keyed_pages_for_delivery(
+        self,
+        incoming_pages: list[dict[str, Any]],
+        incoming_keys: tuple[_PageKey, ...],
+        *,
+        terminal: bool,
+    ) -> list[tuple[_PageKey, dict[str, Any]]]:
+        for page_key, page in zip(incoming_keys, incoming_pages):
+            self._last_pages_by_key[page_key] = copy.deepcopy(page)
+            if page_key not in self._known_page_keys:
+                self._known_page_keys.append(page_key)
+
+        delivery_keys = list(incoming_keys)
+        if terminal:
+            delivery_keys.extend(
+                page_key
+                for page_key in self._known_page_keys
+                if page_key not in incoming_keys
+            )
+
+        pages: list[tuple[_PageKey, dict[str, Any]]] = []
+        for page_key in delivery_keys:
+            page = copy.deepcopy(self._last_pages_by_key[page_key])
+            if terminal:
+                page = _without_stop_actions(page)
+                self._last_pages_by_key[page_key] = copy.deepcopy(page)
+            pages.append((page_key, page))
+        return pages
+
     def _pages_for_delivery(
         self,
         incoming_pages: list[dict[str, Any]],
@@ -179,6 +318,36 @@ def _normalize_pages(
             raise TypeError("Workflow renderer pages must all be dictionaries")
         return [copy.deepcopy(page) for page in pages]
     raise TypeError("Workflow renderer output must be a card dictionary or page sequence")
+
+
+def _page_key(card: dict[str, Any]) -> _PageKey | None:
+    raw = card.get(_PAGE_KEY_FIELD)
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) != 3:
+        raise ValueError("Invalid Workflow renderer page key")
+    kind, page_identity, local_page_index = raw
+    if kind not in _PAGE_KEY_KINDS:
+        raise ValueError("Invalid Workflow renderer page key kind")
+    if isinstance(page_identity, bool) or not isinstance(page_identity, (int, str)):
+        raise ValueError("Invalid Workflow renderer page identity")
+    if isinstance(page_identity, str) and (
+        kind != "agent" or not page_identity.strip()
+    ):
+        raise ValueError("Invalid Workflow renderer agent page identity")
+    if (
+        isinstance(local_page_index, bool)
+        or not isinstance(local_page_index, int)
+        or local_page_index < 0
+    ):
+        raise ValueError("Invalid Workflow renderer local page index")
+    return str(kind), page_identity, local_page_index
+
+
+def _without_page_key(card: dict[str, Any]) -> dict[str, Any]:
+    cleaned = copy.deepcopy(card)
+    cleaned.pop(_PAGE_KEY_FIELD, None)
+    return cleaned
 
 
 def _without_stop_actions(card: dict[str, Any]) -> dict[str, Any]:

@@ -30,6 +30,14 @@ from src.autonomous.workforce.projection import commit_workforce_events
 HMAC_KEY = b"employee-runtime-recovery-key-32!"
 
 
+@pytest.fixture
+def run_asyncio_threads_inline(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_inline(function, /, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+
 def _writer(tmp_path: Path, epoch: int) -> JournalWriter:
     return JournalWriter.open(
         tmp_path / "journal",
@@ -304,6 +312,7 @@ def test_effect_replay_accepts_exact_duplicate_and_rejects_conflict(
 
 def test_reconfigure_disposes_superseded_effect_before_automatic_activation(
     tmp_path: Path,
+    run_asyncio_threads_inline: None,
 ) -> None:
     _seed_active_employee(tmp_path)
     service = _service(_writer(tmp_path, 2))
@@ -482,6 +491,7 @@ def test_same_epoch_crash_and_exhaustion_requires_restart_then_recovers(
 
 def test_repaired_intent_reaches_active_with_fresh_effects_and_one_worker(
     tmp_path: Path,
+    run_asyncio_threads_inline: None,
 ) -> None:
     service = _seed_action_required(tmp_path)
     repaired = service.recover_replay_safe_action_required()
@@ -542,6 +552,7 @@ def test_repaired_intent_reaches_active_with_fresh_effects_and_one_worker(
 
 def test_projection_consumes_phase_only_automatic_activation_proof_once(
     tmp_path: Path,
+    run_asyncio_threads_inline: None,
 ) -> None:
     from src.autonomous.provisioning.hire_state import HireProjectionError
 
@@ -631,6 +642,7 @@ def test_projection_consumes_phase_only_automatic_activation_proof_once(
 
 def test_later_generation_exhaustion_ignores_disposed_prior_generation(
     tmp_path: Path,
+    run_asyncio_threads_inline: None,
 ) -> None:
     service = _seed_action_required(tmp_path)
     repaired = service.recover_replay_safe_action_required()
