@@ -571,6 +571,21 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         )
         return models, state
 
+    @staticmethod
+    def _workflow_form_model_selection(value: dict[str, Any]) -> str | None:
+        """Read one exact model selection from a CardKit form callback."""
+        raw: Any = value.get("_form_value")
+        if not isinstance(raw, dict):
+            return None
+        nested = raw.get("workflow_agent_binding")
+        if isinstance(nested, dict):
+            raw = nested
+        selected = raw.get("model_selection")
+        if isinstance(selected, dict):
+            selected = selected.get("value") or selected.get("option")
+        normalized = str(selected or "").strip()
+        return normalized or None
+
     @classmethod
     def _validated_workflow_draft_binding(
         cls,
@@ -714,6 +729,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         admission_owner: _WorkflowLifecycleOwner | None,
     ) -> None:
         """Publish an owner-bound Agent Pool card without opening an ACP session."""
+        from ...acp.helper import kickoff_acp_model_preheat
         from ...thread import get_current_sender_id
         from ...workflow_engine.models import PendingWorkflow, WorkflowProject, WorkflowStatus
         from ...workflow_engine.tool_registry import get_available_tools
@@ -748,6 +764,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             }
             for name in recommendation_names
         ]
+        kickoff_acp_model_preheat(list(available_tools), cwd=root_path)
 
         with engine._lock:
             if not engine.project:
@@ -947,15 +964,36 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         f"并发 Agent Pool 最多允许 {MAX_WORKFLOW_AGENT_POOL_SIZE} 个 Agent。",
                     )
                 else:
-                    try:
-                        model_name, profile, effort = self._validated_workflow_draft_binding(
-                            pending=pending,
+                    form_selection = self._workflow_form_model_selection(value)
+                    if form_selection == "default":
+                        pending.draft_model_name = None
+                        pending.draft_profile = None
+                        pending.draft_effort = None
+                    elif form_selection:
+                        from ...card.render.model_cascade import parse_model_selection
+
+                        models, _state = self._workflow_selection_model_state(
+                            tool_name=tool_name,
                             root_path=root_path,
-                            available_tools=available_tools,
+                            pending=pending,
                         )
+                        parsed = parse_model_selection(models, form_selection)
+                        if parsed is None:
+                            error = ("invalid_argument", "所选模型配置当前不可用。")
+                        else:
+                            pending.draft_model_name = parsed.model
+                            pending.draft_profile = parsed.profile
+                            pending.draft_effort = parsed.effort
+                    try:
+                        if error is None:
+                            model_name, profile, effort = self._validated_workflow_draft_binding(
+                                pending=pending,
+                                root_path=root_path,
+                                available_tools=available_tools,
+                            )
                     except ValueError as exc:
                         error = ("invalid_argument", str(exc))
-                    else:
+                    if error is None:
                         if any(
                             binding.tool_name == tool_name
                             and binding.model_name == model_name

@@ -101,7 +101,9 @@ def test_application_startup_preheats_codex_model_capabilities_without_join(
 
     app.run()
 
-    assert preheat_calls == [(["codex"], "/repo")]
+    assert preheat_calls == [
+        (["claude", "aiden", "codex", "gemini", "traex"], "/repo")
+    ]
     assert events == [
         "coco-preheat",
         "codex-preheat",

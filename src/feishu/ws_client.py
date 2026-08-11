@@ -54,6 +54,7 @@ from ..agent.intent_recognizer import IntentRecognizer
 from ..autonomous.provisioning.notification_state import (
     hire_notification_message_uuid,
 )
+from ..card.actions.dispatch import WORKFLOW_AGENT_SELECTION_ACTIONS
 from ..card.ui_text import UI_TEXT
 from ..config import IngressAccessMode, get_settings
 from ..config.env_file_store import AtomicEnvFileStore
@@ -2713,6 +2714,13 @@ class FeishuWSClient:
                 logger.debug(
                     "link_task失败(card_action): origin=%s, run_id=%s, err=%s", origin_message_id, handle.run_id, e
                 )
+        if action_type_preview in WORKFLOW_AGENT_SELECTION_ACTIONS:
+            return {
+                "toast": {
+                    "type": "info",
+                    "content": UI_TEXT["workflow_selection_toast_processing"],
+                }
+            }
         return None
 
     def _resolve_card_is_p2p(

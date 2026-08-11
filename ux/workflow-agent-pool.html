@@ -1158,7 +1158,7 @@
           <div class="section-heading">
             <div>
               <h2 class="section-title" id="add-title"><span class="section-index">1</span> 添加 tool + model</h2>
-              <p class="section-help">同一工具可添加不同模型；完全相同的组合不会重复进入池。</p>
+              <p class="section-help">模型、Profile 与 Effort 合并为精确配置，本地选好后一次提交；完全相同的组合不会重复进入池。</p>
             </div>
           </div>
 
@@ -1167,8 +1167,8 @@
             <div class="tool-tabs" id="toolTabs" role="group" aria-label="选择工具"></div>
             <div class="compose-row">
               <label>
-                <span class="field-label">选择模型</span>
-                <select class="model-select" id="modelSelect" aria-label="选择模型"></select>
+                <span class="field-label">选择精确配置</span>
+                <select class="model-select" id="modelSelect" aria-label="选择模型、Profile 与 Effort 的精确配置"></select>
               </label>
               <button class="secondary-add" id="addAgent" type="button">＋ 添加到池</button>
             </div>
@@ -1295,7 +1295,7 @@
   <script>
     (function () {
       var catalog = [
-        { key: "codex", label: "Codex", models: ["gpt-5.2-codex", "gpt-5.1-codex-mini", "default"] },
+        { key: "codex", label: "Codex", models: ["gpt-5.2-codex · standard · high", "gpt-5.2-codex · standard · medium", "gpt-5.1-codex-mini · standard · high", "default"] },
         { key: "claude", label: "Claude", models: ["claude-sonnet-4-5", "claude-opus-4-1", "default"] },
         { key: "gemini", label: "Gemini", models: ["gemini-2.5-pro", "gemini-2.5-flash", "default"] },
         { key: "coco", label: "Coco", models: ["default", "glm-4.5"] },

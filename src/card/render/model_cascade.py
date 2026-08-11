@@ -25,6 +25,7 @@ class ModelCascadeState:
     efforts: tuple[str, ...]
     selected_effort: str | None
     selection: str
+    selections: tuple[ModelSelection, ...] = ()
 
 
 def _ordered_unique(values: Sequence[str | None]) -> tuple[str, ...]:
@@ -94,6 +95,21 @@ def parse_model_selection(
         profile=variant.profile,
         effort=variant.effort,
         value=variant.name,
+    )
+
+
+def available_model_selections(
+    models: Sequence[ACPModelOption],
+) -> tuple[ModelSelection, ...]:
+    """Return every backend-declared exact selection in stable display order."""
+    return tuple(
+        ModelSelection(
+            model=variant.model,
+            profile=variant.profile,
+            effort=variant.effort,
+            value=variant.name,
+        )
+        for variant in _variants(models)
     )
 
 
@@ -176,7 +192,7 @@ def resolve_model_cascade(
 ) -> ModelCascadeState:
     names = available_model_names(models)
     if not names:
-        return ModelCascadeState((), "", (), None, (), None, "")
+        return ModelCascadeState((), "", (), None, (), None, "", ())
 
     current = parse_model_selection(models, current_model)
     pending_model = str(selected_model or "").strip()
@@ -241,4 +257,5 @@ def resolve_model_cascade(
         efforts=efforts,
         selected_effort=effort,
         selection=selection,
+        selections=available_model_selections(models),
     )

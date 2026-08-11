@@ -135,7 +135,7 @@ def _walk(value):
             yield from _walk(child)
 
 
-def test_renderer_uses_real_tool_model_profile_effort_cascade_and_one_primary() -> None:
+def test_renderer_batches_exact_model_selection_into_one_form_submit() -> None:
     pending = PendingWorkflow(
         requirement="build",
         selection_session_key="selection-1",
@@ -160,38 +160,53 @@ def test_renderer_uses_real_tool_model_profile_effort_cascade_and_one_primary() 
     ).render()
 
     selects = {item.get("name"): item for item in _walk(card) if item.get("tag") == "select_static"}
-    assert set(selects) == {"tool_name", "model_name", "model_profile", "model_effort"}
+    assert set(selects) == {"tool_name", "model_selection"}
     assert {option["value"] for option in selects["tool_name"]["options"]} == {
         "codex",
         "gemini",
     }
-    assert {option["value"] for option in selects["model_effort"]["options"]} == {
-        "low",
-        "high",
+    assert {option["value"] for option in selects["model_selection"]["options"]} == {
+        "default",
+        "gpt/standard/low",
+        "gpt/standard/high",
     }
+    assert selects["model_selection"]["behaviors"] == []
+    forms = [item for item in _walk(card) if item.get("tag") == "form"]
+    assert len(forms) == 1
+    assert forms[0]["name"] == "workflow_agent_binding"
     primary = [item for item in _walk(card) if item.get("type") == "primary"]
     assert len(primary) == 1
     assert primary[0]["text"]["content"] == "使用此池开始编排"
     assert not any(item.get("tag") == "action" for item in _walk(card))
-    callbacks = [
+    add = next(
         item
         for item in _walk(card)
-        if item.get("tag") in {"button", "select_static"}
+        if item.get("tag") == "button" and item.get("value", {}).get("action") == "workflow_add_agent"
+    )
+    assert add["action_type"] == "form_submit"
+    assert add["form_action_type"] == "submit"
+    assert add["form_name"] == "workflow_agent_binding"
+    assert selects["tool_name"]["behaviors"] == [
+        {"type": "callback", "value": selects["tool_name"]["value"]}
     ]
-    assert callbacks
-    assert all(item.get("behaviors") == [{"type": "callback", "value": item["value"]}] for item in callbacks)
 
 
 def test_server_consumes_trusted_options_and_builds_same_tool_different_model_pool(tmp_path) -> None:
     handler, engine, project = _selection(tmp_path)
 
     _act(handler, project, "workflow_select_tool", option="codex")
-    _act(handler, project, "workflow_select_model", option="gpt")
-    _act(handler, project, "workflow_select_profile", option="standard")
-    _act(handler, project, "workflow_select_effort", option="high")
-    _act(handler, project, "workflow_add_agent")
-    _act(handler, project, "workflow_select_effort", option="low")
-    _act(handler, project, "workflow_add_agent")
+    _act(
+        handler,
+        project,
+        "workflow_add_agent",
+        _form_value={"model_selection": "gpt/standard/high"},
+    )
+    _act(
+        handler,
+        project,
+        "workflow_add_agent",
+        _form_value={"model_selection": "gpt/standard/low"},
+    )
 
     assert [binding.model_name for binding in engine.project.pending.agent_pool] == [
         "gpt/standard/high",

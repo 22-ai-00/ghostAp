@@ -123,12 +123,22 @@ def test_button_rapid_clicks_are_deduped_and_only_one_task_is_submitted():
             return_value=SimpleNamespace(get_card=lambda _mid: None, set_sticky_message=lambda *_a, **_k: None)
         )
 
-        data = _make_card_action_data(open_message_id="om_1", open_chat_id="oc_1", action="enter_coco")
-        client._handle_card_action(data)
-        client._handle_card_action(data)
+        data = _make_card_action_data(
+            open_message_id="om_1",
+            open_chat_id="oc_1",
+            action="workflow_select_tool",
+        )
+        first = client._handle_card_action(data)
+        duplicate = client._handle_card_action(data)
 
         # first click -> submit once; second click within TTL -> ignored
         assert client._scheduler.submit.call_count == 1
         assert reply_text.call_count == 0
+        assert first == {
+            "toast": {"type": "info", "content": "正在应用选择，卡片将自动更新"}
+        }
+        assert duplicate == {
+            "toast": {"type": "info", "content": "操作已受理，请勿重复点击"}
+        }
 
         client.close()

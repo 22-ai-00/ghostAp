@@ -583,8 +583,9 @@ class WorkflowAgentSelectionRenderer:
         options: list[tuple[str, str]],
         selected: str | None,
         action: str,
+        emit_callback: bool = True,
     ) -> dict[str, Any]:
-        callback = self._value(action)
+        callback_value = self._value(action)
         element: dict[str, Any] = {
             "tag": "select_static",
             "name": name,
@@ -596,9 +597,14 @@ class WorkflowAgentSelectionRenderer:
                 }
                 for value, label in options
             ],
-            "value": callback,
-            "behaviors": [{"type": "callback", "value": callback}],
+            "behaviors": (
+                [{"type": "callback", "value": callback_value}]
+                if emit_callback
+                else []
+            ),
         }
+        if emit_callback:
+            element["value"] = callback_value
         option_values = {value for value, _label in options}
         if selected in option_values:
             element["initial_option"] = selected
@@ -643,54 +649,59 @@ class WorkflowAgentSelectionRenderer:
                 }
             )
 
-        elements.extend(
-            [
-                self._select_static(
-                    name="tool_name",
-                    placeholder="选择工具",
-                    options=list(self.tool_options.items()),
-                    selected=draft_tool,
-                    action="workflow_select_tool",
-                ),
-            ]
+        tool_select = self._select_static(
+            name="tool_name",
+            placeholder="选择工具",
+            options=list(self.tool_options.items()),
+            selected=draft_tool,
+            action="workflow_select_tool",
         )
         model_options = [("default", "Backend default")]
-        if self.model_state is not None:
+        selections = tuple(getattr(self.model_state, "selections", ()) or ())
+        if selections:
+            for selection in selections:
+                parts = [selection.model, selection.profile, selection.effort]
+                model_options.append(
+                    (selection.value, " · ".join(part for part in parts if part))
+                )
+        elif self.model_state is not None:
             model_options.extend((name, name) for name in self.model_state.model_names)
-        elements.append(
-            self._select_static(
-                name="model_name",
-                placeholder="选择模型",
-                options=model_options,
-                selected=draft_model or "default",
-                action="workflow_select_model",
-            )
+        exact_selection = (
+            str(getattr(self.model_state, "selection", "") or "")
+            if draft_model
+            else "default"
         )
-        if draft_model and self.model_state is not None and self.model_state.profiles:
-            elements.append(
-                self._select_static(
-                    name="model_profile",
-                    placeholder="选择 Profile",
-                    options=[(value, value) for value in self.model_state.profiles],
-                    selected=self.pending.draft_profile,
-                    action="workflow_select_profile",
-                )
-            )
-        if draft_model and self.model_state is not None and self.model_state.efforts:
-            elements.append(
-                self._select_static(
-                    name="model_effort",
-                    placeholder="选择 Effort",
-                    options=[(value, value) for value in self.model_state.efforts],
-                    selected=self.pending.draft_effort,
-                    action="workflow_select_effort",
-                )
-            )
-
+        model_select = self._select_static(
+            name="model_selection",
+            placeholder="选择模型 / Profile / Effort",
+            options=model_options,
+            selected=exact_selection or draft_model or "default",
+            action="workflow_select_model",
+            emit_callback=False,
+        )
+        add_button = self._button(
+            "+ 添加 Agent",
+            self._value("workflow_add_agent"),
+        )
+        add_button.update(
+            {
+                "action_type": "form_submit",
+                "form_action_type": "submit",
+                "form_name": "workflow_agent_binding",
+            }
+        )
+        elements.append(
+            {
+                "tag": "form",
+                "name": "workflow_agent_binding",
+                "direction": "vertical",
+                "vertical_spacing": "8px",
+                "elements": [tool_select, model_select, add_button],
+            }
+        )
         elements.extend(
             build_responsive_layout(
                 [
-                    self._button("+ 添加 Agent", self._value("workflow_add_agent")),
                     self._button("使用推荐池", self._value("workflow_add_recommended_pool")),
                     self._button("清空", self._value("workflow_clear_agents")),
                 ],

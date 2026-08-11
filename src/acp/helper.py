@@ -563,7 +563,7 @@ def kickoff_acp_model_preheat(
         return None
 
     def preheat() -> None:
-        for tool in tools:
+        def preheat_one(tool: str) -> None:
             started = time.monotonic()
             try:
                 models = fetch_acp_models(tool, cwd)
@@ -582,6 +582,20 @@ def kickoff_acp_model_preheat(
                     get_error_detail(exc),
                     (time.monotonic() - started) * 1000,
                 )
+
+        workers = [
+            threading.Thread(
+                target=preheat_one,
+                args=(tool,),
+                name=f"acp-model-preheat-{tool}",
+                daemon=True,
+            )
+            for tool in tools
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
 
     thread = threading.Thread(target=preheat, name="acp-model-preheat", daemon=True)
     thread.start()

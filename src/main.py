@@ -233,7 +233,10 @@ class Application:
                 from .coco_model import get_coco_model_manager
 
                 get_coco_model_manager().kickoff_preheat()
-                kickoff_acp_model_preheat(["codex"], cwd=os.getcwd())
+                kickoff_acp_model_preheat(
+                    ["claude", "aiden", "codex", "gemini", "traex"],
+                    cwd=os.getcwd(),
+                )
         except Exception:
             logger.debug("Application.run: ACP model preheat failed", exc_info=True)
 

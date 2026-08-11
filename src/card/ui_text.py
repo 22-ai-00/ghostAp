@@ -568,6 +568,7 @@ UI_TEXT = {
     "card_session_toast_dispatch_error": "系统暂时繁忙，请稍等片刻后重新发送命令",
     "card_session_toast_action_ack": "操作已提交，正在处理",
     "card_session_toast_dedup": "操作已受理，请勿重复点击",
+    "workflow_selection_toast_processing": "正在应用选择，卡片将自动更新",
     "card_session_terminal_retry_failed": "⚠️ 任务已结束（卡片未能刷新最终状态）。可发送状态命令查看结果；开始新任务请发送 {engine_cmd} <需求描述>",
     # TTL expiry messages — mutually exclusive triggers:
     # All engine-specific messages follow a consistent structure:
