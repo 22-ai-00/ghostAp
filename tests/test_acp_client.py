@@ -364,7 +364,7 @@ def test_supports_acp_serve_unsets_claudecode(monkeypatch):
     except Exception:
         pass
 
-    calls = {"env": None}
+    calls = {"env": None, "queue": None}
 
     def fake_run(cmd, capture_output, text, timeout, env=None):
         calls["env"] = env
@@ -406,6 +406,7 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
 
     def fake_spawn(to_client, command, *args, env=None, cwd=None, transport_kwargs=None, **kw):
         calls["env"] = env
+        calls["queue"] = kw.get("queue")
         return FakeCtx()
 
     monkeypatch.setattr(session_mod, "spawn_agent_process", fake_spawn)
@@ -422,6 +423,14 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
         assert sid == "s_test"
         assert calls["env"] is not None
         assert "CLAUDECODE" not in calls["env"]
+
+    async def publish_after_close() -> None:
+        queue = calls["queue"]
+        assert queue is not None
+        await queue.close()
+        await queue.publish(object())
+
+    asyncio.run(publish_after_close())
 
 
 def test_acp_session_start_failure_has_fail_phase(monkeypatch):

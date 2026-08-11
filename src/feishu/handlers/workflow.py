@@ -3461,6 +3461,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         """Generate through the confirmed pool with strict attempt fencing."""
         del selected_tools
         from ...agent_session import create_engine_session
+        from ...workflow_engine.constants import SCRIPT_GEN_TIMEOUT_S
         from ...workflow_engine.models import WorkflowStatus
         from ...workflow_engine.script_gen import (
             build_script_gen_prompt,
@@ -3513,6 +3514,16 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         captured_session_key = pending.engine_session_key
         started_at = time.monotonic()
         hard_deadline = started_at + 600.0
+        configured_attempt_timeout = float(
+            getattr(
+                self.settings,
+                "workflow_script_gen_timeout_s",
+                SCRIPT_GEN_TIMEOUT_S,
+            )
+            or SCRIPT_GEN_TIMEOUT_S
+        )
+        if configured_attempt_timeout <= 0:
+            configured_attempt_timeout = float(SCRIPT_GEN_TIMEOUT_S)
         ordered_pool = (
             orchestrator,
             *(item for item in pool if item.agent_id != orchestrator.agent_id),
@@ -3745,10 +3756,14 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             )
 
                     try:
+                        attempt_timeout = max(
+                            0.001,
+                            min(configured_attempt_timeout, remaining),
+                        )
                         result = session.send_prompt(
                             base_prompt + retry_note,
-                            timeout=max(0.001, min(600.0, remaining)),
-                            idle_timeout=max(0.001, min(120.0, remaining)),
+                            timeout=attempt_timeout,
+                            idle_timeout=max(0.001, min(120.0, attempt_timeout)),
                             on_event=on_event,
                             activity_predicate=self._workflow_generation_event_is_meaningful,
                         )

@@ -19,6 +19,7 @@ from acp.exceptions import RequestError
 from acp.helpers import text_block
 from acp.schema import PromptResponse
 from acp.stdio import spawn_agent_process
+from acp.task import InMemoryMessageQueue
 
 from ..config import get_settings
 from ..utils.async_helpers import safe_wait_for
@@ -44,6 +45,23 @@ logger = logging.getLogger(__name__)
 
 _CODEX_GOAL_CONTROL_METHOD = "_codex/session/goal_control"
 _MAX_DEFERRED_CHILD_EVENTS = 512
+
+
+class _LateFrameTolerantMessageQueue(InMemoryMessageQueue):
+    """Drop transport frames that arrive after connection shutdown begins."""
+
+    def __init__(self, *, maxsize: int = 0) -> None:
+        super().__init__(maxsize=maxsize)
+        self._accepting = True
+
+    async def publish(self, task: Any) -> None:
+        if not self._accepting:
+            return
+        await super().publish(task)
+
+    async def close(self) -> None:
+        self._accepting = False
+        await super().close()
 
 
 def _remember_bounded_identities(
@@ -678,6 +696,7 @@ class ACPSession:
             env=env,
             cwd=self._cwd,
             transport_kwargs=transport_kwargs or None,
+            queue=_LateFrameTolerantMessageQueue(),
         )
 
         phase = ""

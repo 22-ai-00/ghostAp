@@ -246,9 +246,13 @@ def test_cancel_uncertainty_still_closes_and_fences_new_workflow(tmp_path) -> No
     assert error == "invalid_state"
 
 
-def test_activity_aware_idle_and_shared_hard_cap_across_attempts(tmp_path) -> None:
+def test_configured_attempt_timeout_preserves_shared_generation_fallback_budget(
+    tmp_path,
+) -> None:
     clock = [0.0]
     progress: list[str] = []
+    handler = _handler()
+    handler.ctx.settings.workflow_script_gen_timeout_s = 180
 
     def advance() -> None:
         clock[0] = 550.0
@@ -270,7 +274,7 @@ def test_activity_aware_idle_and_shared_hard_cap_across_attempts(tmp_path) -> No
 
     with patch("src.feishu.handlers.workflow.time.monotonic", side_effect=lambda: clock[0]):
         _generate(
-            _handler(),
+            handler,
             _engine(tmp_path),
             tmp_path,
             factory,
@@ -279,7 +283,7 @@ def test_activity_aware_idle_and_shared_hard_cap_across_attempts(tmp_path) -> No
 
     first_kwargs = first.calls[0][1]
     second_kwargs = second.calls[0][1]
-    assert 590 <= first_kwargs["timeout"] <= 600
+    assert 170 <= first_kwargs["timeout"] <= 180
     assert first_kwargs["idle_timeout"] == 120
     assert second_kwargs["timeout"] <= 50
     assert second_kwargs["idle_timeout"] <= 50

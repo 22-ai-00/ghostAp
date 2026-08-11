@@ -27,6 +27,7 @@
 | B064 | 2026-08-11 | Workflow 的 `ACPStreamBridge` 尚未注入 handler 图片 uploader；Agent 截图/图片只会生成 `IMAGE_FAILED` 占位。需用窄 callback 接通上传，CardState 只保存 `image_key`，并补真实图片事件回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
 | B065 | 2026-08-11 | ACP `ToolCallProgress.raw_output` 为快照语义，但 reducer 仍按 delta 拼接；连续 `A`/`AB` 会形成重复或无效内容并可能 O(n²) 膨胀。需为 full Workflow 投影使用 replace/去重语义并覆盖多 progress 回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
 | B066 | 2026-08-11 | 完整 tool input/progress/output 固定使用三反引号；载荷自带 fenced Markdown 时会提前闭合并被当作卡片 Markdown 解释。需使用动态 fence 长度并让分页保持原 fence，覆盖跨页 fenced payload。 | Medium | Workflow 完整执行卡审查 | Open | — |
+| B067 | 2026-08-11 | `agent-client-protocol==0.11.0` 及当前官方 main 在 Connection.close 时先停 dispatcher queue、后停 receive loop，关闭竞态由本地 late-frame tolerant queue 兼容。关注上游修正，升级并验证后移除适配。 | Low | Workflow 生成超时关闭竞态 | Open | — |
 
 > **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。强化多副本档的外部验收条件由 [employee runtime profiles ADR](../docs/adr-employee-runtime-profiles.md) 持续承载，不作为本地代码已证明能力。
 
