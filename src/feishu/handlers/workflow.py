@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from ...card.text_stream import append_stream_text
 from ...utils.text import generate_task_id
 from ..emoji import EmojiReaction
+from ..slash_command_parser import SlashCommandParser
 from .engine_base import BaseEngineHandler
 
 if TYPE_CHECKING:
@@ -163,10 +164,9 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None
     ):
         """Route /wf, /workflow, /stop_wf, /wf_status commands."""
-        from ...utils.command_parser import CommandParser
-
-        cmd = CommandParser.parse_basic(text)
-        command = cmd.command
+        match = SlashCommandParser.parse(text)
+        command = match.command if match else ""
+        args = match.args if match else ""
 
         if command == "/stop_wf":
             self.stop_workflow(message_id, chat_id, project)
@@ -175,9 +175,8 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         elif command == "/wf_help":
             self.show_workflow_help(message_id)
         elif command == "/wf":
-            arg = cmd.args
-            if arg:
-                self.start_workflow(message_id, chat_id, arg, project)
+            if args:
+                self.start_workflow(message_id, chat_id, args, project)
             else:
                 self.show_workflow_help(message_id)
         else:

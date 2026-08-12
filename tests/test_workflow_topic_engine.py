@@ -93,6 +93,61 @@ def _make_mock_project(project_id: str = "proj_1", root_path: str = "/tmp/test_p
 
 
 # ===========================================================================
+# 0. Workflow command compatibility aliases
+# ===========================================================================
+
+
+class TestWorkflowCommandAliases(unittest.TestCase):
+    """Public long-form aliases must reach the canonical Workflow actions."""
+
+    def test_long_aliases_delegate_to_canonical_actions(self):
+        project = _make_mock_project()
+        cases = (
+            (
+                "/workflow\t实现登录",
+                "start_workflow",
+                ("msg_1", "chat_1", "实现登录", project),
+            ),
+            (
+                "/workflow_status",
+                "show_workflow_status",
+                ("msg_1", "chat_1", project),
+            ),
+            (
+                "/workflow_help",
+                "show_workflow_help",
+                ("msg_1",),
+            ),
+            (
+                "/stop_workflow",
+                "stop_workflow",
+                ("msg_1", "chat_1", project),
+            ),
+        )
+
+        for text, target_name, expected_args in cases:
+            with self.subTest(text=text):
+                handler = _make_workflow_handler()
+                handler.start_workflow = MagicMock()
+                handler.show_workflow_status = MagicMock()
+                handler.show_workflow_help = MagicMock()
+                handler.stop_workflow = MagicMock()
+                handler._reply_workflow_error = MagicMock()
+
+                handler.handle_workflow_command(
+                    "msg_1",
+                    "chat_1",
+                    text,
+                    project,
+                )
+
+                getattr(handler, target_name).assert_called_once_with(
+                    *expected_args,
+                )
+                handler._reply_workflow_error.assert_not_called()
+
+
+# ===========================================================================
 # 1. TestAGENTSMDScopeStatement
 # ===========================================================================
 
