@@ -260,20 +260,24 @@ UI_TEXT = {
     ),
     "system_help_section_workflow": "⚡ Workflow · 多 Agent 编排执行",
     "system_help_section_workflow_body": (
-        "`/wf <需求>` · 启动 Workflow 编排执行\n"
+        "`/wf <需求>` · 选择 1–8 个 Agent 组成 Agent Pool\n"
         "`/wf_status` · 查看当前 Workflow 进度\n"
-        "`/wf_help` · Workflow 命令帮助\n"
+        "`/wf_help`（`/workflow_help`） · Workflow 命令帮助\n"
         "`/stop_wf` · 停止正在运行的 Workflow\n"
         "别名：`/workflow` · `/workflow_status` · `/stop_workflow`\n"
-        "流程：需求分析 → 生成脚本 → 自动执行 → 多 Agent 并行/流水线 → 汇总结果"
+        "流程：发起者点击“使用此池开始编排”完成单次确认 → "
+        "确认后自动生成、验证并执行脚本 → 汇总结果"
     ),
     "system_help_section_hire": "👤 数字员工 · 雇佣与管理",
     "system_help_section_hire_body": (
-        "`/hire <名字>` · 雇佣新员工（弹出工具+模型选择）\n"
-        "`/hire <名字> --tool codex --model o3-pro` · 带参数直接创建\n"
-        "`/hire <名字> --prompt \"约束描述\"` · 设定员工身份约束\n"
-        "每位员工保留独立身份、记忆、会话、配置和工作空间\n"
-        "员工无需加入特殊群或切换额外模式即可持续工作"
+        "`/hire <名字>` · 自动选择推荐可用工具和后端默认模型\n"
+        "`/h <名字>` · `/hire` 的简写\n"
+        "`/hire <名字> --tool codex --model <模型>` · 受控覆盖工具或模型\n"
+        "`/employees` · 查看在职员工\n"
+        "`/fire <名字或ID> [--drain]` · 退役员工，可等待当前任务排空\n"
+        "`/history <名字或ID>` · 查看员工执行历史\n"
+        "`/employee-memory <名字或ID>` · 查看员工记忆\n"
+        "以上管理命令由配置管理员在主 Bot 私聊使用"
     ),
     "system_help_tips": (
         "**💡 使用提示**\n"

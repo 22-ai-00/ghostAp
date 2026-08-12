@@ -16,10 +16,13 @@ engineering environment.
 - Direct programming keeps the selected Agent's existing session, cancellation,
   retry and streaming-card semantics; the control plane does not add a planning
   or routing model call.
-- Direct, Deep, Spec and Workflow automatically advance each accepted task to a
-  successful or explicit failed terminal state. Missing ordinary choices use the
-  saved or recommended default; bounded recovery never turns into a request for
-  the user to select an Agent, confirm a script, approve continuation or resume.
+- Direct, Deep and Spec automatically advance each accepted task to a successful
+  or explicit failed terminal state. Missing ordinary choices use the saved or
+  recommended default; bounded recovery does not add confirmation or resume gates.
+- Workflow accepts work through one owner-confirmed Agent Pool containing
+  1-8 `tool+model` Agents. After that single confirmation, the pool and
+  orchestrator are frozen and script generation, validation and execution advance
+  automatically without a later script-confirmation or continuation gate.
 - Users retain explicit stop and configuration controls. High-risk actions that
   were not precisely authorized by the original request remain fail-closed; safe
   work may continue without weakening ACP permission checks.

@@ -3113,20 +3113,22 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         sections = [
             (
                 "📚 命令列表",
-                "`/wf <需求描述>` · AI 生成编排脚本并执行\n"
-                "`/wf_status` · 查看当前 Workflow 进度\n"
-                "`/wf_help` · 显示本帮助\n"
-                "`/stop_wf` · 停止正在执行的 Workflow",
+                "`/wf <需求描述>`（`/workflow`） · 打开 Agent Pool 选择卡\n"
+                "`/wf_status`（`/workflow_status`） · 查看当前 Workflow 进度\n"
+                "`/wf_help`（`/workflow_help`） · 显示本帮助\n"
+                "`/stop_wf`（`/stop_workflow`） · 停止正在执行的 Workflow",
             ),
             (
                 "🧭 执行流程",
-                "**① 自动编排** · 使用推荐可用工具和后端默认模型\n"
-                "**② 自动验证** · 有界修复生成脚本并检查工具与安全约束\n"
-                "**③ 自动执行** · 立即启动，多阶段并行执行并实时更新进度卡片",
+                "**① 选择 Agent Pool** · 发起者选择 1–8 个 `tool+model` Agent，"
+                "也可采用推荐池\n"
+                "**② 单次确认** · 点击“使用此池开始编排”后，Agent Pool 与主编排器冻结\n"
+                "**③ 自动推进** · 确认后自动生成、验证并执行脚本，"
+                "无需再次确认脚本或批准继续",
             ),
             (
                 "✨ 核心能力",
-                "• 多工具并行调度（coco / claude / aiden / codex / traex / grok）\n"
+                "• 多工具并行调度（coco / claude / aiden / codex / gemini / traex / grok）\n"
                 "• 工具 Agent 可继续拆分 subagent 并行工作\n"
                 "• Agent 按任务动态规划角色分工\n"
                 "• Journal 缓存避免重复执行\n"

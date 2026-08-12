@@ -132,3 +132,37 @@ def test_public_docs_do_not_promise_rejected_hire_prompt() -> None:
         fenced_blocks,
     ) is None
     assert "Arbitrary `/hire --prompt` input is rejected." in public
+
+
+def test_readme_documents_current_employee_bot_command_boundaries() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    employee_section = readme.split(
+        "### Agent Department（持久数字员工）",
+        maxsplit=1,
+    )[1].split("## 全自动执行", maxsplit=1)[0]
+
+    assert "员工 Bot 私聊" in employee_section
+    assert "`/status`" in employee_section
+    assert "`@员工 /task <需求>`" in employee_section
+    assert "恰好一个目标员工" in employee_section
+
+
+def test_readme_documents_workflow_single_pool_confirmation_gate() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "`/workflow_help`" in readme
+    assert "1–8 个 `tool+model` Agent" in readme
+    assert "`使用此池开始编排`" in readme
+    assert "单次确认后" in readme
+    assert "不以 Agent 选择" not in readme
+
+
+def test_product_contract_documents_workflow_single_pool_confirmation_gate() -> None:
+    contract = (ROOT / "docs" / "product-contract.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "owner-confirmed Agent Pool" in contract
+    assert "1-8 `tool+model` Agents" in contract
+    assert "After that single confirmation" in contract
+    assert "never turns into a request for the user to select an Agent" not in contract

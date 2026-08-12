@@ -147,6 +147,23 @@ class TestWorkflowCommandAliases(unittest.TestCase):
                 handler._reply_workflow_error.assert_not_called()
 
 
+def test_workflow_help_card_describes_confirmed_agent_pool_contract():
+    """完整帮助卡不得跳过 Workflow 唯一的用户确认门。"""
+    handler = _make_workflow_handler()
+    handler.reply_card = MagicMock()
+
+    handler.show_workflow_help("msg_1")
+
+    card = handler.reply_card.call_args.args[1]
+    rendered = str(card)
+    assert "/workflow_help" in rendered
+    assert "1–8" in rendered
+    assert "Agent Pool" in rendered
+    assert "使用此池开始编排" in rendered
+    assert "确认后自动生成、验证并执行" in rendered
+    assert "自动编排** · 使用推荐可用工具和后端默认模型" not in rendered
+
+
 # ===========================================================================
 # 1. TestAGENTSMDScopeStatement
 # ===========================================================================

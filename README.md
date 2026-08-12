@@ -29,7 +29,7 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 | provider/transport | ACP 直接模式、Shell CLI 桥接 |
 | Host Shell | 独立的特权宿主执行能力，不是 Agent provider，也不是操作系统沙箱 |
 
-普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。四种执行策略收到任务后都会自动推进到成功或明确失败，不以 Agent 选择、Review、脚本确认或手动恢复阻塞主路径。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
+普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。普通编程、Deep 和 Spec 收到任务后会自动推进到成功或明确失败；Workflow 仅保留一次由发起者完成的 Agent Pool 选择确认，确认后自动生成、验证和执行脚本，不再要求脚本确认、继续批准或手动恢复。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
 
 ## 快速开始
 
@@ -195,17 +195,19 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 | `/deep_status`、`/stop_deep` | 查看或停止 Deep |
 | `/spec <需求>` | 按 Spec → Plan → Task → Build → Review 闭环推进 |
 | `/spec_status`、`/stop_spec` | 查看或停止 Spec |
-| `/wf <需求>` | 生成并执行 JS Workflow 编排脚本 |
-| `/wf`、`/wf_status`、`/wf_help`、`/stop_wf` | 生成、查看或停止 Workflow |
+| `/wf <需求>` | 选择并单次确认 Agent Pool，随后自动生成、验证并执行 JS Workflow |
+| `/wf_status`、`/wf_help`、`/stop_wf` | 查看进度、帮助或停止 Workflow |
+| `/workflow`、`/workflow_status`、`/workflow_help`、`/stop_workflow` | Workflow 长命令别名 |
 
 ### Agent Department（持久数字员工）
 
 | 命令 | 作用 |
 | --- | --- |
 | `/hire <名字>` | 由配置管理员在主 Bot 私聊中雇佣持久数字员工 |
+| `/h <名字>` | `/hire` 的简写 |
 | `/hire <名字> --tool codex --model <模型> --role coder` | 使用受控参数发起雇佣 |
 | `/employees` | 查看在职数字员工 |
-| `/fire <名字>` | 退役持久数字员工 |
+| `/fire <名字或ID> [--drain]` | 退役持久数字员工；可等待当前任务排空 |
 | `/history <名字>`、`/employee-memory <名字>` | 由主 Bot 管理员读取授权范围内的员工历史或记忆 |
 
 **雇佣数字员工流程（/hire）：**
@@ -226,8 +228,11 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 员工创建后：
 
 - Journal、加密 Blob/Vault 是事实源，`identity.json` 仅是可安全重建的投影，不含密钥。
+- 员工 Bot 私聊支持 `/task <需求>`、`/status`、`/history [天数]`、`/memory`
+  和 `/stop`；其中 `/status` 返回当前员工的持久任务状态。
+- 在受管员工群中，只有恰好一个目标员工的 `@员工 /task <需求>` 会进入该员工的
+  任务通道；未知员工、多员工提及和其他 Slash 命令不会作为员工任务分派。
 - 员工使用自己的 Bot 接收任务、更新卡片和返回结果，不回退到主 Bot 代发。
-  `/memory` 和 `/stop` 管理其工作。
 - `/hire` 拒绝任意提示词注入；工作风格由受控 role/profile 与持久上下文形成。
 
 旧的独立 Autonomous Manager 命令面已经退役并默认拒绝，不是 Agent Department
@@ -235,11 +240,11 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 
 ## 全自动执行
 
-普通编程、Deep、Spec 和 Workflow 共用一条主路径契约：使用已保存配置，缺失时采用可用的推荐工具和默认模型，经过有界自动恢复后到达成功或明确失败终态。用户只需在运行中主动停止，或通过独立配置入口改变默认值。
+普通编程、Deep 和 Spec 使用已保存配置，缺失时采用可用的推荐工具和默认模型，经过有界自动恢复后到达成功或明确失败终态。Workflow 发起后先显示仅发起者可修改的 Agent Pool：池中包含 1–8 个 `tool+model` Agent，并使用稳定的 `A1`、`A2` 等标识。用户点击 `使用此池开始编排` 完成单次确认后，池和主编排器冻结，脚本生成、验证与执行自动推进，不再出现脚本确认或继续批准门。
 
 普通、安全、可逆的选择自动采用推荐项；高风险且未经原始请求精确授权的操作拒绝或跳过，并继续可安全完成的部分。ACP 权限保持 fail-closed，不通过跳过权限检查换取自动化。
 
-Workflow 动态生成任务专用 JS，并按复杂度组合 `agent()`、`sequence()`、`fanout()`、`verify()`、`generate()`、`tournament()`、`loop()` 和 `race()`。运行时负责确定性控制流、总 Agent 数和危险能力限制，Agent 负责语义工作；简单任务保持单 Agent。进度卡片展示任务、阶段和直接子 Agent 的调度状态，每个 Agent 只保留一条最新操作，完整结果通过分页或附件交付。
+Workflow 动态生成任务专用 JS，并按复杂度组合 `agent()`、`sequence()`、`fanout()`、`verify()`、`generate()`、`tournament()`、`loop()` 和 `race()`。脚本中的直接和动态调用只能引用已确认池内的 Agent，不能覆盖冻结的工具和模型绑定。运行时负责确定性控制流、总 Agent 数和危险能力限制，Agent 负责语义工作；简单任务保持少量调用。进度卡片展示任务、完整池、静态计划、动态候选和直接子 Agent 的实际调度状态，每个 Agent 只保留一条最新操作，完整结果通过分页或附件交付。
 
 ## 架构入口
 
