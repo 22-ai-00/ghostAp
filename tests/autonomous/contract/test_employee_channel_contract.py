@@ -561,6 +561,18 @@ def test_protocol_rejects_oversized_and_multiline_frames() -> None:
 def _direct_bot_mention_event():
     from types import SimpleNamespace
 
+    from lark_channel.api.im.v1.model.mention_event import MentionEvent
+    from lark_channel.api.im.v1.model.user_id import UserId
+
+    mention = (
+        MentionEvent.builder()
+        .key("@_user_1")
+        .id(UserId.builder().open_id("ou_employee_bot").build())
+        .name("Employee")
+        .tenant_key("tenant_1")
+        .build()
+    )
+
     return SimpleNamespace(
         header=SimpleNamespace(
             event_id="event-mention",
@@ -587,14 +599,7 @@ def _direct_bot_mention_event():
                 chat_type="group",
                 message_type="text",
                 content='{"text":"@_user_1 /task ship it"}',
-                mentions=(
-                    SimpleNamespace(
-                        key="@_user_1",
-                        mentioned_type="bot",
-                        id=SimpleNamespace(open_id="ou_employee_bot"),
-                        tenant_key="tenant_1",
-                    ),
-                ),
+                mentions=(mention,),
             ),
         ),
     )
@@ -625,7 +630,6 @@ def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> Non
     assert part["mentions"] == (
         {
             "key": "@_user_1",
-            "mentioned_type": "bot",
             "open_id": "ou_employee_bot",
             "tenant_key": "tenant_1",
         },
@@ -639,7 +643,6 @@ def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> Non
         (("mentions", 0, "open_id"), "ou_other_bot"),
         (("mentions", 0, "tenant_key"), "tenant_other"),
         (("mentions", 0, "key"), "@_user_2"),
-        (("mentions", 0, "mentioned_type"), "user"),
         (("sender_union_id",), "on_other"),
         (("remote_chat_id",), "oc_other"),
         (("remote_message_id",), "om_other"),

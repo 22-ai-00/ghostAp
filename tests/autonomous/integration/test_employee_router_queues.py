@@ -509,7 +509,6 @@ def test_targeted_group_task_routes_with_union_owner_and_freezes_input(
         mentions=(
             {
                 "key": "@_user_1",
-                "mentioned_type": "bot",
                 "open_id": "ou_bot_alpha",
                 "tenant_key": "tenant_1",
             },
@@ -622,7 +621,6 @@ def test_targeted_group_task_rejects_foreign_target_union_or_resolver_confusion(
         mentions=(
             {
                 "key": "@_user_1",
-                "mentioned_type": "bot",
                 "open_id": mention_open_id,
                 "tenant_key": "tenant_1",
             },

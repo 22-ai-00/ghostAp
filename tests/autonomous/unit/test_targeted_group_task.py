@@ -58,7 +58,6 @@ def _metadata() -> EmployeeIngressMetadata:
 def _mention(**overrides: object) -> dict[str, object]:
     value: dict[str, object] = {
         "key": _MENTION_KEY,
-        "mentioned_type": "bot",
         "open_id": _BOT_OPEN_ID,
         "tenant_key": _TENANT_KEY,
     }
@@ -204,7 +203,6 @@ def test_missing_foreign_duplicate_and_all_mentions_fail_closed() -> None:
         _part(mentions=()),
         _part(mentions=(_mention(open_id="ou_other_employee_bot"),)),
         _part(mentions=(_mention(tenant_key="tenant_2"),)),
-        _part(mentions=(_mention(mentioned_type="user"),)),
         _part(mentions=(_mention(key="@all"),)),
         _part(mentions=(_mention(key="@_user_x"),)),
         _part(mentions=(_mention(), _mention(key="@_user_2"))),

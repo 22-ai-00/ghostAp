@@ -747,7 +747,6 @@ def _normalize_message_mentions(message: Any) -> tuple[dict[str, str], ...]:
         identity = getattr(mention, "id", None)
         fields = {
             "key": getattr(mention, "key", None),
-            "mentioned_type": getattr(mention, "mentioned_type", None),
             "open_id": getattr(identity, "open_id", None),
             "tenant_key": getattr(mention, "tenant_key", None),
         }

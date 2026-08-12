@@ -1850,18 +1850,19 @@ class EmployeeDepartmentRuntime:
             else None
         )
         if (
-            router is None
-            or not isinstance(metadata, EmployeeIngressMetadata)
+            not isinstance(metadata, EmployeeIngressMetadata)
             or not isinstance(part, Mapping)
             or not isinstance(part.get("mentions"), tuple)
             or not is_group_slash_observation(part)
             or not self._employee_ingress_transport_is_current(metadata)
         ):
             return None
+        if router is None:
+            return TargetedTaskParseResult(TargetedTaskState.INDETERMINATE)
         try:
             return router.classify_targeted_group_task(metadata, payload)
         except Exception:
-            return None
+            return TargetedTaskParseResult(TargetedTaskState.INDETERMINATE)
 
     def _owner_p2p_requester(
         self,
@@ -1967,6 +1968,7 @@ class EmployeeDepartmentRuntime:
         worked = False
         for acceptance_id, record in tuple(ingress.state.by_acceptance_id.items()):
             if record.disposition is None:
+                payload_unavailable = False
                 try:
                     payload = ingress.get_payload(acceptance_id)
                     first = (
@@ -1983,6 +1985,11 @@ class EmployeeDepartmentRuntime:
                         continue
                 except Exception:
                     payload = None
+                    payload_unavailable = True
+                if payload_unavailable:
+                    # A transient blob/read failure is not an authority denial.
+                    # Preserve the pending ingress for a later bounded retry.
+                    continue
                 try:
                     owner_p2p_requester = self._owner_p2p_requester(
                         record,
@@ -2001,8 +2008,21 @@ class EmployeeDepartmentRuntime:
                     )
                 except Exception:
                     trust = self._unknown_employee_ingress_trust()
-                if self._handle_control_ingress(acceptance_id):
+                if self._handle_control_ingress(
+                    acceptance_id,
+                    targeted_group_task=targeted_group_task,
+                    targeted_group_task_classified=True,
+                ):
                     worked = True
+                    continue
+                if (
+                    targeted_group_task is not None
+                    and targeted_group_task.state
+                    is TargetedTaskState.INDETERMINATE
+                ):
+                    # Authority dependencies can be temporarily unavailable.
+                    # Preserve the pending ingress so the next bounded drain
+                    # retries instead of terminally suppressing the command.
                     continue
                 if (
                     owner_p2p_requester is None
@@ -2317,7 +2337,13 @@ class EmployeeDepartmentRuntime:
                 pass
 
 
-    def _handle_control_ingress(self, acceptance_id: str) -> bool:
+    def _handle_control_ingress(
+        self,
+        acceptance_id: str,
+        *,
+        targeted_group_task: TargetedTaskParseResult | None = None,
+        targeted_group_task_classified: bool = False,
+    ) -> bool:
         """Consume durable membership, data, status, and stop controls."""
         ingress = self._ingress
         if ingress is None:
@@ -2355,12 +2381,18 @@ class EmployeeDepartmentRuntime:
             isinstance(first, Mapping)
             and first.get("type") == "membership_event"
         )
+        if not isinstance(targeted_group_task_classified, bool):
+            raise TypeError("targeted task classification flag must be bool")
         if (
             not is_membership_event
             and isinstance(first, Mapping)
             and isinstance(first.get("mentions"), tuple)
             and is_group_slash_observation(first)
-            and self._authorized_targeted_group_task(record, payload)
+            and (
+                targeted_group_task
+                if targeted_group_task_classified
+                else self._authorized_targeted_group_task(record, payload)
+            )
             is not None
         ):
             # Uniquely addressed group `/task` commands are routed or receive
@@ -2671,6 +2703,11 @@ class EmployeeDepartmentRuntime:
         if (
             targeted_group_task is not None
             and targeted_group_task.state is TargetedTaskState.TARGETED_VALID
+        ):
+            return False
+        if (
+            targeted_group_task is not None
+            and targeted_group_task.state is TargetedTaskState.INDETERMINATE
         ):
             return False
         if (

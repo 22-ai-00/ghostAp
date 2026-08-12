@@ -288,7 +288,8 @@ def test_production_dispatch_projects_group_context_before_routing_and_gc(
     monkeypatch.setattr(
         runtime,
         "_handle_control_ingress",
-        lambda observed_acceptance_id: calls.append("handle_control") or False,
+        lambda observed_acceptance_id, **_kwargs: calls.append("handle_control")
+        or False,
     )
     monkeypatch.setattr(
         runtime,
@@ -372,7 +373,7 @@ def test_production_dispatch_routes_owner_p2p_without_group_control(
     monkeypatch.setattr(
         runtime,
         "_handle_control_ingress",
-        lambda _acceptance_id: calls.append("handle_control") or False,
+        lambda _acceptance_id, **_kwargs: calls.append("handle_control") or False,
     )
     monkeypatch.setattr(
         runtime,
@@ -476,14 +477,18 @@ def test_production_dispatch_ignores_main_bot_group_command_observation(
         "_record_employee_ingress_group_event",
         lambda _acceptance_id: calls.append("project_group_context"),
     )
-    monkeypatch.setattr(runtime, "_handle_control_ingress", lambda _acceptance_id: False)
+    monkeypatch.setattr(
+        runtime,
+        "_handle_control_ingress",
+        lambda _acceptance_id, **_kwargs: False,
+    )
     runtime._drain_employee_dispatch_once()  # noqa: SLF001
 
     assert calls == ["command_gate", "dispatch", "gc_payload"]
     assert pending.disposition.reason_code == "main_bot_group_command"
 
 
-def test_production_dispatch_routes_only_authorized_targeted_group_task(
+def test_production_dispatch_retries_indeterminate_targeted_group_task_once_per_drain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.autonomous.ingress.targeted_task import (
@@ -521,9 +526,19 @@ def test_production_dispatch_routes_only_authorized_targeted_group_task(
                         "type": "message",
                         "chat_type": "group",
                         "content": {"text": "@_user_1 /task finish audit"},
+                        "mentions": (
+                            {
+                                "key": "@_user_1",
+                                "open_id": "ou_bot_alpha",
+                                "tenant_key": "tenant_1",
+                            },
+                        ),
                     },
                 )
             )
+
+        def record_disposition(self, *_args, **_kwargs):
+            pytest.fail("authorized targeted task was consumed as a control")
 
         def gc_terminal_payloads(self):
             calls.append("gc_payload")
@@ -550,11 +565,24 @@ def test_production_dispatch_routes_only_authorized_targeted_group_task(
     runtime._ingress = _Ingress()  # type: ignore[assignment]  # noqa: SLF001
     runtime._router = _Router()  # type: ignore[assignment]  # noqa: SLF001
     runtime._dispatch = _Dispatch()  # type: ignore[assignment]  # noqa: SLF001
-    monkeypatch.setattr(runtime, "_handle_control_ingress", lambda _value: False)
+    classifications = 0
+
+    classifications_by_drain = (
+        TargetedTaskParseResult(TargetedTaskState.INDETERMINATE),
+        task,
+    )
+
+    def classify_once(_record, _payload):
+        nonlocal classifications
+        classifications += 1
+        if classifications > len(classifications_by_drain):
+            pytest.fail("an ingress drain classified the targeted task twice")
+        return classifications_by_drain[classifications - 1]
+
     monkeypatch.setattr(
         runtime,
         "_authorized_targeted_group_task",
-        lambda _record, _payload: task,
+        classify_once,
     )
     monkeypatch.setattr(
         runtime,
@@ -569,7 +597,15 @@ def test_production_dispatch_routes_only_authorized_targeted_group_task(
 
     runtime._drain_employee_dispatch_once()  # noqa: SLF001
 
-    assert calls == ["project_group_context", "route", "dispatch", "gc_payload"]
+    assert pending.disposition is None
+    assert calls == ["dispatch", "gc_payload"]
+    assert classifications == 1
+
+    calls.clear()
+    runtime._drain_employee_dispatch_once()  # noqa: SLF001
+
+    assert calls == ["project_group_context", "route", "dispatch"]
+    assert classifications == 2
 
 
 def test_targeted_group_task_authority_ignores_unavailable_ingress_payload() -> None:
@@ -796,7 +832,6 @@ def test_generic_control_lane_leaves_targeted_group_task_for_command_gate(
                 "mentions": (
                     {
                         "key": "@_user_1",
-                        "mentioned_type": "bot",
                         "open_id": "ou_bot_alpha",
                         "tenant_key": "tenant_1",
                     },
@@ -1127,7 +1162,8 @@ async def test_channel_acceptance_callback_does_not_repeat_group_projection_afte
     monkeypatch.setattr(
         runtime,
         "_handle_control_ingress",
-        lambda observed_acceptance_id: calls.append("handle_control") or False,
+        lambda observed_acceptance_id, **_kwargs: calls.append("handle_control")
+        or False,
     )
 
     await runtime._handle_channel_event(  # noqa: SLF001

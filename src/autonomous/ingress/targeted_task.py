@@ -15,7 +15,7 @@ MAX_TARGETED_TASK_DESCRIPTION_CHARS = 14_000
 TARGETED_TASK_DIGEST_VERSION = "ghostap.targeted-group-task.v1"
 TARGETED_TASK_INPUT_KIND = "targeted_group_task_v1"
 _MESSAGE_RECEIVE_EVENT_TYPE = "im.message.receive_v1"
-_MENTION_FIELDS = frozenset({"key", "mentioned_type", "open_id", "tenant_key"})
+_MENTION_FIELDS = frozenset({"key", "open_id", "tenant_key"})
 _MENTION_KEY_RE = re.compile(r"@_user_[0-9]+\Z")
 _BODY_MENTION_RE = re.compile(r"@_user_[0-9]+|@all")
 _LEADING_MENTION_RE = re.compile(r"(?:@_user_[0-9]+|@all)(?=\s|$)")
@@ -32,6 +32,7 @@ def _has_forbidden_control(value: str) -> bool:
 class TargetedTaskState(StrEnum):
     """Fail-closed classification of one normalized employee ingress part."""
 
+    INDETERMINATE = "indeterminate"
     NOT_TARGETED = "not_targeted"
     TARGETED_INVALID = "targeted_invalid"
     TARGETED_VALID = "targeted_valid"
@@ -143,7 +144,6 @@ def _target_mention(
         or not expected_bot_open_id.startswith("ou_")
         or not isinstance(key, str)
         or _MENTION_KEY_RE.fullmatch(key) is None
-        or mention.get("mentioned_type") != "bot"
         or mention.get("open_id") != expected_bot_open_id
         or mention.get("tenant_key") != expected_tenant_key
     ):
