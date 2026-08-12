@@ -3,10 +3,54 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.feishu.ws_client import FeishuWSClient
 from src.mode import InteractionMode
 from src.tasking import TaskSpec
+
+
+@pytest.mark.parametrize(
+    ("mode", "handler_name"),
+    [
+        (InteractionMode.COCO, "coco"),
+        (InteractionMode.CLAUDE, "claude"),
+        (InteractionMode.AIDEN, "aiden"),
+        (InteractionMode.CODEX, "codex"),
+        (InteractionMode.GEMINI, "gemini"),
+        (InteractionMode.TRAEX, "traex"),
+        (InteractionMode.GROK, "grok"),
+    ],
+)
+def test_exit_current_mode_delegates_for_every_programming_backend(
+    mode,
+    handler_name,
+):
+    ctx = MagicMock()
+    ctx.mode_manager.get_mode.return_value = mode
+    programming_handlers = {
+        name: MagicMock()
+        for name in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok")
+    }
+    ctx.handlers.get.side_effect = programming_handlers.get
+    handler = SystemHandler(ctx)
+    handler.reply_text = MagicMock()
+    project = SimpleNamespace(project_id="project-1")
+
+    with patch("src.thread.get_current_thread_id", return_value=None):
+        handler.exit_current_mode("message-1", "chat-1", project)
+
+    programming_handlers[handler_name].exit_mode.assert_called_once_with(
+        "message-1",
+        "chat-1",
+        project,
+    )
+    for name, programming_handler in programming_handlers.items():
+        if name != handler_name:
+            programming_handler.exit_mode.assert_not_called()
+    handler.reply_text.assert_not_called()
 
 
 def test_exit_is_deferred_until_running_task_finishes():

@@ -1697,18 +1697,23 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                 except ValueError:
                     logger.debug("invalid InteractionMode value: %s", thread_ctx.mode, exc_info=True)
 
-        if current_mode == InteractionMode.COCO:
-            self.get_handler("coco").exit_mode(message_id, chat_id, project)
-        elif current_mode == InteractionMode.CLAUDE:
-            self.get_handler("claude").exit_mode(message_id, chat_id, project)
-        elif current_mode == InteractionMode.AIDEN:
-            self.get_handler("aiden").exit_mode(message_id, chat_id, project)
-        elif current_mode == InteractionMode.CODEX:
-            self.get_handler("codex").exit_mode(message_id, chat_id, project)
-        elif current_mode == InteractionMode.GEMINI:
-            self.get_handler("gemini").exit_mode(message_id, chat_id, project)
-        else:
-            self.reply_text(message_id, UI_TEXT["system_already_in_mode"])
+        programming_handler = {
+            InteractionMode.COCO: "coco",
+            InteractionMode.CLAUDE: "claude",
+            InteractionMode.AIDEN: "aiden",
+            InteractionMode.CODEX: "codex",
+            InteractionMode.GEMINI: "gemini",
+            InteractionMode.TRAEX: "traex",
+            InteractionMode.GROK: "grok",
+        }.get(current_mode)
+        if programming_handler:
+            self.get_handler(programming_handler).exit_mode(
+                message_id,
+                chat_id,
+                project,
+            )
+            return
+        self.reply_text(message_id, UI_TEXT["system_already_in_mode"])
 
     # ------------------------------------------------------------------
     # Shell command submission
