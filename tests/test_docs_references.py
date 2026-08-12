@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from urllib.parse import urldefrag
+
+from src.workflow_engine.constants import NODE_MIN_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 DOC_PATHS = [
@@ -145,6 +148,42 @@ def test_readme_documents_current_employee_bot_command_boundaries() -> None:
     assert "`/status`" in employee_section
     assert "`@员工 /task <需求>`" in employee_section
     assert "恰好一个目标员工" in employee_section
+    assert "`/roster`" in employee_section
+    assert "`/employee-role <员工名> <职责>`" in employee_section
+    assert "配置管理员在主 Bot 私聊" in employee_section
+
+
+def test_readme_discovers_all_programming_session_info_commands() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    modes_section = readme.split("### 模式与模型", maxsplit=1)[1].split(
+        "### 项目",
+        maxsplit=1,
+    )[0]
+
+    for command in (
+        "/coco_info",
+        "/claude_info",
+        "/aiden_info",
+        "/codex_info",
+        "/gemini_info",
+        "/traex_info",
+        "/grok_info",
+    ):
+        assert f"`{command}`" in modes_section
+
+
+def test_workflow_node_minimum_is_consistent_across_runtime_and_readme() -> None:
+    runtime_package = json.loads(
+        (ROOT / "src" / "workflow_engine" / "runtime" / "package.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    minimum = ".".join(str(part) for part in NODE_MIN_VERSION)
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert runtime_package["engines"]["node"] == f">={minimum}"
+    assert NODE_MIN_VERSION[1:] == (0, 0), "README's major+ notation would be too broad"
+    assert f"Node.js {NODE_MIN_VERSION[0]}+" in readme
 
 
 def test_readme_documents_workflow_single_pool_confirmation_gate() -> None:

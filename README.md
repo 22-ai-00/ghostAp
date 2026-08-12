@@ -169,6 +169,7 @@ PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就�
 | --- | --- |
 | `/help` | 查看完整帮助 |
 | `/coco`、`/claude`、`/aiden`、`/codex`、`/gemini`、`/traex`、`/grok` | 进入对应编程模式 |
+| `/coco_info`、`/claude_info`、`/aiden_info`、`/codex_info`、`/gemini_info`、`/traex_info`、`/grok_info` | 查看对应编程会话与模型信息 |
 | `/model`、`/model list`、`/model <name>` | 查看或切换当前 ACP 工具模型 |
 | `/acp` | 查看 ACP 工具选择入口 |
 | `/exit` | 退出当前模式，回到 Smart |
@@ -206,7 +207,8 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 | `/hire <名字>` | 由配置管理员在主 Bot 私聊中雇佣持久数字员工 |
 | `/h <名字>` | `/hire` 的简写 |
 | `/hire <名字> --tool codex --model <模型> --role coder` | 使用受控参数发起雇佣 |
-| `/employees` | 查看在职数字员工 |
+| `/employees`、`/roster` | 查看在职数字员工 |
+| `/employee-role <员工名> <职责>` | 由配置管理员在主 Bot 私聊中设置数字员工职责 |
 | `/fire <名字或ID> [--drain]` | 退役持久数字员工；可等待当前任务排空 |
 | `/history <名字>`、`/employee-memory <名字>` | 由主 Bot 管理员读取授权范围内的员工历史或记忆 |
 
