@@ -318,11 +318,13 @@ class RuntimeBridge:
         Raises RuntimeError if the process fails to start or doesn't send
         the ready notification within a reasonable time.
         """
-        # Resolve paths
-        runtime_path = os.path.join(self._cwd, RUNTIME_JS_PATH)
+        # The runtime is executable product code. Resolve it from the installed
+        # package, never from the untrusted user project used as subprocess cwd.
+        runtime_path = os.path.realpath(RUNTIME_JS_PATH)
         if not os.path.isfile(runtime_path):
-            # Try absolute path as fallback
-            runtime_path = RUNTIME_JS_PATH
+            raise RuntimeError(
+                "packaged Workflow runtime is missing; reinstall GhostAP"
+            )
 
         node_bin = shutil.which("node")
         if not node_bin:

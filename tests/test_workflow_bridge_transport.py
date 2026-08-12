@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -198,6 +199,89 @@ def test_start_sends_deadline_budget_in_init(tmp_path, monkeypatch):
     assert params["deadline_unix_ms"] - params["started_unix_ms"] <= (
         WORKFLOW_TOTAL_TIMEOUT_S * 1000
     )
+
+
+def test_start_uses_packaged_runtime_not_project_decoy(tmp_path, monkeypatch):
+    """A user project must never replace the trusted Workflow runtime."""
+
+    project = tmp_path / "user-project"
+    decoy = project / "src" / "workflow_engine" / "runtime" / "runtime.js"
+    decoy.parent.mkdir(parents=True)
+    decoy.write_text("throw new Error('project decoy executed');", encoding="utf-8")
+    bridge = _make_bridge(project)
+    captured: dict[str, object] = {}
+
+    class FakeStream:
+        def __iter__(self):
+            return iter(())
+
+        def readline(self):
+            return ""
+
+        def read(self, _size=-1):
+            return ""
+
+        def close(self):
+            pass
+
+    class FakeProcess:
+        def __init__(self):
+            self.stdin = MagicMock()
+            self.stdout = FakeStream()
+            self.stderr = FakeStream()
+            self.returncode = 0
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    def popen(command, **kwargs):
+        captured["command"] = command
+        captured["cwd"] = kwargs.get("cwd")
+        return FakeProcess()
+
+    monkeypatch.setattr(bridge_mod.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(bridge_mod.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        bridge,
+        "_wait_for_notification",
+        lambda method, timeout=30.0: {"jsonrpc": "2.0", "method": "ready"},
+    )
+
+    try:
+        bridge.start()
+    finally:
+        bridge.stop()
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    runtime = Path(command[2])
+    packaged = Path(bridge_mod.__file__).resolve().parent / "runtime" / "runtime.js"
+    assert runtime.is_absolute()
+    assert runtime == packaged
+    assert runtime != decoy
+    assert captured["cwd"] == str(project)
+
+
+def test_start_fails_before_spawn_when_packaged_runtime_is_missing(
+    tmp_path,
+    monkeypatch,
+):
+    bridge = _make_bridge(tmp_path)
+    popen = MagicMock()
+    monkeypatch.setattr(bridge_mod, "RUNTIME_JS_PATH", str(tmp_path / "missing.js"))
+    monkeypatch.setattr(bridge_mod.shutil, "which", lambda _name: "/usr/bin/node")
+    monkeypatch.setattr(bridge_mod.subprocess, "Popen", popen)
+
+    with pytest.raises(RuntimeError, match="packaged Workflow runtime is missing"):
+        bridge.start()
+
+    popen.assert_not_called()
 
 
 def test_agent_call_timeout_is_capped_by_remaining_workflow_budget(tmp_path, monkeypatch):
@@ -447,6 +531,43 @@ def test_start_after_stop_never_spawns_node(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_packaged_runtime_executes_from_external_project_cwd(tmp_path):
+    """The installed runtime must work when the user project is elsewhere."""
+
+    project = tmp_path / "external-project"
+    project.mkdir()
+    script_path = project / "external_workflow.js"
+    script_path.write_text(
+        """\
+export const meta = {
+  name: 'external-cwd-test',
+  description: 'Run the packaged Workflow runtime outside the GhostAP checkout',
+  phases: [{ title: 'run', detail: 'Return a deterministic result' }],
+};
+
+export default async function main() {
+  return 'external-cwd-ok';
+}
+""",
+        encoding="utf-8",
+    )
+    bridge = RuntimeBridge(
+        script_path=str(script_path),
+        cwd=str(project),
+        on_agent_call=lambda _params: AgentCallResult(output="unexpected"),
+    )
+
+    try:
+        bridge.start()
+        assert json.loads(bridge.run()) == "external-cwd-ok"
+    finally:
+        bridge.stop()
+
+
 RACE_CANCEL_SCRIPT = """\
 export const meta = {
   name: 'race-cancel-test',
@@ -488,8 +609,7 @@ def test_race_cancel_real_node_process(tmp_path):
     script_path = tmp_path / "race_cancel_test.js"
     script_path.write_text(RACE_CANCEL_SCRIPT, encoding="utf-8")
 
-    # Project root — needed so that RuntimeBridge can find runtime.js via
-    # RUNTIME_JS_PATH (which is relative to cwd).
+    # Keep the user project as cwd; the trusted runtime is package-relative.
     import os
     project_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..")

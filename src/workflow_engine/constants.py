@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 # --- Timeouts ---
 # NOTE: These are the default-value SSOT / import-time fallbacks. The
 # authoritative runtime values are read from Settings (workflow_* fields),
@@ -59,7 +61,9 @@ RETRY_BACKOFF_BASE_S: float = 1.0  # Base delay for exponential backoff (seconds
 MAX_QUEUE_SIZE: int = 10_000  # Max pending messages in bridge queue
 
 # --- Runtime ---
-RUNTIME_JS_PATH: str = "src/workflow_engine/runtime/runtime.js"
+RUNTIME_JS_PATH: str = str(
+    (Path(__file__).resolve().parent / "runtime" / "runtime.js").resolve()
+)
 NODE_MIN_VERSION: tuple[int, ...] = (20, 0, 0)
 # Number of most-recent Node stderr lines the bridge keeps in a ring buffer.
 # Surfaced in the "process exited/closed stdout unexpectedly" diagnostic so a
