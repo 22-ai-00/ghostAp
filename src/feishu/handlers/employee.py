@@ -39,6 +39,7 @@ from ...thread import (
     get_current_tenant_key,
     get_current_thread_id,
 )
+from ...utils.redact import redact_sensitive
 from .base import BaseHandler
 
 if TYPE_CHECKING:
@@ -75,6 +76,18 @@ _HIRE_VALUE_OPTIONS = frozenset(
 )
 _APP_ID_PATTERN = re.compile(r"cli_[A-Za-z0-9_-]{3,128}\Z")
 _MAX_DATA_REPLY_CHARS = 18_000
+_POSIX_ABSOLUTE_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.-])/(?:[^\s/]+/)+[^\s,;]+"
+)
+_WINDOWS_ABSOLUTE_PATH = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\(?:[^\s\\]+\\)+[^\s,;]+"
+)
+_QUOTED_SECRET_VALUE = re.compile(
+    r'''(?ix)
+    (["']?[^\s"']*(?:token|secret|password|passwd|credential|api[_-]?key|private[_-]?key)[^\s"']*["']?\s*[:=]\s*)
+    (["'])[^"'\n]*\2
+    '''
+)
 
 
 class EmployeeHandler(BaseHandler):
@@ -185,6 +198,10 @@ class EmployeeHandler(BaseHandler):
             for character in text
             if character in {"\n", "\t"} or ord(character) >= 32
         )
+        text = redact_sensitive(text)
+        text = _QUOTED_SECRET_VALUE.sub(r"\1\2<redacted>\2", text)
+        text = _POSIX_ABSOLUTE_PATH.sub("<redacted:path>", text)
+        text = _WINDOWS_ABSOLUTE_PATH.sub("<redacted:path>", text)
         if len(text) <= limit:
             return text
         return text[:limit] + "\n\n[内容已截断]"

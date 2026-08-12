@@ -1530,6 +1530,11 @@ class FeishuWSClient:
             "/employee-role",
         }:
             action = ActionKind.GRANT_ADMIN
+        elif command_match is not None and command_match.command in {
+            "/history",
+            "/employee-memory",
+        }:
+            action = ActionKind.SYSTEM_ADMIN
         if action is None:
             return trust.zone is not TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
         return ActionMatrix().decide(

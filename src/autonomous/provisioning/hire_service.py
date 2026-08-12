@@ -1670,6 +1670,7 @@ class ProductionEmployeeHireService:
         if (
             not isinstance(request.model, str)
             or request.model != request.model.strip()
+            or any(character.isspace() for character in request.model)
         ):
             raise HireAdmissionError("invalid employee model selection")
         if not isinstance(request.role, str) or not isinstance(request.persona, str):

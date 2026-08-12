@@ -72,6 +72,15 @@ class MessageDispatcher:
             )
         ):
             return
+        if (
+            command_match is not None
+            and command_match.command in {"/history", "/employee-memory"}
+            and not self._action_matrix_allows(
+                effective_trust,
+                action_name="system_admin",
+            )
+        ):
+            return
 
         _pid = project.project_id if project else None
         current_mode, is_in_programming = self.client._get_effective_mode(chat_id, project_id=_pid)
@@ -243,6 +252,7 @@ class MessageDispatcher:
         action = {
             "grant_admin": ActionKind.GRANT_ADMIN,
             "host_shell": ActionKind.HOST_SHELL,
+            "system_admin": ActionKind.SYSTEM_ADMIN,
         }[action_name]
         return ActionMatrix().decide(
             ActionRequest(

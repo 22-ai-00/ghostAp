@@ -388,6 +388,9 @@ def test_empty_model_round_trips_as_backend_default_through_both_projections(
     [
         {"model": None},
         {"model": " gpt-5.6-sol"},
+        {"model": "gpt 5.6"},
+        {"model": "gpt\t5.6"},
+        {"model": "gpt\n5.6"},
         {"model": "gpt-5.6-sol/max/high"},
         {"tool": ""},
         {"profile": "turbo"},

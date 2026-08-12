@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -9,9 +9,12 @@ from src.autonomous.data.query import AuditFailedError
 from src.autonomous.provisioning.fire_service import EmployeeFireRequest
 from src.autonomous.provisioning.fire_state import FireCleanupMode, FirePhase
 from src.autonomous.provisioning.hire_service import HireAdmissionError
+from src.feishu.dispatcher import MessageDispatcher
 from src.feishu.handlers.employee import EmployeeHandler
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
+from src.feishu.ws_client import FeishuWSClient, TrustActionDecision
+from src.mode import InteractionMode
 from src.thread import (
     set_current_is_p2p,
     set_current_sender_id,
@@ -19,6 +22,7 @@ from src.thread import (
     set_current_tenant_key,
     set_current_thread_id,
 )
+from src.trust.models import ActorKind, EffectiveTrust, TrustZone
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +100,73 @@ def test_system_routes_every_employee_command(
     )
 
     target.assert_called_once_with("om_command", "oc_admin_dm", expected_args)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/hire Atlas",
+        "/fire Atlas",
+        "/history Atlas",
+        "/employee-memory Atlas",
+    ],
+)
+@pytest.mark.parametrize(
+    ("mode", "topic_context"),
+    [
+        (InteractionMode.SMART, False),
+        (InteractionMode.COCO, False),
+        (InteractionMode.CLAUDE, False),
+        (InteractionMode.AIDEN, False),
+        (InteractionMode.CODEX, False),
+        (InteractionMode.GEMINI, False),
+        (InteractionMode.TRAEX, False),
+        (InteractionMode.GROK, False),
+        (InteractionMode.SMART, True),
+    ],
+)
+def test_dispatcher_intercepts_employee_commands_before_every_active_lane(
+    text: str,
+    mode: InteractionMode,
+    topic_context: bool,
+) -> None:
+    client = MagicMock()
+    active = MagicMock()
+    system = MagicMock()
+    system.is_interceptable_command_match.return_value = True
+    client._handler_ctx.handlers = {
+        "coco": active,
+        "system": system,
+        "project": MagicMock(),
+    }
+    client._get_effective_mode.return_value = (
+        mode,
+        mode is not InteractionMode.SMART,
+    )
+    client._is_topic_engine_context.return_value = topic_context
+    client._current_trust_can_dispatch.return_value = True
+    if topic_context:
+        set_current_thread_id("omt_workflow")
+        client._thread_manager.get.return_value = SimpleNamespace(mode="workflow")
+    dispatcher = MessageDispatcher(client)
+    match = SlashCommandParser.parse(text)
+
+    dispatcher.process_with_intent(
+        "om_command",
+        "oc_admin_dm",
+        text,
+        command_match=match,
+    )
+
+    system.handle_intercepted_command.assert_called_once_with(
+        "om_command",
+        "oc_admin_dm",
+        text,
+        None,
+        command_match=match,
+    )
+    active.handle_message.assert_not_called()
+    client._intent_recognizer.recognize.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -361,6 +432,34 @@ def test_memory_uses_audited_full_l1_query_and_bounds_output() -> None:
     assert "截断" in visible
 
 
+def test_memory_redacts_credentials_and_absolute_paths_before_delivery() -> None:
+    handler, ctx = _handler()
+    _authorize()
+    employee = SimpleNamespace(agent_id="agt_atlas", name="Atlas")
+    ctx.employee_hire_service.list_employee_roster.return_value = (employee,)
+    ctx.employee_data_composition.memory_query.query.return_value = SimpleNamespace(
+        content=(
+            'api_key="plain-secret-value"\n'
+            '{"nested":{"client_secret":"nested-secret-value"}}\n'
+            "workspace=/data00/home/alice/private/project/config.yaml\n"
+            "windows=C:\\Users\\alice\\private\\settings.json"
+        ),
+        scope="full_l1",
+    )
+
+    handler.show_employee_memory("om_memory", "oc_admin_dm", "Atlas")
+
+    visible = handler.reply_text.call_args.args[1]
+    for forbidden in (
+        "plain-secret-value",
+        "nested-secret-value",
+        "/data00/home/alice/private/project/config.yaml",
+        "C:\\Users\\alice\\private\\settings.json",
+    ):
+        assert forbidden not in visible
+    assert "redacted" in visible
+
+
 @pytest.mark.parametrize(
     ("method", "query_path"),
     [
@@ -384,3 +483,62 @@ def test_data_audit_failure_returns_no_read_content(
     visible = handler.reply_text.call_args.args[1]
     assert "secret-audit-backend-detail" not in visible
     assert "审计" in visible
+
+
+@pytest.mark.parametrize("command", ["/history Atlas", "/employee-memory Atlas"])
+def test_dispatcher_applies_system_admin_gate_before_sensitive_employee_read(
+    command: str,
+) -> None:
+    client = MagicMock()
+    client._handler_ctx.handlers = {
+        "coco": MagicMock(),
+        "system": MagicMock(),
+        "project": MagicMock(),
+    }
+    client._get_effective_mode.return_value = (InteractionMode.SMART, False)
+    client._current_trust_can_dispatch.return_value = True
+    client._handler_ctx.handlers[
+        "system"
+    ].is_interceptable_command_match.return_value = True
+    dispatcher = MessageDispatcher(client)
+    dispatcher._action_matrix_allows = MagicMock(return_value=False)
+
+    dispatcher.process_with_intent(
+        "om_read",
+        "oc_admin_dm",
+        command,
+        command_match=SlashCommandParser.parse(command),
+        effective_trust=MagicMock(),
+    )
+
+    dispatcher._action_matrix_allows.assert_called_once_with(
+        ANY,
+        action_name="system_admin",
+    )
+    dispatcher.system.handle_intercepted_command.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["/history Atlas", "/employee-memory Atlas"])
+def test_ws_ingress_classifies_sensitive_employee_read_as_system_admin(
+    command: str,
+) -> None:
+    client = object.__new__(FeishuWSClient)
+    trust = EffectiveTrust(
+        zone=TrustZone.MANAGED_AGENT_GROUP,
+        actor=ActorKind.OWNER,
+        managed_group=MagicMock(revision=1),
+        group_revision=1,
+        grant_revision=1,
+    )
+    with patch("src.feishu.ws_client.ActionMatrix") as matrix:
+        matrix.return_value.decide.return_value = TrustActionDecision.DENY
+
+        allowed = client._managed_ingress_action_allowed(
+            trust,
+            text=command,
+            command_match=SlashCommandParser.parse(command),
+        )
+
+    assert allowed is False
+    request = matrix.return_value.decide.call_args.args[0]
+    assert request.action.value == "system_admin"
