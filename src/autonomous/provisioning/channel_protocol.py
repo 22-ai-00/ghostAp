@@ -28,6 +28,14 @@ _BOOTSTRAP_KEYS = {
     "bot_principal_id",
     "ack_timeout_seconds",
 }
+_READY_PAYLOAD_KEYS = {"identity", "connection_id", "connection"}
+_READY_IDENTITY_KEYS = {"app_id", "open_id"}
+_READY_CONNECTION_KEYS = {
+    "observed",
+    "sdk_connection_id",
+    "service_id",
+    "secure",
+}
 _FORBIDDEN_IPC_KEYS = {
     "app_secret",
     "credential_ref",
@@ -244,6 +252,9 @@ def _reject_secret_fields(value: Any) -> None:
 
 
 def _validate_typed_payload(frame: ChannelFrame) -> None:
+    if frame.frame_type is FrameType.READY:
+        validate_ready_payload(frame.payload)
+        return
     if frame.frame_type is FrameType.SEND:
         try:
             _validate_send_payload(frame)
@@ -263,6 +274,54 @@ def _validate_typed_payload(frame: ChannelFrame) -> None:
             _validate_ingress_ack_payload(frame)
     except (TypeError, ValueError, KeyError) as exc:
         raise ProtocolError("invalid employee ingress frame") from exc
+
+
+def validate_ready_payload(payload: Mapping[str, Any]) -> None:
+    """Validate the complete READY authority schema without runtime state."""
+
+    try:
+        if not isinstance(payload, dict) or set(payload) != _READY_PAYLOAD_KEYS:
+            raise ValueError("invalid ready payload fields")
+        identity = payload["identity"]
+        connection = payload["connection"]
+        if not isinstance(identity, dict) or set(identity) != _READY_IDENTITY_KEYS:
+            raise ValueError("invalid ready identity fields")
+        if (
+            not _is_safe_text(identity["app_id"])
+            or not _is_safe_identifier(identity["open_id"], prefix="ou_")
+            or not _is_safe_identifier(payload["connection_id"], prefix="conn_")
+        ):
+            raise ValueError("invalid ready authority identity")
+        if (
+            not isinstance(connection, dict)
+            or set(connection) != _READY_CONNECTION_KEYS
+            or connection["observed"] is not True
+            or connection["secure"] is not True
+            or not _is_safe_text(connection["sdk_connection_id"])
+            or not _is_safe_text(connection["service_id"])
+        ):
+            raise ValueError("invalid ready connection proof")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProtocolError("invalid employee ready frame") from exc
+
+
+def _is_safe_text(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= 256
+        and value == value.strip()
+        and not any(ord(character) < 32 or ord(character) == 127 for character in value)
+    )
+
+
+def _is_safe_identifier(value: Any, *, prefix: str) -> bool:
+    return (
+        _is_safe_text(value)
+        and isinstance(value, str)
+        and value.startswith(prefix)
+        and re.fullmatch(r"[A-Za-z0-9_-]+", value) is not None
+    )
 
 
 def _validate_send_payload(frame: ChannelFrame) -> None:

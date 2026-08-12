@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -34,6 +35,7 @@ from src.autonomous.provisioning.channel_protocol import (
     decode_frame,
     encode_bootstrap,
     encode_frame,
+    validate_ready_payload,
 )
 from src.autonomous.supervisor.channel_models import (
     ChannelProcessState,
@@ -905,7 +907,11 @@ class EmployeeChannelSupervisor:
                     error_code="worker-exited",
                 )
                 runtime.ready.set()
-            return runtime.status
+            return replace(
+                runtime.status,
+                identity=deepcopy(runtime.status.identity),
+                ready_metadata=deepcopy(runtime.status.ready_metadata),
+            )
 
     def close(self) -> None:
         """Stop all owned children and make admission permanently closed."""
@@ -1008,8 +1014,12 @@ class EmployeeChannelSupervisor:
 
     def _accept_frame(self, runtime: _Runtime, frame: ChannelFrame) -> None:
         if frame.frame_type is FrameType.READY:
-            identity = frame.payload.get("identity")
-            if not isinstance(identity, dict):
+            try:
+                validate_ready_payload(frame.payload)
+                identity = frame.payload["identity"]
+                if identity["app_id"] != runtime.status.app_id:
+                    raise ProtocolError("READY app identity does not match runtime")
+            except (KeyError, ProtocolError, TypeError):
                 with self._lock:
                     runtime.status = replace(runtime.status, error_code="invalid-ready")
                 return
@@ -1024,12 +1034,16 @@ class EmployeeChannelSupervisor:
                         runtime.status, error_code="unobserved-connection"
                     )
                 return
-            metadata = {key: value for key, value in frame.payload.items() if key != "identity"}
+            metadata = {
+                key: deepcopy(value)
+                for key, value in frame.payload.items()
+                if key != "identity"
+            }
             with self._lock:
                 runtime.status = replace(
                     runtime.status,
                     state=ChannelProcessState.READY,
-                    identity=dict(identity),
+                    identity=deepcopy(identity),
                     ready_metadata=metadata,
                     ready_at=time.time(),
                     error_code="",
