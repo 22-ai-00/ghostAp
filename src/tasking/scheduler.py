@@ -209,6 +209,7 @@ class TaskScheduler:
     }
     _TERMINAL_STATUSES = frozenset({TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED})
     _REAP_DEFAULT_MAX_AGE = 300.0
+    _RUN_ID_GENERATION_ATTEMPTS = 16
 
     def __init__(
         self,
@@ -393,7 +394,12 @@ class TaskScheduler:
             if rl and not rl.acquire(1, blocking=False):
                 raise RateLimitExceededException(f"Rate limit exceeded for task type {spec.task_type}")
 
-            run_id = str(uuid.uuid4())[:10]
+            for _attempt in range(self._RUN_ID_GENERATION_ATTEMPTS):
+                run_id = uuid.uuid4().hex
+                if run_id not in self._states:
+                    break
+            else:
+                raise RuntimeError("TaskScheduler could not allocate a unique run_id")
             state = TaskRunState(
                 spec=spec,
                 run_id=run_id,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -212,6 +213,198 @@ def test_concurrent_submission_is_thread_safe_and_serial_per_queue() -> None:
         assert max(max_by_key.values()) == 1
         assert len(scheduler.list_tasks(include_done=True, limit=100)) == len(handles)
     finally:
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_concurrent_submissions_with_shared_uuid_prefix_keep_unique_full_run_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_count = 8
+    generated_ids = iter(
+        scheduler_module.uuid.UUID(f"12345678-9000-4000-8000-{index:012x}") for index in range(task_count)
+    )
+    id_lock = threading.Lock()
+
+    def next_uuid():
+        with id_lock:
+            return next(generated_ids)
+
+    monkeypatch.setattr(scheduler_module.uuid, "uuid4", next_uuid)
+    scheduler, _events = _scheduler(max_concurrent=1, per_key_concurrency=1)
+    submissions_ready = threading.Barrier(task_count, timeout=3)
+    release = threading.Event()
+
+    def submit(index: int):
+        submissions_ready.wait()
+        return scheduler.submit(
+            TaskSpec(chat_id="collision-chat", name=f"collision-{index}"),
+            lambda _ctx: release.wait(timeout=3),
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=task_count) as pool:
+            futures = {index: pool.submit(submit, index) for index in range(task_count)}
+            handles = {index: future.result(timeout=3) for index, future in futures.items()}
+
+        assert len({handle.run_id for handle in handles.values()}) == task_count
+        assert all(len(handle.run_id) == 32 for handle in handles.values())
+        for index, handle in handles.items():
+            state = scheduler.get_state(handle.run_id)
+            assert state is not None
+            assert state.spec.name == f"collision-{index}"
+    finally:
+        release.set()
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_exact_run_id_collision_retries_without_crossing_cancel_state_or_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duplicate = scheduler_module.uuid.UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    replacement = scheduler_module.uuid.UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+    generated_ids = iter((duplicate, duplicate, replacement))
+    monkeypatch.setattr(scheduler_module.uuid, "uuid4", lambda: next(generated_ids))
+
+    scheduler, events = _scheduler(
+        max_concurrent=1,
+        per_key_concurrency=1,
+        system_concurrency=1,
+    )
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    observed_canceled: dict[str, bool] = {}
+
+    def block(name: str, started: threading.Event, release: threading.Event):
+        def run(ctx) -> None:
+            started.set()
+            release.wait(timeout=3)
+            observed_canceled[name] = ctx.cancel_token.is_canceled
+            ctx.check_canceled()
+
+        return run
+
+    try:
+        first = scheduler.submit(
+            TaskSpec(
+                chat_id="collision-chat",
+                queue_key="collision:first",
+                project_id="first-project",
+                task_id="collision-first",
+                name="first",
+            ),
+            block("first", first_started, release_first),
+        )
+        assert first_started.wait(timeout=1)
+        second = scheduler.submit(
+            TaskSpec(
+                chat_id="collision-chat",
+                project_id="second-project",
+                task_id="collision-second",
+                name="second",
+                is_system_command=True,
+            ),
+            block("second", second_started, release_second),
+        )
+        assert second_started.wait(timeout=1)
+
+        assert first.cancel() is True
+        release_second.set()
+        assert events.wait_for(second.run_id, TaskStatus.SUCCEEDED)
+        release_first.set()
+        assert events.wait_for(first.run_id, TaskStatus.CANCELED)
+        assert observed_canceled == {"second": False, "first": True}
+        assert first.run_id == duplicate.hex
+        assert second.run_id == replacement.hex
+
+        first_state = scheduler.get_state_by_task_id("collision-first", "collision-chat")
+        second_state = scheduler.get_state_by_task_id("collision-second", "collision-chat")
+        assert first_state is not None
+        assert second_state is not None
+        assert first_state.run_id == first.run_id
+        assert second_state.run_id == second.run_id
+        assert first_state.status is TaskStatus.CANCELED
+        assert second_state.status is TaskStatus.SUCCEEDED
+        assert scheduler.wait_for_idle(timeout=1)
+
+        with scheduler._lock:
+            assert scheduler._running_total_normal == 0
+            assert scheduler._running_total_system == 0
+            assert scheduler._active_run_ids == set()
+            assert scheduler._running_by_key == {}
+            assert scheduler._running_by_project == {}
+            assert scheduler._pending_normal == 0
+            assert scheduler._pending_system == 0
+    finally:
+        release_first.set()
+        release_second.set()
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_run_id_collision_retry_exhaustion_leaves_scheduler_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    duplicate = scheduler_module.uuid.UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+    recovery = scheduler_module.uuid.UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+    monkeypatch.setattr(scheduler_module.uuid, "uuid4", lambda: duplicate)
+    scheduler, events = _scheduler(max_concurrent=1, per_key_concurrency=1)
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def block_first(_ctx) -> None:
+        first_started.set()
+        release_first.wait(timeout=3)
+
+    try:
+        first = scheduler.submit(
+            TaskSpec(chat_id="collision-running", name="collision-running"),
+            block_first,
+        )
+        assert first_started.wait(timeout=1)
+
+        collision_calls = 0
+
+        def repeated_collision():
+            nonlocal collision_calls
+            collision_calls += 1
+            if collision_calls > 100:
+                raise AssertionError("run_id allocation did not stop")
+            return duplicate
+
+        monkeypatch.setattr(scheduler_module.uuid, "uuid4", repeated_collision)
+        with pytest.raises(RuntimeError, match="unique run_id"):
+            scheduler.submit(
+                TaskSpec(
+                    chat_id="collision-rejected",
+                    project_id="collision-rejected-project",
+                    task_id="collision-rejected-task",
+                    name="collision-rejected",
+                ),
+                lambda _ctx: None,
+            )
+
+        with scheduler._lock:
+            assert len(scheduler._states) == 1
+            assert "collision-rejected" not in scheduler._by_chat
+            assert "collision-rejected-project" not in scheduler._by_project
+            assert "collision-rejected-task" not in scheduler._by_task_id
+            assert scheduler._pending_normal == 0
+
+        monkeypatch.setattr(scheduler_module.uuid, "uuid4", lambda: recovery)
+        queued = scheduler.submit(
+            TaskSpec(chat_id="collision-recovery", name="collision-recovery"),
+            lambda _ctx: None,
+        )
+        assert queued.cancel() is True
+        assert events.wait_for(queued.run_id, TaskStatus.CANCELED)
+        assert scheduler.get_state(first.run_id).status is TaskStatus.RUNNING
+
+        release_first.set()
+        assert events.wait_for(first.run_id, TaskStatus.SUCCEEDED)
+        assert scheduler.wait_for_idle(timeout=1)
+    finally:
+        release_first.set()
         scheduler.stop(shutdown_executor=True)
 
 
