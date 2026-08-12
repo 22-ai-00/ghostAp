@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -26,6 +29,7 @@ from .models import (
     EmployeeIngressAck,
     EmployeeIngressMetadata,
     EmployeeIngressPayload,
+    IngressAcceptance,
     IngressDisposition,
 )
 from .projection import (
@@ -75,6 +79,8 @@ class EmployeeKeyring(Protocol):
 class EmployeeIngressService:
     """Own one encrypted BlobStore and anchor ingress before returning an ACK."""
 
+    _MAX_ACCEPTANCE_WAITERS = 256
+
     def __init__(
         self,
         *,
@@ -97,6 +103,11 @@ class EmployeeIngressService:
         self._active_key_id = active_key_id
         self._mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._shared_blob_mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._transport_message_index: dict[tuple[str, ...], str] = {}
+        self._acceptance_waiters: dict[
+            tuple[str, ...],
+            set[threading.Event],
+        ] = {}
         self._retained_shared_blob_ids: set[str] = set()
         self._admission_closed = False
         self._closed = False
@@ -199,6 +210,7 @@ class EmployeeIngressService:
                 )
         self._state.cursor_sequence = frame.sequence
         self._state.cursor_hash = frame.frame_hash
+        self._index_accepted_frame_unlocked(frame)
 
     def close(self) -> None:
         """Close only the ingress-owned BlobStore; the writer has another owner."""
@@ -207,6 +219,7 @@ class EmployeeIngressService:
             if self._closed:
                 return
             self._closed = True
+            self._wake_all_acceptance_waiters_unlocked()
             self._blob_store.close()
 
     def stop_admission(self) -> None:
@@ -215,6 +228,79 @@ class EmployeeIngressService:
         with self._mutex:
             self._ensure_open_unlocked()
             self._admission_closed = True
+            self._wake_all_acceptance_waiters_unlocked()
+
+    def wait_for_anchored_message_acceptance(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        bot_principal_id: str,
+        app_id: str,
+        event_type: str,
+        chat_id: str,
+        message_id: str,
+        timeout: float,
+    ) -> IngressAcceptance | None:
+        """Wait for one exact transport message to reach anchored acceptance.
+
+        The lookup uses only secret-free metadata indexes.  Registration and
+        the initial projection check share the ingress mutex with ``accept``;
+        therefore accept-before-register and register-before-accept cannot
+        lose a wakeup.  A stopped/closed service releases waiters fail-closed.
+        """
+
+        key = self._transport_message_key(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            bot_principal_id=bot_principal_id,
+            app_id=app_id,
+            event_type=event_type,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or float(timeout) < 0
+            or float(timeout) > 30
+        ):
+            raise ValueError("acceptance wait timeout is invalid")
+        deadline = time.monotonic() + float(timeout)
+        waiter = threading.Event()
+        registered = False
+        with self._mutex:
+            if self._closed:
+                return None
+            self._ensure_open_unlocked()
+            self._synchronize_projection_unlocked()
+            observed = self._acceptance_for_key_unlocked(key)
+            if observed is not None or self._admission_closed:
+                return observed
+            waiter_count = sum(
+                len(waiters) for waiters in self._acceptance_waiters.values()
+            )
+            if waiter_count >= self._MAX_ACCEPTANCE_WAITERS:
+                return None
+            self._acceptance_waiters.setdefault(key, set()).add(waiter)
+            registered = True
+        try:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining:
+                waiter.wait(remaining)
+            with self._mutex:
+                if not self._closed:
+                    self._synchronize_projection_unlocked()
+                return self._acceptance_for_key_unlocked(key)
+        finally:
+            if registered:
+                with self._mutex:
+                    waiters = self._acceptance_waiters.get(key)
+                    if waiters is not None:
+                        waiters.discard(waiter)
+                        if not waiters:
+                            self._acceptance_waiters.pop(key, None)
 
 
     def accept(
@@ -244,6 +330,7 @@ class EmployeeIngressService:
             existing = self._state.by_dedup_key.get(metadata.dedup_key)
             if existing is not None:
                 self._verify_duplicate_unlocked(existing, metadata, payload)
+                self._index_acceptance_unlocked(existing)
                 return self._ack(
                     existing,
                     metadata,
@@ -506,6 +593,7 @@ class EmployeeIngressService:
         self._state.closed_employees = fresh.closed_employees
         self._state.cursor_sequence = fresh.cursor_sequence
         self._state.cursor_hash = fresh.cursor_hash
+        self._rebuild_transport_message_index_unlocked()
 
     def _apply_frame_unlocked(self, result: CommitResult) -> None:
         frame = result.frame
@@ -519,6 +607,129 @@ class EmployeeIngressService:
                 )
         self._state.cursor_sequence = frame.sequence
         self._state.cursor_hash = frame.frame_hash
+        self._index_accepted_frame_unlocked(frame)
+
+    @staticmethod
+    def _transport_message_key(
+        *,
+        tenant_key: str,
+        agent_id: str,
+        bot_principal_id: str,
+        app_id: str,
+        event_type: str,
+        chat_id: str,
+        message_id: str,
+    ) -> tuple[str, ...]:
+        values = (
+            tenant_key,
+            agent_id,
+            bot_principal_id,
+            app_id,
+            event_type,
+            chat_id,
+            message_id,
+        )
+        safe_identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
+        if any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > 256
+            or safe_identifier.fullmatch(value) is None
+            for value in values
+        ):
+            raise ValueError("transport message acceptance key is invalid")
+        if (
+            not agent_id.startswith("agt_")
+            or not bot_principal_id.startswith("bot_")
+            or not app_id.startswith("cli_")
+            or len(chat_id) != 67
+            or not chat_id.startswith("oc_")
+            or len(message_id) != 67
+            or not message_id.startswith("om_")
+            or any(character not in "0123456789abcdef" for character in chat_id[3:])
+            or any(character not in "0123456789abcdef" for character in message_id[3:])
+        ):
+            raise ValueError("transport message acceptance binding is invalid")
+        return values
+
+    @classmethod
+    def _transport_message_key_for_record(
+        cls,
+        record: IngressRecord,
+    ) -> tuple[str, ...] | None:
+        metadata = record.metadata
+        try:
+            return cls._transport_message_key(
+                tenant_key=metadata.tenant_key,
+                agent_id=metadata.agent_id,
+                bot_principal_id=metadata.bot_principal_id,
+                app_id=metadata.app_id,
+                event_type=metadata.event_type,
+                chat_id=metadata.chat_id,
+                message_id=metadata.message_id,
+            )
+        except ValueError:
+            # Internal/team envelopes and legacy records can carry raw-looking
+            # coordinates.  They are deliberately outside this proof index.
+            return None
+
+    def _acceptance_for_key_unlocked(
+        self,
+        key: tuple[str, ...],
+    ) -> IngressAcceptance | None:
+        acceptance_id = self._transport_message_index.get(key)
+        record = self._state.by_acceptance_id.get(acceptance_id or "")
+        if record is None or self._transport_message_key_for_record(record) != key:
+            return None
+        return record.acceptance
+
+    def _index_acceptance_unlocked(self, record: IngressRecord) -> None:
+        key = self._transport_message_key_for_record(record)
+        if key is None:
+            return
+        existing_id = self._transport_message_index.get(key)
+        existing = self._state.by_acceptance_id.get(existing_id or "")
+        if (
+            existing is None
+            or record.acceptance.journal_sequence
+            < existing.acceptance.journal_sequence
+        ):
+            self._transport_message_index[key] = record.acceptance.acceptance_id
+        for waiter in self._acceptance_waiters.pop(key, ()):
+            waiter.set()
+
+    def _index_accepted_frame_unlocked(self, frame: TransactionFrame) -> None:
+        for event in frame.events:
+            if event.event_type != "employee.ingress.accepted":
+                continue
+            acceptance_id = event.payload.get("acceptance_id")
+            record = self._state.by_acceptance_id.get(
+                acceptance_id if isinstance(acceptance_id, str) else ""
+            )
+            if record is not None:
+                self._index_acceptance_unlocked(record)
+
+    def _rebuild_transport_message_index_unlocked(self) -> None:
+        self._transport_message_index.clear()
+        records = sorted(
+            self._state.by_acceptance_id.values(),
+            key=lambda record: (
+                record.acceptance.journal_sequence,
+                record.acceptance.acceptance_id,
+            ),
+        )
+        for record in records:
+            self._index_acceptance_unlocked(record)
+
+    def _wake_all_acceptance_waiters_unlocked(self) -> None:
+        waiters = tuple(
+            waiter
+            for keyed in self._acceptance_waiters.values()
+            for waiter in keyed
+        )
+        self._acceptance_waiters.clear()
+        for waiter in waiters:
+            waiter.set()
 
     def _commit_unlocked(self, aggregate_id: str, event: JournalEvent) -> CommitResult:
         result = self._writer.commit(

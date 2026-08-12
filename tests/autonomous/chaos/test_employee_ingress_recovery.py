@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import multiprocessing
 import secrets
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -27,6 +29,10 @@ from src.autonomous.journal.writer import JournalWriter
 HMAC_KEY = b"employee-ingress-chaos-hmac-key-32"
 DATA_KEY = b"employee-ingress-data-key-32byte"
 IPC_ACK_BOUND_SECONDS = 1.5
+
+
+def _transport_index(prefix: str, raw: str) -> str:
+    return prefix + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _payload() -> EmployeeIngressPayload:
@@ -184,6 +190,274 @@ def test_restart_replay_returns_stable_acceptance_for_new_generation(
     assert replay.channel_generation == 9
     assert replay.connection_id == "conn_restart"
     assert len(tuple(writer.replay())) == 1
+    service.close()
+    writer.close()
+
+
+def test_anchored_message_acceptance_is_queryable_before_waiter_registration(
+    tmp_path: Path,
+) -> None:
+    service, writer, _blob_store = _service(tmp_path)
+    payload = _payload()
+    metadata = _metadata(
+        payload,
+        message_id=_transport_index("om_", "om_remote_message"),
+        chat_id=_transport_index("oc_", "oc_remote_chat"),
+    )
+    ack = service.accept(metadata, payload, request_id="req_anchored_lookup")
+
+    observed = service.wait_for_anchored_message_acceptance(
+        tenant_key=metadata.tenant_key,
+        agent_id=metadata.agent_id,
+        bot_principal_id=metadata.bot_principal_id,
+        app_id=metadata.app_id,
+        event_type="im.message.receive_v1",
+        chat_id=metadata.chat_id,
+        message_id=metadata.message_id,
+        timeout=0,
+    )
+
+    assert observed == ack.acceptance
+    assert observed.journal_sequence == writer.anchor.read().sequence
+    assert observed.journal_frame_hash == writer.anchor.read().frame_hash
+    service.close()
+    writer.close()
+
+
+def test_message_acceptance_waiter_has_no_accept_before_register_lost_wakeup(
+    tmp_path: Path,
+) -> None:
+    service, writer, _blob_store = _service(tmp_path)
+    payload = _payload()
+    metadata = _metadata(
+        payload,
+        message_id=_transport_index("om_", "om_waited_message"),
+        chat_id=_transport_index("oc_", "oc_waited_chat"),
+    )
+    started = threading.Event()
+    completed = threading.Event()
+    observed = []
+
+    def wait_for_acceptance() -> None:
+        started.set()
+        observed.append(
+            service.wait_for_anchored_message_acceptance(
+                tenant_key=metadata.tenant_key,
+                agent_id=metadata.agent_id,
+                bot_principal_id=metadata.bot_principal_id,
+                app_id=metadata.app_id,
+                event_type="im.message.receive_v1",
+                chat_id=metadata.chat_id,
+                message_id=metadata.message_id,
+                timeout=1.0,
+            )
+        )
+        completed.set()
+
+    waiter = threading.Thread(target=wait_for_acceptance)
+    waiter.start()
+    assert started.wait(0.5)
+    ack = service.accept(metadata, payload, request_id="req_waited")
+    assert completed.wait(0.5)
+    waiter.join(timeout=0.5)
+
+    assert observed == [ack.acceptance]
+    service.close()
+    writer.close()
+
+
+def test_message_acceptance_index_replays_across_restart_and_reconnect(
+    tmp_path: Path,
+) -> None:
+    anchor = MemoryAnchor()
+    service, writer, _blob_store = _service(tmp_path, anchor=anchor)
+    payload = _payload()
+    metadata = _metadata(
+        payload,
+        message_id=_transport_index("om_", "om_reconnected_message"),
+        chat_id=_transport_index("oc_", "oc_reconnected_chat"),
+    )
+    first = service.accept(metadata, payload, request_id="req_generation_3")
+    service.close()
+    writer.close()
+
+    writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=anchor,
+        hmac_key=HMAC_KEY,
+        writer_epoch=2,
+    )
+    service = EmployeeIngressService(
+        writer=writer,
+        blob_store=_store(tmp_path / "ingress-blobs"),
+        ingress_state=IngressProjectionState(),
+        active_key_id="k1",
+    )
+    replay = service.accept(
+        _metadata(
+            payload,
+            message_id=metadata.message_id,
+            chat_id=metadata.chat_id,
+            channel_generation=9,
+            connection_id="conn_reconnected",
+        ),
+        payload,
+        request_id="req_generation_9",
+    )
+
+    observed = service.wait_for_anchored_message_acceptance(
+        tenant_key=metadata.tenant_key,
+        agent_id=metadata.agent_id,
+        bot_principal_id=metadata.bot_principal_id,
+        app_id=metadata.app_id,
+        event_type=metadata.event_type,
+        chat_id=metadata.chat_id,
+        message_id=metadata.message_id,
+        timeout=0,
+    )
+
+    assert replay.duplicate is True
+    assert replay.channel_generation == 9
+    assert replay.connection_id == "conn_reconnected"
+    assert observed == first.acceptance == replay.acceptance
+    service.close()
+    writer.close()
+
+
+def test_transport_message_index_keeps_first_acceptance_when_event_ids_differ(
+    tmp_path: Path,
+) -> None:
+    service, writer, _blob_store = _service(tmp_path)
+    payload = _payload()
+    coordinates = {
+        "message_id": _transport_index("om_", "om_same_transport_message"),
+        "chat_id": _transport_index("oc_", "oc_same_transport_chat"),
+    }
+    first = service.accept(
+        _metadata(payload, event_id="evt_first", **coordinates),
+        payload,
+        request_id="req_first_event",
+    )
+    service.accept(
+        _metadata(payload, event_id="evt_second", **coordinates),
+        payload,
+        request_id="req_second_event",
+    )
+
+    observed = service.wait_for_anchored_message_acceptance(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        bot_principal_id="bot_alpha",
+        app_id="cli_alpha",
+        event_type="im.message.receive_v1",
+        chat_id=coordinates["chat_id"],
+        message_id=coordinates["message_id"],
+        timeout=0,
+    )
+
+    assert observed == first.acceptance
+    service.close()
+    writer.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tenant_key", "tenant_other"),
+        ("agent_id", "agt_other"),
+        ("bot_principal_id", "bot_other"),
+        ("app_id", "cli_other"),
+        ("event_type", "im.chat.member.user.added_v1"),
+        ("chat_id", _transport_index("oc_", "oc_other")),
+        ("message_id", _transport_index("om_", "om_other")),
+    ],
+)
+def test_message_acceptance_proof_rejects_every_mismatched_transport_binding(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    service, writer, _blob_store = _service(tmp_path)
+    payload = _payload()
+    metadata = _metadata(
+        payload,
+        message_id=_transport_index("om_", "om_bound_message"),
+        chat_id=_transport_index("oc_", "oc_bound_chat"),
+    )
+    service.accept(metadata, payload, request_id="req_bound")
+    query = {
+        "tenant_key": metadata.tenant_key,
+        "agent_id": metadata.agent_id,
+        "bot_principal_id": metadata.bot_principal_id,
+        "app_id": metadata.app_id,
+        "event_type": metadata.event_type,
+        "chat_id": metadata.chat_id,
+        "message_id": metadata.message_id,
+        "timeout": 0,
+    }
+    query[field] = value
+
+    assert service.wait_for_anchored_message_acceptance(**query) is None
+    service.close()
+    writer.close()
+
+
+def test_message_acceptance_waiter_is_released_when_admission_stops(
+    tmp_path: Path,
+) -> None:
+    service, writer, _blob_store = _service(tmp_path)
+    result = []
+    started = threading.Event()
+
+    def wait_for_acceptance() -> None:
+        started.set()
+        result.append(
+            service.wait_for_anchored_message_acceptance(
+                tenant_key="tenant_1",
+                agent_id="agt_alpha",
+                bot_principal_id="bot_alpha",
+                app_id="cli_alpha",
+                event_type="im.message.receive_v1",
+                chat_id=_transport_index("oc_", "oc_never"),
+                message_id=_transport_index("om_", "om_never"),
+                timeout=5.0,
+            )
+        )
+
+    waiter = threading.Thread(target=wait_for_acceptance)
+    waiter.start()
+    assert started.wait(0.5)
+    service.stop_admission()
+    waiter.join(timeout=0.5)
+
+    assert not waiter.is_alive()
+    assert result == [None]
+    service.close()
+    writer.close()
+
+
+def test_message_acceptance_waiters_are_bounded_fail_closed(tmp_path: Path) -> None:
+    service, writer, _blob_store = _service(tmp_path)
+    parked = {threading.Event() for _ in range(service._MAX_ACCEPTANCE_WAITERS)}
+    service._acceptance_waiters = {
+        ("occupied",): parked,
+    }
+
+    started = time.monotonic()
+    observed = service.wait_for_anchored_message_acceptance(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        bot_principal_id="bot_alpha",
+        app_id="cli_alpha",
+        event_type="im.message.receive_v1",
+        chat_id=_transport_index("oc_", "oc_overloaded"),
+        message_id=_transport_index("om_", "om_overloaded"),
+        timeout=5.0,
+    )
+
+    assert observed is None
+    assert time.monotonic() - started < 0.5
+    assert service._acceptance_waiters == {("occupied",): parked}
     service.close()
     writer.close()
 

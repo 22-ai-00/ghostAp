@@ -507,6 +507,18 @@ class EmployeeRecoverySummary:
     failed: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class ReadyEmployeeIngressTarget:
+    """Frozen READY authority used to correlate one cross-App handoff."""
+
+    tenant_key: str
+    chat_id: str
+    agent_id: str
+    bot_principal_id: str
+    app_id: str
+    bot_open_id: str
+
+
 class EmployeeDepartmentRuntime:
     """Own Journal, Vault, Saga, Channel children and the activity loop."""
 
@@ -2154,6 +2166,39 @@ class EmployeeDepartmentRuntime:
         deliberately never compared with Feishu ``open_id`` values.
         """
 
+        return frozenset(
+            self._ready_employee_ingress_targets(
+                tenant_key=tenant_key,
+                chat_id=chat_id,
+            )
+        )
+
+    def resolve_ready_employee_bot_target(
+        self,
+        *,
+        tenant_key: str,
+        chat_id: str,
+        bot_open_id: str,
+    ) -> ReadyEmployeeIngressTarget | None:
+        """Freeze one unambiguous READY employee transport binding."""
+
+        if (
+            not isinstance(bot_open_id, str)
+            or not bot_open_id.startswith("ou_")
+            or len(bot_open_id) > 256
+        ):
+            return None
+        return self._ready_employee_ingress_targets(
+            tenant_key=tenant_key,
+            chat_id=chat_id,
+        ).get(bot_open_id)
+
+    def _ready_employee_ingress_targets(
+        self,
+        *,
+        tenant_key: str | None = None,
+        chat_id: str | None = None,
+    ) -> dict[str, ReadyEmployeeIngressTarget]:
         scoped = tenant_key is not None or chat_id is not None
         if scoped and (
             not isinstance(tenant_key, str)
@@ -2161,13 +2206,14 @@ class EmployeeDepartmentRuntime:
             or not isinstance(chat_id, str)
             or not chat_id
         ):
-            return frozenset()
+            return {}
         service = self._service
         channels = self._channels
         if service is None or channels is None:
-            return frozenset()
+            return {}
         projection = service.synchronize_projection()
-        result: set[str] = set()
+        result: dict[str, ReadyEmployeeIngressTarget] = {}
+        ambiguous: set[str] = set()
         for employee in projection.employees.values():
             if (
                 employee.state is not EmployeeState.ACTIVE
@@ -2188,6 +2234,8 @@ class EmployeeDepartmentRuntime:
             open_id = identity.get("open_id") if isinstance(identity, Mapping) else None
             if (
                 principal is not None
+                and principal.tenant_key == employee.tenant_key
+                and principal.agent_id == employee.agent_id
                 and getattr(status, "state", None) is ChannelProcessState.READY
                 and getattr(status, "agent_id", None) == employee.agent_id
                 and getattr(status, "tenant_key", None) == employee.tenant_key
@@ -2197,8 +2245,70 @@ class EmployeeDepartmentRuntime:
                 and isinstance(open_id, str)
                 and open_id.startswith("ou_")
             ):
-                result.add(open_id)
-        return frozenset(result)
+                target = ReadyEmployeeIngressTarget(
+                    tenant_key=employee.tenant_key,
+                    chat_id=chat_id or "",
+                    agent_id=employee.agent_id,
+                    bot_principal_id=employee.bot_principal_id,
+                    app_id=principal.app_id,
+                    bot_open_id=open_id,
+                )
+                existing = result.get(open_id)
+                if existing is not None and existing != target:
+                    ambiguous.add(open_id)
+                else:
+                    result[open_id] = target
+        for open_id in ambiguous:
+            result.pop(open_id, None)
+        return result
+
+    def wait_for_employee_message_acceptance(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        bot_principal_id: str,
+        app_id: str,
+        chat_id: str,
+        message_id: str,
+        timeout: float,
+    ) -> bool:
+        """Prove that one employee transport anchored this exact message."""
+
+        ingress = self._ingress
+        if ingress is None:
+            return False
+        values = (tenant_key, agent_id, bot_principal_id, app_id, chat_id, message_id)
+        safe_identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
+        if any(
+            not isinstance(value, str)
+            or not value
+            or len(value) > 256
+            or safe_identifier.fullmatch(value) is None
+            for value in values
+        ) or (
+            not agent_id.startswith("agt_")
+            or not bot_principal_id.startswith("bot_")
+            or not app_id.startswith("cli_")
+            or not chat_id.startswith("oc_")
+            or not message_id.startswith("om_")
+        ):
+            return False
+        indexed_chat_id = "oc_" + hashlib.sha256(chat_id.encode("utf-8")).hexdigest()
+        indexed_message_id = "om_" + hashlib.sha256(
+            message_id.encode("utf-8")
+        ).hexdigest()
+        acceptance = ingress.wait_for_anchored_message_acceptance(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            bot_principal_id=bot_principal_id,
+            app_id=app_id,
+            event_type="im.message.receive_v1",
+            chat_id=indexed_chat_id,
+            message_id=indexed_message_id,
+            timeout=timeout,
+        )
+        return acceptance is not None
 
     def _employee_ingress_transport_is_current(
         self,
@@ -4032,4 +4142,8 @@ class EmployeeDepartmentRuntime:
         return self._service
 
 
-__all__ = ["EmployeeDepartmentRuntime", "RuntimeReadiness"]
+__all__ = [
+    "EmployeeDepartmentRuntime",
+    "ReadyEmployeeIngressTarget",
+    "RuntimeReadiness",
+]

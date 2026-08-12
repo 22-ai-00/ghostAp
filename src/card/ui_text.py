@@ -467,6 +467,10 @@ UI_TEXT = {
     "ws_backpressure_generic": "⚠️ 系统繁忙，请稍后再试",
     "ws_message_timeout": "⏳ 处理消息超时，请稍后重试",
     "ws_message_internal_error": "❌ 处理消息时发生内部错误，请稍后重试",
+    "ws_employee_handoff_unconfirmed": (
+        "⚠️ 尚未确认目标员工已接收该命令；GhostAP 主 Bot 未执行。"
+        "请查看员工回复后再决定是否重试。"
+    ),
     "ws_unsupported_msg_type": "⚠️ 目前仅支持文本、图片和富文本消息",
     "ws_image_only_prefix": "请查看并理解以下图片",
     "ws_system_cmd_gate_blocked": "⏳ 系统指令处理中，按钮暂不可用，请稍后重试",

@@ -19,6 +19,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -157,6 +158,19 @@ def _configured_managed_group_owner_id(settings: Any) -> str:
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("ghostap.audit")
 _LARK_MENTION_PLACEHOLDER_RE = re.compile(r"@_user_[0-9]+|@all")
+_EMPLOYEE_HANDOFF_GRACE_SECONDS = 0.25
+_EMPLOYEE_HANDOFF_MAX_SECONDS = 3.0
+
+
+@dataclass(frozen=True, slots=True)
+class _EmployeeTargetedCommand:
+    tenant_key: str
+    chat_id: str
+    message_id: str
+    agent_id: str
+    bot_principal_id: str
+    app_id: str
+    bot_open_id: str
 
 
 def _employee_hire_status_text(employee_name: str, status: str) -> str | None:
@@ -1634,23 +1648,23 @@ class FeishuWSClient:
             return None
         return message_id, chat_id, chat_type, sender_id
 
-    def _is_ready_employee_targeted_group_command(
+    def _resolve_ready_employee_targeted_group_command(
         self,
         data: P2ImMessageReceiveV1,
-    ) -> bool:
-        """Recognize a slash command addressed only to one READY employee Bot."""
+    ) -> _EmployeeTargetedCommand | None:
+        """Freeze a slash command addressed only to one READY employee Bot."""
 
         try:
             message = data.event.message
             event_tenant_key = data.header.tenant_key
         except (AttributeError, TypeError):
-            return False
+            return None
         chat_id = getattr(message, "chat_id", None)
         if message.chat_type != "group" or message.message_type != "text":
-            return False
+            return None
         mentions = getattr(message, "mentions", None)
         if not isinstance(mentions, (list, tuple)) or len(mentions) != 1:
-            return False
+            return None
         mention = mentions[0]
         identity = getattr(mention, "id", None)
         mention_key = getattr(mention, "key", None)
@@ -1668,41 +1682,131 @@ class FeishuWSClient:
             or not isinstance(target_open_id, str)
             or not target_open_id.startswith("ou_")
         ):
-            return False
+            return None
         content = getattr(message, "content", None)
         if not isinstance(content, str):
-            return False
+            return None
         try:
             decoded = json.loads(content)
         except (json.JSONDecodeError, TypeError, ValueError):
-            return False
+            return None
         raw_text = decoded.get("text") if isinstance(decoded, dict) else None
         if (
             not isinstance(raw_text, str)
             or _LARK_MENTION_PLACEHOLDER_RE.findall(raw_text) != [mention_key]
         ):
-            return False
+            return None
         addressed = raw_text.lstrip()
         if not addressed.startswith(mention_key):
-            return False
+            return None
         command_text = addressed[len(mention_key) :]
         if not command_text[:1].isspace():
-            return False
+            return None
         if SlashCommandParser.parse(command_text.lstrip()) is None:
-            return False
+            return None
         runtime = getattr(self, "_employee_department_runtime", None)
-        ready_bot_ids = getattr(runtime, "trusted_employee_bot_open_ids", None)
-        if not callable(ready_bot_ids):
-            return False
+        resolve_target = getattr(runtime, "resolve_ready_employee_bot_target", None)
+        if not callable(resolve_target):
+            return None
         try:
-            current = ready_bot_ids(
+            target = resolve_target(
                 tenant_key=event_tenant_key,
                 chat_id=chat_id,
+                bot_open_id=target_open_id,
             )
         except Exception:
             logger.warning("employee Bot identity lookup failed closed", exc_info=True)
-            return False
-        return type(current) is frozenset and target_open_id in current
+            return None
+        agent_id = getattr(target, "agent_id", None)
+        bot_principal_id = getattr(target, "bot_principal_id", None)
+        app_id = getattr(target, "app_id", None)
+        if (
+            getattr(target, "tenant_key", None) != event_tenant_key
+            or getattr(target, "chat_id", None) != chat_id
+            or getattr(target, "bot_open_id", None) != target_open_id
+            or not isinstance(agent_id, str)
+            or not agent_id.startswith("agt_")
+            or not isinstance(bot_principal_id, str)
+            or not bot_principal_id.startswith("bot_")
+            or not isinstance(app_id, str)
+            or not app_id.startswith("cli_")
+        ):
+            return None
+        message_id = getattr(message, "message_id", None)
+        if not isinstance(message_id, str) or not message_id:
+            return None
+        return _EmployeeTargetedCommand(
+            tenant_key=event_tenant_key,
+            chat_id=chat_id,
+            message_id=message_id,
+            agent_id=agent_id,
+            bot_principal_id=bot_principal_id,
+            app_id=app_id,
+            bot_open_id=target_open_id,
+        )
+
+    def _employee_handoff_timeout(self) -> float:
+        configured = getattr(
+            self.settings,
+            "autonomous_employee_ingress_ack_timeout_seconds",
+            1.5,
+        )
+        if (
+            isinstance(configured, bool)
+            or not isinstance(configured, (int, float))
+            or configured <= 0
+        ):
+            configured = 1.5
+        return min(
+            _EMPLOYEE_HANDOFF_MAX_SECONDS,
+            float(configured) + _EMPLOYEE_HANDOFF_GRACE_SECONDS,
+        )
+
+    def _complete_employee_target_handoff(
+        self,
+        target: _EmployeeTargetedCommand,
+    ) -> None:
+        runtime = getattr(self, "_employee_department_runtime", None)
+        wait_for_acceptance = getattr(
+            runtime,
+            "wait_for_employee_message_acceptance",
+            None,
+        )
+        accepted = False
+        if callable(wait_for_acceptance):
+            try:
+                accepted = wait_for_acceptance(
+                    tenant_key=target.tenant_key,
+                    agent_id=target.agent_id,
+                    bot_principal_id=target.bot_principal_id,
+                    app_id=target.app_id,
+                    chat_id=target.chat_id,
+                    message_id=target.message_id,
+                    timeout=self._employee_handoff_timeout(),
+                ) is True
+            except Exception:
+                logger.warning(
+                    "employee targeted command acceptance proof unavailable",
+                    exc_info=True,
+                )
+        if accepted:
+            return
+        self._reply_employee_handoff_unconfirmed(target)
+
+    def _reply_employee_handoff_unconfirmed(
+        self,
+        target: _EmployeeTargetedCommand,
+    ) -> None:
+        try:
+            self._handler_ctx.handlers["coco"].reply_text(
+                target.message_id,
+                UI_TEXT["ws_employee_handoff_unconfirmed"],
+            )
+        except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
+            logger.warning(
+                "employee targeted command handoff warning delivery failed",
+                exc_info=True,
+            )
 
     def _handle_message(self, data: P2ImMessageReceiveV1):
         """飞书消息事件入口：只做轻量前置判断，然后交给 scheduler 异步处理。"""
@@ -1753,9 +1857,8 @@ class FeishuWSClient:
         )
         if not ingress_decision.allowed:
             return
-        if self._is_ready_employee_targeted_group_command(data):
-            return
-        if not self._managed_ingress_action_allowed(
+        employee_target = self._resolve_ready_employee_targeted_group_command(data)
+        if employee_target is None and not self._managed_ingress_action_allowed(
             effective_trust,
             text=text,
             command_match=command_match,
@@ -1829,6 +1932,8 @@ class FeishuWSClient:
 
         control_queue_key = self._build_control_queue_key(chat_id=chat_id, project_id=project_id, text=text)
         queue_key = shell_queue_key or control_queue_key
+        if employee_target is not None:
+            queue_key = f"{chat_id}:employee-handoff"
         if not queue_key and thread_root_id and self.settings.thread_programming_enabled:
             queue_suffix = project_id or "default"
             queue_key = f"{chat_id}:{queue_suffix}:t:{thread_root_id}"
@@ -1852,8 +1957,12 @@ class FeishuWSClient:
             )
 
         with TraceContext(request_id):
-            task_type = "spec_command" if is_spec else "feishu_message"
-            if is_system:
+            task_type = (
+                "employee_target_handoff"
+                if employee_target is not None
+                else ("spec_command" if is_spec else "feishu_message")
+            )
+            if employee_target is None and is_system:
                 tl = (text or "").strip().lower()
                 if tl in {"/help", "/帮助"}:
                     task_type = "system_help"
@@ -1878,16 +1987,23 @@ class FeishuWSClient:
             try:
                 handle = self._scheduler.submit(
                     spec,
-                    lambda ctx, _sf=is_shell_fast, _trust=effective_trust: self._process_message_async(
+                    lambda ctx, _sf=is_shell_fast, _trust=effective_trust, _target=employee_target: self._process_message_async(
                         data,
                         task_ctx=ctx,
                         shell_fast_tracked=_sf,
                         effective_trust=_trust,
+                        employee_target=_target,
                     ),
                 )
-            except (RateLimitExceededException, CircuitBreakerOpenException) as e:
+            except (
+                RateLimitExceededException,
+                CircuitBreakerOpenException,
+                TaskQueueFullError,
+            ) as e:
                 logger.warning(f"Backpressure applied: {get_error_detail(e)}")
-                if is_spec:
+                if employee_target is not None:
+                    self._reply_employee_handoff_unconfirmed(employee_target)
+                elif is_spec:
                     self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_backpressure_spec"])
                 else:
                     self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_backpressure_generic"])
@@ -1935,6 +2051,7 @@ class FeishuWSClient:
         task_ctx=None,
         shell_fast_tracked: bool = False,
         effective_trust: EffectiveTrust | None = None,
+        employee_target: _EmployeeTargetedCommand | None = None,
     ):
         """消息处理主逻辑（运行在 scheduler 线程池中）。
 
@@ -2027,7 +2144,7 @@ class FeishuWSClient:
             )
             if not ingress_decision.allowed:
                 return
-            if not self._managed_ingress_action_allowed(
+            if employee_target is None and not self._managed_ingress_action_allowed(
                 current_trust,
                 text=text,
                 command_match=command_match,
@@ -2039,6 +2156,24 @@ class FeishuWSClient:
             # Validation follows authorization so denied traffic cannot mutate
             # duplicate/expiry state or trigger unsupported-content replies.
             if not self._validate_message(message, request_id):
+                return
+
+            if employee_target is not None:
+                if (
+                    employee_target.tenant_key != _tenant_key
+                    or employee_target.chat_id != chat_id
+                    or employee_target.message_id != message_id
+                ):
+                    audit_logger.warning(
+                        "EMPLOYEE_TARGET_HANDOFF_EVENT_MISMATCH chat_hash=%s",
+                        self._access_identifier_hash(chat_id),
+                    )
+                    return
+                set_current_sender_id(_sender_id)
+                set_current_sender_union_id(_sender_union_id or None)
+                set_current_is_p2p(_is_p2p)
+                set_current_tenant_key(_tenant_key or None)
+                self._complete_employee_target_handoff(employee_target)
                 return
 
             if ingress_decision.operation in {
