@@ -64,6 +64,13 @@ class EmployeeCancellationOutcome:
     changed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class EmployeeActorInspection:
+    status: EmployeeActorStatus
+    mailbox_depth: int
+    active_assignment_id: str = ""
+
+
 class EmployeeActor:
     """One employee mailbox; no two assignments execute concurrently."""
 
@@ -119,6 +126,16 @@ class EmployeeActor:
     def active_assignment_id(self) -> str:
         with self._lock:
             return self._active_id
+
+    def inspect_snapshot(self) -> EmployeeActorInspection:
+        """Return a coarse process-local view without reaping the live session."""
+
+        with self._lock:
+            return EmployeeActorInspection(
+                status=self._status,
+                mailbox_depth=self._queue.qsize(),
+                active_assignment_id=self._active_id,
+            )
 
     def submit(self, assignment: EmployeeAssignment, *, recovered: bool = False) -> str:
         if assignment.bootstrap.session_key.agent_id != self.agent_id:
@@ -387,6 +404,7 @@ class EmployeeActor:
 
 __all__ = [
     "EmployeeActor",
+    "EmployeeActorInspection",
     "EmployeeActorStatus",
     "EmployeeAssignment",
     "EmployeeAssignmentTerminal",

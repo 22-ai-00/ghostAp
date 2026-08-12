@@ -2357,8 +2357,26 @@ class EmployeeDepartmentRuntime:
             value = content.get("text") if isinstance(content, Mapping) else None
             if isinstance(value, str):
                 texts.append(value.strip())
-        if texts == ["/status"]:
-            return finish("terminal", "status_automatic")
+        status_match = (
+            re.fullmatch(r"/status(?:\s+(.+))?", texts[0], re.IGNORECASE)
+            if len(texts) == 1
+            else None
+        )
+        if status_match is not None:
+            # Every employee Bot observes ambient group slash commands.  A
+            # group response here would therefore broadcast one card per
+            # employee.  Only the union-resolved owner P2P lane is an
+            # unambiguous employee control channel.
+            if owner_p2p_requester is None:
+                if isinstance(first, Mapping) and first.get("chat_type") == "group":
+                    return False
+                return finish("ignored", "authority_denied")
+            return self._handle_status_control(
+                acceptance_id=acceptance_id,
+                record=record,
+                payload=payload,
+                has_arguments=status_match.group(1) is not None,
+            )
         data_control = self._parse_data_control(texts)
         if data_control is not None:
             return self._handle_data_control(
@@ -2402,6 +2420,141 @@ class EmployeeDepartmentRuntime:
         finish("terminal", f"stop_{outcome.status}")
         self._drain_employee_outbox_once()
         return True
+
+    def _handle_status_control(
+        self,
+        *,
+        acceptance_id: str,
+        record: Any,
+        payload: EmployeeIngressPayload,
+        has_arguments: bool,
+    ) -> bool:
+        """Publish an owner-scoped, Journal-backed employee status view."""
+
+        ingress = self._ingress
+        lifecycle = self._outbox_lifecycle
+        if ingress is None or lifecycle is None:
+            return False
+        metadata = record.metadata
+        first = (
+            payload.normalized_parts[0]
+            if len(payload.normalized_parts) == 1
+            else None
+        )
+        coordinates = (
+            _bound_remote_coordinates(metadata, first)
+            if isinstance(first, Mapping)
+            else None
+        )
+        if coordinates is None:
+            try:
+                ingress.record_disposition(
+                    acceptance_id,
+                    state="terminal",
+                    reason_code="status_coordinates_invalid",
+                )
+            except IngressConflictError:
+                pass
+            return True
+        remote_chat_id, remote_message_id, remote_root_id = coordinates
+        if has_arguments:
+            summary = "用法：/status"
+            succeeded = False
+            reason = "invalid_arguments"
+        else:
+            try:
+                summary = self._employee_status_summary(
+                    tenant_key=metadata.tenant_key,
+                    agent_id=metadata.agent_id,
+                    chat_id=remote_chat_id,
+                    thread_root_id=remote_root_id,
+                )
+                succeeded = True
+                reason = "completed"
+            except Exception:
+                logger.exception("employee status inspection failed closed")
+                summary = "员工状态暂不可用，请稍后重试。"
+                succeeded = False
+                reason = "unavailable"
+        lifecycle.status_response(
+            tenant_key=metadata.tenant_key,
+            agent_id=metadata.agent_id,
+            chat_id=remote_chat_id,
+            thread_root_message_id=remote_root_id or remote_message_id,
+            command_acceptance_id=acceptance_id,
+            summary=summary,
+            succeeded=succeeded,
+        )
+        try:
+            ingress.record_disposition(
+                acceptance_id,
+                state="terminal",
+                reason_code=f"status_{reason}",
+            )
+        except IngressConflictError:
+            pass
+        self._drain_employee_outbox_once()
+        return True
+
+    def _employee_status_summary(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        chat_id: str,
+        thread_root_id: str,
+    ) -> str:
+        """Combine durable attempt facts with a coarse process-local view."""
+
+        dispatch = self._dispatch
+        employee_runtime = (
+            getattr(dispatch, "employee_runtime", None)
+            if dispatch is not None
+            else None
+        )
+        if employee_runtime is None:
+            raise RuntimeError("employee runtime is unavailable")
+        actor = employee_runtime.inspect(agent_id)
+        status = getattr(actor.status, "value", actor.status)
+        labels = {
+            "recovering": "恢复中",
+            "ready_cold": "空闲（冷会话）",
+            "starting_session": "会话启动中",
+            "ready_warm": "空闲（热会话）",
+            "busy": "执行中",
+            "degraded": "降级",
+            "stopping": "停止中",
+            "stopped": "已停止",
+        }
+        if status not in labels:
+            raise RuntimeError("employee runtime status is invalid")
+        durable = dispatch.scoped_attempt_status(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            chat_id=chat_id,
+            thread_root_id=thread_root_id,
+        )
+        active_count = durable.active_count
+        stopping_count = durable.stopping_count
+        if not active_count:
+            task_view = "当前会话无活动任务"
+        elif active_count == 1 and stopping_count:
+            task_view = "当前会话有 1 个活动任务（停止中）"
+        elif stopping_count:
+            task_view = (
+                f"当前会话有 {active_count} 个活动任务"
+                f"（其中 {stopping_count} 个停止中）"
+            )
+        else:
+            task_view = f"当前会话有 {active_count} 个活动任务"
+        mailbox_depth = getattr(actor, "mailbox_depth", 0)
+        if type(mailbox_depth) is not int or mailbox_depth < 0:
+            raise RuntimeError("employee mailbox depth is invalid")
+        return (
+            f"员工状态：{labels[status]}\n"
+            f"任务：{task_view}\n"
+            f"队列：{mailbox_depth}"
+        )
 
     def _handle_main_bot_group_command_ingress(self, acceptance_id: str) -> bool:
         """Ignore main-Bot slash commands observed by an employee group Bot."""

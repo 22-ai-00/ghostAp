@@ -118,6 +118,57 @@ def test_owner_p2p_dispatches_once_and_replay_preserves_scope(
     harness.close()
 
 
+def test_scoped_attempt_status_synchronizes_latest_journal_head(tmp_path) -> None:
+    harness = _real_coordinator_harness(tmp_path, owner_p2p=True)
+    prepared = harness.coordinator.prepare_next()
+    assert prepared is not None
+    stale_reader = harness.restart()
+
+    before_cancel = stale_reader.scoped_attempt_status(
+        tenant_key=prepared.binding.tenant_key,
+        agent_id=prepared.binding.agent_id,
+        chat_id=prepared.binding.chat_id,
+        thread_root_id=prepared.binding.thread_root_id,
+    )
+    outcome = harness.coordinator.request_cancel(
+        agent_id=prepared.binding.agent_id,
+        chat_id=prepared.binding.chat_id,
+        requester_principal_id=prepared.binding.requester_principal_id,
+        command_acceptance_id="acc_status_cancel",
+    )
+    after_cancel = stale_reader.scoped_attempt_status(
+        tenant_key=prepared.binding.tenant_key,
+        agent_id=prepared.binding.agent_id,
+        chat_id=prepared.binding.chat_id,
+        thread_root_id=prepared.binding.thread_root_id,
+    )
+    last_frame = harness.writer.get_last_frame()
+
+    assert outcome.status == "cancel_requested"
+    assert (before_cancel.active_count, before_cancel.stopping_count) == (1, 0)
+    assert (after_cancel.active_count, after_cancel.stopping_count) == (1, 1)
+    assert last_frame is not None
+    assert after_cancel.journal_sequence == last_frame.sequence
+    assert stale_reader.scoped_attempt_status(
+        tenant_key="tenant_other",
+        agent_id=prepared.binding.agent_id,
+        chat_id=prepared.binding.chat_id,
+    ).active_count == 0
+    assert stale_reader.scoped_attempt_status(
+        tenant_key=prepared.binding.tenant_key,
+        agent_id=prepared.binding.agent_id,
+        chat_id="oc_other",
+    ).active_count == 0
+    assert stale_reader.scoped_attempt_status(
+        tenant_key=prepared.binding.tenant_key,
+        agent_id=prepared.binding.agent_id,
+        chat_id=prepared.binding.chat_id,
+        thread_root_id="om_other_root",
+    ).active_count == 0
+    stale_reader.close()
+    harness.close()
+
+
 def test_owner_p2p_owner_drift_is_rejected_inside_dispatch_guard(
     tmp_path,
     monkeypatch,

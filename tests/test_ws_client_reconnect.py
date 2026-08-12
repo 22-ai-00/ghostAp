@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.feishu.ws_client import (
+    _employee_hire_status_text,
     _employee_hire_status_uuid,
 )
 
@@ -343,6 +344,16 @@ def test_employee_hire_status_uuid_is_stable_per_intent_and_status() -> None:
     assert _employee_hire_status_uuid("hire-intent-1", "active") == expected
     assert _employee_hire_status_uuid("hire-intent-1", "active") == expected
     assert _employee_hire_status_uuid("hire-intent-1", "ready") != expected
+
+
+def test_ready_hire_notice_describes_automatic_enablement() -> None:
+    text = _employee_hire_status_text("Atlas", "ready")
+
+    assert text is not None
+    assert "自动" in text
+    assert "无需手动激活" in text
+    assert "/status" not in text
+    assert "等待激活" not in text
 
 
 def test_main_dispatcher_acknowledges_p2p_chat_entered_event() -> None:

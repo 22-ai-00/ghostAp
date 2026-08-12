@@ -183,11 +183,12 @@ class EmployeeRuntimeSupervisor:
                 EmployeeActorStatus.STOPPED if retired else EmployeeActorStatus.READY_COLD,
                 0,
             )
+        inspected = actor.inspect_snapshot()
         return EmployeeActorSnapshot(
             agent_id,
-            actor.status,
-            actor.mailbox_depth,
-            actor.active_assignment_id,
+            inspected.status,
+            inspected.mailbox_depth,
+            inspected.active_assignment_id,
         )
 
     def submit(self, assignment: EmployeeAssignment) -> str:

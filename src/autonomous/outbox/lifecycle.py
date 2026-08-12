@@ -118,16 +118,15 @@ class EmployeeOutboxLifecycle:
             "forbidden": "权限不足：仅管理员、团队创建者或原任务发起人可停止任务。",
             "ambiguous": "检测到多个活动任务，已拒绝不明确的停止请求。",
         }
-        return self._append_control(
+        return self._terminal_control(
             tenant_key=tenant_key,
             agent_id=agent_id,
             attempt_id=attempt_id,
             chat_id=chat_id,
             thread_root_message_id=thread_root_message_id,
-            version=current.version + 1,
+            current=current,
             state=EmployeeCardState.COMPLETED,
             summary=summaries.get(status, "停止请求已处理。"),
-            created_at=current.created_at,
             command="/stop",
         )
 
@@ -169,6 +168,101 @@ class EmployeeOutboxLifecycle:
             )
         if current.state.terminal:
             return current
+        return self._terminal_control(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            attempt_id=attempt_id,
+            chat_id=chat_id,
+            thread_root_message_id=thread_root_message_id,
+            current=current,
+            state=(
+                EmployeeCardState.COMPLETED
+                if succeeded
+                else EmployeeCardState.ACTION_REQUIRED
+            ),
+            summary=summary,
+            command=command,
+        )
+
+    def status_response(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        chat_id: str,
+        thread_root_message_id: str,
+        command_acceptance_id: str,
+        summary: str,
+        succeeded: bool,
+    ) -> EmployeeOutboxSnapshot:
+        """Publish one idempotent terminal response for ``/status``."""
+
+        attempt_id = f"control_{command_acceptance_id}"
+        outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
+        try:
+            current = self._outbox.get_snapshot(outbox_id)
+        except KeyError:
+            created_at = datetime.now(UTC).isoformat(timespec="microseconds").replace(
+                "+00:00", "Z"
+            )
+            current = self._append_control(
+                tenant_key=tenant_key,
+                agent_id=agent_id,
+                attempt_id=attempt_id,
+                chat_id=chat_id,
+                thread_root_message_id=thread_root_message_id,
+                version=1,
+                state=EmployeeCardState.QUEUED,
+                summary="正在读取员工状态。",
+                created_at=created_at,
+                command="/status",
+            )
+        if current.state.terminal:
+            return current
+        return self._terminal_control(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            attempt_id=attempt_id,
+            chat_id=chat_id,
+            thread_root_message_id=thread_root_message_id,
+            current=current,
+            state=(
+                EmployeeCardState.COMPLETED
+                if succeeded
+                else EmployeeCardState.ACTION_REQUIRED
+            ),
+            summary=summary,
+            command="/status",
+        )
+
+    def _terminal_control(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        attempt_id: str,
+        chat_id: str,
+        thread_root_message_id: str,
+        current: EmployeeOutboxSnapshot,
+        state: EmployeeCardState,
+        summary: str,
+        command: str,
+    ) -> EmployeeOutboxSnapshot:
+        """Advance a control card through the shared monotonic state machine."""
+
+        if current.state is EmployeeCardState.QUEUED and state is EmployeeCardState.COMPLETED:
+            current = self._append_control(
+                tenant_key=tenant_key,
+                agent_id=agent_id,
+                attempt_id=attempt_id,
+                chat_id=chat_id,
+                thread_root_message_id=thread_root_message_id,
+                version=current.version + 1,
+                state=EmployeeCardState.RUNNING,
+                summary="正在处理员工控制请求。",
+                created_at=current.created_at,
+                command=command,
+            )
         return self._append_control(
             tenant_key=tenant_key,
             agent_id=agent_id,
@@ -176,11 +270,7 @@ class EmployeeOutboxLifecycle:
             chat_id=chat_id,
             thread_root_message_id=thread_root_message_id,
             version=current.version + 1,
-            state=(
-                EmployeeCardState.COMPLETED
-                if succeeded
-                else EmployeeCardState.ACTION_REQUIRED
-            ),
+            state=state,
             summary=summary,
             created_at=current.created_at,
             command=command,
@@ -213,7 +303,7 @@ class EmployeeOutboxLifecycle:
             version=version,
             state=state,
             title=title,
-            summary=summary,
+            summary=_safe_single_line(summary),
             progress_percent=progress,
             card_json=build_employee_status_card(
                 title=title,

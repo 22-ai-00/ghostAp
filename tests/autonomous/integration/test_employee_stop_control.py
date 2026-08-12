@@ -6,6 +6,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from src.autonomous.gateway.coordinator import (
     EmployeeCancellationOutcome,
     TeamAttemptSnapshot,
@@ -14,6 +16,7 @@ from src.autonomous.gateway.models import GatewayExecutionStatus
 from src.autonomous.gateway.projection import (
     ATTEMPT_CANCEL_REQUESTED,
 )
+from src.autonomous.runtime.employee_actor import EmployeeActorStatus
 from tests.autonomous.integration.test_employee_team_gateway import (
     _real_coordinator_harness,
 )
@@ -475,6 +478,389 @@ def test_runtime_consumes_exact_stop_before_router_admission() -> None:
         state="terminal",
         reason_code="stop_cancel_requested",
     )
+
+
+def test_owner_p2p_status_anchors_scoped_runtime_snapshot_before_delivery() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_status_control"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        app_id="cli_alpha",
+        bot_principal_id="bot_alpha",
+        chat_id="oc_owner_p2p",
+        message_id="om_status",
+        sender_principal_id="ou_employee_app_owner",
+        tenant_key="tenant_1",
+        thread_root_message_id="",
+    )
+    record = SimpleNamespace(disposition=None, metadata=metadata)
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(by_acceptance_id={acceptance_id: record})
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "p2p",
+                "content": {"text": " /status "},
+            },
+        ),
+    )
+    ingress.get_payload.return_value = payload
+    runtime_snapshot = SimpleNamespace(
+        status=EmployeeActorStatus.BUSY,
+        mailbox_depth=2,
+        active_assignment_id="att_private_marker",
+    )
+    employee_runtime = MagicMock()
+    employee_runtime.inspect.return_value = runtime_snapshot
+    dispatch = SimpleNamespace(
+        employee_runtime=employee_runtime,
+        scoped_attempt_status=MagicMock(
+            return_value=SimpleNamespace(
+                active_count=1,
+                stopping_count=0,
+                journal_sequence=12,
+            )
+        ),
+    )
+    lifecycle = MagicMock()
+    events: list[str] = []
+    lifecycle.status_response.side_effect = lambda **_kwargs: events.append("outbox")
+    ingress.record_disposition.side_effect = (
+        lambda *_args, **_kwargs: events.append("disposition")
+    )
+    department = EmployeeDepartmentRuntime()
+    department._ingress = ingress
+    department._dispatch = dispatch
+    department._outbox_lifecycle = lifecycle
+    department._owner_p2p_requester = MagicMock(return_value="ou_owner")
+    department._drain_employee_outbox_once = MagicMock(
+        side_effect=lambda: events.append("delivery") or True
+    )
+
+    assert department._handle_control_ingress(acceptance_id) is True
+
+    employee_runtime.inspect.assert_called_once_with("agt_alpha")
+    response = lifecycle.status_response.call_args.kwargs
+    assert response["succeeded"] is True
+    assert "执行中" in response["summary"]
+    assert "1 个活动任务" in response["summary"]
+    assert "队列：2" in response["summary"]
+    assert "att_private_marker" not in response["summary"]
+    assert "secret" not in response["summary"]
+    ingress.record_disposition.assert_called_once_with(
+        acceptance_id,
+        state="terminal",
+        reason_code="status_completed",
+    )
+    assert events == ["outbox", "disposition", "delivery"]
+
+
+def test_owner_p2p_status_arguments_return_durable_usage_without_inspection() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_status_args"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        app_id="cli_alpha",
+        bot_principal_id="bot_alpha",
+        chat_id="oc_owner_p2p",
+        message_id="om_status",
+        sender_principal_id="ou_employee_app_owner",
+        tenant_key="tenant_1",
+        thread_root_message_id="",
+    )
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(
+        by_acceptance_id={
+            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
+        }
+    )
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "p2p",
+                "content": {"text": "/status details"},
+            },
+        ),
+    )
+    ingress.get_payload.return_value = payload
+    employee_runtime = MagicMock()
+    lifecycle = MagicMock()
+    department = EmployeeDepartmentRuntime()
+    department._ingress = ingress
+    department._dispatch = SimpleNamespace(
+        employee_runtime=employee_runtime,
+        scoped_attempt_status=MagicMock(),
+    )
+    department._outbox_lifecycle = lifecycle
+    department._owner_p2p_requester = MagicMock(return_value="ou_owner")
+    department._drain_employee_outbox_once = MagicMock(return_value=True)
+
+    assert department._handle_control_ingress(acceptance_id) is True
+
+    employee_runtime.inspect.assert_not_called()
+    response = lifecycle.status_response.call_args.kwargs
+    assert response["succeeded"] is False
+    assert response["summary"] == "用法：/status"
+    ingress.record_disposition.assert_called_once_with(
+        acceptance_id,
+        state="terminal",
+        reason_code="status_invalid_arguments",
+    )
+
+
+def test_group_status_is_left_for_the_main_bot_group_command_gate() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+    from src.trust.models import ActorKind, EffectiveTrust, TrustZone
+
+    acceptance_id = "acc_group_status"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        app_id="cli_alpha",
+        bot_principal_id="bot_alpha",
+        chat_id="oc_team",
+        message_id="om_status",
+        sender_principal_id="ou_owner",
+        tenant_key="tenant_1",
+        thread_root_message_id="",
+    )
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(
+        by_acceptance_id={
+            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
+        }
+    )
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "group",
+                "content": {"text": "/status"},
+            },
+        ),
+    )
+    ingress.get_payload.return_value = payload
+    lifecycle = MagicMock()
+    department = EmployeeDepartmentRuntime()
+    department._ingress = ingress
+    department._dispatch = MagicMock()
+    department._outbox_lifecycle = lifecycle
+    department._owner_p2p_requester = MagicMock(return_value=None)
+    department._managed_employee_ingress_trust = MagicMock(
+        return_value=EffectiveTrust(
+            zone=TrustZone.MANAGED_AGENT_GROUP,
+            actor=ActorKind.OWNER,
+            managed_group=None,
+            group_revision=None,
+            grant_revision=None,
+        )
+    )
+
+    assert department._handle_control_ingress(acceptance_id) is False
+    lifecycle.status_response.assert_not_called()
+    ingress.record_disposition.assert_not_called()
+
+
+def test_owner_p2p_status_reports_unavailable_without_allocating_actor() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_status_unavailable"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        app_id="cli_alpha",
+        bot_principal_id="bot_alpha",
+        chat_id="oc_owner_p2p",
+        message_id="om_status",
+        sender_principal_id="ou_employee_app_owner",
+        tenant_key="tenant_1",
+        thread_root_message_id="",
+    )
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(
+        by_acceptance_id={
+            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
+        }
+    )
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "p2p",
+                "content": {"text": "/status"},
+            },
+        ),
+    )
+    ingress.get_payload.return_value = payload
+    lifecycle = MagicMock()
+    department = EmployeeDepartmentRuntime()
+    department._ingress = ingress
+    department._dispatch = SimpleNamespace(
+        employee_runtime=None,
+        scoped_attempt_status=MagicMock(),
+    )
+    department._outbox_lifecycle = lifecycle
+    department._owner_p2p_requester = MagicMock(return_value="ou_owner")
+    department._drain_employee_outbox_once = MagicMock(return_value=True)
+
+    assert department._handle_control_ingress(acceptance_id) is True
+
+    response = lifecycle.status_response.call_args.kwargs
+    assert response["succeeded"] is False
+    assert response["summary"] == "员工状态暂不可用，请稍后重试。"
+    ingress.record_disposition.assert_called_once_with(
+        acceptance_id,
+        state="terminal",
+        reason_code="status_unavailable",
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "label"),
+    [
+        (EmployeeActorStatus.READY_COLD, "空闲（冷会话）"),
+        (EmployeeActorStatus.BUSY, "执行中"),
+        (EmployeeActorStatus.DEGRADED, "降级"),
+        (EmployeeActorStatus.STOPPING, "停止中"),
+    ],
+)
+def test_status_summary_uses_coarse_actor_states_without_identifiers(
+    status,
+    label,
+) -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    employee_runtime = MagicMock()
+    employee_runtime.inspect.return_value = SimpleNamespace(
+        status=status,
+        mailbox_depth=0,
+        active_assignment_id="att_must_not_leak",
+    )
+    department = EmployeeDepartmentRuntime()
+    department._dispatch = SimpleNamespace(
+        employee_runtime=employee_runtime,
+        scoped_attempt_status=MagicMock(
+            return_value=SimpleNamespace(
+                active_count=0,
+                stopping_count=0,
+                journal_sequence=2,
+            )
+        ),
+    )
+
+    summary = department._employee_status_summary(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        chat_id="oc_owner",
+        thread_root_id="",
+    )
+
+    assert label in summary
+    assert "无活动任务" in summary
+    assert "att_must_not_leak" not in summary
+    assert "agt_alpha" not in summary
+
+
+def test_status_summary_requests_durable_counts_for_current_thread() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    employee_runtime = MagicMock()
+    employee_runtime.inspect.return_value = SimpleNamespace(
+        status=EmployeeActorStatus.BUSY,
+        mailbox_depth=0,
+        active_assignment_id="att_hidden",
+    )
+    scoped_attempt_status = MagicMock(
+        return_value=SimpleNamespace(
+            active_count=1,
+            stopping_count=0,
+            journal_sequence=8,
+        )
+    )
+    department = EmployeeDepartmentRuntime()
+    department._dispatch = SimpleNamespace(
+        employee_runtime=employee_runtime,
+        scoped_attempt_status=scoped_attempt_status,
+    )
+
+    summary = department._employee_status_summary(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        chat_id="oc_owner",
+        thread_root_id="om_current_root",
+    )
+
+    assert "1 个活动任务" in summary
+    assert "停止中" not in summary
+    scoped_attempt_status.assert_called_once_with(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        chat_id="oc_owner",
+        thread_root_id="om_current_root",
+    )
+
+
+def test_status_outbox_failure_does_not_terminalize_or_deliver_ingress() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_status_outbox_failure"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        app_id="cli_alpha",
+        bot_principal_id="bot_alpha",
+        chat_id="oc_owner_p2p",
+        message_id="om_status",
+        sender_principal_id="ou_employee_app_owner",
+        tenant_key="tenant_1",
+        thread_root_message_id="",
+    )
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(
+        by_acceptance_id={
+            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
+        }
+    )
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "p2p",
+                "content": {"text": "/status"},
+            },
+        ),
+    )
+    ingress.get_payload.return_value = payload
+    employee_runtime = MagicMock()
+    employee_runtime.inspect.return_value = SimpleNamespace(
+        status=EmployeeActorStatus.READY_COLD,
+        mailbox_depth=0,
+        active_assignment_id="",
+    )
+    lifecycle = MagicMock()
+    lifecycle.status_response.side_effect = RuntimeError("journal unavailable")
+    department = EmployeeDepartmentRuntime()
+    department._ingress = ingress
+    department._dispatch = SimpleNamespace(
+        employee_runtime=employee_runtime,
+        scoped_attempt_status=MagicMock(
+            return_value=SimpleNamespace(
+                active_count=0,
+                stopping_count=0,
+                journal_sequence=3,
+            )
+        ),
+    )
+    department._outbox_lifecycle = lifecycle
+    department._owner_p2p_requester = MagicMock(return_value="ou_owner")
+    department._drain_employee_outbox_once = MagicMock(return_value=True)
+
+    with pytest.raises(RuntimeError, match="journal unavailable"):
+        department._handle_control_ingress(acceptance_id)
+
+    ingress.record_disposition.assert_not_called()
+    department._drain_employee_outbox_once.assert_not_called()
 
 
 def test_owner_p2p_stop_uses_union_canonical_owner() -> None:

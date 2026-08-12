@@ -123,6 +123,15 @@ class TeamAttemptSnapshot:
     error_code: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class EmployeeScopedAttemptStatus:
+    """Minimal Journal-backed task counts for one authorized conversation."""
+
+    active_count: int
+    stopping_count: int
+    journal_sequence: int
+
+
 EnvironmentProvider = Callable[
     [EmployeeEnvironmentAuthority],
     EmployeeProcessEnvironmentMaterial,
@@ -213,6 +222,46 @@ class EmployeeDispatchCoordinator:
     def state(self) -> GatewayProjectionState:
         with self._projection_sync_lock:
             return self._gateway_state.clone()
+
+    def scoped_attempt_status(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        chat_id: str,
+        thread_root_id: str = "",
+    ) -> EmployeeScopedAttemptStatus:
+        """Read current durable task counts without exposing attempt identity."""
+
+        for name, value in (
+            ("tenant_key", tenant_key),
+            ("agent_id", agent_id),
+            ("chat_id", chat_id),
+        ):
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(f"{name} is required")
+        if not isinstance(thread_root_id, str) or thread_root_id != thread_root_id.strip():
+            raise ValueError("thread_root_id is invalid")
+        with self._projection_sync_lock:
+            self._synchronize_gateway_unlocked()
+            live = tuple(
+                attempt
+                for attempt in self._gateway_state.attempts.values()
+                if attempt.binding.tenant_key == tenant_key
+                and attempt.binding.agent_id == agent_id
+                and attempt.binding.chat_id == chat_id
+                and (
+                    not thread_root_id
+                    or attempt.binding.thread_root_id == thread_root_id
+                )
+                and attempt.dispatch_committed
+                and not attempt.terminal_status
+            )
+            return EmployeeScopedAttemptStatus(
+                active_count=len(live),
+                stopping_count=sum(attempt.cancel_requested for attempt in live),
+                journal_sequence=self._gateway_state.cursor_sequence,
+            )
 
     def prepare_next(self) -> PreparedEmployeeDispatch | None:
         """Prepare with bounded retries when the Journal head races."""
@@ -1415,6 +1464,7 @@ __all__ = [
     "EmployeeCancellationOutcome",
     "EmployeeDispatchCoordinator",
     "EmployeeDispatchError",
+    "EmployeeScopedAttemptStatus",
     "FinalizedEmployeeAttempt",
     "PreparedEmployeeDispatch",
 ]

@@ -389,8 +389,10 @@ def test_production_dispatch_routes_owner_p2p_without_group_control(
     assert calls == ["handle_control", "route", "dispatch", "gc_payload"]
 
 
+@pytest.mark.parametrize("command", ["/help", "/status", "/status details"])
 def test_production_dispatch_ignores_main_bot_group_command_observation(
     monkeypatch: pytest.MonkeyPatch,
+    command: str,
 ) -> None:
     calls: list[str] = []
     acceptance_id = "acc_ambient_message"
@@ -415,7 +417,7 @@ def test_production_dispatch_ignores_main_bot_group_command_observation(
                     {
                         "type": "message",
                         "chat_type": "group",
-                        "content": {"text": "/help"},
+                        "content": {"text": command},
                     },
                 )
             )
@@ -562,7 +564,19 @@ def test_employee_group_projection_preserves_source_open_id_for_partial_context(
     assert snapshot.thread_messages[0].sender_id == "ou_employee_app"
 
 
-def test_owner_p2p_rejects_hire_owner_after_projected_owner_drift() -> None:
+@pytest.mark.parametrize(
+    ("projected_owner", "hire_union", "transport_current"),
+    [
+        ("ou_rotated_owner", "on_owner", True),
+        ("ou_original_owner", "on_different", True),
+        ("ou_original_owner", "on_owner", False),
+    ],
+)
+def test_owner_p2p_status_fails_closed_on_identity_or_transport_drift(
+    projected_owner: str,
+    hire_union: str,
+    transport_current: bool,
+) -> None:
     from src.autonomous.context.runtime import RuntimeRequesterChatAcl
     from src.autonomous.domain import (
         BotPrincipal,
@@ -586,7 +600,7 @@ def test_owner_p2p_rejects_hire_owner_after_projected_owner_drift() -> None:
                 "type": "message",
                 "message_type": "text",
                 "chat_type": "p2p",
-                "content": {"text": "/stop"},
+                "content": {"text": "/status"},
                 "sender_id": "ou_employee_app_owner",
                 "sender_union_id": "on_owner",
                 "sender_id_type": "open_id",
@@ -624,7 +638,7 @@ def test_owner_p2p_rejects_hire_owner_after_projected_owner_drift() -> None:
     projection.employees["agt_alpha"] = EmployeeDefinition(
         agent_id="agt_alpha",
         tenant_key="tenant_1",
-        owner_principal_id="ou_rotated_owner",
+        owner_principal_id=projected_owner,
         worker_type=WorkerType.VISIBLE,
         state=EmployeeState.ACTIVE,
         bot_principal_id="bot_alpha",
@@ -641,7 +655,7 @@ def test_owner_p2p_rejects_hire_owner_after_projected_owner_drift() -> None:
         agent_id="agt_alpha",
         phase=HirePhase.ACTIVE,
         requester_principal_id="ou_original_owner",
-        requester_union_id="on_owner",
+        requester_union_id=hire_union,
     )
     service = SimpleNamespace(
         synchronize_projection=lambda: projection,
@@ -653,13 +667,33 @@ def test_owner_p2p_rejects_hire_owner_after_projected_owner_drift() -> None:
         allowed_requesters=("ou_original_owner",),
     )
     runtime._employee_ingress_transport_is_current = MagicMock(  # noqa: SLF001
-        return_value=True
+        return_value=transport_current
     )
+    acceptance_id = "acc_owner_status_denied"
+    record = SimpleNamespace(disposition=None, metadata=metadata)
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(
+        by_acceptance_id={acceptance_id: record}
+    )
+    ingress.get_payload.return_value = payload
+    lifecycle = MagicMock()
+    dispatch = MagicMock()
+    runtime._ingress = ingress  # type: ignore[assignment]  # noqa: SLF001
+    runtime._outbox_lifecycle = lifecycle  # noqa: SLF001
+    runtime._dispatch = dispatch  # noqa: SLF001
 
     assert runtime._owner_p2p_requester(  # noqa: SLF001
-        SimpleNamespace(metadata=metadata),
+        record,
         payload,
     ) is None
+    assert runtime._handle_control_ingress(acceptance_id) is True  # noqa: SLF001
+    ingress.record_disposition.assert_called_once_with(
+        acceptance_id,
+        state="ignored",
+        reason_code="authority_denied",
+    )
+    lifecycle.status_response.assert_not_called()
+    dispatch.employee_runtime.inspect.assert_not_called()
 
 
 @pytest.mark.asyncio

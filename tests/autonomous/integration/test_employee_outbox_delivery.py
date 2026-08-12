@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass, replace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -385,6 +386,196 @@ def test_gateway_lifecycle_renders_one_monotonic_card_for_all_terminal_states(
         assert terminal.terminal_version == 3
         assert terminal.card_json["header"]["template"]
         assert lifecycle.terminal(binding, result) == terminal
+    finally:
+        service.close()
+        writer.close()
+
+
+def test_status_response_is_terminal_and_idempotent_across_replay(tmp_path) -> None:
+    service, writer, anchor = _runtime(tmp_path)
+    lifecycle = EmployeeOutboxLifecycle(service)
+    try:
+        first = lifecycle.status_response(
+            tenant_key="tenant-a",
+            agent_id="agt_alpha",
+            chat_id="oc_owner",
+            thread_root_message_id="om_status",
+            command_acceptance_id="acc_status",
+            summary="员工状态：执行中\n任务：当前会话有 1 个活动任务\n队列：0",
+            succeeded=True,
+        )
+        repeated = lifecycle.status_response(
+            tenant_key="tenant-a",
+            agent_id="agt_alpha",
+            chat_id="oc_owner",
+            thread_root_message_id="om_status",
+            command_acceptance_id="acc_status",
+            summary="conflicting replay text",
+            succeeded=False,
+        )
+
+        assert first == repeated
+        assert first.version == 3
+        assert first.state is EmployeeCardState.COMPLETED
+        assert first.terminal_version == 3
+        assert first.attempt_id == "control_acc_status"
+        assert "\n" not in first.summary
+        card_text = first.card_json["body"]["elements"][0]["content"]
+        assert "任务：当前会话有 1 个活动任务" in card_text
+        assert len(service.get_record(first.outbox_id).snapshots) == 3
+    finally:
+        service.close()
+        writer.close()
+
+    reopened_writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=anchor,
+        hmac_key=b"j" * 32,
+        writer_epoch=2,
+    )
+    reopened_service = EmployeeOutboxService(
+        writer=reopened_writer,
+        blob_store=BlobStore(
+            tmp_path / "outbox-blobs",
+            AesGcmEncryptionProvider(lambda _ref: b"b" * 32),
+        ),
+        outbox_state=OutboxProjectionState(),
+        active_key_id="k1",
+    )
+    try:
+        replayed = EmployeeOutboxLifecycle(reopened_service).status_response(
+            tenant_key="tenant-a",
+            agent_id="agt_alpha",
+            chat_id="oc_owner",
+            thread_root_message_id="om_status",
+            command_acceptance_id="acc_status",
+            summary="another replay",
+            succeeded=False,
+        )
+
+        assert replayed == first
+        assert len(reopened_service.get_record(first.outbox_id).snapshots) == 3
+    finally:
+        reopened_service.close()
+        reopened_writer.close()
+
+
+@pytest.mark.parametrize("command", ["stop", "history", "memory"])
+def test_existing_successful_control_responses_use_valid_monotonic_states(
+    tmp_path,
+    command,
+) -> None:
+    service, writer, _anchor = _runtime(tmp_path)
+    lifecycle = EmployeeOutboxLifecycle(service)
+    try:
+        common = {
+            "tenant_key": "tenant-a",
+            "agent_id": "agt_alpha",
+            "chat_id": "oc_owner",
+            "thread_root_message_id": "om_control",
+            "command_acceptance_id": f"acc_{command}",
+        }
+        if command == "stop":
+            terminal = lifecycle.command_response(
+                **common,
+                status="no_active",
+            )
+        else:
+            terminal = lifecycle.read_response(
+                **common,
+                command=f"/{command}",
+                summary="第一行\n第二行",
+                succeeded=True,
+            )
+
+        record = service.get_record(terminal.outbox_id)
+        snapshots = [
+            service.get_snapshot(terminal.outbox_id, version)
+            for version in sorted(record.snapshots)
+        ]
+        assert [snapshot.state for snapshot in snapshots] == [
+            EmployeeCardState.QUEUED,
+            EmployeeCardState.RUNNING,
+            EmployeeCardState.COMPLETED,
+        ]
+        assert terminal.terminal_version == 3
+        assert "\n" not in terminal.summary
+    finally:
+        service.close()
+        writer.close()
+
+
+def test_failed_status_snapshot_append_never_returns_a_terminal_response(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    service, writer, _anchor = _runtime(tmp_path)
+    lifecycle = EmployeeOutboxLifecycle(service)
+    monkeypatch.setattr(
+        service,
+        "append_snapshot",
+        MagicMock(side_effect=RuntimeError("journal unavailable")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="journal unavailable"):
+            lifecycle.status_response(
+                tenant_key="tenant-a",
+                agent_id="agt_alpha",
+                chat_id="oc_owner",
+                thread_root_message_id="om_status",
+                command_acceptance_id="acc_status_failure",
+                summary="员工状态：空闲",
+                succeeded=True,
+            )
+    finally:
+        service.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("failed_append", [2, 3])
+def test_status_response_resumes_from_partial_monotonic_snapshot(
+    tmp_path,
+    monkeypatch,
+    failed_append,
+) -> None:
+    service, writer, _anchor = _runtime(tmp_path)
+    lifecycle = EmployeeOutboxLifecycle(service)
+    original_append = service.append_snapshot
+    calls = 0
+
+    def fail_once(snapshot):
+        nonlocal calls
+        calls += 1
+        if calls == failed_append:
+            raise RuntimeError("simulated crash boundary")
+        return original_append(snapshot)
+
+    monkeypatch.setattr(service, "append_snapshot", fail_once)
+    common = {
+        "tenant_key": "tenant-a",
+        "agent_id": "agt_alpha",
+        "chat_id": "oc_owner",
+        "thread_root_message_id": "om_status",
+        "command_acceptance_id": f"acc_partial_{failed_append}",
+        "summary": "员工状态：执行中\n任务：1 个活动任务",
+        "succeeded": True,
+    }
+    try:
+        with pytest.raises(RuntimeError, match="simulated crash boundary"):
+            lifecycle.status_response(**common)
+        monkeypatch.setattr(service, "append_snapshot", original_append)
+
+        terminal = lifecycle.status_response(**common)
+
+        record = service.get_record(terminal.outbox_id)
+        assert [
+            service.get_snapshot(terminal.outbox_id, version).state
+            for version in sorted(record.snapshots)
+        ] == [
+            EmployeeCardState.QUEUED,
+            EmployeeCardState.RUNNING,
+            EmployeeCardState.COMPLETED,
+        ]
     finally:
         service.close()
         writer.close()

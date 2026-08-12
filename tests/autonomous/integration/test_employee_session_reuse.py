@@ -58,6 +58,18 @@ def test_supervisor_reports_cold_ready_before_first_assignment() -> None:
     supervisor.close()
 
 
+def test_inspect_missing_employee_does_not_allocate_a_cold_actor() -> None:
+    supervisor = EmployeeRuntimeSupervisor(session_factory=lambda _bootstrap: None)
+
+    snapshot = supervisor.inspect("agt_missing")
+
+    assert snapshot.status is EmployeeActorStatus.READY_COLD
+    assert snapshot.mailbox_depth == 0
+    assert snapshot.active_assignment_id == ""
+    assert supervisor._actors == {}  # noqa: SLF001
+    supervisor.close()
+
+
 def test_different_employee_mailboxes_execute_in_parallel(tmp_path: Path) -> None:
     gate = threading.Event()
     entered = threading.Barrier(3)
@@ -98,5 +110,31 @@ def test_idle_ttl_recycles_warm_session_to_cold(tmp_path: Path) -> None:
     now[0] = 11
     assert supervisor.sweep_idle() == 1
     assert supervisor.status("agt_1") is EmployeeActorStatus.READY_COLD
+    assert sessions[0].closed is True
+    supervisor.close()
+
+
+def test_inspect_is_a_pure_atomic_snapshot_and_does_not_reap_idle_session(
+    tmp_path: Path,
+) -> None:
+    now = [0.0]
+    sessions: list[_Session] = []
+    supervisor = EmployeeRuntimeSupervisor(
+        session_factory=lambda _bootstrap: sessions.append(_Session()) or sessions[-1],
+        idle_ttl_seconds=10,
+        monotonic=lambda: now[0],
+    )
+    bootstrap = _bootstrap(tmp_path, "agt_1")
+    supervisor.submit(EmployeeAssignment("asgn_1", bootstrap, "work", 1))
+    assert supervisor.wait_terminal("asgn_1", timeout=1).status == "completed"
+    now[0] = 11
+
+    snapshot = supervisor.inspect("agt_1")
+
+    assert snapshot.status is EmployeeActorStatus.READY_WARM
+    assert snapshot.mailbox_depth == 0
+    assert snapshot.active_assignment_id == ""
+    assert sessions[0].closed is False
+    assert supervisor.sweep_idle() == 1
     assert sessions[0].closed is True
     supervisor.close()

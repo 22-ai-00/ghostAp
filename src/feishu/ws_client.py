@@ -166,8 +166,8 @@ def _employee_hire_status_text(employee_name: str, status: str) -> str | None:
         )
     if status == "ready":
         return (
-            f"✅ 员工 **{employee_name}** 配置完成，正在等待激活。"
-            "请先私聊该员工发送 `/status`，激活成功后再将其加入 Team 群。"
+            f"✅ 员工 **{employee_name}** 基础配置已就绪，系统将自动完成启用，"
+            "无需手动激活；完成后会再次通知。"
         )
     if status == "active":
         return f"✅ 员工 **{employee_name}** 已激活，可以加入 Team 群协作。"
