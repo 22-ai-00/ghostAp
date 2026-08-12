@@ -11,7 +11,10 @@ from unittest.mock import patch
 import pytest
 
 from src.autonomous.ingress.models import EmployeeIngressMetadata, EmployeeIngressPayload
-from src.autonomous.ingress.projection import IngressProjectionState
+from src.autonomous.ingress.projection import (
+    IngressProjectionState,
+    reduce_ingress_event,
+)
 from src.autonomous.ingress.service import (
     EmployeeIngressService,
     IngressBlobError,
@@ -24,6 +27,7 @@ from src.autonomous.journal.blob_store import (
     BlobPublishError,
     BlobStore,
 )
+from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.writer import JournalWriter
 
 HMAC_KEY = b"employee-ingress-chaos-hmac-key-32"
@@ -42,6 +46,45 @@ def _payload() -> EmployeeIngressPayload:
         normalized_parts=({"type": "text", "text": "durable work"},),
         attachment_descriptors=(),
     )
+
+
+def _message_payload(
+    *,
+    raw_chat_id: str = "oc_bound_chat",
+    raw_message_id: str = "om_bound_message",
+) -> EmployeeIngressPayload:
+    return EmployeeIngressPayload(
+        schema_version=1,
+        envelope_id="ing_" + "2" * 64,
+        normalized_parts=(
+            {
+                "type": "message",
+                "remote_chat_id": raw_chat_id,
+                "remote_message_id": raw_message_id,
+                "remote_root_id": "",
+            },
+        ),
+        attachment_descriptors=(),
+    )
+
+
+def _bound_message(
+    *,
+    raw_chat_id: str,
+    raw_message_id: str,
+    **metadata_overrides: object,
+) -> tuple[EmployeeIngressPayload, EmployeeIngressMetadata]:
+    payload = _message_payload(
+        raw_chat_id=raw_chat_id,
+        raw_message_id=raw_message_id,
+    )
+    metadata = _metadata(
+        payload,
+        chat_id=_transport_index("oc_", raw_chat_id),
+        message_id=_transport_index("om_", raw_message_id),
+        **metadata_overrides,
+    )
+    return payload, metadata
 
 
 def _metadata(payload: EmployeeIngressPayload, **overrides: object) -> EmployeeIngressMetadata:
@@ -198,11 +241,9 @@ def test_anchored_message_acceptance_is_queryable_before_waiter_registration(
     tmp_path: Path,
 ) -> None:
     service, writer, _blob_store = _service(tmp_path)
-    payload = _payload()
-    metadata = _metadata(
-        payload,
-        message_id=_transport_index("om_", "om_remote_message"),
-        chat_id=_transport_index("oc_", "oc_remote_chat"),
+    payload, metadata = _bound_message(
+        raw_message_id="om_remote_message",
+        raw_chat_id="oc_remote_chat",
     )
     ack = service.accept(metadata, payload, request_id="req_anchored_lookup")
 
@@ -228,11 +269,9 @@ def test_message_acceptance_waiter_has_no_accept_before_register_lost_wakeup(
     tmp_path: Path,
 ) -> None:
     service, writer, _blob_store = _service(tmp_path)
-    payload = _payload()
-    metadata = _metadata(
-        payload,
-        message_id=_transport_index("om_", "om_waited_message"),
-        chat_id=_transport_index("oc_", "oc_waited_chat"),
+    payload, metadata = _bound_message(
+        raw_message_id="om_waited_message",
+        raw_chat_id="oc_waited_chat",
     )
     started = threading.Event()
     completed = threading.Event()
@@ -271,11 +310,9 @@ def test_message_acceptance_index_replays_across_restart_and_reconnect(
 ) -> None:
     anchor = MemoryAnchor()
     service, writer, _blob_store = _service(tmp_path, anchor=anchor)
-    payload = _payload()
-    metadata = _metadata(
-        payload,
-        message_id=_transport_index("om_", "om_reconnected_message"),
-        chat_id=_transport_index("oc_", "oc_reconnected_chat"),
+    payload, metadata = _bound_message(
+        raw_message_id="om_reconnected_message",
+        raw_chat_id="oc_reconnected_chat",
     )
     first = service.accept(metadata, payload, request_id="req_generation_3")
     service.close()
@@ -328,10 +365,13 @@ def test_transport_message_index_keeps_first_acceptance_when_event_ids_differ(
     tmp_path: Path,
 ) -> None:
     service, writer, _blob_store = _service(tmp_path)
-    payload = _payload()
+    payload, base_metadata = _bound_message(
+        raw_message_id="om_same_transport_message",
+        raw_chat_id="oc_same_transport_chat",
+    )
     coordinates = {
-        "message_id": _transport_index("om_", "om_same_transport_message"),
-        "chat_id": _transport_index("oc_", "oc_same_transport_chat"),
+        "message_id": base_metadata.message_id,
+        "chat_id": base_metadata.chat_id,
     }
     first = service.accept(
         _metadata(payload, event_id="evt_first", **coordinates),
@@ -360,6 +400,149 @@ def test_transport_message_index_keeps_first_acceptance_when_event_ids_differ(
     writer.close()
 
 
+def test_message_acceptance_proof_requires_authenticated_raw_coordinates(
+    tmp_path: Path,
+) -> None:
+    service, writer, _blob_store = _service(tmp_path)
+    payload = _message_payload(
+        raw_chat_id="oc_payload_chat",
+        raw_message_id="om_payload_message",
+    )
+    metadata = _metadata(
+        payload,
+        chat_id=_transport_index("oc_", "oc_different_chat"),
+        message_id=_transport_index("om_", "om_different_message"),
+    )
+
+    service.accept(metadata, payload, request_id="req_mismatched_coordinates")
+
+    assert (
+        service.wait_for_anchored_message_acceptance(
+            tenant_key=metadata.tenant_key,
+            agent_id=metadata.agent_id,
+            bot_principal_id=metadata.bot_principal_id,
+            app_id=metadata.app_id,
+            event_type=metadata.event_type,
+            chat_id=metadata.chat_id,
+            message_id=metadata.message_id,
+            timeout=0,
+        )
+        is None
+    )
+    service.close()
+    writer.close()
+
+
+def test_message_acceptance_proof_requires_a_normalized_message_part_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    anchor = MemoryAnchor()
+    service, writer, _blob_store = _service(tmp_path, anchor=anchor)
+    payload = EmployeeIngressPayload(
+        schema_version=1,
+        envelope_id="ing_" + "3" * 64,
+        normalized_parts=(
+            {
+                "type": "text",
+                "remote_chat_id": "oc_wrong_part_type",
+                "remote_message_id": "om_wrong_part_type",
+            },
+        ),
+        attachment_descriptors=(),
+    )
+    metadata = _metadata(
+        payload,
+        chat_id=_transport_index("oc_", "oc_wrong_part_type"),
+        message_id=_transport_index("om_", "om_wrong_part_type"),
+    )
+    service.accept(metadata, payload, request_id="req_wrong_part_type")
+    service.close()
+    writer.close()
+
+    writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=anchor,
+        hmac_key=HMAC_KEY,
+        writer_epoch=2,
+    )
+    service = EmployeeIngressService(
+        writer=writer,
+        blob_store=_store(tmp_path / "ingress-blobs"),
+        ingress_state=IngressProjectionState(),
+        active_key_id="k1",
+    )
+
+    assert (
+        service.wait_for_anchored_message_acceptance(
+            tenant_key=metadata.tenant_key,
+            agent_id=metadata.agent_id,
+            bot_principal_id=metadata.bot_principal_id,
+            app_id=metadata.app_id,
+            event_type=metadata.event_type,
+            chat_id=metadata.chat_id,
+            message_id=metadata.message_id,
+            timeout=0,
+        )
+        is None
+    )
+    service.close()
+    writer.close()
+
+
+def test_legacy_acceptance_schema_replays_without_granting_transport_proof(
+    tmp_path: Path,
+) -> None:
+    service, writer, _blob_store = _service(tmp_path)
+    payload, metadata = _bound_message(
+        raw_chat_id="oc_legacy_chat",
+        raw_message_id="om_legacy_message",
+    )
+    service.accept(metadata, payload, request_id="req_current_schema")
+    frame = next(writer.replay())
+    accepted = next(
+        event
+        for event in frame.events
+        if event.event_type == "employee.ingress.accepted"
+    )
+    legacy_payload = dict(accepted.payload)
+    legacy_payload.pop("transport_message_proof")
+    state = IngressProjectionState()
+
+    reduce_ingress_event(
+        state,
+        JournalEvent(
+            event_type=accepted.event_type,
+            aggregate_id=accepted.aggregate_id,
+            payload=legacy_payload,
+        ),
+        frame_sequence=frame.sequence,
+        frame_hash=frame.frame_hash,
+    )
+
+    projected = next(iter(state.by_acceptance_id.values()))
+    assert projected.transport_message_proof is False
+    service.close()
+    writer.close()
+
+
+def test_semantic_digest_mismatch_is_rejected_before_blob_publication(
+    tmp_path: Path,
+) -> None:
+    service, writer, blob_store = _service(tmp_path)
+    payload = _payload()
+    metadata = _metadata(payload, semantic_digest="b" * 64)
+
+    with (
+        patch.object(blob_store, "stage_and_publish", wraps=blob_store.stage_and_publish) as publish,
+        pytest.raises(ValueError, match="semantic digest"),
+    ):
+        service.accept(metadata, payload, request_id="req_bad_semantic_digest")
+
+    publish.assert_not_called()
+    service.close()
+    writer.close()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -378,11 +561,9 @@ def test_message_acceptance_proof_rejects_every_mismatched_transport_binding(
     value: str,
 ) -> None:
     service, writer, _blob_store = _service(tmp_path)
-    payload = _payload()
-    metadata = _metadata(
-        payload,
-        message_id=_transport_index("om_", "om_bound_message"),
-        chat_id=_transport_index("oc_", "oc_bound_chat"),
+    payload, metadata = _bound_message(
+        raw_message_id="om_bound_message",
+        raw_chat_id="oc_bound_chat",
     )
     service.accept(metadata, payload, request_id="req_bound")
     query = {

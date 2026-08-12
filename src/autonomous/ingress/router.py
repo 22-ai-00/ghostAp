@@ -460,7 +460,22 @@ class RouterDispatchGrant:
 
 def _accepted_record(event: JournalEvent, sequence: int) -> RouterLifecycleRecord:
     payload = event.payload
-    if set(payload) != {"metadata", "acceptance_id", "accepted_at", "blob_ref"}:
+    current_fields = {
+        "metadata",
+        "acceptance_id",
+        "accepted_at",
+        "blob_ref",
+        "transport_message_proof",
+    }
+    legacy_fields = current_fields - {"transport_message_proof"}
+    if (
+        frozenset(payload)
+        not in {
+            frozenset(current_fields),
+            frozenset(legacy_fields),
+        }
+        or type(payload.get("transport_message_proof", False)) is not bool
+    ):
         raise RouterProjectionError("invalid employee ingress acceptance")
     try:
         metadata = EmployeeIngressMetadata.from_dict(payload["metadata"])

@@ -22,6 +22,7 @@ class IngressRecord:
     metadata: EmployeeIngressMetadata
     acceptance: IngressAcceptance
     blob_ref: BlobRef
+    transport_message_proof: bool = False
     disposition: IngressDisposition | None = None
     payload_tombstoned: bool = False
 
@@ -117,8 +118,22 @@ def _reduce_accepted(
     frame_hash: str,
 ) -> None:
     payload = event.payload
-    if set(payload) != {"metadata", "acceptance_id", "accepted_at", "blob_ref"}:
+    current_fields = {
+        "metadata",
+        "acceptance_id",
+        "accepted_at",
+        "blob_ref",
+        "transport_message_proof",
+    }
+    legacy_fields = current_fields - {"transport_message_proof"}
+    if frozenset(payload) not in {
+        frozenset(current_fields),
+        frozenset(legacy_fields),
+    }:
         raise IngressProjectionError("invalid employee.ingress.accepted payload")
+    transport_message_proof = payload.get("transport_message_proof", False)
+    if type(transport_message_proof) is not bool:
+        raise IngressProjectionError("invalid employee ingress transport proof")
     try:
         metadata = EmployeeIngressMetadata.from_dict(payload["metadata"])
         blob_ref = BlobRef.from_dict(payload["blob_ref"])
@@ -147,6 +162,7 @@ def _reduce_accepted(
         metadata=metadata,
         acceptance=acceptance,
         blob_ref=blob_ref,
+        transport_message_proof=transport_message_proof,
     )
     state.by_dedup_key[metadata.dedup_key] = record
     state.by_acceptance_id[acceptance.acceptance_id] = record

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -330,7 +332,7 @@ class EmployeeIngressService:
             existing = self._state.by_dedup_key.get(metadata.dedup_key)
             if existing is not None:
                 self._verify_duplicate_unlocked(existing, metadata, payload)
-                self._index_acceptance_unlocked(existing)
+                self._index_acceptance_unlocked(existing, payload)
                 return self._ack(
                     existing,
                     metadata,
@@ -352,6 +354,10 @@ class EmployeeIngressService:
                 raise IngressBlobError("ingress payload publication failed") from exc
 
             accepted_at = _utc_now()
+            transport_message_proof = self._payload_matches_transport_metadata(
+                metadata,
+                payload,
+            )
             event = JournalEvent(
                 event_type="employee.ingress.accepted",
                 aggregate_id=metadata.dedup_key,
@@ -360,6 +366,7 @@ class EmployeeIngressService:
                     "acceptance_id": f"acc_{uuid.uuid4().hex}",
                     "accepted_at": accepted_at,
                     "blob_ref": blob_ref.to_dict(),
+                    "transport_message_proof": transport_message_proof,
                 },
             )
             versions = self._writer.get_aggregate_versions([metadata.dedup_key])
@@ -378,6 +385,7 @@ class EmployeeIngressService:
                 raise IngressWriteDisabledError("ingress acceptance was not anchored")
             self._apply_frame_unlocked(result)
             record = self._state.by_dedup_key[metadata.dedup_key]
+            self._index_acceptance_unlocked(record, payload)
             return self._ack(record, metadata, request_id=request_id, duplicate=False)
 
     def get_payload(self, acceptance_id: str) -> EmployeeIngressPayload:
@@ -673,19 +681,65 @@ class EmployeeIngressService:
             # coordinates.  They are deliberately outside this proof index.
             return None
 
+    @staticmethod
+    def _payload_matches_transport_metadata(
+        metadata: EmployeeIngressMetadata,
+        payload: EmployeeIngressPayload,
+    ) -> bool:
+        """Bind public message indexes to authenticated raw coordinates."""
+
+        if metadata.event_type != "im.message.receive_v1":
+            return False
+        if len(payload.normalized_parts) != 1:
+            return False
+        part = payload.normalized_parts[0]
+        if not isinstance(part, Mapping) or part.get("type") != "message":
+            return False
+        raw_chat_id = part.get("remote_chat_id")
+        raw_message_id = part.get("remote_message_id")
+        if (
+            not isinstance(raw_chat_id, str)
+            or not raw_chat_id.startswith("oc_")
+            or not isinstance(raw_message_id, str)
+            or not raw_message_id.startswith("om_")
+        ):
+            return False
+        return (
+            metadata.chat_id == "oc_" + hashlib.sha256(raw_chat_id.encode("utf-8")).hexdigest()
+            and metadata.message_id == "om_" + hashlib.sha256(raw_message_id.encode("utf-8")).hexdigest()
+        )
+
     def _acceptance_for_key_unlocked(
         self,
         key: tuple[str, ...],
     ) -> IngressAcceptance | None:
         acceptance_id = self._transport_message_index.get(key)
         record = self._state.by_acceptance_id.get(acceptance_id or "")
-        if record is None or self._transport_message_key_for_record(record) != key:
+        if (
+            record is None
+            or self._transport_message_key_for_record(record) != key
+            or record.transport_message_proof is not True
+        ):
             return None
         return record.acceptance
 
-    def _index_acceptance_unlocked(self, record: IngressRecord) -> None:
+    def _index_acceptance_unlocked(
+        self,
+        record: IngressRecord,
+        payload: EmployeeIngressPayload | None = None,
+    ) -> None:
         key = self._transport_message_key_for_record(record)
-        if key is None:
+        if (
+            key is None
+            or record.transport_message_proof is not True
+            or (
+                payload is not None
+                and not self._payload_matches_transport_metadata(
+                    record.metadata,
+                    payload,
+                )
+            )
+        ):
             return
         existing_id = self._transport_message_index.get(key)
         existing = self._state.by_acceptance_id.get(existing_id or "")
@@ -858,6 +912,8 @@ class EmployeeIngressService:
             raise ValueError("payload envelope does not match metadata")
         if metadata.payload_sha256 != payload.payload_sha256:
             raise ValueError("payload hash does not match metadata")
+        if metadata.semantic_digest != payload.payload_sha256:
+            raise ValueError("payload semantic digest does not match payload")
         if metadata.payload_size_bytes != payload.canonical_size_bytes:
             raise ValueError("payload size does not match metadata")
         if metadata.attachment_count != len(payload.attachment_descriptors):
