@@ -1667,6 +1667,27 @@ class ProductionEmployeeHireService:
         for field_name, value in required.items():
             if not isinstance(value, str) or not value.strip():
                 raise HireAdmissionError(f"{field_name} is required")
+        try:
+            registration_name = RegistrationRequest(
+                name=request.employee_name,
+                description="GhostAP employee",
+            ).name
+        except (TypeError, ValueError):
+            raise HireAdmissionError("invalid employee name") from None
+        if registration_name != request.employee_name:
+            raise HireAdmissionError("invalid employee name")
+        try:
+            from src.acp.providers import get_providers
+
+            configured_tools = get_providers()
+        except Exception:
+            raise HireAdmissionError("employee tool registry unavailable") from None
+        if (
+            not isinstance(configured_tools, Mapping)
+            or request.tool != request.tool.strip().casefold()
+            or request.tool not in configured_tools
+        ):
+            raise HireAdmissionError("invalid employee tool selection")
         if (
             not isinstance(request.model, str)
             or request.model != request.model.strip()

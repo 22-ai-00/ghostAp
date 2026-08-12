@@ -401,9 +401,97 @@ def test_model_sentinel_still_rejects_invalid_model_tool_profile_and_effort(
     tmp_path: Path,
     changes: dict[str, object],
 ) -> None:
-    service, writer, _projection = _service(tmp_path)
+    service, writer, _projection = _service(
+        tmp_path,
+        visible_employee_limit=1,
+    )
 
     with pytest.raises(HireAdmissionError):
         service.start_hire(replace(_request(), **changes))
 
     assert tuple(writer.replay()) == ()
+    admitted = service.start_hire(_request(model=""))
+    assert admitted.model == ""
+    assert len(tuple(writer.replay())) == 1
+
+
+@pytest.mark.parametrize(
+    "employee_name",
+    [
+        "",
+        "   ",
+        " Atlas",
+        "Atlas ",
+        "At\nlas",
+        "At\tlas",
+        "At\x00las",
+        "At\x7flas",
+        "A" * 81,
+    ],
+)
+def test_registration_invalid_employee_name_is_rejected_without_capacity_use(
+    tmp_path: Path,
+    employee_name: str,
+) -> None:
+    service, writer, _projection = _service(
+        tmp_path,
+        visible_employee_limit=1,
+    )
+
+    with pytest.raises(HireAdmissionError):
+        service.start_hire(_request(employee_name=employee_name))
+
+    assert tuple(writer.replay()) == ()
+    admitted = service.start_hire(_request(employee_name="A" * 80))
+    assert admitted.employee_name == "A" * 80
+    assert len(tuple(writer.replay())) == 1
+
+
+@pytest.mark.parametrize(
+    "tool",
+    [
+        "unknown",
+        "Traex",
+        "trae",
+        " traex",
+        "traex ",
+    ],
+)
+def test_noncanonical_employee_tool_is_rejected_without_capacity_use(
+    tmp_path: Path,
+    tool: str,
+) -> None:
+    service, writer, _projection = _service(
+        tmp_path,
+        visible_employee_limit=1,
+    )
+
+    with pytest.raises(HireAdmissionError):
+        service.start_hire(
+            replace(_request(model=""), tool=tool, effort="default")
+        )
+
+    assert tuple(writer.replay()) == ()
+    admitted = service.start_hire(_request(model=""))
+    assert admitted.tool == "traex"
+    assert admitted.model == ""
+    assert len(tuple(writer.replay())) == 1
+
+
+@pytest.mark.parametrize(
+    "tool",
+    ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok"],
+)
+def test_canonical_employee_tools_accept_backend_default_model(
+    tmp_path: Path,
+    tool: str,
+) -> None:
+    service, writer, _projection = _service(tmp_path)
+
+    admitted = service.start_hire(
+        replace(_request(model=""), tool=tool, effort="default")
+    )
+
+    assert admitted.tool == tool
+    assert admitted.model == ""
+    assert len(tuple(writer.replay())) == 1
