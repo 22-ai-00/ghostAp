@@ -3,6 +3,7 @@
 from .delivery import (
     EmployeeDeliveryAuthority,
     EmployeeOutboxDeliveryCoordinator,
+    EmployeeOutboxDrainDeadlineExceeded,
     EmployeeOutboxDrainResult,
     EmployeeOutboxItemDeliveryError,
     EmployeeOutboxReceiptIntegrityError,
@@ -42,6 +43,7 @@ __all__ = [
     "EmployeeOutboxSnapshot",
     "EmployeeDeliveryAuthority",
     "EmployeeOutboxDeliveryCoordinator",
+    "EmployeeOutboxDrainDeadlineExceeded",
     "EmployeeOutboxDrainResult",
     "EmployeeOutboxItemDeliveryError",
     "EmployeeOutboxReceiptIntegrityError",

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
@@ -60,6 +62,10 @@ class EmployeeOutboxItemDeliveryError(RuntimeError):
     """One record hit an external delivery failure safe to isolate and retry."""
 
 
+class EmployeeOutboxDrainDeadlineExceeded(TimeoutError):
+    """The caller's absolute monotonic delivery deadline was exhausted."""
+
+
 class EmployeeOutboxReceiptIntegrityError(RuntimeError):
     """A successful Channel receipt contradicted the frozen delivery authority."""
 
@@ -73,6 +79,7 @@ class EmployeeCardChannels(Protocol):
         target: str,
         message: Any,
         options: Any = None,
+        deadline: float | None = None,
     ) -> Any: ...
 
     def update_card(
@@ -82,6 +89,7 @@ class EmployeeCardChannels(Protocol):
         generation: int,
         message_id: str,
         card: dict[str, Any],
+        deadline: float | None = None,
     ) -> Any: ...
 
 
@@ -109,6 +117,7 @@ class EmployeeOutboxDeliveryCoordinator:
         self,
         *,
         max_items: int = _DEFAULT_PENDING_DELIVERY_BATCH,
+        deadline: float | None = None,
     ) -> EmployeeOutboxDrainResult:
         """Attempt a bounded rotating batch, isolating failures by Outbox ID.
 
@@ -126,15 +135,22 @@ class EmployeeOutboxDeliveryCoordinator:
             raise ValueError(
                 f"max_items must be between 1 and {_MAX_PENDING_DELIVERY_BATCH}"
             )
+        self._validate_deadline(deadline)
         with self._delivery_lock:
-            return self._deliver_pending_locked(max_items=max_items)
+            return self._deliver_pending_locked(
+                max_items=max_items,
+                deadline=deadline,
+            )
 
     def _deliver_pending_locked(
         self,
         *,
         max_items: int,
+        deadline: float | None,
     ) -> EmployeeOutboxDrainResult:
+        self._raise_if_deadline_expired(deadline)
         pending = self._outbox.list_pending_delivery_records()
+        self._raise_if_deadline_expired(deadline)
         if not pending:
             self._pending_outbox_ids.clear()
             return EmployeeOutboxDrainResult(
@@ -162,10 +178,11 @@ class EmployeeOutboxDeliveryCoordinator:
         delivered: list[str] = []
         failed: list[str] = []
         for _attempt in range(attempt_limit):
+            self._raise_if_deadline_expired(deadline)
             outbox_id = self._pending_outbox_ids.popleft()
             attempted.append(outbox_id)
             try:
-                self.deliver(outbox_id)
+                self.deliver(outbox_id, deadline=deadline)
             except EmployeeOutboxItemDeliveryError as exc:
                 failed.append(outbox_id)
                 self._pending_outbox_ids.append(outbox_id)
@@ -190,15 +207,20 @@ class EmployeeOutboxDeliveryCoordinator:
         self,
         outbox_id: str,
         snapshot_version: int | None = None,
+        *,
+        deadline: float | None = None,
     ) -> EmployeeOutboxBinding | None:
+        self._validate_deadline(deadline)
         with self._delivery_lock:
-            return self._deliver_locked(outbox_id, snapshot_version)
+            return self._deliver_locked(outbox_id, snapshot_version, deadline)
 
     def _deliver_locked(
         self,
         outbox_id: str,
         snapshot_version: int | None,
+        deadline: float | None,
     ) -> EmployeeOutboxBinding | None:
+        self._raise_if_deadline_expired(deadline)
         record = self._outbox.get_record(outbox_id)
         version = record.latest_version if snapshot_version is None else snapshot_version
         if record.binding is not None and record.binding.bound_snapshot_version >= version:
@@ -217,6 +239,7 @@ class EmployeeOutboxDeliveryCoordinator:
         authority = self._authority_resolver(record)
         if not isinstance(authority, EmployeeDeliveryAuthority):
             raise RuntimeError("employee delivery authority is unavailable")
+        self._raise_if_deadline_expired(deadline)
         if record.binding is None:
             options: dict[str, Any] = {"uuid": employee_outbox_uuid(outbox_id)}
             if snapshot.thread_root_message_id:
@@ -227,24 +250,31 @@ class EmployeeOutboxDeliveryCoordinator:
                     }
                 )
             try:
-                receipt = self._channels.send(
-                    record.agent_id,
-                    generation=authority.generation,
-                    target=snapshot.chat_id,
-                    message={"card": snapshot.to_dict()["card_json"]},
-                    options=options,
-                )
+                send_kwargs: dict[str, Any] = {
+                    "generation": authority.generation,
+                    "target": snapshot.chat_id,
+                    "message": {"card": snapshot.to_dict()["card_json"]},
+                    "options": options,
+                }
+                if deadline is not None:
+                    send_kwargs["deadline"] = deadline
+                receipt = self._channels.send(record.agent_id, **send_kwargs)
             except (EmployeeChannelOutboundError, ConnectionError, TimeoutError) as exc:
                 raise EmployeeOutboxItemDeliveryError(
                     "employee delivery transport is unavailable"
                 ) from exc
         else:
             try:
+                update_kwargs: dict[str, Any] = {
+                    "generation": authority.generation,
+                    "message_id": record.binding.message_id,
+                    "card": snapshot.to_dict()["card_json"],
+                }
+                if deadline is not None:
+                    update_kwargs["deadline"] = deadline
                 receipt = self._channels.update_card(
                     record.agent_id,
-                    generation=authority.generation,
-                    message_id=record.binding.message_id,
-                    card=snapshot.to_dict()["card_json"],
+                    **update_kwargs,
                 )
             except (EmployeeChannelOutboundError, ConnectionError, TimeoutError) as exc:
                 raise EmployeeOutboxItemDeliveryError(
@@ -258,6 +288,24 @@ class EmployeeOutboxDeliveryCoordinator:
             connection_id=receipt.connection_id,
             message_id=receipt.message_id,
         )
+
+    @staticmethod
+    def _validate_deadline(deadline: float | None) -> None:
+        if deadline is None:
+            return
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(float(deadline))
+        ):
+            raise ValueError("employee Outbox delivery deadline is invalid")
+
+    @staticmethod
+    def _raise_if_deadline_expired(deadline: float | None) -> None:
+        if deadline is not None and time.monotonic() >= float(deadline):
+            raise EmployeeOutboxDrainDeadlineExceeded(
+                "employee Outbox delivery deadline exceeded"
+            )
 
     @staticmethod
     def _validate_receipt(
@@ -282,6 +330,7 @@ class EmployeeOutboxDeliveryCoordinator:
 
 __all__ = [
     "EmployeeDeliveryAuthority",
+    "EmployeeOutboxDrainDeadlineExceeded",
     "EmployeeOutboxDrainResult",
     "EmployeeOutboxDeliveryCoordinator",
     "EmployeeOutboxItemDeliveryError",

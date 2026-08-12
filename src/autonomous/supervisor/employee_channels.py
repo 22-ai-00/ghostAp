@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import secrets
 import select
@@ -797,6 +798,7 @@ class EmployeeChannelSupervisor:
         target: str,
         message: Any,
         options: Any = None,
+        deadline: float | None = None,
     ) -> ChannelSendReceipt:
         """Send through the exact READY employee generation and await its receipt."""
         if not isinstance(target, str) or not target:
@@ -806,6 +808,7 @@ class EmployeeChannelSupervisor:
             generation,
             FrameType.SEND,
             {"target": target, "message": message, "options": options},
+            deadline=deadline,
         )
 
     def update_card(
@@ -815,6 +818,7 @@ class EmployeeChannelSupervisor:
         generation: int,
         message_id: str,
         card: dict[str, Any],
+        deadline: float | None = None,
     ) -> ChannelSendReceipt:
         """Patch one pre-bound card through the exact READY employee generation."""
         if not isinstance(message_id, str) or not message_id:
@@ -827,6 +831,7 @@ class EmployeeChannelSupervisor:
             FrameType.UPDATE_CARD,
             {"message_id": message_id, "card": card},
             expected_message_id=message_id,
+            deadline=deadline,
         )
 
     def _request_outbound(
@@ -837,9 +842,26 @@ class EmployeeChannelSupervisor:
         payload: dict[str, Any],
         *,
         expected_message_id: str = "",
+        deadline: float | None = None,
     ) -> ChannelSendReceipt:
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
             raise ValueError("generation must be a positive integer")
+        if (
+            deadline is not None
+            and (
+                isinstance(deadline, bool)
+                or not isinstance(deadline, (int, float))
+                or not math.isfinite(float(deadline))
+            )
+        ):
+            raise ValueError("employee Channel outbound deadline is invalid")
+        receipt_deadline = time.monotonic() + self._send_timeout
+        if deadline is not None:
+            receipt_deadline = min(receipt_deadline, float(deadline))
+        if receipt_deadline <= time.monotonic():
+            raise EmployeeChannelOutboundTimeout(
+                "employee Channel outbound deadline exceeded"
+            )
         operation = "send" if frame_type is FrameType.SEND else "update_card"
         request_id = f"{operation}_{uuid.uuid4().hex}"
         pending = _PendingSend(operation=operation, expected_message_id=expected_message_id)
@@ -853,20 +875,31 @@ class EmployeeChannelSupervisor:
                 )
             runtime.pending_sends[request_id] = pending
             try:
-                sent = self._send_control(
-                    runtime,
-                    frame_type,
-                    {"request_id": request_id, **payload},
-                )
+                control_payload = {"request_id": request_id, **payload}
+                if deadline is None:
+                    sent = self._send_control(runtime, frame_type, control_payload)
+                else:
+                    sent = self._send_control(
+                        runtime,
+                        frame_type,
+                        control_payload,
+                        deadline=receipt_deadline,
+                    )
             except ProtocolError:
                 runtime.pending_sends.pop(request_id, None)
                 raise ValueError(f"unsafe {operation.replace('_', ' ')} payload") from None
+            except TimeoutError as exc:
+                runtime.pending_sends.pop(request_id, None)
+                raise EmployeeChannelOutboundTimeout(
+                    f"employee Channel {operation.replace('_', ' ')} timed out"
+                ) from exc
             if not sent:
                 runtime.pending_sends.pop(request_id, None)
                 raise EmployeeChannelOutboundError(
                     f"employee Channel {operation.replace('_', ' ')} failed"
                 )
-        if not pending.completed.wait(self._send_timeout):
+        remaining = max(0.0, receipt_deadline - time.monotonic())
+        if not pending.completed.wait(remaining):
             with self._lock:
                 runtime.pending_sends.pop(request_id, None)
             raise EmployeeChannelOutboundTimeout(
@@ -1184,8 +1217,22 @@ class EmployeeChannelSupervisor:
                     error_code="ingress-not-acknowledged",
                 )
 
-    def _send_control(self, runtime: _Runtime, frame_type: FrameType, payload: dict[str, Any]) -> bool:
-        with runtime.control_lock:
+    def _send_control(
+        self,
+        runtime: _Runtime,
+        frame_type: FrameType,
+        payload: dict[str, Any],
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        abandoned_fd = -1
+        if deadline is None:
+            runtime.control_lock.acquire()
+        else:
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0 or not runtime.control_lock.acquire(timeout=remaining):
+                raise TimeoutError("employee Channel IPC write timed out")
+        try:
             if runtime.control_fd < 0:
                 return False
             runtime.outbound_sequence += 1
@@ -1199,10 +1246,26 @@ class EmployeeChannelSupervisor:
                 )
             )
             try:
-                _write_all(runtime.control_fd, raw)
+                if deadline is None:
+                    _write_all(runtime.control_fd, raw)
+                else:
+                    _write_all(runtime.control_fd, raw, deadline=deadline)
+            except TimeoutError:
+                # A timed-out frame may have been written only partially.
+                # Never append another frame to that stream: doing so would
+                # let the child parse corrupted control input as a new command.
+                abandoned_fd = runtime.control_fd
+                runtime.control_fd = -1
+                raise
             except OSError:
+                if deadline is not None:
+                    abandoned_fd = runtime.control_fd
+                    runtime.control_fd = -1
                 return False
             return True
+        finally:
+            runtime.control_lock.release()
+            _close_fd(abandoned_fd)
 
     def _fail_and_reap(self, runtime: _Runtime, error_code: str) -> None:
         runtime.stopping = True
@@ -1439,13 +1502,55 @@ def _read_sandbox_metadata(fd: int) -> dict[str, Any]:
     return decoded
 
 
-def _write_all(fd: int, raw: bytes) -> None:
+def _write_all(
+    fd: int,
+    raw: bytes,
+    *,
+    deadline: float | None = None,
+) -> None:
+    if deadline is None:
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise BrokenPipeError("employee Channel IPC closed")
+            view = view[written:]
+        return
+
+    if (
+        isinstance(deadline, bool)
+        or not isinstance(deadline, (int, float))
+        or not math.isfinite(float(deadline))
+    ):
+        raise ValueError("employee Channel IPC write deadline is invalid")
+    deadline = float(deadline)
+    was_blocking = os.get_blocking(fd)
+    if was_blocking:
+        os.set_blocking(fd, False)
     view = memoryview(raw)
-    while view:
-        written = os.write(fd, view)
-        if written <= 0:
-            raise BrokenPipeError("employee Channel IPC closed")
-        view = view[written:]
+    try:
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("employee Channel IPC write timed out")
+            try:
+                written = os.write(fd, view)
+            except BlockingIOError:
+                _, writable, _ = select.select((), (fd,), (), remaining)
+                if not writable:
+                    raise TimeoutError("employee Channel IPC write timed out")
+                continue
+            except InterruptedError:
+                continue
+            if written <= 0:
+                raise BrokenPipeError("employee Channel IPC closed")
+            view = view[written:]
+    finally:
+        if was_blocking:
+            try:
+                os.set_blocking(fd, True)
+            except OSError:
+                pass
 
 
 def _close_fd(fd: int) -> None:
