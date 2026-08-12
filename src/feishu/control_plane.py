@@ -8,6 +8,7 @@ from typing import Deque, Optional
 from ..tasking import TaskEvent, TaskPriority, TaskSpec, TaskStatus
 
 logger = logging.getLogger(__name__)
+_SYSTEM_GATE_TASK_TYPES = frozenset({"system_help", "system_exit"})
 
 @dataclass(frozen=True)
 class _PendingExit:
@@ -44,6 +45,21 @@ class ControlPlane:
         self._thread.start()
 
     def is_system_cmd_inflight(self, chat_id: str) -> bool:
+        authoritative = getattr(self._scheduler, "has_running_task", None)
+        if callable(authoritative):
+            try:
+                result = authoritative(
+                    chat_id,
+                    task_types=_SYSTEM_GATE_TASK_TYPES,
+                )
+            except Exception:
+                logger.debug(
+                    "failed to query authoritative system command state",
+                    exc_info=True,
+                )
+            else:
+                if type(result) is bool:
+                    return result
         with self._system_cmd_gate_lock:
             return chat_id in self._system_cmd_inflight_by_chat
 
@@ -51,7 +67,7 @@ class ControlPlane:
         """TaskScheduler listener (MUST be non-blocking)."""
         try:
             # 1) System command gate state
-            if ev.task_type in {"system_help", "system_exit"}:
+            if ev.task_type in _SYSTEM_GATE_TASK_TYPES:
                 terminal = {
                     TaskStatus.SUCCEEDED,
                     TaskStatus.FAILED,

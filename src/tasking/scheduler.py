@@ -354,17 +354,26 @@ class TaskScheduler:
             tuple[
                 TaskEvent,
                 tuple[Callable[[TaskEvent], None], ...],
-                tuple[Callable[[TaskEvent], None], ...],
             ]
             | None
         ] = queue.Queue()
+        self._completion_queue: queue.Queue[
+            tuple[TaskEvent, tuple[Callable[[TaskEvent], None], ...]] | None
+        ] = queue.Queue()
         self._event_dispatch_stopping = False
+        self._completion_dispatch_stopping = False
         self._event_dispatcher = threading.Thread(
             target=self._event_dispatch_loop,
             name="task_scheduler_events",
             daemon=True,
         )
+        self._completion_dispatcher = threading.Thread(
+            target=self._completion_dispatch_loop,
+            name="task_scheduler_completions",
+            daemon=True,
+        )
         self._event_dispatcher.start()
+        self._completion_dispatcher.start()
 
         self._rate_limiters: dict[str, RateLimiter] = {}
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
@@ -634,6 +643,25 @@ class TaskScheduler:
         with self._lock:
             return self._states.get(run_id)
 
+    def has_running_task(
+        self,
+        chat_id: str,
+        *,
+        task_types: frozenset[str],
+    ) -> bool:
+        """Return authoritative RUNNING truth for selected task types."""
+
+        if not task_types:
+            return False
+        with self._lock:
+            return any(
+                state is not None
+                and state.status is TaskStatus.RUNNING
+                and state.spec.task_type in task_types
+                for run_id in self._by_chat.get(chat_id, ())
+                if (state := self._states.get(run_id)) is not None
+            )
+
     def get_state_by_task_id(self, task_id: str, chat_id: str) -> Optional[TaskRunState]:
         """Look up a task by its human-readable task_id.
 
@@ -706,6 +734,8 @@ class TaskScheduler:
                     logger.debug("failed to shutdown executor", exc_info=True)
         if wait and self._event_dispatch_stopping:
             self._event_dispatcher.join(timeout=2)
+        if wait and self._completion_dispatch_stopping:
+            self._completion_dispatcher.join(timeout=2)
 
     def fence_admission(self) -> None:
         """Reject new work and cancel work that has not entered its callback.
@@ -1181,16 +1211,16 @@ class TaskScheduler:
             completion = self._completions.pop(st.run_id, None)
             if completion is not None:
                 completion_callbacks = completion.complete(ev)
-        self._event_queue.put((ev, tuple(self._listeners), completion_callbacks))
+        self._event_queue.put((ev, tuple(self._listeners)))
+        if completion_callbacks:
+            self._completion_queue.put((ev, completion_callbacks))
 
     def _event_dispatch_loop(self) -> None:
         while True:
             item = self._event_queue.get()
             if item is None:
                 return
-            event, listeners, completion_callbacks = item
-            for callback in completion_callbacks:
-                _TaskCompletion._invoke(callback, event)
+            event, listeners = item
             for listener in listeners:
                 listener_id = id(listener)
                 with self._cv:
@@ -1213,6 +1243,15 @@ class TaskScheduler:
                             self._listener_inflight.pop(listener_id, None)
                         self._cv.notify_all()
 
+    def _completion_dispatch_loop(self) -> None:
+        while True:
+            item = self._completion_queue.get()
+            if item is None:
+                return
+            event, callbacks = item
+            for callback in callbacks:
+                _TaskCompletion._invoke(callback, event)
+
     def _maybe_stop_event_dispatcher_unlocked(self) -> None:
         if (
             self._stopped
@@ -1221,6 +1260,13 @@ class TaskScheduler:
         ):
             self._event_dispatch_stopping = True
             self._event_queue.put(None)
+        if (
+            self._stopped
+            and not self._active_run_ids
+            and not self._completion_dispatch_stopping
+        ):
+            self._completion_dispatch_stopping = True
+            self._completion_queue.put(None)
 
     def _pop_queued_item_unlocked(self, run_id: str, key: str) -> Optional[_QueuedTask]:
         q = self._queues.get(key)
