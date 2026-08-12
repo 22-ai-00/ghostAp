@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
@@ -12,6 +15,11 @@ from .models import (
 )
 from .projection import OutboxRecord
 from .service import EmployeeOutboxService
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_PENDING_DELIVERY_BATCH = 16
+_MAX_PENDING_DELIVERY_BATCH = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +35,24 @@ class EmployeeDeliveryAuthority:
             raise ValueError("delivery authority generation is invalid")
         if not isinstance(self.connection_id, str) or not self.connection_id:
             raise ValueError("delivery authority connection_id is required")
+
+
+@dataclass(frozen=True, slots=True)
+class EmployeeOutboxDrainResult:
+    """Bounded delivery scan outcome without exposing transport error details."""
+
+    pending_count: int
+    attempted_outbox_ids: tuple[str, ...]
+    delivered_outbox_ids: tuple[str, ...]
+    failed_outbox_ids: tuple[str, ...]
+
+    @property
+    def made_progress(self) -> bool:
+        return bool(self.delivered_outbox_ids)
+
+    @property
+    def has_pending(self) -> bool:
+        return self.pending_count > 0
 
 
 class EmployeeCardChannels(Protocol):
@@ -67,6 +93,79 @@ class EmployeeOutboxDeliveryCoordinator:
         self._outbox = outbox
         self._channels = channels
         self._authority_resolver = authority_resolver
+        self._pending_cursor: tuple[str, str] | None = None
+        self._cursor_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+
+    def deliver_pending(
+        self,
+        *,
+        max_items: int = _DEFAULT_PENDING_DELIVERY_BATCH,
+    ) -> EmployeeOutboxDrainResult:
+        """Attempt a bounded rotating batch, isolating failures by Outbox ID.
+
+        The cursor advances when a record is selected, including when its
+        authority or transport is unavailable.  A permanently broken oldest
+        record therefore cannot starve later employees, while the ring still
+        revisits that record on a later call.
+        """
+
+        if (
+            type(max_items) is not int
+            or max_items < 1
+            or max_items > _MAX_PENDING_DELIVERY_BATCH
+        ):
+            raise ValueError(
+                f"max_items must be between 1 and {_MAX_PENDING_DELIVERY_BATCH}"
+            )
+        pending = self._outbox.list_pending_delivery_records()
+        if not pending:
+            with self._cursor_lock:
+                self._pending_cursor = None
+            return EmployeeOutboxDrainResult(
+                pending_count=0,
+                attempted_outbox_ids=(),
+                delivered_outbox_ids=(),
+                failed_outbox_ids=(),
+            )
+
+        keys = tuple(
+            (record.latest.created_at, record.outbox_id) for record in pending
+        )
+        with self._cursor_lock:
+            start = (
+                0
+                if self._pending_cursor is None
+                else bisect_right(keys, self._pending_cursor)
+            )
+            if start >= len(pending):
+                start = 0
+            selected = tuple(
+                pending[(start + offset) % len(pending)]
+                for offset in range(min(max_items, len(pending)))
+            )
+            last = selected[-1]
+            self._pending_cursor = (last.latest.created_at, last.outbox_id)
+
+        delivered: list[str] = []
+        failed: list[str] = []
+        for record in selected:
+            try:
+                self.deliver(record.outbox_id)
+            except Exception as exc:
+                failed.append(record.outbox_id)
+                logger.warning(
+                    "employee Outbox delivery deferred: outbox_id=%s error=%s",
+                    record.outbox_id,
+                    type(exc).__name__,
+                )
+                continue
+            delivered.append(record.outbox_id)
+        return EmployeeOutboxDrainResult(
+            pending_count=len(pending),
+            attempted_outbox_ids=tuple(record.outbox_id for record in selected),
+            delivered_outbox_ids=tuple(delivered),
+            failed_outbox_ids=tuple(failed),
+        )
 
     def deliver(
         self,
@@ -144,5 +243,6 @@ class EmployeeOutboxDeliveryCoordinator:
 
 __all__ = [
     "EmployeeDeliveryAuthority",
+    "EmployeeOutboxDrainResult",
     "EmployeeOutboxDeliveryCoordinator",
 ]

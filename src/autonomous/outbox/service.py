@@ -232,6 +232,28 @@ class EmployeeOutboxService:
                 raise KeyError(outbox_id)
             return record
 
+    def list_pending_delivery_records(self) -> tuple[OutboxRecord, ...]:
+        """Return one immutable, stable-order view of cards needing delivery."""
+
+        with self._mutex:
+            self._ensure_open_unlocked()
+            self._synchronize_projection_unlocked()
+            return tuple(
+                sorted(
+                    (
+                        record
+                        for record in self._state.by_outbox_id.values()
+                        if record.binding is None
+                        or record.binding.bound_snapshot_version
+                        < record.latest_version
+                    ),
+                    key=lambda record: (
+                        record.latest.created_at,
+                        record.outbox_id,
+                    ),
+                )
+            )
+
     def record_collaboration_publication(
         self,
         *,

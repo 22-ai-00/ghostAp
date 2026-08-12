@@ -1,6 +1,10 @@
 """Durable employee-owned response Outbox."""
 
-from .delivery import EmployeeDeliveryAuthority, EmployeeOutboxDeliveryCoordinator
+from .delivery import (
+    EmployeeDeliveryAuthority,
+    EmployeeOutboxDeliveryCoordinator,
+    EmployeeOutboxDrainResult,
+)
 from .lifecycle import EmployeeOutboxLifecycle
 from .models import (
     DeliveryEffectKind,
@@ -36,6 +40,7 @@ __all__ = [
     "EmployeeOutboxSnapshot",
     "EmployeeDeliveryAuthority",
     "EmployeeOutboxDeliveryCoordinator",
+    "EmployeeOutboxDrainResult",
     "EmployeeOutboxLifecycle",
     "OutboxDeliveryEffect",
     "OutboxProjectionError",
