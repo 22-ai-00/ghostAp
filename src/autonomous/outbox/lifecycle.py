@@ -235,6 +235,51 @@ class EmployeeOutboxLifecycle:
             command="/status",
         )
 
+    def task_usage_response(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        chat_id: str,
+        thread_root_message_id: str,
+        command_acceptance_id: str,
+    ) -> EmployeeOutboxSnapshot:
+        """Publish one idempotent usage card for a uniquely targeted `/task`."""
+
+        attempt_id = f"control_{command_acceptance_id}"
+        outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
+        try:
+            current = self._outbox.get_snapshot(outbox_id)
+        except KeyError:
+            created_at = datetime.now(UTC).isoformat(
+                timespec="microseconds"
+            ).replace("+00:00", "Z")
+            current = self._append_control(
+                tenant_key=tenant_key,
+                agent_id=agent_id,
+                attempt_id=attempt_id,
+                chat_id=chat_id,
+                thread_root_message_id=thread_root_message_id,
+                version=1,
+                state=EmployeeCardState.QUEUED,
+                summary="正在检查任务命令。",
+                created_at=created_at,
+                command="/task",
+            )
+        if current.state.terminal:
+            return current
+        return self._terminal_control(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            attempt_id=attempt_id,
+            chat_id=chat_id,
+            thread_root_message_id=thread_root_message_id,
+            current=current,
+            state=EmployeeCardState.ACTION_REQUIRED,
+            summary="用法：@员工 /task <任务描述>",
+            command="/task",
+        )
+
     def _terminal_control(
         self,
         *,

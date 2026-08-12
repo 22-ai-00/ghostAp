@@ -460,6 +460,71 @@ def test_status_response_is_terminal_and_idempotent_across_replay(tmp_path) -> N
         reopened_writer.close()
 
 
+def test_targeted_task_usage_response_is_terminal_and_idempotent_across_replay(
+    tmp_path,
+) -> None:
+    service, writer, anchor = _runtime(tmp_path)
+    lifecycle = EmployeeOutboxLifecycle(service)
+    try:
+        first = lifecycle.task_usage_response(
+            tenant_key="tenant-a",
+            agent_id="agt_alpha",
+            chat_id="oc_team",
+            thread_root_message_id="om_task",
+            command_acceptance_id="acc_task_usage",
+        )
+        repeated = lifecycle.task_usage_response(
+            tenant_key="tenant-a",
+            agent_id="agt_alpha",
+            chat_id="oc_team",
+            thread_root_message_id="om_task",
+            command_acceptance_id="acc_task_usage",
+        )
+
+        assert repeated == first
+        assert first.version == 2
+        assert first.state is EmployeeCardState.ACTION_REQUIRED
+        assert first.terminal_version == 2
+        assert "@员工 /task <任务描述>" in first.card_json["body"]["elements"][0][
+            "content"
+        ]
+        assert len(service.get_record(first.outbox_id).snapshots) == 2
+    finally:
+        service.close()
+        writer.close()
+
+    reopened_writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=anchor,
+        hmac_key=b"j" * 32,
+        writer_epoch=2,
+    )
+    reopened_service = EmployeeOutboxService(
+        writer=reopened_writer,
+        blob_store=BlobStore(
+            tmp_path / "outbox-blobs",
+            AesGcmEncryptionProvider(lambda _ref: b"b" * 32),
+        ),
+        outbox_state=OutboxProjectionState(),
+        active_key_id="k1",
+    )
+    try:
+        replayed = EmployeeOutboxLifecycle(
+            reopened_service
+        ).task_usage_response(
+            tenant_key="tenant-a",
+            agent_id="agt_alpha",
+            chat_id="oc_team",
+            thread_root_message_id="om_task",
+            command_acceptance_id="acc_task_usage",
+        )
+        assert replayed == first
+        assert len(reopened_service.get_record(first.outbox_id).snapshots) == 2
+    finally:
+        reopened_service.close()
+        reopened_writer.close()
+
+
 @pytest.mark.parametrize("command", ["stop", "history", "memory"])
 def test_existing_successful_control_responses_use_valid_monotonic_states(
     tmp_path,

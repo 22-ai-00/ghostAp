@@ -106,7 +106,10 @@ class _Channels:
                 state=ChannelProcessState.READY,
                 tenant_key="tenant_1",
                 bot_principal_id=f"bot_{agent_id.removeprefix('agt_')}",
-                identity={"app_id": f"cli_{agent_id.removeprefix('agt_')}"},
+                identity={
+                    "app_id": f"cli_{agent_id.removeprefix('agt_')}",
+                    "open_id": f"ou_bot_{agent_id.removeprefix('agt_')}",
+                },
                 ready_metadata={"connection_id": f"conn_{agent_id.removeprefix('agt_')}"},
             )
             for index, agent_id in enumerate(agent_ids)
@@ -233,6 +236,9 @@ def _stack(
     requester_acl: object | None = None,
     membership_health: object | None = None,
     requester_principal_resolver=None,
+    managed_group_registry_provider=None,
+    managed_group_owner_id: str = "",
+    employee_bot_ids_provider=None,
 ):
     module = _module()
     writer = JournalWriter.open(
@@ -299,6 +305,9 @@ def _stack(
             membership_health=membership_health or _HealthyMembership(),
             attachment_staging=attachment_staging,
             requester_principal_resolver=requester_principal_resolver,
+            managed_group_registry_provider=managed_group_registry_provider,
+            managed_group_owner_id=managed_group_owner_id,
+            employee_bot_ids_provider=employee_bot_ids_provider,
         )
 
     return module, writer, ingress, new_router
@@ -450,6 +459,205 @@ def test_owner_p2p_without_explicit_union_resolver_fails_closed(
     writer.close()
 
 
+def test_targeted_group_task_routes_with_union_owner_and_freezes_input(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime
+
+    from src.trust.models import ManagedGroupOrigin
+    from src.trust.registry import ManagedGroupRegistry
+
+    registry = ManagedGroupRegistry(tmp_path / "managed-groups.json")
+    registry.register(
+        chat_id="oc_team",
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.OWNER_ADOPTED,
+        receiving_bot_ref="main-bot",
+        project_id="project-1",
+        canonical_root_ref="/project",
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+    )
+
+    def resolve_owner(**values):
+        return (
+            "ou_owner"
+            if values["sender_union_id"] == "on_owner"
+            and values["owner_principal_id"] == "ou_owner"
+            else None
+        )
+
+    _, writer, ingress, new_router = _stack(
+        tmp_path,
+        requester_acl=RuntimeRequesterChatAcl(
+            allowed_requesters=("ou_owner",),
+            allowed_chats=("oc_team",),
+        ),
+        requester_principal_resolver=resolve_owner,
+        managed_group_registry_provider=lambda: registry,
+        managed_group_owner_id="ou_owner",
+        employee_bot_ids_provider=lambda: frozenset({"ou_bot_alpha"}),
+    )
+    router = new_router()
+    payload = _payload(
+        94,
+        sender="ou_employee_app_owner",
+        sender_union_id="on_owner",
+    )
+    part = dict(payload.normalized_parts[0])
+    part.update(
+        content={"text": "@_user_1 /task finish audit"},
+        mentions=(
+            {
+                "key": "@_user_1",
+                "mentioned_type": "bot",
+                "open_id": "ou_bot_alpha",
+                "tenant_key": "tenant_1",
+            },
+        ),
+        remote_chat_id="oc_team",
+        remote_message_id="om_targeted",
+        remote_root_id="om_root",
+    )
+    payload = EmployeeIngressPayload(
+        schema_version=1,
+        envelope_id=payload.envelope_id,
+        normalized_parts=(part,),
+        attachment_descriptors=(),
+    )
+    metadata = _metadata(payload, 94, "agt_alpha")
+    metadata = replace(
+        metadata,
+        sender_principal_id="ou_employee_app_owner",
+        message_id="om_" + hashlib.sha256(b"om_targeted").hexdigest(),
+        chat_id="oc_" + hashlib.sha256(b"oc_team").hexdigest(),
+        thread_root_message_id="om_" + hashlib.sha256(b"om_root").hexdigest(),
+    )
+    acceptance_id = ingress.accept(
+        metadata,
+        payload,
+        request_id="req_targeted_task",
+    ).acceptance.acceptance_id
+
+    queued = router.route(acceptance_id)
+    grant = router.peek_dispatch_candidate()
+
+    assert queued.state == "queued"
+    assert queued.authority is not None
+    assert queued.authority.requester_principal_id == "ou_owner"
+    assert queued.authority.effective_input_kind == "targeted_group_task_v1"
+    assert queued.authority.target_bot_open_id_digest == hashlib.sha256(
+        b"ou_bot_alpha"
+    ).hexdigest()
+    with pytest.raises(ValueError, match="effective input"):
+        replace(
+            queued.authority,
+            effective_input_kind=None,
+            effective_input_digest=None,
+        )
+    assert grant is not None and grant.targeted_task is not None
+    assert grant.targeted_task.description == "finish audit"
+    assert grant.request.source_requester_principal_id == "ou_employee_app_owner"
+    assert grant.payload.payload_sha256 == payload.payload_sha256
+    assert "finish audit" not in repr(grant)
+
+    restarted = new_router()
+    replayed = restarted.peek_dispatch_candidate()
+    assert replayed is not None and replayed.targeted_task is not None
+    assert replayed.targeted_task.input_digest == grant.targeted_task.input_digest
+    ingress.close()
+    writer.close()
+
+
+@pytest.mark.parametrize(
+    ("mention_open_id", "sender_union_id", "resolved_requester"),
+    (
+        ("ou_bot_beta", "on_owner", "ou_owner"),
+        ("ou_bot_alpha", "on_other", None),
+        ("ou_bot_alpha", "on_owner", "ou_bot_alpha"),
+    ),
+)
+def test_targeted_group_task_rejects_foreign_target_union_or_resolver_confusion(
+    tmp_path: Path,
+    mention_open_id: str,
+    sender_union_id: str,
+    resolved_requester: str | None,
+) -> None:
+    from datetime import UTC, datetime
+
+    from src.trust.models import ManagedGroupOrigin
+    from src.trust.registry import ManagedGroupRegistry
+
+    registry = ManagedGroupRegistry(tmp_path / "managed-groups.json")
+    registry.register(
+        chat_id="oc_team",
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.OWNER_ADOPTED,
+        receiving_bot_ref="main-bot",
+        project_id="project-1",
+        canonical_root_ref="/project",
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+    )
+    _, writer, ingress, new_router = _stack(
+        tmp_path,
+        requester_acl=RuntimeRequesterChatAcl(
+            allowed_requesters=("ou_owner", "ou_bot_alpha", "ou_bot_beta"),
+            allowed_chats=("oc_team",),
+        ),
+        requester_principal_resolver=lambda **_values: resolved_requester,
+        managed_group_registry_provider=lambda: registry,
+        managed_group_owner_id="ou_owner",
+        employee_bot_ids_provider=lambda: frozenset(
+            {"ou_bot_alpha", "ou_bot_beta"}
+        ),
+    )
+    router = new_router()
+    base = _payload(
+        95,
+        sender="ou_employee_app_owner",
+        sender_union_id=sender_union_id,
+    )
+    part = dict(base.normalized_parts[0])
+    part.update(
+        content={"text": "@_user_1 /task finish audit"},
+        mentions=(
+            {
+                "key": "@_user_1",
+                "mentioned_type": "bot",
+                "open_id": mention_open_id,
+                "tenant_key": "tenant_1",
+            },
+        ),
+        remote_chat_id="oc_team",
+        remote_message_id="om_targeted",
+        remote_root_id="om_root",
+    )
+    payload = EmployeeIngressPayload(
+        schema_version=1,
+        envelope_id=base.envelope_id,
+        normalized_parts=(part,),
+        attachment_descriptors=(),
+    )
+    metadata = replace(
+        _metadata(payload, 95, "agt_alpha"),
+        sender_principal_id="ou_employee_app_owner",
+        message_id="om_" + hashlib.sha256(b"om_targeted").hexdigest(),
+        chat_id="oc_" + hashlib.sha256(b"oc_team").hexdigest(),
+        thread_root_message_id="om_" + hashlib.sha256(b"om_root").hexdigest(),
+    )
+    acceptance_id = ingress.accept(
+        metadata,
+        payload,
+        request_id=f"req_rejected_{mention_open_id}_{sender_union_id}",
+    ).acceptance.acceptance_id
+
+    rejected = router.route(acceptance_id)
+
+    assert rejected.state == "terminal"
+    assert rejected.reason_code in {"authority_denied", "requester_denied"}
+    ingress.close()
+    writer.close()
+
+
 def _commit_dispatch(router, writer, acceptance_id: str):
     """Test-only simulation of the coordinator's Router event application."""
 
@@ -576,7 +784,13 @@ def test_router_replay_backfills_legacy_authorized_requester_from_acceptance(
     authority = router.state.by_acceptance_id[seed_acceptance].authority
     assert authority is not None
     authority_payload = authority.to_dict()
-    authority_payload.pop("authorization_scope")
+    for field_name in (
+        "authorization_scope",
+        "effective_input_kind",
+        "effective_input_digest",
+        "target_bot_open_id_digest",
+    ):
+        authority_payload.pop(field_name)
     authority_payload["requester_principal_id"] = "ou_resolved_requester"
 
     legacy_acceptance = _accept(ingress, 2)

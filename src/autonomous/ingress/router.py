@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Mapping, Protocol
 
-from ...trust.models import TrustZone
+from ...trust.models import ActorKind, TrustZone
 from ...trust.registry import ManagedGroupRegistry
 from ...trust.resolver import TrustZoneResolver
 from ..authorization import EmployeeAuthorizationScope
@@ -33,6 +33,13 @@ from ..workforce.registry import (
 )
 from .models import EmployeeIngressMetadata, EmployeeIngressPayload
 from .service import EmployeeIngressService, IngressBlobError
+from .targeted_task import (
+    TARGETED_TASK_INPUT_KIND,
+    TargetedTaskParseResult,
+    TargetedTaskState,
+    is_group_slash_observation,
+    parse_targeted_group_task,
+)
 
 _ROUTER_PREFIX = "employee.ingress.router_"
 _ROUTER_EVENTS = frozenset(
@@ -102,6 +109,7 @@ def _same_app_requester_principal(
     owner_principal_id: str,
     sender_principal_id: str,
     sender_union_id: str,
+    **_transport: object,
 ) -> str | None:
     """Preserve the historical same-app requester identity by default."""
 
@@ -213,6 +221,9 @@ class RouterAuthoritySnapshot:
     effort: str
     constraints_digest: str = ""
     system_prompt_token_reserve: int = 0
+    effective_input_kind: str = ""
+    effective_input_digest: str = ""
+    target_bot_open_id_digest: str = ""
 
     _FIELDS = frozenset(
         {
@@ -233,6 +244,9 @@ class RouterAuthoritySnapshot:
             "effort",
             "constraints_digest",
             "system_prompt_token_reserve",
+            "effective_input_kind",
+            "effective_input_digest",
+            "target_bot_open_id_digest",
         }
     )
 
@@ -278,6 +292,45 @@ class RouterAuthoritySnapshot:
             raise ValueError("Router constraints digest must be lowercase SHA-256")
         if self.system_prompt_token_reserve and not self.constraints_digest:
             raise ValueError("Router reserve requires constraints digest")
+        if not all(
+            isinstance(value, str)
+            for value in (
+                self.effective_input_kind,
+                self.effective_input_digest,
+                self.target_bot_open_id_digest,
+            )
+        ):
+            raise ValueError("Router effective input binding must be text")
+        if (
+            self.effective_input_kind != self.effective_input_kind.strip()
+            or self.effective_input_digest != self.effective_input_digest.strip()
+            or self.target_bot_open_id_digest
+            != self.target_bot_open_id_digest.strip()
+        ):
+            raise ValueError("Router effective input binding must be trimmed")
+        if not (
+            bool(self.effective_input_kind)
+            == bool(self.effective_input_digest)
+            == bool(self.target_bot_open_id_digest)
+        ):
+            raise ValueError("Router effective input binding is incomplete")
+        if self.effective_input_kind and (
+            self.effective_input_kind != TARGETED_TASK_INPUT_KIND
+            or self.authorization_scope
+            is not EmployeeAuthorizationScope.MANAGED_GROUP
+            or any(
+                len(digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in digest
+                )
+                for digest in (
+                    self.effective_input_digest,
+                    self.target_bot_open_id_digest,
+                )
+            )
+        ):
+            raise ValueError("Router effective input binding is invalid")
 
     def to_dict(self) -> dict[str, object]:
         result = {name: getattr(self, name) for name in sorted(self._FIELDS)}
@@ -294,11 +347,23 @@ class RouterAuthoritySnapshot:
         if not isinstance(value, dict):
             raise ValueError("Router authority snapshot must use exact schema")
         normalized = dict(value)
-        legacy_fields = cls._FIELDS - {"authorization_scope"}
-        if allow_legacy_replay and set(normalized) == legacy_fields:
-            normalized["authorization_scope"] = (
-                EmployeeAuthorizationScope.MANAGED_GROUP.value
+        previous_fields = cls._FIELDS - {
+            "effective_input_kind",
+            "effective_input_digest",
+            "target_bot_open_id_digest",
+        }
+        oldest_fields = previous_fields - {"authorization_scope"}
+        if allow_legacy_replay and frozenset(normalized) in {
+            frozenset(previous_fields),
+            frozenset(oldest_fields),
+        }:
+            normalized.setdefault(
+                "authorization_scope",
+                EmployeeAuthorizationScope.MANAGED_GROUP.value,
             )
+            normalized["effective_input_kind"] = ""
+            normalized["effective_input_digest"] = ""
+            normalized["target_bot_open_id_digest"] = ""
         if set(normalized) != cls._FIELDS:
             raise ValueError("Router authority snapshot must use exact schema")
         try:
@@ -316,6 +381,10 @@ class _AuthorityResolution:
 
     snapshot: RouterAuthoritySnapshot
     credential_ref: str = field(repr=False)
+    targeted_task: TargetedTaskParseResult | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.credential_ref, str) or not self.credential_ref:
@@ -362,6 +431,10 @@ class RouterDispatchGrant:
     record: RouterLifecycleRecord
     request: AuthorizedContextRequest
     payload: EmployeeIngressPayload = field(repr=False)
+    targeted_task: TargetedTaskParseResult | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 def _accepted_record(event: JournalEvent, sequence: int) -> RouterLifecycleRecord:
@@ -840,6 +913,17 @@ class DurableEmployeeIngressRouter:
             ingress_record.metadata,
             payload,
         )
+        if (
+            resolution is not None
+            and resolution.targeted_task is not None
+            and resolution.targeted_task.state
+            is TargetedTaskState.TARGETED_INVALID
+        ):
+            return self._terminal_for_snapshot(
+                acceptance_id,
+                accepted_identity,
+                "sender_invalid",
+            )
         try:
             with self._ingress.dispatch_snapshot_guard(acceptance_id) as (
                 current_ingress,
@@ -1146,10 +1230,36 @@ class DurableEmployeeIngressRouter:
                     ):
                         self._terminal_unlocked(current, "authority_stale")
                         continue
-                    return RouterDispatchGrant(current, request, payload)
+                    targeted_task = resolution.targeted_task
+                    if (
+                        authority.effective_input_kind
+                        == TARGETED_TASK_INPUT_KIND
+                    ) != (
+                        targeted_task is not None
+                        and targeted_task.state
+                        is TargetedTaskState.TARGETED_VALID
+                    ):
+                        self._terminal_unlocked(current, "authority_stale")
+                        continue
+                    return RouterDispatchGrant(
+                        current,
+                        request,
+                        payload,
+                        targeted_task,
+                    )
             except IngressBlobError:
                 self._terminal_inbox_failure(candidate.acceptance_id)
                 continue
+
+    def classify_targeted_group_task(
+        self,
+        metadata: EmployeeIngressMetadata,
+        payload: EmployeeIngressPayload,
+    ) -> TargetedTaskParseResult | None:
+        """Return an authorized target view, re-derived from authenticated ingress."""
+
+        resolution, _reason = self._resolve_authority(metadata, payload)
+        return None if resolution is None else resolution.targeted_task
 
     def finish(self, acceptance_id: str, *, reason_code: str) -> RouterLifecycleRecord:
         try:
@@ -1379,45 +1489,6 @@ class DurableEmployeeIngressRouter:
             authorization_scope = EmployeeAuthorizationScope.OWNER_P2P
         else:
             return None, "sender_invalid"
-        if (
-            authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
-            and self._managed_group_registry_provider is not None
-        ):
-            try:
-                managed_registry = self._managed_group_registry_provider()
-                if type(managed_registry) is not ManagedGroupRegistry:
-                    return None, "authority_denied"
-                employee_bot_ids = (
-                    self._employee_bot_ids_provider()
-                    if self._employee_bot_ids_provider is not None
-                    else frozenset()
-                )
-                if type(employee_bot_ids) is not frozenset:
-                    return None, "authority_denied"
-                sender_id = part.get("sender_id")
-                if not isinstance(sender_id, str) or not sender_id:
-                    return None, "sender_invalid"
-                managed_group, project_grant = managed_registry.trust_snapshot(
-                    remote_chat_id
-                )
-                trust = TrustZoneResolver(
-                    owner_id=self._managed_group_owner_id,
-                    managed_groups=(
-                        () if managed_group is None else (managed_group,)
-                    ),
-                    project_grants=(
-                        () if project_grant is None else (project_grant,)
-                    ),
-                    employee_bot_ids=employee_bot_ids,
-                ).resolve(
-                    sender_id=sender_id,
-                    chat_id=remote_chat_id,
-                    chat_type=str(chat_type),
-                )
-                if trust.zone is not TrustZone.MANAGED_AGENT_GROUP:
-                    return None, "authority_denied"
-            except Exception:
-                return None, "authority_denied"
         try:
             registry = self._registry_provider()
             if type(registry) is not ProjectedAgentRegistry:
@@ -1430,6 +1501,74 @@ class DurableEmployeeIngressRouter:
                 or employee.bot_principal_id != metadata.bot_principal_id
             ):
                 return None, "authority_denied"
+            status = self._channels.status(metadata.agent_id)
+            identity = getattr(status, "identity", None)
+            ready_metadata = getattr(status, "ready_metadata", None)
+            status_agent_id = getattr(status, "agent_id", None)
+            status_app_id = getattr(status, "app_id", None)
+            status_tenant_key = getattr(status, "tenant_key", None)
+            status_bot_principal_id = getattr(status, "bot_principal_id", None)
+            status_generation = getattr(status, "generation", None)
+            status_state = getattr(status, "state", None)
+            identity_app_id = (
+                identity.get("app_id") if isinstance(identity, Mapping) else None
+            )
+            identity_open_id = (
+                identity.get("open_id") if isinstance(identity, Mapping) else None
+            )
+            connection_id = (
+                ready_metadata.get("connection_id")
+                if isinstance(ready_metadata, Mapping)
+                else None
+            )
+            required_strings = (
+                status_agent_id,
+                status_app_id,
+                status_tenant_key,
+                status_bot_principal_id,
+                identity_app_id,
+                connection_id,
+            )
+            if (
+                not isinstance(identity, Mapping)
+                or not isinstance(ready_metadata, Mapping)
+                or any(
+                    not isinstance(value, str) or not value
+                    for value in required_strings
+                )
+                or type(status_generation) is not int
+                or status_generation < 1
+                or status_state is not ChannelProcessState.READY
+                or status_agent_id != metadata.agent_id
+                or status_tenant_key != metadata.tenant_key
+                or status_bot_principal_id != metadata.bot_principal_id
+                or status_app_id != metadata.app_id
+                or status_generation != metadata.channel_generation
+                or identity_app_id != metadata.app_id
+                or connection_id != metadata.connection_id
+            ):
+                return None, "authority_denied"
+
+            targeted_task: TargetedTaskParseResult | None = None
+            if (
+                authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
+                and metadata.event_type == "im.message.receive_v1"
+            ):
+                slash_observation = is_group_slash_observation(part)
+                if not isinstance(identity_open_id, str) or not identity_open_id:
+                    if slash_observation:
+                        return None, "authority_denied"
+                else:
+                    parsed_task = parse_targeted_group_task(
+                        metadata=metadata,
+                        part=part,
+                        expected_bot_open_id=identity_open_id,
+                        expected_tenant_key=metadata.tenant_key,
+                    )
+                    if parsed_task.state is not TargetedTaskState.NOT_TARGETED:
+                        targeted_task = parsed_task
+                    elif slash_observation:
+                        return None, "authority_denied"
             sender_union_id = part.get("sender_union_id", "")
             if not isinstance(sender_union_id, str):
                 return None, "sender_invalid"
@@ -1440,10 +1579,21 @@ class DurableEmployeeIngressRouter:
                 return None, "sender_invalid"
             if metadata.event_type == "ghostap.team.assignment.v1":
                 requester_principal_id = metadata.sender_principal_id
+            elif (
+                authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
+                and targeted_task is None
+            ):
+                # Ambient group text retains the same-App identity contract.
+                # Cross-App union normalization is reserved for a uniquely
+                # targeted employee command so one event cannot fan out.
+                requester_principal_id = metadata.sender_principal_id
             else:
                 requester_principal_resolver = self._requester_principal_resolver
                 if requester_principal_resolver is None:
-                    if authorization_scope is EmployeeAuthorizationScope.OWNER_P2P:
+                    if (
+                        authorization_scope is EmployeeAuthorizationScope.OWNER_P2P
+                        or targeted_task is not None
+                    ):
                         return None, "requester_denied"
                     requester_principal_resolver = _same_app_requester_principal
                 try:
@@ -1453,6 +1603,11 @@ class DurableEmployeeIngressRouter:
                         owner_principal_id=employee.owner_principal_id,
                         sender_principal_id=metadata.sender_principal_id,
                         sender_union_id=sender_union_id,
+                        app_id=metadata.app_id,
+                        bot_principal_id=metadata.bot_principal_id,
+                        channel_generation=metadata.channel_generation,
+                        connection_id=metadata.connection_id,
+                        channel_identity_app_id=identity_app_id,
                     )
                 except Exception:
                     return None, "requester_denied"
@@ -1461,6 +1616,65 @@ class DurableEmployeeIngressRouter:
                 or not requester_principal_id
             ):
                 return None, "requester_denied"
+            if targeted_task is not None and (
+                requester_principal_id != employee.owner_principal_id
+                or requester_principal_id != self._managed_group_owner_id
+            ):
+                # A uniquely targeted group command is an owner control lane.
+                # Do not delegate this invariant to a pluggable resolver or
+                # permissive requester ACL.
+                return None, "requester_denied"
+            if authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP:
+                if (
+                    targeted_task is not None
+                    and self._managed_group_registry_provider is None
+                ):
+                    return None, "authority_denied"
+                if self._managed_group_registry_provider is not None:
+                    try:
+                        managed_registry = self._managed_group_registry_provider()
+                        if type(managed_registry) is not ManagedGroupRegistry:
+                            return None, "authority_denied"
+                        employee_bot_ids = (
+                            self._employee_bot_ids_provider()
+                            if self._employee_bot_ids_provider is not None
+                            else frozenset()
+                        )
+                        if type(employee_bot_ids) is not frozenset:
+                            return None, "authority_denied"
+                        managed_group, project_grant = (
+                            managed_registry.trust_snapshot(remote_chat_id)
+                        )
+                        trust = TrustZoneResolver(
+                            owner_id=self._managed_group_owner_id,
+                            managed_groups=(
+                                () if managed_group is None else (managed_group,)
+                            ),
+                            project_grants=(
+                                () if project_grant is None else (project_grant,)
+                            ),
+                            employee_bot_ids=employee_bot_ids,
+                        ).resolve(
+                            sender_id=(
+                                requester_principal_id
+                                if targeted_task is not None
+                                else metadata.sender_principal_id
+                            ),
+                            chat_id=remote_chat_id,
+                            chat_type=str(chat_type),
+                        )
+                        if trust.zone is not TrustZone.MANAGED_AGENT_GROUP or (
+                            targeted_task is not None
+                            and (
+                                trust.actor is not ActorKind.OWNER
+                                or trust.managed_group is None
+                                or trust.managed_group.owner_id
+                                != requester_principal_id
+                            )
+                        ):
+                            return None, "authority_denied"
+                    except Exception:
+                        return None, "authority_denied"
             binding = registry.context_binding(
                 tenant_key=metadata.tenant_key,
                 agent_id=metadata.agent_id,
@@ -1502,50 +1716,6 @@ class DurableEmployeeIngressRouter:
                 binding.projection_hash,
             ):
                 return None, "authority_denied"
-            status = self._channels.status(metadata.agent_id)
-            identity = getattr(status, "identity", None)
-            ready_metadata = getattr(status, "ready_metadata", None)
-            status_agent_id = getattr(status, "agent_id", None)
-            status_app_id = getattr(status, "app_id", None)
-            status_tenant_key = getattr(status, "tenant_key", None)
-            status_bot_principal_id = getattr(status, "bot_principal_id", None)
-            status_generation = getattr(status, "generation", None)
-            status_state = getattr(status, "state", None)
-            identity_app_id = (
-                identity.get("app_id") if isinstance(identity, Mapping) else None
-            )
-            connection_id = (
-                ready_metadata.get("connection_id")
-                if isinstance(ready_metadata, Mapping)
-                else None
-            )
-            required_strings = (
-                status_agent_id,
-                status_app_id,
-                status_tenant_key,
-                status_bot_principal_id,
-                identity_app_id,
-                connection_id,
-            )
-            if (
-                not isinstance(identity, Mapping)
-                or not isinstance(ready_metadata, Mapping)
-                or any(
-                    not isinstance(value, str) or not value
-                    for value in required_strings
-                )
-                or type(status_generation) is not int
-                or status_generation < 1
-                or status_state is not ChannelProcessState.READY
-                or status_agent_id != metadata.agent_id
-                or status_tenant_key != metadata.tenant_key
-                or status_bot_principal_id != metadata.bot_principal_id
-                or status_app_id != metadata.app_id
-                or status_generation != metadata.channel_generation
-                or identity_app_id != metadata.app_id
-                or connection_id != metadata.connection_id
-            ):
-                return None, "authority_denied"
             if authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP:
                 try:
                     membership_degraded = self._membership_health.is_degraded(
@@ -1581,6 +1751,25 @@ class DurableEmployeeIngressRouter:
                 effort=employee.effort,
                 constraints_digest=self._constraints_digest,
                 system_prompt_token_reserve=self._reserve,
+                effective_input_kind=(
+                    TARGETED_TASK_INPUT_KIND
+                    if targeted_task is not None
+                    and targeted_task.state is TargetedTaskState.TARGETED_VALID
+                    else ""
+                ),
+                effective_input_digest=(
+                    targeted_task.input_digest
+                    if targeted_task is not None
+                    and targeted_task.state is TargetedTaskState.TARGETED_VALID
+                    else ""
+                ),
+                target_bot_open_id_digest=(
+                    hashlib.sha256(identity_open_id.encode("utf-8")).hexdigest()
+                    if targeted_task is not None
+                    and targeted_task.state is TargetedTaskState.TARGETED_VALID
+                    and isinstance(identity_open_id, str)
+                    else ""
+                ),
             )
             request = self._request_from(metadata, part, snapshot)
             try:
@@ -1592,7 +1781,11 @@ class DurableEmployeeIngressRouter:
             credential_ref = principal.credential_ref
             if not isinstance(credential_ref, str) or not credential_ref:
                 return None, "authority_denied"
-            return _AuthorityResolution(snapshot, credential_ref), ""
+            return _AuthorityResolution(
+                snapshot,
+                credential_ref,
+                targeted_task,
+            ), ""
         except Exception:
             return None, "authority_denied"
 

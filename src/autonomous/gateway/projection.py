@@ -29,14 +29,22 @@ _LEGACY_SLOCK_BINDING_FIELDS = frozenset(
     {"slock_chat_id", "slock_engine_identity", "slock_root_identity"}
 )
 _CURRENT_BINDING_FIELDS = frozenset(DispatchBinding.__dataclass_fields__)
-_CURRENT_SLOCK_BINDING_FIELDS = (
-    _CURRENT_BINDING_FIELDS - _CURRENT_TEAM_BINDING_FIELDS
-) | _LEGACY_SLOCK_BINDING_FIELDS
+_EFFECTIVE_INPUT_BINDING_FIELDS = frozenset(
+    {
+        "effective_input_kind",
+        "effective_input_digest",
+        "target_bot_open_id_digest",
+        "prompt_digest",
+    }
+)
+_PRE_EFFECTIVE_BINDING_FIELDS = (
+    _CURRENT_BINDING_FIELDS - _EFFECTIVE_INPUT_BINDING_FIELDS
+)
 _SCOPE_BINDING_FIELDS = frozenset(
     {"authorization_scope", "source_requester_principal_id"}
 )
 _LEGACY_TEAM_BINDING_FIELDS = (
-    _CURRENT_BINDING_FIELDS - _SCOPE_BINDING_FIELDS
+    _PRE_EFFECTIVE_BINDING_FIELDS - _SCOPE_BINDING_FIELDS
 )
 _LEGACY_SLOCK_BINDING_FIELDS_EXACT = (
     _LEGACY_TEAM_BINDING_FIELDS - _CURRENT_TEAM_BINDING_FIELDS
@@ -90,16 +98,18 @@ def is_gateway_event(event_type: str) -> bool:
 def _dispatch_binding_from_journal(value: object) -> DispatchBinding:
     """Normalize the one authenticated pre-team binding schema during replay."""
 
+    legacy_shape = False
     if isinstance(value, dict) and set(value) in {
-        _CURRENT_SLOCK_BINDING_FIELDS,
         _LEGACY_SLOCK_BINDING_FIELDS_EXACT,
     }:
+        legacy_shape = True
         normalized = dict(value)
         normalized["team_chat_id"] = normalized.pop("slock_chat_id")
         normalized["team_identity"] = normalized.pop("slock_engine_identity")
         normalized["team_root_identity"] = normalized.pop("slock_root_identity")
         value = normalized
     if isinstance(value, dict) and set(value) == _LEGACY_TEAM_BINDING_FIELDS:
+        legacy_shape = True
         normalized = dict(value)
         normalized["authorization_scope"] = (
             EmployeeAuthorizationScope.MANAGED_GROUP.value
@@ -108,7 +118,42 @@ def _dispatch_binding_from_journal(value: object) -> DispatchBinding:
             "requester_principal_id"
         ]
         value = normalized
+    if isinstance(value, dict) and set(value) == _PRE_EFFECTIVE_BINDING_FIELDS:
+        legacy_shape = True
+        normalized = dict(value)
+        normalized.update(
+            effective_input_kind="",
+            effective_input_digest="",
+            target_bot_open_id_digest="",
+            prompt_digest="",
+        )
+        value = normalized
+    if legacy_shape and isinstance(value, dict):
+        if value.get("schema_version") != 1:
+            raise ValueError("legacy dispatch binding requires schema version 1")
+        normalized = dict(value)
+        normalized["schema_version"] = 1
+        value = normalized
+        return DispatchBinding(**_binding_constructor_values(value))
     return DispatchBinding.from_dict(value)
+
+
+def _binding_constructor_values(value: dict[str, object]) -> dict[str, object]:
+    """Convert one exact replay-only binding mapping to constructor values."""
+
+    normalized = dict(value)
+    try:
+        normalized["authorization_scope"] = EmployeeAuthorizationScope(
+            normalized["authorization_scope"]
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid dispatch authorization scope") from exc
+    if not isinstance(normalized.get("permissions"), list) or not isinstance(
+        normalized.get("capabilities"),
+        list,
+    ):
+        raise ValueError("dispatch authority collections must be JSON arrays")
+    return normalized
 
 
 def _reduce_gateway_event(

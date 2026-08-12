@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import threading
 
+import pytest
+
 
 class _TraceRLock:
     def __init__(self, name, level, held, trace):
@@ -97,6 +99,102 @@ def test_unknown_dispatch_recovers_action_required_without_rerun(
     assert reopened.writer.anchor.read().sequence == sequence
     assert acp_calls == []
     reopened.close()
+
+
+@pytest.mark.parametrize(
+    "legacy_shape",
+    ("scoped_team", "unscoped_team", "unscoped_slock"),
+)
+def test_each_historical_v1_binding_replays_and_finalizes_without_rerun(
+    tmp_path,
+    monkeypatch,
+    legacy_shape,
+) -> None:
+    """Every binding shape written before v2 remains recoverable, not executable."""
+
+    from src.autonomous.gateway.projection import ATTEMPT_BOUND
+    from src.autonomous.journal.frame import JournalEvent
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    harness = _real_coordinator_harness(tmp_path)
+    original_commit = harness.coordinator._commit_events_unlocked  # noqa: SLF001
+
+    def commit_as_historical_v1(events):
+        historical_events = []
+        for event in events:
+            if event.event_type != ATTEMPT_BOUND:
+                historical_events.append(event)
+                continue
+            payload = dict(event.payload["binding"])
+            payload["schema_version"] = 1
+            for field_name in (
+                "effective_input_kind",
+                "effective_input_digest",
+                "target_bot_open_id_digest",
+                "prompt_digest",
+            ):
+                payload.pop(field_name)
+            if legacy_shape != "scoped_team":
+                payload.pop("authorization_scope")
+                payload.pop("source_requester_principal_id")
+            if legacy_shape == "unscoped_slock":
+                payload["slock_chat_id"] = payload.pop("team_chat_id")
+                payload["slock_engine_identity"] = payload.pop("team_identity")
+                payload["slock_root_identity"] = payload.pop("team_root_identity")
+            historical_events.append(
+                JournalEvent(
+                    event_type=event.event_type,
+                    aggregate_id=event.aggregate_id,
+                    payload={"binding": payload},
+                    timestamp=event.timestamp,
+                )
+            )
+        return original_commit(tuple(historical_events))
+
+    monkeypatch.setattr(
+        harness.coordinator,
+        "_commit_events_unlocked",
+        commit_as_historical_v1,
+    )
+    acp_calls = []
+
+    def forbidden_acp(*args, **kwargs):
+        acp_calls.append((args, kwargs))
+        raise AssertionError("historical recovery must not rerun ACP")
+
+    monkeypatch.setattr(harness.engine, "_run_acp_session", forbidden_acp)
+    try:
+        prepared = harness.coordinator.prepare_next()
+        assert prepared is not None
+        projected = harness.coordinator.state.attempts[
+            prepared.binding.attempt_id
+        ].binding
+        assert projected.schema_version == 1
+        assert projected.effective_input_kind == ""
+        assert projected.effective_input_digest == ""
+        assert projected.target_bot_open_id_digest == ""
+        assert projected.prompt_digest == ""
+    finally:
+        harness.close()
+
+    reopened = _reopen_recovery_harness(tmp_path, harness)
+    try:
+        recovered = reopened.coordinator.recover_incomplete_attempts()
+
+        assert len(recovered) == 1
+        assert recovered[0].attempt_id == prepared.binding.attempt_id
+        assert recovered[0].status.value == "action_required"
+        lifecycle = reopened.coordinator.state.attempts[
+            prepared.binding.attempt_id
+        ]
+        assert lifecycle.binding.schema_version == 1
+        assert lifecycle.terminal_status == "action_required"
+        assert reopened.coordinator.recover_incomplete_attempts() == ()
+        assert acp_calls == []
+    finally:
+        reopened.close()
 
 
 def test_actor_terminal_is_preserved_when_gateway_recovery_follows_process_death(

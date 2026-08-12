@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from ..authorization import EmployeeAuthorizationScope
+from ..ingress.targeted_task import TARGETED_TASK_INPUT_KIND
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _RFC3339_UTC_RE = re.compile(
@@ -103,10 +104,14 @@ class DispatchBinding:
     render_contract_digest: str
     context_snapshot_hash: str
     context_watermark_digest: str
+    effective_input_kind: str
+    effective_input_digest: str
+    target_bot_open_id_digest: str
+    prompt_digest: str
     dispatch_committed_at: str
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
+        if type(self.schema_version) is not int or self.schema_version not in {1, 2}:
             raise ValueError("unsupported dispatch binding schema")
         if not isinstance(
             self.authorization_scope,
@@ -189,6 +194,47 @@ class DispatchBinding:
             "context_watermark_digest",
         ):
             object.__setattr__(self, name, _digest(getattr(self, name), name))
+        prompt_digest = _optional_digest(self.prompt_digest, "prompt_digest")
+        if self.schema_version == 2 and not prompt_digest:
+            raise ValueError("prompt_digest is required for dispatch binding v2")
+        if self.schema_version == 1 and prompt_digest:
+            raise ValueError("legacy dispatch binding cannot carry prompt_digest")
+        object.__setattr__(self, "prompt_digest", prompt_digest)
+        effective_input_kind = _optional_text(
+            self.effective_input_kind,
+            "effective_input_kind",
+        )
+        effective_input_digest = _optional_digest(
+            self.effective_input_digest,
+            "effective_input_digest",
+        )
+        target_bot_open_id_digest = _optional_digest(
+            self.target_bot_open_id_digest,
+            "target_bot_open_id_digest",
+        )
+        object.__setattr__(self, "effective_input_kind", effective_input_kind)
+        object.__setattr__(self, "effective_input_digest", effective_input_digest)
+        object.__setattr__(
+            self,
+            "target_bot_open_id_digest",
+            target_bot_open_id_digest,
+        )
+        if not (
+            bool(effective_input_kind)
+            == bool(effective_input_digest)
+            == bool(target_bot_open_id_digest)
+        ):
+            raise ValueError("effective input binding is incomplete")
+        if effective_input_kind:
+            if (
+                effective_input_kind != TARGETED_TASK_INPUT_KIND
+                or self.authorization_scope
+                is not EmployeeAuthorizationScope.MANAGED_GROUP
+                or self.requester_principal_id != self.owner_principal_id
+            ):
+                raise ValueError("unsupported effective input kind")
+        if self.schema_version == 1 and effective_input_kind:
+            raise ValueError("legacy dispatch binding cannot carry effective input")
         object.__setattr__(
             self,
             "constraints_digest",
@@ -216,6 +262,8 @@ class DispatchBinding:
             raise ValueError("dispatch_committed_at must be canonical UTC")
 
     def to_dict(self) -> dict[str, object]:
+        if self.schema_version != 2:
+            raise ValueError("legacy dispatch binding is replay-only")
         result = {name: getattr(self, name) for name in self.__dataclass_fields__}
         result["authorization_scope"] = self.authorization_scope.value
         result["permissions"] = list(self.permissions)
@@ -235,6 +283,8 @@ class DispatchBinding:
         ):
             raise ValueError("dispatch authority collections must be JSON arrays")
         normalized = dict(value)
+        if normalized.get("schema_version") != 2:
+            raise ValueError("current dispatch binding requires schema version 2")
         try:
             normalized["authorization_scope"] = EmployeeAuthorizationScope(
                 normalized["authorization_scope"]

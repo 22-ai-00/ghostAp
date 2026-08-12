@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from concurrent.futures import CancelledError
 from dataclasses import dataclass
@@ -60,6 +61,12 @@ class EmployeeTeamGateway:
         env: dict[str, str],
     ) -> DispatchPermit:
         self._validate_agent_binding(binding, agent)
+        if (
+            not binding.prompt_digest
+            or hashlib.sha256(prompt.encode()).hexdigest()
+            != binding.prompt_digest
+        ):
+            raise DispatchPermitAuthorityError("permit prompt binding mismatch")
         frozen_agent = AgentExecutionSpec.from_agent(agent)
         permit = DispatchPermit(
             binding=binding,

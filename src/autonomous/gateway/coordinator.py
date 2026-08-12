@@ -8,7 +8,7 @@ import logging
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -26,6 +26,7 @@ from ..data.ports import AuthenticatedExecutionTerminal, EmployeeDataSink, Publi
 from ..data.service import EmployeeDataService
 from ..domain import EmployeeState, WorkerType
 from ..ingress.models import parse_canonical_utc
+from ..ingress.targeted_task import TARGETED_TASK_INPUT_KIND
 from ..journal.frame import JournalEvent
 from ..journal.projections import apply_frame
 from ..journal.writer import CommitState, JournalWriter
@@ -33,7 +34,12 @@ from ..runtime.employee_supervisor import EmployeeRuntimeSupervisor
 from ..supervisor.channel_models import ChannelProcessState
 from ..team.runtime import TeamRuntimeResolutionError, team_runtime_guard
 from ..workforce.registry import ProjectedAgentRegistry
-from .context_prompt import RenderedEmployeePrompt, render_employee_context
+from .context_prompt import (
+    EmployeePromptRenderError,
+    RenderedEmployeePrompt,
+    UntrustedCurrentMessageOverride,
+    render_employee_context,
+)
 from .env_scope import (
     EmployeeEnvironmentAuthority,
     EmployeeProcessEnvironmentMaterial,
@@ -97,7 +103,23 @@ class _ProjectionHeadChanged(RuntimeError):
 class PreparedEmployeeDispatch:
     binding: DispatchBinding
     permit: DispatchPermit
-    prompt: str
+    prompt: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, DispatchBinding):
+            raise TypeError("binding must be DispatchBinding")
+        if not isinstance(self.permit, DispatchPermit):
+            raise TypeError("permit must be DispatchPermit")
+        if self.permit.binding != self.binding:
+            raise ValueError("prepared dispatch binding mismatch")
+        if self.permit.prompt != self.prompt:
+            raise ValueError("prepared dispatch prompt mismatch")
+        if (
+            not self.binding.prompt_digest
+            or hashlib.sha256(self.prompt.encode()).hexdigest()
+            != self.binding.prompt_digest
+        ):
+            raise ValueError("prepared dispatch prompt digest mismatch")
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,11 +428,40 @@ class EmployeeDispatchCoordinator:
                 f"{system_instruction}\n\n## TEAM_COORDINATOR_INSTRUCTION\n"
                 f"{team_instruction}"
             )
-        rendered = render_employee_context(
-            snapshot,
-            system_instruction=system_instruction,
-            constraints_digest=grant.request.constraints_digest,
-        )
+        try:
+            current_message_override = None
+            if grant.targeted_task is not None:
+                authority = grant.record.authority
+                if (
+                    authority is None
+                    or authority.effective_input_kind
+                    != TARGETED_TASK_INPUT_KIND
+                    or authority.effective_input_digest
+                    != grant.targeted_task.input_digest
+                ):
+                    raise EmployeeDispatchError(
+                        "targeted employee input binding is stale"
+                    )
+                current_message_override = UntrustedCurrentMessageOverride(
+                    message_id=grant.request.current_message_id,
+                    text=grant.targeted_task.description,
+                    input_kind=authority.effective_input_kind,
+                    input_digest=authority.effective_input_digest,
+                    payload_digest=grant.payload.payload_sha256,
+                )
+            rendered = render_employee_context(
+                snapshot,
+                system_instruction=system_instruction,
+                constraints_digest=grant.request.constraints_digest,
+                current_message_override=current_message_override,
+            )
+        except EmployeePromptRenderError:
+            self._router.reject_dispatch_candidate(
+                grant.record.acceptance_id,
+                reason_code="context_unavailable",
+            )
+            logger.warning("employee authenticated Context rendering was rejected")
+            return None
         environment_authority = EmployeeEnvironmentAuthority(
             tenant_key=employee.tenant_key,
             agent_id=employee.agent_id,
@@ -663,13 +714,15 @@ class EmployeeDispatchCoordinator:
         self,
         prepared: PreparedEmployeeDispatch,
     ) -> FinalizedEmployeeAttempt:
+        binding = prepared.permit.binding
+        prompt = prepared.permit.prompt
         if self._attempt_lifecycle is not None:
-            self._attempt_lifecycle.running(prepared.binding)
+            self._attempt_lifecycle.running(binding)
         result = self._gateway.execute_permit(prepared.permit)
         return self.finalize_attempt(
-            prepared.binding.attempt_id,
+            binding.attempt_id,
             result,
-            request_text=prepared.prompt,
+            request_text=prompt,
         )
 
     def team_attempt_result(self, acceptance_id: str) -> TeamAttemptSnapshot | None:
@@ -1276,7 +1329,7 @@ class EmployeeDispatchCoordinator:
         authority = grant.record.authority
         assert authority is not None
         return DispatchBinding(
-            schema_version=1,
+            schema_version=2,
             authorization_scope=grant.request.authorization_scope,
             permit_id="prm_" + _stable_hash("permit", acceptance),
             attempt_id="att_" + _stable_hash("attempt", acceptance),
@@ -1318,6 +1371,10 @@ class EmployeeDispatchCoordinator:
             render_contract_digest=rendered.render_contract_digest,
             context_snapshot_hash=rendered.context_snapshot_hash,
             context_watermark_digest=rendered.context_watermark_digest,
+            effective_input_kind=authority.effective_input_kind,
+            effective_input_digest=authority.effective_input_digest,
+            target_bot_open_id_digest=authority.target_bot_open_id_digest,
+            prompt_digest=hashlib.sha256(rendered.prompt.encode()).hexdigest(),
             dispatch_committed_at=self._timestamp(),
         )
 
@@ -1395,6 +1452,11 @@ class EmployeeDispatchCoordinator:
             or authority is None
             or authority.authorization_scope
             is not grant.request.authorization_scope
+            or (
+                bool(authority.effective_input_kind)
+                and grant.request.requester_principal_id
+                != employee.owner_principal_id
+            )
             or employee.aggregate_version != authority.employee_version
             or (employee.tool, employee.model, employee.effort) != (authority.tool, authority.model, authority.effort)
         ):
@@ -1407,6 +1469,16 @@ class EmployeeDispatchCoordinator:
         identity = getattr(status, "identity", None)
         connection = ready.get("connection_id") if isinstance(ready, Mapping) else None
         identity_app = identity.get("app_id") if isinstance(identity, Mapping) else None
+        identity_open_id = (
+            identity.get("open_id") if isinstance(identity, Mapping) else None
+        )
+        target_open_id_matches = not bool(authority.effective_input_kind) if authority else False
+        if authority is not None and authority.effective_input_kind:
+            target_open_id_matches = (
+                isinstance(identity_open_id, str)
+                and hashlib.sha256(identity_open_id.encode("utf-8")).hexdigest()
+                == authority.target_bot_open_id_digest
+            )
         if (
             authority is None
             or status is None
@@ -1418,6 +1490,7 @@ class EmployeeDispatchCoordinator:
             or status.generation != authority.channel_generation
             or connection != authority.connection_id
             or identity_app != authority.app_id
+            or not target_open_id_matches
         ):
             raise EmployeeDispatchError("employee channel authority is stale")
         return connection

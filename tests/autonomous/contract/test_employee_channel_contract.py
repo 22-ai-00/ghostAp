@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import inspect
 import json
@@ -15,7 +16,11 @@ from src.autonomous.ingress.models import (
     EmployeeIngressPayload,
     IngressAcceptance,
 )
+from src.autonomous.ingress.projection import IngressProjectionState
 from src.autonomous.ingress.service import EmployeeIngressService
+from src.autonomous.journal.anchor import MemoryAnchor
+from src.autonomous.journal.blob_store import AesGcmEncryptionProvider, BlobStore
+from src.autonomous.journal.writer import JournalWriter
 from src.autonomous.provisioning import channel_protocol as channel_protocol_module
 from src.autonomous.provisioning.channel_protocol import (
     MAX_FRAME_BYTES,
@@ -553,10 +558,10 @@ def test_protocol_rejects_oversized_and_multiline_frames() -> None:
         decode_frame(b"x" * (MAX_FRAME_BYTES + 1))
 
 
-def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> None:
+def _direct_bot_mention_event():
     from types import SimpleNamespace
 
-    event = SimpleNamespace(
+    return SimpleNamespace(
         header=SimpleNamespace(
             event_id="event-mention",
             event_type="im.message.receive_v1",
@@ -581,7 +586,7 @@ def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> Non
                 chat_id="oc_team",
                 chat_type="group",
                 message_type="text",
-                content='{"text":"@_user_1 hello"}',
+                content='{"text":"@_user_1 /task ship it"}',
                 mentions=(
                     SimpleNamespace(
                         key="@_user_1",
@@ -594,8 +599,10 @@ def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> Non
         ),
     )
 
-    _metadata, payload, _correlation = _normalize_sdk_ingress(
-        event,
+
+def _normalized_direct_bot_mention():
+    return _normalize_sdk_ingress(
+        _direct_bot_mention_event(),
         kind="message",
         agent_id="agt_employee",
         app_id="cli_employee",
@@ -605,7 +612,17 @@ def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> Non
         bot_principal_id="bot_employee",
     )
 
-    assert payload.normalized_parts[0]["mentions"] == (
+
+def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> None:
+    _metadata, payload, _correlation = _normalized_direct_bot_mention()
+
+    part = payload.normalized_parts[0]
+    assert part["sender_union_id"] == "on_admin"
+    assert part["content"] == {"text": "@_user_1 /task ship it"}
+    assert part["remote_chat_id"] == "oc_team"
+    assert part["remote_message_id"] == "om_mention"
+    assert part["remote_root_id"] == ""
+    assert part["mentions"] == (
         {
             "key": "@_user_1",
             "mentioned_type": "bot",
@@ -613,6 +630,88 @@ def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> Non
             "tenant_key": "tenant_1",
         },
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    (
+        (("content", "text"), "@_user_1 /task altered"),
+        (("mentions", 0, "open_id"), "ou_other_bot"),
+        (("mentions", 0, "tenant_key"), "tenant_other"),
+        (("mentions", 0, "key"), "@_user_2"),
+        (("mentions", 0, "mentioned_type"), "user"),
+        (("sender_union_id",), "on_other"),
+        (("remote_chat_id",), "oc_other"),
+        (("remote_message_id",), "om_other"),
+        (("remote_root_id",), "om_other_root"),
+    ),
+)
+def test_message_identity_and_coordinates_are_bound_to_payload_digest(
+    path: tuple[str | int, ...],
+    replacement: str,
+) -> None:
+    _metadata, payload, _correlation = _normalized_direct_bot_mention()
+    mutated = copy.deepcopy(payload.to_dict())
+    target = mutated["normalized_parts"][0]
+    for segment in path[:-1]:
+        target = target[segment]
+    target[path[-1]] = replacement
+
+    mutated_payload = EmployeeIngressPayload.from_dict(mutated)
+
+    assert mutated_payload.payload_sha256 != payload.payload_sha256
+
+
+def test_encrypted_ingress_restart_replay_preserves_mention_and_union_identity(
+    tmp_path,
+) -> None:
+    metadata, payload, _correlation = _normalized_direct_bot_mention()
+    anchor = MemoryAnchor()
+    key = b"channel-contract-ingress-key-32b"
+    writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=anchor,
+        hmac_key=b"channel-contract-hmac-key-32byte",
+        writer_epoch=1,
+    )
+    service = EmployeeIngressService(
+        writer=writer,
+        blob_store=BlobStore(
+            tmp_path / "ingress-blobs",
+            AesGcmEncryptionProvider(lambda _ref: key),
+        ),
+        ingress_state=IngressProjectionState(),
+        active_key_id="k1",
+    )
+    ack = service.accept(metadata, payload, request_id="req_channel_identity")
+    acceptance_id = ack.acceptance.acceptance_id
+    service.close()
+    writer.close()
+
+    writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=anchor,
+        hmac_key=b"channel-contract-hmac-key-32byte",
+        writer_epoch=2,
+    )
+    service = EmployeeIngressService(
+        writer=writer,
+        blob_store=BlobStore(
+            tmp_path / "ingress-blobs",
+            AesGcmEncryptionProvider(lambda _ref: key),
+        ),
+        ingress_state=IngressProjectionState(),
+        active_key_id="k1",
+    )
+    replayed = service.get_payload(acceptance_id)
+    replayed_part = replayed.normalized_parts[0]
+
+    assert replayed.payload_sha256 == payload.payload_sha256
+    assert replayed_part["sender_union_id"] == "on_admin"
+    assert replayed_part["mentions"] == payload.normalized_parts[0]["mentions"]
+
+    service.close()
+    writer.close()
 
 
 def test_production_worker_main_reaches_only_the_low_level_durable_bridge() -> None:

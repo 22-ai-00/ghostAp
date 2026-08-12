@@ -301,7 +301,8 @@ def test_production_dispatch_projects_group_context_before_routing_and_gc(
     monkeypatch.setattr(
         runtime,
         "_handle_main_bot_group_command_ingress",
-        lambda observed_acceptance_id: calls.append("command_gate") or False,
+        lambda observed_acceptance_id, **_kwargs: calls.append("command_gate")
+        or False,
     )
 
     runtime._drain_employee_dispatch_once()  # noqa: SLF001
@@ -376,7 +377,7 @@ def test_production_dispatch_routes_owner_p2p_without_group_control(
     monkeypatch.setattr(
         runtime,
         "_handle_main_bot_group_command_ingress",
-        lambda _acceptance_id: calls.append("command_gate") or False,
+        lambda _acceptance_id, **_kwargs: calls.append("command_gate") or False,
     )
     monkeypatch.setattr(
         runtime,
@@ -389,7 +390,18 @@ def test_production_dispatch_routes_owner_p2p_without_group_control(
     assert calls == ["handle_control", "route", "dispatch", "gc_payload"]
 
 
-@pytest.mark.parametrize("command", ["/help", "/status", "/status details"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "/help",
+        "/status",
+        "/status details",
+        "/task unaddressed",
+        "/tasks",
+        "@_user_1 /task addressed elsewhere",
+        "@_user_1 /help",
+    ],
+)
 def test_production_dispatch_ignores_main_bot_group_command_observation(
     monkeypatch: pytest.MonkeyPatch,
     command: str,
@@ -469,6 +481,348 @@ def test_production_dispatch_ignores_main_bot_group_command_observation(
 
     assert calls == ["command_gate", "dispatch", "gc_payload"]
     assert pending.disposition.reason_code == "main_bot_group_command"
+
+
+def test_production_dispatch_routes_only_authorized_targeted_group_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.autonomous.ingress.targeted_task import (
+        TargetedTaskParseResult,
+        TargetedTaskState,
+        targeted_group_task_digest,
+    )
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    calls: list[str] = []
+    acceptance_id = "acc_targeted_task"
+    pending = SimpleNamespace(
+        disposition=None,
+        metadata=SimpleNamespace(
+            event_type="im.message.receive_v1",
+            action_identity="",
+        ),
+    )
+    task = TargetedTaskParseResult(
+        TargetedTaskState.TARGETED_VALID,
+        description="finish audit",
+        input_digest=targeted_group_task_digest("finish audit"),
+    )
+
+    class _Ingress:
+        state = SimpleNamespace(by_acceptance_id={acceptance_id: pending})
+
+        def rebuild_projection(self):
+            return None
+
+        def get_payload(self, _acceptance_id: str):
+            return SimpleNamespace(
+                normalized_parts=(
+                    {
+                        "type": "message",
+                        "chat_type": "group",
+                        "content": {"text": "@_user_1 /task finish audit"},
+                    },
+                )
+            )
+
+        def gc_terminal_payloads(self):
+            calls.append("gc_payload")
+            return 0
+
+    class _Router:
+        state = SimpleNamespace(by_acceptance_id={})
+
+        def rebuild_projection(self):
+            return None
+
+        def route(self, routed_acceptance_id: str):
+            assert routed_acceptance_id == acceptance_id
+            calls.append("route")
+
+    class _Dispatch:
+        employee_runtime = None
+
+        def dispatch_next(self):
+            calls.append("dispatch")
+            return None
+
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = _Ingress()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._router = _Router()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._dispatch = _Dispatch()  # type: ignore[assignment]  # noqa: SLF001
+    monkeypatch.setattr(runtime, "_handle_control_ingress", lambda _value: False)
+    monkeypatch.setattr(
+        runtime,
+        "_authorized_targeted_group_task",
+        lambda _record, _payload: task,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_managed_employee_ingress_trust",
+        lambda _record, _payload: runtime._unknown_employee_ingress_trust(),  # noqa: SLF001
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_record_employee_ingress_group_event",
+        lambda _value: calls.append("project_group_context"),
+    )
+
+    runtime._drain_employee_dispatch_once()  # noqa: SLF001
+
+    assert calls == ["project_group_context", "route", "dispatch", "gc_payload"]
+
+
+def test_targeted_group_task_authority_ignores_unavailable_ingress_payload() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    runtime = EmployeeDepartmentRuntime()
+    runtime._router = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        classify_targeted_group_task=lambda *_args: pytest.fail(
+            "unavailable payload reached Router classification"
+        )
+    )
+
+    assert runtime._authorized_targeted_group_task(  # noqa: SLF001
+        SimpleNamespace(metadata=SimpleNamespace()),
+        None,
+    ) is None
+
+
+def test_targeted_group_task_usage_is_anchored_before_ingress_disposition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.autonomous.ingress.targeted_task import (
+        TargetedTaskParseResult,
+        TargetedTaskState,
+    )
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    calls: list[str] = []
+    acceptance_id = "acc_task_usage"
+    metadata = SimpleNamespace(
+        event_type="im.message.receive_v1",
+        action_identity="",
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+    )
+    pending = SimpleNamespace(disposition=None, metadata=metadata)
+
+    class _Ingress:
+        state = SimpleNamespace(by_acceptance_id={acceptance_id: pending})
+
+        def get_payload(self, _acceptance_id: str):
+            return SimpleNamespace(
+                normalized_parts=(
+                    {
+                        "type": "message",
+                        "chat_type": "group",
+                        "content": {"text": "@_user_1 /task"},
+                    },
+                )
+            )
+
+        def record_disposition(self, *_args, **kwargs):
+            calls.append(f"disposition:{kwargs['reason_code']}")
+
+    lifecycle = SimpleNamespace(
+        task_usage_response=lambda **_kwargs: calls.append("outbox")
+    )
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = _Ingress()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._outbox_lifecycle = lifecycle  # type: ignore[assignment]  # noqa: SLF001
+    monkeypatch.setattr(
+        "src.autonomous.provisioning.composition._bound_remote_coordinates",
+        lambda _metadata, _part: ("oc_team", "om_message", "om_root"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_drain_employee_outbox_once",
+        lambda: calls.append("drain") or True,
+    )
+
+    assert runtime._handle_main_bot_group_command_ingress(  # noqa: SLF001
+        acceptance_id,
+        targeted_group_task=TargetedTaskParseResult(
+            TargetedTaskState.TARGETED_INVALID
+        ),
+    )
+    assert calls == [
+        "outbox",
+        "disposition:task_invalid_arguments",
+        "drain",
+    ]
+
+
+def test_targeted_group_task_usage_does_not_consume_ingress_when_outbox_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.autonomous.ingress.targeted_task import (
+        TargetedTaskParseResult,
+        TargetedTaskState,
+    )
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    calls: list[str] = []
+    acceptance_id = "acc_task_usage_outbox_failure"
+    metadata = SimpleNamespace(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        event_type="im.message.receive_v1",
+        action_identity="",
+    )
+    pending = SimpleNamespace(disposition=None, metadata=metadata)
+
+    class _Ingress:
+        state = SimpleNamespace(by_acceptance_id={acceptance_id: pending})
+
+        def get_payload(self, _acceptance_id: str):
+            return SimpleNamespace(
+                normalized_parts=(
+                    {
+                        "type": "message",
+                        "chat_type": "group",
+                        "content": {"text": "@_user_1 /task"},
+                    },
+                )
+            )
+
+        def record_disposition(self, *_args, **_kwargs):
+            calls.append("disposition")
+
+    def fail_outbox(**_kwargs):
+        calls.append("outbox")
+        raise RuntimeError("injected outbox failure")
+
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = _Ingress()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._outbox_lifecycle = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        task_usage_response=fail_outbox
+    )
+    monkeypatch.setattr(
+        "src.autonomous.provisioning.composition._bound_remote_coordinates",
+        lambda _metadata, _part: ("oc_team", "om_message", "om_root"),
+    )
+
+    with pytest.raises(RuntimeError, match="injected outbox failure"):
+        runtime._handle_main_bot_group_command_ingress(  # noqa: SLF001
+            acceptance_id,
+            targeted_group_task=TargetedTaskParseResult(
+                TargetedTaskState.TARGETED_INVALID
+            ),
+        )
+
+    assert calls == ["outbox"]
+
+
+def test_targeted_group_task_usage_drains_anchored_response_after_disposition_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.autonomous.ingress.service import IngressConflictError
+    from src.autonomous.ingress.targeted_task import (
+        TargetedTaskParseResult,
+        TargetedTaskState,
+    )
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    calls: list[str] = []
+    acceptance_id = "acc_task_usage_disposition_race"
+    metadata = SimpleNamespace(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        event_type="im.message.receive_v1",
+        action_identity="",
+    )
+    pending = SimpleNamespace(disposition=None, metadata=metadata)
+
+    class _Ingress:
+        state = SimpleNamespace(by_acceptance_id={acceptance_id: pending})
+
+        def get_payload(self, _acceptance_id: str):
+            return SimpleNamespace(
+                normalized_parts=(
+                    {
+                        "type": "message",
+                        "chat_type": "group",
+                        "content": {"text": "@_user_1 /task"},
+                    },
+                )
+            )
+
+        def record_disposition(self, *_args, **_kwargs):
+            calls.append("disposition")
+            raise IngressConflictError("injected disposition race")
+
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = _Ingress()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._outbox_lifecycle = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        task_usage_response=lambda **_kwargs: calls.append("outbox")
+    )
+    monkeypatch.setattr(
+        "src.autonomous.provisioning.composition._bound_remote_coordinates",
+        lambda _metadata, _part: ("oc_team", "om_message", "om_root"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_drain_employee_outbox_once",
+        lambda: calls.append("drain") or True,
+    )
+
+    assert runtime._handle_main_bot_group_command_ingress(  # noqa: SLF001
+        acceptance_id,
+        targeted_group_task=TargetedTaskParseResult(
+            TargetedTaskState.TARGETED_INVALID
+        ),
+    )
+    assert calls == ["outbox", "disposition", "drain"]
+
+
+def test_generic_control_lane_leaves_targeted_group_task_for_command_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.autonomous.ingress.targeted_task import (
+        TargetedTaskParseResult,
+        TargetedTaskState,
+        targeted_group_task_digest,
+    )
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_targeted_control_bypass"
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "type": "message",
+                "chat_type": "group",
+                "content": {"text": "@_user_1 /task finish audit"},
+                "mentions": (
+                    {
+                        "key": "@_user_1",
+                        "mentioned_type": "bot",
+                        "open_id": "ou_bot_alpha",
+                        "tenant_key": "tenant_1",
+                    },
+                ),
+            },
+        )
+    )
+    record = SimpleNamespace(disposition=None, metadata=SimpleNamespace())
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        rebuild_projection=lambda: None,
+        state=SimpleNamespace(by_acceptance_id={acceptance_id: record}),
+        get_payload=lambda _value: payload,
+    )
+    task = TargetedTaskParseResult(
+        TargetedTaskState.TARGETED_VALID,
+        description="finish audit",
+        input_digest=targeted_group_task_digest("finish audit"),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_authorized_targeted_group_task",
+        lambda _record, _payload: task,
+    )
+
+    assert runtime._handle_control_ingress(acceptance_id) is False  # noqa: SLF001
 
 
 def test_employee_group_projection_preserves_source_open_id_for_partial_context() -> None:
@@ -694,6 +1048,58 @@ def test_owner_p2p_status_fails_closed_on_identity_or_transport_drift(
     )
     lifecycle.status_response.assert_not_called()
     dispatch.employee_runtime.inspect.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "drifted"),
+    [
+        ("app_id", "cli_rotated"),
+        ("bot_principal_id", "bot_rotated"),
+        ("channel_generation", 4),
+        ("connection_id", "conn_rotated"),
+        ("channel_identity_app_id", "cli_rotated"),
+    ],
+)
+def test_union_owner_resolution_binds_durable_hire_transport(
+    field_name: str,
+    drifted: object,
+) -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+    from src.autonomous.provisioning.hire_state import HirePhase
+
+    state = SimpleNamespace(
+        tenant_key="tenant_1",
+        agent_id="agt_alpha",
+        phase=HirePhase.ACTIVE,
+        requester_principal_id="ou_owner",
+        requester_union_id="on_owner",
+        app_id="cli_alpha",
+        bot_principal_id="bot_alpha",
+        channel_generation=3,
+        channel_connection_id="conn_alpha",
+        channel_identity_app_id="cli_alpha",
+    )
+    runtime = EmployeeDepartmentRuntime()
+    runtime._service = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        synchronize_projection=lambda: None,
+        list_states=lambda: (state,),
+    )
+    values = {
+        "tenant_key": "tenant_1",
+        "agent_id": "agt_alpha",
+        "owner_principal_id": "ou_owner",
+        "sender_principal_id": "ou_employee_app_owner",
+        "sender_union_id": "on_owner",
+        "app_id": "cli_alpha",
+        "bot_principal_id": "bot_alpha",
+        "channel_generation": 3,
+        "connection_id": "conn_alpha",
+        "channel_identity_app_id": "cli_alpha",
+    }
+
+    assert runtime._resolve_employee_requester_principal(**values) == "ou_owner"  # noqa: SLF001
+    values[field_name] = drifted
+    assert runtime._resolve_employee_requester_principal(**values) is None  # noqa: SLF001
 
 
 @pytest.mark.asyncio

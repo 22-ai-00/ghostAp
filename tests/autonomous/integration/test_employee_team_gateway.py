@@ -118,6 +118,161 @@ def test_owner_p2p_dispatches_once_and_replay_preserves_scope(
     harness.close()
 
 
+def test_targeted_group_task_reaches_acp_as_only_untrusted_business_text(
+    tmp_path,
+) -> None:
+    harness = _real_coordinator_harness(tmp_path, targeted_group_task=True)
+    original_payload_digest = harness.payload.payload_sha256
+
+    prepared = harness.coordinator.prepare_next()
+
+    assert prepared is not None
+    trusted, untrusted = prepared.prompt.split(
+        "## UNTRUSTED_CONTEXT_JSON\n",
+        1,
+    )
+    prompt_payload = json.loads(untrusted)
+    assert prompt_payload["thread"][0]["text"] == "finish the targeted audit"
+    assert "finish the targeted audit" not in trusted
+    assert "@_user_1 /task" not in prepared.prompt
+    assert prepared.binding.payload_digest == original_payload_digest
+    assert harness.ingress.get_payload(
+        harness.acceptance_ids[0]
+    ).payload_sha256 == original_payload_digest
+    assert prepared.binding.effective_input_kind == "targeted_group_task_v1"
+    assert prepared.binding.effective_input_digest
+    assert prepared.binding.target_bot_open_id_digest == hashlib.sha256(
+        b"ou_bot_alpha"
+    ).hexdigest()
+    assert prepared.binding.prompt_digest == hashlib.sha256(
+        prepared.prompt.encode()
+    ).hexdigest()
+    journal = json.dumps(
+        [
+            [event.to_dict() for event in frame.events]
+            for frame in harness.writer.replay()
+        ],
+        sort_keys=True,
+    )
+    assert "finish the targeted audit" not in journal
+    assert "ou_bot_alpha" not in journal
+    harness.close()
+
+
+def test_targeted_group_task_rejects_bot_open_id_drift_before_commit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from src.autonomous.gateway.coordinator import EmployeeDispatchError
+    from src.autonomous.gateway.projection import ATTEMPT_BOUND
+
+    harness = _real_coordinator_harness(tmp_path, targeted_group_task=True)
+    original_assemble = harness.context.assemble
+    current_status = harness.channels.status("agt_alpha")
+    drifted_status = replace(
+        current_status,
+        identity={
+            **current_status.identity,
+            "open_id": "ou_bot_alpha_rotated",
+        },
+    )
+
+    def assemble_then_rotate_bot_identity(request):
+        snapshot = original_assemble(request)
+        monkeypatch.setattr(
+            harness.channels,
+            "status",
+            lambda _agent_id: drifted_status,
+        )
+        return snapshot
+
+    monkeypatch.setattr(harness.context, "assemble", assemble_then_rotate_bot_identity)
+    try:
+        with pytest.raises(EmployeeDispatchError, match="channel authority"):
+            harness.coordinator.prepare_next()
+
+        event_types = {
+            event.event_type
+            for frame in harness.writer.replay()
+            for event in frame.events
+        }
+        assert ATTEMPT_BOUND not in event_types
+        assert harness.router.state.by_acceptance_id[
+            harness.acceptance_ids[0]
+        ].state == "queued"
+    finally:
+        harness.close()
+
+
+def test_prepared_dispatch_rejects_outer_binding_mismatch() -> None:
+    from src.autonomous.gateway.coordinator import PreparedEmployeeDispatch
+    from src.autonomous.gateway.models import DispatchPermit
+
+    prompt = "anchored prompt"
+    binding = _binding(prompt)
+    permit = DispatchPermit(
+        binding=binding,
+        prompt=prompt,
+        engine=object(),
+        agent=object(),
+        timeout_seconds=30,
+        env={},
+    )
+
+    with pytest.raises(ValueError, match="binding"):
+        PreparedEmployeeDispatch(
+            binding=replace(binding, task_id="task_" + "e" * 64),
+            permit=permit,
+            prompt=prompt,
+        )
+
+
+def test_prepared_dispatch_rejects_outer_prompt_mismatch() -> None:
+    from src.autonomous.gateway.coordinator import PreparedEmployeeDispatch
+    from src.autonomous.gateway.models import DispatchPermit
+
+    prompt = "anchored prompt"
+    binding = _binding(prompt)
+    permit = DispatchPermit(
+        binding=binding,
+        prompt=prompt,
+        engine=object(),
+        agent=object(),
+        timeout_seconds=30,
+        env={},
+    )
+
+    with pytest.raises(ValueError, match="prompt"):
+        PreparedEmployeeDispatch(
+            binding=binding,
+            permit=permit,
+            prompt="tampered outer prompt",
+        )
+
+
+def test_prepared_dispatch_rejects_prompt_digest_mismatch() -> None:
+    from src.autonomous.gateway.coordinator import PreparedEmployeeDispatch
+    from src.autonomous.gateway.models import DispatchPermit
+
+    prompt = "anchored prompt"
+    binding = _binding("different prompt")
+    permit = DispatchPermit(
+        binding=binding,
+        prompt=prompt,
+        engine=object(),
+        agent=object(),
+        timeout_seconds=30,
+        env={},
+    )
+
+    with pytest.raises(ValueError, match="digest"):
+        PreparedEmployeeDispatch(
+            binding=binding,
+            permit=permit,
+            prompt=prompt,
+        )
+
+
 def test_scoped_attempt_status_synchronizes_latest_journal_head(tmp_path) -> None:
     harness = _real_coordinator_harness(tmp_path, owner_p2p=True)
     prepared = harness.coordinator.prepare_next()
@@ -327,11 +482,11 @@ def test_completed_gateway_fails_closed_without_canonical_document_sink(tmp_path
     harness.close()
 
 
-def _binding():
+def _binding(prompt: str = "budgeted"):
     from src.autonomous.gateway.models import DispatchBinding
 
     return DispatchBinding(
-        schema_version=1,
+        schema_version=2,
         authorization_scope=EmployeeAuthorizationScope.MANAGED_GROUP,
         permit_id="prm_" + "0" * 64,
         attempt_id="att_" + "1" * 64,
@@ -371,8 +526,65 @@ def _binding():
         render_contract_digest="d" * 64,
         context_snapshot_hash="a" * 64,
         context_watermark_digest="b" * 64,
+        effective_input_kind="",
+        effective_input_digest="",
+        target_bot_open_id_digest="",
+        prompt_digest=hashlib.sha256(prompt.encode()).hexdigest(),
         dispatch_committed_at="2026-07-14T00:00:00Z",
     )
+
+
+def test_dispatch_binding_rejects_empty_prompt_digest_in_current_schema() -> None:
+    with pytest.raises(ValueError, match="prompt_digest"):
+        replace(_binding(), prompt_digest="")
+
+
+@pytest.mark.parametrize(
+    ("kind", "digest"),
+    [
+        (None, None),
+        (0, 0),
+        ([], []),
+        ({}, {}),
+        ("", None),
+        (None, ""),
+        ("targeted_group_task_v1", "not-a-digest"),
+    ],
+)
+def test_dispatch_binding_rejects_non_text_effective_input_pair(
+    kind,
+    digest,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="effective"):
+        replace(
+            _binding(),
+            effective_input_kind=kind,
+            effective_input_digest=digest,
+        )
+
+
+def test_dispatch_binding_requires_owner_and_target_bot_digest_for_targeted_input() -> None:
+    targeted = {
+        "effective_input_kind": "targeted_group_task_v1",
+        "effective_input_digest": "e" * 64,
+        "target_bot_open_id_digest": "f" * 64,
+    }
+
+    with pytest.raises(ValueError, match="unsupported effective input"):
+        replace(_binding(), **targeted)
+    with pytest.raises(ValueError, match="incomplete"):
+        replace(
+            _binding(),
+            requester_principal_id="ou_owner",
+            **{**targeted, "target_bot_open_id_digest": ""},
+        )
+
+    binding = replace(
+        _binding(),
+        requester_principal_id="ou_owner",
+        **targeted,
+    )
+    assert binding.target_bot_open_id_digest == "f" * 64
 
 
 def _replay_gateway_binding_frame(tmp_path, binding_payload):
@@ -426,13 +638,23 @@ def _replay_gateway_binding_frame(tmp_path, binding_payload):
 
 def _legacy_slock_binding_payload():
     payload = _binding().to_dict()
+    payload["schema_version"] = 1
+    for field_name in (
+        "authorization_scope",
+        "source_requester_principal_id",
+        "effective_input_kind",
+        "effective_input_digest",
+        "target_bot_open_id_digest",
+        "prompt_digest",
+    ):
+        payload.pop(field_name)
     payload["slock_chat_id"] = payload.pop("team_chat_id")
     payload["slock_engine_identity"] = payload.pop("team_identity")
     payload["slock_root_identity"] = payload.pop("team_root_identity")
     return payload
 
 
-def test_gateway_replay_normalizes_exact_legacy_slock_binding(tmp_path) -> None:
+def test_gateway_replay_normalizes_exact_pre_scope_slock_binding(tmp_path) -> None:
     from src.autonomous.gateway.models import DispatchBinding
     from src.autonomous.gateway.projection import (
         GatewayProjectionState,
@@ -451,6 +673,10 @@ def test_gateway_replay_normalizes_exact_legacy_slock_binding(tmp_path) -> None:
     assert binding.team_chat_id == "oc_team"
     assert binding.team_identity == "8" * 64
     assert binding.team_root_identity == "9" * 64
+    assert binding.schema_version == 1
+    assert binding.prompt_digest == ""
+    with pytest.raises(ValueError, match="legacy"):
+        binding.to_dict()
 
 
 def test_gateway_replay_defaults_pre_scope_binding_to_managed_group(
@@ -463,8 +689,16 @@ def test_gateway_replay_defaults_pre_scope_binding_to_managed_group(
     )
 
     payload = _binding().to_dict()
-    payload.pop("authorization_scope")
-    payload.pop("source_requester_principal_id")
+    payload["schema_version"] = 1
+    for field_name in (
+        "authorization_scope",
+        "source_requester_principal_id",
+        "effective_input_kind",
+        "effective_input_digest",
+        "target_bot_open_id_digest",
+        "prompt_digest",
+    ):
+        payload.pop(field_name)
     with pytest.raises(ValueError, match="exact schema"):
         DispatchBinding.from_dict(payload)
 
@@ -475,6 +709,35 @@ def test_gateway_replay_defaults_pre_scope_binding_to_managed_group(
     binding = state.attempts[_binding().attempt_id].binding
     assert binding.authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
     assert binding.source_requester_principal_id == binding.requester_principal_id
+
+
+def test_gateway_replay_normalizes_exact_pre_effective_scoped_team_binding(
+    tmp_path,
+) -> None:
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+
+    payload = _binding().to_dict()
+    payload["schema_version"] = 1
+    for field_name in (
+        "effective_input_kind",
+        "effective_input_digest",
+        "target_bot_open_id_digest",
+        "prompt_digest",
+    ):
+        payload.pop(field_name)
+
+    state = GatewayProjectionState()
+    for frame in _replay_gateway_binding_frame(tmp_path, payload):
+        reduce_gateway_frame(state, frame)
+
+    binding = state.attempts[_binding().attempt_id].binding
+    assert binding.schema_version == 1
+    assert binding.authorization_scope is EmployeeAuthorizationScope.MANAGED_GROUP
+    assert binding.source_requester_principal_id == "ou_requester"
+    assert binding.prompt_digest == ""
 
 
 @pytest.mark.parametrize("invalid_shape", ["mixed", "missing", "extra"])
@@ -495,6 +758,86 @@ def test_gateway_replay_rejects_non_exact_legacy_binding(
         payload.pop("slock_root_identity")
     else:
         payload["unexpected"] = "value"
+
+    state = GatewayProjectionState()
+    frames = _replay_gateway_binding_frame(tmp_path, payload)
+    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
+        for frame in frames:
+            reduce_gateway_frame(state, frame)
+
+
+def test_gateway_replay_rejects_impossible_current_slock_hybrid(tmp_path) -> None:
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionError,
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+
+    payload = _binding().to_dict()
+    payload["slock_chat_id"] = payload.pop("team_chat_id")
+    payload["slock_engine_identity"] = payload.pop("team_identity")
+    payload["slock_root_identity"] = payload.pop("team_root_identity")
+
+    state = GatewayProjectionState()
+    frames = _replay_gateway_binding_frame(tmp_path, payload)
+    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
+        for frame in frames:
+            reduce_gateway_frame(state, frame)
+
+
+def test_gateway_replay_rejects_impossible_scoped_slock_hybrid(tmp_path) -> None:
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionError,
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+
+    payload = _binding().to_dict()
+    for field_name in (
+        "effective_input_kind",
+        "effective_input_digest",
+        "target_bot_open_id_digest",
+        "prompt_digest",
+    ):
+        payload.pop(field_name)
+    payload["schema_version"] = 1
+    payload["slock_chat_id"] = payload.pop("team_chat_id")
+    payload["slock_engine_identity"] = payload.pop("team_identity")
+    payload["slock_root_identity"] = payload.pop("team_root_identity")
+
+    state = GatewayProjectionState()
+    frames = _replay_gateway_binding_frame(tmp_path, payload)
+    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
+        for frame in frames:
+            reduce_gateway_frame(state, frame)
+
+
+def test_gateway_replay_rejects_legacy_shape_claiming_schema_v2(tmp_path) -> None:
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionError,
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+
+    payload = _legacy_slock_binding_payload()
+    payload["schema_version"] = 2
+
+    state = GatewayProjectionState()
+    frames = _replay_gateway_binding_frame(tmp_path, payload)
+    with pytest.raises(GatewayProjectionError, match="invalid attempt binding"):
+        for frame in frames:
+            reduce_gateway_frame(state, frame)
+
+
+def test_gateway_replay_rejects_current_shape_claiming_schema_v1(tmp_path) -> None:
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionError,
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+
+    payload = _binding().to_dict()
+    payload["schema_version"] = 1
 
     state = GatewayProjectionState()
     frames = _replay_gateway_binding_frame(tmp_path, payload)
@@ -541,6 +884,8 @@ def _real_coordinator_harness(
     team_content_overrides: dict[str, object] | None = None,
     expected_route_rejection: str = "",
     owner_p2p: bool = False,
+    targeted_group_task: bool = False,
+    targeted_task_description: str = "finish the targeted audit",
 ):
     import threading as local_threading
     from contextlib import contextmanager
@@ -586,6 +931,8 @@ def _real_coordinator_harness(
     from src.autonomous.team.runtime import TeamRuntime
     from src.autonomous.workforce.projection import workforce_projection_guard
     from src.autonomous.workforce.registry import ProjectedAgentRegistry
+    from src.trust.models import ManagedGroupOrigin
+    from src.trust.registry import ManagedGroupRegistry
     writer = JournalWriter.open(
         tmp_path / "journal",
         anchor=FileAnchor(tmp_path / "journal-anchor.json"),
@@ -653,7 +1000,10 @@ def _real_coordinator_harness(
                 state=ChannelProcessState.READY,
                 tenant_key="tenant_1",
                 bot_principal_id="bot_beta" if beta else "bot_alpha",
-                identity={"app_id": "cli_beta" if beta else "cli_alpha"},
+                identity={
+                    "app_id": "cli_beta" if beta else "cli_alpha",
+                    "open_id": "ou_bot_beta" if beta else "ou_bot_alpha",
+                },
                 ready_metadata={
                     "connection_id": "conn_beta" if beta else "conn_alpha"
                 },
@@ -665,10 +1015,28 @@ def _real_coordinator_harness(
 
     router_channels = _RouterChannels()
     chat_id = "oc_owner_p2p" if owner_p2p else "oc_team"
-    canonical_requester = "ou_owner" if owner_p2p else "ou_requester"
-    source_requester = (
-        "ou_employee_app_owner" if owner_p2p else "ou_requester"
+    canonical_requester = (
+        "ou_owner" if owner_p2p or targeted_group_task else "ou_requester"
     )
+    source_requester = (
+        "ou_employee_app_owner"
+        if owner_p2p or targeted_group_task
+        else "ou_requester"
+    )
+    managed_registry = None
+    if targeted_group_task:
+        managed_registry = ManagedGroupRegistry(
+            tmp_path / "managed-groups.json"
+        )
+        managed_registry.register(
+            chat_id="oc_team",
+            owner_id="ou_owner",
+            origin=ManagedGroupOrigin.OWNER_ADOPTED,
+            receiving_bot_ref="main-bot",
+            project_id="project-1",
+            canonical_root_ref="/project",
+            created_at=datetime(2026, 7, 14, tzinfo=UTC),
+        )
     router_kwargs = dict(
         writer=writer,
         ingress_service=ingress,
@@ -686,30 +1054,60 @@ def _real_coordinator_harness(
         requester_principal_resolver=(
             lambda **values: (
                 "ou_owner"
-                if owner_p2p
+                if (owner_p2p or targeted_group_task)
                 and values["sender_union_id"] == "on_owner"
                 and values["owner_principal_id"] == "ou_owner"
                 else (
-                    values["sender_principal_id"] if not owner_p2p else None
+                    values["sender_principal_id"]
+                    if not owner_p2p and not targeted_group_task
+                    else None
                 )
             )
         ),
         constraints_digest="c" * 64,
         system_prompt_token_reserve=128,
     )
+    if managed_registry is not None:
+        router_kwargs.update(
+            managed_group_registry_provider=lambda: managed_registry,
+            managed_group_owner_id="ou_owner",
+            employee_bot_ids_provider=lambda: frozenset({"ou_bot_alpha"}),
+        )
     router = DurableEmployeeIngressRouter(**router_kwargs)
     content = {
         "type": "message",
         "message_type": "text",
         "chat_type": "p2p" if owner_p2p else "group",
-        "content": {"text": "run the employee task"},
+        "content": {
+            "text": (
+                f"@_user_1 /task {targeted_task_description}"
+                if targeted_group_task
+                else "run the employee task"
+            )
+        },
         "sender_id": source_requester,
-        "sender_union_id": "on_owner" if owner_p2p else "",
+        "sender_union_id": (
+            "on_owner" if owner_p2p or targeted_group_task else ""
+        ),
         "sender_id_type": "open_id",
         "sender_type": "user",
         "sender_tenant_key": "tenant_1",
         "feishu_thread_id": "omt_1",
     }
+    if targeted_group_task:
+        content.update(
+            mentions=(
+                {
+                    "key": "@_user_1",
+                    "mentioned_type": "bot",
+                    "open_id": "ou_bot_alpha",
+                    "tenant_key": "tenant_1",
+                },
+            ),
+            remote_chat_id="oc_team",
+            remote_message_id="om_current",
+            remote_root_id="om_root",
+        )
     if team_assignment:
         content = {
             "type": "team_assignment",
@@ -748,7 +1146,6 @@ def _real_coordinator_harness(
         channel_generation=3,
         connection_id="conn_alpha",
         event_id="evt_1",
-        message_id="om_current",
         event_type=(
             "ghostap.team.assignment.v1"
             if team_assignment
@@ -757,8 +1154,21 @@ def _real_coordinator_harness(
         action_identity=(
             "team:teamrun_inactive:analysis" if team_assignment else ""
         ),
-        chat_id=chat_id,
-        thread_root_message_id="om_root",
+        chat_id=(
+            "oc_" + hashlib.sha256(b"oc_team").hexdigest()
+            if targeted_group_task
+            else chat_id
+        ),
+        thread_root_message_id=(
+            "om_" + hashlib.sha256(b"om_root").hexdigest()
+            if targeted_group_task
+            else "om_root"
+        ),
+        message_id=(
+            "om_" + hashlib.sha256(b"om_current").hexdigest()
+            if targeted_group_task
+            else "om_current"
+        ),
         sender_principal_id=source_requester,
         received_at="2026-07-14T00:00:00Z",
         semantic_digest=payload.payload_sha256,
@@ -859,8 +1269,13 @@ def _real_coordinator_harness(
                 message_id=request.current_message_id,
                 sender_id=request.source_requester_principal_id,
                 sender_type="user",
-                text="run the employee task",
+                text=(
+                    f"@_user_1 /task {targeted_task_description}"
+                    if targeted_group_task
+                    else "run the employee task"
+                ),
                 timestamp=1.0,
+                is_current=True,
                 chat_id=request.chat_id,
                 thread_id=request.feishu_thread_id,
                 root_id=request.thread_root_message_id,
@@ -999,6 +1414,7 @@ def _real_coordinator_harness(
         router=router,
         data=data,
         ingress=ingress,
+        payload=payload,
         hire=hire,
         workforce=workforce,
         channels=channels,
@@ -1018,7 +1434,7 @@ def test_dispatch_permit_is_frozen_and_atomically_one_shot() -> None:
     )
 
     permit = DispatchPermit(
-        binding=_binding(),
+        binding=_binding("already-budgeted prompt"),
         prompt="already-budgeted prompt",
         engine=object(),
         agent=object(),
@@ -1058,6 +1474,36 @@ def test_binding_profile_schema_fails_closed_but_legacy_identity_defaults() -> N
     assert identity.reasoning_effort == "default"
 
 
+def test_actor_gateway_rejects_prompt_that_differs_from_anchored_binding() -> None:
+    from src.autonomous.gateway.team import (
+        DispatchPermitAuthorityError,
+        EmployeeTeamGateway,
+    )
+    from src.autonomous.workforce.identity import AgentIdentity
+
+    binding = _binding("anchored prompt")
+    agent = AgentIdentity(
+        agent_id=binding.agent_id,
+        agent_type=binding.tool,
+        model_name=_runtime_model(binding),
+        model_profile=binding.profile,
+        reasoning_effort=binding.effort,
+        permissions=list(binding.permissions),
+        capabilities=list(binding.capabilities),
+        security_profile="employee_v1",
+    )
+
+    with pytest.raises(DispatchPermitAuthorityError, match="prompt binding"):
+        EmployeeTeamGateway(runtime_supervisor=object()).issue_permit(
+            binding=binding,
+            prompt="tampered prompt",
+            engine=object(),
+            agent=agent,
+            timeout_seconds=30,
+            env={},
+        )
+
+
 def test_dispatch_binding_allows_empty_capability_set_and_carries_full_authority() -> None:
     """Deny-all is valid and the anchored binding carries every replay coordinate."""
 
@@ -1076,6 +1522,10 @@ def test_dispatch_binding_allows_empty_capability_set_and_carries_full_authority
         "thread_id",
         "system_prompt_token_reserve",
         "render_contract_digest",
+        "prompt_digest",
+        "effective_input_kind",
+        "effective_input_digest",
+        "target_bot_open_id_digest",
     } <= field_names
     assert "terminal_epoch" not in field_names
     journal_payload = binding.to_dict()
@@ -1261,6 +1711,138 @@ def test_context_prompt_uses_only_budgeted_layers_in_strict_order() -> None:
     assert rendered.render_contract_digest == RENDER_CONTRACT_DIGEST
     assert rendered.context_snapshot_hash == snapshot.snapshot_hash
     assert "thread body" in rendered.prompt and "l2 body" in rendered.prompt
+
+
+def test_context_prompt_replaces_only_bound_current_targeted_task_text() -> None:
+    from src.autonomous.context.models import (
+        AssembledContext,
+        ContextLayer,
+        ContextMessage,
+    )
+    from src.autonomous.gateway.context_prompt import (
+        RENDER_CONTRACT_DIGEST,
+        UntrustedCurrentMessageOverride,
+        render_employee_context,
+    )
+    from src.autonomous.ingress.targeted_task import targeted_group_task_digest
+
+    raw = "@_user_1 /task 完成细致审查"
+    description = "完成细致审查"
+    message = ContextMessage(
+        message_id="om_current",
+        sender_id="ou_employee_app_owner",
+        sender_type="user",
+        text=raw,
+        timestamp=1.0,
+        is_current=True,
+        chat_id="oc_team",
+        thread_id="omt_team",
+        root_id="om_root",
+        sender_id_type="open_id",
+        sender_tenant_key="tenant_1",
+    )
+    snapshot = AssembledContext(
+        thread_messages=(message,),
+        group_messages=(),
+        l1_summary="",
+        l2_summary="",
+        total_tokens_estimate=20,
+        watermark=None,
+        layers_used=(ContextLayer.THREAD_FULL,),
+        total_chars=len(raw),
+        snapshot_hash="a" * 64,
+        system_prompt_tokens_reserved=256,
+        constraints_digest="c" * 64,
+    )
+    override = UntrustedCurrentMessageOverride(
+        message_id="om_current",
+        text=description,
+        input_kind="targeted_group_task_v1",
+        input_digest=targeted_group_task_digest(description),
+        payload_digest="b" * 64,
+    )
+
+    rendered = render_employee_context(
+        snapshot,
+        system_instruction="trusted persona",
+        constraints_digest="c" * 64,
+        current_message_override=override,
+    )
+    payload = json.loads(
+        rendered.prompt.split("## UNTRUSTED_CONTEXT_JSON\n", 1)[1]
+    )
+
+    assert payload["thread"][0]["text"] == description
+    assert raw not in rendered.prompt
+    assert description not in rendered.prompt.split(
+        "## UNTRUSTED_CONTEXT_JSON\n", 1
+    )[0]
+    assert rendered.context_snapshot_hash != snapshot.snapshot_hash
+    assert rendered.render_contract_digest != RENDER_CONTRACT_DIGEST
+    assert rendered == render_employee_context(
+        snapshot,
+        system_instruction="trusted persona",
+        constraints_digest="c" * 64,
+        current_message_override=override,
+    )
+
+
+def test_context_prompt_rejects_unbound_or_tampered_targeted_task_override() -> None:
+    from src.autonomous.context.models import (
+        AssembledContext,
+        ContextLayer,
+        ContextMessage,
+    )
+    from src.autonomous.gateway.context_prompt import (
+        UntrustedCurrentMessageOverride,
+        render_employee_context,
+    )
+
+    message = ContextMessage(
+        message_id="om_current",
+        sender_id="ou_owner",
+        sender_type="user",
+        text="@_user_1 /task safe body",
+        timestamp=1.0,
+        is_current=True,
+        chat_id="oc_team",
+        sender_id_type="open_id",
+        sender_tenant_key="tenant_1",
+    )
+    snapshot = AssembledContext(
+        thread_messages=(message,),
+        group_messages=(),
+        l1_summary="",
+        l2_summary="",
+        total_tokens_estimate=20,
+        watermark=None,
+        layers_used=(ContextLayer.THREAD_FULL,),
+        total_chars=len(message.text),
+        snapshot_hash="a" * 64,
+        system_prompt_tokens_reserved=128,
+    )
+
+    with pytest.raises(ValueError, match="digest"):
+        UntrustedCurrentMessageOverride(
+            message_id="om_current",
+            text="tampered body",
+            input_kind="targeted_group_task_v1",
+            input_digest="c" * 64,
+            payload_digest="b" * 64,
+        )
+    with pytest.raises(ValueError, match="current message"):
+        render_employee_context(
+            snapshot,
+            current_message_override=UntrustedCurrentMessageOverride(
+                message_id="om_other",
+                text="safe body",
+                input_kind="targeted_group_task_v1",
+                input_digest=hashlib.sha256(
+                    b"ghostap.targeted-group-task.v1\0safe body"
+                ).hexdigest(),
+                payload_digest="b" * 64,
+            ),
+        )
 
 
 def test_rendered_context_uses_canonical_untrusted_envelope_and_exact_token_rate() -> None:
@@ -1568,6 +2150,39 @@ def test_context_failure_terminally_rejects_candidate_once(tmp_path, caplog) -> 
     assert "reason=root_thread_binding" in caplog.text
     assert not [record for record in caplog.records if record.levelname == "ERROR"]
     harness.close()
+
+
+def test_targeted_group_render_budget_failure_terminally_rejects_candidate_once(
+    tmp_path,
+) -> None:
+    description = "\\" * 14_000
+    harness = _real_coordinator_harness(
+        tmp_path,
+        targeted_group_task=True,
+        targeted_task_description=description,
+    )
+    delegate = harness.coordinator._context  # noqa: SLF001
+
+    class _CountingContext:
+        calls = 0
+
+        def assemble(self, request):
+            self.calls += 1
+            return delegate.assemble(request)
+
+    context = _CountingContext()
+    harness.coordinator._context = context  # noqa: SLF001
+
+    try:
+        assert harness.coordinator.prepare_next() is None
+        record = harness.router.state.by_acceptance_id[harness.acceptance_ids[0]]
+        assert record.state == "terminal"
+        assert record.reason_code == "context_unavailable"
+        assert harness.router.peek_dispatch_candidate() is None
+        assert harness.coordinator.prepare_next() is None
+        assert context.calls == 1
+    finally:
+        harness.close()
 
 
 def test_inactive_team_assignment_is_rejected_before_context_assembly(tmp_path) -> None:

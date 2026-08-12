@@ -58,6 +58,11 @@ from ..ingress.models import EmployeeIngressMetadata, EmployeeIngressPayload
 from ..ingress.projection import IngressProjectionState
 from ..ingress.router import DurableEmployeeIngressRouter, RouterQueueLimits
 from ..ingress.service import EmployeeIngressService, IngressConflictError
+from ..ingress.targeted_task import (
+    TargetedTaskParseResult,
+    TargetedTaskState,
+    is_group_slash_observation,
+)
 from ..journal.anchor import FileAnchor
 from ..journal.frame import JournalEvent
 from ..journal.projections import ProjectionState
@@ -1772,6 +1777,11 @@ class EmployeeDepartmentRuntime:
         owner_principal_id: str,
         sender_principal_id: str,
         sender_union_id: str,
+        app_id: str = "",
+        bot_principal_id: str = "",
+        channel_generation: int = 0,
+        connection_id: str = "",
+        channel_identity_app_id: str = "",
     ) -> str | None:
         """Map an employee-app Open ID to the main-bot owner via union ID."""
 
@@ -1804,7 +1814,54 @@ class EmployeeDepartmentRuntime:
             or state.requester_union_id != sender_union_id
         ):
             return None
+        strict_transport = any(
+            (
+                app_id,
+                bot_principal_id,
+                channel_generation,
+                connection_id,
+                channel_identity_app_id,
+            )
+        )
+        if strict_transport and (
+            state.app_id != app_id
+            or state.bot_principal_id != bot_principal_id
+            or state.channel_generation != channel_generation
+            or state.channel_connection_id != connection_id
+            or state.channel_identity_app_id != channel_identity_app_id
+        ):
+            return None
         return owner_principal_id
+
+    def _authorized_targeted_group_task(
+        self,
+        record: Any,
+        payload: EmployeeIngressPayload | None,
+    ) -> TargetedTaskParseResult | None:
+        """Use the Router's independent authority fence for one group command."""
+
+        if not isinstance(payload, EmployeeIngressPayload):
+            return None
+        router = self._router
+        metadata = getattr(record, "metadata", None)
+        part = (
+            payload.normalized_parts[0]
+            if len(payload.normalized_parts) == 1
+            else None
+        )
+        if (
+            router is None
+            or not isinstance(metadata, EmployeeIngressMetadata)
+            or not isinstance(part, Mapping)
+            or not isinstance(part.get("mentions"), tuple)
+            or not is_group_slash_observation(part)
+            or not self._employee_ingress_transport_is_current(metadata)
+        ):
+            return None
+        try:
+            return router.classify_targeted_group_task(metadata, payload)
+        except Exception:
+            return None
 
     def _owner_p2p_requester(
         self,
@@ -1933,6 +1990,10 @@ class EmployeeDepartmentRuntime:
                     )
                 except Exception:
                     owner_p2p_requester = None
+                targeted_group_task = self._authorized_targeted_group_task(
+                    record,
+                    payload,
+                )
                 try:
                     trust = self._managed_employee_ingress_trust(
                         record,
@@ -1945,6 +2006,7 @@ class EmployeeDepartmentRuntime:
                     continue
                 if (
                     owner_p2p_requester is None
+                    and targeted_group_task is None
                     and trust is not None
                     and trust.zone is not TrustZone.MANAGED_AGENT_GROUP
                 ):
@@ -1960,6 +2022,7 @@ class EmployeeDepartmentRuntime:
                     continue
                 if (
                     owner_p2p_requester is None
+                    and targeted_group_task is None
                     and trust is not None
                     and trust.actor is ActorKind.EMPLOYEE
                 ):
@@ -1982,7 +2045,10 @@ class EmployeeDepartmentRuntime:
                 # into every employee mailbox as coding work.
                 if (
                     owner_p2p_requester is None
-                    and self._handle_main_bot_group_command_ingress(acceptance_id)
+                    and self._handle_main_bot_group_command_ingress(
+                        acceptance_id,
+                        targeted_group_task=targeted_group_task,
+                    )
                 ):
                     worked = True
                     continue
@@ -2289,6 +2355,17 @@ class EmployeeDepartmentRuntime:
             isinstance(first, Mapping)
             and first.get("type") == "membership_event"
         )
+        if (
+            not is_membership_event
+            and isinstance(first, Mapping)
+            and isinstance(first.get("mentions"), tuple)
+            and is_group_slash_observation(first)
+            and self._authorized_targeted_group_task(record, payload)
+            is not None
+        ):
+            # Uniquely addressed group `/task` commands are routed or receive
+            # usage by the group command gate, never by generic controls.
+            return False
         owner_p2p_requester = (
             None
             if is_membership_event
@@ -2556,8 +2633,13 @@ class EmployeeDepartmentRuntime:
             f"队列：{mailbox_depth}"
         )
 
-    def _handle_main_bot_group_command_ingress(self, acceptance_id: str) -> bool:
-        """Ignore main-Bot slash commands observed by an employee group Bot."""
+    def _handle_main_bot_group_command_ingress(
+        self,
+        acceptance_id: str,
+        *,
+        targeted_group_task: TargetedTaskParseResult | None = None,
+    ) -> bool:
+        """Route one addressed task; suppress every other group slash observation."""
 
         ingress = self._ingress
         if ingress is None:
@@ -2584,7 +2666,42 @@ class EmployeeDepartmentRuntime:
             return False
         content = first.get("content")
         text = content.get("text") if isinstance(content, Mapping) else None
-        if not isinstance(text, str) or not text.lstrip().startswith("/"):
+        if not isinstance(text, str):
+            return False
+        if (
+            targeted_group_task is not None
+            and targeted_group_task.state is TargetedTaskState.TARGETED_VALID
+        ):
+            return False
+        if (
+            targeted_group_task is not None
+            and targeted_group_task.state is TargetedTaskState.TARGETED_INVALID
+        ):
+            lifecycle = self._outbox_lifecycle
+            coordinates = _bound_remote_coordinates(metadata, first)
+            if lifecycle is None or coordinates is None:
+                return False
+            remote_chat_id, remote_message_id, remote_root_id = coordinates
+            # Anchor the idempotent employee-owned response before consuming
+            # ingress so a crash can safely replay this command.
+            lifecycle.task_usage_response(
+                tenant_key=metadata.tenant_key,
+                agent_id=metadata.agent_id,
+                chat_id=remote_chat_id,
+                thread_root_message_id=remote_root_id or remote_message_id,
+                command_acceptance_id=acceptance_id,
+            )
+            try:
+                ingress.record_disposition(
+                    acceptance_id,
+                    state="terminal",
+                    reason_code="task_invalid_arguments",
+                )
+            except IngressConflictError:
+                pass
+            self._drain_employee_outbox_once()
+            return True
+        if not is_group_slash_observation(first):
             return False
         try:
             ingress.record_disposition(
@@ -2595,6 +2712,7 @@ class EmployeeDepartmentRuntime:
         except IngressConflictError:
             pass
         return True
+
 
 
 
