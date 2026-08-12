@@ -60,6 +60,10 @@ class EmployeeOutboxItemDeliveryError(RuntimeError):
     """One record hit an external delivery failure safe to isolate and retry."""
 
 
+class EmployeeOutboxReceiptIntegrityError(RuntimeError):
+    """A successful Channel receipt contradicted the frozen delivery authority."""
+
+
 class EmployeeCardChannels(Protocol):
     def send(
         self,
@@ -271,7 +275,7 @@ class EmployeeOutboxDeliveryCoordinator:
             and (current_binding is None or receipt.message_id == current_binding.message_id)
         )
         if not valid:
-            raise EmployeeOutboxItemDeliveryError(
+            raise EmployeeOutboxReceiptIntegrityError(
                 "employee delivery receipt does not match authority"
             )
 
@@ -281,4 +285,5 @@ __all__ = [
     "EmployeeOutboxDrainResult",
     "EmployeeOutboxDeliveryCoordinator",
     "EmployeeOutboxItemDeliveryError",
+    "EmployeeOutboxReceiptIntegrityError",
 ]
