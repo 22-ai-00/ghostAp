@@ -18,8 +18,7 @@
 |----|------|----------|----------|------|------|-------------|
 | B049 | 2026-07-16 | Feishu API 硬超时后 daemon SDK worker 无法取消；本地删除 binding 后，迟到 PATCH 可能越过新代际远端写入。需设计 request generation/远端见证并做故障注入。 | Medium | Deep 卡片顺序分页审计 | Open | — |
 | B051 | 2026-07-16 | 员工 Contact/Context/群历史 SDK 调用缺少 endpoint、员工 app、message_id、平台错误码与分段耗时关联；异常目前多被压缩为 false/unknown，现场只能结合 Journal 推断。需补脱敏结构化观测。 | Medium | Team 员工延迟日志审计 | Open | — |
-| B052 | 2026-07-20 | 仓库级 Ruff 仍报告 85 条既有 Autonomous 测试告警（69 个 F401、4 个 F841、12 个 I001，分布在 31 个测试文件）；需在独立机械清理批次处理，避免与行为治理混杂。 | Low | 测试套件治理审计 | Open | — |
-| B054 | 2026-07-22 | `lark-channel-sdk==1.1.0` 在 Python 3.13 导入时仍调用 protobuf `utcfromtimestamp()` 和无当前 loop 的 `asyncio.get_event_loop()`，产生两条上游 `DeprecationWarning`；关注 SDK 升级并在上游修复后移除兼容记录，不使用过滤器掩盖。 | Low | 普通编程 Channel 迁移 | Open | — |
+| B054 | 2026-07-22 | `lark-channel-sdk==1.2.0` 在 Python 3.13 导入时仍调用 protobuf `utcfromtimestamp()`，产生上游 `DeprecationWarning`；关注 SDK 升级并在上游修复后移除兼容记录，不使用过滤器掩盖。 | Low | 普通编程 Channel 迁移 | Open | — |
 
 | B061 | 2026-08-07 | 单窗口耗尽后现已安全退休 transport、按原 provider session ID 自动恢复并续开新窗口，不再把一次 deadline 当作任务终态。仍需部署后采集真实租户 timeout → pause → retire → load_session → continue 的墙钟事件，校准 4 窗口默认值和 finalization reserve。 | Medium | 普通编程超时日志复盘 | Mitigated | — |
 | B062 | 2026-08-09 | Workflow 进度测试仍保留实现前的 RED 注释和 `object.__setattr__` 绕过，分页交付合同标题也仍标记为 RED；生产模型现已正式暴露对应字段。需在独立测试治理批次改用正常模型构造并校准文案，避免掩盖未来 schema 回归。 | Low | “继续执行”续接点调查 | Open | — |
@@ -28,13 +27,28 @@
 | B065 | 2026-08-11 | ACP `ToolCallProgress.raw_output` 为快照语义，但 reducer 仍按 delta 拼接；连续 `A`/`AB` 会形成重复或无效内容并可能 O(n²) 膨胀。需为 full Workflow 投影使用 replace/去重语义并覆盖多 progress 回归。 | Medium | Workflow 完整执行卡审查 | Open | — |
 | B066 | 2026-08-11 | 完整 tool input/progress/output 固定使用三反引号；载荷自带 fenced Markdown 时会提前闭合并被当作卡片 Markdown 解释。需使用动态 fence 长度并让分页保持原 fence，覆盖跨页 fenced payload。 | Medium | Workflow 完整执行卡审查 | Open | — |
 | B067 | 2026-08-11 | `agent-client-protocol==0.11.0` 及当前官方 main 在 Connection.close 时先停 dispatcher queue、后停 receive loop，关闭竞态由本地 late-frame tolerant queue 兼容。关注上游修正，升级并验证后移除适配。 | Low | Workflow 生成超时关闭竞态 | Open | — |
+| B068 | 2026-08-12 | Employee Ingress、Router、Outbox、dispatch history 和 Main-Bot warning 的 cursor 只避免“Journal 头未变”时重放；头被任何域推进后仍从 genesis 完整 replay，部分路径还解密全部历史 Blob、枚举 Blob 目录或周期扫描全部 terminal/pending 记录。Journal 增长后会放大空闲 worker、`/status`、恢复和关闭的 I/O/CPU。需实现可校验的增量 frame cursor、按域 pending/terminal 索引，并把全量 Blob 一致性检查移到启动或低频 reconciliation。 | Medium | 前六命令性能/稳定性复审 | Open | — |
+| B069 | 2026-08-12 | Employee `/status` 的 `scoped_attempt_status()` 会在 Journal 头变化时于同步锁内重放 Gateway 投影，再全扫 attempts；Actor 状态仍读取 `queue.Queue.qsize()` 的近似值。需维护按 tenant/agent/chat/thread 的活动计数投影与锁保护 mailbox counter，使状态查询成本不随全域历史增长。 | Medium | 前六命令性能/稳定性复审 | Open | — |
+| B070 | 2026-08-12 | `/stop`、`/history`、`/memory`、`/status` 及定向 `/task` 的确定性 Outbox 响应采用 `get_snapshot()` 后再 append；同一 acceptance 的并发首次调用可各自产生不同微秒 `created_at`，由第二个 writer 触发冲突而非稳定回读。需提供锁内 `get_or_create`/compare-and-return API，并覆盖每个 control 入口的多线程首次创建。 | Medium | 前六命令并发复审 | Open | — |
+| B071 | 2026-08-12 | Fire 仍以全局生命周期互斥覆盖部分远端 effect，Membership 的每 chat 锁也覆盖 SDK 成员查询/变更；Hire 已把准入域锁与 submit 分离，但工具选择仍可同步探测 provider，完整 provisioning intent 没有统一 monotonic 总 deadline。慢 SDK/provider 会串行阻塞同域操作，且超时的线程调用仍可能迟到完成。需把远端 I/O 移出域锁后用代际/CAS 复核，按指定工具缩小探测并为整个 intent 建立可恢复 deadline。 | Medium | 前六命令性能/稳定性复审 | Open | — |
+| B072 | 2026-08-12 | `test_ws_client_routing.py`（4,326 行/116 个测试函数）、`test_employee_team_gateway.py`（2,935/69）、`test_employee_router_queues.py`（2,488/44）、`test_employee_ingress_recovery.py`（1,696/36）与 `test_employee_membership_service.py`（1,023/34）已成为超大测试模块，增加定向运行、审查和冲突成本。需按 owner P2P、targeted group、handoff、terminal/reporting、membership recovery 拆分，同时保持共享 harness 单一来源。 | Low | 前六命令测试质量复审 | Open | — |
+| B073 | 2026-08-12 | Targeted `/task` 已区分确定拒绝与 `INDETERMINATE`，但 READY transport、union identity、TrustZone/ACL、membership 与投影读取等依赖失败仍缺少分阶段、脱敏的 reason telemetry；现场只能看到最终 deny/unknown/retry 行为。需记录 dependency、stage、稳定 reason code 与延迟，禁止包含正文、Open ID、union ID 或凭据。 | Medium | 前六命令可观测性复审 | Open | — |
+| B074 | 2026-08-12 | Dispatch reporting 的 `recovered_count=len(recovered)+reconciled` 可把同一 attempt 的“补终态”和“补快照”计为两次恢复；同时 missing/unreadable history 或 Outbox Blob 会保持周期 deferred，但缺少持久 ACTION_REQUIRED/运维修复入口。需拆分 attempt/snapshot 指标并为长期 poison record 建立可处置状态和告警。 | Medium | Employee reporting 恢复复审 | Open | — |
+| B075 | 2026-08-12 | `EmployeeOutboxService.get_snapshot()` 以裸 `KeyError` 表示记录不存在，而 lifecycle 同时把该异常当作“首次创建”；投影/API 编程错误若也泄漏 `KeyError` 会被误归类为不存在。需增加类型化 `OutboxNotFoundError`，仅该异常允许进入创建分支。 | Medium | Employee Outbox 错误分类复审 | Open | — |
+| B076 | 2026-08-12 | Main-Bot warning Outbox 已耐久化 Employee handoff/pre-start 终态告警，但普通消息 backpressure 与主 Bot identity 不可用仍有同步直发分支；warning `ACTION_REQUIRED` 也没有查询、重试或处置入口。需统一需要响应所有权的告警策略，并提供受审计的运维视图和重试动作。 | Medium | Main-Bot warning 交付复审 | Open | — |
+| B077 | 2026-08-12 | Main-Bot warning 的公平轮转 cursor 与 delivery 锁只在单进程实例内；重启会从持久排序头重新开始，多副本也没有跨进程 delivery lease。其 origin digest 还以允许输入中出现的 NUL 作为字段分隔符。需持久化公平 cursor/claim lease，并改为长度前缀或 canonical JSON 编码坐标。 | Medium | Main-Bot warning 幂等/扩展性复审 | Open | — |
+| B078 | 2026-08-12 | 启动 membership audit 现已在 runtime ready 前执行并失败关闭；但若旧版本留下“员工已 ARCHIVED、历史 ADD 未有因果更晚 REMOVE”的异常账本，而凭据已销毁，线上无法自动调用远端 API 证明清理。需提供离线 repair saga、人工证据锚定与明确运维手册，不能伪造 REMOVE 成功。 | Medium | Employee retirement 恢复复审 | Open | — |
+| B079 | 2026-08-12 | `tests/conftest.py` 的 Node 泄漏诊断只在结束时枚举系统全部 Node 进程，没有记录测试启动基线，可能把用户或其他任务原有进程误报为本套件泄漏。需像线程诊断一样比较 PID/启动时间基线；当前没有证据表明本轮测试实际泄漏 Node。 | Low | 全量测试稳定性复审 | Open | — |
+| B080 | 2026-08-12 | `AsyncCallbackBridge` 已为外部 callback task 加稳定命名并让 `drain()` 等待全部 sibling 后聚合失败，但仓库缺少直接覆盖“一个 sibling 取消/失败，另一个外部 callback 仍完成后才返回”的桥接回归。需增加独立 async contract test，避免后续改回 fail-fast gather。 | Low | 外部 mutation gate 覆盖复审 | Open | — |
+| B081 | 2026-08-12 | `_sync_main_bot_identity()` 在进程内 identity lock 内执行同步飞书 SDK 请求；冷启动或缓存失效时，所有需要确认主 Bot 身份的入站消息会串行等待该调用，SDK 的迟到返回也不可取消。需后台 single-flight 预热、短调用 deadline 与 stale-safe 缓存，热路径只读快照并失败关闭。 | Medium | 主 Bot 入站延迟复审 | Open | — |
+| B082 | 2026-08-12 | `EmployeeOutboxDeliveryCoordinator` 的 delivery lock 只在单对象内生效；若同一 Outbox 被两个 coordinator 实例共享，两者可同时取得同一 EXECUTING effect 并双重外发。第二个 commit 直接回读已有 binding，不核对自己的 receipt，因此可静默丢失先返回的 receipt。当前生产组装仅创建一个 coordinator，需将此单例拓扑固化为合同，或增加耐久 claim/lease 及 receipt 坐标 CAS，覆盖嵌入式/未来多副本部署。 | Medium | Employee Outbox 并发投递复审 | Open | — |
+| B083 | 2026-08-12 | `FeishuWSClient.close()` 已在 SDK handler 创建前安装 binding barrier，但忽略 `WSHealthMonitor.disconnect()` 的 `False`；当 SDK disconnect 五秒超时或无可观测连接时，关闭仍可继续并返回成功。新 handler 会被 fence 拒绝，已调度 handler 也由 barrier 保护，因此未证明数据丢失；但底层 WS 资源仍可能滞留。需将 disconnect 结果纳入关闭结果/可重试资源所有权，并区分“本来无连接”与“断开超时”。 | Medium | WS 关闭 barrier 复审 | Open | — |
+| B084 | 2026-08-12 | Scheduler completion callback 内若重入调用 `FeishuWSClient.close()`，`wait_for_completion_callbacks()` 会检测自身并返回未空，关闭随后进入 best-effort `scheduler.stop(wait=True)`；虽不会销毁 callback 依赖，但会经历自等待超时并返回 `False`。需显式拒绝 callback 内关闭或将关闭转移给独立 owner 线程，避免无效延迟与含糊返回值。 | Low | Scheduler completion 关闭复审 | Open | — |
 
 > **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。强化多副本档的外部验收条件由 [employee runtime profiles ADR](../docs/adr-employee-runtime-profiles.md) 持续承载，不作为本地代码已证明能力。
 
 - 2026-08-10 [中/安全契约] `create_engine_session(require_tool_filter=True)` 当前只强制 ACP transport，不在工厂入口验证/安装具体 filter；现役 Workflow/Employee 调用方会随后安装 filter，但 API 容易被新调用方误用。后续应改为类型化 lane permission profile 或将 `tool_filter` 作为必填参数并在首个 prompt 前 fail-closed。
 - 2026-08-10 [中/可靠性] `SPEC_EXECUTION_TIMEOUT` 当前被复用为各阶段 prompt timeout 与卡片 TTL，不是真正的 Spec 总运行 deadline；应增加 monotonic 总 SLA，并从其推导 phase timeout，避免自动任务无限循环或名称误导。
-
-- 2026-08-10 [高/产品闭环] Slock 退役还遗留 `/fire`、`/history`、`/employee-memory` 三个 catalog 孤儿命令；当前 Journal services 仍在，应迁移为独立 EmployeeHandler 并恢复 admin/tenant/audit fail-closed 门禁。`/hire` 还缺 3ed4bcec 删除的 durable admission/start_hire，必须重建幂等、容量、唯一性、anchor-before-submit 与全自动默认工具模型流程，不能只补路由或复活旧 Slock UI。
 
 ## 员工 ACTION_REQUIRED 恢复入口（2026-08-10）
 
