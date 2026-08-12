@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -196,6 +197,103 @@ def test_task_guard_blocks_exclusive_pair_until_absolute_deadline(
 
     elapsed = time.monotonic() - started
     assert 0.1 <= elapsed < 1.0
+
+
+def test_cancellable_task_guard_cancel_is_scoped_to_one_wait(
+    tmp_path: Path,
+) -> None:
+    _project, gate, _generation = _ready_gate(tmp_path)
+    canceled = threading.Event()
+    attempted = threading.Event()
+    entered = threading.Event()
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def wait_for_guard() -> None:
+        attempted.set()
+        try:
+            with gate.cancellable_task_guard(
+                canceled=canceled.is_set,
+                deadline=time.monotonic() + 2,
+            ):
+                entered.set()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    with gate._lock_pair(exclusive=True, deadline=time.monotonic() + 2):
+        waiter = threading.Thread(target=wait_for_guard)
+        waiter.start()
+        assert attempted.wait(timeout=1)
+        canceled.set()
+        assert done.wait(timeout=0.5)
+        assert not entered.is_set()
+
+    waiter.join(timeout=1)
+    assert not waiter.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RestartGateError)
+    assert "admission canceled" in str(errors[0])
+
+    with gate.cancellable_task_guard(
+        canceled=lambda: False,
+        deadline=time.monotonic() + 0.5,
+    ):
+        pass
+
+
+def test_cancellable_task_guard_has_one_absolute_wait_deadline(
+    tmp_path: Path,
+) -> None:
+    _project, gate, _generation = _ready_gate(tmp_path)
+    started = time.monotonic()
+
+    with gate._lock_pair(exclusive=True, deadline=started + 2):
+        with pytest.raises(RestartGateTimeout):
+            with gate.cancellable_task_guard(
+                canceled=lambda: False,
+                deadline=started + 0.15,
+            ):
+                pytest.fail("task callback boundary must not be entered")
+
+    elapsed = time.monotonic() - started
+    assert 0.1 <= elapsed < 1.0
+
+
+def test_cancellable_task_guard_rechecks_after_both_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _project, gate, _generation = _ready_gate(tmp_path)
+    canceled = threading.Event()
+    entered = False
+    acquire_count = 0
+    original_acquire = gate._acquire
+
+    def acquire_then_cancel(
+        fd: int,
+        mode: int,
+        deadline: float | None = None,
+        cancel_check=None,
+    ) -> None:
+        nonlocal acquire_count
+        original_acquire(fd, mode, deadline, cancel_check)
+        acquire_count += 1
+        if acquire_count == 2:
+            canceled.set()
+
+    monkeypatch.setattr(gate, "_acquire", acquire_then_cancel)
+
+    with pytest.raises(RestartGateError, match="admission canceled"):
+        with gate.cancellable_task_guard(
+            canceled=canceled.is_set,
+            deadline=time.monotonic() + 0.5,
+        ):
+            entered = True
+
+    assert acquire_count == 2
+    assert entered is False
 
 
 @pytest.mark.skipif(

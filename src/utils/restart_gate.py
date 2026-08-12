@@ -531,10 +531,19 @@ class RestartGate:
                 logger.exception("failed to close restart gate fd=%s", fd)
 
     @staticmethod
-    def _acquire(fd: int, mode: int, deadline: float | None = None) -> None:
+    def _acquire(
+        fd: int,
+        mode: int,
+        deadline: float | None = None,
+        canceled: Callable[[], bool] | None = None,
+    ) -> None:
         while True:
+            if canceled is not None and canceled():
+                raise RestartGateError("restart gate task admission canceled")
             try:
                 fcntl.flock(fd, mode | fcntl.LOCK_NB)
+                if canceled is not None and canceled():
+                    raise RestartGateError("restart gate task admission canceled")
                 return
             except BlockingIOError:
                 if deadline is None:
@@ -550,18 +559,24 @@ class RestartGate:
 
     @contextmanager
     def _lock_pair(
-        self, *, exclusive: bool, deadline: float | None = None
+        self,
+        *,
+        exclusive: bool,
+        deadline: float | None = None,
+        canceled: Callable[[], bool] | None = None,
     ) -> Iterator[None]:
         admission_fd: int | None = self._open_lock(self.admission_path)
         drain_fd: int | None = None
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         try:
-            self._acquire(admission_fd, mode, deadline)
+            self._acquire(admission_fd, mode, deadline, canceled)
             drain_fd = self._open_lock(self.drain_path)
-            self._acquire(drain_fd, mode, deadline)
+            self._acquire(drain_fd, mode, deadline, canceled)
             if not exclusive:
                 self._close_lock(admission_fd)
                 admission_fd = None
+            if canceled is not None and canceled():
+                raise RestartGateError("restart gate task admission canceled")
             yield
         finally:
             if drain_fd is not None:
@@ -574,6 +589,22 @@ class RestartGate:
         """Hold the drain reader lock for one complete scheduler run."""
 
         with self._lock_pair(exclusive=False):
+            yield
+
+    @contextmanager
+    def cancellable_task_guard(
+        self,
+        *,
+        canceled: Callable[[], bool],
+        deadline: float | None,
+    ) -> Iterator[None]:
+        """Hold the task lock while honoring one run's cancellation boundary."""
+
+        with self._lock_pair(
+            exclusive=False,
+            deadline=deadline,
+            canceled=canceled,
+        ):
             yield
 
     def _verify_gate_identity(self) -> None:
