@@ -35,7 +35,12 @@ from src.autonomous.provisioning.channel_protocol import (
     encode_bootstrap,
     encode_frame,
 )
-from src.autonomous.supervisor.channel_models import ChannelProcessState
+from src.autonomous.supervisor.channel_models import (
+    ChannelProcessState,
+    EmployeeChannelGenerationChanged,
+    EmployeeChannelOutboundError,
+    EmployeeChannelOutboundTimeout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -839,9 +844,11 @@ class EmployeeChannelSupervisor:
         with self._lock:
             runtime = self._runtimes.get(agent_id)
             if runtime is None or runtime.status.state is not ChannelProcessState.READY:
-                raise RuntimeError("employee Channel is not ready")
+                raise EmployeeChannelOutboundError("employee Channel is not ready")
             if runtime.status.generation != generation:
-                raise ValueError("employee Channel generation mismatch")
+                raise EmployeeChannelGenerationChanged(
+                    "employee Channel generation mismatch"
+                )
             runtime.pending_sends[request_id] = pending
             try:
                 sent = self._send_control(
@@ -854,15 +861,21 @@ class EmployeeChannelSupervisor:
                 raise ValueError(f"unsafe {operation.replace('_', ' ')} payload") from None
             if not sent:
                 runtime.pending_sends.pop(request_id, None)
-                raise RuntimeError(f"employee Channel {operation.replace('_', ' ')} failed")
+                raise EmployeeChannelOutboundError(
+                    f"employee Channel {operation.replace('_', ' ')} failed"
+                )
         if not pending.completed.wait(self._send_timeout):
             with self._lock:
                 runtime.pending_sends.pop(request_id, None)
-            raise TimeoutError(f"employee Channel {operation.replace('_', ' ')} receipt timed out")
+            raise EmployeeChannelOutboundTimeout(
+                f"employee Channel {operation.replace('_', ' ')} receipt timed out"
+            )
         with self._lock:
             runtime.pending_sends.pop(request_id, None)
         if pending.success is not True:
-            raise RuntimeError(f"employee Channel {operation.replace('_', ' ')} was not acknowledged")
+            raise EmployeeChannelOutboundError(
+                f"employee Channel {operation.replace('_', ' ')} was not acknowledged"
+            )
         return ChannelSendReceipt(
             request_id=request_id,
             success=True,

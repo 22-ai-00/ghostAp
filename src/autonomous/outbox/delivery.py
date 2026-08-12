@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import logging
 import threading
-from bisect import bisect_right
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
+from ..supervisor.channel_models import EmployeeChannelOutboundError
 from .models import (
     DeliveryEffectState,
     EmployeeOutboxBinding,
@@ -55,6 +56,10 @@ class EmployeeOutboxDrainResult:
         return self.pending_count > 0
 
 
+class EmployeeOutboxItemDeliveryError(RuntimeError):
+    """One record hit an external delivery failure safe to isolate and retry."""
+
+
 class EmployeeCardChannels(Protocol):
     def send(
         self,
@@ -93,8 +98,8 @@ class EmployeeOutboxDeliveryCoordinator:
         self._outbox = outbox
         self._channels = channels
         self._authority_resolver = authority_resolver
-        self._pending_cursor: tuple[str, str] | None = None
-        self._cursor_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._pending_outbox_ids: deque[str] = deque()
+        self._delivery_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
 
     def deliver_pending(
         self,
@@ -117,10 +122,17 @@ class EmployeeOutboxDeliveryCoordinator:
             raise ValueError(
                 f"max_items must be between 1 and {_MAX_PENDING_DELIVERY_BATCH}"
             )
+        with self._delivery_lock:
+            return self._deliver_pending_locked(max_items=max_items)
+
+    def _deliver_pending_locked(
+        self,
+        *,
+        max_items: int,
+    ) -> EmployeeOutboxDrainResult:
         pending = self._outbox.list_pending_delivery_records()
         if not pending:
-            with self._cursor_lock:
-                self._pending_cursor = None
+            self._pending_outbox_ids.clear()
             return EmployeeOutboxDrainResult(
                 pending_count=0,
                 attempted_outbox_ids=(),
@@ -128,41 +140,44 @@ class EmployeeOutboxDeliveryCoordinator:
                 failed_outbox_ids=(),
             )
 
-        keys = tuple(
-            (record.latest.created_at, record.outbox_id) for record in pending
-        )
-        with self._cursor_lock:
-            start = (
-                0
-                if self._pending_cursor is None
-                else bisect_right(keys, self._pending_cursor)
-            )
-            if start >= len(pending):
-                start = 0
-            selected = tuple(
-                pending[(start + offset) % len(pending)]
-                for offset in range(min(max_items, len(pending)))
-            )
-            last = selected[-1]
-            self._pending_cursor = (last.latest.created_at, last.outbox_id)
+        live_ids = {record.outbox_id for record in pending}
+        queued_ids: set[str] = set()
+        retained: deque[str] = deque()
+        for outbox_id in self._pending_outbox_ids:
+            if outbox_id in live_ids and outbox_id not in queued_ids:
+                retained.append(outbox_id)
+                queued_ids.add(outbox_id)
+        for record in pending:
+            if record.outbox_id not in queued_ids:
+                retained.append(record.outbox_id)
+                queued_ids.add(record.outbox_id)
+        self._pending_outbox_ids = retained
 
+        attempt_limit = min(max_items, len(self._pending_outbox_ids))
+        attempted: list[str] = []
         delivered: list[str] = []
         failed: list[str] = []
-        for record in selected:
+        for _attempt in range(attempt_limit):
+            outbox_id = self._pending_outbox_ids.popleft()
+            attempted.append(outbox_id)
             try:
-                self.deliver(record.outbox_id)
-            except Exception as exc:
-                failed.append(record.outbox_id)
+                self.deliver(outbox_id)
+            except EmployeeOutboxItemDeliveryError as exc:
+                failed.append(outbox_id)
+                self._pending_outbox_ids.append(outbox_id)
                 logger.warning(
                     "employee Outbox delivery deferred: outbox_id=%s error=%s",
-                    record.outbox_id,
+                    outbox_id,
                     type(exc).__name__,
                 )
                 continue
-            delivered.append(record.outbox_id)
+            except BaseException:
+                self._pending_outbox_ids.appendleft(outbox_id)
+                raise
+            delivered.append(outbox_id)
         return EmployeeOutboxDrainResult(
             pending_count=len(pending),
-            attempted_outbox_ids=tuple(record.outbox_id for record in selected),
+            attempted_outbox_ids=tuple(attempted),
             delivered_outbox_ids=tuple(delivered),
             failed_outbox_ids=tuple(failed),
         )
@@ -171,6 +186,14 @@ class EmployeeOutboxDeliveryCoordinator:
         self,
         outbox_id: str,
         snapshot_version: int | None = None,
+    ) -> EmployeeOutboxBinding | None:
+        with self._delivery_lock:
+            return self._deliver_locked(outbox_id, snapshot_version)
+
+    def _deliver_locked(
+        self,
+        outbox_id: str,
+        snapshot_version: int | None,
     ) -> EmployeeOutboxBinding | None:
         record = self._outbox.get_record(outbox_id)
         version = record.latest_version if snapshot_version is None else snapshot_version
@@ -199,20 +222,30 @@ class EmployeeOutboxDeliveryCoordinator:
                         "reply_in_thread": True,
                     }
                 )
-            receipt = self._channels.send(
-                record.agent_id,
-                generation=authority.generation,
-                target=snapshot.chat_id,
-                message={"card": snapshot.to_dict()["card_json"]},
-                options=options,
-            )
+            try:
+                receipt = self._channels.send(
+                    record.agent_id,
+                    generation=authority.generation,
+                    target=snapshot.chat_id,
+                    message={"card": snapshot.to_dict()["card_json"]},
+                    options=options,
+                )
+            except (EmployeeChannelOutboundError, ConnectionError, TimeoutError) as exc:
+                raise EmployeeOutboxItemDeliveryError(
+                    "employee delivery transport is unavailable"
+                ) from exc
         else:
-            receipt = self._channels.update_card(
-                record.agent_id,
-                generation=authority.generation,
-                message_id=record.binding.message_id,
-                card=snapshot.to_dict()["card_json"],
-            )
+            try:
+                receipt = self._channels.update_card(
+                    record.agent_id,
+                    generation=authority.generation,
+                    message_id=record.binding.message_id,
+                    card=snapshot.to_dict()["card_json"],
+                )
+            except (EmployeeChannelOutboundError, ConnectionError, TimeoutError) as exc:
+                raise EmployeeOutboxItemDeliveryError(
+                    "employee delivery transport is unavailable"
+                ) from exc
         self._validate_receipt(receipt, authority, record.binding)
         return self._outbox.commit_delivery(
             effect.effect_id,
@@ -238,11 +271,14 @@ class EmployeeOutboxDeliveryCoordinator:
             and (current_binding is None or receipt.message_id == current_binding.message_id)
         )
         if not valid:
-            raise RuntimeError("employee delivery receipt does not match authority")
+            raise EmployeeOutboxItemDeliveryError(
+                "employee delivery receipt does not match authority"
+            )
 
 
 __all__ = [
     "EmployeeDeliveryAuthority",
     "EmployeeOutboxDrainResult",
     "EmployeeOutboxDeliveryCoordinator",
+    "EmployeeOutboxItemDeliveryError",
 ]

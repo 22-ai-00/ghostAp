@@ -4,6 +4,7 @@ from .delivery import (
     EmployeeDeliveryAuthority,
     EmployeeOutboxDeliveryCoordinator,
     EmployeeOutboxDrainResult,
+    EmployeeOutboxItemDeliveryError,
 )
 from .lifecycle import EmployeeOutboxLifecycle
 from .models import (
@@ -41,6 +42,7 @@ __all__ = [
     "EmployeeDeliveryAuthority",
     "EmployeeOutboxDeliveryCoordinator",
     "EmployeeOutboxDrainResult",
+    "EmployeeOutboxItemDeliveryError",
     "EmployeeOutboxLifecycle",
     "OutboxDeliveryEffect",
     "OutboxProjectionError",
