@@ -454,6 +454,85 @@ def test_drain_action_required_after_quiesce_is_not_polled_again(tmp_path):
     writer.close()
 
 
+def test_reconcile_draining_evicts_cursor_advanced_by_another_service(tmp_path):
+    writer, _state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    now = 10.0
+    active = True
+
+    class _CountingWriter:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.replay_count = 0
+
+        def replay(self, *args, **kwargs):
+            self.replay_count += 1
+            return self.wrapped.replay(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    class _DrainEffect:
+        def execute(self, _state):
+            return None
+
+        def observe(self, _state):
+            return not active
+
+    class _UnresolvedCleanup:
+        def execute(self, _state):
+            raise RuntimeError("cleanup unavailable")
+
+        def observe(self, _state):
+            return False
+
+    counting_writer = _CountingWriter(writer)
+    initial_effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    initial_effects["execution_quiesce"] = _DrainEffect()
+    initial = EmployeeFireService(
+        writer=counting_writer,
+        authority=authority,
+        effects=initial_effects,
+        monotonic=lambda: now,
+    )
+    waiting = initial.start_fire(
+        EmployeeFireRequest(
+            employee="Atlas",
+            tenant_key="tenant_1",
+            message_id="om_fire_cross_instance_drain",
+            chat_id="oc_dm",
+            requester_principal_id="ou_admin",
+            drain=True,
+        )
+    )
+    assert waiting.effect_state("execution_quiesce") is FireEffectState.EXECUTING
+
+    active = False
+    recovery_effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    recovery_effects["execution_quiesce"] = _DrainEffect()
+    recovery_effects["slash_cleanup"] = _UnresolvedCleanup()
+    recovered = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects=recovery_effects,
+    ).recover()
+
+    assert len(recovered) == 1
+    advanced = recovered[0]
+    assert advanced.phase is FirePhase.ACTION_REQUIRED
+    assert advanced.effect_state("execution_quiesce") is FireEffectState.COMMITTED
+    assert advanced.effect_state("slash_cleanup") is FireEffectState.ACTION_REQUIRED
+
+    counting_writer.replay_count = 0
+    assert initial.reconcile_draining() == ()
+    assert counting_writer.replay_count == 1
+
+    now += 0.5
+    assert initial.reconcile_draining() == ()
+    assert counting_writer.replay_count == 1
+    ingress.close()
+    writer.close()
+
+
 def test_pending_drain_reconciliation_is_throttled_but_converges_on_due_poll(
     tmp_path,
 ):

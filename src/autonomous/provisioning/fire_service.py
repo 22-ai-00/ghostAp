@@ -460,6 +460,7 @@ class EmployeeFireService:
                     FireEffectState.EXECUTING,
                     FireEffectState.ACTION_REQUIRED,
                 }:
+                    self._pending_drains.discard(intent_id)
                     continue
                 if effect_state is FireEffectState.ACTION_REQUIRED:
                     current = self._retry_action_required(state.intent_id)
