@@ -2134,13 +2134,26 @@ class EmployeeDepartmentRuntime:
             grant_revision=None,
         )
 
-    def trusted_employee_bot_open_ids(self) -> frozenset[str]:
+    def trusted_employee_bot_open_ids(
+        self,
+        *,
+        tenant_key: str | None = None,
+        chat_id: str | None = None,
+    ) -> frozenset[str]:
         """Return only current READY employee Bot Open IDs.
 
         Workforce ``bot_principal_id`` values are internal identifiers and are
         deliberately never compared with Feishu ``open_id`` values.
         """
 
+        scoped = tenant_key is not None or chat_id is not None
+        if scoped and (
+            not isinstance(tenant_key, str)
+            or not tenant_key
+            or not isinstance(chat_id, str)
+            or not chat_id
+        ):
+            return frozenset()
         service = self._service
         channels = self._channels
         if service is None or channels is None:
@@ -2152,6 +2165,13 @@ class EmployeeDepartmentRuntime:
                 employee.state is not EmployeeState.ACTIVE
                 or employee.worker_type is not WorkerType.VISIBLE
                 or not employee.bot_principal_id
+                or (
+                    scoped
+                    and (
+                        employee.tenant_key != tenant_key
+                        or chat_id not in employee.member_groups
+                    )
+                )
             ):
                 continue
             principal = projection.bot_principals.get(employee.bot_principal_id)

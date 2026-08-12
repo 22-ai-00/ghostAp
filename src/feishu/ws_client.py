@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -155,6 +156,7 @@ def _configured_managed_group_owner_id(settings: Any) -> str:
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger("ghostap.audit")
+_LARK_MENTION_PLACEHOLDER_RE = re.compile(r"@_user_[0-9]+|@all")
 
 
 def _employee_hire_status_text(employee_name: str, status: str) -> str | None:
@@ -1632,6 +1634,76 @@ class FeishuWSClient:
             return None
         return message_id, chat_id, chat_type, sender_id
 
+    def _is_ready_employee_targeted_group_command(
+        self,
+        data: P2ImMessageReceiveV1,
+    ) -> bool:
+        """Recognize a slash command addressed only to one READY employee Bot."""
+
+        try:
+            message = data.event.message
+            event_tenant_key = data.header.tenant_key
+        except (AttributeError, TypeError):
+            return False
+        chat_id = getattr(message, "chat_id", None)
+        if message.chat_type != "group" or message.message_type != "text":
+            return False
+        mentions = getattr(message, "mentions", None)
+        if not isinstance(mentions, (list, tuple)) or len(mentions) != 1:
+            return False
+        mention = mentions[0]
+        identity = getattr(mention, "id", None)
+        mention_key = getattr(mention, "key", None)
+        target_open_id = getattr(identity, "open_id", None)
+        mention_tenant_key = getattr(mention, "tenant_key", None)
+        if (
+            not isinstance(event_tenant_key, str)
+            or not event_tenant_key
+            or not isinstance(chat_id, str)
+            or not chat_id
+            or mention_tenant_key != event_tenant_key
+            or not isinstance(mention_key, str)
+            or not mention_key.startswith("@_user_")
+            or not mention_key.removeprefix("@_user_").isdigit()
+            or not isinstance(target_open_id, str)
+            or not target_open_id.startswith("ou_")
+        ):
+            return False
+        content = getattr(message, "content", None)
+        if not isinstance(content, str):
+            return False
+        try:
+            decoded = json.loads(content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False
+        raw_text = decoded.get("text") if isinstance(decoded, dict) else None
+        if (
+            not isinstance(raw_text, str)
+            or _LARK_MENTION_PLACEHOLDER_RE.findall(raw_text) != [mention_key]
+        ):
+            return False
+        addressed = raw_text.lstrip()
+        if not addressed.startswith(mention_key):
+            return False
+        command_text = addressed[len(mention_key) :]
+        if not command_text[:1].isspace():
+            return False
+        if SlashCommandParser.parse(command_text.lstrip()) is None:
+            return False
+        runtime = getattr(self, "_employee_department_runtime", None)
+        ready_bot_ids = getattr(runtime, "trusted_employee_bot_open_ids", None)
+        if not callable(ready_bot_ids):
+            return False
+        try:
+            current = ready_bot_ids(
+                tenant_key=event_tenant_key,
+                chat_id=chat_id,
+            )
+        except Exception:
+            logger.warning("employee Bot identity lookup failed closed", exc_info=True)
+            return False
+        return type(current) is frozenset and target_open_id in current
+
     def _handle_message(self, data: P2ImMessageReceiveV1):
         """飞书消息事件入口：只做轻量前置判断，然后交给 scheduler 异步处理。"""
         ingress_facts = self._extract_canonical_ingress_facts(data)
@@ -1680,6 +1752,8 @@ class FeishuWSClient:
             command_match=command_match,
         )
         if not ingress_decision.allowed:
+            return
+        if self._is_ready_employee_targeted_group_command(data):
             return
         if not self._managed_ingress_action_allowed(
             effective_trust,

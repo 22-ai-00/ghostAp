@@ -128,6 +128,291 @@ def create_mock_message(text: str, message_id="om_123", chat_id="oc_456", messag
     return data
 
 
+def _sdk_message_mention(
+    *,
+    key: str,
+    open_id: str,
+    name: str,
+    tenant_key: str = "tenant_test",
+):
+    """Build the exact mention shape emitted by lark-channel-sdk 1.2.0."""
+
+    from lark_channel.api.im.v1.model.mention_event import MentionEvent
+    from lark_channel.api.im.v1.model.user_id import UserId
+
+    return (
+        MentionEvent.builder()
+        .key(key)
+        .id(UserId.builder().open_id(open_id).build())
+        .name(name)
+        .tenant_key(tenant_key)
+        .build()
+    )
+
+
+def _mentioned_group_command(
+    text: str,
+    *mentions,
+    message_id: str = "om_mentioned_command",
+):
+    message = create_mock_message(text, message_id=message_id)
+    message.event.message.mentions = tuple(mentions)
+    return message
+
+
+@pytest.mark.parametrize(
+    ("employee_open_id", "command"),
+    [
+        ("ou_employee_alpha", "/task ship the release"),
+        ("ou_employee_beta", "/stop_wf"),
+        ("ou_employee_alpha", "/fire Atlas"),
+    ],
+)
+def test_main_bot_does_not_enqueue_commands_uniquely_targeted_to_ready_employee(
+    mock_ws_client: FeishuWSClient,
+    employee_open_id: str,
+    command: str,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.trusted_employee_bot_open_ids = MagicMock(
+        return_value=frozenset({"ou_employee_alpha", "ou_employee_beta"})
+    )
+    mention = _sdk_message_mention(
+        key="@_user_1",
+        open_id=employee_open_id,
+        name="Employee",
+    )
+    event = _mentioned_group_command(f"@_user_1 {command}", mention)
+
+    mock_ws_client._handle_message(event)
+
+    runtime.trusted_employee_bot_open_ids.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+    )
+    mock_ws_client._scheduler.submit.assert_not_called()
+
+
+def test_main_bot_does_not_suppress_ready_employee_outside_current_group(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+
+    def scoped_ready_ids(*args, **kwargs):
+        if kwargs == {"tenant_key": "tenant_test", "chat_id": "oc_456"}:
+            return frozenset()
+        return frozenset({"ou_employee_alpha"})
+
+    runtime.trusted_employee_bot_open_ids = MagicMock(side_effect=scoped_ready_ids)
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee In Another Group",
+        ),
+        message_id="om_ready_outside_group",
+    )
+
+    mock_ws_client._handle_message(event)
+
+    mock_ws_client._scheduler.submit.assert_called_once()
+
+
+def test_main_bot_routes_when_scoped_ready_employee_lookup_fails(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.trusted_employee_bot_open_ids = MagicMock(
+        side_effect=RuntimeError("identity snapshot unavailable")
+    )
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id="om_employee_lookup_failure",
+    )
+
+    mock_ws_client._handle_message(event)
+
+    mock_ws_client._scheduler.submit.assert_called_once()
+
+
+def test_ready_employee_identity_snapshot_supports_tenant_group_scope() -> None:
+    from src.autonomous.domain import EmployeeState, WorkerType
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+    from src.autonomous.supervisor.employee_channels import ChannelProcessState
+
+    alpha = SimpleNamespace(
+        agent_id="agt_alpha",
+        tenant_key="tenant_test",
+        state=EmployeeState.ACTIVE,
+        worker_type=WorkerType.VISIBLE,
+        bot_principal_id="bot_alpha",
+        member_groups=("oc_456",),
+    )
+    beta = SimpleNamespace(
+        agent_id="agt_beta",
+        tenant_key="tenant_other",
+        state=EmployeeState.ACTIVE,
+        worker_type=WorkerType.VISIBLE,
+        bot_principal_id="bot_beta",
+        member_groups=("oc_other",),
+    )
+    projection = SimpleNamespace(
+        employees={"agt_alpha": alpha, "agt_beta": beta},
+        bot_principals={
+            "bot_alpha": SimpleNamespace(app_id="cli_alpha"),
+            "bot_beta": SimpleNamespace(app_id="cli_beta"),
+        },
+    )
+    statuses = {
+        "agt_alpha": SimpleNamespace(
+            state=ChannelProcessState.READY,
+            agent_id="agt_alpha",
+            tenant_key="tenant_test",
+            bot_principal_id="bot_alpha",
+            app_id="cli_alpha",
+            identity={"open_id": "ou_employee_alpha"},
+        ),
+        "agt_beta": SimpleNamespace(
+            state=ChannelProcessState.READY,
+            agent_id="agt_beta",
+            tenant_key="tenant_other",
+            bot_principal_id="bot_beta",
+            app_id="cli_beta",
+            identity={"open_id": "ou_employee_beta"},
+        ),
+    }
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._service = SimpleNamespace(synchronize_projection=lambda: projection)
+    runtime._channels = SimpleNamespace(status=statuses.get)
+
+    assert runtime.trusted_employee_bot_open_ids() == frozenset(
+        {"ou_employee_alpha", "ou_employee_beta"}
+    )
+    assert runtime.trusted_employee_bot_open_ids(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+    ) == frozenset({"ou_employee_alpha"})
+
+
+def test_main_bot_keeps_main_targeted_command_on_original_route(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.trusted_employee_bot_open_ids = MagicMock(
+        return_value=frozenset({"ou_employee_alpha"})
+    )
+    mention = _sdk_message_mention(
+        key="@_user_1",
+        open_id="ou_main_bot",
+        name="GhostAP",
+    )
+    event = _mentioned_group_command("@_user_1 /stop_wf", mention)
+    mock_ws_client._validate_message = MagicMock(return_value=True)
+    mock_ws_client._dispatch_message_logic = MagicMock()
+
+    mock_ws_client._handle_message(event)
+
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.is_system_command is True
+    callback(MagicMock())
+    dispatch = mock_ws_client._dispatch_message_logic.call_args
+    assert dispatch.args[2] == "/stop_wf"
+    assert dispatch.kwargs["command_match"].command == "/stop_wf"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        _mentioned_group_command(
+            "@_user_1 /task unknown target",
+            _sdk_message_mention(
+                key="@_user_1",
+                open_id="ou_not_ready_employee",
+                name="Former Employee",
+            ),
+            message_id="om_unknown_target",
+        ),
+        _mentioned_group_command(
+            "@_user_1 /stop_wf @_user_2",
+            _sdk_message_mention(
+                key="@_user_1",
+                open_id="ou_main_bot",
+                name="GhostAP",
+            ),
+            _sdk_message_mention(
+                key="@_user_2",
+                open_id="ou_employee_alpha",
+                name="Employee",
+            ),
+            message_id="om_multiple_targets",
+        ),
+        _mentioned_group_command(
+            "@_user_2 /task mismatched placeholder",
+            _sdk_message_mention(
+                key="@_user_1",
+                open_id="ou_employee_alpha",
+                name="Employee",
+            ),
+            message_id="om_mismatched_placeholder",
+        ),
+        _mentioned_group_command(
+            "@_user_1 /stop_wf @_user_2",
+            _sdk_message_mention(
+                key="@_user_1",
+                open_id="ou_employee_alpha",
+                name="Employee",
+            ),
+            message_id="om_unbound_extra_placeholder",
+        ),
+        _mentioned_group_command(
+            "@_user_1 ordinary conversation",
+            _sdk_message_mention(
+                key="@_user_1",
+                open_id="ou_employee_alpha",
+                name="Employee",
+            ),
+            message_id="om_non_command",
+        ),
+        _mentioned_group_command(
+            "@_user_1 /task foreign tenant",
+            _sdk_message_mention(
+                key="@_user_1",
+                open_id="ou_employee_alpha",
+                name="Foreign Employee",
+                tenant_key="tenant_other",
+            ),
+            message_id="om_foreign_tenant",
+        ),
+    ],
+    ids=(
+        "unknown",
+        "multiple",
+        "placeholder-mismatch",
+        "unbound-placeholder",
+        "non-command",
+        "foreign-tenant",
+    ),
+)
+def test_main_bot_does_not_suppress_unproven_employee_command_targets(
+    mock_ws_client: FeishuWSClient,
+    event,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.trusted_employee_bot_open_ids = MagicMock(
+        return_value=frozenset({"ou_employee_alpha"})
+    )
+
+    mock_ws_client._handle_message(event)
+
+    mock_ws_client._scheduler.submit.assert_called_once()
+
+
 def test_handle_message_system_command_routing(mock_ws_client: FeishuWSClient):
     """Test that system commands (like /help) bypass project queue and get HIGH priority."""
     msg = create_mock_message("/help")
