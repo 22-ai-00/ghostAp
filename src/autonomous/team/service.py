@@ -127,6 +127,8 @@ class EmployeeTeamService:
         coordinator_profile: str = "",
         coordinator_effort: str = "",
         coordinator_decision_provider: DecisionProvider | None = None,
+        blob_retainer: Callable[[str], None] | None = None,
+        blob_releaser: Callable[[str], None] | None = None,
     ) -> None:
         if blob_store is None or not active_key_id:
             raise ValueError("Team Coordinator requires encrypted Blob storage")
@@ -144,6 +146,8 @@ class EmployeeTeamService:
             poll_seconds=poll_seconds,
             clock=clock,
             decision_provider=coordinator_decision_provider,
+            blob_retainer=blob_retainer,
+            blob_releaser=blob_releaser,
         )
 
     def start_task(
@@ -217,8 +221,8 @@ class EmployeeTeamService:
     def recover(self) -> int:
         return self._coordinator.recover()
 
-    def close(self) -> None:
-        self._coordinator.close()
+    def close(self, *, timeout_seconds: float = 5.0) -> None:
+        self._coordinator.close(timeout_seconds=timeout_seconds)
 
     @staticmethod
     def _adapt(run: object) -> TeamRunState:

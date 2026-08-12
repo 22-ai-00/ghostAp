@@ -24,28 +24,48 @@ class ExecutionQuiesceEffect:
     def execute(self, state: DurableFireState) -> None:
         if self._coordinator is None:
             raise RuntimeError("employee dispatch coordinator unavailable")
+        begin_retirement = getattr(
+            self._coordinator,
+            "begin_employee_retirement",
+            None,
+        )
+        if callable(begin_retirement):
+            begin_retirement(
+                tenant_key=state.tenant_key,
+                agent_id=state.agent_id,
+            )
         if state.drain:
             # Drain polling must be non-blocking.  The first request and every
             # background reconciliation simply install the actor fence once
-            # the last assignment is terminal.
-            if self._has_active_attempts(state):
+            # the last assignment and response obligation are terminal.
+            if (
+                self._has_active_attempts(state)
+                or self._retirement_ready(state) is not True
+            ):
                 return
             self._retire_actor(state)
             return
-        if not state.drain:
-            attempts = tuple(self._coordinator.state.attempts.values())
-            for attempt in attempts:
-                if attempt.binding.agent_id != state.agent_id or attempt.terminal_status:
-                    continue
-                self._coordinator.request_cancel(
-                    agent_id=state.agent_id,
-                    chat_id=attempt.binding.chat_id,
-                    requester_principal_id=state.requester_principal_id,
-                    command_acceptance_id=state.message_id,
-                )
+        attempts = tuple(self._coordinator.state.attempts.values())
+        for attempt in attempts:
+            if attempt.binding.agent_id != state.agent_id or attempt.terminal_status:
+                continue
+            self._coordinator.request_cancel(
+                agent_id=state.agent_id,
+                chat_id=attempt.binding.chat_id,
+                requester_principal_id=state.requester_principal_id,
+                command_acceptance_id=state.message_id,
+            )
         deadline = time.monotonic() + self._grace
-        while time.monotonic() < deadline and self.observe(state) is not True:
+        while time.monotonic() < deadline and (
+            self._has_active_attempts(state)
+            or self._retirement_ready(state) is not True
+        ):
             time.sleep(0.05)
+        if (
+            self._has_active_attempts(state)
+            or self._retirement_ready(state) is not True
+        ):
+            return
         self._retire_actor(state)
 
     def _retire_actor(self, state: DurableFireState) -> None:
@@ -59,6 +79,9 @@ class ExecutionQuiesceEffect:
             return None
         if self._has_active_attempts(state):
             return False
+        ready = self._retirement_ready(state)
+        if ready is not True:
+            return ready
         runtime = getattr(self._coordinator, "employee_runtime", None)
         is_retired = getattr(runtime, "is_retired", None)
         if callable(is_retired):
@@ -73,6 +96,16 @@ class ExecutionQuiesceEffect:
             attempt.binding.agent_id == state.agent_id and not attempt.terminal_status
             for attempt in self._coordinator.state.attempts.values()
         )
+
+    def _retirement_ready(self, state: DurableFireState) -> bool | None:
+        ready = getattr(self._coordinator, "employee_retirement_ready", None)
+        if not callable(ready):
+            return True
+        observed = ready(
+            tenant_key=state.tenant_key,
+            agent_id=state.agent_id,
+        )
+        return observed if type(observed) is bool else None
 
 
 class SlashCleanupEffect:
@@ -138,10 +171,20 @@ class MembershipCleanupEffect:
             raise RuntimeError("employee membership cleanup unconfirmed")
 
     def observe(self, state: DurableFireState) -> bool | None:
-        employee = self._hire.synchronize_projection().employees.get(state.agent_id)
-        if employee is None:
+        if self._membership is None:
             return None
-        return employee.member_groups == ()
+        confirmed_empty = getattr(
+            self._membership,
+            "retirement_confirmed_empty",
+            None,
+        )
+        if not callable(confirmed_empty):
+            return None
+        observed = confirmed_empty(
+            tenant_key=state.tenant_key,
+            agent_id=state.agent_id,
+        )
+        return observed if type(observed) is bool else None
 
 
 class CredentialDestroyEffect:

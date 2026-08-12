@@ -522,6 +522,9 @@ class EmployeeIngressAck:
 
     schema_version: int
     request_id: str
+    request_envelope_id: str
+    request_dedup_key: str
+    request_semantic_digest: str
     acceptance: IngressAcceptance
     agent_id: str
     app_id: str
@@ -535,6 +538,9 @@ class EmployeeIngressAck:
         {
             "schema_version",
             "request_id",
+            "request_envelope_id",
+            "request_dedup_key",
+            "request_semantic_digest",
             "acceptance",
             "agent_id",
             "app_id",
@@ -550,6 +556,25 @@ class EmployeeIngressAck:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("unsupported ACK schema_version")
         object.__setattr__(self, "request_id", _identifier(self.request_id, "request_id", "req_"))
+        object.__setattr__(
+            self,
+            "request_envelope_id",
+            _identifier(
+                self.request_envelope_id,
+                "request_envelope_id",
+                "ing_",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "request_dedup_key",
+            _identifier(self.request_dedup_key, "request_dedup_key", "dedup_"),
+        )
+        object.__setattr__(
+            self,
+            "request_semantic_digest",
+            _sha256(self.request_semantic_digest, "request_semantic_digest"),
+        )
         if not isinstance(self.acceptance, IngressAcceptance):
             raise ValueError("acceptance must be an IngressAcceptance")
         object.__setattr__(self, "agent_id", _identifier(self.agent_id, "agent_id", "agt_"))
@@ -576,6 +601,9 @@ class EmployeeIngressAck:
         return {
             "schema_version": self.schema_version,
             "request_id": self.request_id,
+            "request_envelope_id": self.request_envelope_id,
+            "request_dedup_key": self.request_dedup_key,
+            "request_semantic_digest": self.request_semantic_digest,
             "acceptance": self.acceptance.to_dict(),
             "agent_id": self.agent_id,
             "app_id": self.app_id,

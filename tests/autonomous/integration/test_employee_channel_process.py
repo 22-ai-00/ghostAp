@@ -22,6 +22,9 @@ from src.autonomous.provisioning.channel_protocol import (
     decode_frame,
 )
 from src.autonomous.supervisor import employee_channels as employee_channel_module
+from src.autonomous.supervisor.channel_models import (
+    EmployeeChannelOutboundIntegrityError,
+)
 from src.autonomous.supervisor.employee_channels import (
     ChannelProcessState,
     EmployeeChannelSupervisor,
@@ -69,18 +72,40 @@ def _worker(tmp_path: Path, *, behavior: str = "normal") -> Path:
             if {behavior!r} == 'timeout':
                 time.sleep(5)
                 raise SystemExit(0)
+            connection_id = bootstrap.get('frozen_connection_id') or 'conn_fixture'
+            ready_payload = {{
+                'identity': {{
+                    'app_id': bootstrap['app_id'],
+                    'open_id': 'ou_fixture_bot',
+                }},
+                'connection_id': connection_id,
+                'connection': {{
+                    'observed': True,
+                    'sdk_connection_id': 'sdk_fixture',
+                    'service_id': 'service_fixture',
+                    'secure': True,
+                }},
+            }}
             if {behavior!r} == 'crash':
-                emit('READY', {{'identity': {{'app_id': bootstrap['app_id']}},
-                               'secret_digest': secret_digest, 'bootstrap_eof': eof}})
+                emit('READY', ready_payload)
                 time.sleep(0.1)
                 raise SystemExit(23)
             if {behavior!r} == 'stale':
-                emit('READY', {{'identity': {{'app_id': 'stale'}}}}, gen=generation - 1)
-            emit('READY', {{'identity': {{'app_id': bootstrap['app_id']}},
-                           'secret_digest': secret_digest, 'bootstrap_eof': eof,
-                           'connection_id': 'conn-fixture',
-                           'pid': os.getpid()}})
-            emit('EVENT', {{'event': 'health-fixture', 'data': {{'pid': os.getpid()}}}})
+                stale_payload = dict(ready_payload)
+                stale_payload['identity'] = {{
+                    'app_id': bootstrap['app_id'],
+                    'open_id': 'ou_fixture_bot',
+                }}
+                emit('READY', stale_payload, gen=generation - 1)
+            emit('READY', ready_payload)
+            emit('EVENT', {{
+                'event': 'health-fixture',
+                'data': {{
+                    'pid': os.getpid(),
+                    'secret_digest': secret_digest,
+                    'bootstrap_eof': eof,
+                }},
+            }})
             if {behavior!r} == 'event_eof_alive':
                 time.sleep(0.1)
                 os.close(event_fd)
@@ -100,7 +125,7 @@ def _worker(tmp_path: Path, *, behavior: str = "normal") -> Path:
                                     'success': True,
                                     'app_id': bootstrap['app_id'],
                                     'generation': generation,
-                                    'connection_id': 'conn-fixture',
+                                    'connection_id': connection_id,
                                     'message_id': 'om-fixture-reply'}})
                 if frame['type'] == 'UPDATE_CARD':
                     message_id = frame['payload']['message_id']
@@ -111,7 +136,7 @@ def _worker(tmp_path: Path, *, behavior: str = "normal") -> Path:
                                     'success': True,
                                     'app_id': bootstrap['app_id'],
                                     'generation': generation,
-                                    'connection_id': 'conn-fixture',
+                                    'connection_id': connection_id,
                                     'message_id': message_id}})
             raise SystemExit(0)
             """
@@ -136,7 +161,7 @@ def _ingress_worker(tmp_path: Path) -> Path:
             agent_id = bootstrap['agent_id']
             app_id = bootstrap['app_id']
             generation = bootstrap['generation']
-            connection_id = 'conn_fixture'
+            connection_id = bootstrap.get('frozen_connection_id') or 'conn_fixture'
             sequence = 0
             def emit(kind, body, *, outer_app=None):
                 global sequence
@@ -145,41 +170,114 @@ def _ingress_worker(tmp_path: Path) -> Path:
                          'generation': generation, 'sequence': sequence, 'payload': body}
                 os.write(event_fd, (json.dumps(frame, separators=(',', ':')) + '\\n').encode())
 
-            emit('READY', {'identity': {'app_id': app_id},
+            emit('READY', {'identity': {'app_id': app_id,
+                                        'open_id': 'ou_fixture_bot'},
                            'connection_id': connection_id,
-                           'connection': {'observed': True}})
+                           'connection': {'observed': True,
+                                          'sdk_connection_id': 'sdk_fixture',
+                                          'service_id': 'service_fixture',
+                                          'secure': True}})
+            raw_chat_id = 'oc_fixture_raw'
+            raw_message_id = 'om_fixture_raw'
             payload = {
                 'schema_version': 1,
                 'envelope_id': 'ing_' + '1' * 64,
-                'normalized_parts': [{'type': 'text', 'text': 'durable'}],
+                'normalized_parts': [{
+                    'type': 'message',
+                    'remote_chat_id': raw_chat_id,
+                    'remote_message_id': raw_message_id,
+                    'remote_root_id': '',
+                }],
                 'attachment_descriptors': [],
             }
             raw = json.dumps(payload, ensure_ascii=False, sort_keys=True,
                              separators=(',', ':'), allow_nan=False).encode()
             digest = hashlib.sha256(raw).hexdigest()
-            metadata = {
-                'schema_version': 1, 'envelope_id': payload['envelope_id'],
-                'tenant_key': bootstrap['tenant_key'], 'agent_id': agent_id,
-                'bot_principal_id': bootstrap['bot_principal_id'], 'app_id': app_id,
-                'channel_generation': generation, 'connection_id': connection_id,
-                'event_id': 'evt_fixture', 'message_id': 'om_fixture',
-                'event_type': 'im.message.receive_v1', 'action_identity': '',
-                'chat_id': 'oc_fixture', 'thread_root_message_id': '',
-                'sender_principal_id': 'ou_requester',
-                'received_at': '2026-07-13T00:00:00Z',
-                'semantic_digest': digest, 'payload_sha256': digest,
-                'payload_size_bytes': len(raw), 'attachment_count': 0,
-                'attachment_total_bytes': 0,
-            }
-            emit('INGRESS', {'request_id': 'req_fixture', 'app_id': app_id,
-                             'connection_id': connection_id, 'metadata': metadata,
-                             'payload': payload, 'action_correlation': None})
+            def metadata_for(event_id):
+                return {
+                    'schema_version': 1, 'envelope_id': payload['envelope_id'],
+                    'tenant_key': bootstrap['tenant_key'], 'agent_id': agent_id,
+                    'bot_principal_id': bootstrap['bot_principal_id'], 'app_id': app_id,
+                    'channel_generation': generation, 'connection_id': connection_id,
+                    'event_id': event_id,
+                    'message_id': 'om_' + hashlib.sha256(raw_message_id.encode()).hexdigest(),
+                    'event_type': 'im.message.receive_v1', 'action_identity': '',
+                    'chat_id': 'oc_' + hashlib.sha256(raw_chat_id.encode()).hexdigest(),
+                    'thread_root_message_id': '',
+                    'sender_principal_id': 'ou_requester',
+                    'received_at': '2026-07-13T00:00:00Z',
+                    'semantic_digest': digest, 'payload_sha256': digest,
+                    'payload_size_bytes': len(raw), 'attachment_count': 0,
+                    'attachment_total_bytes': 0,
+                }
+            def dedup_key(event_id):
+                material = json.dumps(
+                    [bootstrap['tenant_key'], agent_id, 'event', event_id],
+                    ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+                    allow_nan=False,
+                ).encode()
+                return 'dedup_' + hashlib.sha256(material).hexdigest()
+            event_ids = [
+                'evt_fixture_' + str(generation) + '_first',
+                'evt_fixture_' + str(generation) + '_redelivery',
+                'evt_fixture_' + str(generation) + '_reconnected',
+            ]
+            request_index = 0
+            acceptance_id = None
+            def emit_ingress():
+                event_id = event_ids[request_index]
+                request_id = 'req_fixture_' + str(generation) + '_' + str(request_index)
+                metadata = metadata_for(event_id)
+                emit('INGRESS', {'request_id': request_id, 'app_id': app_id,
+                                 'connection_id': connection_id, 'metadata': metadata,
+                                 'payload': payload, 'action_correlation': None})
+            emit_ingress()
             control = os.fdopen(control_fd, 'rb', buffering=0)
             while line := control.readline():
                 frame = json.loads(line)
                 if frame['type'] == 'INGRESS_ACK':
-                    emit('HEALTH', {'operation': 'ingress-ack', 'success': True,
-                                    'acceptance_id': frame['payload']['ack']['acceptance']['acceptance_id']})
+                    ack = frame['payload']['ack']
+                    expected_metadata = metadata_for(event_ids[request_index])
+                    valid = (
+                        ack['request_envelope_id'] == expected_metadata['envelope_id']
+                        and ack['request_dedup_key'] == dedup_key(event_ids[request_index])
+                        and ack['request_semantic_digest'] == digest
+                        and ack['channel_generation'] == generation
+                        and ack['connection_id'] == connection_id
+                    )
+                    current_acceptance = ack['acceptance']['acceptance_id']
+                    if acceptance_id is None:
+                        acceptance_id = current_acceptance
+                    valid = valid and current_acceptance == acceptance_id
+                    if not valid:
+                        emit('HEALTH', {'operation': 'ingress-ack', 'success': False})
+                        continue
+                    request_index += 1
+                    if request_index == 2:
+                        emit('EVENT', {'event': 'reconnecting', 'data': {}})
+                        connection_id = 'conn_fixture_reconnected'
+                        emit('READY', {
+                            'identity': {'app_id': app_id,
+                                         'open_id': 'ou_fixture_bot'},
+                            'connection_id': connection_id,
+                            'connection': {'observed': True,
+                                           'sdk_connection_id': 'sdk_reconnected',
+                                           'service_id': 'service_reconnected',
+                                           'secure': True},
+                        })
+                    if request_index < len(event_ids):
+                        emit_ingress()
+                    else:
+                        emit('HEALTH', {
+                            'operation': 'ingress-ack',
+                            'success': True,
+                            'acceptance_id': acceptance_id,
+                            'canonical_dedup_key': ack['acceptance']['dedup_key'],
+                            'request_dedup_key': ack['request_dedup_key'],
+                            'duplicate': ack['duplicate'],
+                            'generation': generation,
+                            'connection_id': connection_id,
+                        })
                 elif frame['type'] == 'STOP':
                     break
             """
@@ -202,8 +300,15 @@ def _partial_ingress_worker(tmp_path: Path) -> Path:
             bootstrap = json.loads(os.fdopen(bootstrap_fd, 'rb', buffering=0).readline())
             ready = {'v': 1, 'type': 'READY', 'agent_id': bootstrap['agent_id'],
                      'generation': bootstrap['generation'], 'sequence': 1,
-                     'payload': {'identity': {'app_id': bootstrap['app_id']},
-                                 'connection_id': 'conn_partial'}}
+                     'payload': {
+                         'identity': {'app_id': bootstrap['app_id'],
+                                      'open_id': 'ou_fixture_bot'},
+                         'connection_id': 'conn_partial',
+                         'connection': {'observed': True,
+                                        'sdk_connection_id': 'sdk_partial',
+                                        'service_id': 'service_partial',
+                                        'secure': True},
+                     }}
             os.write(event_fd, (json.dumps(ready, separators=(',', ':')) + '\\n').encode())
             partial = {'v': 1, 'type': 'INGRESS', 'agent_id': bootstrap['agent_id'],
                        'generation': bootstrap['generation'], 'sequence': 2,
@@ -228,9 +333,7 @@ def _ingress_service(tmp_path: Path) -> tuple[EmployeeIngressService, JournalWri
         writer=writer,
         blob_store=BlobStore(
             tmp_path / "ingress-blobs",
-            AesGcmEncryptionProvider(
-                lambda _ref: b"employee-channel-process-key-32b"
-            ),
+            AesGcmEncryptionProvider(lambda _ref: b"employee-channel-process-key-32b"),
         ),
         ingress_state=IngressProjectionState(),
         active_key_id="k1",
@@ -349,20 +452,78 @@ def test_bootstrap_write_failure_closes_bootstrap_fd_once(
 
 
 def test_two_employees_get_distinct_fresh_processes_and_one_shot_credentials(tmp_path: Path) -> None:
-    supervisor, secret, calls = _supervisor(tmp_path)
+    events: list[dict[str, object]] = []
+    supervisor, secret, calls = _supervisor(tmp_path, events=events)
     try:
-        first = supervisor.start("agt_1", "cli_1", "cred_1", 1, lambda _: None)
+        first = supervisor.start("agt_1", "cli_1", "cred_1", 1, events.append)
         second = supervisor.start("agt_2", "cli_2", "cred_2", 1, lambda _: None)
 
         assert first.state is ChannelProcessState.READY
         assert second.state is ChannelProcessState.READY
         assert first.pid != second.pid != os.getpid()
-        assert first.identity == {"app_id": "cli_1"}
-        assert first.ready_metadata["secret_digest"] == hashlib.sha256(secret.encode()).hexdigest()
-        assert first.ready_metadata["bootstrap_eof"] is True
+        assert first.identity == {
+            "app_id": "cli_1",
+            "open_id": "ou_fixture_bot",
+        }
+        deadline = time.monotonic() + 1
+        while not events and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert events == [
+            {
+                "event": "health-fixture",
+                "data": {
+                    "pid": first.pid,
+                    "secret_digest": hashlib.sha256(secret.encode()).hexdigest(),
+                    "bootstrap_eof": True,
+                },
+            }
+        ]
         assert calls == [("cred_1", "agt_1", "cli_1"), ("cred_2", "agt_2", "cli_2")]
     finally:
         supervisor.close()
+
+
+def test_delivery_only_channel_reuses_frozen_authority_and_rejects_ingress(
+    tmp_path: Path,
+) -> None:
+    service, writer = _ingress_service(tmp_path)
+    events: list[dict[str, object]] = []
+    supervisor = EmployeeChannelSupervisor(
+        secret_resolver=lambda *_: "employee-secret",
+        worker_path=_ingress_worker(tmp_path),
+        sandbox_attestor=_accepted_attestation,
+        ready_timeout=1.0,
+        stop_timeout=1.0,
+        ingress_service=service,
+        ingress_binding_resolver=lambda *_: ("tenant-fixture", "bot_fixture"),
+    )
+    try:
+        status = supervisor.start_delivery_only(
+            "agt_fixture",
+            "cli_fixture",
+            "cred_1",
+            3,
+            frozen_connection_id="conn_retirement_cutoff",
+        )
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if supervisor.status("agt_fixture").error_code:
+                break
+            time.sleep(0.01)
+
+        current = supervisor.status("agt_fixture")
+        assert status.state is ChannelProcessState.READY
+        assert status.delivery_only is True
+        assert status.ready_metadata["connection_id"] == "conn_retirement_cutoff"
+        assert current is not None
+        assert current.error_code == "delivery-only-ingress-rejected"
+        assert service.state.by_acceptance_id == {}
+        assert tuple(writer.replay()) == ()
+        assert events == []
+    finally:
+        supervisor.close()
+        service.close()
+        writer.close()
 
 
 @pytest.mark.slow
@@ -412,11 +573,7 @@ def test_start_waits_for_inflight_stop_before_launching_next_generation(
     real_launch_candidate = supervisor._launch_candidate
 
     def block_stop(runtime, frame_type, payload):
-        if (
-            frame_type is FrameType.STOP
-            and runtime.status.agent_id == "agt_serial"
-            and runtime.status.generation == 1
-        ):
+        if frame_type is FrameType.STOP and runtime.status.agent_id == "agt_serial" and runtime.status.generation == 1:
             stop_entered.set()
             assert allow_stop.wait(2.0)
         return real_send_control(runtime, frame_type, payload)
@@ -588,11 +745,7 @@ def test_ready_event_pipe_eof_revokes_readiness_and_reaps_live_worker(
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             status = supervisor.status("agt_eof")
-            if (
-                status is not None
-                and status.state is ChannelProcessState.FAILED
-                and runtime.process.poll() is not None
-            ):
+            if status is not None and status.state is ChannelProcessState.FAILED and runtime.process.poll() is not None:
                 break
             time.sleep(0.01)
 
@@ -617,9 +770,21 @@ def test_stale_generation_frames_are_rejected_and_events_are_delivered(tmp_path:
             time.sleep(0.01)
 
         assert status.state is ChannelProcessState.READY
-        assert status.identity == {"app_id": "cli_1"}
+        assert status.identity == {
+            "app_id": "cli_1",
+            "open_id": "ou_fixture_bot",
+        }
         assert supervisor.status("agt_1").stale_frames == 1
-        assert events == [{"event": "health-fixture", "data": {"pid": status.pid}}]
+        assert events == [
+            {
+                "event": "health-fixture",
+                "data": {
+                    "pid": status.pid,
+                    "secret_digest": hashlib.sha256(_secret.encode()).hexdigest(),
+                    "bootstrap_eof": True,
+                },
+            }
+        ]
     finally:
         supervisor.close()
 
@@ -642,7 +807,7 @@ def test_send_is_generation_fenced_and_waits_for_employee_worker_receipt(
         assert receipt.request_id
         assert receipt.app_id == "cli_1"
         assert receipt.generation == 3
-        assert receipt.connection_id == "conn-fixture"
+        assert receipt.connection_id == "conn_fixture"
         assert receipt.message_id == "om-fixture-reply"
         with pytest.raises(ValueError, match="generation"):
             supervisor.send(
@@ -672,7 +837,7 @@ def test_update_card_is_generation_and_message_fenced(
         assert receipt.success is True
         assert receipt.app_id == "cli_1"
         assert receipt.generation == 3
-        assert receipt.connection_id == "conn-fixture"
+        assert receipt.connection_id == "conn_fixture"
         assert receipt.message_id == "om-employee-card"
         with pytest.raises(ValueError, match="generation"):
             supervisor.update_card(
@@ -692,7 +857,10 @@ def test_update_card_rejects_receipt_for_a_different_message(tmp_path: Path) -> 
     )
     try:
         supervisor.start("agt_1", "cli_1", "cred_1", 3, lambda _: None)
-        with pytest.raises(RuntimeError, match="not acknowledged"):
+        with pytest.raises(
+            EmployeeChannelOutboundIntegrityError,
+            match="invalid-outbound-receipt",
+        ):
             supervisor.update_card(
                 "agt_1",
                 generation=3,
@@ -727,11 +895,7 @@ def test_parent_supervisor_anchors_runtime_bound_ingress_before_ack(
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             status = supervisor.status("agt_fixture")
-            if (
-                status is not None
-                and status.ready_metadata.get("health", {}).get("operation")
-                == "ingress-ack"
-            ):
+            if status is not None and status.ready_metadata.get("health", {}).get("operation") == "ingress-ack":
                 break
             time.sleep(0.01)
 
@@ -740,7 +904,65 @@ def test_parent_supervisor_anchors_runtime_bound_ingress_before_ack(
         assert status.ready_metadata["health"]["success"] is True
         records = tuple(service.state.by_acceptance_id.values())
         assert len(records) == 1
-        assert writer.anchor.read().sequence == records[0].acceptance.journal_sequence
+        assert writer.anchor.read().sequence >= records[0].acceptance.journal_sequence
+        health = status.ready_metadata["health"]
+        assert health["duplicate"] is True
+        assert health["connection_id"] == "conn_fixture_reconnected"
+        assert health["request_dedup_key"] != health["canonical_dedup_key"]
+        event_types = [event.event_type for frame in writer.replay() for event in frame.events]
+        assert event_types == [
+            "employee.ingress.accepted",
+            "employee.ingress.message_redelivery_accepted",
+        ]
+    finally:
+        supervisor.close()
+        service.close()
+        writer.close()
+
+
+def test_ingress_request_alias_survives_a_new_worker_generation(
+    tmp_path: Path,
+) -> None:
+    service, writer = _ingress_service(tmp_path)
+    supervisor = EmployeeChannelSupervisor(
+        secret_resolver=lambda *_: "employee-secret",
+        worker_path=_ingress_worker(tmp_path),
+        sandbox_attestor=_accepted_attestation,
+        ready_timeout=1.0,
+        stop_timeout=1.0,
+        ingress_service=service,
+        ingress_binding_resolver=lambda agent_id, app_id: (
+            "tenant-fixture",
+            "bot_fixture",
+        ),
+    )
+
+    def wait_for_health(generation: int) -> dict[str, object]:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = supervisor.status("agt_fixture")
+            health = status.ready_metadata.get("health", {}) if status is not None else {}
+            if health.get("generation") == generation:
+                return health
+            time.sleep(0.01)
+        raise AssertionError(f"generation {generation} ingress ACK did not converge")
+
+    try:
+        supervisor.start("agt_fixture", "cli_fixture", "cred_1", 3, lambda _: None)
+        first_health = wait_for_health(3)
+        first_pid = supervisor.status("agt_fixture").pid
+        supervisor.stop("agt_fixture")
+
+        supervisor.start("agt_fixture", "cli_fixture", "cred_1", 4, lambda _: None)
+        second_health = wait_for_health(4)
+        second_pid = supervisor.status("agt_fixture").pid
+
+        assert second_pid != first_pid
+        assert second_health["acceptance_id"] == first_health["acceptance_id"]
+        assert second_health["canonical_dedup_key"] == first_health["canonical_dedup_key"]
+        assert second_health["request_dedup_key"] != second_health["canonical_dedup_key"]
+        assert second_health["duplicate"] is True
+        assert len(service.state.by_acceptance_id) == 1
     finally:
         supervisor.close()
         service.close()
@@ -805,13 +1027,21 @@ def test_parent_control_ack_stop_send_share_one_noninterleaving_writer(
         ingress_binding_resolver=lambda *_: ("tenant-fixture", "bot_fixture"),
     )
     try:
-        status = supervisor.start(
-            "agt_fixture", "cli_fixture", "cred_1", 3, lambda _: None
-        )
+        status = supervisor.start("agt_fixture", "cli_fixture", "cred_1", 3, lambda _: None)
         deadline = time.monotonic() + 2
-        while not service.state.by_acceptance_id and time.monotonic() < deadline:
+        health: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            current = supervisor.status("agt_fixture")
+            health = (
+                current.ready_metadata.get("health", {})
+                if current is not None
+                else {}
+            )
+            if health.get("operation") == "ingress-ack":
+                break
             time.sleep(0.01)
         assert status.state is ChannelProcessState.READY
+        assert health.get("success") is True
         record = next(iter(service.state.by_acceptance_id.values()))
         duplicate_ack = service.accept(
             record.metadata,
@@ -849,10 +1079,7 @@ def test_parent_control_ack_stop_send_share_one_noninterleaving_writer(
             (FrameType.STOP, {}),
         )
         with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = tuple(
-                pool.submit(supervisor._send_control, runtime, kind, body)
-                for kind, body in calls
-            )
+            futures = tuple(pool.submit(supervisor._send_control, runtime, kind, body) for kind, body in calls)
             results = tuple(future.result() for future in futures)
 
         frames = tuple(decode_frame(line + b"\n") for line in bytes(captured).splitlines())
@@ -862,9 +1089,7 @@ def test_parent_control_ack_stop_send_share_one_noninterleaving_writer(
             FrameType.SEND,
             FrameType.STOP,
         }
-        assert [frame.sequence for frame in frames] == sorted(
-            frame.sequence for frame in frames
-        )
+        assert [frame.sequence for frame in frames] == sorted(frame.sequence for frame in frames)
         assert len({frame.sequence for frame in frames}) == 3
         assert supervisor.status("agt_fixture").state is ChannelProcessState.READY
     finally:
@@ -912,12 +1137,16 @@ def test_reconnect_event_revokes_readiness_until_new_observed_ready(
                 1,
                 4,
                 {
-                    "identity": {"app_id": "cli_1"},
-                    "connection_id": "conn-fixture",
+                    "identity": {
+                        "app_id": "cli_1",
+                        "open_id": "ou_fixture_bot",
+                    },
+                    "connection_id": "conn_fixture",
                     "connection": {
                         "observed": True,
                         "secure": True,
                         "sdk_connection_id": "dev-reconnected",
+                        "service_id": "service-reconnected",
                     },
                 },
             ),

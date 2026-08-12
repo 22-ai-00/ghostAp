@@ -5,12 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 import threading
 import time
 import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -26,7 +26,12 @@ from ..journal.blob_store import (
     KeyResolutionError,
 )
 from ..journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
-from ..journal.writer import CommitResult, CommitState, JournalWriter
+from ..journal.writer import (
+    CommitResult,
+    CommitState,
+    JournalDeadlineExceededError,
+    JournalWriter,
+)
 from .models import (
     EmployeeIngressAck,
     EmployeeIngressMetadata,
@@ -37,7 +42,13 @@ from .models import (
 from .projection import (
     IngressProjectionState,
     IngressRecord,
+    MessageLogicalKey,
     is_ingress_event,
+    message_deny_aggregate_id,
+    message_logical_key,
+    message_logical_key_from_metadata,
+    message_transport_key,
+    message_transport_key_from_metadata,
     reduce_ingress_event,
 )
 
@@ -68,6 +79,31 @@ class IngressWriteDisabledError(IngressServiceError):
 
 class IngressClosedError(IngressServiceError):
     """Admission is closed for the service or employee after recovery failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class MessageAcceptanceOutcome:
+    """Durable winner plus the transport proven for the current operation.
+
+    A wait reports its exact witnessed transport while retaining the canonical
+    acceptance.  A deny that loses before its transport is witnessed reports
+    the canonical winner's original transport instead.
+    """
+
+    status: str
+    acceptance: IngressAcceptance | None
+    channel_generation: int
+    connection_id: str
+
+    def __post_init__(self) -> None:
+        if self.status not in {"accepted", "denied"}:
+            raise ValueError("message acceptance outcome status is invalid")
+        if (self.status == "accepted") != (self.acceptance is not None):
+            raise ValueError("message acceptance outcome payload is inconsistent")
+        if type(self.channel_generation) is not int or self.channel_generation <= 0:
+            raise ValueError("message acceptance outcome generation is invalid")
+        if not isinstance(self.connection_id, str) or not self.connection_id:
+            raise ValueError("message acceptance outcome connection is invalid")
 
 
 class EmployeeKeyring(Protocol):
@@ -106,10 +142,10 @@ class EmployeeIngressService:
         self._mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._shared_blob_mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._transport_message_index: dict[tuple[str, ...], str] = {}
-        self._acceptance_waiters: dict[
-            tuple[str, ...],
-            set[threading.Event],
-        ] = {}
+        self._acceptance_waiter_slots = threading.BoundedSemaphore(
+            self._MAX_ACCEPTANCE_WAITERS
+        )
+        self._acceptance_progress = threading.Event()
         self._retained_shared_blob_ids: set[str] = set()
         self._admission_closed = False
         self._closed = False
@@ -150,6 +186,30 @@ class EmployeeIngressService:
     @property
     def blob_store(self) -> BlobStore:
         return self._blob_store
+
+    def record_snapshot(
+        self,
+        acceptance_id: str,
+        *,
+        deadline: float | None = None,
+        allow_immediate: bool = False,
+    ) -> IngressRecord | None:
+        """Return one immutable in-memory record without replaying the Journal."""
+
+        if not isinstance(acceptance_id, str) or not acceptance_id:
+            return None
+        hard_deadline = self._validated_deadline(deadline)
+        if not self._acquire_mutex_before_deadline(
+            hard_deadline,
+            allow_immediate=allow_immediate,
+        ):
+            raise IngressWriteDisabledError(
+                "ingress snapshot deadline expired before ingress lock"
+            )
+        try:
+            return self._state.by_acceptance_id.get(acceptance_id)
+        finally:
+            self._mutex.release()
 
     def retain_shared_blob(self, blob_id: str) -> None:
         """Protect and restore a Journal-anchored blob co-owned by another projection."""
@@ -213,6 +273,7 @@ class EmployeeIngressService:
         self._state.cursor_sequence = frame.sequence
         self._state.cursor_hash = frame.frame_hash
         self._index_accepted_frame_unlocked(frame)
+        self._wake_resolved_acceptance_waiters_unlocked()
 
     def close(self) -> None:
         """Close only the ingress-owned BlobStore; the writer has another owner."""
@@ -242,9 +303,11 @@ class EmployeeIngressService:
         event_type: str,
         chat_id: str,
         message_id: str,
+        channel_generation: int,
+        connection_id: str,
         timeout: float,
-    ) -> IngressAcceptance | None:
-        """Wait for one exact transport message to reach anchored acceptance.
+    ) -> MessageAcceptanceOutcome | None:
+        """Wait until this exact transport witnesses the logical winner.
 
         The lookup uses only secret-free metadata indexes.  Registration and
         the initial projection check share the ingress mutex with ``accept``;
@@ -252,7 +315,7 @@ class EmployeeIngressService:
         lose a wakeup.  A stopped/closed service releases waiters fail-closed.
         """
 
-        key = self._transport_message_key(
+        transport_key = message_transport_key(
             tenant_key=tenant_key,
             agent_id=agent_id,
             bot_principal_id=bot_principal_id,
@@ -260,7 +323,10 @@ class EmployeeIngressService:
             event_type=event_type,
             chat_id=chat_id,
             message_id=message_id,
+            channel_generation=channel_generation,
+            connection_id=connection_id,
         )
+        logical_key = transport_key[:7]
         if (
             isinstance(timeout, bool)
             or not isinstance(timeout, (int, float))
@@ -270,39 +336,179 @@ class EmployeeIngressService:
         ):
             raise ValueError("acceptance wait timeout is invalid")
         deadline = time.monotonic() + float(timeout)
-        waiter = threading.Event()
-        registered = False
-        with self._mutex:
+        if not self._acceptance_waiter_slots.acquire(blocking=False):
+            return None
+        try:
+            while True:
+                if not self._acquire_mutex_before_deadline(
+                    deadline,
+                    allow_immediate=True,
+                ):
+                    return None
+                try:
+                    if self._closed:
+                        return None
+                    self._ensure_open_unlocked()
+                    observed = self._message_acceptance_outcome_unlocked(
+                        logical_key,
+                        transport_key=transport_key,
+                    )
+                    if observed is not None or self._admission_closed:
+                        return observed
+                    # Clear while holding the Ingress mutex.  Every state
+                    # transition sets progress under that same mutex, so an
+                    # accept between this clear and wait cannot be lost.
+                    self._acceptance_progress.clear()
+                finally:
+                    self._mutex.release()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._acceptance_progress.wait(remaining)
+        finally:
+            # Slot release is lock-free from the Ingress perspective, so a
+            # timed-out waiter cannot remain registered behind a contended
+            # domain or registry mutex.
+            self._acceptance_waiter_slots.release()
+
+    def observe_anchored_message_acceptance(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        bot_principal_id: str,
+        app_id: str,
+        event_type: str,
+        chat_id: str,
+        message_id: str,
+        channel_generation: int,
+        connection_id: str,
+        deadline: float | None = None,
+    ) -> MessageAcceptanceOutcome | None:
+        """Observe an existing exact transport witness without waiting for one."""
+
+        transport_key = message_transport_key(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            bot_principal_id=bot_principal_id,
+            app_id=app_id,
+            event_type=event_type,
+            chat_id=chat_id,
+            message_id=message_id,
+            channel_generation=channel_generation,
+            connection_id=connection_id,
+        )
+        hard_deadline = self._validated_deadline(deadline)
+        if not self._acquire_mutex_before_deadline(hard_deadline):
+            raise IngressWriteDisabledError(
+                "message acceptance observation deadline expired before ingress lock"
+            )
+        try:
             if self._closed:
                 return None
             self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
-            observed = self._acceptance_for_key_unlocked(key)
-            if observed is not None or self._admission_closed:
-                return observed
-            waiter_count = sum(
-                len(waiters) for waiters in self._acceptance_waiters.values()
+            self._ensure_before_deadline(
+                hard_deadline,
+                operation="message acceptance observation",
             )
-            if waiter_count >= self._MAX_ACCEPTANCE_WAITERS:
-                return None
-            self._acceptance_waiters.setdefault(key, set()).add(waiter)
-            registered = True
-        try:
-            remaining = max(0.0, deadline - time.monotonic())
-            if remaining:
-                waiter.wait(remaining)
-            with self._mutex:
-                if not self._closed:
-                    self._synchronize_projection_unlocked()
-                return self._acceptance_for_key_unlocked(key)
+            return self._message_acceptance_outcome_unlocked(
+                transport_key[:7],
+                transport_key=transport_key,
+            )
         finally:
-            if registered:
-                with self._mutex:
-                    waiters = self._acceptance_waiters.get(key)
-                    if waiters is not None:
-                        waiters.discard(waiter)
-                        if not waiters:
-                            self._acceptance_waiters.pop(key, None)
+            self._mutex.release()
+
+    def deny_message_acceptance(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        bot_principal_id: str,
+        app_id: str,
+        event_type: str,
+        chat_id: str,
+        message_id: str,
+        channel_generation: int,
+        connection_id: str,
+        deadline: float | None = None,
+    ) -> MessageAcceptanceOutcome:
+        """Durably fence a logical message unless an acceptance already won.
+
+        If acceptance won without an exact witness for these coordinates, the
+        returned outcome identifies the canonical winner's original transport.
+        """
+
+        if event_type != "im.message.receive_v1":
+            raise ValueError("message acceptance denial event type is invalid")
+        transport_key = message_transport_key(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            bot_principal_id=bot_principal_id,
+            app_id=app_id,
+            event_type=event_type,
+            chat_id=chat_id,
+            message_id=message_id,
+            channel_generation=channel_generation,
+            connection_id=connection_id,
+        )
+        logical_key = transport_key[:7]
+        hard_deadline = self._validated_deadline(deadline)
+        if not self._acquire_mutex_before_deadline(hard_deadline):
+            raise IngressWriteDisabledError(
+                "message acceptance denial deadline expired before ingress lock"
+            )
+        try:
+            try:
+                guard = (
+                    self._writer.transaction_guard()
+                    if hard_deadline is None
+                    else self._writer.transaction_guard(deadline=hard_deadline)
+                )
+                with guard:
+                    self._ensure_before_deadline(
+                        hard_deadline,
+                        operation="message acceptance denial",
+                    )
+                    self._ensure_open_unlocked()
+                    self._synchronize_projection_unlocked(deadline=hard_deadline)
+                    observed = self._message_acceptance_outcome_unlocked(logical_key)
+                    if observed is not None:
+                        return observed
+                    denied_at = _utc_now()
+                    event = JournalEvent(
+                        event_type="employee.ingress.message_acceptance_denied",
+                        aggregate_id=message_deny_aggregate_id(transport_key),
+                        payload={
+                            "tenant_key": tenant_key,
+                            "agent_id": agent_id,
+                            "bot_principal_id": bot_principal_id,
+                            "app_id": app_id,
+                            "event_type": event_type,
+                            "chat_id": chat_id,
+                            "message_id": message_id,
+                            "channel_generation": channel_generation,
+                            "connection_id": connection_id,
+                            "reason_code": "handoff_unconfirmed",
+                            "denied_at": denied_at,
+                        },
+                    )
+                    self._commit_unlocked(
+                        event.aggregate_id,
+                        event,
+                        deadline=hard_deadline,
+                    )
+                    outcome = self._message_acceptance_outcome_unlocked(logical_key)
+                    if outcome is None or outcome.status != "denied":
+                        raise IngressWriteDisabledError(
+                            "message acceptance denial projection was not applied"
+                        )
+                    return outcome
+            except JournalDeadlineExceededError as exc:
+                raise IngressWriteDisabledError(
+                    "message acceptance denial deadline expired"
+                ) from exc
+        finally:
+            self._mutex.release()
 
 
     def accept(
@@ -321,6 +527,15 @@ class EmployeeIngressService:
             raise TypeError("payload must be EmployeeIngressPayload")
         self._validate_incoming_payload(metadata, payload)
         self._validate_action_correlation(metadata, action_correlation)
+        transport_message_proof = self._payload_matches_transport_metadata(
+            metadata,
+            payload,
+        )
+        logical_key = (
+            message_logical_key_from_metadata(metadata)
+            if transport_message_proof
+            else None
+        )
         with self._mutex, self._writer.transaction_guard():
             self._ensure_open_unlocked()
             if self._admission_closed:
@@ -329,6 +544,49 @@ class EmployeeIngressService:
             employee_key = (metadata.tenant_key, metadata.agent_id)
             if employee_key in self._state.closed_employees:
                 raise IngressClosedError("employee ingress is closed")
+            if logical_key is not None:
+                denied = self._state.message_acceptance_denials.get(logical_key)
+                if denied is not None:
+                    denied_acceptance_id = self._state.message_denied_acceptances.get(
+                        logical_key
+                    )
+                    denied_record = self._state.by_acceptance_id.get(
+                        denied_acceptance_id or ""
+                    )
+                    if denied_record is not None:
+                        self._verify_logical_duplicate_unlocked(
+                            denied_record,
+                            metadata,
+                            payload,
+                        )
+                        return self._ack(
+                            denied_record,
+                            metadata,
+                            request_id=request_id,
+                            duplicate=True,
+                        )
+                    return self._accept_denied_message_unlocked(
+                        metadata,
+                        payload,
+                        request_id=request_id,
+                    )
+
+                winner_id = self._state.message_acceptance_winners.get(logical_key)
+                winner = self._state.by_acceptance_id.get(winner_id or "")
+                if winner is not None:
+                    self._verify_logical_duplicate_unlocked(
+                        winner,
+                        metadata,
+                        payload,
+                    )
+                    self._anchor_redelivery_witness_unlocked(winner, metadata)
+                    return self._ack(
+                        winner,
+                        metadata,
+                        request_id=request_id,
+                        duplicate=True,
+                    )
+
             existing = self._state.by_dedup_key.get(metadata.dedup_key)
             if existing is not None:
                 self._verify_duplicate_unlocked(existing, metadata, payload)
@@ -340,24 +598,19 @@ class EmployeeIngressService:
                     duplicate=True,
                 )
 
-            labels = _blob_labels(metadata)
-            before_ids = set(self._blob_store.iter_blob_ids())
-            try:
-                blob_ref = self._blob_store.stage_and_publish(
-                    payload.canonical_bytes,
-                    labels,
-                    self._active_key_id,
+            if (
+                metadata.event_type == "im.message.receive_v1"
+                and not transport_message_proof
+            ):
+                return self._accept_invalid_transport_unlocked(
+                    metadata,
+                    payload,
+                    request_id=request_id,
                 )
-                self._verify_ref_and_payload(blob_ref, metadata, payload)
-            except (BlobError, IngressBlobError) as exc:
-                self._quarantine_new_blobs_unlocked(before_ids)
-                raise IngressBlobError("ingress payload publication failed") from exc
+
+            blob_ref = self._publish_payload_unlocked(metadata, payload)
 
             accepted_at = _utc_now()
-            transport_message_proof = self._payload_matches_transport_metadata(
-                metadata,
-                payload,
-            )
             event = JournalEvent(
                 event_type="employee.ingress.accepted",
                 aggregate_id=metadata.dedup_key,
@@ -370,35 +623,55 @@ class EmployeeIngressService:
                 },
             )
             versions = self._writer.get_aggregate_versions([metadata.dedup_key])
-            try:
-                result = self._writer.commit(
-                    [event],
-                    versions,
-                    expected_head_sequence=self._state.cursor_sequence,
-                    expected_head_hash=self._state.cursor_hash or None,
-                )
-            except Exception:
-                self._quarantine_blob_unlocked(blob_ref)
-                raise
+            # A failed commit result is not proof that the monotonic anchor
+            # stayed unchanged: FileAnchor may have replaced its file before
+            # its directory fsync raised.  Keep the published blob until a
+            # later verified projection rebuild can prove it is unreferenced.
+            result = self._writer.commit(
+                [event],
+                versions,
+                expected_head_sequence=self._state.cursor_sequence,
+                expected_head_hash=self._state.cursor_hash or None,
+            )
             if result.state != CommitState.ANCHORED:
-                self._quarantine_blob_unlocked(blob_ref)
                 raise IngressWriteDisabledError("ingress acceptance was not anchored")
             self._apply_frame_unlocked(result)
             record = self._state.by_dedup_key[metadata.dedup_key]
             self._index_acceptance_unlocked(record, payload)
             return self._ack(record, metadata, request_id=request_id, duplicate=False)
 
-    def get_payload(self, acceptance_id: str) -> EmployeeIngressPayload:
+    def get_payload(
+        self,
+        acceptance_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> EmployeeIngressPayload:
         """Read and authenticate one accepted payload for a later trusted stage."""
 
-        with self._mutex:
+        hard_deadline = self._validated_deadline(deadline)
+        if not self._acquire_mutex_before_deadline(hard_deadline):
+            raise IngressBlobRetryableError(
+                "ingress payload deadline expired before ingress lock"
+            )
+        try:
+            self._ensure_before_deadline(
+                hard_deadline,
+                operation="ingress payload read",
+            )
             self._ensure_open_unlocked()
             record = self._state.by_acceptance_id.get(acceptance_id)
             if record is None:
                 raise KeyError(acceptance_id)
             if record.payload_tombstoned:
                 raise IngressBlobError("ingress payload is tombstoned")
-            return self._read_record_payload(record)
+            payload = self._read_record_payload(record)
+            self._ensure_before_deadline(
+                hard_deadline,
+                operation="ingress payload read",
+            )
+            return payload
+        finally:
+            self._mutex.release()
 
     @contextmanager
     def dispatch_snapshot_guard(
@@ -505,16 +778,33 @@ class EmployeeIngressService:
             self._synchronize_projection_unlocked()
             return self._quarantine_unreferenced_blobs_unlocked()
 
-    def rebuild_projection(self) -> IngressProjectionState:
+    def rebuild_projection(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> IngressProjectionState:
         """Replay Journal state and verify nonterminal blobs before admission."""
 
-        with self._mutex:
+        hard_deadline = self._validated_deadline(deadline)
+        if not self._acquire_mutex_before_deadline(hard_deadline):
+            raise IngressWriteDisabledError(
+                "ingress projection deadline expired before ingress lock"
+            )
+        try:
+            self._ensure_before_deadline(
+                hard_deadline,
+                operation="ingress projection rebuild",
+            )
             self._ensure_open_unlocked()
             fresh = IngressProjectionState()
             verify_all = not getattr(self, "_projection_verified", False)
             known_acceptance_ids = frozenset(self._state.by_acceptance_id)
             inbox_retry_identities: set[tuple[str, str]] = set()
             anchor = self._writer.anchor.read()
+            self._ensure_before_deadline(
+                hard_deadline,
+                operation="ingress projection rebuild",
+            )
             cursor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
             if getattr(self, "_projection_verified", False) and (
                 self._state.cursor_sequence,
@@ -522,7 +812,12 @@ class EmployeeIngressService:
             ) == (anchor.sequence, cursor_hash):
                 return self._state
             anchored_frame_hash = GENESIS_HASH
-            for frame in self._writer.replay():
+            replay = (
+                self._writer.replay()
+                if hard_deadline is None
+                else self._writer.replay(deadline=hard_deadline)
+            )
+            for frame in replay:
                 if frame.sequence > anchor.sequence:
                     break
                 for event in frame.events:
@@ -551,6 +846,10 @@ class EmployeeIngressService:
                     "ingress projection cannot verify the Journal anchor"
                 )
             for record in fresh.by_acceptance_id.values():
+                self._ensure_before_deadline(
+                    hard_deadline,
+                    operation="ingress projection rebuild",
+                )
                 if record.terminal or record.payload_tombstoned:
                     continue
                 if (
@@ -576,28 +875,86 @@ class EmployeeIngressService:
                     json.JSONDecodeError,
                 ):
                     fresh.closed_employees.add(record.employee_key)
+            self._ensure_before_deadline(
+                hard_deadline,
+                operation="ingress projection rebuild",
+            )
             self._replace_state_unlocked(fresh)
-            self._quarantine_unreferenced_blobs_unlocked()
+            # Handoff callers need a deadline-bounded metadata refresh.  Blob
+            # hygiene is an independent recovery concern and may scan storage.
+            if hard_deadline is None:
+                self._quarantine_unreferenced_blobs_unlocked()
             self._projection_verified = True
             return self._state
+        finally:
+            self._mutex.release()
 
     def _ensure_open_unlocked(self) -> None:
         if self._closed or self._blob_store.closed:
             raise IngressClosedError("employee ingress service is closed")
 
-    def _synchronize_projection_unlocked(self) -> None:
+    def _synchronize_projection_unlocked(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         anchor = self._writer.anchor.read()
+        self._ensure_before_deadline(
+            deadline,
+            operation="ingress projection synchronization",
+        )
         sequence = anchor.sequence
         frame_hash = "" if anchor.sequence == 0 else anchor.frame_hash
         if (self._state.cursor_sequence, self._state.cursor_hash) != (
             sequence,
             frame_hash,
         ):
-            self.rebuild_projection()
+            self.rebuild_projection(deadline=deadline)
+
+    @staticmethod
+    def _validated_deadline(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(float(deadline))
+        ):
+            raise ValueError("deadline must be a finite monotonic timestamp")
+        return float(deadline)
+
+    @staticmethod
+    def _ensure_before_deadline(
+        deadline: float | None,
+        *,
+        operation: str,
+    ) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise IngressWriteDisabledError(f"{operation} deadline expired")
+
+    def _acquire_mutex_before_deadline(
+        self,
+        deadline: float | None,
+        *,
+        allow_immediate: bool = False,
+    ) -> bool:
+        if deadline is None:
+            self._mutex.acquire()
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return bool(allow_immediate and self._mutex.acquire(blocking=False))
+        return self._mutex.acquire(
+            timeout=min(remaining, threading.TIMEOUT_MAX),
+        )
 
     def _replace_state_unlocked(self, fresh: IngressProjectionState) -> None:
         self._state.by_dedup_key = fresh.by_dedup_key
         self._state.by_acceptance_id = fresh.by_acceptance_id
+        self._state.message_acceptance_winners = fresh.message_acceptance_winners
+        self._state.message_transport_witnesses = fresh.message_transport_witnesses
+        self._state.message_acceptance_denials = fresh.message_acceptance_denials
+        self._state.message_denied_acceptances = fresh.message_denied_acceptances
         self._state.closed_employees = fresh.closed_employees
         self._state.cursor_sequence = fresh.cursor_sequence
         self._state.cursor_hash = fresh.cursor_hash
@@ -616,6 +973,7 @@ class EmployeeIngressService:
         self._state.cursor_sequence = frame.sequence
         self._state.cursor_hash = frame.frame_hash
         self._index_accepted_frame_unlocked(frame)
+        self._wake_resolved_acceptance_waiters_unlocked()
 
     @staticmethod
     def _transport_message_key(
@@ -627,44 +985,22 @@ class EmployeeIngressService:
         event_type: str,
         chat_id: str,
         message_id: str,
-    ) -> tuple[str, ...]:
-        values = (
-            tenant_key,
-            agent_id,
-            bot_principal_id,
-            app_id,
-            event_type,
-            chat_id,
-            message_id,
+    ) -> MessageLogicalKey:
+        return message_logical_key(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            bot_principal_id=bot_principal_id,
+            app_id=app_id,
+            event_type=event_type,
+            chat_id=chat_id,
+            message_id=message_id,
         )
-        safe_identifier = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
-        if any(
-            not isinstance(value, str)
-            or not value
-            or len(value) > 256
-            or safe_identifier.fullmatch(value) is None
-            for value in values
-        ):
-            raise ValueError("transport message acceptance key is invalid")
-        if (
-            not agent_id.startswith("agt_")
-            or not bot_principal_id.startswith("bot_")
-            or not app_id.startswith("cli_")
-            or len(chat_id) != 67
-            or not chat_id.startswith("oc_")
-            or len(message_id) != 67
-            or not message_id.startswith("om_")
-            or any(character not in "0123456789abcdef" for character in chat_id[3:])
-            or any(character not in "0123456789abcdef" for character in message_id[3:])
-        ):
-            raise ValueError("transport message acceptance binding is invalid")
-        return values
 
     @classmethod
     def _transport_message_key_for_record(
         cls,
         record: IngressRecord,
-    ) -> tuple[str, ...] | None:
+    ) -> MessageLogicalKey | None:
         metadata = record.metadata
         try:
             return cls._transport_message_key(
@@ -723,6 +1059,45 @@ class EmployeeIngressService:
             return None
         return record.acceptance
 
+    def _message_acceptance_outcome_unlocked(
+        self,
+        key: MessageLogicalKey,
+        *,
+        transport_key: tuple[str, ...] | None = None,
+    ) -> MessageAcceptanceOutcome | None:
+        denial = self._state.message_acceptance_denials.get(key)
+        if denial is not None:
+            return MessageAcceptanceOutcome(
+                status="denied",
+                acceptance=None,
+                channel_generation=denial.channel_generation,
+                connection_id=denial.connection_id,
+            )
+        acceptance_id = self._state.message_acceptance_winners.get(key)
+        if (
+            transport_key is not None
+            and self._state.message_transport_witnesses.get(transport_key)
+            != acceptance_id
+        ):
+            return None
+        record = self._state.by_acceptance_id.get(acceptance_id or "")
+        if record is None or record.transport_message_proof is not True:
+            return None
+        return MessageAcceptanceOutcome(
+            status="accepted",
+            acceptance=record.acceptance,
+            channel_generation=(
+                record.metadata.channel_generation
+                if transport_key is None
+                else int(transport_key[7])
+            ),
+            connection_id=(
+                record.metadata.connection_id
+                if transport_key is None
+                else str(transport_key[8])
+            ),
+        )
+
     def _index_acceptance_unlocked(
         self,
         record: IngressRecord,
@@ -732,6 +1107,7 @@ class EmployeeIngressService:
         if (
             key is None
             or record.transport_message_proof is not True
+            or record.disposition is not None
             or (
                 payload is not None
                 and not self._payload_matches_transport_metadata(
@@ -749,8 +1125,10 @@ class EmployeeIngressService:
             < existing.acceptance.journal_sequence
         ):
             self._transport_message_index[key] = record.acceptance.acceptance_id
-        for waiter in self._acceptance_waiters.pop(key, ()):
-            waiter.set()
+        self._acceptance_progress.set()
+
+    def _wake_resolved_acceptance_waiters_unlocked(self) -> None:
+        self._acceptance_progress.set()
 
     def _index_accepted_frame_unlocked(self, frame: TransactionFrame) -> None:
         for event in frame.events:
@@ -776,21 +1154,140 @@ class EmployeeIngressService:
             self._index_acceptance_unlocked(record)
 
     def _wake_all_acceptance_waiters_unlocked(self) -> None:
-        waiters = tuple(
-            waiter
-            for keyed in self._acceptance_waiters.values()
-            for waiter in keyed
-        )
-        self._acceptance_waiters.clear()
-        for waiter in waiters:
-            waiter.set()
+        self._acceptance_progress.set()
 
-    def _commit_unlocked(self, aggregate_id: str, event: JournalEvent) -> CommitResult:
+    def _publish_payload_unlocked(
+        self,
+        metadata: EmployeeIngressMetadata,
+        payload: EmployeeIngressPayload,
+    ) -> BlobRef:
+        before_ids = set(self._blob_store.iter_blob_ids())
+        try:
+            blob_ref = self._blob_store.stage_and_publish(
+                payload.canonical_bytes,
+                _blob_labels(metadata),
+                self._active_key_id,
+            )
+            self._verify_ref_and_payload(blob_ref, metadata, payload)
+            return blob_ref
+        except (BlobError, IngressBlobError) as exc:
+            self._quarantine_new_blobs_unlocked(before_ids)
+            raise IngressBlobError("ingress payload publication failed") from exc
+
+    def _accept_denied_message_unlocked(
+        self,
+        metadata: EmployeeIngressMetadata,
+        payload: EmployeeIngressPayload,
+        *,
+        request_id: str,
+    ) -> EmployeeIngressAck:
+        blob_ref = self._publish_payload_unlocked(metadata, payload)
+        recorded_at = _utc_now()
+        event = JournalEvent(
+            event_type="employee.ingress.denied_acceptance",
+            aggregate_id=metadata.dedup_key,
+            payload={
+                "metadata": metadata.to_dict(),
+                "acceptance_id": f"acc_{uuid.uuid4().hex}",
+                "accepted_at": recorded_at,
+                "blob_ref": blob_ref.to_dict(),
+                "transport_message_proof": True,
+                "disposition_id": f"dsp_{uuid.uuid4().hex}",
+                "reason_code": "handoff_unconfirmed",
+                "recorded_at": recorded_at,
+            },
+        )
+        self._commit_unlocked(metadata.dedup_key, event)
+        record = self._state.by_dedup_key.get(metadata.dedup_key)
+        if record is None or not record.terminal:
+            raise IngressWriteDisabledError(
+                "denied ingress acceptance projection was not applied"
+            )
+        return self._ack(record, metadata, request_id=request_id, duplicate=False)
+
+    def _accept_invalid_transport_unlocked(
+        self,
+        metadata: EmployeeIngressMetadata,
+        payload: EmployeeIngressPayload,
+        *,
+        request_id: str,
+    ) -> EmployeeIngressAck:
+        blob_ref = self._publish_payload_unlocked(metadata, payload)
+        recorded_at = _utc_now()
+        event = JournalEvent(
+            event_type="employee.ingress.invalid_transport_acceptance",
+            aggregate_id=metadata.dedup_key,
+            payload={
+                "metadata": metadata.to_dict(),
+                "acceptance_id": f"acc_{uuid.uuid4().hex}",
+                "accepted_at": recorded_at,
+                "blob_ref": blob_ref.to_dict(),
+                "transport_message_proof": False,
+                "disposition_id": f"dsp_{uuid.uuid4().hex}",
+                "reason_code": "invalid_transport_proof",
+                "recorded_at": recorded_at,
+            },
+        )
+        self._commit_unlocked(metadata.dedup_key, event)
+        record = self._state.by_dedup_key.get(metadata.dedup_key)
+        if record is None or not record.terminal:
+            raise IngressWriteDisabledError(
+                "invalid transport acceptance projection was not applied"
+            )
+        return self._ack(record, metadata, request_id=request_id, duplicate=False)
+
+    def _anchor_redelivery_witness_unlocked(
+        self,
+        winner: IngressRecord,
+        metadata: EmployeeIngressMetadata,
+    ) -> None:
+        transport_key = message_transport_key_from_metadata(metadata)
+        existing = self._state.message_transport_witnesses.get(transport_key)
+        if existing is not None:
+            if existing != winner.acceptance.acceptance_id:
+                raise IngressConflictError("message transport witness owner conflict")
+            return
+        event = JournalEvent(
+            event_type="employee.ingress.message_redelivery_accepted",
+            aggregate_id=winner.aggregate_id,
+            payload={
+                "acceptance_id": winner.acceptance.acceptance_id,
+                "tenant_key": metadata.tenant_key,
+                "agent_id": metadata.agent_id,
+                "bot_principal_id": metadata.bot_principal_id,
+                "app_id": metadata.app_id,
+                "event_type": metadata.event_type,
+                "chat_id": metadata.chat_id,
+                "message_id": metadata.message_id,
+                "channel_generation": metadata.channel_generation,
+                "connection_id": metadata.connection_id,
+                "witnessed_at": _utc_now(),
+            },
+        )
+        self._commit_unlocked(winner.aggregate_id, event)
+
+    def _commit_unlocked(
+        self,
+        aggregate_id: str,
+        event: JournalEvent,
+        *,
+        deadline: float | None = None,
+    ) -> CommitResult:
+        self._ensure_before_deadline(deadline, operation="ingress commit")
+        versions = (
+            self._writer.get_aggregate_versions([aggregate_id])
+            if deadline is None
+            else self._writer.get_aggregate_versions(
+                [aggregate_id],
+                deadline=deadline,
+            )
+        )
         result = self._writer.commit(
             [event],
-            self._writer.get_aggregate_versions([aggregate_id]),
+            versions,
             expected_head_sequence=self._state.cursor_sequence,
             expected_head_hash=self._state.cursor_hash or None,
+            **({} if deadline is None else {"deadline": deadline}),
         )
         if result.state != CommitState.ANCHORED:
             raise IngressWriteDisabledError("ingress lifecycle event was not anchored")
@@ -825,6 +1322,8 @@ class EmployeeIngressService:
         )
         if any(getattr(existing, field) != getattr(metadata, field) for field in comparable_fields):
             raise IngressConflictError("durable employee ingress conflict")
+        if record.payload_tombstoned:
+            return
         try:
             self._verify_ref_and_payload(record.blob_ref, existing, payload)
         except (BlobReadError, KeyResolutionError, OSError) as exc:
@@ -840,6 +1339,70 @@ class EmployeeIngressService:
         ) as exc:
             self._state.closed_employees.add(record.employee_key)
             raise IngressClosedError("authenticated ingress payload is unavailable") from exc
+
+    def _verify_logical_duplicate_unlocked(
+        self,
+        record: IngressRecord,
+        metadata: EmployeeIngressMetadata,
+        payload: EmployeeIngressPayload,
+    ) -> None:
+        """Prove identical message content across event-id/envelope aliases."""
+
+        existing = record.metadata
+        comparable_fields = (
+            "tenant_key",
+            "agent_id",
+            "bot_principal_id",
+            "app_id",
+            "message_id",
+            "event_type",
+            "action_identity",
+            "chat_id",
+            "thread_root_message_id",
+            "sender_principal_id",
+            "attachment_count",
+            "attachment_total_bytes",
+        )
+        if any(
+            getattr(existing, field) != getattr(metadata, field)
+            for field in comparable_fields
+        ):
+            raise IngressConflictError("durable employee ingress conflict")
+        aliased_payload = EmployeeIngressPayload(
+            schema_version=payload.schema_version,
+            envelope_id=existing.envelope_id,
+            normalized_parts=payload.normalized_parts,
+            attachment_descriptors=payload.attachment_descriptors,
+        )
+        if (
+            aliased_payload.payload_sha256 != existing.payload_sha256
+            or aliased_payload.payload_sha256 != existing.semantic_digest
+            or aliased_payload.canonical_size_bytes != existing.payload_size_bytes
+        ):
+            raise IngressConflictError("durable employee ingress content conflict")
+        if record.payload_tombstoned:
+            return
+        try:
+            self._verify_ref_and_payload(
+                record.blob_ref,
+                existing,
+                aliased_payload,
+            )
+        except (BlobReadError, KeyResolutionError, OSError) as exc:
+            raise IngressBlobRetryableError(
+                "authenticated ingress payload is temporarily unavailable"
+            ) from exc
+        except (
+            BlobError,
+            IngressBlobError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ) as exc:
+            self._state.closed_employees.add(record.employee_key)
+            raise IngressClosedError(
+                "authenticated ingress payload is unavailable"
+            ) from exc
 
     def _verify_ref_and_payload(
         self,
@@ -874,15 +1437,17 @@ class EmployeeIngressService:
             ) from exc
 
     def _quarantine_new_blobs_unlocked(self, before_ids: set[str]) -> None:
-        try:
-            new_ids = set(self._blob_store.iter_blob_ids()) - before_ids
-        except BlobError:
-            return
-        for blob_id in new_ids:
+        with self._shared_blob_mutex:
             try:
-                self._blob_store.quarantine_blob(blob_id)
+                new_ids = set(self._blob_store.iter_blob_ids()) - before_ids
             except BlobError:
-                continue
+                return
+            new_ids.difference_update(self._retained_shared_blob_ids)
+            for blob_id in new_ids:
+                try:
+                    self._blob_store.quarantine_blob(blob_id)
+                except BlobError:
+                    continue
 
     def _quarantine_unreferenced_blobs_unlocked(self) -> int:
         with self._shared_blob_mutex:
@@ -896,12 +1461,6 @@ class EmployeeIngressService:
             for blob_id in orphan_ids:
                 self._blob_store.quarantine_blob(blob_id)
             return len(orphan_ids)
-
-    def _quarantine_blob_unlocked(self, blob_ref: BlobRef) -> None:
-        try:
-            self._blob_store.quarantine_blob(blob_ref.blob_id)
-        except BlobError:
-            pass
 
     @staticmethod
     def _validate_incoming_payload(
@@ -948,12 +1507,15 @@ class EmployeeIngressService:
         return EmployeeIngressAck(
             schema_version=1,
             request_id=request_id,
+            request_envelope_id=metadata.envelope_id,
+            request_dedup_key=metadata.dedup_key,
+            request_semantic_digest=metadata.semantic_digest,
             acceptance=record.acceptance,
             agent_id=metadata.agent_id,
             app_id=metadata.app_id,
             channel_generation=metadata.channel_generation,
             connection_id=metadata.connection_id,
-            semantic_digest=metadata.semantic_digest,
+            semantic_digest=record.acceptance.semantic_digest,
             duplicate=duplicate,
             acknowledged_at=_utc_now(),
         )

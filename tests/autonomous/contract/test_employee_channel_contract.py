@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import textwrap
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -31,7 +32,9 @@ from src.autonomous.provisioning.channel_protocol import (
     encode_frame,
 )
 from src.autonomous.provisioning.channel_worker import (
+    IngressAckMailbox,
     WorkerSecurityError,
+    _build_low_level_event_dispatcher,
     _fetch_employee_bot_open_id,
     _handle_low_level_outbound,
     _normalize_sdk_ingress,
@@ -134,13 +137,10 @@ def test_parent_durable_ingress_call_graph_excludes_router_and_acp_execution() -
     invoked = {
         node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, (ast.Attribute, ast.Name))
+        if isinstance(node, ast.Call) and isinstance(node.func, (ast.Attribute, ast.Name))
     }
 
-    assert invoked.isdisjoint(
-        {"route", "execute", "start_session", "ensure_session", "_run_acp_session"}
-    )
+    assert invoked.isdisjoint({"route", "execute", "start_session", "ensure_session", "_run_acp_session"})
     assert "src.acp" not in source
     assert "provisioning.router" not in source
 
@@ -272,19 +272,13 @@ def test_low_level_worker_executes_employee_owned_outbound(frame_type: FrameType
 
     _handle_low_level_outbound(frame, bootstrap, _Outbound(), admission, emitter)
 
-    assert calls and calls[0][0] == (
-        "send" if frame_type is FrameType.SEND else "update_card"
-    )
+    assert calls and calls[0][0] == ("send" if frame_type is FrameType.SEND else "update_card")
     assert emitted == [
         (
             FrameType.HEALTH,
             {
-                "operation": (
-                    "send" if frame_type is FrameType.SEND else "update_card"
-                ),
-                "request_id": (
-                    "send_1" if frame_type is FrameType.SEND else "update_1"
-                ),
+                "operation": ("send" if frame_type is FrameType.SEND else "update_card"),
+                "request_id": ("send_1" if frame_type is FrameType.SEND else "update_1"),
                 "success": True,
                 "app_id": "cli_employee",
                 "generation": 3,
@@ -445,6 +439,9 @@ def _transport_contract() -> tuple[
     ack = EmployeeIngressAck(
         schema_version=1,
         request_id="req_channel_contract",
+        request_envelope_id=metadata.envelope_id,
+        request_dedup_key=metadata.dedup_key,
+        request_semantic_digest=metadata.semantic_digest,
         acceptance=acceptance,
         agent_id=metadata.agent_id,
         app_id=metadata.app_id,
@@ -636,6 +633,118 @@ def test_worker_normalizes_direct_bot_mentions_inside_encrypted_payload() -> Non
     )
 
 
+def test_message_redelivery_event_id_keeps_payload_identity_but_changes_dedup() -> None:
+    first_event = _direct_bot_mention_event()
+    second_event = _direct_bot_mention_event()
+    second_event.header.event_id = "event-mention-redelivery"
+
+    first_metadata, first_payload, _ = _normalize_sdk_ingress(
+        first_event,
+        kind="message",
+        agent_id="agt_employee",
+        app_id="cli_employee",
+        generation=7,
+        connection_id="conn_employee",
+        tenant_key="tenant_1",
+        bot_principal_id="bot_employee",
+    )
+    second_metadata, second_payload, _ = _normalize_sdk_ingress(
+        second_event,
+        kind="message",
+        agent_id="agt_employee",
+        app_id="cli_employee",
+        generation=7,
+        connection_id="conn_employee",
+        tenant_key="tenant_1",
+        bot_principal_id="bot_employee",
+    )
+
+    assert second_metadata.event_id != first_metadata.event_id
+    assert second_metadata.dedup_key != first_metadata.dedup_key
+    assert second_metadata.envelope_id == first_metadata.envelope_id
+    assert second_payload == first_payload
+    assert second_metadata.semantic_digest == first_metadata.semantic_digest
+
+
+def test_mailbox_accepts_current_request_alias_for_canonical_acceptance() -> None:
+    metadata, _payload_value, canonical_ack = _transport_contract()
+    current_metadata = replace(metadata, event_id="evt_channel_redelivery")
+    current_ack = replace(
+        canonical_ack,
+        request_id="req_channel_redelivery",
+        request_envelope_id=current_metadata.envelope_id,
+        request_dedup_key=current_metadata.dedup_key,
+        duplicate=True,
+    )
+    mailbox = IngressAckMailbox()
+    pending = mailbox.register(
+        request_id=current_ack.request_id,
+        agent_id=current_ack.agent_id,
+        app_id=current_ack.app_id,
+        generation=current_ack.channel_generation,
+        connection_id=current_ack.connection_id,
+        semantic_digest=current_ack.semantic_digest,
+        envelope_id=current_metadata.envelope_id,
+        dedup_key=current_metadata.dedup_key,
+    )
+
+    assert current_ack.acceptance == canonical_ack.acceptance
+    assert current_ack.acceptance.dedup_key != current_ack.request_dedup_key
+    assert mailbox.deliver(current_ack) is True
+    assert mailbox.wait(pending, timeout=0) == current_ack
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("request_id", "req_late_old"),
+        ("connection_id", "conn_stale"),
+        ("channel_generation", 6),
+        ("request_envelope_id", "ing_stale"),
+        ("request_dedup_key", "dedup_stale"),
+    ),
+)
+def test_mailbox_rejects_stale_request_transport_or_alias(
+    field: str,
+    value: object,
+) -> None:
+    metadata, _payload_value, ack = _transport_contract()
+    mailbox = IngressAckMailbox()
+    pending = mailbox.register(
+        request_id=ack.request_id,
+        agent_id=ack.agent_id,
+        app_id=ack.app_id,
+        generation=ack.channel_generation,
+        connection_id=ack.connection_id,
+        semantic_digest=ack.semantic_digest,
+        envelope_id=metadata.envelope_id,
+        dedup_key=metadata.dedup_key,
+    )
+
+    assert mailbox.deliver(replace(ack, **{field: value})) is False
+    mailbox.cancel(pending)
+
+
+def test_mailbox_first_valid_ack_is_immutable() -> None:
+    metadata, _payload_value, first = _transport_contract()
+    mailbox = IngressAckMailbox()
+    pending = mailbox.register(
+        request_id=first.request_id,
+        agent_id=first.agent_id,
+        app_id=first.app_id,
+        generation=first.channel_generation,
+        connection_id=first.connection_id,
+        semantic_digest=first.semantic_digest,
+        envelope_id=metadata.envelope_id,
+        dedup_key=metadata.dedup_key,
+    )
+    later = replace(first, duplicate=True)
+
+    assert mailbox.deliver(first) is True
+    assert mailbox.deliver(later) is False
+    assert mailbox.wait(pending, timeout=0) == first
+
+
 @pytest.mark.parametrize(
     ("path", "replacement"),
     (
@@ -728,18 +837,56 @@ def test_production_worker_main_reaches_only_the_low_level_durable_bridge() -> N
 def test_low_level_entry_hardens_before_credentials_or_sdk_import() -> None:
     source = inspect.getsource(run_low_level_employee_channel)
 
-    assert source.index("apply_process_hardening()") < source.index(
-        "decode_bootstrap"
+    assert source.index("apply_process_hardening()") < source.index("decode_bootstrap")
+    assert source.index("emit_macos_sandbox_proof") < source.index("decode_bootstrap")
+    assert source.index("collect_sdk_distribution_identity") < source.index("emit_macos_sandbox_proof")
+    assert source.index("apply_process_hardening()") < source.index("from lark_channel")
+
+
+def test_delivery_only_worker_registers_no_ingress_callbacks() -> None:
+    registrations: list[str] = []
+
+    class Builder:
+        def register_p2_im_message_receive_v1(self, _callback):
+            registrations.append("message")
+            return self
+
+        def register_p2_card_action_trigger(self, _callback):
+            registrations.append("card")
+            return self
+
+        def register_p2_im_chat_member_bot_added_v1(self, _callback):
+            registrations.append("added")
+            return self
+
+        def register_p2_im_chat_member_bot_deleted_v1(self, _callback):
+            registrations.append("deleted")
+            return self
+
+        def build(self):
+            return object()
+
+    class Dispatcher:
+        @staticmethod
+        def builder(_verification_token, _encrypt_key, *, security):
+            assert security is marker
+            return Builder()
+
+    marker = object()
+    callbacks = (lambda _event: None,) * 4
+
+    dispatcher = _build_low_level_event_dispatcher(
+        Dispatcher,
+        marker,
+        delivery_only=True,
+        on_message=callbacks[0],
+        on_card_action=callbacks[1],
+        on_bot_added=callbacks[2],
+        on_bot_deleted=callbacks[3],
     )
-    assert source.index("emit_macos_sandbox_proof") < source.index(
-        "decode_bootstrap"
-    )
-    assert source.index("collect_sdk_distribution_identity") < source.index(
-        "emit_macos_sandbox_proof"
-    )
-    assert source.index("apply_process_hardening()") < source.index(
-        "from lark_channel"
-    )
+
+    assert dispatcher is not None
+    assert registrations == []
 
 
 def test_card_action_never_self_attests_user_value_as_trusted_correlation() -> None:

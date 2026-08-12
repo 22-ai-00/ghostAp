@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import math
 import os
 import threading
 import time
@@ -38,6 +39,10 @@ class AnchorMismatchError(JournalIntegrityError):
 
 class JournalClosedError(RuntimeError):
     """The writer is closed or write-disabled after an anchor failure."""
+
+
+class JournalDeadlineExceededError(TimeoutError):
+    """A Journal operation could not begin before its monotonic deadline."""
 
 
 class CommitState(str, Enum):
@@ -197,8 +202,14 @@ class JournalWriter:
         if self._closed or self._write_disabled:
             raise JournalClosedError("journal writer is closed for writes")
 
-    def _load_and_recover(self) -> list[TransactionFrame]:
+    def _load_and_recover(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> list[TransactionFrame]:
+        self._ensure_before_deadline(deadline, operation="Journal replay")
         raw = self.journal_path.read_bytes()
+        self._ensure_before_deadline(deadline, operation="Journal replay")
         if not raw:
             return []
         anchored_before_recovery = self.anchor.read()
@@ -209,6 +220,7 @@ class JournalWriter:
             if physical.strip()
         ]
         if not nonempty_indexes:
+            self._ensure_before_deadline(deadline, operation="Journal replay recovery")
             with open(self.journal_path, "r+b") as file:
                 file.truncate(0)
                 file.flush()
@@ -222,6 +234,7 @@ class JournalWriter:
         expected_sequence = 1
         tail_incomplete = False
         for index, physical in enumerate(physical_lines):
+            self._ensure_before_deadline(deadline, operation="Journal replay")
             if not physical.strip():
                 if index < last_nonempty_index:
                     raise JournalIntegrityError("blank record before journal tail")
@@ -254,6 +267,7 @@ class JournalWriter:
                 raise AnchorMismatchError(
                     "anchor confirms a journal tail that is incomplete locally"
                 )
+            self._ensure_before_deadline(deadline, operation="Journal replay recovery")
             with open(self.journal_path, "r+b") as file:
                 file.truncate(valid_length)
                 file.flush()
@@ -323,6 +337,7 @@ class JournalWriter:
         *,
         expected_head_sequence: int | None = None,
         expected_head_hash: str | None = None,
+        deadline: float | None = None,
     ) -> CommitResult:
         self._ensure_writable()
         event_values = tuple(events)
@@ -331,7 +346,11 @@ class JournalWriter:
         if not all(isinstance(event, JournalEvent) for event in event_values):
             raise TypeError("events must contain JournalEvent values")
         self._validate_blob_refs(event_values)
-        with self._mutex:
+        with self._deadline_guard(
+            self._mutex,
+            deadline,
+            operation="Journal commit",
+        ):
             self._ensure_writable()
             logical_head_hash = "" if self._sequence == 0 else self._previous_hash
             if (
@@ -372,6 +391,7 @@ class JournalWriter:
                 events=event_values,
                 hmac_key=self._hmac_key,
             )
+            self._ensure_before_deadline(deadline, operation="Journal commit")
             try:
                 _append_record(
                     self.journal_path,
@@ -403,11 +423,21 @@ class JournalWriter:
                 state=CommitState.DURABLE_NOT_ANCHORED,
             )
 
-    def replay(self, from_sequence: int = 1) -> Iterator[TransactionFrame]:
+    def replay(
+        self,
+        from_sequence: int = 1,
+        *,
+        deadline: float | None = None,
+    ) -> Iterator[TransactionFrame]:
         if isinstance(from_sequence, bool) or from_sequence < 1:
             raise ValueError("from_sequence must be >= 1")
-        with self._mutex:
-            frames = tuple(self._load_and_recover())
+        with self._deadline_guard(
+            self._mutex,
+            deadline,
+            operation="Journal replay",
+        ):
+            self._ensure_before_deadline(deadline, operation="Journal replay")
+            frames = tuple(self._load_and_recover(deadline=deadline))
             self._rebuild_aggregate_versions(frames)
         for frame in frames:
             if frame.sequence >= from_sequence:
@@ -420,11 +450,17 @@ class JournalWriter:
     def get_aggregate_versions(
         self,
         aggregate_ids: Iterable[str],
+        *,
+        deadline: float | None = None,
     ) -> dict[str, int]:
         """Return an atomic snapshot of selected aggregate versions."""
 
         ids = tuple(aggregate_ids)
-        with self._mutex:
+        with self._deadline_guard(
+            self._mutex,
+            deadline,
+            operation="Journal version lookup",
+        ):
             return {
                 aggregate_id: self._aggregate_versions.get(aggregate_id, 0)
                 for aggregate_id in ids
@@ -438,7 +474,63 @@ class JournalWriter:
         return True, []
 
     @contextmanager
-    def transaction_guard(self) -> Iterator[None]:
-        """Serialize a domain projection refresh with its following commit."""
-        with self._transaction_mutex:
+    def transaction_guard(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> Iterator[None]:
+        """Serialize refresh + commit admission before an optional deadline."""
+
+        with self._deadline_guard(
+            self._transaction_mutex,
+            deadline,
+            operation="Journal transaction",
+        ):
             yield
+
+    @staticmethod
+    def _validated_deadline(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(float(deadline))
+        ):
+            raise ValueError("deadline must be a finite monotonic timestamp")
+        return float(deadline)
+
+    @classmethod
+    def _ensure_before_deadline(
+        cls,
+        deadline: float | None,
+        *,
+        operation: str,
+    ) -> None:
+        value = cls._validated_deadline(deadline)
+        if value is not None and time.monotonic() >= value:
+            raise JournalDeadlineExceededError(f"{operation} deadline expired")
+
+    @classmethod
+    @contextmanager
+    def _deadline_guard(
+        cls,
+        lock: threading.Lock | threading.RLock,
+        deadline: float | None,
+        *,
+        operation: str,
+    ) -> Iterator[None]:
+        value = cls._validated_deadline(deadline)
+        if value is None:
+            with lock:
+                yield
+            return
+        remaining = value - time.monotonic()
+        if remaining <= 0 or not lock.acquire(
+            timeout=min(remaining, threading.TIMEOUT_MAX)
+        ):
+            raise JournalDeadlineExceededError(f"{operation} deadline expired")
+        try:
+            yield
+        finally:
+            lock.release()

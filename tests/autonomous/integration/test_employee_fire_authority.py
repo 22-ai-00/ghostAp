@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -11,8 +13,16 @@ from src.autonomous.ingress.service import EmployeeIngressService
 from src.autonomous.journal.blob_store import AesGcmEncryptionProvider, BlobStore
 from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.projections import ProjectionState, apply_frame
+from src.autonomous.provisioning.external_mutation_gate import (
+    EmployeeExternalMutationGate,
+    ExternalMutationFenced,
+    ExternalMutationKind,
+)
 from src.autonomous.provisioning.fire_authority import JournalFireAuthority
-from src.autonomous.provisioning.fire_effects import ExecutionQuiesceEffect
+from src.autonomous.provisioning.fire_effects import (
+    ExecutionQuiesceEffect,
+    MembershipCleanupEffect,
+)
 from src.autonomous.provisioning.fire_service import (
     EmployeeFireRequest,
     EmployeeFireService,
@@ -23,6 +33,7 @@ from src.autonomous.provisioning.fire_state import (
     FireCleanupMode,
     FireEffectState,
     FirePhase,
+    rebuild_fire_projection,
 )
 from src.autonomous.provisioning.hire_state import (
     DurableHireState,
@@ -129,6 +140,631 @@ def test_reconcile_draining_is_constant_time_without_pending_drains() -> None:
     assert service.reconcile_draining() == ()
 
 
+def test_fire_fences_then_waits_for_inflight_external_mutation_before_admission(
+    tmp_path,
+) -> None:
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    gate = EmployeeExternalMutationGate()
+    lease = gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.APP_REGISTRATION,
+    )
+    calls: list[str] = []
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, calls) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=gate,
+        external_mutation_wait_seconds=1.0,
+    )
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def run_fire() -> None:
+        try:
+            service.start_fire(
+                EmployeeFireRequest(
+                    employee="Atlas",
+                    tenant_key="tenant_1",
+                    message_id="om_fire_external_lease",
+                    chat_id="oc_dm",
+                    requester_principal_id="ou_admin",
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=run_fire)
+    thread.start()
+    for _attempt in range(100):
+        if gate.is_fenced("tenant_1", "agt_1"):
+            break
+        threading.Event().wait(0.01)
+    assert gate.is_fenced("tenant_1", "agt_1") is True
+    assert done.is_set() is False
+    assert state.employees["agt_1"].state.value == "active"
+    assert all(
+        event.event_type != "fire.requested"
+        for frame in writer.replay()
+        for event in frame.events
+    )
+
+    lease.release()
+    assert done.wait(1.0)
+    thread.join(timeout=1.0)
+    assert errors == []
+    assert state.employees["agt_1"].state.value == "archived"
+    assert calls == list(FIRE_EFFECT_ORDER)
+    ingress.close()
+    writer.close()
+
+
+def test_fire_external_mutation_wait_timeout_does_not_admit_retirement(
+    tmp_path,
+) -> None:
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    gate = EmployeeExternalMutationGate()
+    lease = gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.CREDENTIAL_PUT,
+    )
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=gate,
+        external_mutation_wait_seconds=0.01,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_external_timeout",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+
+    with pytest.raises(FireServiceError, match="external mutation is still active"):
+        service.start_fire(request)
+
+    assert state.employees["agt_1"].state.value == "active"
+    assert all(
+        event.event_type != "fire.requested"
+        for frame in writer.replay()
+        for event in frame.events
+    )
+    assert any(
+        event.event_type == "employee.external_mutation_fenced"
+        and event.payload.get("tenant_key") == "tenant_1"
+        and event.payload.get("agent_id") == "agt_1"
+        and event.payload.get("message_id") == request.message_id
+        for frame in writer.replay()
+        for event in frame.events
+    )
+    restarted_gate = EmployeeExternalMutationGate()
+    EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=restarted_gate,
+        external_mutation_wait_seconds=0.01,
+    )
+    assert restarted_gate.is_fenced("tenant_1", "agt_1") is True
+    with pytest.raises(ExternalMutationFenced):
+        restarted_gate.acquire(
+            "tenant_1",
+            "agt_1",
+            ExternalMutationKind.CHANNEL_START,
+        )
+    lease.release()
+    assert service.start_fire(request).phase is FirePhase.ARCHIVED
+    ingress.close()
+    writer.close()
+
+
+@pytest.mark.parametrize(
+    ("effect_id", "effect_type"),
+    (
+        ("slash-reconcile:2:1", "slash_reconciliation"),
+        ("channel-start:2", "employee_channel_start"),
+    ),
+)
+def test_restart_marker_does_not_bypass_unresolved_external_hire_effect(
+    tmp_path,
+    effect_id,
+    effect_type,
+) -> None:
+    writer, state, ingress, _authority = _active_bound_fire_authority(tmp_path)
+    hire = _HireProjectionOwner(state)
+    authority = JournalFireAuthority(
+        writer=writer,
+        hire_service=hire,
+        ingress_service=ingress,
+        admin_principal_ids=frozenset({"ou_admin"}),
+    )
+    gate = EmployeeExternalMutationGate()
+    lease = gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.CREDENTIAL_PUT,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_marker_unresolved_hire",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=gate,
+        external_mutation_wait_seconds=0.01,
+    )
+
+    with pytest.raises(FireServiceError, match="external mutation is still active"):
+        service.start_fire(request)
+
+    base = _pre_binding_hire_state(
+        register_state=HireEffectState.COMMITTED,
+        credential_committed=True,
+    )
+    hire.hire_states = (
+        replace(
+            base,
+            effects=(
+                *base.effects,
+                (effect_id, HireEffectState.EXECUTING),
+            ),
+            effect_types=(
+                *base.effect_types,
+                (effect_id, effect_type),
+            ),
+            effect_metadata=(
+                *base.effect_metadata,
+                (effect_id, ()),
+            ),
+        ),
+    )
+    lease.release()
+
+    with pytest.raises(FireServiceError, match="external mutation outcome"):
+        service.start_fire(request)
+
+    assert state.employees["agt_1"].state.value == "action_required"
+    assert all(
+        event.event_type != "fire.requested"
+        for frame in writer.replay()
+        for event in frame.events
+    )
+    ingress.close()
+    writer.close()
+
+
+def test_restart_marks_orphan_fence_action_required_when_hire_call_is_unresolved(
+    tmp_path,
+) -> None:
+    writer, state, ingress, _authority = _active_bound_fire_authority(tmp_path)
+    hire = _HireProjectionOwner(state)
+    authority = JournalFireAuthority(
+        writer=writer,
+        hire_service=hire,
+        ingress_service=ingress,
+        admin_principal_ids=frozenset({"ou_admin"}),
+    )
+    initial_gate = EmployeeExternalMutationGate()
+    lease = initial_gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.CREDENTIAL_PUT,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_marker_action_required",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+    initial = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=initial_gate,
+        external_mutation_wait_seconds=0.01,
+    )
+    with pytest.raises(FireServiceError, match="external mutation is still active"):
+        initial.start_fire(request)
+
+    base = _pre_binding_hire_state(
+        register_state=HireEffectState.COMMITTED,
+        credential_committed=True,
+    )
+    hire.hire_states = (
+        replace(
+            base,
+            effects=(
+                *base.effects,
+                ("slash-reconcile:2:1", HireEffectState.EXECUTING),
+            ),
+            effect_types=(
+                *base.effect_types,
+                ("slash-reconcile:2:1", "slash_reconciliation"),
+            ),
+            effect_metadata=(
+                *base.effect_metadata,
+                ("slash-reconcile:2:1", ()),
+            ),
+        ),
+    )
+    lease.release()
+    restarted = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=EmployeeExternalMutationGate(),
+        external_mutation_wait_seconds=0.01,
+    )
+
+    assert restarted.recover() == ()
+    assert state.employees["agt_1"].state.value == "action_required"
+    assert all(
+        event.event_type != "fire.requested"
+        for frame in writer.replay()
+        for event in frame.events
+    )
+    ingress.close()
+    writer.close()
+
+
+def test_restart_recovers_marker_anchored_before_fire_admission(tmp_path) -> None:
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    initial_gate = EmployeeExternalMutationGate()
+    lease = initial_gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.CREDENTIAL_PUT,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_marker_crash_recovery",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+    initial = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=initial_gate,
+        external_mutation_wait_seconds=0.01,
+    )
+
+    with pytest.raises(FireServiceError, match="external mutation is still active"):
+        initial.start_fire(request)
+    lease.release()
+
+    calls: list[str] = []
+    restarted = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, calls) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=EmployeeExternalMutationGate(),
+        external_mutation_wait_seconds=0.01,
+    )
+
+    recovered = restarted.recover()
+
+    assert len(recovered) == 1
+    assert recovered[0].phase is FirePhase.ARCHIVED
+    assert recovered[0].message_id == request.message_id
+    assert calls == list(FIRE_EFFECT_ORDER)
+    assert state.employees["agt_1"].state.value == "archived"
+    ingress.close()
+    writer.close()
+
+
+def test_marker_recovery_timeout_keeps_live_hire_workforce_state_active(
+    tmp_path,
+) -> None:
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    gate = EmployeeExternalMutationGate()
+    lease = gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.CREDENTIAL_PUT,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_recover_live_lease",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=gate,
+        external_mutation_wait_seconds=0.01,
+    )
+    with pytest.raises(FireServiceError, match="external mutation is still active"):
+        service.start_fire(request)
+
+    assert service.recover() == ()
+    assert state.employees["agt_1"].state.value == "active"
+    lease.release()
+    ingress.close()
+    writer.close()
+
+
+def test_legacy_short_fence_is_upgraded_to_recoverable_request(tmp_path) -> None:
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    aggregate_id = EmployeeFireService._external_mutation_fence_aggregate_id(  # noqa: SLF001
+        "tenant_1",
+        "agt_1",
+    )
+    marker = JournalEvent(
+        event_type="employee.external_mutation_fenced",
+        aggregate_id=aggregate_id,
+        payload={"tenant_key": "tenant_1", "agent_id": "agt_1"},
+    )
+    with writer.transaction_guard():
+        last = writer.get_last_frame()
+        result = writer.commit(
+            (marker,),
+            writer.get_aggregate_versions((aggregate_id,)),
+            expected_head_sequence=0 if last is None else last.sequence,
+            expected_head_hash="" if last is None else last.frame_hash,
+        )
+    assert result.state.value == "anchored"
+    gate = EmployeeExternalMutationGate()
+    lease = gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.CREDENTIAL_PUT,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_upgrade_short_marker",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=gate,
+        external_mutation_wait_seconds=0.01,
+    )
+
+    with pytest.raises(FireServiceError, match="external mutation is still active"):
+        service.start_fire(request)
+
+    full_markers = [
+        event
+        for frame in writer.replay()
+        for event in frame.events
+        if event.event_type == "employee.external_mutation_fenced"
+        and event.payload.get("message_id") == request.message_id
+    ]
+    assert len(full_markers) == 1
+    lease.release()
+    restarted = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=EmployeeExternalMutationGate(),
+        external_mutation_wait_seconds=0.01,
+    )
+
+    recovered = restarted.recover()
+
+    assert len(recovered) == 1
+    assert recovered[0].phase is FirePhase.ARCHIVED
+    assert state.employees["agt_1"].state.value == "archived"
+    ingress.close()
+    writer.close()
+
+
+def test_concurrent_fire_requests_share_one_recoverable_fence_intent(tmp_path) -> None:
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    gate = EmployeeExternalMutationGate()
+    lease = gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.CREDENTIAL_PUT,
+    )
+    services = tuple(
+        EmployeeFireService(
+            writer=writer,
+            authority=authority,
+            effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+            external_mutation_gate=gate,
+            external_mutation_wait_seconds=0.02,
+        )
+        for _index in range(2)
+    )
+    requests = tuple(
+        EmployeeFireRequest(
+            employee="Atlas",
+            tenant_key="tenant_1",
+            message_id=f"om_fire_concurrent_marker_{index}",
+            chat_id="oc_dm",
+            requester_principal_id="ou_admin",
+        )
+        for index in range(2)
+    )
+    barrier = threading.Barrier(2)
+
+    def start(item):
+        service, request = item
+        barrier.wait(timeout=2)
+        with pytest.raises(
+            FireServiceError,
+            match="external mutation is still active",
+        ):
+            service.start_fire(request)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tuple(pool.map(start, zip(services, requests, strict=True)))
+
+    full_markers = [
+        event
+        for frame in writer.replay()
+        for event in frame.events
+        if event.event_type == "employee.external_mutation_fenced"
+        and "message_id" in event.payload
+    ]
+    assert len(full_markers) == 1
+    lease.release()
+    restarted = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=EmployeeExternalMutationGate(),
+        external_mutation_wait_seconds=0.01,
+    )
+
+    recovered = restarted.recover()
+
+    assert len(recovered) == 1
+    assert recovered[0].phase is FirePhase.ARCHIVED
+    assert state.employees["agt_1"].state.value == "archived"
+    ingress.close()
+    writer.close()
+
+
+def test_marker_recovery_resumes_new_fire_stream_once(tmp_path) -> None:
+    writer, _state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    initial_gate = EmployeeExternalMutationGate()
+    lease = initial_gate.acquire(
+        "tenant_1",
+        "agt_1",
+        ExternalMutationKind.CREDENTIAL_PUT,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_marker_single_resume",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+    initial = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=initial_gate,
+        external_mutation_wait_seconds=0.01,
+    )
+    with pytest.raises(FireServiceError, match="external mutation is still active"):
+        initial.start_fire(request)
+    lease.release()
+    executions = 0
+
+    class _WaitingQuiesce:
+        def execute(self, _state):
+            nonlocal executions
+            executions += 1
+
+        def observe(self, _state):
+            return False
+
+    effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    effects["execution_quiesce"] = _WaitingQuiesce()
+    restarted = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects=effects,
+        external_mutation_gate=EmployeeExternalMutationGate(),
+        external_mutation_wait_seconds=0.01,
+    )
+
+    recovered = restarted.recover()
+
+    assert len(recovered) == 1
+    assert recovered[0].phase is FirePhase.RETIRING
+    assert recovered[0].effect_state("execution_quiesce") is FireEffectState.EXECUTING
+    assert executions == 1
+    ingress.close()
+    writer.close()
+
+
+def test_concurrent_fire_resume_does_not_append_duplicate_effect_transition(
+    tmp_path,
+) -> None:
+    writer, _state, ingress, authority = _active_bound_fire_authority(tmp_path)
+
+    class _WaitingQuiesce:
+        def execute(self, _state):
+            return None
+
+        def observe(self, _state):
+            return False
+
+    initial_effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    initial_effects["execution_quiesce"] = _WaitingQuiesce()
+    initial = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects=initial_effects,
+    )
+    waiting = initial.start_fire(
+        EmployeeFireRequest(
+            employee="Atlas",
+            tenant_key="tenant_1",
+            message_id="om_fire_concurrent_resume",
+            chat_id="oc_dm",
+            requester_principal_id="ou_admin",
+        )
+    )
+    barrier = threading.Barrier(2)
+
+    class _RacingQuiesce:
+        def execute(self, _state):
+            barrier.wait(timeout=2)
+
+        def observe(self, _state):
+            return True
+
+    racing_effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    racing_effects["execution_quiesce"] = _RacingQuiesce()
+    services = (
+        EmployeeFireService(
+            writer=writer,
+            authority=authority,
+            effects=racing_effects,
+        ),
+        EmployeeFireService(
+            writer=writer,
+            authority=authority,
+            effects=racing_effects,
+        ),
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = tuple(
+            pool.map(lambda service: service.resume(waiting.intent_id), services)
+        )
+
+    projection = rebuild_fire_projection(tuple(writer.replay()))
+    assert projection[waiting.intent_id].phase is FirePhase.ARCHIVED
+    assert all(result.phase is FirePhase.ARCHIVED for result in results)
+    committed = [
+        event
+        for frame in writer.replay()
+        for event in frame.events
+        if event.event_type == "fire.effect.committed"
+        and event.payload.get("effect_type") == "execution_quiesce"
+    ]
+    assert len(committed) == 1
+    ingress.close()
+    writer.close()
+
+
 def _pre_binding_hire_state(
     *,
     register_state: HireEffectState = HireEffectState.PREPARED,
@@ -156,6 +792,70 @@ def _pre_binding_hire_state(
         effect_types=tuple((name, name) for name, _state in effects),
         effect_metadata=tuple(metadata),
     )
+
+
+@pytest.mark.parametrize(
+    ("effect_id", "effect_type"),
+    (
+        ("slash-reconcile:2:1", "slash_reconciliation"),
+        ("channel-start:2", "employee_channel_start"),
+    ),
+)
+def test_restart_pending_external_hire_effect_blocks_fire_admission(
+    tmp_path,
+    effect_id,
+    effect_type,
+) -> None:
+    writer, state, ingress, _authority = _active_bound_fire_authority(tmp_path)
+    base = _pre_binding_hire_state(
+        register_state=HireEffectState.COMMITTED,
+        credential_committed=True,
+    )
+    hire_state = replace(
+        base,
+        effects=(*base.effects, (effect_id, HireEffectState.EXECUTING)),
+        effect_types=(*base.effect_types, (effect_id, effect_type)),
+        effect_metadata=(*base.effect_metadata, (effect_id, ())),
+    )
+    authority = JournalFireAuthority(
+        writer=writer,
+        hire_service=_HireProjectionOwner(state, hire_states=(hire_state,)),
+        ingress_service=ingress,
+        admin_principal_ids=frozenset({"ou_admin"}),
+    )
+    calls: list[str] = []
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects={name: _Effect(name, calls) for name in FIRE_EFFECT_ORDER},
+        external_mutation_gate=EmployeeExternalMutationGate(),
+    )
+
+    with pytest.raises(FireServiceError, match="external mutation outcome"):
+        service.start_fire(
+            EmployeeFireRequest(
+                employee="Atlas",
+                tenant_key="tenant_1",
+                message_id=f"om_fire_pending_{effect_type}",
+                chat_id="oc_dm",
+                requester_principal_id="ou_admin",
+            )
+        )
+
+    assert calls == []
+    assert state.employees["agt_1"].state.value == "action_required"
+    assert all(
+        event.event_type != "fire.requested"
+        for frame in writer.replay()
+        for event in frame.events
+    )
+    assert any(
+        event.event_type == "employee.external_mutation_fenced"
+        for frame in writer.replay()
+        for event in frame.events
+    )
+    ingress.close()
+    writer.close()
 
 
 def test_admission_atomically_commits_retiring_and_employee_ingress_closure(tmp_path):
@@ -400,6 +1100,74 @@ def test_drain_waits_without_action_required_then_auto_reconciles(tmp_path):
     assert state.employees["agt_1"].state.value == "archived"
     ingress.close()
     writer.close()
+
+
+def test_action_required_membership_cleanup_is_reexecuted_on_retry(tmp_path) -> None:
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    calls = 0
+    cleaned = False
+
+    class _RetryableMembershipCleanup:
+        def execute(self, _state):
+            nonlocal calls, cleaned
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient remove failure")
+            cleaned = True
+
+        def observe(self, _state):
+            return cleaned
+
+    effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    effects["membership_cleanup"] = _RetryableMembershipCleanup()
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects=effects,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_retry_membership_cleanup",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+
+    waiting = service.start_fire(request)
+    assert waiting.phase is FirePhase.ACTION_REQUIRED
+    assert waiting.effect_state("membership_cleanup") is FireEffectState.ACTION_REQUIRED
+    assert calls == 1
+
+    completed = service.start_fire(
+        EmployeeFireRequest(
+            employee="Atlas",
+            tenant_key="tenant_1",
+            message_id="om_fire_retry_membership_cleanup_again",
+            chat_id="oc_dm",
+            requester_principal_id="ou_admin",
+        )
+    )
+
+    assert completed.phase is FirePhase.ARCHIVED
+    assert calls == 2
+    assert state.employees["agt_1"].state.value == "archived"
+    ingress.close()
+    writer.close()
+
+
+def test_membership_cleanup_observation_uses_durable_cleanup_obligations() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class _Membership:
+        def retirement_confirmed_empty(self, *, tenant_key, agent_id):
+            calls.append((tenant_key, agent_id))
+            return False
+
+    effect = MembershipCleanupEffect(_Membership(), object())
+    state = SimpleNamespace(tenant_key="tenant_1", agent_id="agt_1")
+
+    assert effect.observe(state) is False
+    assert calls == [("tenant_1", "agt_1")]
 
 
 def test_drain_action_required_after_quiesce_is_not_polled_again(tmp_path):
@@ -893,6 +1661,77 @@ def test_admission_re_resolves_principal_bound_after_optimistic_resolve(tmp_path
     )
     assert fire_event.payload["bot_principal_id"] == "bot_1"
     assert fire_event.payload["credential_ref"] == "cred_1"
+    ingress.close()
+    writer.close()
+
+
+def test_admission_rejects_name_rebound_to_different_agent(tmp_path) -> None:
+    writer, state, ingress, _authority = _active_bound_fire_authority(tmp_path)
+
+    def replace_employee() -> None:
+        commit_events(
+            writer,
+            state,
+            JournalEvent(
+                event_type="employee.state_changed",
+                aggregate_id="agt_1",
+                payload={"state": "archived"},
+            ),
+        )
+        commit_events(
+            writer,
+            state,
+            JournalEvent(
+                event_type="employee.name_released",
+                aggregate_id="agt_1",
+                payload={"name": "Atlas"},
+            ),
+        )
+        replacement = employee_created("agt_2", "Atlas")
+        commit_events(
+            writer,
+            state,
+            JournalEvent(
+                event_type=replacement.event_type,
+                aggregate_id=replacement.aggregate_id,
+                payload={**replacement.payload, "state": "active"},
+            ),
+        )
+        commit_events(
+            writer,
+            state,
+            *bot_binding_events(
+                agent_id="agt_2",
+                bot_principal_id="bot_2",
+                app_id="cli_2",
+                credential_ref="cred_2",
+            ),
+        )
+
+    hire = _HireProjectionOwner(state, before_locked_sync=replace_employee)
+    authority = JournalFireAuthority(
+        writer=writer,
+        hire_service=hire,
+        ingress_service=ingress,
+        admin_principal_ids=frozenset({"ou_admin"}),
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_name_rebound",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+    )
+    stale = authority.resolve(request)
+
+    with pytest.raises(FireServiceError, match="authority changed"):
+        authority.admit(request, stale, "fire_name_rebound")
+
+    assert all(
+        event.event_type != "fire.requested"
+        for frame in writer.replay()
+        for event in frame.events
+    )
     ingress.close()
     writer.close()
 

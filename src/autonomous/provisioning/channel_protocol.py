@@ -27,6 +27,8 @@ _BOOTSTRAP_KEYS = {
     "tenant_key",
     "bot_principal_id",
     "ack_timeout_seconds",
+    "delivery_only",
+    "frozen_connection_id",
 }
 _READY_PAYLOAD_KEYS = {"identity", "connection_id", "connection"}
 _READY_IDENTITY_KEYS = {"app_id", "open_id"}
@@ -51,9 +53,7 @@ _FORBIDDEN_IPC_KEYS = {
     "password",
     "token",
 }
-_FORBIDDEN_IPC_COLLAPSED_KEYS = frozenset(
-    re.sub(r"[^a-z0-9]", "", key.casefold()) for key in _FORBIDDEN_IPC_KEYS
-)
+_FORBIDDEN_IPC_COLLAPSED_KEYS = frozenset(re.sub(r"[^a-z0-9]", "", key.casefold()) for key in _FORBIDDEN_IPC_KEYS)
 
 
 class ProtocolError(ValueError):
@@ -90,6 +90,8 @@ class ChannelBootstrap:
     tenant_key: str
     bot_principal_id: str
     ack_timeout_seconds: float
+    delivery_only: bool = False
+    frozen_connection_id: str = ""
 
 
 def encode_frame(frame: ChannelFrame) -> bytes:
@@ -158,6 +160,8 @@ def encode_bootstrap(bootstrap: ChannelBootstrap) -> bytes:
             "tenant_key": bootstrap.tenant_key,
             "bot_principal_id": bootstrap.bot_principal_id,
             "ack_timeout_seconds": bootstrap.ack_timeout_seconds,
+            "delivery_only": bootstrap.delivery_only,
+            "frozen_connection_id": bootstrap.frozen_connection_id,
         }
     )
 
@@ -177,6 +181,8 @@ def decode_bootstrap(raw: bytes) -> ChannelBootstrap:
         tenant_key=value.get("tenant_key"),
         bot_principal_id=value.get("bot_principal_id"),
         ack_timeout_seconds=value.get("ack_timeout_seconds"),
+        delivery_only=value.get("delivery_only"),
+        frozen_connection_id=value.get("frozen_connection_id"),
     )
     _validate_identity(bootstrap.agent_id, bootstrap.generation)
     if not isinstance(bootstrap.app_id, str) or not bootstrap.app_id:
@@ -221,28 +227,27 @@ def _validate_identity(agent_id: Any, generation: Any) -> None:
 def _validate_bootstrap_ingress(bootstrap: ChannelBootstrap) -> None:
     if not isinstance(bootstrap.tenant_key, str) or not bootstrap.tenant_key:
         raise ProtocolError("invalid tenant_key")
-    if (
-        not isinstance(bootstrap.bot_principal_id, str)
-        or not bootstrap.bot_principal_id.startswith("bot_")
-    ):
+    if not isinstance(bootstrap.bot_principal_id, str) or not bootstrap.bot_principal_id.startswith("bot_"):
         raise ProtocolError("invalid bot_principal_id")
     timeout = bootstrap.ack_timeout_seconds
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, (int, float))
-        or not 0 < float(timeout) < 3.0
-    ):
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < float(timeout) < 3.0:
         raise ProtocolError("invalid ack_timeout_seconds")
+    if type(bootstrap.delivery_only) is not bool:
+        raise ProtocolError("invalid delivery_only")
+    if bootstrap.delivery_only:
+        if not _is_safe_identifier(
+            bootstrap.frozen_connection_id,
+            prefix="conn_",
+        ):
+            raise ProtocolError("invalid frozen_connection_id")
+    elif bootstrap.frozen_connection_id != "":
+        raise ProtocolError("invalid frozen_connection_id")
 
 
 def _reject_secret_fields(value: Any) -> None:
     if isinstance(value, dict):
         for key, child in value.items():
-            collapsed = (
-                re.sub(r"[^a-z0-9]", "", key.casefold())
-                if isinstance(key, str)
-                else ""
-            )
+            collapsed = re.sub(r"[^a-z0-9]", "", key.casefold()) if isinstance(key, str) else ""
             if collapsed in _FORBIDDEN_IPC_COLLAPSED_KEYS:
                 raise ProtocolError("credential material is forbidden on ordinary IPC")
             _reject_secret_fields(child)
@@ -254,6 +259,9 @@ def _reject_secret_fields(value: Any) -> None:
 def _validate_typed_payload(frame: ChannelFrame) -> None:
     if frame.frame_type is FrameType.READY:
         validate_ready_payload(frame.payload)
+        return
+    if frame.frame_type is FrameType.HEALTH:
+        _validate_health_payload(frame)
         return
     if frame.frame_type is FrameType.SEND:
         try:
@@ -324,6 +332,57 @@ def _is_safe_identifier(value: Any, *, prefix: str) -> bool:
     )
 
 
+def _validate_health_payload(frame: ChannelFrame) -> None:
+    operation = frame.payload.get("operation")
+    if operation not in {"send", "update_card"}:
+        return
+    request_id = frame.payload.get("request_id")
+    expected_prefix = "send_" if operation == "send" else "update_"
+    if (
+        not isinstance(request_id, str)
+        or not request_id.startswith(expected_prefix)
+        or len(request_id) > 256
+        or type(frame.payload.get("success")) is not bool
+    ):
+        raise ProtocolError("invalid employee outbound health frame")
+    if frame.payload["success"] is True:
+        if set(frame.payload) != {
+            "operation",
+            "request_id",
+            "success",
+            "app_id",
+            "generation",
+            "connection_id",
+            "message_id",
+        }:
+            raise ProtocolError("invalid employee outbound health frame")
+        if (
+            not _is_safe_text(frame.payload["app_id"])
+            or frame.payload["generation"] != frame.generation
+            or not _is_safe_identifier(
+                frame.payload["connection_id"],
+                prefix="conn_",
+            )
+            or not _is_safe_text(frame.payload["message_id"])
+        ):
+            raise ProtocolError("invalid employee outbound health frame")
+        return
+    if set(frame.payload) != {
+        "operation",
+        "request_id",
+        "success",
+        "failure_kind",
+        "error_code",
+    }:
+        raise ProtocolError("invalid employee outbound health frame")
+    if (
+        frame.payload["failure_kind"] not in {"transport", "remote", "internal"}
+        or not _is_safe_text(frame.payload["error_code"])
+        or re.fullmatch(r"[a-z0-9-]+", frame.payload["error_code"]) is None
+    ):
+        raise ProtocolError("invalid employee outbound health frame")
+
+
 def _validate_send_payload(frame: ChannelFrame) -> None:
     if set(frame.payload) != {"request_id", "target", "message", "options"}:
         raise ValueError("invalid send payload fields")
@@ -331,19 +390,11 @@ def _validate_send_payload(frame: ChannelFrame) -> None:
     target = frame.payload["target"]
     message = frame.payload["message"]
     options = frame.payload["options"]
-    if (
-        not isinstance(request_id, str)
-        or not request_id.startswith("send_")
-        or len(request_id) > 256
-    ):
+    if not isinstance(request_id, str) or not request_id.startswith("send_") or len(request_id) > 256:
         raise ValueError("invalid send request_id")
     if not isinstance(target, str) or not target or len(target) > 256:
         raise ValueError("invalid send target")
-    if (
-        not isinstance(message, dict)
-        or len(message) != 1
-        or next(iter(message)) not in {"text", "card", "post"}
-    ):
+    if not isinstance(message, dict) or len(message) != 1 or next(iter(message)) not in {"text", "card", "post"}:
         raise ValueError("invalid send message")
     if options is not None and not isinstance(options, dict):
         raise ValueError("invalid send options")
@@ -355,11 +406,7 @@ def _validate_update_card_payload(frame: ChannelFrame) -> None:
     request_id = frame.payload["request_id"]
     message_id = frame.payload["message_id"]
     card = frame.payload["card"]
-    if (
-        not isinstance(request_id, str)
-        or not request_id.startswith("update_")
-        or len(request_id) > 256
-    ):
+    if not isinstance(request_id, str) or not request_id.startswith("update_") or len(request_id) > 256:
         raise ValueError("invalid update card request_id")
     if not isinstance(message_id, str) or not message_id or len(message_id) > 256:
         raise ValueError("invalid update card message_id")

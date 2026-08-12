@@ -6,16 +6,33 @@ from dataclasses import dataclass
 import pytest
 
 from src.autonomous.domain import EmployeeState
+from src.autonomous.ingress.projection import IngressProjectionState
+from src.autonomous.ingress.service import EmployeeIngressService
+from src.autonomous.journal.blob_store import AesGcmEncryptionProvider, BlobStore
 from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.projections import ProjectionState
 from src.autonomous.membership.lark import MembershipRemoteUnknown
-from src.autonomous.membership.models import MembershipOperation, MembershipState
+from src.autonomous.membership.models import (
+    MembershipEffectState,
+    MembershipOperation,
+    MembershipState,
+)
 from src.autonomous.membership.service import (
     EmployeeMembershipService,
     MembershipAuthorizationError,
     MembershipBindingError,
     MembershipMutationRequest,
 )
+from src.autonomous.provisioning.external_mutation_gate import (
+    EmployeeExternalMutationGate,
+)
+from src.autonomous.provisioning.fire_authority import JournalFireAuthority
+from src.autonomous.provisioning.fire_effects import MembershipCleanupEffect
+from src.autonomous.provisioning.fire_service import (
+    EmployeeFireRequest,
+    EmployeeFireService,
+)
+from src.autonomous.provisioning.fire_state import FIRE_EFFECT_ORDER, FirePhase
 from src.autonomous.provisioning.hire_service import ProductionEmployeeHireService
 from src.autonomous.workforce.projection import commit_workforce_events
 from tests.autonomous.workforce_helpers import bot_binding_events, employee_created, make_writer
@@ -30,7 +47,10 @@ class _Remote:
         self.observation_error: Exception | None = None
         self.entered = threading.Event()
         self.release = threading.Event()
+        self.observation_entered = threading.Event()
+        self.observation_release = threading.Event()
         self.block = False
+        self.block_observation = False
         self.inflight = 0
         self.max_inflight = 0
         self._lock = threading.Lock()
@@ -54,6 +74,9 @@ class _Remote:
 
     def is_member(self, *, chat_id, agent_id, app_id, credential_ref):
         self.observations.append((chat_id, agent_id, app_id, credential_ref))
+        self.observation_entered.set()
+        if self.block_observation:
+            assert self.observation_release.wait(2)
         if self.observation_error:
             raise self.observation_error
         return self.observed
@@ -74,6 +97,7 @@ def _fixture(
     admin_ids=frozenset({"ou_admin"}),
     team_active=True,
     employee_state=EmployeeState.ACTIVE,
+    external_mutation_gate=None,
 ) -> _Fixture:
     writer = make_writer(tmp_path)
     state = ProjectionState()
@@ -98,6 +122,7 @@ def _fixture(
         admin_principal_ids=admin_ids,
         team_owner_resolver=lambda chat_id: "ou_owner" if chat_id == "oc_team" else "",
         team_active_resolver=lambda _chat_id: team_active,
+        external_mutation_gate=external_mutation_gate,
     )
     return _Fixture(service, remote, hire, writer)
 
@@ -125,6 +150,139 @@ def test_add_commits_only_after_employee_bot_confirms_membership(tmp_path, reque
     employee = fx.hire.synchronize_projection().employees["agt_1"]
     assert employee.member_groups == ("oc_team",)
     assert fx.service.is_degraded("agt_1", "oc_team") is False
+
+
+def test_retirement_fence_rejects_new_add_before_remote_mutation(tmp_path) -> None:
+    gate = EmployeeExternalMutationGate()
+    gate.restore_retirement_fence("tenant_1", "agt_1")
+    fx = _fixture(tmp_path, external_mutation_gate=gate)
+
+    with pytest.raises(MembershipBindingError, match="retiring"):
+        fx.service.mutate(_request())
+
+    assert fx.remote.mutations == []
+    assert fx.remote.observations == []
+    assert fx.hire.synchronize_projection().employees["agt_1"].member_groups == ()
+
+
+def test_retirement_fence_prevents_event_reconciliation_from_restoring_add(
+    tmp_path,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    fx = _fixture(tmp_path, external_mutation_gate=gate)
+    fx.remote.observed = True
+    gate.restore_retirement_fence("tenant_1", "agt_1")
+
+    with pytest.raises(MembershipBindingError, match="retiring"):
+        fx.service.reconcile_event(
+            tenant_key="tenant_1",
+            chat_id="oc_team",
+            agent_id="agt_1",
+            app_id="cli_1",
+            observed_is_member=True,
+        )
+
+    assert fx.remote.mutations == []
+    assert fx.hire.synchronize_projection().employees["agt_1"].member_groups == ()
+
+
+def test_retirement_waits_for_event_observation_and_durable_add_target(
+    tmp_path,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    fx = _fixture(tmp_path, external_mutation_gate=gate)
+    fx.remote.observed = True
+    fx.remote.block_observation = True
+    event_outcomes = []
+    retirement_outcomes: list[bool] = []
+
+    event_thread = threading.Thread(
+        target=lambda: event_outcomes.append(
+            fx.service.reconcile_event(
+                tenant_key="tenant_1",
+                chat_id="oc_team",
+                agent_id="agt_1",
+                app_id="cli_1",
+                observed_is_member=True,
+            )
+        )
+    )
+    event_thread.start()
+    assert fx.remote.observation_entered.wait(1.0)
+
+    retirement = threading.Thread(
+        target=lambda: retirement_outcomes.append(
+            gate.begin_retirement(
+                "tenant_1",
+                "agt_1",
+                timeout_seconds=1.0,
+            )
+        )
+    )
+    retirement.start()
+    for _attempt in range(100):
+        if gate.is_fenced("tenant_1", "agt_1"):
+            break
+        threading.Event().wait(0.01)
+    assert gate.is_fenced("tenant_1", "agt_1") is True
+    assert retirement.is_alive()
+    pending = tuple(fx.service.state.effects.values())
+    assert len(pending) == 1
+    assert pending[0].operation is MembershipOperation.ADD
+    assert pending[0].state is MembershipEffectState.EXECUTING
+
+    fx.remote.observation_release.set()
+    event_thread.join(2.0)
+    retirement.join(2.0)
+
+    assert retirement_outcomes == [True]
+    assert len(event_outcomes) == 1
+    assert event_outcomes[0].state is MembershipState.ACTIVE
+    assert fx.hire.synchronize_projection().employees["agt_1"].member_groups == (
+        "oc_team",
+    )
+
+
+def test_retirement_waits_until_inflight_add_is_durably_committed(tmp_path) -> None:
+    gate = EmployeeExternalMutationGate()
+    fx = _fixture(tmp_path, external_mutation_gate=gate)
+    fx.remote.block = True
+    mutation_outcomes = []
+    retirement_outcomes: list[bool] = []
+
+    mutation = threading.Thread(
+        target=lambda: mutation_outcomes.append(fx.service.mutate(_request()))
+    )
+    mutation.start()
+    assert fx.remote.entered.wait(1.0)
+
+    retirement = threading.Thread(
+        target=lambda: retirement_outcomes.append(
+            gate.begin_retirement(
+                "tenant_1",
+                "agt_1",
+                timeout_seconds=1.0,
+            )
+        )
+    )
+    retirement.start()
+    for _attempt in range(100):
+        if gate.is_fenced("tenant_1", "agt_1"):
+            break
+        threading.Event().wait(0.01)
+    assert gate.is_fenced("tenant_1", "agt_1") is True
+    assert retirement.is_alive()
+
+    fx.remote.release.set()
+    mutation.join(2.0)
+    retirement.join(2.0)
+
+    assert retirement_outcomes == [True]
+    assert len(mutation_outcomes) == 1
+    assert mutation_outcomes[0].state is MembershipState.ACTIVE
+    assert fx.hire.synchronize_projection().employees["agt_1"].member_groups == (
+        "oc_team",
+    )
 
 
 def test_batch_membership_health_rebuilds_projection_once(
@@ -193,6 +351,226 @@ def test_retirement_cleanup_is_admin_remove_only_and_does_not_require_live_team(
     assert employee.state is EmployeeState.RETIRING
     assert employee.member_groups == ()
     assert fx.remote.mutations == [(MembershipOperation.REMOVE, "oc_team", "cli_1")]
+
+
+@pytest.mark.parametrize(
+    ("pending_state", "causally_settled"),
+    (
+        (MembershipEffectState.PREPARED, True),
+        (MembershipEffectState.EXECUTING, False),
+        (MembershipEffectState.ACTION_REQUIRED, False),
+    ),
+)
+def test_retirement_cleanup_includes_unprojected_add_obligations(
+    tmp_path,
+    pending_state,
+    causally_settled,
+) -> None:
+    fx = _fixture(tmp_path)
+    request = _request()
+    authority = fx.service._resolve_authority(request)
+    effect = fx.service._prepare(request, authority)
+    if pending_state is not MembershipEffectState.PREPARED:
+        fx.service._mark_executing(effect.effect_id)
+    if pending_state is MembershipEffectState.ACTION_REQUIRED:
+        fx.service._mark_action_required(effect.effect_id, "remote_unknown")
+    fx.remote.observed = True
+    commit_workforce_events(
+        fx.writer,
+        fx.hire.synchronize_projection(),
+        (
+            JournalEvent(
+                event_type="employee.state_changed",
+                aggregate_id="agt_1",
+                payload={"state": EmployeeState.RETIRING.value},
+            ),
+        ),
+    )
+
+    outcomes = fx.service.retire_all(
+        tenant_key="tenant_1",
+        agent_id="agt_1",
+        requester_principal_id="ou_admin",
+    )
+
+    assert len(outcomes) == 1
+    assert outcomes[0].state is MembershipState.ABSENT
+    assert outcomes[0].confirmed is True
+    assert fx.remote.mutations == [
+        (MembershipOperation.REMOVE, "oc_team", "cli_1"),
+    ]
+    assert fx.service.retirement_confirmed_empty(
+        tenant_key="tenant_1",
+        agent_id="agt_1",
+    ) is causally_settled
+
+
+def test_add_terminal_anchor_failure_is_diagnosed_and_releases_lease(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    fx = _fixture(tmp_path, external_mutation_gate=gate)
+    original = fx.service._commit_confirmed
+    failed = False
+
+    def fail_once(effect_id: str, observed: bool):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("simulated terminal projection failure")
+        return original(effect_id, observed)
+
+    monkeypatch.setattr(fx.service, "_commit_confirmed", fail_once)
+
+    with pytest.raises(RuntimeError, match="terminal projection"):
+        fx.service.mutate(_request())
+
+    effects = tuple(fx.service.state.effects.values())
+    assert len(effects) == 1
+    assert effects[0].state is MembershipEffectState.ACTION_REQUIRED
+    assert effects[0].error_code == "terminal_anchor_failed"
+    assert gate.begin_retirement(
+        "tenant_1",
+        "agt_1",
+        timeout_seconds=0,
+    ) is True
+
+
+def test_fire_retries_unprojected_add_cleanup_until_absence_is_confirmed(
+    tmp_path,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    fx = _fixture(tmp_path, external_mutation_gate=gate)
+    request = _request()
+    authority = fx.service._resolve_authority(request)
+    pending = fx.service._prepare(request, authority)
+    fx.service._mark_executing(pending.effect_id)
+    fx.service._commit_confirmed(pending.effect_id, True)
+    fx.remote.observed = True
+    fx.remote.observation_error = MembershipRemoteUnknown(
+        "membership_observation_unknown"
+    )
+    fx.remote.mutation_error = TimeoutError("membership remove outcome unknown")
+    ingress = EmployeeIngressService(
+        writer=fx.writer,
+        blob_store=BlobStore(
+            tmp_path / "ingress-blobs",
+            AesGcmEncryptionProvider(
+                lambda _key: b"fire-ingress-data-key-32-bytes!!"
+            ),
+        ),
+        ingress_state=IngressProjectionState(),
+        active_key_id="k1",
+    )
+    fire_authority = JournalFireAuthority(
+        writer=fx.writer,
+        hire_service=fx.hire,
+        ingress_service=ingress,
+        admin_principal_ids=frozenset({"ou_admin"}),
+    )
+
+    class _NoopEffect:
+        def execute(self, _state):
+            return None
+
+        def observe(self, _state):
+            return True
+
+    effects = {name: _NoopEffect() for name in FIRE_EFFECT_ORDER}
+    effects["membership_cleanup"] = MembershipCleanupEffect(
+        fx.service,
+        fx.hire,
+    )
+    fire = EmployeeFireService(
+        writer=fx.writer,
+        authority=fire_authority,
+        effects=effects,
+        external_mutation_gate=gate,
+    )
+
+    waiting = fire.start_fire(
+        EmployeeFireRequest(
+            employee="agt_1",
+            tenant_key="tenant_1",
+            message_id="om_fire_pending_membership",
+            chat_id="oc_admin_dm",
+            requester_principal_id="ou_admin",
+        )
+    )
+
+    assert waiting.phase is FirePhase.ACTION_REQUIRED
+    assert fx.hire.synchronize_projection().employees["agt_1"].state is (
+        EmployeeState.ACTION_REQUIRED
+    )
+    assert fx.service.retirement_confirmed_empty(
+        tenant_key="tenant_1",
+        agent_id="agt_1",
+    ) is False
+
+    fx.remote.observation_error = None
+    fx.remote.mutation_error = None
+    completed = fire.start_fire(
+        EmployeeFireRequest(
+            employee="agt_1",
+            tenant_key="tenant_1",
+            message_id="om_fire_pending_membership_retry",
+            chat_id="oc_admin_dm",
+            requester_principal_id="ou_admin",
+        )
+    )
+
+    assert completed.phase is FirePhase.ARCHIVED
+    assert fx.remote.mutations == [
+        (MembershipOperation.REMOVE, "oc_team", "cli_1"),
+        (MembershipOperation.REMOVE, "oc_team", "cli_1"),
+    ]
+    assert fx.service.retirement_confirmed_empty(
+        tenant_key="tenant_1",
+        agent_id="agt_1",
+    ) is True
+    ingress.close()
+
+
+def test_retirement_cleanup_forces_remove_despite_stale_absence(tmp_path) -> None:
+    fx = _fixture(tmp_path)
+    assert fx.service.mutate(_request()).confirmed is True
+    assert fx.service.mutate(
+        _request(operation=MembershipOperation.REMOVE)
+    ).confirmed is True
+    fx.remote.mutations.clear()
+    fx.remote.observations.clear()
+    # The remote member may have been restored out of band, or a crashed ADD
+    # request may complete after the old ABSENT observation.
+    fx.remote.observed = True
+    commit_workforce_events(
+        fx.writer,
+        fx.hire.synchronize_projection(),
+        (
+            JournalEvent(
+                event_type="employee.state_changed",
+                aggregate_id="agt_1",
+                payload={"state": EmployeeState.RETIRING.value},
+            ),
+        ),
+    )
+
+    outcomes = fx.service.retire_all(
+        tenant_key="tenant_1",
+        agent_id="agt_1",
+        requester_principal_id="ou_admin",
+    )
+
+    assert len(outcomes) == 1
+    assert outcomes[0].confirmed is True
+    assert fx.remote.mutations == [
+        (MembershipOperation.REMOVE, "oc_team", "cli_1")
+    ]
+    assert fx.remote.observed is False
+    assert fx.service.retirement_confirmed_empty(
+        tenant_key="tenant_1",
+        agent_id="agt_1",
+    ) is True
 
 
 def test_unauthorized_mutation_is_rejected_before_remote_or_journal(tmp_path) -> None:
@@ -470,6 +848,26 @@ def test_startup_audit_keeps_confirmed_remote_membership_without_writes(
     assert fx.writer.get_last_frame().sequence == before
 
 
+def test_startup_audit_cannot_commit_add_across_retirement_fence(tmp_path) -> None:
+    gate = EmployeeExternalMutationGate()
+    fx = _fixture(
+        tmp_path,
+        member_groups=("oc_team",),
+        external_mutation_gate=gate,
+    )
+    fx.remote.observed = True
+    gate.restore_retirement_fence("tenant_1", "agt_1")
+    before = fx.writer.get_last_frame().sequence
+
+    summary = fx.service.reconcile_projected_memberships()
+
+    assert summary.checked == 1
+    assert summary.confirmed == 0
+    assert summary.degraded == 1
+    assert fx.remote.observations == []
+    assert fx.writer.get_last_frame().sequence == before
+
+
 def test_startup_audit_degrades_unknown_membership_and_blocks_dispatch(
     tmp_path,
 ) -> None:
@@ -504,6 +902,29 @@ def test_recovery_observes_executing_effect_without_replaying_mutation(tmp_path)
     assert recovered == 1
     assert fx.remote.mutations == []
     assert fx.service.get("tenant_1", "oc_team", "agt_1").state is MembershipState.ACTIVE
+
+
+def test_recovery_observes_fenced_add_without_reprojecting_membership(tmp_path) -> None:
+    gate = EmployeeExternalMutationGate()
+    fx = _fixture(tmp_path, external_mutation_gate=gate)
+    request = _request()
+    authority = fx.service._resolve_authority(request)
+    effect = fx.service._prepare(request, authority)
+    fx.service._mark_executing(effect.effect_id)
+    fx.remote.observed = True
+    gate.restore_retirement_fence("tenant_1", "agt_1")
+
+    recovered = fx.service.recover_pending()
+
+    assert recovered == 1
+    assert fx.remote.observations == [
+        ("oc_team", "agt_1", "cli_1", "cred_1")
+    ]
+    assert fx.remote.mutations == []
+    current = fx.service.state.effects[effect.effect_id]
+    assert current.state is MembershipEffectState.ACTION_REQUIRED
+    assert current.error_code == "retirement_reconciliation_required"
+    assert fx.hire.synchronize_projection().employees["agt_1"].member_groups == ()
 
 
 def test_recovery_marks_prepared_effect_degraded_without_dispatch(tmp_path) -> None:

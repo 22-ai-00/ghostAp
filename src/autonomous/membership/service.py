@@ -10,6 +10,12 @@ from typing import Any
 from ..domain import EmployeeState, WorkerType
 from ..journal.frame import JournalEvent
 from ..journal.writer import JournalWriter
+from ..provisioning.external_mutation_gate import (
+    EmployeeExternalMutationGate,
+    EmployeeExternalMutationLease,
+    ExternalMutationFenced,
+    ExternalMutationKind,
+)
 from ..workforce.projection import commit_workforce_events_unlocked
 from .lark import MembershipRemoteRejected, MembershipRemoteUnknown
 from .models import (
@@ -103,6 +109,12 @@ class _Authority:
     member_groups: tuple[str, ...]
 
 
+@dataclass(slots=True)
+class _ExternalMutationProgress:
+    effect_id: str = ""
+    external_started: bool = False
+
+
 class EmployeeMembershipService:
     """Own canonical employee membership; legacy registry is never a fallback."""
 
@@ -115,6 +127,7 @@ class EmployeeMembershipService:
         admin_principal_ids: frozenset[str],
         team_owner_resolver: Callable[[str], str],
         team_active_resolver: Callable[[str], bool],
+        external_mutation_gate: EmployeeExternalMutationGate | None = None,
     ) -> None:
         if not isinstance(writer, JournalWriter):
             raise TypeError("writer must be JournalWriter")
@@ -128,6 +141,7 @@ class EmployeeMembershipService:
         self._admins = frozenset(admin_principal_ids)
         self._team_owner_resolver = team_owner_resolver
         self._team_active_resolver = team_active_resolver
+        self._external_mutation_gate = external_mutation_gate
         self._state = MembershipProjectionState()
         self._mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._chat_locks: dict[str, threading.RLock] = {}
@@ -245,84 +259,156 @@ class EmployeeMembershipService:
             raise TypeError("request must be MembershipMutationRequest")
         with self._chat_lock(request.chat_id):
             authority = self._resolve_authority(request)
-            desired = request.operation is MembershipOperation.ADD
-            desired_state = (
-                MembershipState.ACTIVE if desired else MembershipState.ABSENT
-            )
-            projected = request.chat_id in authority.member_groups
-            record = self.get(
-                request.tenant_key,
-                request.chat_id,
-                request.agent_id,
-            )
-            if (
-                projected is desired
-                and record is not None
-                and record.state is desired_state
-                and record.confirmed_state is desired_state
-            ):
-                return MembershipMutationOutcome(
-                    state=desired_state,
-                    confirmed=True,
-                    changed=False,
-                )
-
-            if projected is desired:
-                try:
-                    observed = self._observe(request, authority)
-                except MembershipRemoteUnknown:
-                    effect = self._prepare(request, authority)
-                    self._mark_executing(effect.effect_id)
-                    return self._mark_action_required(
-                        effect.effect_id,
-                        (
-                            "remote_unknown"
-                            if record is not None
-                            and record.state is MembershipState.DEGRADED
-                            else "idempotency_observation_unknown"
-                        ),
-                    )
-                if observed is desired:
-                    effect = self._prepare(request, authority)
-                    self._mark_executing(effect.effect_id)
-                    return self._commit_confirmed(effect.effect_id, observed)
-
-            effect = self._prepare(request, authority)
-            self._mark_executing(effect.effect_id)
-            mutation_error = ""
-            mutation_confirmed = False
+            lease = self._acquire_add_lease(request)
+            progress = _ExternalMutationProgress()
+            completed = False
             try:
-                mutation_confirmed = self._remote.mutate(
-                    request.operation,
-                    chat_id=request.chat_id,
-                    app_id=authority.app_id,
-                ) is True
-                if not mutation_confirmed:
-                    mutation_error = "remote_unknown"
-            except MembershipRemoteRejected:
-                mutation_error = "remote_rejected"
-            except Exception:
-                mutation_error = "remote_unknown"
+                outcome = self._mutate_with_authority(
+                    request,
+                    authority,
+                    progress=progress,
+                )
+                completed = True
+                return outcome
+            except BaseException:
+                if progress.external_started and progress.effect_id:
+                    self._best_effort_terminal_disposition(progress.effect_id)
+                raise
+            finally:
+                if lease is not None and (
+                    completed
+                    or not progress.external_started
+                    or self._effect_is_terminal(progress.effect_id)
+                ):
+                    lease.release()
+
+    def _acquire_add_lease(
+        self,
+        request: MembershipMutationRequest,
+    ) -> EmployeeExternalMutationLease | None:
+        gate = self._external_mutation_gate
+        if gate is None:
+            return None
+        try:
+            return gate.acquire(
+                request.tenant_key,
+                request.agent_id,
+                ExternalMutationKind.MEMBERSHIP_ADD,
+            )
+        except ExternalMutationFenced:
+            raise MembershipBindingError("employee is retiring") from None
+
+    def _mutate_with_authority(
+        self,
+        request: MembershipMutationRequest,
+        authority: _Authority,
+        *,
+        progress: _ExternalMutationProgress | None = None,
+    ) -> MembershipMutationOutcome:
+        progress = progress or _ExternalMutationProgress()
+        desired = request.operation is MembershipOperation.ADD
+        desired_state = (
+            MembershipState.ACTIVE if desired else MembershipState.ABSENT
+        )
+        projected = request.chat_id in authority.member_groups
+        record = self.get(
+            request.tenant_key,
+            request.chat_id,
+            request.agent_id,
+        )
+        if (
+            projected is desired
+            and record is not None
+            and record.state is desired_state
+            and record.confirmed_state is desired_state
+        ):
+            return MembershipMutationOutcome(
+                state=desired_state,
+                confirmed=True,
+                changed=False,
+            )
+
+        if projected is desired:
             try:
                 observed = self._observe(request, authority)
             except MembershipRemoteUnknown:
-                # A strict successful create/delete response (including empty
-                # invalid/pending lists) is direct remote evidence.  The
-                # follow-up employee probe is defense in depth and can be
-                # temporarily unavailable while an existing app's scopes are
-                # being upgraded.
-                if mutation_confirmed:
-                    return self._commit_confirmed(effect.effect_id, desired)
+                effect = self._prepare(request, authority)
+                progress.effect_id = effect.effect_id
+                self._mark_executing(effect.effect_id)
                 return self._mark_action_required(
                     effect.effect_id,
-                    mutation_error or "remote_unknown",
+                    (
+                        "remote_unknown"
+                        if record is not None
+                        and record.state is MembershipState.DEGRADED
+                        else "idempotency_observation_unknown"
+                    ),
                 )
             if observed is desired:
+                effect = self._prepare(request, authority)
+                progress.effect_id = effect.effect_id
+                self._mark_executing(effect.effect_id)
                 return self._commit_confirmed(effect.effect_id, observed)
+
+        effect = self._prepare(request, authority)
+        progress.effect_id = effect.effect_id
+        self._mark_executing(effect.effect_id)
+        mutation_error = ""
+        mutation_confirmed = False
+        try:
+            progress.external_started = True
+            mutation_confirmed = self._remote.mutate(
+                request.operation,
+                chat_id=request.chat_id,
+                app_id=authority.app_id,
+            ) is True
+            if not mutation_confirmed:
+                mutation_error = "remote_unknown"
+        except MembershipRemoteRejected:
+            mutation_error = "remote_rejected"
+        except Exception:
+            mutation_error = "remote_unknown"
+        try:
+            observed = self._observe(request, authority)
+        except MembershipRemoteUnknown:
+            # A strict successful create/delete response (including empty
+            # invalid/pending lists) is direct remote evidence.  The
+            # follow-up employee probe is defense in depth and can be
+            # temporarily unavailable while an existing app's scopes are
+            # being upgraded.
+            if mutation_confirmed:
+                return self._commit_confirmed(effect.effect_id, desired)
             return self._mark_action_required(
                 effect.effect_id,
-                mutation_error or "observation_mismatch",
+                mutation_error or "remote_unknown",
             )
+        if observed is desired:
+            return self._commit_confirmed(effect.effect_id, observed)
+        return self._mark_action_required(
+            effect.effect_id,
+            mutation_error or "observation_mismatch",
+        )
+
+    def _effect_is_terminal(self, effect_id: str) -> bool:
+        if not effect_id:
+            return False
+        try:
+            self.rebuild_projection()
+            effect = self._state.effects.get(effect_id)
+            return effect is not None and effect.state.terminal
+        except Exception:
+            return False
+
+    def _best_effort_terminal_disposition(self, effect_id: str) -> None:
+        if self._effect_is_terminal(effect_id):
+            return
+        try:
+            self._mark_action_required(effect_id, "terminal_anchor_failed")
+        except Exception:
+            # Without a durable terminal fact the active lease intentionally
+            # remains held.  Restart replay will retain the EXECUTING cleanup
+            # obligation instead of allowing retirement to miss it.
+            return
 
     def retire_all(
         self,
@@ -344,18 +430,258 @@ class EmployeeMembershipService:
             or employee.worker_type is not WorkerType.VISIBLE
         ):
             raise MembershipBindingError("retiring employee membership authority unavailable")
-        return tuple(
-            self.mutate(
-                MembershipMutationRequest(
-                    tenant_key=tenant_key,
-                    chat_id=chat_id,
-                    agent_id=agent_id,
-                    requester_principal_id=requester_principal_id,
-                    operation=MembershipOperation.REMOVE,
+        self.rebuild_projection()
+        with self._mutex:
+            historical_targets = {
+                record.chat_id
+                for record in self._state.records.values()
+                if record.tenant_key == tenant_key
+                and record.agent_id == agent_id
+            }
+        targets = tuple(sorted(set(employee.member_groups) | historical_targets))
+        outcomes: list[MembershipMutationOutcome] = []
+        for chat_id in targets:
+            self._dispose_pending_retirement_effect(
+                tenant_key=tenant_key,
+                chat_id=chat_id,
+                agent_id=agent_id,
+            )
+            outcomes.append(
+                self._force_retirement_remove(
+                    MembershipMutationRequest(
+                        tenant_key=tenant_key,
+                        chat_id=chat_id,
+                        agent_id=agent_id,
+                        requester_principal_id=requester_principal_id,
+                        operation=MembershipOperation.REMOVE,
+                    )
                 )
             )
-            for chat_id in employee.member_groups
+        return tuple(outcomes)
+
+    def _force_retirement_remove(
+        self,
+        request: MembershipMutationRequest,
+    ) -> MembershipMutationOutcome:
+        """Dispatch an idempotent REMOVE and anchor fresh retirement evidence."""
+
+        with self._chat_lock(request.chat_id):
+            authority = self._resolve_authority(request)
+            effect = self._prepare(request, authority)
+            self._mark_executing(effect.effect_id)
+            try:
+                self._remote.mutate(
+                    MembershipOperation.REMOVE,
+                    chat_id=request.chat_id,
+                    app_id=authority.app_id,
+                )
+            except MembershipRemoteRejected:
+                pass
+            except Exception:
+                pass
+            try:
+                observed = self._observe(request, authority)
+            except MembershipRemoteUnknown:
+                return self._mark_action_required(
+                    effect.effect_id,
+                    "retirement_remove_unknown",
+                )
+            if observed is False:
+                return self._commit_confirmed(effect.effect_id, False)
+            return self._mark_action_required(
+                effect.effect_id,
+                "retirement_remove_unconfirmed",
+            )
+
+    def _dispose_pending_retirement_effect(
+        self,
+        *,
+        tenant_key: str,
+        chat_id: str,
+        agent_id: str,
+    ) -> None:
+        with self._chat_lock(chat_id):
+            self.rebuild_projection()
+            record = self._state.records.get((tenant_key, chat_id, agent_id))
+            effect = (
+                self._state.effects.get(record.current_effect_id)
+                if record is not None
+                else None
+            )
+            if effect is not None and not effect.state.terminal:
+                self._mark_action_required(
+                    effect.effect_id,
+                    "retirement_requested",
+                )
+
+    def retirement_confirmed_empty(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+    ) -> bool:
+        """Prove every projected or historical team target is absent."""
+
+        self.rebuild_projection()
+        projection = self._hire.synchronize_projection()
+        employee = projection.employees.get(agent_id)
+        if employee is None or employee.tenant_key != tenant_key:
+            return False
+        if employee.member_groups:
+            return False
+        retirement_started = employee.state in {
+            EmployeeState.RETIRING,
+            EmployeeState.ACTION_REQUIRED,
+            EmployeeState.ARCHIVED,
+        }
+        if not retirement_started:
+            return False
+        retirement_sequence = self._retirement_start_sequence(
+            tenant_key,
+            agent_id,
         )
+        effect_sequences = self._membership_effect_terminal_sequences(
+            tenant_key,
+            agent_id,
+        )
+        effect_last_sequences = self._membership_effect_last_sequences(
+            tenant_key,
+            agent_id,
+        )
+        with self._mutex:
+            effects = tuple(
+                effect
+                for effect in self._state.effects.values()
+                if effect.tenant_key == tenant_key
+                and effect.agent_id == agent_id
+            )
+            records = tuple(
+                record
+                for record in self._state.records.values()
+                if record.tenant_key == tenant_key
+                and record.agent_id == agent_id
+            )
+            for record in records:
+                effect = self._state.effects.get(record.current_effect_id)
+                if (
+                    effect is None
+                    or effect.operation is not MembershipOperation.REMOVE
+                    or effect.state is not MembershipEffectState.COMMITTED
+                    or record.state is not MembershipState.ABSENT
+                    or record.confirmed_state is not MembershipState.ABSENT
+                ):
+                    return False
+                if (
+                    retirement_sequence is None
+                    or effect_sequences.get(effect.effect_id, 0)
+                    <= retirement_sequence
+                ):
+                    return False
+            for add_effect in effects:
+                if add_effect.operation is not MembershipOperation.ADD:
+                    continue
+                if not self._add_effect_causally_settled(add_effect):
+                    return False
+                cutoff = max(
+                    retirement_sequence or 0,
+                    effect_last_sequences.get(add_effect.effect_id, 0),
+                )
+                if not any(
+                    remove_effect.operation is MembershipOperation.REMOVE
+                    and remove_effect.chat_id == add_effect.chat_id
+                    and remove_effect.state is MembershipEffectState.COMMITTED
+                    and effect_sequences.get(remove_effect.effect_id, 0) > cutoff
+                    for remove_effect in effects
+                ):
+                    return False
+        return True
+
+    def _add_effect_causally_settled(self, effect: MembershipEffect) -> bool:
+        """Prove an ADD cannot become effective after retirement's REMOVE."""
+
+        if effect.state is MembershipEffectState.COMMITTED:
+            return True
+        executed = any(
+            event.event_type == EFFECT_EXECUTING
+            and event.aggregate_id == effect.effect_id
+            for frame in self._writer.replay()
+            for event in frame.events
+        )
+        if not executed:
+            return True
+        # These EXECUTING records are observation-only probes or an explicit
+        # remote rejection; no asynchronous ADD request was accepted.
+        return effect.state is MembershipEffectState.ACTION_REQUIRED and (
+            effect.error_code
+            in {
+                "event_observation_unknown",
+                "event_observed_absent",
+                "idempotency_observation_unknown",
+                "prepared_recovery_unknown",
+                "remote_rejected",
+            }
+        )
+
+    def _retirement_start_sequence(
+        self,
+        tenant_key: str,
+        agent_id: str,
+    ) -> int | None:
+        sequence: int | None = None
+        for frame in self._writer.replay():
+            if any(
+                (
+                    event.event_type == "employee.external_mutation_fenced"
+                    and event.payload.get("tenant_key") == tenant_key
+                    and event.payload.get("agent_id") == agent_id
+                )
+                or (
+                    event.event_type == "employee.state_changed"
+                    and event.aggregate_id == agent_id
+                    and event.payload.get("state") == EmployeeState.RETIRING.value
+                )
+                for event in frame.events
+            ):
+                sequence = frame.sequence if sequence is None else min(sequence, frame.sequence)
+        return sequence
+
+    def _membership_effect_terminal_sequences(
+        self,
+        tenant_key: str,
+        agent_id: str,
+    ) -> dict[str, int]:
+        identities = {
+            effect.effect_id
+            for effect in self._state.effects.values()
+            if effect.tenant_key == tenant_key and effect.agent_id == agent_id
+        }
+        sequences: dict[str, int] = {}
+        for frame in self._writer.replay():
+            for event in frame.events:
+                effect_id = event.payload.get("effect_id")
+                if (
+                    event.event_type == EFFECT_COMMITTED
+                    and effect_id in identities
+                ):
+                    sequences[effect_id] = frame.sequence
+        return sequences
+
+    def _membership_effect_last_sequences(
+        self,
+        tenant_key: str,
+        agent_id: str,
+    ) -> dict[str, int]:
+        identities = {
+            effect.effect_id
+            for effect in self._state.effects.values()
+            if effect.tenant_key == tenant_key and effect.agent_id == agent_id
+        }
+        sequences: dict[str, int] = {}
+        for frame in self._writer.replay():
+            for event in frame.events:
+                if event.aggregate_id in identities:
+                    sequences[event.aggregate_id] = frame.sequence
+        return sequences
 
     def reconcile_event(
         self,
@@ -412,47 +738,67 @@ class EmployeeMembershipService:
                     else MembershipOperation.REMOVE
                 ),
             )
+            # The live observation may contradict the unordered event and
+            # prove an ADD.  Acquire the ADD capability before probing, then
+            # hold it until any resulting durable membership fact is anchored.
+            lease = self._acquire_add_lease(
+                replace(probe, operation=MembershipOperation.ADD)
+            )
+            prior_record = self.get(tenant_key, chat_id, agent_id)
+            effect: MembershipEffect | None = None
             try:
-                observed = self._observe(probe, authority)
-            except MembershipRemoteUnknown:
-                stable_state = (
-                    MembershipState.ACTIVE if observed_is_member else MembershipState.ABSENT
-                )
-                current = self.get(tenant_key, chat_id, agent_id)
-                if (
-                    current is not None
-                    and current.state is stable_state
-                    and (chat_id in employee.member_groups) is observed_is_member
-                ):
-                    return MembershipMutationOutcome(
-                        state=stable_state,
-                        confirmed=True,
-                        changed=False,
-                    )
-                # An unordered/replayed event is not enough to rewrite the
-                # durable membership projection. Keep the desired transition
-                # degraded until either a live employee probe or a strict
-                # create/delete API response confirms it.
-                effect = self._prepare(probe, authority)
+                # Anchor the possible positive fact before the live probe.  If
+                # observation discovers membership, Fire already has a durable
+                # chat cleanup target before this lease can be released.
+                add_probe = replace(probe, operation=MembershipOperation.ADD)
+                effect = self._prepare(add_probe, authority)
                 self._mark_executing(effect.effect_id)
-                return self._mark_action_required(
+                try:
+                    observed = self._observe(probe, authority)
+                except MembershipRemoteUnknown:
+                    stable_state = (
+                        MembershipState.ACTIVE
+                        if observed_is_member
+                        else MembershipState.ABSENT
+                    )
+                    if (
+                        prior_record is not None
+                        and prior_record.state is stable_state
+                        and prior_record.confirmed_state is stable_state
+                        and (chat_id in employee.member_groups)
+                        is observed_is_member
+                    ):
+                        committed = self._commit_confirmed(
+                            effect.effect_id,
+                            observed_is_member,
+                        )
+                        return replace(committed, changed=False)
+                    return self._mark_action_required(
+                        effect.effect_id,
+                        "event_observation_unknown",
+                    )
+                if observed:
+                    return self._commit_confirmed(effect.effect_id, True)
+                self._mark_action_required(
                     effect.effect_id,
-                    "event_observation_unknown",
+                    "event_observed_absent",
                 )
-            operation = MembershipOperation.ADD if observed else MembershipOperation.REMOVE
-            request = replace(probe, operation=operation)
-            record = self.get(tenant_key, chat_id, agent_id)
-            projected = chat_id in employee.member_groups
-            desired_state = MembershipState.ACTIVE if observed else MembershipState.ABSENT
-            if projected is observed and record is not None and record.state is desired_state:
-                return MembershipMutationOutcome(
-                    state=desired_state,
-                    confirmed=True,
-                    changed=False,
+                removal = replace(probe, operation=MembershipOperation.REMOVE)
+                effect = self._prepare(removal, authority)
+                self._mark_executing(effect.effect_id)
+                return self._commit_confirmed(
+                    effect.effect_id,
+                    False,
                 )
-            effect = self._prepare(request, authority)
-            self._mark_executing(effect.effect_id)
-            return self._commit_confirmed(effect.effect_id, observed)
+            except BaseException:
+                if effect is not None:
+                    self._best_effort_terminal_disposition(effect.effect_id)
+                raise
+            finally:
+                # Event reconciliation only observes remote state; it
+                # never dispatches an ADD side effect.
+                if lease is not None:
+                    lease.release()
 
     def rebuild_projection(self) -> MembershipProjectionState:
         with self._mutex:
@@ -485,8 +831,20 @@ class EmployeeMembershipService:
                     )
                     recovered += 1
                     continue
+                lease: EmployeeExternalMutationLease | None = None
+                retirement_fenced = (
+                    effect.operation is MembershipOperation.ADD
+                    and self._external_mutation_gate is not None
+                    and self._external_mutation_gate.is_fenced(
+                        effect.tenant_key,
+                        effect.agent_id,
+                    )
+                )
                 try:
-                    authority = self._authority_for_effect(effect)
+                    authority = self._authority_for_effect(
+                        effect,
+                        allow_retiring_add_observation=retirement_fenced,
+                    )
                     request = MembershipMutationRequest(
                         tenant_key=effect.tenant_key,
                         chat_id=effect.chat_id,
@@ -494,21 +852,58 @@ class EmployeeMembershipService:
                         requester_principal_id=effect.requester_principal_id,
                         operation=effect.operation,
                     )
+                    if not retirement_fenced:
+                        try:
+                            lease = self._acquire_add_lease(request)
+                        except MembershipBindingError:
+                            gate = self._external_mutation_gate
+                            if (
+                                effect.operation is not MembershipOperation.ADD
+                                or gate is None
+                                or not gate.is_fenced(
+                                    effect.tenant_key,
+                                    effect.agent_id,
+                                )
+                            ):
+                                raise
+                            retirement_fenced = True
+                            authority = self._authority_for_effect(
+                                effect,
+                                allow_retiring_add_observation=True,
+                            )
                     observed = self._observe(request, authority)
                 except (MembershipBindingError, MembershipRemoteUnknown):
                     self._mark_action_required(
                         effect.effect_id,
-                        "recovery_observation_unknown",
+                        (
+                            "retirement_reconciliation_required"
+                            if retirement_fenced
+                            else "recovery_observation_unknown"
+                        ),
                     )
                 else:
                     desired = effect.operation is MembershipOperation.ADD
-                    if observed is desired:
+                    if retirement_fenced:
+                        # A fence forbids restoring an ADD projection from a
+                        # stale or late observation.  Preserve the chat as a
+                        # durable retirement cleanup target instead.
+                        self._mark_action_required(
+                            effect.effect_id,
+                            "retirement_reconciliation_required",
+                        )
+                    elif observed is desired:
                         self._commit_confirmed(effect.effect_id, observed)
                     else:
                         self._mark_action_required(
                             effect.effect_id,
                             "recovery_observation_mismatch",
                         )
+                finally:
+                    # Recovery performs observation only.  If its Journal
+                    # disposition fails, the original pending effect remains
+                    # a durable cleanup obligation.
+                    if lease is not None:
+                        lease.release()
                 recovered += 1
         return recovered
 
@@ -570,42 +965,27 @@ class EmployeeMembershipService:
                     operation=MembershipOperation.ADD,
                 )
                 try:
-                    observed = self._observe(request, authority)
-                except MembershipRemoteUnknown:
-                    record = self.get(tenant_key, chat_id, agent_id)
-                    if not (
-                        record is not None
-                        and record.state is MembershipState.DEGRADED
-                        and record.error_code == "recovery_observation_unknown"
-                    ):
-                        effect = self._prepare(request, authority)
-                        self._mark_executing(effect.effect_id)
-                        self._mark_action_required(
-                            effect.effect_id,
-                            "recovery_observation_unknown",
-                        )
+                    lease = self._acquire_add_lease(request)
+                except MembershipBindingError:
                     degraded += 1
                     continue
-                if observed:
-                    record = self.get(tenant_key, chat_id, agent_id)
-                    if not (
-                        record is not None
-                        and record.state is MembershipState.ACTIVE
-                        and record.confirmed_state is MembershipState.ACTIVE
-                    ):
-                        effect = self._prepare(request, authority)
-                        self._mark_executing(effect.effect_id)
-                        self._commit_confirmed(effect.effect_id, True)
+                try:
+                    result = self._audit_projected_membership(
+                        request,
+                        authority,
+                    )
+                finally:
+                    # Startup audit performs observation only; the lease
+                    # prevents a stale positive result from crossing a Fire
+                    # fence while its Journal disposition is committed.
+                    if lease is not None:
+                        lease.release()
+                if result == "confirmed":
                     confirmed += 1
-                    continue
-                removal = replace(
-                    request,
-                    operation=MembershipOperation.REMOVE,
-                )
-                effect = self._prepare(removal, authority)
-                self._mark_executing(effect.effect_id)
-                self._commit_confirmed(effect.effect_id, False)
-                removed += 1
+                elif result == "removed":
+                    removed += 1
+                else:
+                    degraded += 1
         return MembershipAuditSummary(
             checked=len(coordinates),
             confirmed=confirmed,
@@ -613,7 +993,58 @@ class EmployeeMembershipService:
             degraded=degraded,
         )
 
-    def _authority_for_effect(self, effect: MembershipEffect) -> _Authority:
+    def _audit_projected_membership(
+        self,
+        request: MembershipMutationRequest,
+        authority: _Authority,
+    ) -> str:
+        try:
+            observed = self._observe(request, authority)
+        except MembershipRemoteUnknown:
+            record = self.get(
+                request.tenant_key,
+                request.chat_id,
+                request.agent_id,
+            )
+            if not (
+                record is not None
+                and record.state is MembershipState.DEGRADED
+                and record.error_code == "recovery_observation_unknown"
+            ):
+                effect = self._prepare(request, authority)
+                self._mark_executing(effect.effect_id)
+                self._mark_action_required(
+                    effect.effect_id,
+                    "recovery_observation_unknown",
+                )
+            return "degraded"
+        if observed:
+            record = self.get(
+                request.tenant_key,
+                request.chat_id,
+                request.agent_id,
+            )
+            if not (
+                record is not None
+                and record.state is MembershipState.ACTIVE
+                and record.confirmed_state is MembershipState.ACTIVE
+            ):
+                effect = self._prepare(request, authority)
+                self._mark_executing(effect.effect_id)
+                self._commit_confirmed(effect.effect_id, True)
+            return "confirmed"
+        removal = replace(request, operation=MembershipOperation.REMOVE)
+        effect = self._prepare(removal, authority)
+        self._mark_executing(effect.effect_id)
+        self._commit_confirmed(effect.effect_id, False)
+        return "removed"
+
+    def _authority_for_effect(
+        self,
+        effect: MembershipEffect,
+        *,
+        allow_retiring_add_observation: bool = False,
+    ) -> _Authority:
         projection = self._hire.synchronize_projection()
         employee = projection.employees.get(effect.agent_id)
         if (
@@ -624,6 +1055,12 @@ class EmployeeMembershipService:
                 and not (
                     effect.operation is MembershipOperation.REMOVE
                     and employee.state in {EmployeeState.RETIRING, EmployeeState.ACTION_REQUIRED}
+                )
+                and not (
+                    allow_retiring_add_observation
+                    and effect.operation is MembershipOperation.ADD
+                    and employee.state
+                    in {EmployeeState.RETIRING, EmployeeState.ACTION_REQUIRED}
                 )
             )
             or employee.worker_type is not WorkerType.VISIBLE

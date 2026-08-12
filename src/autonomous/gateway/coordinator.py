@@ -48,6 +48,7 @@ from .env_scope import (
 from .models import (
     DispatchBinding,
     DispatchPermit,
+    EmployeeDispatchReportingDeferredError,
     GatewayExecutionResult,
     GatewayExecutionStatus,
 )
@@ -131,6 +132,35 @@ class FinalizedEmployeeAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class EmployeeDispatchReportingRecoveryResult:
+    """One reporting repair scan, including record-local retry obligations."""
+
+    recovered_count: int
+    deferred_attempt_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.recovered_count) is not int:
+            raise TypeError("recovered_count must be an integer")
+        if self.recovered_count < 0:
+            raise ValueError("recovered_count must be non-negative")
+        if type(self.deferred_attempt_ids) is not tuple:
+            raise TypeError("deferred_attempt_ids must be a tuple")
+        if any(
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or attempt_id != attempt_id.strip()
+            for attempt_id in self.deferred_attempt_ids
+        ):
+            raise ValueError("deferred_attempt_ids must contain non-empty identifiers")
+        if len(set(self.deferred_attempt_ids)) != len(self.deferred_attempt_ids):
+            raise ValueError("deferred_attempt_ids must be unique")
+
+    @property
+    def made_progress(self) -> bool:
+        return self.recovered_count > 0
+
+
+@dataclass(frozen=True, slots=True)
 class EmployeeCancellationOutcome:
     status: str
     attempt_id: str = ""
@@ -171,6 +201,22 @@ class EmployeeAttemptLifecycle(Protocol):
         binding: DispatchBinding,
         result: GatewayExecutionResult,
     ) -> object: ...
+
+    def terminal_response_delivered(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        attempt_id: str,
+    ) -> bool: ...
+
+    def employee_responses_delivered(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        attempt_ids: frozenset[str],
+    ) -> bool: ...
 
 
 class EmployeeDispatchCoordinator:
@@ -244,6 +290,205 @@ class EmployeeDispatchCoordinator:
     def state(self) -> GatewayProjectionState:
         with self._projection_sync_lock:
             return self._gateway_state.clone()
+
+    def begin_employee_retirement(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+    ) -> int:
+        """Fence queued work for one retiring employee at dispatch commit."""
+
+        self._validate_employee_coordinates(tenant_key, agent_id)
+        for _attempt in range(3):
+            captured_head = self._presynchronize_domains()
+            try:
+                with team_runtime_guard(), self._dispatch_commit_guard(captured_head):
+                    queued = tuple(
+                        sorted(
+                            (
+                                record
+                                for record in self._router.state.by_acceptance_id.values()
+                                if record.tenant_key == tenant_key
+                                and record.agent_id == agent_id
+                                and record.state == "queued"
+                            ),
+                            key=lambda record: (
+                                record.queued_sequence,
+                                record.acceptance_id,
+                            ),
+                        )
+                    )
+                    if not queued:
+                        return 0
+                    events = tuple(
+                        self._router.preflight_rejection_event_unlocked(
+                            acceptance_id=record.acceptance_id,
+                            reason_code="context_unavailable",
+                        )
+                        for record in queued
+                    )
+                    result = self._commit_events_unlocked(events)
+                    self._apply_committed_frame_unlocked(result.frame)
+                    return len(events)
+            except _ProjectionHeadChanged:
+                continue
+        raise EmployeeDispatchError("employee retirement head remained unstable")
+
+    def employee_retirement_ready(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+    ) -> bool:
+        """Prove terminal response obligations before Channel retirement."""
+
+        self._validate_employee_coordinates(tenant_key, agent_id)
+        for _attempt in range(3):
+            captured_head = self._presynchronize_domains()
+            with self._projection_sync_lock:
+                gateway = self._gateway_state.clone()
+            router = self._router.state.clone()
+            with self._ingress.employee_dispatch_guard():
+                ingress_by_acceptance_id = dict(self._ingress.state.by_acceptance_id)
+            try:
+                self._require_presynchronized_head(captured_head)
+            except _ProjectionHeadChanged:
+                continue
+            matching_attempts = tuple(
+                attempt
+                for attempt in gateway.attempts.values()
+                if attempt.binding.tenant_key == tenant_key and attempt.binding.agent_id == agent_id
+            )
+            if any(not attempt.terminal_status for attempt in matching_attempts):
+                return False
+            ingress_records = tuple(
+                record
+                for record in ingress_by_acceptance_id.values()
+                if record.metadata.tenant_key == tenant_key and record.metadata.agent_id == agent_id
+            )
+            if any(not record.terminal for record in ingress_records):
+                return False
+            router_records = tuple(
+                record
+                for record in router.by_acceptance_id.values()
+                if record.tenant_key == tenant_key and record.agent_id == agent_id
+            )
+            for record in router_records:
+                if record.state in {"queued", "dispatching"}:
+                    return False
+                if record.state in {"accepted", "authorized", "staging"}:
+                    continue
+                if record.state != "terminal":
+                    return False
+                ingress_record = ingress_by_acceptance_id.get(record.acceptance_id)
+                if ingress_record is None or not ingress_record.terminal:
+                    return False
+                attempt_id = gateway.attempt_by_acceptance_id.get(
+                    record.acceptance_id,
+                    "",
+                )
+                if attempt_id:
+                    attempt = gateway.attempts.get(attempt_id)
+                    if attempt is None or not attempt.terminal_status:
+                        return False
+                    if not self._terminal_response_delivered(
+                        tenant_key=tenant_key,
+                        agent_id=agent_id,
+                        attempt_id=attempt_id,
+                    ):
+                        return False
+                    continue
+                if record.reason_code in {
+                    "completed",
+                    "failed",
+                    "canceled",
+                    "timeout",
+                    "action_required",
+                }:
+                    return False
+                if record.event_type != "im.message.receive_v1":
+                    continue
+                disposition = None if ingress_record is None else ingress_record.disposition
+                if (
+                    disposition is None
+                    or disposition.state != "terminal"
+                    or disposition.reason_code != record.reason_code
+                    or (
+                        record.queued_sequence > 0
+                        and not self._terminal_response_delivered(
+                            tenant_key=tenant_key,
+                            agent_id=agent_id,
+                            attempt_id=f"control_{record.acceptance_id}",
+                        )
+                    )
+                ):
+                    return False
+            expected_response_ids = frozenset(
+                {attempt.binding.attempt_id for attempt in matching_attempts}
+                | {
+                    f"control_{record.acceptance.acceptance_id}"
+                    for record in ingress_records
+                    if record.metadata.event_type == "im.message.receive_v1"
+                }
+            )
+            if not self._employee_responses_delivered(
+                tenant_key=tenant_key,
+                agent_id=agent_id,
+                attempt_ids=expected_response_ids,
+            ):
+                return False
+            try:
+                self._require_presynchronized_head(captured_head)
+            except _ProjectionHeadChanged:
+                continue
+            return True
+        raise EmployeeDispatchError("employee retirement head remained unstable")
+
+    def _employee_responses_delivered(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        attempt_ids: frozenset[str],
+    ) -> bool:
+        lifecycle = self._attempt_lifecycle
+        delivered = getattr(lifecycle, "employee_responses_delivered", None)
+        if not callable(delivered):
+            return False
+        return (
+            delivered(
+                tenant_key=tenant_key,
+                agent_id=agent_id,
+                attempt_ids=attempt_ids,
+            )
+            is True
+        )
+
+    def _terminal_response_delivered(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        attempt_id: str,
+    ) -> bool:
+        lifecycle = self._attempt_lifecycle
+        delivered = getattr(lifecycle, "terminal_response_delivered", None)
+        if not callable(delivered):
+            return False
+        return (
+            delivered(
+                tenant_key=tenant_key,
+                agent_id=agent_id,
+                attempt_id=attempt_id,
+            )
+            is True
+        )
+
+    @staticmethod
+    def _validate_employee_coordinates(tenant_key: str, agent_id: str) -> None:
+        if any(not isinstance(value, str) or not value or value != value.strip() for value in (tenant_key, agent_id)):
+            raise ValueError("employee retirement coordinates are required")
 
     def scoped_attempt_status(
         self,
@@ -1019,7 +1264,6 @@ class EmployeeDispatchCoordinator:
             ended_at=ended_at,
         )
         staged = self._data.stage_history_payload(record, payload)
-        anchored = False
         try:
             for _attempt in range(3):
                 captured_head = self._presynchronize_domains()
@@ -1054,7 +1298,6 @@ class EmployeeDispatchCoordinator:
                             commit = self._commit_events_unlocked(
                                 (history_event, terminal_event, router_event)
                             )
-                            anchored = True
                             self._apply_committed_frame_unlocked(commit.frame)
                             return FinalizedEmployeeAttempt(
                                 attempt_id,
@@ -1068,8 +1311,10 @@ class EmployeeDispatchCoordinator:
                     continue
             raise EmployeeDispatchError("employee terminal head remained unstable")
         except Exception:
-            if not anchored:
-                self._data.quarantine_staged_history(staged)
+            # This only releases the in-flight reservation.  Blob isolation is
+            # deferred to Data's anchor-bounded verified hygiene, so an
+            # ambiguous FileAnchor outcome cannot delete an anchored payload.
+            self._data.quarantine_staged_history(staged)
             raise
 
     @staticmethod
@@ -1094,19 +1339,49 @@ class EmployeeDispatchCoordinator:
     def recover_incomplete_attempts(self) -> tuple[FinalizedEmployeeAttempt, ...]:
         """Reconcile Actor facts, then terminalize unknowns without re-execution."""
 
+        recovered, deferred_attempt_ids, first_deferred = (
+            self._recover_incomplete_attempts_batch()
+        )
+        if deferred_attempt_ids:
+            raise EmployeeDispatchReportingDeferredError(
+                "employee dispatch recovery has deferred reporting attempts",
+                failed_attempt_ids=deferred_attempt_ids,
+                repaired_count=len(recovered),
+            ) from first_deferred
+        return recovered
+
+    def _recover_incomplete_attempts_batch(
+        self,
+    ) -> tuple[
+        tuple[FinalizedEmployeeAttempt, ...],
+        tuple[str, ...],
+        EmployeeDispatchReportingDeferredError | None,
+    ]:
         self._synchronize_gateway_from_journal()
         pending = tuple(
             attempt_id
             for attempt_id, record in self._gateway_state.attempts.items()
             if record.dispatch_committed and not record.terminal_status
         )
-        return tuple(
-            self.finalize_attempt(
-                attempt_id,
-                self._recovered_execution_result(attempt_id),
-            )
-            for attempt_id in pending
-        )
+        recovered: list[FinalizedEmployeeAttempt] = []
+        deferred_attempt_ids: list[str] = []
+        first_deferred: EmployeeDispatchReportingDeferredError | None = None
+        for attempt_id in pending:
+            try:
+                recovered.append(
+                    self.finalize_attempt(
+                        attempt_id,
+                        self._recovered_execution_result(attempt_id),
+                    )
+                )
+            except EmployeeDispatchReportingDeferredError as exc:
+                # This exception is an explicit record-local contract.  Keep
+                # scanning so one missing/corrupt response cannot prevent later
+                # unknown attempts from reaching a durable terminal state.
+                deferred_attempt_ids.append(attempt_id)
+                if first_deferred is None:
+                    first_deferred = exc
+        return tuple(recovered), tuple(deferred_attempt_ids), first_deferred
 
     def _recovered_execution_result(
         self,
@@ -1147,31 +1422,71 @@ class EmployeeDispatchCoordinator:
     def reconcile_terminal_snapshots(self) -> int:
         """Re-emit terminal lifecycle facts without executing ACP."""
 
+        reconciled, deferred_attempt_ids, first_deferred = (
+            self._reconcile_terminal_snapshots_batch()
+        )
+        if deferred_attempt_ids:
+            raise EmployeeDispatchReportingDeferredError(
+                "employee terminal snapshot reconciliation has deferred attempts",
+                failed_attempt_ids=deferred_attempt_ids,
+                repaired_count=reconciled,
+            ) from first_deferred
+        return reconciled
+
+    def _reconcile_terminal_snapshots_batch(
+        self,
+    ) -> tuple[int, tuple[str, ...], EmployeeDispatchReportingDeferredError | None]:
         if self._attempt_lifecycle is None:
-            return 0
+            return 0, (), None
         self._data.rebuild_projection()
         self._synchronize_gateway_from_journal()
         reconciled = 0
+        deferred_attempt_ids: list[str] = []
+        first_deferred: EmployeeDispatchReportingDeferredError | None = None
         for lifecycle in tuple(self._gateway_state.attempts.values()):
             if not lifecycle.terminal_status:
                 continue
-            payload = self._data.get_history_payload(lifecycle.history_record_id)
-            status = GatewayExecutionStatus(lifecycle.terminal_status)
-            completed = status is GatewayExecutionStatus.COMPLETED
-            result = GatewayExecutionResult(
-                status=status,
-                output=payload.result_text if completed else "",
-                safe_error_code="" if completed else payload.error_detail,
-            )
-            if status is GatewayExecutionStatus.COMPLETED:
-                self._publish_completed_artifacts(
-                    lifecycle.binding,
-                    result,
-                    request_text=payload.request_text,
+            try:
+                payload = self._data.get_history_payload(lifecycle.history_record_id)
+                status = GatewayExecutionStatus(lifecycle.terminal_status)
+                completed = status is GatewayExecutionStatus.COMPLETED
+                result = GatewayExecutionResult(
+                    status=status,
+                    output=payload.result_text if completed else "",
+                    safe_error_code="" if completed else payload.error_detail,
                 )
-            self._attempt_lifecycle.terminal(lifecycle.binding, result)
-            reconciled += 1
-        return reconciled
+                if status is GatewayExecutionStatus.COMPLETED:
+                    self._publish_completed_artifacts(
+                        lifecycle.binding,
+                        result,
+                        request_text=payload.request_text,
+                    )
+                self._attempt_lifecycle.terminal(lifecycle.binding, result)
+                reconciled += 1
+            except EmployeeDispatchReportingDeferredError as exc:
+                # Only the explicit attempt-local marker is isolatable.  Any
+                # unknown exception (including programming errors) propagates
+                # immediately instead of being mislabeled as retryable.
+                deferred_attempt_ids.append(lifecycle.binding.attempt_id)
+                if first_deferred is None:
+                    first_deferred = exc
+        return reconciled, tuple(deferred_attempt_ids), first_deferred
+
+    def repair_reporting(self) -> EmployeeDispatchReportingRecoveryResult:
+        """Repair all attempts without letting a typed poison record block peers."""
+
+        recovered, recovery_deferred, _recovery_error = (
+            self._recover_incomplete_attempts_batch()
+        )
+        reconciled, snapshot_deferred, _snapshot_error = (
+            self._reconcile_terminal_snapshots_batch()
+        )
+        return EmployeeDispatchReportingRecoveryResult(
+            recovered_count=len(recovered) + reconciled,
+            deferred_attempt_ids=_unique_attempt_ids(
+                (*recovery_deferred, *snapshot_deferred)
+            ),
+        )
 
     def _publish_completed_artifacts(
         self,
@@ -1520,6 +1835,10 @@ def _stable_hash(namespace: str, value: str) -> str:
     return hashlib.sha256(f"{namespace}\0{value}".encode()).hexdigest()
 
 
+def _unique_attempt_ids(attempt_ids) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(attempt_ids))
+
+
 def _result_digest(result: GatewayExecutionResult) -> str:
     encoded = json.dumps(
         {
@@ -1537,6 +1856,8 @@ __all__ = [
     "EmployeeCancellationOutcome",
     "EmployeeDispatchCoordinator",
     "EmployeeDispatchError",
+    "EmployeeDispatchReportingDeferredError",
+    "EmployeeDispatchReportingRecoveryResult",
     "EmployeeScopedAttemptStatus",
     "FinalizedEmployeeAttempt",
     "PreparedEmployeeDispatch",

@@ -17,7 +17,7 @@ from .models import (
     employee_outbox_uuid,
 )
 from .projection import OutboxRecord
-from .service import EmployeeOutboxService
+from .service import EmployeeOutboxService, OutboxDeadlineExceededError
 
 logger = logging.getLogger(__name__)
 
@@ -127,20 +127,17 @@ class EmployeeOutboxDeliveryCoordinator:
         revisits that record on a later call.
         """
 
-        if (
-            type(max_items) is not int
-            or max_items < 1
-            or max_items > _MAX_PENDING_DELIVERY_BATCH
-        ):
-            raise ValueError(
-                f"max_items must be between 1 and {_MAX_PENDING_DELIVERY_BATCH}"
-            )
+        if type(max_items) is not int or max_items < 1 or max_items > _MAX_PENDING_DELIVERY_BATCH:
+            raise ValueError(f"max_items must be between 1 and {_MAX_PENDING_DELIVERY_BATCH}")
         self._validate_deadline(deadline)
-        with self._delivery_lock:
-            return self._deliver_pending_locked(
-                max_items=max_items,
-                deadline=deadline,
-            )
+        try:
+            with self._deadline_lock(deadline):
+                return self._deliver_pending_locked(
+                    max_items=max_items,
+                    deadline=deadline,
+                )
+        except OutboxDeadlineExceededError as exc:
+            raise EmployeeOutboxDrainDeadlineExceeded(str(exc)) from exc
 
     def _deliver_pending_locked(
         self,
@@ -149,7 +146,10 @@ class EmployeeOutboxDeliveryCoordinator:
         deadline: float | None,
     ) -> EmployeeOutboxDrainResult:
         self._raise_if_deadline_expired(deadline)
-        pending = self._outbox.list_pending_delivery_records()
+        pending = self._call_outbox(
+            self._outbox.list_pending_delivery_records,
+            deadline=deadline,
+        )
         self._raise_if_deadline_expired(deadline)
         if not pending:
             self._pending_outbox_ids.clear()
@@ -211,8 +211,15 @@ class EmployeeOutboxDeliveryCoordinator:
         deadline: float | None = None,
     ) -> EmployeeOutboxBinding | None:
         self._validate_deadline(deadline)
-        with self._delivery_lock:
-            return self._deliver_locked(outbox_id, snapshot_version, deadline)
+        try:
+            with self._deadline_lock(deadline):
+                return self._deliver_locked(
+                    outbox_id,
+                    snapshot_version,
+                    deadline,
+                )
+        except OutboxDeadlineExceededError as exc:
+            raise EmployeeOutboxDrainDeadlineExceeded(str(exc)) from exc
 
     def _deliver_locked(
         self,
@@ -221,21 +228,47 @@ class EmployeeOutboxDeliveryCoordinator:
         deadline: float | None,
     ) -> EmployeeOutboxBinding | None:
         self._raise_if_deadline_expired(deadline)
-        record = self._outbox.get_record(outbox_id)
+        record = self._call_outbox(
+            self._outbox.get_record,
+            outbox_id,
+            deadline=deadline,
+        )
         version = record.latest_version if snapshot_version is None else snapshot_version
         if record.binding is not None and record.binding.bound_snapshot_version >= version:
             return record.binding
-        effect = self._outbox.prepare_delivery(outbox_id, version)
+        effect = self._call_outbox(
+            self._outbox.prepare_delivery,
+            outbox_id,
+            version,
+            deadline=deadline,
+        )
         if effect.state is DeliveryEffectState.COMMITTED:
-            return self._outbox.get_record(outbox_id).binding
+            return self._call_outbox(
+                self._outbox.get_record,
+                outbox_id,
+                deadline=deadline,
+            ).binding
         if effect.state is DeliveryEffectState.PREPARED:
-            effect = self._outbox.mark_effect_executing(effect.effect_id)
+            effect = self._call_outbox(
+                self._outbox.mark_effect_executing,
+                effect.effect_id,
+                deadline=deadline,
+            )
         if effect.state is not DeliveryEffectState.EXECUTING:
             raise RuntimeError("Outbox delivery effect is not executable")
         version = effect.snapshot_version
-        snapshot = self._outbox.get_snapshot(outbox_id, version)
+        snapshot = self._call_outbox(
+            self._outbox.get_snapshot,
+            outbox_id,
+            version,
+            deadline=deadline,
+        )
 
-        record = self._outbox.get_record(outbox_id)
+        record = self._call_outbox(
+            self._outbox.get_record,
+            outbox_id,
+            deadline=deadline,
+        )
         authority = self._authority_resolver(record)
         if not isinstance(authority, EmployeeDeliveryAuthority):
             raise RuntimeError("employee delivery authority is unavailable")
@@ -260,9 +293,7 @@ class EmployeeOutboxDeliveryCoordinator:
                     send_kwargs["deadline"] = deadline
                 receipt = self._channels.send(record.agent_id, **send_kwargs)
             except (EmployeeChannelOutboundError, ConnectionError, TimeoutError) as exc:
-                raise EmployeeOutboxItemDeliveryError(
-                    "employee delivery transport is unavailable"
-                ) from exc
+                raise EmployeeOutboxItemDeliveryError("employee delivery transport is unavailable") from exc
         else:
             try:
                 update_kwargs: dict[str, Any] = {
@@ -277,35 +308,55 @@ class EmployeeOutboxDeliveryCoordinator:
                     **update_kwargs,
                 )
             except (EmployeeChannelOutboundError, ConnectionError, TimeoutError) as exc:
-                raise EmployeeOutboxItemDeliveryError(
-                    "employee delivery transport is unavailable"
-                ) from exc
+                raise EmployeeOutboxItemDeliveryError("employee delivery transport is unavailable") from exc
         self._validate_receipt(receipt, authority, record.binding)
-        return self._outbox.commit_delivery(
+        return self._call_outbox(
+            self._outbox.commit_delivery,
             effect.effect_id,
             app_id=receipt.app_id,
             generation=receipt.generation,
             connection_id=receipt.connection_id,
             message_id=receipt.message_id,
+            deadline=deadline,
+        )
+
+    @staticmethod
+    def _call_outbox(
+        operation: Callable[..., Any],
+        *args: object,
+        deadline: float | None,
+        **kwargs: object,
+    ) -> Any:
+        """Keep the pre-deadline call shape for narrow injected test doubles."""
+
+        if deadline is not None:
+            kwargs["deadline"] = deadline
+        return operation(*args, **kwargs)
+
+    def _deadline_lock(self, deadline: float | None):
+        """Acquire the coordinator lock within the caller's shared deadline."""
+
+        if deadline is None:
+            return self._delivery_lock
+        remaining = float(deadline) - time.monotonic()
+        if remaining <= 0:
+            raise EmployeeOutboxDrainDeadlineExceeded("employee Outbox delivery lock deadline exceeded")
+        return _AcquiredDeliveryLock(
+            self._delivery_lock,
+            min(remaining, threading.TIMEOUT_MAX),
         )
 
     @staticmethod
     def _validate_deadline(deadline: float | None) -> None:
         if deadline is None:
             return
-        if (
-            isinstance(deadline, bool)
-            or not isinstance(deadline, (int, float))
-            or not math.isfinite(float(deadline))
-        ):
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(float(deadline)):
             raise ValueError("employee Outbox delivery deadline is invalid")
 
     @staticmethod
     def _raise_if_deadline_expired(deadline: float | None) -> None:
         if deadline is not None and time.monotonic() >= float(deadline):
-            raise EmployeeOutboxDrainDeadlineExceeded(
-                "employee Outbox delivery deadline exceeded"
-            )
+            raise EmployeeOutboxDrainDeadlineExceeded("employee Outbox delivery deadline exceeded")
 
     @staticmethod
     def _validate_receipt(
@@ -323,9 +374,22 @@ class EmployeeOutboxDeliveryCoordinator:
             and (current_binding is None or receipt.message_id == current_binding.message_id)
         )
         if not valid:
-            raise EmployeeOutboxReceiptIntegrityError(
-                "employee delivery receipt does not match authority"
-            )
+            raise EmployeeOutboxReceiptIntegrityError("employee delivery receipt does not match authority")
+
+
+class _AcquiredDeliveryLock:
+    """Small context adapter for deadline-bounded RLock acquisition."""
+
+    def __init__(self, lock: threading.RLock, timeout: float) -> None:
+        self._lock = lock
+        self._timeout = timeout
+
+    def __enter__(self) -> None:
+        if not self._lock.acquire(timeout=self._timeout):
+            raise EmployeeOutboxDrainDeadlineExceeded("employee Outbox delivery lock deadline exceeded")
+
+    def __exit__(self, *_args: object) -> None:
+        self._lock.release()
 
 
 __all__ = [

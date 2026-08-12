@@ -103,6 +103,16 @@ class EmployeeDataService:
         self._shard_timezone = shard_timezone
         self._authority_required = authority_required
         self._mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+        # Serialize publication/reservation with verified Blob hygiene without
+        # holding the data or Journal domains across encryption and readback.
+        self._blob_hygiene_mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._blob_hygiene_condition = threading.Condition(
+            self._blob_hygiene_mutex
+        )
+        self._history_publications_inflight = 0
+        self._blob_hygiene_requested = False
+        self._staged_history_blob_ids: set[str] = set()
+        self._active_history_blob_ids: set[str] = set()
         self._known_cursor = (
             data_state.cursor_sequence,
             data_state.cursor_hash,
@@ -298,27 +308,64 @@ class EmployeeDataService:
             return False
 
     def quarantine_unreferenced_blobs(self) -> int:
-        """Quarantine orphan blobs against one locked projection snapshot."""
-        with self._mutex:
+        """Quarantine blobs outside one verified anchor-bounded live set."""
+        with self._blob_hygiene_condition:
+            self._blob_hygiene_requested = True
+            try:
+                while self._history_publications_inflight:
+                    self._blob_hygiene_condition.wait()
+                return self._quarantine_unreferenced_blobs_exclusive()
+            finally:
+                self._blob_hygiene_requested = False
+                self._blob_hygiene_condition.notify_all()
+
+    def _quarantine_unreferenced_blobs_exclusive(self) -> int:
+        """Run hygiene while the publication gate is exclusively held."""
+
+        with self._mutex, self._writer.transaction_guard():
+            anchor = self._writer.anchor.read()
+            fresh = DataProjectionState()
+            anchored_hash = GENESIS_HASH
+            for frame in self._writer.replay():
+                if frame.sequence > anchor.sequence:
+                    break
+                for event in frame.events:
+                    if is_data_event(event.event_type):
+                        reduce_data_event(
+                            fresh,
+                            event,
+                            frame_sequence=frame.sequence,
+                            frame_hash=frame.frame_hash,
+                        )
+                fresh.cursor_sequence = frame.sequence
+                fresh.cursor_hash = frame.frame_hash
+                anchored_hash = frame.frame_hash
+            if fresh.cursor_sequence != anchor.sequence or anchored_hash != anchor.frame_hash:
+                return 0
+            self._replace_state_unlocked(fresh)
             live_ids = {
                 blob_id
-                for record in self._state.history_records.values()
+                for record in fresh.history_records.values()
                 if (blob_id := record.blob_ref.get("blob_id", ""))
             }
             live_ids.update(
                 blob_id
-                for document in self._state.employee_documents.values()
+                for document in fresh.employee_documents.values()
                 if (blob_id := document.blob_ref.get("blob_id", ""))
             )
-        orphan_ids = set(self._blob_store.iter_blob_ids()) - live_ids
-        quarantined = 0
-        for blob_id in orphan_ids:
-            try:
-                self._blob_store.quarantine_blob(blob_id)
-                quarantined += 1
-            except Exception:
-                continue
-        return quarantined
+            self._staged_history_blob_ids.difference_update(live_ids)
+            self._active_history_blob_ids.difference_update(live_ids)
+            retained_ids = live_ids | self._active_history_blob_ids
+            orphan_ids = set(self._blob_store.iter_blob_ids()) - retained_ids
+            quarantined = 0
+            for blob_id in orphan_ids:
+                try:
+                    self._blob_store.quarantine_blob(blob_id)
+                    self._staged_history_blob_ids.discard(blob_id)
+                    quarantined += 1
+                except Exception:
+                    continue
+            return quarantined
 
     def start_attempt(self, context: ExecutionAttemptContext) -> AttemptResult:
         """Anchor an immutable attempt binding before ACP dispatch."""
@@ -388,19 +435,25 @@ class EmployeeDataService:
                     if result.state != CommitState.ANCHORED:
                         raise DataWriteDisabledError("history commit not anchored")
                     self._apply_frame(result)
-            if duplicate:
-                self.quarantine_staged_history(staged)
-                return RecordResult(
-                    record=record,
-                    commit_result=CommitResult(
-                        frame=None,  # type: ignore[arg-type]
-                        state=CommitState.ANCHORED,
-                    ),
-                )
-            return RecordResult(record=record, commit_result=result)
         except Exception:
-            self.quarantine_staged_history(staged)
+            with self._mutex:
+                self._active_history_blob_ids.discard(staged.blob_ref.blob_id)
             raise
+        if duplicate:
+            with self._mutex:
+                self._staged_history_blob_ids.discard(staged.blob_ref.blob_id)
+                self._active_history_blob_ids.discard(staged.blob_ref.blob_id)
+            return RecordResult(
+                record=record,
+                commit_result=CommitResult(
+                    frame=None,  # type: ignore[arg-type]
+                    state=CommitState.ANCHORED,
+                ),
+            )
+        with self._mutex:
+            self._staged_history_blob_ids.discard(staged.blob_ref.blob_id)
+            self._active_history_blob_ids.discard(staged.blob_ref.blob_id)
+        return RecordResult(record=record, commit_result=result)
 
     def stage_history_payload(
         self,
@@ -426,32 +479,46 @@ class EmployeeDataService:
             record.record_id,
         )
         payload_bytes = _canonical_payload(sensitive_payload)
-        blob_ref: BlobRef | None = None
+        with self._blob_hygiene_condition:
+            while self._blob_hygiene_requested:
+                self._blob_hygiene_condition.wait()
+            self._history_publications_inflight += 1
         try:
-            blob_ref = self._blob_store.stage_and_publish(
-                payload_bytes,
-                labels,
-                self._active_key_id,
+            blob_ref: BlobRef | None = None
+            try:
+                blob_ref = self._blob_store.stage_and_publish(
+                    payload_bytes,
+                    labels,
+                    self._active_key_id,
+                )
+                validate_blob_ref_labels(blob_ref, labels)
+                if self._blob_store.read(blob_ref) != payload_bytes:
+                    raise DataBlobError("blob readback verification failed")
+            except Exception as exc:
+                if blob_ref is not None:
+                    self._quarantine_blob_ids({blob_ref.blob_id})
+                if isinstance(exc, (BlobError, DataBlobError)):
+                    raise
+                raise DataBlobError("history payload publication failed") from exc
+            staged = StagedHistoryPayload(
+                record=record,
+                blob_ref=blob_ref,
+                content_hash=hashlib.sha256(payload_bytes).hexdigest(),
             )
-            validate_blob_ref_labels(blob_ref, labels)
-            if self._blob_store.read(blob_ref) != payload_bytes:
-                raise DataBlobError("blob readback verification failed")
-        except Exception as exc:
-            if blob_ref is not None:
-                self._quarantine_blob_ids({blob_ref.blob_id})
-            if isinstance(exc, (BlobError, DataBlobError)):
-                raise
-            raise DataBlobError("history payload publication failed") from exc
-        return StagedHistoryPayload(
-            record=record,
-            blob_ref=blob_ref,
-            content_hash=hashlib.sha256(payload_bytes).hexdigest(),
-        )
+            with self._mutex:
+                self._staged_history_blob_ids.add(blob_ref.blob_id)
+                self._active_history_blob_ids.add(blob_ref.blob_id)
+            return staged
+        finally:
+            with self._blob_hygiene_condition:
+                self._history_publications_inflight -= 1
+                self._blob_hygiene_condition.notify_all()
 
     def quarantine_staged_history(self, staged: StagedHistoryPayload) -> None:
         if not isinstance(staged, StagedHistoryPayload):
             raise TypeError("staged must be StagedHistoryPayload")
-        self._quarantine_blob_ids({staged.blob_ref.blob_id})
+        with self._mutex:
+            self._active_history_blob_ids.discard(staged.blob_ref.blob_id)
 
     def preflight_history_event_unlocked(
         self,
@@ -521,6 +588,21 @@ class EmployeeDataService:
         self._state.cursor_sequence = frame.sequence
         self._state.cursor_hash = frame.frame_hash
         self._known_cursor = (frame.sequence, frame.frame_hash)
+        self._release_committed_history_reservations_unlocked(frame)
+
+    def _release_committed_history_reservations_unlocked(
+        self,
+        frame: TransactionFrame,
+    ) -> None:
+        for event in frame.events:
+            if event.event_type != "employee.history.recorded":
+                continue
+            reference = event.payload.get("blob_ref")
+            if isinstance(reference, dict):
+                blob_id = reference.get("blob_id")
+                if isinstance(blob_id, str):
+                    self._staged_history_blob_ids.discard(blob_id)
+                    self._active_history_blob_ids.discard(blob_id)
 
     def _quarantine_blob_ids(self, blob_ids: set[str]) -> None:
         for blob_id in blob_ids:
@@ -657,6 +739,7 @@ class EmployeeDataService:
         self._state.cursor_sequence = frame.sequence
         self._state.cursor_hash = frame.frame_hash
         self._known_cursor = (frame.sequence, frame.frame_hash)
+        self._release_committed_history_reservations_unlocked(frame)
 
 
 def _canonical_payload(payload: ExecutionHistoryPayloadV1) -> bytes:

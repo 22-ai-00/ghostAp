@@ -155,10 +155,7 @@ def test_team_queued_cancel_retries_when_dispatch_binds_after_head_capture(
     bind_sequence = next(
         frame.sequence
         for frame in frames
-        if any(
-            event.event_type == "employee.execution_attempt.bound"
-            for event in frame.events
-        )
+        if any(event.event_type == "employee.execution_attempt.bound" for event in frame.events)
     )
     cancel_sequence = next(
         frame.sequence
@@ -190,9 +187,7 @@ def test_runtime_team_backend_requires_observed_terminal_before_retry(
 
     missing = _RuntimeTeamBackend(SimpleNamespace(_dispatch=None), lambda *_args: None)
     no_active = _RuntimeTeamBackend(
-        SimpleNamespace(
-            _dispatch=_Dispatch(EmployeeCancellationOutcome("no_active"), ())
-        ),
+        SimpleNamespace(_dispatch=_Dispatch(EmployeeCancellationOutcome("no_active"), ())),
         lambda *_args: None,
     )
     unavailable = _RuntimeTeamBackend(
@@ -208,11 +203,14 @@ def test_runtime_team_backend_requires_observed_terminal_before_retry(
     assert missing.result("acc_missing").retry_allowed is False
     assert missing.cancel("acc_missing", run_id="run", step_id="step").retry_allowed is False
     assert no_active.cancel("acc_no_active", run_id="run", step_id="step").retry_allowed is False
-    assert unavailable.cancel(
-        "acc_unavailable",
-        run_id="run",
-        step_id="step",
-    ).retry_allowed is False
+    assert (
+        unavailable.cancel(
+            "acc_unavailable",
+            run_id="run",
+            step_id="step",
+        ).retry_allowed
+        is False
+    )
 
     terminal = _RuntimeTeamBackend(
         SimpleNamespace(
@@ -252,7 +250,6 @@ def test_runtime_team_backend_cancel_observation_timeout_is_not_retryable(
 
     assert result.status == "canceled"
     assert result.retry_allowed is False
-
 
 
 def test_team_queued_cancel_is_idempotent_after_effect_terminal_and_restart(
@@ -439,7 +436,6 @@ def test_stop_allows_configured_admin_and_team_owner(tmp_path) -> None:
         harness.close()
 
 
-
 def test_runtime_consumes_exact_stop_before_router_admission() -> None:
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 
@@ -527,17 +523,13 @@ def test_owner_p2p_status_anchors_scoped_runtime_snapshot_before_delivery() -> N
     lifecycle = MagicMock()
     events: list[str] = []
     lifecycle.status_response.side_effect = lambda **_kwargs: events.append("outbox")
-    ingress.record_disposition.side_effect = (
-        lambda *_args, **_kwargs: events.append("disposition")
-    )
+    ingress.record_disposition.side_effect = lambda *_args, **_kwargs: events.append("disposition")
     department = EmployeeDepartmentRuntime()
     department._ingress = ingress
     department._dispatch = dispatch
     department._outbox_lifecycle = lifecycle
     department._owner_p2p_requester = MagicMock(return_value="ou_owner")
-    department._drain_employee_outbox_once = MagicMock(
-        side_effect=lambda: events.append("delivery") or True
-    )
+    department._drain_employee_outbox_once = MagicMock(side_effect=lambda: events.append("delivery") or True)
 
     assert department._handle_control_ingress(acceptance_id) is True
 
@@ -573,9 +565,7 @@ def test_owner_p2p_status_arguments_return_durable_usage_without_inspection() ->
     )
     ingress = MagicMock()
     ingress.state = SimpleNamespace(
-        by_acceptance_id={
-            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
-        }
+        by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)}
     )
     payload = SimpleNamespace(
         normalized_parts=(
@@ -629,9 +619,7 @@ def test_group_status_is_left_for_the_main_bot_group_command_gate() -> None:
     )
     ingress = MagicMock()
     ingress.state = SimpleNamespace(
-        by_acceptance_id={
-            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
-        }
+        by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)}
     )
     payload = SimpleNamespace(
         normalized_parts=(
@@ -680,9 +668,7 @@ def test_owner_p2p_status_reports_unavailable_without_allocating_actor() -> None
     )
     ingress = MagicMock()
     ingress.state = SimpleNamespace(
-        by_acceptance_id={
-            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
-        }
+        by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)}
     )
     payload = SimpleNamespace(
         normalized_parts=(
@@ -818,9 +804,7 @@ def test_status_outbox_failure_does_not_terminalize_or_deliver_ingress() -> None
     )
     ingress = MagicMock()
     ingress.state = SimpleNamespace(
-        by_acceptance_id={
-            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
-        }
+        by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)}
     )
     payload = SimpleNamespace(
         normalized_parts=(
@@ -889,9 +873,7 @@ def test_owner_p2p_stop_uses_union_canonical_owner() -> None:
     )
     ingress.get_payload.return_value = payload
     dispatch = MagicMock()
-    dispatch.request_cancel.return_value = SimpleNamespace(
-        status="cancel_requested"
-    )
+    dispatch.request_cancel.return_value = SimpleNamespace(status="cancel_requested")
     runtime = EmployeeDepartmentRuntime()
     runtime._ingress = ingress
     runtime._dispatch = dispatch
@@ -915,9 +897,7 @@ def test_runtime_does_not_consume_non_control_text() -> None:
 
     acceptance_id = "acc_normal"
     ingress = MagicMock()
-    ingress.state = SimpleNamespace(
-        by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None)}
-    )
+    ingress.state = SimpleNamespace(by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None)})
     ingress.get_payload.return_value = SimpleNamespace(
         normalized_parts=({"content": {"text": "please stop later"}},),
     )
@@ -992,9 +972,7 @@ def test_runtime_rejects_membership_event_with_unbound_remote_chat() -> None:
     )
     ingress = MagicMock()
     ingress.state = SimpleNamespace(
-        by_acceptance_id={
-            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
-        }
+        by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)}
     )
     ingress.get_payload.return_value = SimpleNamespace(
         normalized_parts=(
@@ -1019,7 +997,7 @@ def test_runtime_rejects_membership_event_with_unbound_remote_chat() -> None:
     )
 
 
-def test_runtime_consumes_history_through_authoritative_read_and_outbox() -> None:
+def test_group_history_is_left_for_the_main_bot_group_command_gate() -> None:
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 
     acceptance_id = "acc_history_control"
@@ -1036,9 +1014,7 @@ def test_runtime_consumes_history_through_authoritative_read_and_outbox() -> Non
     ingress = MagicMock()
     ingress.state = SimpleNamespace(by_acceptance_id={acceptance_id: record})
     ingress.get_payload.return_value = SimpleNamespace(
-        normalized_parts=(
-            {"chat_type": "group", "content": {"text": " /history 14 "}},
-        ),
+        normalized_parts=({"chat_type": "group", "content": {"text": " /history 14 "}},),
     )
     history = MagicMock()
     history.query.return_value = SimpleNamespace(records=())
@@ -1051,17 +1027,60 @@ def test_runtime_consumes_history_through_authoritative_read_and_outbox() -> Non
     )
     runtime._outbox_lifecycle = MagicMock()
     runtime._drain_employee_outbox_once = MagicMock(return_value=True)
+    runtime._owner_p2p_requester = MagicMock(return_value=None)
+
+    assert runtime._handle_control_ingress(acceptance_id) is False
+
+    history.query.assert_not_called()
+    runtime._outbox_lifecycle.read_response.assert_not_called()
+    runtime._drain_employee_outbox_once.assert_not_called()
+    ingress.record_disposition.assert_not_called()
+
+
+def test_owner_p2p_history_uses_canonical_owner_and_durable_outbox() -> None:
+    from datetime import date
+
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_owner_p2p_history"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        app_id="employee_app",
+        chat_id="oc_owner_p2p",
+        message_id="om_current",
+        sender_principal_id="ou_employee_app_owner",
+        tenant_key="tenant_1",
+        thread_root_message_id="",
+    )
+    record = SimpleNamespace(disposition=None, metadata=metadata)
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(by_acceptance_id={acceptance_id: record})
+    payload = SimpleNamespace(
+        normalized_parts=({"chat_type": "p2p", "content": {"text": " /history 14 "}},),
+    )
+    ingress.get_payload.return_value = payload
+    history = MagicMock()
+    history.query.return_value = SimpleNamespace(records=())
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = ingress
+    runtime._data = SimpleNamespace(
+        query=history,
+        memory_query=MagicMock(),
+        service=SimpleNamespace(shard_timezone="UTC"),
+    )
+    runtime._outbox_lifecycle = MagicMock()
+    runtime._drain_employee_outbox_once = MagicMock(return_value=True)
+    runtime._owner_p2p_requester = MagicMock(return_value="ou_canonical_owner")
 
     assert runtime._handle_control_ingress(acceptance_id) is True
 
+    runtime._owner_p2p_requester.assert_called_once_with(record, payload)
     request = history.query.call_args.args[0]
-    assert request.principal_id == "ou_member"
+    assert request.principal_id == "ou_canonical_owner"
     assert request.receiving_bot_app_id == "employee_app"
-    assert request.chat_id == "oc_team"
-    assert request.chat_type == "group"
+    assert request.chat_id == "oc_owner_p2p"
+    assert request.chat_type == "p2p"
     spec = history.query.call_args.args[1]
-    from datetime import date
-
     assert (date.fromisoformat(spec.end_day) - date.fromisoformat(spec.start_day)).days == 13
     runtime._outbox_lifecycle.read_response.assert_called_once()
     ingress.record_disposition.assert_called_once_with(
@@ -1071,7 +1090,7 @@ def test_runtime_consumes_history_through_authoritative_read_and_outbox() -> Non
     )
 
 
-def test_runtime_memory_ignores_payload_authority_and_uses_ingress_metadata() -> None:
+def test_group_memory_is_left_for_the_main_bot_group_command_gate() -> None:
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 
     acceptance_id = "acc_memory_control"
@@ -1086,9 +1105,7 @@ def test_runtime_memory_ignores_payload_authority_and_uses_ingress_metadata() ->
     )
     ingress = MagicMock()
     ingress.state = SimpleNamespace(
-        by_acceptance_id={
-            acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)
-        }
+        by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)}
     )
     ingress.get_payload.return_value = SimpleNamespace(
         normalized_parts=(
@@ -1109,11 +1126,103 @@ def test_runtime_memory_ignores_payload_authority_and_uses_ingress_metadata() ->
     runtime._data = SimpleNamespace(query=MagicMock(), memory_query=memory)
     runtime._outbox_lifecycle = MagicMock()
     runtime._drain_employee_outbox_once = MagicMock(return_value=True)
+    runtime._owner_p2p_requester = MagicMock(return_value=None)
+
+    assert runtime._handle_control_ingress(acceptance_id) is False
+
+    memory.query.assert_not_called()
+    runtime._outbox_lifecycle.read_response.assert_not_called()
+    runtime._drain_employee_outbox_once.assert_not_called()
+    ingress.record_disposition.assert_not_called()
+
+
+def test_owner_p2p_memory_uses_canonical_owner_and_durable_outbox() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_owner_p2p_memory"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        app_id="employee_app",
+        chat_id="oc_owner_p2p",
+        message_id="om_current",
+        sender_principal_id="ou_employee_app_owner",
+        tenant_key="tenant_1",
+        thread_root_message_id="",
+    )
+    record = SimpleNamespace(disposition=None, metadata=metadata)
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(by_acceptance_id={acceptance_id: record})
+    payload = SimpleNamespace(
+        normalized_parts=(
+            {
+                "chat_type": "p2p",
+                "content": {
+                    "text": "/memory",
+                    "principal_id": "ou_forged",
+                    "tenant_key": "tenant_forged",
+                },
+            },
+        ),
+    )
+    ingress.get_payload.return_value = payload
+    memory = MagicMock()
+    memory.query.return_value = SimpleNamespace(content="scoped summary")
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = ingress
+    runtime._data = SimpleNamespace(query=MagicMock(), memory_query=memory)
+    runtime._outbox_lifecycle = MagicMock()
+    runtime._drain_employee_outbox_once = MagicMock(return_value=True)
+    runtime._owner_p2p_requester = MagicMock(return_value="ou_canonical_owner")
 
     assert runtime._handle_control_ingress(acceptance_id) is True
 
+    runtime._owner_p2p_requester.assert_called_once_with(record, payload)
     request = memory.query.call_args.args[0]
-    assert request.principal_id == "ou_member"
+    assert request.principal_id == "ou_canonical_owner"
     assert request.tenant_key == "tenant_1"
+    assert request.receiving_bot_app_id == "employee_app"
+    assert request.chat_id == "oc_owner_p2p"
+    assert request.chat_type == "p2p"
     assert request.requested_agent_id == "agt_alpha"
     assert memory.query.call_args.args[1].full_l1 is False
+    runtime._outbox_lifecycle.read_response.assert_called_once()
+    ingress.record_disposition.assert_called_once_with(
+        acceptance_id,
+        state="terminal",
+        reason_code="memory_completed",
+    )
+
+
+def test_group_stop_is_left_for_the_main_bot_group_command_gate() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    acceptance_id = "acc_group_stop"
+    metadata = SimpleNamespace(
+        agent_id="agt_alpha",
+        app_id="employee_app",
+        chat_id="oc_team",
+        message_id="om_current",
+        sender_principal_id="ou_member",
+        tenant_key="tenant_1",
+        thread_root_message_id="om_root",
+    )
+    ingress = MagicMock()
+    ingress.state = SimpleNamespace(
+        by_acceptance_id={acceptance_id: SimpleNamespace(disposition=None, metadata=metadata)}
+    )
+    ingress.get_payload.return_value = SimpleNamespace(
+        normalized_parts=({"chat_type": "group", "content": {"text": "/stop"}},),
+    )
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = ingress
+    runtime._dispatch = MagicMock()
+    runtime._outbox_lifecycle = MagicMock()
+    runtime._drain_employee_outbox_once = MagicMock(return_value=True)
+    runtime._owner_p2p_requester = MagicMock(return_value=None)
+
+    assert runtime._handle_control_ingress(acceptance_id) is False
+
+    runtime._dispatch.request_cancel.assert_not_called()
+    runtime._outbox_lifecycle.command_response.assert_not_called()
+    runtime._drain_employee_outbox_once.assert_not_called()
+    ingress.record_disposition.assert_not_called()

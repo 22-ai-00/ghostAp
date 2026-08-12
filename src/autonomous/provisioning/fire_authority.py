@@ -48,6 +48,25 @@ class JournalFireAuthority:
         if request.requester_principal_id not in self._admins:
             raise FireServiceError("fire is not authorized")
 
+    def ensure_no_unresolved_external_mutation(
+        self,
+        target: EmployeeFireTarget,
+    ) -> None:
+        """Reject a crashed external mutation regardless of fence presence."""
+
+        with self._hire.employee_dispatch_guard():
+            state = self._hire_state(target.agent_id)
+            if state is None:
+                return
+            effect_types = dict(state.effect_types)
+            if any(
+                effect_state is HireEffectState.EXECUTING
+                and effect_types.get(effect_id)
+                in {"slash_reconciliation", "employee_channel_start"}
+                for effect_id, effect_state in state.effects
+            ):
+                raise FireServiceError("external mutation outcome is unresolved")
+
     def _resolve_from_projection(
         self,
         request: EmployeeFireRequest,
@@ -156,7 +175,15 @@ class JournalFireAuthority:
             projection = self._hire.synchronize_projection_unlocked()
             # Re-resolve under the same locks that commit retirement. Provisioning
             # may have bound a principal after the optimistic resolve above.
-            target = self._resolve_from_projection(request, projection)
+            resolved_target = self._resolve_from_projection(request, projection)
+            if (
+                resolved_target.tenant_key != target.tenant_key
+                or resolved_target.agent_id != target.agent_id
+            ):
+                raise FireServiceError(
+                    "employee retirement authority changed during admission"
+                )
+            target = resolved_target
             live_requests = [
                 state
                 for state in rebuild_fire_projection(
@@ -208,7 +235,7 @@ class JournalFireAuthority:
                 },
             )
             hire_effect_dispositions = self._hire_effect_dispositions(
-                target.agent_id
+                target.agent_id,
             )
             validate_workforce_events(projection, (retiring,))
             frame = self._commit_unlocked(
@@ -223,7 +250,10 @@ class JournalFireAuthority:
             self._ingress.apply_committed_frame_unlocked(frame)
             return target
 
-    def _hire_effect_dispositions(self, agent_id: str) -> tuple[JournalEvent, ...]:
+    def _hire_effect_dispositions(
+        self,
+        agent_id: str,
+    ) -> tuple[JournalEvent, ...]:
         list_states = getattr(self._hire, "list_states", None)
         if not callable(list_states):
             return ()
@@ -234,6 +264,20 @@ class JournalFireAuthority:
             return ()
         state = matches[0]
         effect_types = dict(state.effect_types)
+        unresolved_external = tuple(
+            effect_id
+            for effect_id, effect_state in state.effects
+            if effect_state is HireEffectState.EXECUTING
+            and effect_types.get(effect_id)
+            in {"slash_reconciliation", "employee_channel_start"}
+        )
+        if unresolved_external:
+            # These calls can outlive the process that dispatched them.  A
+            # fresh in-memory gate therefore cannot prove they stopped.  Keep
+            # the durable fence, but do not retire or clean up until runtime
+            # recovery has observed/disposed the exact effects.  The fence
+            # prevents new calls; it is not evidence that an old call ended.
+            raise FireServiceError("external mutation outcome is unresolved")
         events: list[JournalEvent] = []
         for effect_id, effect_state in state.effects:
             if effect_state.value not in {"prepared", "executing"}:
@@ -399,6 +443,17 @@ class JournalFireAuthority:
         )
         with self._hire.employee_dispatch_guard(), self._writer.transaction_guard():
             projection = self._hire.synchronize_projection_unlocked()
+            current = projection.employees.get(agent_id)
+            current_fire = rebuild_fire_projection(
+                tuple(self._writer.replay())
+            ).get(intent_id)
+            if (
+                current is not None
+                and current.state is EmployeeState.ARCHIVED
+                and current_fire is not None
+                and current_fire.phase is FirePhase.ARCHIVED
+            ):
+                return
             validate_workforce_events(projection, (archived,))
             frame = self._commit_unlocked((archived, completed))
             self._hire.apply_committed_frame_unlocked(frame)

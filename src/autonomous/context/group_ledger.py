@@ -119,6 +119,7 @@ class GroupContextLedger:
         self._config = config or ThreadContextConfig()
         self._blob_retainer = blob_retainer
         self._blob_releaser = blob_releaser
+        self._retained_blob_ids: set[str] = set()
         self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._records: dict[str, GroupEventRecord] = {}
         self.rebuild_projection()
@@ -183,6 +184,7 @@ class GroupContextLedger:
             )
             if self._blob_retainer is not None:
                 self._blob_retainer(ref.blob_id)
+                self._retained_blob_ids.add(ref.blob_id)
             event = JournalEvent(
                 event_type="group.event.recorded",
                 aggregate_id=aggregate,
@@ -199,26 +201,23 @@ class GroupContextLedger:
                 },
             )
             last = self._writer.get_last_frame()
-            try:
-                result = self._writer.commit(
-                    (event,),
-                    self._writer.get_aggregate_versions((aggregate,)),
-                    expected_head_sequence=0 if last is None else last.sequence,
-                    expected_head_hash="" if last is None else last.frame_hash,
-                )
-            except BaseException:
-                if self._blob_releaser is not None:
-                    self._blob_releaser(ref.blob_id)
-                raise
+            result = self._writer.commit(
+                (event,),
+                self._writer.get_aggregate_versions((aggregate,)),
+                expected_head_sequence=0 if last is None else last.sequence,
+                expected_head_hash="" if last is None else last.frame_hash,
+            )
             if result.state is not CommitState.ANCHORED:
-                if self._blob_releaser is not None:
-                    self._blob_releaser(ref.blob_id)
                 raise GroupLedgerError("group event was not anchored")
             record = self._record_from_event(event, result.frame.sequence)
             self._records[dedup_key] = record
             return record
 
     def rebuild_projection(self) -> int:
+        with self._lock, self._writer.transaction_guard():
+            return self._rebuild_projection_unlocked()
+
+    def _rebuild_projection_unlocked(self) -> int:
         records: dict[str, GroupEventRecord] = {}
         anchored = self._writer.anchor.read()
         last_hash = GENESIS_HASH
@@ -237,9 +236,14 @@ class GroupContextLedger:
         if last_hash != anchored.frame_hash:
             raise GroupLedgerError("group ledger anchor mismatch")
         self._records = records
+        anchored_blob_ids = {record.payload_ref.blob_id for record in records.values()}
         if self._blob_retainer is not None:
             for record in records.values():
                 self._blob_retainer(record.payload_ref.blob_id)
+        if self._blob_releaser is not None:
+            for blob_id in self._retained_blob_ids - anchored_blob_ids:
+                self._blob_releaser(blob_id)
+        self._retained_blob_ids = anchored_blob_ids
         return len(records)
 
     def window(

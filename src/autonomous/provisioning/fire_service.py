@@ -11,6 +11,7 @@ from typing import Callable, Protocol
 
 from ..journal.frame import JournalEvent
 from ..journal.writer import CommitState, JournalWriter
+from .external_mutation_gate import EmployeeExternalMutationGate
 from .fire_state import (
     FIRE_EFFECT_ORDER,
     DurableFireState,
@@ -19,6 +20,9 @@ from .fire_state import (
     FirePhase,
     rebuild_fire_projection,
 )
+
+_EXTERNAL_MUTATION_FENCE_EVENT = "employee.external_mutation_fenced"
+_UNSET = object()
 
 
 class FireServiceError(RuntimeError):
@@ -58,6 +62,13 @@ class EmployeeFireTarget:
     @property
     def pre_binding(self) -> bool:
         return self.cleanup_mode is not FireCleanupMode.BOUND
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingExternalMutationFence:
+    request: EmployeeFireRequest
+    target: EmployeeFireTarget
+    intent_id: str
 
 
 class FireAuthority(Protocol):
@@ -109,6 +120,8 @@ class EmployeeFireService:
         effects: dict[str, FireEffectPort],
         drain_reconcile_interval_seconds: float = 0.5,
         monotonic: Callable[[], float] | None = None,
+        external_mutation_gate: EmployeeExternalMutationGate | None = None,
+        external_mutation_wait_seconds: float = 5.0,
     ) -> None:
         if set(effects) != set(FIRE_EFFECT_ORDER):
             raise ValueError("all fire effects must be configured exactly once")
@@ -119,14 +132,22 @@ class EmployeeFireService:
             )
         if monotonic is not None and not callable(monotonic):
             raise TypeError("monotonic must be callable")
+        mutation_wait = float(external_mutation_wait_seconds)
+        if not math.isfinite(mutation_wait) or mutation_wait < 0:
+            raise ValueError(
+                "external mutation wait must be finite and non-negative"
+            )
         self._writer = writer
         self._authority = authority
         self._effects = dict(effects)
+        self._external_mutation_gate = external_mutation_gate
+        self._external_mutation_wait_seconds = mutation_wait
         self._mutex = RLock()
         self._pending_drains: set[str] = set()
         self._drain_reconcile_interval = interval
         self._monotonic = monotonic or time.monotonic
         self._next_drain_reconcile_at = 0.0
+        self._restore_external_mutation_fences()
 
     def start_fire(self, request: EmployeeFireRequest) -> DurableFireState:
         with self._mutex:
@@ -145,6 +166,8 @@ class EmployeeFireService:
                 raise FireServiceError("fire idempotency conflict")
             if state.phase is FirePhase.SUPERSEDED:
                 raise FireServiceError("fire request was superseded")
+            if state.phase is FirePhase.ACTION_REQUIRED:
+                return self._retry_action_required(intent_id)
             return self.resume(intent_id)
         existing = self._coalesce_live_requests(request)
         if existing is not None:
@@ -152,6 +175,34 @@ class EmployeeFireService:
                 raise FireServiceError("employee already archived")
             return self._retry_action_required(existing.intent_id)
         target = self._authority.resolve(request)
+        if self._external_mutation_gate is not None:
+            pending = self._anchor_external_mutation_fence(
+                request,
+                target,
+                intent_id,
+            )
+            request = pending.request
+            target = pending.target
+            intent_id = pending.intent_id
+            settled = self._external_mutation_gate.begin_retirement(
+                target.tenant_key,
+                target.agent_id,
+                timeout_seconds=self._external_mutation_wait_seconds,
+            )
+            if not settled:
+                raise FireServiceError("external mutation is still active")
+            preflight = getattr(
+                self._authority,
+                "ensure_no_unresolved_external_mutation",
+                None,
+            )
+            if callable(preflight):
+                try:
+                    preflight(target)
+                except FireServiceError as exc:
+                    if str(exc) == "external mutation outcome is unresolved":
+                        self._authority.mark_action_required(target.agent_id)
+                    raise
         try:
             target = self._authority.admit(request, target, intent_id)
         except FireServiceError as exc:
@@ -237,6 +288,22 @@ class EmployeeFireService:
                     )
                 continue
             if effect_state is FireEffectState.COMMITTED:
+                if (
+                    effect_type == "membership_cleanup"
+                    and self._observe(state, effect_type) is not True
+                ):
+                    claimed = self._transition(
+                        intent_id,
+                        effect_type,
+                        FireEffectState.EXECUTING,
+                        expected_previous=FireEffectState.COMMITTED,
+                    )
+                    if not claimed:
+                        return self._resume(intent_id)
+                    return self._reconcile_executing(
+                        self._require(intent_id),
+                        effect_type,
+                    )
                 if effect_type == "credential_destroy":
                     self._authority.mark_credential_destroyed(target)
                 continue
@@ -246,7 +313,13 @@ class EmployeeFireService:
                 return state
             if effect_state is None:
                 self._transition(intent_id, effect_type, FireEffectState.PREPARED)
-            self._transition(intent_id, effect_type, FireEffectState.EXECUTING)
+            claimed = self._transition(
+                intent_id,
+                effect_type,
+                FireEffectState.EXECUTING,
+            )
+            if not claimed:
+                return self._resume(intent_id)
             state = self._require(intent_id)
             try:
                 self._effects[effect_type].execute(state)
@@ -254,11 +327,10 @@ class EmployeeFireService:
                 pass
             observed = self._observe(state, effect_type)
             if observed is not True:
-                if state.drain and effect_type == "execution_quiesce":
-                    # A drain is an asynchronous wait, not an ambiguous side
-                    # effect.  Keep the anchored EXECUTING frame recoverable;
-                    # the department loop will reconcile it after the active
-                    # assignment reaches a terminal state.
+                if effect_type == "execution_quiesce":
+                    # Quiescing is an asynchronous retirement fence, not an
+                    # ambiguous side effect. Keep EXECUTING recoverable until
+                    # work and its owed responses are terminal.
                     return self._require(intent_id)
                 return self._action_required(state, effect_type, "outcome_unknown")
             self._transition(intent_id, effect_type, FireEffectState.COMMITTED)
@@ -402,16 +474,23 @@ class EmployeeFireService:
         if len(failed_effects) != 1:
             raise FireServiceError("fire recovery effect is ambiguous")
         effect_type = failed_effects[0]
-        if state.drain and effect_type == "execution_quiesce":
-            # Historical builds marked a long drain ACTION_REQUIRED.  Once
-            # work is terminal, execute the idempotent actor retirement fence
-            # before reconciling that durable effect as committed.
+        if effect_type in {"execution_quiesce", "membership_cleanup"}:
+            # Both operations are idempotent retirement fences.  Re-execute
+            # them so a transient actor wait or remote membership REMOVE can
+            # converge instead of leaving an ACTION_REQUIRED tombstone with
+            # no automated recovery path.
             try:
                 self._effects[effect_type].execute(state)
             except Exception:
                 return state
             if self._observe(state, effect_type) is not True:
-                return state
+                if effect_type == "execution_quiesce":
+                    return state
+                return self._action_required(
+                    state,
+                    effect_type,
+                    "recovery_outcome_unknown",
+                )
         elif self._observe(state, effect_type) is not True:
             return state
         self._commit(
@@ -427,9 +506,9 @@ class EmployeeFireService:
         return self.resume(intent_id)
 
     def reconcile_draining(self) -> tuple[DurableFireState, ...]:
-        """Advance drains whose active assignments have naturally finished.
+        """Advance pending retirement fences whose work has settled.
 
-        Waiting drains remain unchanged and are omitted from the result so a
+        Waiting fences remain unchanged and are omitted from the result so a
         caller can poll this method without turning an idle worker into a hot
         loop.  The Journal state is the cursor, so restart recovery preserves
         exactly the same bounded operation.
@@ -449,7 +528,7 @@ class EmployeeFireService:
             progressed: list[DurableFireState] = []
             for intent_id in tuple(sorted(self._pending_drains)):
                 state = self._require(intent_id)
-                if not state.drain or state.phase not in {
+                if state.phase not in {
                     FirePhase.RETIRING,
                     FirePhase.ACTION_REQUIRED,
                 }:
@@ -472,8 +551,7 @@ class EmployeeFireService:
 
     def _track_drain(self, state: DurableFireState) -> None:
         if (
-            state.drain
-            and state.phase in {FirePhase.RETIRING, FirePhase.ACTION_REQUIRED}
+            state.phase in {FirePhase.RETIRING, FirePhase.ACTION_REQUIRED}
             and state.effect_state("execution_quiesce")
             in {FireEffectState.EXECUTING, FireEffectState.ACTION_REQUIRED}
         ):
@@ -490,8 +568,7 @@ class EmployeeFireService:
         state: DurableFireState,
     ) -> None:
         if (
-            not state.drain
-            or state.phase not in {FirePhase.RETIRING, FirePhase.ACTION_REQUIRED}
+            state.phase not in {FirePhase.RETIRING, FirePhase.ACTION_REQUIRED}
             or state.effect_state("execution_quiesce")
             is not FireEffectState.COMMITTED
         ):
@@ -548,6 +625,8 @@ class EmployeeFireService:
     def recover(self) -> tuple[DurableFireState, ...]:
         with self._mutex:
             recovered: list[DurableFireState] = []
+            for pending in self._pending_external_mutation_fences():
+                self._recover_pending_external_mutation_fence(pending)
             grouped: dict[tuple[str, str], list[DurableFireState]] = {}
             self._pending_drains.clear()
             self._next_drain_reconcile_at = 0.0
@@ -567,7 +646,12 @@ class EmployeeFireService:
                     self._track_drain(current)
                     recovered.append(current)
                 elif state.phase is FirePhase.ACTION_REQUIRED:
-                    if state.drain:
+                    if (
+                        state.effect_state("execution_quiesce")
+                        is FireEffectState.ACTION_REQUIRED
+                        or state.effect_state("membership_cleanup")
+                        is FireEffectState.ACTION_REQUIRED
+                    ):
                         current = self._retry_action_required(state.intent_id)
                         self._track_drain(current)
                         if current.last_sequence != state.last_sequence:
@@ -592,7 +676,7 @@ class EmployeeFireService:
         state: DurableFireState,
         effect_type: str,
     ) -> DurableFireState:
-        if state.drain and effect_type == "execution_quiesce":
+        if effect_type in {"execution_quiesce", "membership_cleanup"}:
             try:
                 self._effects[effect_type].execute(state)
             except Exception:
@@ -637,21 +721,75 @@ class EmployeeFireService:
         state: FireEffectState,
         *,
         error_code: str = "",
-    ) -> None:
+        expected_previous: FireEffectState | None | object = _UNSET,
+    ) -> bool:
         payload = {"effect_type": effect_type}
         if error_code:
             payload["error_code"] = error_code
-        self._commit(
+        if expected_previous is _UNSET:
+            expected_previous = {
+                FireEffectState.PREPARED: None,
+                FireEffectState.EXECUTING: FireEffectState.PREPARED,
+                FireEffectState.COMMITTED: FireEffectState.EXECUTING,
+                FireEffectState.ACTION_REQUIRED: FireEffectState.EXECUTING,
+            }[state]
+        return self._commit(
             JournalEvent(
                 event_type=f"fire.effect.{state.value}",
                 aggregate_id=intent_id,
                 payload=payload,
-            )
+            ),
+            expected_effect_state=expected_previous,
         )
 
-    def _commit(self, event: JournalEvent) -> None:
+    def _commit(
+        self,
+        event: JournalEvent,
+        *,
+        expected_effect_state: FireEffectState | None | object = _UNSET,
+    ) -> bool:
         with self._writer.transaction_guard():
-            last = self._writer.get_last_frame()
+            frames = tuple(self._writer.replay())
+            current = rebuild_fire_projection(frames).get(event.aggregate_id)
+            if event.event_type == "fire.effect.reconciled":
+                effect_type = event.payload.get("effect_type")
+                if current is None or effect_type not in FIRE_EFFECT_ORDER:
+                    raise FireServiceError("invalid reconciled fire effect")
+                actual = current.effect_state(effect_type)
+                if actual is FireEffectState.COMMITTED:
+                    return False
+                if (
+                    current.phase is not FirePhase.ACTION_REQUIRED
+                    or actual is not FireEffectState.ACTION_REQUIRED
+                ):
+                    return False
+            elif event.event_type in {
+                f"fire.effect.{value.value}" for value in FireEffectState
+            }:
+                effect_type = event.payload.get("effect_type")
+                try:
+                    desired = FireEffectState(
+                        event.event_type.removeprefix("fire.effect.")
+                    )
+                except ValueError as exc:
+                    raise FireServiceError("invalid fire effect transition") from exc
+                if current is None or effect_type not in FIRE_EFFECT_ORDER:
+                    raise FireServiceError("invalid fire effect transition")
+                actual = current.effect_state(effect_type)
+                if actual is desired:
+                    return False
+                if (
+                    current.phase in {FirePhase.ARCHIVED, FirePhase.SUPERSEDED}
+                    or expected_effect_state is _UNSET
+                    or actual is not expected_effect_state
+                ):
+                    return False
+            elif event.event_type == "fire.superseded":
+                if current is None:
+                    raise FireServiceError("invalid fire supersession")
+                if current.phase in {FirePhase.ARCHIVED, FirePhase.SUPERSEDED}:
+                    return False
+            last = frames[-1] if frames else None
             sequence = 0 if last is None else last.sequence
             frame_hash = "" if last is None else last.frame_hash
             result = self._writer.commit(
@@ -663,6 +801,312 @@ class EmployeeFireService:
         if result.state is not CommitState.ANCHORED:
             raise FireServiceError("fire transition was not anchored")
         self._states()
+        return True
+
+    def _anchor_external_mutation_fence(
+        self,
+        request: EmployeeFireRequest,
+        target: EmployeeFireTarget,
+        intent_id: str,
+    ) -> _PendingExternalMutationFence:
+        payload = {
+            "tenant_key": target.tenant_key,
+            "agent_id": target.agent_id,
+            "intent_id": intent_id,
+            "employee": request.employee,
+            "message_id": request.message_id,
+            "chat_id": request.chat_id,
+            "requester_principal_id": request.requester_principal_id,
+            "drain": request.drain,
+            "employee_name": target.employee_name,
+            "bot_principal_id": target.bot_principal_id,
+            "app_id": target.app_id,
+            "credential_ref": target.credential_ref,
+            "cleanup_mode": target.cleanup_mode.value,
+        }
+        aggregate_id = self._external_mutation_fence_aggregate_id(
+            target.tenant_key,
+            target.agent_id,
+        )
+        event = JournalEvent(
+            event_type=_EXTERNAL_MUTATION_FENCE_EVENT,
+            aggregate_id=aggregate_id,
+            payload=payload,
+        )
+        with self._writer.transaction_guard():
+            frames = tuple(self._writer.replay())
+            existing = tuple(
+                parsed
+                for frame in frames
+                for existing_event in frame.events
+                if existing_event.event_type == _EXTERNAL_MUTATION_FENCE_EVENT
+                and self._external_mutation_fence_identity(existing_event)
+                == (target.tenant_key, target.agent_id)
+                if (
+                    parsed := self._external_mutation_fence_request(
+                        existing_event
+                    )
+                )
+                is not None
+            )
+            if existing:
+                canonical = existing[0]
+                if any(item != canonical for item in existing[1:]):
+                    raise FireServiceError(
+                        "external mutation fence authority is ambiguous"
+                    )
+                return canonical
+            last = frames[-1] if frames else None
+            sequence = 0 if last is None else last.sequence
+            frame_hash = "" if last is None else last.frame_hash
+            result = self._writer.commit(
+                (event,),
+                self._writer.get_aggregate_versions((aggregate_id,)),
+                expected_head_sequence=sequence,
+                expected_head_hash=frame_hash,
+            )
+        if result.state is not CommitState.ANCHORED:
+            raise FireServiceError(
+                "external mutation fence was not anchored"
+            )
+        return _PendingExternalMutationFence(
+            request=request,
+            target=target,
+            intent_id=intent_id,
+        )
+
+    def _pending_external_mutation_fence_for(
+        self,
+        target: EmployeeFireTarget,
+    ) -> _PendingExternalMutationFence | None:
+        matches = tuple(
+            pending
+            for pending in self._pending_external_mutation_fences()
+            if (
+                pending.target.tenant_key,
+                pending.target.agent_id,
+            )
+            == (target.tenant_key, target.agent_id)
+        )
+        if len(matches) > 1:
+            raise FireServiceError("external mutation fence authority is ambiguous")
+        return matches[0] if matches else None
+
+    def _pending_external_mutation_fences(
+        self,
+    ) -> tuple[_PendingExternalMutationFence, ...]:
+        active_identities = {
+            (state.tenant_key, state.agent_id) for state in self._states().values()
+        }
+        pending: dict[tuple[str, str], _PendingExternalMutationFence] = {}
+        for frame in self._writer.replay():
+            for event in frame.events:
+                if event.event_type != _EXTERNAL_MUTATION_FENCE_EVENT:
+                    continue
+                parsed = self._external_mutation_fence_request(event)
+                if parsed is None:
+                    continue
+                identity = (parsed.target.tenant_key, parsed.target.agent_id)
+                if identity in active_identities:
+                    continue
+                prior = pending.get(identity)
+                if prior is not None and prior != parsed:
+                    raise FireServiceError(
+                        "external mutation fence authority is ambiguous"
+                    )
+                pending[identity] = parsed
+        return tuple(pending[identity] for identity in sorted(pending))
+
+    def _recover_pending_external_mutation_fence(
+        self,
+        pending: _PendingExternalMutationFence,
+    ) -> bool:
+        gate = self._external_mutation_gate
+        if gate is None or not gate.begin_retirement(
+            pending.target.tenant_key,
+            pending.target.agent_id,
+            timeout_seconds=self._external_mutation_wait_seconds,
+        ):
+            return False
+        preflight = getattr(
+            self._authority,
+            "ensure_no_unresolved_external_mutation",
+            None,
+        )
+        try:
+            if callable(preflight):
+                preflight(pending.target)
+        except FireServiceError as exc:
+            if str(exc) != "external mutation outcome is unresolved":
+                raise
+            self._authority.mark_action_required(pending.target.agent_id)
+            return False
+        try:
+            self._authority.admit(
+                pending.request,
+                pending.target,
+                pending.intent_id,
+            )
+        except FireServiceError as exc:
+            if str(exc) == "employee retirement already in progress":
+                return True
+            if str(exc) != "external mutation outcome is unresolved":
+                raise
+            self._authority.mark_action_required(pending.target.agent_id)
+            return False
+        return True
+
+    def _restore_external_mutation_fences(self) -> None:
+        gate = self._external_mutation_gate
+        if gate is None:
+            return
+        self.restore_external_mutation_fences(self._writer, gate)
+
+    @classmethod
+    def restore_external_mutation_fences(
+        cls,
+        writer: JournalWriter,
+        gate: EmployeeExternalMutationGate,
+    ) -> None:
+        """Restore permanent fences before any mutator recovery can run."""
+
+        identities: set[tuple[str, str]] = set()
+        frames = tuple(writer.replay())
+        for frame in frames:
+            for event in frame.events:
+                if event.event_type != _EXTERNAL_MUTATION_FENCE_EVENT:
+                    continue
+                identities.add(
+                    cls._external_mutation_fence_identity(event)
+                )
+        for tenant_key, agent_id in identities:
+            gate.restore_retirement_fence(tenant_key, agent_id)
+        # Legacy retirement streams predate the explicit pre-admission marker.
+        # Their requested fact is nevertheless a durable permanent fence.
+        legacy_identities = {
+            (state.tenant_key, state.agent_id)
+            for state in rebuild_fire_projection(frames).values()
+        }
+        for tenant_key, agent_id in legacy_identities - identities:
+            gate.restore_retirement_fence(tenant_key, agent_id)
+
+    @staticmethod
+    def _external_mutation_fence_identity(
+        event: JournalEvent,
+    ) -> tuple[str, str]:
+        allowed_shapes = {
+            frozenset({"tenant_key", "agent_id"}),
+            frozenset(
+                {
+                    "tenant_key",
+                    "agent_id",
+                    "intent_id",
+                    "employee",
+                    "message_id",
+                    "chat_id",
+                    "requester_principal_id",
+                    "drain",
+                    "employee_name",
+                    "bot_principal_id",
+                    "app_id",
+                    "credential_ref",
+                    "cleanup_mode",
+                }
+            ),
+        }
+        if frozenset(event.payload) not in allowed_shapes:
+            raise FireServiceError(
+                "external mutation fence record is invalid"
+            )
+        tenant_key = event.payload.get("tenant_key")
+        agent_id = event.payload.get("agent_id")
+        if (
+            not isinstance(tenant_key, str)
+            or not tenant_key
+            or tenant_key != tenant_key.strip()
+            or not isinstance(agent_id, str)
+            or not agent_id
+            or agent_id != agent_id.strip()
+        ):
+            raise FireServiceError(
+                "external mutation fence record is invalid"
+            )
+        return tenant_key, agent_id
+
+    @classmethod
+    def _external_mutation_fence_request(
+        cls,
+        event: JournalEvent,
+    ) -> _PendingExternalMutationFence | None:
+        tenant_key, agent_id = cls._external_mutation_fence_identity(event)
+        if set(event.payload) == {"tenant_key", "agent_id"}:
+            return None
+        try:
+            request = EmployeeFireRequest(
+                employee=event.payload["employee"],
+                tenant_key=tenant_key,
+                message_id=event.payload["message_id"],
+                chat_id=event.payload["chat_id"],
+                requester_principal_id=event.payload["requester_principal_id"],
+                drain=event.payload["drain"],
+            )
+            target = EmployeeFireTarget(
+                tenant_key=tenant_key,
+                agent_id=agent_id,
+                employee_name=event.payload["employee_name"],
+                bot_principal_id=event.payload["bot_principal_id"],
+                app_id=event.payload["app_id"],
+                credential_ref=event.payload["credential_ref"],
+                cleanup_mode=FireCleanupMode(event.payload["cleanup_mode"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FireServiceError(
+                "external mutation fence record is invalid"
+            ) from exc
+        intent_id = event.payload.get("intent_id")
+        target_identity = (
+            target.employee_name,
+            target.bot_principal_id,
+            target.app_id,
+            target.credential_ref,
+        )
+        if (
+            not isinstance(intent_id, str)
+            or intent_id != cls._intent_id(request)
+            or any(not isinstance(value, str) for value in target_identity)
+            or request.employee not in {target.agent_id, target.employee_name}
+            or not target.employee_name
+            or target.employee_name != target.employee_name.strip()
+            or (
+                target.cleanup_mode
+                in {FireCleanupMode.BOUND, FireCleanupMode.RECOVERABLE}
+                and any(not value for value in target_identity[1:])
+            )
+            or (
+                target.cleanup_mode
+                in {FireCleanupMode.SAFE_ABORT, FireCleanupMode.EXTERNAL_UNKNOWN}
+                and (target.bot_principal_id or target.credential_ref)
+            )
+            or event.aggregate_id
+            != cls._external_mutation_fence_aggregate_id(tenant_key, agent_id)
+        ):
+            raise FireServiceError("external mutation fence record is invalid")
+        return _PendingExternalMutationFence(
+            request=request,
+            target=target,
+            intent_id=intent_id,
+        )
+
+    @staticmethod
+    def _external_mutation_fence_aggregate_id(
+        tenant_key: str,
+        agent_id: str,
+    ) -> str:
+        raw = "\x00".join((tenant_key, agent_id))
+        return (
+            "employee-external-mutation-fence:"
+            f"{hashlib.sha256(raw.encode()).hexdigest()}"
+        )
 
     def _states(self):
         return rebuild_fire_projection(tuple(self._writer.replay()))

@@ -9,6 +9,8 @@ from collections.abc import Awaitable, Callable
 from concurrent.futures import Future as ConcurrentFuture
 from typing import Any
 
+from .external_mutation_gate import external_task_name
+
 
 class CallbackBridgeError(RuntimeError):
     """A bridged callback failed without exposing callback arguments."""
@@ -59,21 +61,64 @@ class AsyncCallbackBridge:
             running_loop = None
         if running_loop is self._loop:
             future: asyncio.Future[Any] | ConcurrentFuture[Any] = (
-                self._loop.create_task(invoke())
+                self._loop.create_task(
+                    invoke(),
+                    name=external_task_name("registration-callback"),
+                )
             )
         else:
-            future = asyncio.run_coroutine_threadsafe(invoke(), self._loop)
+            proxy: ConcurrentFuture[Any] = ConcurrentFuture()
+
+            def start() -> None:
+                coroutine = invoke()
+                try:
+                    task = self._loop.create_task(
+                        coroutine,
+                        name=external_task_name("registration-callback"),
+                    )
+                except BaseException as exc:
+                    coroutine.close()
+                    proxy.set_exception(exc)
+                    return
+
+                def completed(done: asyncio.Task[Any]) -> None:
+                    if proxy.done():
+                        return
+                    try:
+                        proxy.set_result(done.result())
+                    except asyncio.CancelledError:
+                        proxy.cancel()
+                    except BaseException as exc:
+                        proxy.set_exception(exc)
+
+                task.add_done_callback(completed)
+
+            future = proxy
+            with self._mutex:
+                self._pending.add(future)
+            try:
+                self._loop.call_soon_threadsafe(start)
+            except BaseException:
+                with self._mutex:
+                    self._pending.discard(future)
+                raise
+            return
         with self._mutex:
             self._pending.add(future)
 
     async def drain(self) -> None:
         """Wait for every callback queued before the activity completes."""
 
+        failed = False
         while True:
             with self._mutex:
                 pending = tuple(self._pending)
                 self._pending.clear()
             if not pending:
+                if failed:
+                    raise CallbackBridgeError(
+                        "registration callback failed"
+                    ) from None
                 return
             awaitables = [
                 future
@@ -81,10 +126,13 @@ class AsyncCallbackBridge:
                 else asyncio.wrap_future(future, loop=self._loop)
                 for future in pending
             ]
-            try:
-                await asyncio.gather(*awaitables)
-            except Exception:
-                raise CallbackBridgeError("registration callback failed") from None
+            results = await asyncio.gather(
+                *awaitables,
+                return_exceptions=True,
+            )
+            failed = failed or any(
+                isinstance(result, BaseException) for result in results
+            )
 
 
 __all__ = ["AsyncCallbackBridge", "CallbackBridgeError"]

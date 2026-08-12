@@ -110,11 +110,13 @@ class IngressAckMailbox:
                 or ack.app_id != pending.app_id
                 or ack.channel_generation != pending.generation
                 or ack.connection_id != pending.connection_id
-                or ack.semantic_digest != pending.semantic_digest
-                or ack.acceptance.envelope_id != pending.envelope_id
-                or ack.acceptance.dedup_key != pending.dedup_key
+                or ack.request_semantic_digest != pending.semantic_digest
+                or ack.request_envelope_id != pending.envelope_id
+                or ack.request_dedup_key != pending.dedup_key
             ):
                 return False
+            if pending.ack is not None:
+                return pending.ack == ack
             pending.ack = ack
             pending.completed.set()
             return True
@@ -217,9 +219,7 @@ class _ConnectionAdmission:
             while not self._ready:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not self._condition.wait(timeout=remaining):
-                    raise TimeoutError(
-                        "employee ingress connection readiness timed out"
-                    )
+                    raise TimeoutError("employee ingress connection readiness timed out")
             return self._epoch, self._connection_id
 
     def register(
@@ -237,11 +237,7 @@ class _ConnectionAdmission:
         dedup_key: str,
     ) -> _PendingIngressAck:
         with self._condition:
-            if (
-                not self._ready
-                or self._epoch != expected_epoch
-                or self._connection_id != connection_id
-            ):
+            if not self._ready or self._epoch != expected_epoch or self._connection_id != connection_id:
                 raise EOFError("employee ingress connection ownership changed")
             return mailbox.register(
                 request_id=request_id,
@@ -272,9 +268,7 @@ def run_low_level_employee_channel(
     )
 
     channel_tmp = Path(os.environ.get("GHOSTAP_CHANNEL_TMP", "/tmp"))
-    prepare_controlled_sdk_import_cache(
-        channel_tmp / f"ghostap-employee-channel-sdk-{os.getpid()}"
-    )
+    prepare_controlled_sdk_import_cache(channel_tmp / f"ghostap-employee-channel-sdk-{os.getpid()}")
     collect_sdk_distribution_identity(require_controlled_import_cache=True)
     if sandbox_proof_fd is not None:
         emit_macos_sandbox_proof(sandbox_proof_fd, sandbox_proof_nonce)
@@ -336,9 +330,7 @@ def run_low_level_employee_channel(
         deadline = time.monotonic() + float(ack_timeout)
         if stop_requested.is_set():
             raise EOFError("employee ingress admission is closed")
-        connection_epoch, connection_id = admission.wait_snapshot(
-            deadline=deadline
-        )
+        connection_epoch, connection_id = admission.wait_snapshot(deadline=deadline)
         if stop_requested.is_set():
             raise EOFError("employee ingress admission is closed")
         metadata, payload, correlation = _normalize_sdk_ingress(
@@ -399,13 +391,14 @@ def run_low_level_employee_channel(
     def on_bot_deleted(event: Any) -> None:
         wait_for_parent(event, kind="membership_deleted")
 
-    dispatcher = (
-        EventDispatcherHandler.builder("", "", security=security)
-        .register_p2_im_message_receive_v1(on_message)
-        .register_p2_card_action_trigger(on_card_action)
-        .register_p2_im_chat_member_bot_added_v1(on_bot_added)
-        .register_p2_im_chat_member_bot_deleted_v1(on_bot_deleted)
-        .build()
+    dispatcher = _build_low_level_event_dispatcher(
+        EventDispatcherHandler,
+        security,
+        delivery_only=bootstrap.delivery_only,
+        on_message=on_message,
+        on_card_action=on_card_action,
+        on_bot_added=on_bot_added,
+        on_bot_deleted=on_bot_deleted,
     )
     client = WSClient(
         app_id=bootstrap.app_id,
@@ -426,7 +419,7 @@ def run_low_level_employee_channel(
 
     def on_reconnected() -> None:
         connection_epoch = admission.epoch
-        connection_id = f"conn_{uuid.uuid4().hex}"
+        connection_id = bootstrap.frozen_connection_id if bootstrap.delivery_only else f"conn_{uuid.uuid4().hex}"
         _emit_nonblocking(emitter, "reconnected", {"connection_id": connection_id})
         _publish_observed_low_level_connection(
             client,
@@ -460,6 +453,29 @@ def run_low_level_employee_channel(
         stop_requested.set()
         mailbox.close()
         emitter.close()
+
+
+def _build_low_level_event_dispatcher(
+    dispatcher_type: Any,
+    security: Any,
+    *,
+    delivery_only: bool,
+    on_message: Callable[[Any], None],
+    on_card_action: Callable[[Any], Any],
+    on_bot_added: Callable[[Any], None],
+    on_bot_deleted: Callable[[Any], None],
+) -> Any:
+    """Build an ingress-free dispatcher for frozen retirement delivery."""
+
+    builder = dispatcher_type.builder("", "", security=security)
+    if not delivery_only:
+        builder = (
+            builder.register_p2_im_message_receive_v1(on_message)
+            .register_p2_card_action_trigger(on_card_action)
+            .register_p2_im_chat_member_bot_added_v1(on_bot_added)
+            .register_p2_im_chat_member_bot_deleted_v1(on_bot_deleted)
+        )
+    return builder.build()
 
 
 def _strict_sdk_security_config() -> Any:
@@ -499,9 +515,7 @@ def _fetch_employee_bot_open_id(
     try:
         response = client.request(request)
     except Exception as exc:
-        raise WorkerSecurityError(
-            f"employee bot identity lookup failed ({type(exc).__name__})"
-        ) from None
+        raise WorkerSecurityError(f"employee bot identity lookup failed ({type(exc).__name__})") from None
     raw = response.raw if isinstance(response, BaseResponse) else None
     if (
         not isinstance(response, BaseResponse)
@@ -527,10 +541,7 @@ def _fetch_employee_bot_open_id(
         or not isinstance(open_id, str)
         or not open_id.startswith("ou_")
         or len(open_id) > 256
-        or (
-            observed_app_id is not None
-            and observed_app_id != expected_app_id
-        )
+        or (observed_app_id is not None and observed_app_id != expected_app_id)
     ):
         raise WorkerSecurityError("employee bot identity response is invalid")
     return open_id
@@ -592,6 +603,19 @@ def _handle_low_level_outbound(
 ) -> None:
     """Execute one parent-authorized send with current Channel authority."""
 
+    # Keep every SDK/HTTP import below ``apply_process_hardening()`` in the
+    # fresh worker.  This handler is reachable only from the hardened runtime.
+    from lark_oapi.core.exception import (
+        AccessTokenException,
+        ObtainAccessTokenException,
+    )
+    from requests.exceptions import (
+        ConnectionError as RequestsConnectionError,
+    )
+    from requests.exceptions import Timeout as RequestsTimeout
+
+    from src.autonomous.provisioning.lark_outbound import EmployeeOutboundError
+
     operation = "send" if frame.frame_type is FrameType.SEND else "update_card"
     request_id = frame.payload.get("request_id")
     if not isinstance(request_id, str) or not request_id:
@@ -601,14 +625,13 @@ def _handle_low_level_outbound(
                 "operation": operation,
                 "request_id": "",
                 "success": False,
+                "failure_kind": "internal",
                 "error_code": "invalid-outbound-request",
             },
         )
         return
     try:
-        _epoch, connection_id = admission.wait_snapshot(
-            deadline=time.monotonic() + 10.0
-        )
+        _epoch, connection_id = admission.wait_snapshot(deadline=time.monotonic() + 10.0)
         if frame.frame_type is FrameType.SEND:
             result = outbound.send(
                 frame.payload.get("target"),
@@ -620,19 +643,47 @@ def _handle_low_level_outbound(
                 frame.payload.get("message_id"),
                 frame.payload.get("card"),
             )
-        if getattr(result, "success", None) is not True:
-            raise RuntimeError("employee outbound operation was not acknowledged")
+        success = getattr(result, "success", None)
+        if success is False:
+            raise EmployeeOutboundError("employee outbound operation was not acknowledged")
+        if success is not True:
+            raise TypeError("employee outbound receipt success is invalid")
         message_id = getattr(result, "message_id", "")
         if not isinstance(message_id, str) or not message_id:
-            raise RuntimeError("employee outbound receipt is invalid")
+            raise TypeError("employee outbound receipt is invalid")
     except Exception as exc:
+        if isinstance(
+            exc,
+            (
+                TimeoutError,
+                ConnectionError,
+                RequestsTimeout,
+                RequestsConnectionError,
+            ),
+        ):
+            failure_kind = "transport"
+            error_code = "transport-unavailable"
+        elif isinstance(
+            exc,
+            (
+                EmployeeOutboundError,
+                AccessTokenException,
+                ObtainAccessTokenException,
+            ),
+        ):
+            failure_kind = "remote"
+            error_code = "remote-rejected"
+        else:
+            failure_kind = "internal"
+            error_code = "outbound-internal-error"
         emitter.emit(
             FrameType.HEALTH,
             {
                 "operation": operation,
                 "request_id": request_id,
                 "success": False,
-                "error_code": type(exc).__name__,
+                "failure_kind": failure_kind,
+                "error_code": error_code,
             },
         )
         return
@@ -659,7 +710,7 @@ def _observe_low_level_connection(
     admission: _ConnectionAdmission,
 ) -> None:
     connection_epoch = admission.epoch
-    connection_id = f"conn_{uuid.uuid4().hex}"
+    connection_id = bootstrap.frozen_connection_id if bootstrap.delivery_only else f"conn_{uuid.uuid4().hex}"
     while not stop_requested.is_set():
         if _publish_observed_low_level_connection(
             client,
@@ -750,10 +801,7 @@ def _normalize_message_mentions(message: Any) -> tuple[dict[str, str], ...]:
             "open_id": getattr(identity, "open_id", None),
             "tenant_key": getattr(mention, "tenant_key", None),
         }
-        if any(
-            not isinstance(value, str) or not value or len(value) > 256
-            for value in fields.values()
-        ):
+        if any(not isinstance(value, str) or not value or len(value) > 256 for value in fields.values()):
             raise ValueError("employee ingress mention identity is invalid")
         normalized.append(fields)
     return tuple(normalized)
@@ -813,9 +861,7 @@ def _normalize_sdk_ingress(
         }
         if mentions:
             normalized_message["mentions"] = mentions
-        parts = (
-            normalized_message,
-        )
+        parts = (normalized_message,)
         action_identity = ""
     elif kind == "card":
         context = getattr(body, "context", None)
@@ -846,9 +892,7 @@ def _normalize_sdk_ingress(
         parts = (
             {
                 "type": "membership_event",
-                "operation": (
-                    "added" if kind == "membership_added" else "deleted"
-                ),
+                "operation": ("added" if kind == "membership_added" else "deleted"),
                 # The public metadata keeps only a one-way index.  The raw
                 # Feishu chat identifier is required for the official API and
                 # therefore travels only inside the encrypted ingress blob.
@@ -866,8 +910,9 @@ def _normalize_sdk_ingress(
     chat_id = _canonical_ingress_id(chat_id, "oc_")
     if root_id:
         root_id = _canonical_ingress_id(root_id, "om_")
+    stable_identity = "message" if kind == "message" else event_id
     stable = json.dumps(
-        [tenant_key, agent_id, event_id, message_id, event_type, action_identity],
+        [tenant_key, agent_id, stable_identity, message_id, event_type, action_identity],
         separators=(",", ":"),
     ).encode()
     import hashlib
@@ -907,9 +952,7 @@ def _normalize_sdk_ingress(
 def _sdk_timestamp(value: Any) -> str:
     if not isinstance(value, str) or not value.isdigit():
         raise ValueError("invalid employee ingress timestamp")
-    return datetime.fromtimestamp(int(value) / 1000, tz=UTC).isoformat(
-        timespec="milliseconds"
-    ).replace("+00:00", "Z")
+    return datetime.fromtimestamp(int(value) / 1000, tz=UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _canonical_ingress_id(value: Any, prefix: str) -> str:
@@ -957,11 +1000,7 @@ def apply_process_hardening() -> None:
 
 def emit_macos_sandbox_proof(fd: int, nonce: str) -> None:
     """Prove the deny-default Seatbelt profile before reading credentials."""
-    if (
-        sys.platform != "darwin"
-        or len(nonce) != 32
-        or any(character not in "0123456789abcdef" for character in nonce)
-    ):
+    if sys.platform != "darwin" or len(nonce) != 32 or any(character not in "0123456789abcdef" for character in nonce):
         raise WorkerSecurityError("invalid macOS sandbox proof request")
     repository_root = Path(__file__).resolve().parents[3]
     canary = repository_root / "AGENTS.md"
@@ -1017,9 +1056,7 @@ class _FrameEmitter:
         self._agent_id = agent_id
         self._generation = generation
         self._sequence = 0
-        self._requests: queue.Queue[_EmitRequest | None] = queue.Queue(
-            maxsize=self._QUEUE_CAPACITY
-        )
+        self._requests: queue.Queue[_EmitRequest | None] = queue.Queue(maxsize=self._QUEUE_CAPACITY)
         self._admission_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._state_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._failed: BaseException | None = None
@@ -1153,9 +1190,7 @@ class _FrameEmitter:
                 view = view[written:]
                 continue
             if not request.required and bytes_written == 0:
-                raise BlockingIOError(
-                    "employee Channel IPC notification could not be emitted"
-                )
+                raise BlockingIOError("employee Channel IPC notification could not be emitted")
             remaining = request.deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("employee Channel IPC emit timed out")
@@ -1198,11 +1233,7 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(child) for child in value]
     if hasattr(value, "__dict__"):
-        return {
-            str(key): _json_safe(child)
-            for key, child in vars(value).items()
-            if not str(key).startswith("_")
-        }
+        return {str(key): _json_safe(child) for key, child in vars(value).items() if not str(key).startswith("_")}
     return {"type": type(value).__name__}
 
 

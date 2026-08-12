@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -13,12 +16,16 @@ from src.autonomous.journal.anchor import FileAnchor
 from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.projections import ProjectionRepository, ProjectionState
 from src.autonomous.journal.writer import JournalWriter
+from src.autonomous.provisioning.external_mutation_gate import (
+    EmployeeExternalMutationGate,
+)
 from src.autonomous.provisioning.hire_port import EmployeeHireRequest
 from src.autonomous.provisioning.hire_service import (
     HireAdmissionError,
     ProductionEmployeeHireService,
 )
 from src.autonomous.provisioning.hire_state import HireProjection
+from src.autonomous.provisioning.lark_app import RegistrationResult
 from src.autonomous.workforce.projection import commit_workforce_events
 
 HMAC_KEY = b"employee-hire-admission-test-key!"
@@ -60,6 +67,9 @@ def _service(
     runtime_recovery_ready: bool = True,
     provisioning_submitter: Callable[[str], object] | None = None,
     admin_provider: Callable[[], object] | None = None,
+    registrar=None,
+    credential_vault=None,
+    external_mutation_gate=None,
 ) -> tuple[ProductionEmployeeHireService, JournalWriter, ProjectionState]:
     writer = JournalWriter.open(
         base / "journal",
@@ -76,11 +86,243 @@ def _service(
         credential_keyring_ready=credential_keyring_ready,
         runtime_recovery_ready=runtime_recovery_ready,
         provisioning_submitter=provisioning_submitter,
+        registrar=registrar,
+        credential_vault=credential_vault,
+        external_mutation_gate=external_mutation_gate,
         admin_principal_ids_provider=(
             admin_provider or (lambda: frozenset({"ou_admin"}))
         ),
     )
     return service, writer, projection
+
+
+class _Registrar:
+    def __init__(self, *, blocked: bool = False) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        if not blocked:
+            self.release.set()
+
+    async def register(self, _request, *, on_link, on_status=None):
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return RegistrationResult(
+            app_id="cli_registered",
+            app_secret="registration-secret",
+        )
+
+
+class _CancelledRegistrar:
+    async def register(self, _request, *, on_link, on_status=None):
+        raise asyncio.CancelledError
+
+
+class _FailingRegistrar(_Registrar):
+    async def register(self, _request, *, on_link, on_status=None):
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        raise RuntimeError("registration failed after caller cancellation")
+
+
+class _Vault:
+    def __init__(self, *, blocked: bool = False) -> None:
+        self.calls = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+        if not blocked:
+            self.release.set()
+
+    def put(self, agent_id, app_id, _secret, hire_intent_id, attempt_id):
+        self.calls += 1
+        self.started.set()
+        assert self.release.wait(2.0)
+        return SimpleNamespace(
+            credential_ref="cred_registered",
+            agent_id=agent_id,
+            app_id=app_id,
+            hire_intent_id=hire_intent_id,
+            attempt_id=attempt_id,
+        )
+
+    def find_orphan_receipts(self, _live_refs):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_retirement_fence_rejects_queued_hire_before_external_calls(
+    tmp_path: Path,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    registrar = _Registrar()
+    vault = _Vault()
+    service, _writer, _projection = _service(
+        tmp_path,
+        registrar=registrar,
+        credential_vault=vault,
+        external_mutation_gate=gate,
+    )
+    admitted = service.start_hire(_request())
+    gate.restore_retirement_fence("tenant-a", admitted.agent_id)
+
+    with pytest.raises(HireAdmissionError, match="retiring"):
+        await service.run_provisioning(admitted.intent_id)
+
+    assert registrar.calls == 0
+    assert vault.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_retirement_waits_for_registration_anchor_then_blocks_vault(
+    tmp_path: Path,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    registrar = _Registrar(blocked=True)
+    vault = _Vault()
+    service, _writer, _projection = _service(
+        tmp_path,
+        registrar=registrar,
+        credential_vault=vault,
+        external_mutation_gate=gate,
+    )
+    admitted = service.start_hire(_request())
+    provisioning = asyncio.create_task(
+        service.run_provisioning(admitted.intent_id)
+    )
+    await asyncio.wait_for(registrar.started.wait(), timeout=1.0)
+    retirement = asyncio.create_task(
+        asyncio.to_thread(
+            gate.begin_retirement,
+            "tenant-a",
+            admitted.agent_id,
+            timeout_seconds=1.0,
+        )
+    )
+    for _attempt in range(100):
+        if gate.is_fenced("tenant-a", admitted.agent_id):
+            break
+        await asyncio.sleep(0.01)
+    assert gate.is_fenced("tenant-a", admitted.agent_id) is True
+    assert retirement.done() is False
+
+    registrar.release.set()
+    with pytest.raises(HireAdmissionError, match="retiring"):
+        await provisioning
+
+    assert await retirement is True
+    assert registrar.calls == 1
+    assert vault.calls == 0
+    state = service.get_state(admitted.intent_id)
+    assert state is not None
+    assert state.app_id == "cli_registered"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_vault_wait_keeps_lease_until_thread_and_anchor_finish(
+    tmp_path: Path,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    registrar = _Registrar()
+    vault = _Vault(blocked=True)
+    service, _writer, _projection = _service(
+        tmp_path,
+        registrar=registrar,
+        credential_vault=vault,
+        external_mutation_gate=gate,
+    )
+    admitted = service.start_hire(_request())
+    provisioning = asyncio.create_task(
+        service.run_provisioning(admitted.intent_id)
+    )
+    assert await asyncio.to_thread(vault.started.wait, 1.0)
+    activity = service._activities[admitted.intent_id]  # noqa: SLF001
+    activity.cancel()
+    retirement = asyncio.create_task(
+        asyncio.to_thread(
+            gate.begin_retirement,
+            "tenant-a",
+            admitted.agent_id,
+            timeout_seconds=1.0,
+        )
+    )
+    for _attempt in range(100):
+        if gate.is_fenced("tenant-a", admitted.agent_id):
+            break
+        await asyncio.sleep(0.01)
+    assert gate.is_fenced("tenant-a", admitted.agent_id) is True
+    assert retirement.done() is False
+
+    vault.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await provisioning
+
+    assert await retirement is True
+    state = service.get_state(admitted.intent_id)
+    assert state is not None
+    assert state.credential_ref == "cred_registered"
+
+
+@pytest.mark.asyncio
+async def test_child_cancelled_registrar_is_disposed_before_releasing_lease(
+    tmp_path: Path,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    vault = _Vault()
+    service, _writer, _projection = _service(
+        tmp_path,
+        registrar=_CancelledRegistrar(),
+        credential_vault=vault,
+        external_mutation_gate=gate,
+    )
+    admitted = service.start_hire(_request())
+
+    with pytest.raises(HireAdmissionError, match="registration outcome"):
+        await service.run_provisioning(admitted.intent_id)
+
+    state = service.get_state(admitted.intent_id)
+    assert state is not None
+    assert state.effect_state("register-app").value == "action_required"
+    assert state.phase.value == "action_required"
+    assert vault.calls == 0
+    assert gate.begin_retirement(
+        "tenant-a",
+        admitted.agent_id,
+        timeout_seconds=0,
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_registration_with_child_failure_preserves_cancellation(
+    tmp_path: Path,
+) -> None:
+    gate = EmployeeExternalMutationGate()
+    registrar = _FailingRegistrar(blocked=True)
+    service, _writer, _projection = _service(
+        tmp_path,
+        registrar=registrar,
+        credential_vault=_Vault(),
+        external_mutation_gate=gate,
+    )
+    admitted = service.start_hire(_request())
+    provisioning = asyncio.create_task(service.run_provisioning(admitted.intent_id))
+    await asyncio.wait_for(registrar.started.wait(), timeout=1.0)
+    activity = service._activities[admitted.intent_id]  # noqa: SLF001
+    activity.cancel()
+    registrar.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await provisioning
+
+    state = service.get_state(admitted.intent_id)
+    assert state is not None
+    assert state.effect_state("register-app").value == "action_required"
+    assert gate.begin_retirement(
+        "tenant-a",
+        admitted.agent_id,
+        timeout_seconds=0,
+    ) is True
 
 
 def test_complete_profile_is_anchored_and_replayed_before_unlocked_submit(

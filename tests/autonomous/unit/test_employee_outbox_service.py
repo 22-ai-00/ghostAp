@@ -88,6 +88,67 @@ def test_append_encrypts_before_anchor_and_duplicate_is_idempotent(tmp_path) -> 
         writer.close()
 
 
+def test_ambiguous_anchor_preserves_referenced_snapshot_blob(tmp_path) -> None:
+    durable_anchor = MemoryAnchor()
+
+    class RaiseAfterAnchor:
+        production_safe = True
+
+        @staticmethod
+        def read():
+            return durable_anchor.read()
+
+        @staticmethod
+        def compare_and_swap(*args):
+            assert durable_anchor.compare_and_swap(*args) is True
+            raise OSError("directory fsync outcome unknown")
+
+    writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=RaiseAfterAnchor(),
+        hmac_key=b"j" * 32,
+        writer_epoch=1,
+    )
+    service = EmployeeOutboxService(
+        writer=writer,
+        blob_store=BlobStore(
+            tmp_path / "outbox-blobs",
+            AesGcmEncryptionProvider(lambda _ref: b"b" * 32),
+        ),
+        outbox_state=OutboxProjectionState(),
+        active_key_id="k1",
+    )
+    snapshot = _snapshot()
+    try:
+        with pytest.raises(Exception):
+            service.append_snapshot(snapshot)
+        assert len(service.blob_store.iter_blob_ids()) == 1
+    finally:
+        service.close()
+        writer.close()
+
+    writer2 = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=durable_anchor,
+        hmac_key=b"j" * 32,
+        writer_epoch=2,
+    )
+    service2 = EmployeeOutboxService(
+        writer=writer2,
+        blob_store=BlobStore(
+            tmp_path / "outbox-blobs",
+            AesGcmEncryptionProvider(lambda _ref: b"b" * 32),
+        ),
+        outbox_state=OutboxProjectionState(),
+        active_key_id="k1",
+    )
+    try:
+        assert service2.get_snapshot(snapshot.outbox_id) == snapshot
+    finally:
+        service2.close()
+        writer2.close()
+
+
 def test_conflicting_duplicate_and_late_terminal_progress_are_rejected(tmp_path) -> None:
     service, writer, _anchor = _runtime(tmp_path)
     try:

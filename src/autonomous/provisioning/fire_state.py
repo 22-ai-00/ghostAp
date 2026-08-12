@@ -275,7 +275,13 @@ def rebuild_fire_projection(
                     FireEffectState.COMMITTED: {FireEffectState.EXECUTING},
                     FireEffectState.ACTION_REQUIRED: {FireEffectState.EXECUTING},
                 }
-                if previous not in allowed[next_state]:
+                membership_revalidation = (
+                    next_state is FireEffectState.EXECUTING
+                    and previous is FireEffectState.COMMITTED
+                    and effect_type == "membership_cleanup"
+                    and current.phase is FirePhase.RETIRING
+                )
+                if previous not in allowed[next_state] and not membership_revalidation:
                     raise FireProjectionError("invalid fire effect transition")
                 effects = dict(current.effects)
                 effects[effect_type] = next_state

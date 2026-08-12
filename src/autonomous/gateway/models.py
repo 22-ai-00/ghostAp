@@ -23,6 +23,42 @@ class DispatchPermitConsumedError(RuntimeError):
     """A one-shot permit has already been claimed."""
 
 
+class EmployeeDispatchReportingDeferredError(RuntimeError):
+    """Attempt-local reporting work was isolated and remains pending."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failed_attempt_ids: tuple[str, ...] = (),
+        repaired_count: int = 0,
+    ) -> None:
+        if not isinstance(message, str) or not message:
+            raise ValueError("deferred reporting message is required")
+        if type(failed_attempt_ids) is not tuple or any(
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or attempt_id != attempt_id.strip()
+            for attempt_id in failed_attempt_ids
+        ):
+            raise ValueError("failed_attempt_ids must be non-empty strings")
+        if len(set(failed_attempt_ids)) != len(failed_attempt_ids):
+            raise ValueError("failed_attempt_ids must be unique")
+        if type(repaired_count) is not int or repaired_count < 0:
+            raise ValueError("repaired_count must be a non-negative integer")
+        super().__init__(message)
+        self.failed_attempt_ids = failed_attempt_ids
+        self.repaired_count = repaired_count
+
+    @property
+    def deferred_attempt_ids(self) -> tuple[str, ...]:
+        return self.failed_attempt_ids
+
+    @property
+    def recovered_count(self) -> int:
+        return self.repaired_count
+
+
 def _required_text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"{name} is required")
@@ -451,6 +487,7 @@ __all__ = [
     "DispatchBinding",
     "DispatchPermit",
     "DispatchPermitConsumedError",
+    "EmployeeDispatchReportingDeferredError",
     "GatewayExecutionResult",
     "GatewayExecutionStatus",
 ]

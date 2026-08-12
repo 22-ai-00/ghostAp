@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
+import math
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -23,8 +26,13 @@ from ..authorization import EmployeeAuthorizationScope
 from ..context.models import AuthorizedContextRequest
 from ..domain import EmployeeState, WorkerType
 from ..journal.blob_store import BlobRef
-from ..journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
-from ..journal.writer import CommitState, JournalWriter
+from ..journal.frame import (
+    GENESIS_HASH,
+    JournalEvent,
+    JournalIntegrityError,
+    TransactionFrame,
+)
+from ..journal.writer import CommitState, JournalDeadlineExceededError, JournalWriter
 from ..supervisor.channel_models import ChannelProcessState
 from ..workforce.projection import is_workforce_event
 from ..workforce.registry import (
@@ -59,6 +67,7 @@ _ROUTER_EVENTS = frozenset(
 )
 
 _INBOX_MAX_FAILURES = 3
+_HANDOFF_ABANDON_MAX_RETRIES = 4
 _AUTHORITY_DEPENDENCY_UNAVAILABLE = "authority_dependency_unavailable"
 
 
@@ -108,6 +117,20 @@ def _bound_remote_coordinate(
         # Synthetic/internal ingress predating dual-coordinate payloads keeps
         # raw coordinates in metadata. Real SDK ingress always supplies raw.
         return indexed_value
+    if not isinstance(raw_value, str):
+        return None
+    if not raw_value:
+        return "" if not indexed_value else None
+    return raw_value if _remote_index(raw_value, prefix) == indexed_value else None
+
+
+def _bound_encrypted_remote_coordinate(
+    indexed_value: str,
+    raw_value: object,
+    prefix: str,
+) -> str | None:
+    """Bind a public message coordinate without treating its hash as raw data."""
+
     if not isinstance(raw_value, str):
         return None
     if not raw_value:
@@ -413,6 +436,175 @@ class _AuthorityResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class RouterResponseObligation:
+    """Minimal reply target frozen atomically with Employee queue ownership."""
+
+    schema_version: int
+    chat_id: str
+    reply_to_message_id: str
+    reply_coordinate_kind: str
+    authority_binding_sha256: str
+
+    _FIELDS = frozenset(
+        {
+            "schema_version",
+            "chat_id",
+            "reply_to_message_id",
+            "reply_coordinate_kind",
+            "authority_binding_sha256",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("unsupported Router response obligation schema")
+        if (
+            not isinstance(self.chat_id, str)
+            or not self.chat_id.startswith("oc_")
+            or len(self.chat_id) > 256
+        ):
+            raise ValueError("invalid Router response chat")
+        if (
+            not isinstance(self.reply_to_message_id, str)
+            or not self.reply_to_message_id.startswith("om_")
+            or len(self.reply_to_message_id) > 256
+        ):
+            raise ValueError("invalid Router response message")
+        if self.reply_coordinate_kind not in {"root", "message"}:
+            raise ValueError("invalid Router response coordinate kind")
+        if (
+            not isinstance(self.authority_binding_sha256, str)
+            or len(self.authority_binding_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.authority_binding_sha256
+            )
+        ):
+            raise ValueError("invalid Router response authority binding")
+
+    def to_dict(self) -> dict[str, object]:
+        return {name: getattr(self, name) for name in sorted(self._FIELDS)}
+
+    def is_bound_to(
+        self,
+        record: RouterLifecycleRecord,
+        authority: RouterAuthoritySnapshot,
+    ) -> bool:
+        """Verify this target against the accepted indexes and frozen authority."""
+
+        return _response_obligation_matches_record(record, authority, self)
+
+    @classmethod
+    def from_dict(cls, value: object) -> RouterResponseObligation:
+        if not isinstance(value, dict) or set(value) != cls._FIELDS:
+            raise ValueError("Router response obligation must use exact schema")
+        return cls(**value)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        authority: RouterAuthoritySnapshot,
+        acceptance_id: str,
+        ingress_aggregate_id: str,
+        envelope_id: str,
+        event_type: str,
+        chat_id: str,
+        message_id: str,
+        thread_root_message_id: str,
+    ) -> RouterResponseObligation:
+        reply_kind = "root" if thread_root_message_id else "message"
+        reply_to = thread_root_message_id or message_id
+        return cls(
+            schema_version=1,
+            chat_id=chat_id,
+            reply_to_message_id=reply_to,
+            reply_coordinate_kind=reply_kind,
+            authority_binding_sha256=_response_authority_binding_sha256(
+                acceptance_id=acceptance_id,
+                ingress_aggregate_id=ingress_aggregate_id,
+                envelope_id=envelope_id,
+                event_type=event_type,
+                authority=authority,
+            ),
+        )
+
+
+def _response_authority_binding_sha256(
+    *,
+    acceptance_id: str,
+    ingress_aggregate_id: str,
+    envelope_id: str,
+    event_type: str,
+    authority: RouterAuthoritySnapshot,
+) -> str:
+    binding = {
+        "acceptance_id": acceptance_id,
+        "authority": authority.to_dict(),
+        "envelope_id": envelope_id,
+        "event_type": event_type,
+        "ingress_aggregate_id": ingress_aggregate_id,
+    }
+    encoded = json.dumps(
+        binding,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(
+        b"ghostap.employee-router-response-authority.v1\0" + encoded
+    ).hexdigest()
+
+
+def _response_coordinate_matches_index(
+    indexed_value: str,
+    raw_value: str,
+    prefix: str,
+) -> bool:
+    return _remote_index(raw_value, prefix) == indexed_value
+
+
+def _response_obligation_matches_record(
+    record: RouterLifecycleRecord,
+    authority: RouterAuthoritySnapshot,
+    obligation: RouterResponseObligation,
+) -> bool:
+    expected_binding = _response_authority_binding_sha256(
+        acceptance_id=record.acceptance_id,
+        ingress_aggregate_id=record.aggregate_id,
+        envelope_id=record.envelope_id,
+        event_type=record.event_type,
+        authority=authority,
+    )
+    if (
+        obligation.authority_binding_sha256 != expected_binding
+        or obligation.chat_id != authority.team_id
+        or not _response_coordinate_matches_index(
+            record.indexed_chat_id,
+            obligation.chat_id,
+            "oc_",
+        )
+    ):
+        return False
+    if obligation.reply_coordinate_kind == "root":
+        return bool(record.indexed_thread_root_message_id) and (
+            _response_coordinate_matches_index(
+                record.indexed_thread_root_message_id,
+                obligation.reply_to_message_id,
+                "om_",
+            )
+        )
+    return not record.indexed_thread_root_message_id and (
+        _response_coordinate_matches_index(
+            record.message_id,
+            obligation.reply_to_message_id,
+            "om_",
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RouterLifecycleRecord:
     aggregate_id: str
     acceptance_id: str
@@ -430,6 +622,12 @@ class RouterLifecycleRecord:
     state: str
     accepted_sequence: int
     authority: RouterAuthoritySnapshot | None = None
+    indexed_chat_id: str = ""
+    indexed_thread_root_message_id: str = ""
+    response_obligation: RouterResponseObligation | None = field(
+        default=None,
+        repr=False,
+    )
     queue_position: int = 0
     queued_sequence: int = 0
     inbox_failures: int = 0
@@ -442,6 +640,9 @@ class RouterLifecycleRecord:
 @dataclass(slots=True)
 class RouterProjectionState:
     by_acceptance_id: dict[str, RouterLifecycleRecord] = field(default_factory=dict)
+    ignored_legacy_acceptances: dict[str, RouterLifecycleRecord] = field(
+        default_factory=dict
+    )
     cursor_sequence: int = 0
     cursor_hash: str = ""
 
@@ -460,7 +661,10 @@ class RouterDispatchGrant:
     )
 
 
-def _accepted_record(event: JournalEvent, sequence: int) -> RouterLifecycleRecord:
+def _accepted_record(
+    event: JournalEvent,
+    sequence: int,
+) -> RouterLifecycleRecord:
     payload = event.payload
     current_fields = {
         "metadata",
@@ -507,6 +711,8 @@ def _accepted_record(event: JournalEvent, sequence: int) -> RouterLifecycleRecor
         requester_principal_id=metadata.sender_principal_id,
         state="accepted",
         accepted_sequence=sequence,
+        indexed_chat_id=metadata.chat_id,
+        indexed_thread_root_message_id=metadata.thread_root_message_id,
     )
 
 
@@ -587,7 +793,18 @@ def _reduce_router_event(
             raise RouterProjectionError("invalid Router staging transition")
         updated = replace(record, state="staging")
     elif event.event_type == _ROUTER_PREFIX + "queued":
-        if set(payload) != {"acceptance_id", "authority", "queue_position"} or record.state != "staging":
+        current_fields = {
+            "acceptance_id",
+            "authority",
+            "queue_position",
+            "response_obligation",
+        }
+        legacy_fields = current_fields - {"response_obligation"}
+        is_legacy_replay = allow_legacy_replay and set(payload) == legacy_fields
+        if (
+            set(payload) != current_fields
+            and not is_legacy_replay
+        ) or record.state != "staging":
             raise RouterProjectionError("invalid Router queued transition")
         try:
             authority = RouterAuthoritySnapshot.from_dict(
@@ -599,11 +816,36 @@ def _reduce_router_event(
         position = payload["queue_position"]
         if authority != record.authority or isinstance(position, bool) or not isinstance(position, int) or position < 1:
             raise RouterProjectionError("invalid Router queue disposition")
+        response_obligation = None
+        if not is_legacy_replay:
+            raw_obligation = payload["response_obligation"]
+            if record.event_type == "im.message.receive_v1":
+                try:
+                    response_obligation = RouterResponseObligation.from_dict(
+                        raw_obligation
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise RouterProjectionError(
+                        "invalid Router response obligation"
+                    ) from exc
+                if not _response_obligation_matches_record(
+                    record,
+                    authority,
+                    response_obligation,
+                ):
+                    raise RouterProjectionError(
+                        "Router response obligation does not match acceptance"
+                    )
+            elif raw_obligation is not None:
+                raise RouterProjectionError(
+                    "non-message Router work cannot carry a response obligation"
+                )
         updated = replace(
             record,
             state="queued",
             queue_position=position,
             queued_sequence=sequence,
+            response_obligation=response_obligation,
         )
     elif event.event_type == _ROUTER_PREFIX + "dispatching":
         if set(payload) != {"acceptance_id"} or record.state != "queued":
@@ -691,6 +933,66 @@ def _reduce_router_event(
     else:
         raise RouterProjectionError("unknown Router event")
     state.by_acceptance_id[acceptance_id] = updated
+
+
+def _apply_router_frame_events(
+    state: RouterProjectionState,
+    frame: TransactionFrame,
+    *,
+    allow_legacy_replay: bool = False,
+) -> None:
+    """Project one frame while tombstoning unproven legacy public history."""
+
+    for event in frame.events:
+        if event.event_type == "employee.ingress.accepted":
+            record = _accepted_record(event, frame.sequence)
+            if (
+                record.acceptance_id in state.by_acceptance_id
+                or record.acceptance_id in state.ignored_legacy_acceptances
+            ):
+                raise RouterProjectionError("duplicate Router acceptance")
+            if (
+                record.event_type == "im.message.receive_v1"
+                and event.payload.get("transport_message_proof", False) is not True
+            ):
+                state.ignored_legacy_acceptances[record.acceptance_id] = record
+            else:
+                state.by_acceptance_id[record.acceptance_id] = record
+        elif event.event_type in _ROUTER_EVENTS:
+            acceptance_id = (
+                event.payload.get("acceptance_id")
+                if isinstance(event.payload, dict)
+                else None
+            )
+            ignored_record = state.ignored_legacy_acceptances.get(
+                acceptance_id or ""
+            )
+            if ignored_record is not None:
+                if event.aggregate_id != ignored_record.aggregate_id:
+                    raise RouterProjectionError(
+                        "Router transition references unknown acceptance"
+                    )
+                ignored_state = RouterProjectionState(
+                    by_acceptance_id={ignored_record.acceptance_id: ignored_record}
+                )
+                _reduce_router_event(
+                    ignored_state,
+                    event,
+                    sequence=frame.sequence,
+                    allow_legacy_replay=allow_legacy_replay,
+                )
+                state.ignored_legacy_acceptances[ignored_record.acceptance_id] = (
+                    ignored_state.by_acceptance_id[ignored_record.acceptance_id]
+                )
+                continue
+            _reduce_router_event(
+                state,
+                event,
+                sequence=frame.sequence,
+                allow_legacy_replay=allow_legacy_replay,
+            )
+        elif event.event_type.startswith(_ROUTER_PREFIX):
+            raise RouterProjectionError("unknown Router event")
 
 
 class DurableEmployeeIngressRouter:
@@ -784,13 +1086,29 @@ class DurableEmployeeIngressRouter:
     def state(self) -> RouterProjectionState:
         return self._state
 
-    def record_snapshot(self, acceptance_id: str) -> RouterLifecycleRecord | None:
+    def record_snapshot(
+        self,
+        acceptance_id: str,
+        *,
+        deadline: float | None = None,
+        allow_immediate: bool = False,
+    ) -> RouterLifecycleRecord | None:
         """Return one immutable in-memory record without replaying the Journal."""
 
         if not isinstance(acceptance_id, str) or not acceptance_id:
             return None
-        with self._mutex:
+        hard_deadline = self._validated_handoff_deadline(deadline)
+        if not self._acquire_handoff_mutex(
+            hard_deadline,
+            allow_immediate=allow_immediate,
+        ):
+            raise RouterWriteDisabledError(
+                "Router snapshot deadline expired before Router lock"
+            )
+        try:
             return self._state.by_acceptance_id.get(acceptance_id)
+        finally:
+            self._mutex.release()
 
     @contextmanager
     def _ingress_dispatch_guard(self) -> Iterator[None]:
@@ -899,30 +1217,29 @@ class DurableEmployeeIngressRouter:
         if frame.previous_hash != expected_previous:
             raise RouterProjectionError("Router frame previous hash mismatch")
         probe = self._state.clone()
-        for event in frame.events:
-            if event.event_type == "employee.ingress.accepted":
-                record = _accepted_record(event, frame.sequence)
-                if record.acceptance_id in probe.by_acceptance_id:
-                    raise RouterProjectionError("duplicate Router acceptance")
-                probe.by_acceptance_id[record.acceptance_id] = record
-            elif event.event_type in _ROUTER_EVENTS:
-                _reduce_router_event(probe, event, sequence=frame.sequence)
+        _apply_router_frame_events(probe, frame)
 
     def apply_committed_frame_unlocked(self, frame: TransactionFrame) -> None:
         self.preflight_frame_unlocked(frame)
-        for event in frame.events:
-            if event.event_type == "employee.ingress.accepted":
-                record = _accepted_record(event, frame.sequence)
-                self._state.by_acceptance_id[record.acceptance_id] = record
-            elif event.event_type in _ROUTER_EVENTS:
-                _reduce_router_event(self._state, event, sequence=frame.sequence)
+        _apply_router_frame_events(self._state, frame)
         self._state.cursor_sequence = frame.sequence
         self._state.cursor_hash = frame.frame_hash
 
-    def rebuild_projection(self) -> RouterProjectionState:
-        with self._mutex:
+    def rebuild_projection(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> RouterProjectionState:
+        hard_deadline = self._validated_handoff_deadline(deadline)
+        if not self._acquire_handoff_mutex(hard_deadline):
+            raise RouterWriteDisabledError(
+                "Router projection deadline expired before Router lock"
+            )
+        try:
+            self._ensure_handoff_deadline(hard_deadline)
             fresh = RouterProjectionState()
             anchor = self._writer.anchor.read()
+            self._ensure_handoff_deadline(hard_deadline)
             cursor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
             if getattr(self, "_projection_verified", False) and (
                 self._state.cursor_sequence,
@@ -930,30 +1247,35 @@ class DurableEmployeeIngressRouter:
             ) == (anchor.sequence, cursor_hash):
                 return self._state
             anchored_hash = GENESIS_HASH
-            for frame in self._writer.replay():
+            replay = (
+                self._writer.replay()
+                if hard_deadline is None
+                else self._writer.replay(deadline=hard_deadline)
+            )
+            for frame in replay:
+                self._ensure_handoff_deadline(hard_deadline)
                 if frame.sequence > anchor.sequence:
                     break
-                for event in frame.events:
-                    if event.event_type == "employee.ingress.accepted":
-                        record = _accepted_record(event, frame.sequence)
-                        if record.acceptance_id in fresh.by_acceptance_id:
-                            raise RouterProjectionError("duplicate Router acceptance")
-                        fresh.by_acceptance_id[record.acceptance_id] = record
-                    elif event.event_type in _ROUTER_EVENTS:
-                        _reduce_router_event(
-                            fresh,
-                            event,
-                            sequence=frame.sequence,
-                            allow_legacy_replay=True,
-                        )
+                _apply_router_frame_events(
+                    fresh,
+                    frame,
+                    allow_legacy_replay=True,
+                )
                 fresh.cursor_sequence = frame.sequence
                 fresh.cursor_hash = frame.frame_hash
                 anchored_hash = frame.frame_hash
             if anchored_hash != anchor.frame_hash:
                 raise RouterWriteDisabledError("Router projection cannot verify Journal anchor")
+            self._ensure_handoff_deadline(hard_deadline)
             self._state = fresh
             self._projection_verified = True
             return self._state
+        except JournalDeadlineExceededError as exc:
+            raise RouterWriteDisabledError(
+                "Router projection deadline expired"
+            ) from exc
+        finally:
+            self._mutex.release()
 
     def is_inbox_candidate_eligible(self, acceptance_id: str) -> bool:
         """Return whether pre-dispatch payload work may read its Blob now."""
@@ -1214,7 +1536,15 @@ class DurableEmployeeIngressRouter:
                     victim = self._rebalance_victim_unlocked(record.authority)
                     if victim is None:
                         return self._terminal_unlocked(record, "queue_full")
-                    return self._rebalance_and_queue_unlocked(record, victim)
+                    return self._rebalance_and_queue_unlocked(
+                        record,
+                        victim,
+                        response_obligation=self._response_obligation(
+                            record,
+                            final_ingress.metadata,
+                            final_payload,
+                        ),
+                    )
                 position = 1 + sum(
                     candidate.state == "queued"
                     and candidate.authority is not None
@@ -1227,6 +1557,11 @@ class DurableEmployeeIngressRouter:
                     {
                         "authority": record.authority.to_dict(),
                         "queue_position": position,
+                        "response_obligation": self._response_obligation(
+                            record,
+                            final_ingress.metadata,
+                            final_payload,
+                        ),
                     },
                 )
         except IngressBlobRetryableError:
@@ -1261,6 +1596,7 @@ class DurableEmployeeIngressRouter:
         *,
         channel_generation: int,
         connection_id: str,
+        deadline: float | None = None,
     ) -> RouterLifecycleRecord:
         """Durably stop work that has not committed to the Employee queue.
 
@@ -1276,16 +1612,281 @@ class DurableEmployeeIngressRouter:
             "conn_"
         ):
             raise ValueError("connection_id is invalid")
-        with self._mutex, self._writer.transaction_guard():
-            self.rebuild_projection()
-            record = self._record(acceptance_id)
-            if (
-                record.channel_generation != channel_generation
-                or record.connection_id != connection_id
-                or record.state not in {"accepted", "authorized", "staging"}
-            ):
-                return record
-            return self._terminal_unlocked(record, "handoff_unconfirmed")
+        hard_deadline = self._validated_handoff_deadline(deadline)
+        last_conflict: JournalIntegrityError | None = None
+        alias_witness: tuple[str, int, str] | None = None
+
+        for _attempt in range(_HANDOFF_ABANDON_MAX_RETRIES):
+            self._ensure_handoff_deadline(
+                hard_deadline,
+                cause=last_conflict,
+            )
+
+            # Journal replay may scan the entire history.  Keep it outside the
+            # cross-domain writer guard so one handoff cannot stall unrelated
+            # ingress, Outbox, or lifecycle writers.
+            if not self._acquire_handoff_mutex(hard_deadline):
+                raise RouterWriteDisabledError(
+                    "Router handoff abandon deadline expired before Router lock"
+                ) from last_conflict
+            try:
+                self.rebuild_projection(deadline=hard_deadline)
+                record = self._record(acceptance_id)
+                canonical_transport = (
+                    record.channel_generation,
+                    record.connection_id,
+                )
+                if (
+                    record.state not in {"accepted", "authorized", "staging"}
+                ):
+                    return record
+                router_identity = (
+                    record.tenant_key,
+                    record.agent_id,
+                    record.bot_principal_id,
+                    record.app_id,
+                    record.event_type,
+                )
+            finally:
+                self._mutex.release()
+
+            if canonical_transport != (channel_generation, connection_id):
+                # A reconnect/redelivery keeps the canonical Router record but
+                # adds an append-only exact transport witness in Ingress.  Do
+                # this cross-domain lookup without the Router mutex so the
+                # global lock order remains Ingress -> Router.
+                canonical_ingress = self._ingress.record_snapshot(
+                    acceptance_id,
+                    **(
+                        {}
+                        if hard_deadline is None
+                        else {"deadline": hard_deadline}
+                    ),
+                )
+                metadata = getattr(canonical_ingress, "metadata", None)
+                if metadata is None or (
+                    metadata.tenant_key,
+                    metadata.agent_id,
+                    metadata.bot_principal_id,
+                    metadata.app_id,
+                    metadata.event_type,
+                ) != router_identity:
+                    raise RouterProjectionError(
+                        "Router handoff canonical Ingress identity mismatch"
+                    )
+                outcome = self._ingress.observe_anchored_message_acceptance(
+                    tenant_key=metadata.tenant_key,
+                    agent_id=metadata.agent_id,
+                    bot_principal_id=metadata.bot_principal_id,
+                    app_id=metadata.app_id,
+                    event_type=metadata.event_type,
+                    chat_id=metadata.chat_id,
+                    message_id=metadata.message_id,
+                    channel_generation=channel_generation,
+                    connection_id=connection_id,
+                    **(
+                        {}
+                        if hard_deadline is None
+                        else {"deadline": hard_deadline}
+                    ),
+                )
+                witnessed_acceptance = getattr(outcome, "acceptance", None)
+                if (
+                    getattr(outcome, "status", None) != "accepted"
+                    or getattr(witnessed_acceptance, "acceptance_id", None)
+                    != acceptance_id
+                    or getattr(outcome, "channel_generation", None)
+                    != channel_generation
+                    or getattr(outcome, "connection_id", None) != connection_id
+                ):
+                    if not self._acquire_handoff_mutex(hard_deadline):
+                        raise RouterWriteDisabledError(
+                            "Router handoff alias recheck deadline expired"
+                        )
+                    try:
+                        return self._record(acceptance_id)
+                    finally:
+                        self._mutex.release()
+                alias_witness = (
+                    acceptance_id,
+                    channel_generation,
+                    connection_id,
+                )
+
+            if not self._acquire_handoff_mutex(hard_deadline):
+                raise RouterWriteDisabledError(
+                    "Router handoff abandon deadline expired before Router lock"
+                ) from last_conflict
+            try:
+                # The witness is append-only, but the Router lane may have
+                # changed while the cross-domain lookup ran.  Rebuild on the
+                # next loop if its cursor moved.
+                record = self._record(acceptance_id)
+                if record.state not in {"accepted", "authorized", "staging"}:
+                    return record
+                if (
+                    (record.channel_generation, record.connection_id)
+                    != (channel_generation, connection_id)
+                    and alias_witness
+                    != (acceptance_id, channel_generation, connection_id)
+                ):
+                    return record
+                prepared_cursor = (
+                    self._state.cursor_sequence,
+                    self._state.cursor_hash,
+                )
+                event = JournalEvent(
+                    event_type=_ROUTER_PREFIX + "terminal",
+                    aggregate_id=record.aggregate_id,
+                    payload={
+                        "acceptance_id": record.acceptance_id,
+                        "reason_code": "handoff_unconfirmed",
+                    },
+                )
+                # Clone/preflight can scale with the whole Router projection;
+                # keep that work out of the global writer transaction guard.
+                preflight = self._state.clone()
+                _reduce_router_event(
+                    preflight,
+                    event,
+                    sequence=self._state.cursor_sequence + 1,
+                )
+            finally:
+                self._mutex.release()
+
+            self._ensure_handoff_deadline(
+                hard_deadline,
+                cause=last_conflict,
+            )
+
+            if not self._acquire_handoff_mutex(hard_deadline):
+                raise RouterWriteDisabledError(
+                    "Router handoff abandon deadline expired before Router lock"
+                ) from last_conflict
+            try:
+                # Another operation on this Router may have refreshed or
+                # advanced the projection while the mutex was released.
+                if prepared_cursor != (
+                    self._state.cursor_sequence,
+                    self._state.cursor_hash,
+                ):
+                    continue
+                record = self._record(acceptance_id)
+                if (
+                    record.state not in {"accepted", "authorized", "staging"}
+                    or (
+                        (
+                            record.channel_generation,
+                            record.connection_id,
+                        )
+                        != (channel_generation, connection_id)
+                        and alias_witness
+                        != (acceptance_id, channel_generation, connection_id)
+                    )
+                ):
+                    return record
+                self._ensure_handoff_deadline(
+                    hard_deadline,
+                    cause=last_conflict,
+                )
+                try:
+                    # This is intentionally the only writer-guarded section:
+                    # preflight, aggregate-version read, CAS commit, and the
+                    # in-memory reducer are all bounded by one small frame.
+                    guard = (
+                        self._writer.transaction_guard()
+                        if hard_deadline is None
+                        else self._writer.transaction_guard(
+                            deadline=hard_deadline,
+                        )
+                    )
+                    with guard:
+                        self._ensure_handoff_deadline(hard_deadline)
+                        versions = self._writer.get_aggregate_versions(
+                            (event.aggregate_id,),
+                            **(
+                                {}
+                                if hard_deadline is None
+                                else {"deadline": hard_deadline}
+                            ),
+                        )
+                        result = self._writer.commit(
+                            (event,),
+                            versions,
+                            expected_head_sequence=self._state.cursor_sequence,
+                            expected_head_hash=self._state.cursor_hash or None,
+                            **(
+                                {}
+                                if hard_deadline is None
+                                else {"deadline": hard_deadline}
+                            ),
+                        )
+                        if result.state is not CommitState.ANCHORED:
+                            raise RouterWriteDisabledError(
+                                "Router handoff abandon was not anchored"
+                            )
+                        _reduce_router_event(
+                            self._state,
+                            event,
+                            sequence=result.frame.sequence,
+                        )
+                        self._state.cursor_sequence = result.frame.sequence
+                        self._state.cursor_hash = result.frame.frame_hash
+                        return self._record(acceptance_id)
+                except JournalIntegrityError as exc:
+                    # A different Journal aggregate may have advanced the head
+                    # after the lock-free replay.  Refresh outside the writer
+                    # guard and re-evaluate whether queue ownership won.
+                    last_conflict = exc
+                except JournalDeadlineExceededError as exc:
+                    raise RouterWriteDisabledError(
+                        "Router handoff abandon deadline expired"
+                    ) from exc
+            finally:
+                self._mutex.release()
+
+        raise RouterWriteDisabledError(
+            "Router handoff abandon could not stabilize the Journal head"
+        ) from last_conflict
+
+    @staticmethod
+    def _validated_handoff_deadline(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(float(deadline))
+        ):
+            raise ValueError("deadline must be a finite monotonic timestamp")
+        return float(deadline)
+
+    @staticmethod
+    def _ensure_handoff_deadline(
+        deadline: float | None,
+        *,
+        cause: BaseException | None = None,
+    ) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise RouterWriteDisabledError(
+                "Router handoff abandon deadline expired"
+            ) from cause
+
+    def _acquire_handoff_mutex(
+        self,
+        deadline: float | None,
+        *,
+        allow_immediate: bool = False,
+    ) -> bool:
+        if deadline is None:
+            self._mutex.acquire()
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return bool(allow_immediate and self._mutex.acquire(blocking=False))
+        return self._mutex.acquire(
+            timeout=min(remaining, threading.TIMEOUT_MAX),
+        )
 
     def defer_dispatch_candidate(
         self,
@@ -1677,7 +2278,12 @@ class DurableEmployeeIngressRouter:
         part, reason = self._message_provenance(metadata, payload)
         if part is None:
             return None, reason
-        remote_chat_id = _bound_remote_coordinate(
+        coordinate_binder = (
+            _bound_encrypted_remote_coordinate
+            if metadata.event_type == "im.message.receive_v1"
+            else _bound_remote_coordinate
+        )
+        remote_chat_id = coordinate_binder(
             metadata.chat_id,
             part.get("remote_chat_id"),
             "oc_",
@@ -2073,17 +2679,17 @@ class DurableEmployeeIngressRouter:
         if any(field in part for field in remote_fields):
             if not all(field in part for field in remote_fields):
                 return None, "sender_invalid"
-            bound_chat = _bound_remote_coordinate(
+            bound_chat = _bound_encrypted_remote_coordinate(
                 metadata.chat_id,
                 part.get("remote_chat_id"),
                 "oc_",
             )
-            bound_message = _bound_remote_coordinate(
+            bound_message = _bound_encrypted_remote_coordinate(
                 metadata.message_id,
                 part.get("remote_message_id"),
                 "om_",
             )
-            bound_root = _bound_remote_coordinate(
+            bound_root = _bound_encrypted_remote_coordinate(
                 metadata.thread_root_message_id,
                 part.get("remote_root_id"),
                 "om_",
@@ -2111,12 +2717,17 @@ class DurableEmployeeIngressRouter:
         thread_id = part.get("feishu_thread_id", "")
         if not isinstance(thread_id, str):
             raise ValueError("invalid Feishu thread identity")
-        remote_message_id = _bound_remote_coordinate(
+        coordinate_binder = (
+            _bound_encrypted_remote_coordinate
+            if metadata.event_type == "im.message.receive_v1"
+            else _bound_remote_coordinate
+        )
+        remote_message_id = coordinate_binder(
             metadata.message_id,
             part.get("remote_message_id"),
             "om_",
         )
-        remote_root_id = _bound_remote_coordinate(
+        remote_root_id = coordinate_binder(
             metadata.thread_root_message_id,
             part.get("remote_root_id"),
             "om_",
@@ -2213,6 +2824,8 @@ class DurableEmployeeIngressRouter:
         self,
         record: RouterLifecycleRecord,
         victim: RouterLifecycleRecord,
+        *,
+        response_obligation: dict[str, object] | None,
     ) -> RouterLifecycleRecord:
         if record.authority is None:
             raise RouterProjectionError("staging Router record lacks authority")
@@ -2239,10 +2852,55 @@ class DurableEmployeeIngressRouter:
                     "acceptance_id": record.acceptance_id,
                     "authority": record.authority.to_dict(),
                     "queue_position": position,
+                    "response_obligation": response_obligation,
                 },
             ),
         )
         return self._commit_events_unlocked(events, record.acceptance_id)
+
+    @staticmethod
+    def _response_obligation(
+        record: RouterLifecycleRecord,
+        metadata: EmployeeIngressMetadata,
+        payload: EmployeeIngressPayload,
+    ) -> dict[str, object] | None:
+        if record.event_type != "im.message.receive_v1":
+            return None
+        if record.authority is None or len(payload.normalized_parts) != 1:
+            raise RouterProjectionError("message queue lacks response authority")
+        part = payload.normalized_parts[0]
+        remote_chat_id = _bound_encrypted_remote_coordinate(
+            metadata.chat_id,
+            part.get("remote_chat_id"),
+            "oc_",
+        )
+        remote_message_id = _bound_encrypted_remote_coordinate(
+            metadata.message_id,
+            part.get("remote_message_id"),
+            "om_",
+        )
+        remote_root_id = _bound_encrypted_remote_coordinate(
+            metadata.thread_root_message_id,
+            part.get("remote_root_id"),
+            "om_",
+        )
+        if (
+            not remote_chat_id
+            or not remote_message_id
+            or remote_root_id is None
+            or remote_chat_id != record.authority.team_id
+        ):
+            raise RouterProjectionError("message queue response target is invalid")
+        return RouterResponseObligation.create(
+            authority=record.authority,
+            acceptance_id=record.acceptance_id,
+            ingress_aggregate_id=record.aggregate_id,
+            envelope_id=record.envelope_id,
+            event_type=record.event_type,
+            chat_id=remote_chat_id,
+            message_id=remote_message_id,
+            thread_root_message_id=remote_root_id,
+        ).to_dict()
 
     @staticmethod
     def _authority_matches(
@@ -2281,7 +2939,7 @@ class DurableEmployeeIngressRouter:
         if self._completed_attachment_stage(acceptance_id) is not None:
             return
         part = payload.normalized_parts[0]
-        remote_message_id = _bound_remote_coordinate(
+        remote_message_id = _bound_encrypted_remote_coordinate(
             metadata.message_id,
             part.get("remote_message_id"),
             "om_",

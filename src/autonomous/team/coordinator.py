@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from typing import Callable
 
 from ..ingress.models import canonical_utc
 from ..journal.blob_store import BlobRef, BlobStore
-from ..journal.frame import JournalEvent
+from ..journal.frame import GENESIS_HASH, JournalEvent
 from ..journal.writer import CommitState, JournalWriter
 from .models import (
     MAX_TEAM_ASSIGNMENTS,
@@ -22,6 +23,7 @@ from .models import (
     CoordinatorAction,
     CoordinatorDecision,
     TeamAssignmentStatus,
+    TeamProjection,
     TeamRunPhase,
     TeamRunV2,
 )
@@ -30,6 +32,10 @@ from .projection import TeamProjectionError, rebuild_team_projection
 
 class TeamCoordinatorError(RuntimeError):
     pass
+
+
+class TeamCoordinatorCloseTimeout(TeamCoordinatorError):
+    """The coordinator fenced admission but running work did not stop in time."""
 
 
 class _FinalNotificationRetry(TeamCoordinatorError):
@@ -229,6 +235,8 @@ class TeamCoordinatorActor:
         poll_seconds: float = 0.1,
         clock: Callable[[], datetime] | None = None,
         decision_provider: DecisionProvider | None = None,
+        blob_retainer: Callable[[str], None] | None = None,
+        blob_releaser: Callable[[str], None] | None = None,
     ) -> None:
         if not coordinator_tool:
             raise ValueError("coordinator tool is required")
@@ -244,10 +252,21 @@ class TeamCoordinatorActor:
         self._poll = float(poll_seconds)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._decide = decision_provider
+        self._blob_retainer = blob_retainer
+        self._blob_releaser = blob_releaser
+        self._retained_blob_ids: set[str] = set()
         self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._close_condition = threading.Condition(self._lock)
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="team-coordinator")
         self._active: set[str] = set()
+        self._futures: dict[str, Future[None]] = {}
         self._closed = False
+        self._shutdown_started = False
+        self._decision_close_started = False
+        self._decision_close_done = threading.Event()
+        self._decision_close_error: BaseException | None = None
+        self._close_complete = False
+        self.projection()
 
     @staticmethod
     def task_run_id(
@@ -339,7 +358,45 @@ class TeamCoordinatorActor:
             return run, True
 
     def projection(self):
-        return rebuild_team_projection(self._writer.replay())
+        with self._lock, self._writer.transaction_guard():
+            return self._projection_unlocked()
+
+    def _projection_unlocked(self):
+        anchored = self._writer.anchor.read()
+        frames = []
+        last_hash = GENESIS_HASH
+        for frame in self._writer.replay():
+            if frame.sequence > anchored.sequence:
+                break
+            frames.append(frame)
+            last_hash = frame.frame_hash
+        if last_hash != anchored.frame_hash:
+            raise TeamCoordinatorError(
+                "team projection cannot verify the Journal anchor"
+            )
+        projection = rebuild_team_projection(frames)
+        anchored_blob_ids = self._projection_blob_ids(projection)
+        if self._blob_retainer is not None:
+            for blob_id in anchored_blob_ids:
+                self._blob_retainer(blob_id)
+        if self._blob_releaser is not None:
+            for blob_id in self._retained_blob_ids - anchored_blob_ids:
+                self._blob_releaser(blob_id)
+        self._retained_blob_ids = anchored_blob_ids
+        return projection
+
+    @staticmethod
+    def _projection_blob_ids(projection: TeamProjection) -> set[str]:
+        blob_ids: set[str] = set()
+        for run in projection.runs.values():
+            blob_ids.add(run.task_ref.blob_id)
+            if run.final_result_ref is not None:
+                blob_ids.add(run.final_result_ref.blob_id)
+        for assignment in projection.assignments.values():
+            blob_ids.add(assignment.instruction_ref.blob_id)
+            if assignment.contribution_ref is not None:
+                blob_ids.add(assignment.contribution_ref.blob_id)
+        return blob_ids
 
     def recover(self) -> int:
         projection = self.projection()
@@ -374,15 +431,66 @@ class TeamCoordinatorActor:
                     return
             time.sleep(0.005)
 
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
+    def close(self, *, timeout_seconds: float = 5.0) -> None:
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("team close timeout must be finite and non-negative")
+        deadline = time.monotonic() + timeout
+        with self._close_condition:
+            if self._close_complete:
                 return
             self._closed = True
-        self._executor.shutdown(wait=True, cancel_futures=False)
-        close = getattr(self._decide, "close", None)
-        if callable(close):
-            close()
+            if not self._shutdown_started:
+                self._shutdown_started = True
+                futures = tuple(self._futures.values())
+                shutdown_executor = True
+            else:
+                futures = ()
+                shutdown_executor = False
+        if shutdown_executor:
+            for future in futures:
+                future.cancel()
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._close_condition:
+            while self._active:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TeamCoordinatorCloseTimeout(
+                        "team coordinator work did not stop before the close deadline"
+                    )
+                self._close_condition.wait(remaining)
+            start_decision_close = not self._decision_close_started
+            if start_decision_close:
+                self._decision_close_started = True
+        if start_decision_close:
+            cleanup_thread = threading.Thread(
+                target=self._close_decision_provider,
+                name="team-coordinator-provider-close",
+                daemon=True,
+            )
+            cleanup_thread.start()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._decision_close_done.wait(remaining):
+            raise TeamCoordinatorCloseTimeout(
+                "team coordinator dependencies did not stop before the close deadline"
+            )
+        with self._close_condition:
+            if self._decision_close_error is not None:
+                raise TeamCoordinatorError(
+                    "team coordinator decision provider close failed"
+                ) from self._decision_close_error
+            self._close_complete = True
+
+    def _close_decision_provider(self) -> None:
+        try:
+            close = getattr(self._decide, "close", None)
+            if callable(close):
+                close()
+        except BaseException as exc:
+            with self._close_condition:
+                self._decision_close_error = exc
+        finally:
+            self._decision_close_done.set()
 
     def claim(self, assignment_id: str, agent_id: str) -> bool:
         with self._lock:
@@ -447,7 +555,25 @@ class TeamCoordinatorActor:
             if self._closed or run_id in self._active:
                 return
             self._active.add(run_id)
-            self._executor.submit(self._run, run_id)
+            try:
+                future = self._executor.submit(self._run, run_id)
+            except BaseException:
+                self._active.discard(run_id)
+                raise
+            self._futures[run_id] = future
+            future.add_done_callback(
+                lambda done, scheduled_run_id=run_id: self._scheduled_done(
+                    scheduled_run_id,
+                    done,
+                )
+            )
+
+    def _scheduled_done(self, run_id: str, future: Future[None]) -> None:
+        with self._close_condition:
+            if self._futures.get(run_id) is future:
+                self._futures.pop(run_id, None)
+                self._active.discard(run_id)
+            self._close_condition.notify_all()
 
     def _run(self, run_id: str) -> None:
         retry_final_notification = False
@@ -749,25 +875,26 @@ class TeamCoordinatorActor:
         ordinal: int,
         agent_id: str,
     ) -> str:
-        projection = self.projection()
-        if len(run.assignment_ids) >= MAX_TEAM_ASSIGNMENTS:
-            raise TeamCoordinatorError("team assignment bound exceeded")
-        assignment_id = f"{run.run_id}:assignment:{ordinal}"
-        if assignment_id in projection.assignments:
+        with self._lock:
+            projection = self.projection()
+            if len(run.assignment_ids) >= MAX_TEAM_ASSIGNMENTS:
+                raise TeamCoordinatorError("team assignment bound exceeded")
+            assignment_id = f"{run.run_id}:assignment:{ordinal}"
+            if assignment_id in projection.assignments:
+                return assignment_id
+            instruction_ref = self._publish_text(
+                decision.instruction,
+                tenant_key=run.tenant_key,
+                run_id=run.run_id,
+                kind="team_instruction",
+            )
+            self._record(
+                "team.v2.assignment.created", assignment_id, run_id=run.run_id,
+                agent_id=agent_id, role=decision.role,
+                instruction_ref=instruction_ref.to_dict(),
+                depends_on=list(decision.depends_on),
+            )
             return assignment_id
-        instruction_ref = self._publish_text(
-            decision.instruction,
-            tenant_key=run.tenant_key,
-            run_id=run.run_id,
-            kind="team_instruction",
-        )
-        self._record(
-            "team.v2.assignment.created", assignment_id, run_id=run.run_id,
-            agent_id=agent_id, role=decision.role,
-            instruction_ref=instruction_ref.to_dict(),
-            depends_on=list(decision.depends_on),
-        )
-        return assignment_id
 
     def _ensure_assignment(self, assignment, run: TeamRunV2) -> bool:
         if assignment.status is TeamAssignmentStatus.CREATED:
@@ -827,18 +954,19 @@ class TeamCoordinatorActor:
             self._effect(aggregate, "employee_dispatch", "action_required")
             self._assignment_failed(assignment, result.error_code or "team_assignment_failed")
             return True
-        contribution_ref = self._publish_text(
-            result.output,
-            tenant_key=run.tenant_key,
-            run_id=run.run_id,
-            kind="team_contribution",
-        )
-        self._effect(aggregate, "employee_dispatch", "committed")
-        self._record(
-            "team.v2.assignment.completed", aggregate, run_id=run.run_id,
-            contribution_ref=contribution_ref.to_dict(),
-            history_record_id=result.history_record_id,
-        )
+        with self._lock:
+            contribution_ref = self._publish_text(
+                result.output,
+                tenant_key=run.tenant_key,
+                run_id=run.run_id,
+                kind="team_contribution",
+            )
+            self._effect(aggregate, "employee_dispatch", "committed")
+            self._record(
+                "team.v2.assignment.completed", aggregate, run_id=run.run_id,
+                contribution_ref=contribution_ref.to_dict(),
+                history_record_id=result.history_record_id,
+            )
         publish_collaboration = getattr(
             self._backend,
             "publish_collaboration",
@@ -1218,12 +1346,21 @@ class TeamCoordinatorActor:
         self._commit(JournalEvent(event_type=event_type, aggregate_id=aggregate_id, payload=payload))
 
     def _publish_json(self, value: object, **labels: str) -> BlobRef:
-        return self._blobs.stage_and_publish(
+        ref = self._blobs.stage_and_publish(
             json.dumps(value, ensure_ascii=False, sort_keys=True).encode(), labels, self._key
         )
+        self._retain_published_blob(ref)
+        return ref
 
     def _publish_text(self, value: str, **labels: str) -> BlobRef:
-        return self._blobs.stage_and_publish(value.encode(), labels, self._key)
+        ref = self._blobs.stage_and_publish(value.encode(), labels, self._key)
+        self._retain_published_blob(ref)
+        return ref
+
+    def _retain_published_blob(self, ref: BlobRef) -> None:
+        if self._blob_retainer is not None:
+            self._blob_retainer(ref.blob_id)
+            self._retained_blob_ids.add(ref.blob_id)
 
     def _read_json(self, ref: BlobRef):
         return json.loads(self._blobs.read(ref))
@@ -1255,5 +1392,6 @@ __all__ = [
     "DecisionProvider",
     "SessionCoordinatorDecisionProvider",
     "TeamCoordinatorActor",
+    "TeamCoordinatorCloseTimeout",
     "TeamCoordinatorError",
 ]

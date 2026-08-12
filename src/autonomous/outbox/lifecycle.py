@@ -6,10 +6,21 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from ..gateway.models import DispatchBinding, GatewayExecutionResult, GatewayExecutionStatus
+from ..gateway.models import (
+    DispatchBinding,
+    EmployeeDispatchReportingDeferredError,
+    GatewayExecutionResult,
+    GatewayExecutionStatus,
+)
+from ..journal.blob_store import (
+    BlobMissingError,
+    BlobPublishError,
+    BlobReadError,
+    KeyResolutionError,
+)
 from .cards import build_employee_status_card
 from .models import EmployeeCardState, EmployeeOutboxSnapshot, employee_outbox_id
-from .service import EmployeeOutboxService
+from .service import EmployeeOutboxService, OutboxBlobError
 
 
 class EmployeeOutboxLifecycle:
@@ -19,6 +30,58 @@ class EmployeeOutboxLifecycle:
         if not isinstance(outbox, EmployeeOutboxService):
             raise TypeError("outbox must be EmployeeOutboxService")
         self._outbox = outbox
+
+    def terminal_response_delivered(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Return whether the latest terminal response is durably delivered."""
+
+        outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
+        try:
+            record = self._outbox.get_record(outbox_id)
+        except KeyError:
+            return False
+        binding = record.binding
+        return (
+            record.latest.state.terminal
+            and binding is not None
+            and binding.bound_snapshot_version >= record.latest_version
+        )
+
+    def employee_responses_delivered(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        attempt_ids: frozenset[str],
+    ) -> bool:
+        """Prove every existing cutoff-owned response reached its latest view."""
+
+        if type(attempt_ids) is not frozenset or any(
+            not isinstance(attempt_id, str) or not attempt_id for attempt_id in attempt_ids
+        ):
+            raise ValueError("employee response attempt_ids must be a frozenset")
+        self._outbox.rebuild_projection()
+        records = tuple(
+            record
+            for record in self._outbox.state.by_outbox_id.values()
+            if record.tenant_key == tenant_key and record.agent_id == agent_id
+        )
+        if any(record.attempt_id not in attempt_ids for record in records):
+            return False
+        for record in records:
+            binding = record.binding
+            if (
+                not record.latest.state.terminal
+                or binding is None
+                or binding.bound_snapshot_version < record.latest_version
+            ):
+                return False
+        return True
 
     def queued(self, binding: DispatchBinding) -> EmployeeOutboxSnapshot:
         outbox_id = employee_outbox_id(
@@ -30,6 +93,11 @@ class EmployeeOutboxLifecycle:
             return self._outbox.get_snapshot(outbox_id)
         except KeyError:
             pass
+        except (BlobMissingError, BlobReadError, KeyResolutionError) as exc:
+            raise EmployeeDispatchReportingDeferredError(
+                "employee Outbox snapshot read is deferred",
+                failed_attempt_ids=(binding.attempt_id,),
+            ) from exc
         return self._append(
             binding,
             version=1,
@@ -280,6 +348,49 @@ class EmployeeOutboxLifecycle:
             command="/task",
         )
 
+    def task_failure_response(
+        self,
+        *,
+        tenant_key: str,
+        agent_id: str,
+        chat_id: str,
+        thread_root_message_id: str,
+        command_acceptance_id: str,
+    ) -> EmployeeOutboxSnapshot:
+        """Publish one idempotent failure card for pre-execution `/task`."""
+
+        attempt_id = f"control_{command_acceptance_id}"
+        outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
+        try:
+            current = self._outbox.get_snapshot(outbox_id)
+        except KeyError:
+            created_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            current = self._append_control(
+                tenant_key=tenant_key,
+                agent_id=agent_id,
+                attempt_id=attempt_id,
+                chat_id=chat_id,
+                thread_root_message_id=thread_root_message_id,
+                version=1,
+                state=EmployeeCardState.QUEUED,
+                summary="正在确认员工任务状态。",
+                created_at=created_at,
+                command="/task",
+            )
+        if current.state.terminal:
+            return current
+        return self._terminal_control(
+            tenant_key=tenant_key,
+            agent_id=agent_id,
+            attempt_id=attempt_id,
+            chat_id=chat_id,
+            thread_root_message_id=thread_root_message_id,
+            current=current,
+            state=EmployeeCardState.ACTION_REQUIRED,
+            summary="目标员工暂时无法接收该任务，本次未执行，请稍后重试。",
+            command="/task",
+        )
+
     def _terminal_control(
         self,
         *,
@@ -401,8 +512,26 @@ class EmployeeOutboxLifecycle:
             created_at=created_at,
             terminal_version=version if state.terminal else 0,
         )
-        self._outbox.append_snapshot(snapshot)
+        try:
+            self._outbox.append_snapshot(snapshot)
+        except OutboxBlobError as exc:
+            if not _has_isolatable_blob_cause(exc):
+                raise
+            raise EmployeeDispatchReportingDeferredError(
+                "employee Outbox snapshot publication is deferred",
+                failed_attempt_ids=(binding.attempt_id,),
+            ) from exc
         return snapshot
+
+
+def _has_isolatable_blob_cause(exc: BaseException) -> bool:
+    """Return whether an Outbox wrapper preserves a record-local Blob failure."""
+
+    cause = exc.__cause__
+    return isinstance(
+        cause,
+        (BlobMissingError, BlobPublishError, BlobReadError, KeyResolutionError),
+    )
 
 
 def _terminal_view(

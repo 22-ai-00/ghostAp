@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ..domain import EmployeeDefinition, EmployeeState, WorkerType
+from ..domain import BotPrincipal, EmployeeDefinition, EmployeeState, WorkerType
 from ..journal.frame import JournalEvent, TransactionFrame
 from ..journal.projections import (
     ProjectionError,
@@ -28,6 +28,14 @@ from ..workforce.projection import (
     workforce_projection_guard,
 )
 from .callback_bridge import AsyncCallbackBridge
+from .external_mutation_gate import (
+    EmployeeExternalMutationGate,
+    EmployeeExternalMutationLease,
+    ExternalMutationFenced,
+    ExternalMutationKind,
+    ExternalTaskTerminalError,
+    external_task_name,
+)
 from .hire_port import (
     EmployeeHireRequest,
     EmployeeRoleUpdateRequest,
@@ -149,6 +157,7 @@ class ProductionEmployeeHireService:
         runtime_recovery_ready: bool = True,
         workspace_projector: Any = None,
         admin_principal_ids_provider: Callable[[], frozenset[str]] | None = None,
+        external_mutation_gate: EmployeeExternalMutationGate | None = None,
     ) -> None:
         if (
             isinstance(visible_employee_limit, bool)
@@ -168,6 +177,7 @@ class ProductionEmployeeHireService:
         self._provisioning_submitter = provisioning_submitter
         self._runtime_recovery_ready = runtime_recovery_ready is True
         self._workspace_projector = workspace_projector
+        self._external_mutation_gate = external_mutation_gate
         self._admin_principal_ids_provider = (
             admin_principal_ids_provider or (lambda: frozenset())
         )
@@ -1083,124 +1093,305 @@ class ProductionEmployeeHireService:
         if self._registrar is None or self._credential_vault is None:
             raise HireAdmissionError("hire provisioning dependencies unavailable")
 
-        register_state = state.effect_state("register-app")
-        if register_state is None:
+        registration_lease = self._acquire_external_mutation(
+            state,
+            ExternalMutationKind.APP_REGISTRATION,
+        )
+        registration_started = False
+        registration_disposed = False
+        deferred_cancel = False
+        registration_result: RegistrationResult | None = None
+        app_id = ""
+        app_secret = ""
+        try:
+            register_state = state.effect_state("register-app")
+            if register_state is None:
+                state = self.commit_effect_transition(
+                    intent_id,
+                    effect_id="register-app",
+                    effect_type="app_registration",
+                    next_state=HireEffectState.PREPARED,
+                )
+                register_state = HireEffectState.PREPARED
+            if register_state is not HireEffectState.PREPARED:
+                await self._mark_action_required(
+                    intent_id,
+                    effect_id="register-app",
+                    effect_type="app_registration",
+                )
+                registration_disposed = True
+                raise HireAdmissionError(
+                    "app registration outcome requires manual action"
+                )
             state = self.commit_effect_transition(
                 intent_id,
                 effect_id="register-app",
                 effect_type="app_registration",
-                next_state=HireEffectState.PREPARED,
+                next_state=HireEffectState.EXECUTING,
             )
-            register_state = HireEffectState.PREPARED
-        if register_state is not HireEffectState.PREPARED:
-            await self._mark_action_required(
-                intent_id,
-                effect_id="register-app",
-                effect_type="app_registration",
-            )
-            raise HireAdmissionError("app registration outcome requires manual action")
-        state = self.commit_effect_transition(
-            intent_id,
-            effect_id="register-app",
-            effect_type="app_registration",
-            next_state=HireEffectState.EXECUTING,
-        )
 
-        bridge = AsyncCallbackBridge()
-        link_callback = bridge.callback(self._on_registration_link, state)
-        status_callback = bridge.callback(self._on_registration_status, state)
-        registration_result: RegistrationResult | None = None
-        registration_error: Exception | None = None
-        try:
-            registration_result = await self._registrar.register(
-                RegistrationRequest(
-                    name=state.employee_name,
-                    description=state.role or state.persona or "GhostAP employee",
-                    existing_app_id=getattr(state, "existing_app_id", "") or "",
+            bridge = AsyncCallbackBridge()
+            link_callback = bridge.callback(self._on_registration_link, state)
+            status_callback = bridge.callback(self._on_registration_status, state)
+            registration_error: Exception | None = None
+            registration_task = asyncio.create_task(
+                self._registrar.register(
+                    RegistrationRequest(
+                        name=state.employee_name,
+                        description=(
+                            state.role
+                            or state.persona
+                            or "GhostAP employee"
+                        ),
+                        existing_app_id=(
+                            getattr(state, "existing_app_id", "") or ""
+                        ),
+                    ),
+                    on_link=link_callback,
+                    on_status=status_callback,
                 ),
-                on_link=link_callback,
-                on_status=status_callback,
+                name=external_task_name("app-registration"),
             )
-        except Exception as exc:
-            registration_error = exc
-        try:
-            await bridge.drain()
-        except Exception as exc:
-            registration_error = exc
-        if registration_error is not None or registration_result is None:
-            await self._mark_action_required(
-                intent_id,
-                effect_id="register-app",
-                effect_type="app_registration",
-            )
-            raise HireAdmissionError("app registration outcome requires manual action") from None
-
-        app_id = registration_result.app_id
-        app_secret = registration_result.app_secret
-        try:
-            state = self._commit_registered_app(intent_id, app_id)
-        except HireAdmissionError:
-            await self._mark_action_required(
-                intent_id,
-                effect_id="register-app",
-                effect_type="app_registration",
-            )
-            raise HireAdmissionError(
-                "app registration outcome requires manual action"
-            ) from None
-        state = self.commit_effect_transition(
-            intent_id,
-            effect_id="store-credential",
-            effect_type="credential_vault_put",
-            next_state=HireEffectState.PREPARED,
-            metadata={"app_id": app_id},
-        )
-        state = self.commit_effect_transition(
-            intent_id,
-            effect_id="store-credential",
-            effect_type="credential_vault_put",
-            next_state=HireEffectState.EXECUTING,
-            metadata={"app_id": app_id},
-        )
-        receipt: object | None = None
-        for _attempt in range(2):
+            registration_started = True
             try:
-                receipt = await asyncio.to_thread(
-                    self._credential_vault.put,
-                    state.agent_id,
-                    app_id,
-                    app_secret,
-                    state.intent_id,
-                    state.attempt_id,
+                registration_result, cancelled = (
+                    await self._await_external_task_terminal(registration_task)
                 )
-                break
-            except Exception:
-                continue
-        del app_secret, registration_result
-        if receipt is None:
-            await self._mark_action_required(
-                intent_id,
-                effect_id="store-credential",
-                effect_type="credential_vault_put",
+                deferred_cancel = deferred_cancel or cancelled
+            except Exception as exc:
+                registration_error = exc
+                if isinstance(exc, ExternalTaskTerminalError):
+                    deferred_cancel = (
+                        deferred_cancel or exc.caller_cancelled
+                    )
+            drain_task = asyncio.create_task(
+                bridge.drain(),
+                name=external_task_name("registration-callback-drain"),
             )
-            raise HireAdmissionError("credential storage requires manual action")
+            try:
+                _drained, cancelled = await self._await_external_task_terminal(
+                    drain_task
+                )
+                deferred_cancel = deferred_cancel or cancelled
+            except Exception as exc:
+                registration_error = exc
+                if isinstance(exc, ExternalTaskTerminalError):
+                    deferred_cancel = deferred_cancel or exc.caller_cancelled
+            if registration_error is not None or registration_result is None:
+                await self._mark_action_required(
+                    intent_id,
+                    effect_id="register-app",
+                    effect_type="app_registration",
+                )
+                registration_disposed = True
+                if deferred_cancel:
+                    raise asyncio.CancelledError
+                raise HireAdmissionError(
+                    "app registration outcome requires manual action"
+                ) from None
+
+            try:
+                app_id = registration_result.app_id
+                app_secret = registration_result.app_secret
+                state = self._commit_registered_app(intent_id, app_id)
+            except (AttributeError, HireAdmissionError):
+                await self._mark_action_required(
+                    intent_id,
+                    effect_id="register-app",
+                    effect_type="app_registration",
+                )
+                registration_disposed = True
+                if deferred_cancel:
+                    raise asyncio.CancelledError
+                raise HireAdmissionError(
+                    "app registration outcome requires manual action"
+                ) from None
+            registration_disposed = True
+        finally:
+            if registration_started and not registration_disposed:
+                try:
+                    self._mark_action_required_sync(
+                        self._require_hire(intent_id),
+                        effect_id="register-app",
+                        effect_type="app_registration",
+                    )
+                except Exception:
+                    pass
+                else:
+                    registration_disposed = True
+            if registration_lease is not None and (
+                not registration_started or registration_disposed
+            ):
+                registration_lease.release()
+
         try:
-            credential_ref = self._validate_receipt(state, app_id, receipt)
-        except HireAdmissionError:
-            await self._mark_action_required(
+            credential_lease = self._acquire_external_mutation(
+                state,
+                ExternalMutationKind.CREDENTIAL_PUT,
+            )
+        except BaseException:
+            app_secret = ""
+            registration_result = None
+            raise
+        credential_started = False
+        credential_disposed = False
+        final_state: DurableHireState | None = None
+        try:
+            state = self.commit_effect_transition(
                 intent_id,
                 effect_id="store-credential",
                 effect_type="credential_vault_put",
+                next_state=HireEffectState.PREPARED,
+                metadata={"app_id": app_id},
             )
-            raise HireAdmissionError("credential storage requires manual action") from None
-        state = self.commit_effect_transition(
-            intent_id,
-            effect_id="store-credential",
-            effect_type="credential_vault_put",
-            next_state=HireEffectState.COMMITTED,
-            metadata={"app_id": app_id, "credential_ref": credential_ref},
-        )
-        return self._bind_principal(state, app_id, credential_ref)
+            state = self.commit_effect_transition(
+                intent_id,
+                effect_id="store-credential",
+                effect_type="credential_vault_put",
+                next_state=HireEffectState.EXECUTING,
+                metadata={"app_id": app_id},
+            )
+            receipt: object | None = None
+            for _attempt in range(2):
+                vault_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._credential_vault.put,
+                        state.agent_id,
+                        app_id,
+                        app_secret,
+                        state.intent_id,
+                        state.attempt_id,
+                    ),
+                    name=external_task_name("credential-vault-put"),
+                )
+                credential_started = True
+                try:
+                    receipt, cancelled = (
+                        await self._await_external_task_terminal(vault_task)
+                    )
+                    deferred_cancel = deferred_cancel or cancelled
+                    break
+                except Exception as exc:
+                    if isinstance(exc, ExternalTaskTerminalError):
+                        deferred_cancel = (
+                            deferred_cancel or exc.caller_cancelled
+                        )
+                    if deferred_cancel:
+                        break
+                    continue
+            app_secret = ""
+            registration_result = None
+            if receipt is None:
+                await self._mark_action_required(
+                    intent_id,
+                    effect_id="store-credential",
+                    effect_type="credential_vault_put",
+                )
+                credential_disposed = True
+                if deferred_cancel:
+                    raise asyncio.CancelledError
+                raise HireAdmissionError(
+                    "credential storage requires manual action"
+                )
+            try:
+                credential_ref = self._validate_receipt(state, app_id, receipt)
+            except HireAdmissionError:
+                await self._mark_action_required(
+                    intent_id,
+                    effect_id="store-credential",
+                    effect_type="credential_vault_put",
+                )
+                credential_disposed = True
+                if deferred_cancel:
+                    raise asyncio.CancelledError
+                raise HireAdmissionError(
+                    "credential storage requires manual action"
+                ) from None
+            state = self.commit_effect_transition(
+                intent_id,
+                effect_id="store-credential",
+                effect_type="credential_vault_put",
+                next_state=HireEffectState.COMMITTED,
+                metadata={"app_id": app_id, "credential_ref": credential_ref},
+            )
+            credential_disposed = True
+            final_state = self._bind_principal(state, app_id, credential_ref)
+        finally:
+            if credential_started and not credential_disposed:
+                try:
+                    self._mark_action_required_sync(
+                        self._require_hire(intent_id),
+                        effect_id="store-credential",
+                        effect_type="credential_vault_put",
+                    )
+                except Exception:
+                    pass
+                else:
+                    credential_disposed = True
+            if credential_lease is not None and (
+                not credential_started or credential_disposed
+            ):
+                credential_lease.release()
+        if deferred_cancel:
+            raise asyncio.CancelledError
+        if final_state is None:  # pragma: no cover - defensive invariant
+            raise HireAdmissionError("credential storage did not finish")
+        return final_state
+
+    def _acquire_external_mutation(
+        self,
+        state: DurableHireState,
+        kind: ExternalMutationKind,
+    ) -> EmployeeExternalMutationLease | None:
+        gate = self._external_mutation_gate
+        if gate is None:
+            return None
+        try:
+            return gate.acquire(state.tenant_key, state.agent_id, kind)
+        except ExternalMutationFenced:
+            raise HireAdmissionError("employee is retiring") from None
+
+    @staticmethod
+    async def _await_external_task_terminal(
+        task: asyncio.Task[Any],
+    ) -> tuple[Any, bool]:
+        """Defer caller cancellation until the real external task is terminal."""
+
+        cancelled = False
+        while True:
+            try:
+                return await asyncio.shield(task), cancelled
+            except asyncio.CancelledError as exc:
+                current = asyncio.current_task()
+                caller_cancelled = cancelled or (
+                    current is not None and current.cancelling() > 0
+                )
+                if task.cancelled():
+                    raise ExternalTaskTerminalError(
+                        caller_cancelled=caller_cancelled,
+                        child_cancelled=True,
+                    ) from exc
+                if task.done():
+                    try:
+                        return task.result(), True
+                    except asyncio.CancelledError as child_cancel:
+                        raise ExternalTaskTerminalError(
+                            caller_cancelled=True,
+                            child_cancelled=True,
+                        ) from child_cancel
+                    except Exception as child_error:
+                        raise ExternalTaskTerminalError(
+                            caller_cancelled=True,
+                            child_cancelled=False,
+                        ) from child_error
+                cancelled = caller_cancelled
+            except Exception as exc:
+                if cancelled:
+                    raise ExternalTaskTerminalError(
+                        caller_cancelled=True,
+                        child_cancelled=False,
+                    ) from exc
+                raise
 
     async def _mark_action_required(
         self,
@@ -1550,6 +1741,22 @@ class ProductionEmployeeHireService:
     def list_states(self) -> tuple[DurableHireState, ...]:
         with self._mutex:
             return tuple(self._hire_projection.states.values())
+
+    def current_employee_transport_snapshot(
+        self,
+    ) -> tuple[
+        tuple[EmployeeDefinition, ...],
+        tuple[BotPrincipal, ...],
+        tuple[DurableHireState, ...],
+    ]:
+        """Copy current transport authority without replaying unrelated Journal frames."""
+
+        with self.employee_dispatch_guard():
+            return (
+                tuple(self._projection_state.employees.values()),
+                tuple(self._projection_state.bot_principals.values()),
+                tuple(self._hire_projection.states.values()),
+            )
 
     def begin_channel_revalidation(
         self,

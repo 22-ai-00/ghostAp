@@ -7,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -34,9 +35,21 @@ def _worker(tmp_path: Path) -> Path:
             bootstrap = json.loads(os.fdopen(bootstrap_fd, 'rb', buffering=0).readline())
             frame = {'v': 1, 'type': 'READY', 'agent_id': bootstrap['agent_id'],
                      'generation': bootstrap['generation'], 'sequence': 1,
-                     'payload': {'identity': {'app_id': bootstrap['app_id']},
-                                 'environment': dict(os.environ)}}
+                     'payload': {
+                         'identity': {'app_id': bootstrap['app_id'],
+                                      'open_id': 'ou_security_fixture'},
+                         'connection_id': 'conn_security_fixture',
+                         'connection': {'observed': True,
+                                        'sdk_connection_id': 'sdk_security_fixture',
+                                        'service_id': 'service_security_fixture',
+                                        'secure': True},
+                     }}
             os.write(event_fd, (json.dumps(frame, separators=(',', ':')) + '\\n').encode())
+            event = {'v': 1, 'type': 'EVENT', 'agent_id': bootstrap['agent_id'],
+                     'generation': bootstrap['generation'], 'sequence': 2,
+                     'payload': {'event': 'fixture-environment',
+                                 'data': {'environment': dict(os.environ)}}}
+            os.write(event_fd, (json.dumps(event, separators=(',', ':')) + '\\n').encode())
             control = os.fdopen(control_fd, 'rb', buffering=0)
             control.readline()
             """
@@ -94,7 +107,15 @@ def _mac_proof_worker(tmp_path: Path, *, denied_errno: int = errno.EACCES) -> Pa
             bootstrap = json.loads(os.fdopen(bootstrap_fd, 'rb', buffering=0).readline())
             frame = {{'v': 1, 'type': 'READY', 'agent_id': bootstrap['agent_id'],
                      'generation': bootstrap['generation'], 'sequence': 1,
-                     'payload': {{'identity': {{'app_id': bootstrap['app_id']}}}}}}
+                     'payload': {{
+                         'identity': {{'app_id': bootstrap['app_id'],
+                                      'open_id': 'ou_mac_fixture'}},
+                         'connection_id': 'conn_mac_fixture',
+                         'connection': {{'observed': True,
+                                        'sdk_connection_id': 'sdk_mac_fixture',
+                                        'service_id': 'service_mac_fixture',
+                                        'secure': True}},
+                     }}}}
             os.write(event_fd, (json.dumps(frame, separators=(',', ':')) + '\\n').encode())
             os.fdopen(control_fd, 'rb', buffering=0).readline()
             """
@@ -175,6 +196,7 @@ def test_secret_and_parent_environment_never_enter_argv_or_child_environment(
     secret = "employee-secret-sentinel"
     monkeypatch.setenv("AUTONOMOUS_VAULT_MASTER_KEY", "master-key-sentinel")
     launches: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    events: list[dict[str, object]] = []
 
     def launch(argv, **kwargs):
         launches.append((tuple(argv), dict(kwargs)))
@@ -188,7 +210,7 @@ def test_secret_and_parent_environment_never_enter_argv_or_child_environment(
         ready_timeout=1.0,
     )
     try:
-        status = supervisor.start("agt_1", "cli_1", "cred_1", 1, lambda _: None)
+        supervisor.start("agt_1", "cli_1", "cred_1", 1, events.append)
 
         argv, kwargs = launches[0]
         joined = " ".join(argv)
@@ -199,7 +221,11 @@ def test_secret_and_parent_environment_never_enter_argv_or_child_environment(
         assert kwargs["close_fds"] is True
         assert len(kwargs["pass_fds"]) == 3
         assert kwargs["env"] == {"PYTHONUTF8": "1"}
-        child_env = status.ready_metadata["environment"]
+        deadline = time.monotonic() + 1
+        while not events and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert events and events[0]["event"] == "fixture-environment"
+        child_env = events[0]["data"]["environment"]
         assert child_env["PYTHONUTF8"] == "1"
         assert "AUTONOMOUS_VAULT_MASTER_KEY" not in child_env
         assert set(child_env) <= {"PYTHONUTF8", "LC_CTYPE"}

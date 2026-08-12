@@ -101,6 +101,48 @@ def test_unknown_dispatch_recovers_action_required_without_rerun(
     reopened.close()
 
 
+def test_recovery_isolates_deferred_attempt_and_terminalizes_later_candidate(
+    tmp_path,
+) -> None:
+    """One typed reporting poison must not head-of-line block later recovery."""
+
+    from src.autonomous.gateway.models import (
+        EmployeeDispatchReportingDeferredError,
+    )
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    harness = _real_coordinator_harness(tmp_path, second_candidate=True)
+    first = harness.coordinator.prepare_next()
+    second = harness.coordinator.prepare_next()
+    assert first is not None
+    assert second is not None
+    observed: list[str] = []
+
+    class _Lifecycle:
+        def terminal(self, binding, _result) -> None:
+            observed.append(binding.attempt_id)
+            if binding.attempt_id == first.binding.attempt_id:
+                raise EmployeeDispatchReportingDeferredError("poison response")
+
+    harness.coordinator._attempt_lifecycle = _Lifecycle()  # noqa: SLF001
+    try:
+        with pytest.raises(EmployeeDispatchReportingDeferredError) as raised:
+            harness.coordinator.recover_incomplete_attempts()
+
+        assert raised.value.failed_attempt_ids == (first.binding.attempt_id,)
+        assert raised.value.repaired_count == 1
+        assert observed == [first.binding.attempt_id, second.binding.attempt_id]
+        assert all(
+            harness.coordinator.state.attempts[attempt_id].terminal_status
+            == "action_required"
+            for attempt_id in (first.binding.attempt_id, second.binding.attempt_id)
+        )
+    finally:
+        harness.close()
+
+
 @pytest.mark.parametrize(
     "legacy_shape",
     ("scoped_team", "unscoped_team", "unscoped_slock"),

@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Protocol
+from typing import Iterator, Protocol
 
 from src.utils.path import canonicalize_user_home_path
 
 from ..journal.blob_store import AesGcmEncryptionProvider, BlobError, BlobRef, BlobStore
 from ..journal.frame import GENESIS_HASH, JournalEvent
-from ..journal.writer import CommitResult, CommitState, JournalWriter
+from ..journal.writer import (
+    CommitResult,
+    CommitState,
+    JournalDeadlineExceededError,
+    JournalWriter,
+)
 from .models import (
     DeliveryEffectKind,
     DeliveryEffectState,
@@ -50,6 +58,10 @@ class OutboxWriteDisabledError(OutboxServiceError):
 
 class OutboxClosedError(OutboxServiceError):
     pass
+
+
+class OutboxDeadlineExceededError(TimeoutError, OutboxServiceError):
+    """An Outbox operation could not begin before its absolute deadline."""
 
 
 class EmployeeKeyring(Protocol):
@@ -199,21 +211,24 @@ class EmployeeOutboxService:
                     "blob_ref": blob_ref.to_dict(),
                 },
             )
-            try:
-                self._commit_unlocked(snapshot.outbox_id, event)
-            except Exception:
-                self._quarantine_blob_unlocked(blob_ref)
-                raise
+            # Commit failure can be ambiguous: the monotonic anchor may have
+            # advanced just before its directory fsync reported an error.
+            # Quarantining here could therefore remove a blob referenced by an
+            # actually anchored event. Verified projection rebuild owns orphan
+            # cleanup once the anchor proves the blob is unreferenced.
+            self._commit_unlocked(snapshot.outbox_id, event)
             return self._state.by_outbox_id[snapshot.outbox_id].snapshots[snapshot.version]
 
     def get_snapshot(
         self,
         outbox_id: str,
         version: int | None = None,
+        *,
+        deadline: float | None = None,
     ) -> EmployeeOutboxSnapshot:
-        with self._mutex:
+        with self._deadline_guard(self._mutex, deadline, "state lock"):
             self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
+            self._synchronize_projection_unlocked(deadline=deadline)
             record = self._state.by_outbox_id.get(outbox_id)
             if record is None:
                 raise KeyError(outbox_id)
@@ -221,31 +236,40 @@ class EmployeeOutboxService:
             metadata = record.snapshots.get(selected)
             if metadata is None or selected in record.tombstoned_versions:
                 raise OutboxBlobError("Outbox snapshot is unavailable")
-            return self._read_snapshot(record, metadata)
+            snapshot = self._read_snapshot(record, metadata)
+            self._require_deadline(deadline, "snapshot read")
+            return snapshot
 
-    def get_record(self, outbox_id: str) -> OutboxRecord:
-        with self._mutex:
+    def get_record(
+        self,
+        outbox_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> OutboxRecord:
+        with self._deadline_guard(self._mutex, deadline, "state lock"):
             self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
+            self._synchronize_projection_unlocked(deadline=deadline)
             record = self._state.by_outbox_id.get(outbox_id)
             if record is None:
                 raise KeyError(outbox_id)
             return record
 
-    def list_pending_delivery_records(self) -> tuple[OutboxRecord, ...]:
+    def list_pending_delivery_records(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> tuple[OutboxRecord, ...]:
         """Return one immutable, stable-order view of cards needing delivery."""
 
-        with self._mutex:
+        with self._deadline_guard(self._mutex, deadline, "state lock"):
             self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
+            self._synchronize_projection_unlocked(deadline=deadline)
             return tuple(
                 sorted(
                     (
                         record
                         for record in self._state.by_outbox_id.values()
-                        if record.binding is None
-                        or record.binding.bound_snapshot_version
-                        < record.latest_version
+                        if record.binding is None or record.binding.bound_snapshot_version < record.latest_version
                     ),
                     key=lambda record: (
                         record.latest.created_at,
@@ -308,9 +332,7 @@ class EmployeeOutboxService:
                 expected_head_hash="" if last is None else last.frame_hash,
             )
             if result.state is not CommitState.ANCHORED:
-                raise OutboxWriteDisabledError(
-                    "collaboration publication was not anchored"
-                )
+                raise OutboxWriteDisabledError("collaboration publication was not anchored")
             self._synchronize_projection_unlocked()
             return True
 
@@ -318,93 +340,128 @@ class EmployeeOutboxService:
         self,
         outbox_id: str,
         snapshot_version: int,
+        *,
+        deadline: float | None = None,
     ) -> OutboxDeliveryEffect:
-        with self._mutex, self._writer.transaction_guard():
-            self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
-            record = self._state.by_outbox_id.get(outbox_id)
-            if record is None:
-                raise KeyError(outbox_id)
-            if snapshot_version not in record.snapshots:
-                raise KeyError(snapshot_version)
-            if snapshot_version in record.tombstoned_versions:
-                raise OutboxBlobError("Outbox delivery snapshot is tombstoned")
-            active = sorted(
-                (
-                    effect
-                    for effect in record.effects.values()
-                    if effect.state
-                    in {
-                        DeliveryEffectState.PREPARED,
-                        DeliveryEffectState.EXECUTING,
-                    }
-                ),
-                key=lambda effect: (effect.snapshot_version, effect.attempt),
-            )
-            if active:
-                return active[0]
-            for effect in record.effects.values():
-                if effect.snapshot_version == snapshot_version and effect.state in {
+        with self._deadline_guard(self._mutex, deadline, "state lock"):
+            with self._writer.transaction_guard(deadline=deadline):
+                return self._prepare_delivery_unlocked(
+                    outbox_id,
+                    snapshot_version,
+                    deadline=deadline,
+                )
+
+    def _prepare_delivery_unlocked(
+        self,
+        outbox_id: str,
+        snapshot_version: int,
+        *,
+        deadline: float | None,
+    ) -> OutboxDeliveryEffect:
+        self._ensure_open_unlocked()
+        self._synchronize_projection_unlocked(deadline=deadline)
+        record = self._state.by_outbox_id.get(outbox_id)
+        if record is None:
+            raise KeyError(outbox_id)
+        if snapshot_version not in record.snapshots:
+            raise KeyError(snapshot_version)
+        if snapshot_version in record.tombstoned_versions:
+            raise OutboxBlobError("Outbox delivery snapshot is tombstoned")
+        active = sorted(
+            (
+                effect
+                for effect in record.effects.values()
+                if effect.state
+                in {
                     DeliveryEffectState.PREPARED,
                     DeliveryEffectState.EXECUTING,
-                    DeliveryEffectState.COMMITTED,
-                }:
-                    return effect
-            kind = DeliveryEffectKind.CREATE if record.binding is None else DeliveryEffectKind.PATCH
-            attempts = [
-                effect.attempt
-                for effect in record.effects.values()
-                if effect.snapshot_version == snapshot_version and effect.kind is kind
-            ]
-            attempt = max(attempts, default=0) + 1
-            metadata = record.snapshots[snapshot_version]
-            effect = OutboxDeliveryEffect(
-                schema_version=1,
-                effect_id=employee_outbox_effect_id(
-                    outbox_id,
-                    kind,
-                    snapshot_version,
-                    attempt,
-                ),
-                outbox_id=outbox_id,
-                kind=kind,
-                state=DeliveryEffectState.PREPARED,
-                snapshot_version=snapshot_version,
-                snapshot_sha256=metadata.payload_sha256,
-                attempt=attempt,
-                error_code="",
-            )
-            self._commit_unlocked(
-                outbox_id,
-                JournalEvent(
-                    event_type="employee.outbox.effect_prepared",
-                    aggregate_id=outbox_id,
-                    payload={"effect": effect.to_dict()},
-                ),
-            )
-            return self._state.by_outbox_id[outbox_id].effects[effect.effect_id]
-
-    def mark_effect_executing(self, effect_id: str) -> OutboxDeliveryEffect:
-        with self._mutex, self._writer.transaction_guard():
-            self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
-            record, effect = self._find_effect_unlocked(effect_id)
-            if effect.state in {
+                }
+            ),
+            key=lambda effect: (effect.snapshot_version, effect.attempt),
+        )
+        if active:
+            return active[0]
+        for effect in record.effects.values():
+            if effect.snapshot_version == snapshot_version and effect.state in {
+                DeliveryEffectState.PREPARED,
                 DeliveryEffectState.EXECUTING,
                 DeliveryEffectState.COMMITTED,
             }:
                 return effect
-            if effect.state is not DeliveryEffectState.PREPARED:
-                raise OutboxConflictError("Outbox effect cannot execute")
-            self._commit_unlocked(
-                record.outbox_id,
-                JournalEvent(
-                    event_type="employee.outbox.effect_executing",
-                    aggregate_id=record.outbox_id,
-                    payload={"effect_id": effect.effect_id},
-                ),
-            )
-            return self._state.by_outbox_id[record.outbox_id].effects[effect.effect_id]
+        kind = DeliveryEffectKind.CREATE if record.binding is None else DeliveryEffectKind.PATCH
+        attempts = [
+            effect.attempt
+            for effect in record.effects.values()
+            if effect.snapshot_version == snapshot_version and effect.kind is kind
+        ]
+        attempt = max(attempts, default=0) + 1
+        metadata = record.snapshots[snapshot_version]
+        effect = OutboxDeliveryEffect(
+            schema_version=1,
+            effect_id=employee_outbox_effect_id(
+                outbox_id,
+                kind,
+                snapshot_version,
+                attempt,
+            ),
+            outbox_id=outbox_id,
+            kind=kind,
+            state=DeliveryEffectState.PREPARED,
+            snapshot_version=snapshot_version,
+            snapshot_sha256=metadata.payload_sha256,
+            attempt=attempt,
+            error_code="",
+        )
+        self._commit_unlocked(
+            outbox_id,
+            JournalEvent(
+                event_type="employee.outbox.effect_prepared",
+                aggregate_id=outbox_id,
+                payload={"effect": effect.to_dict()},
+            ),
+            deadline=deadline,
+        )
+        return self._state.by_outbox_id[outbox_id].effects[effect.effect_id]
+
+    def mark_effect_executing(
+        self,
+        effect_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> OutboxDeliveryEffect:
+        with self._deadline_guard(self._mutex, deadline, "state lock"):
+            with self._writer.transaction_guard(deadline=deadline):
+                return self._mark_effect_executing_unlocked(
+                    effect_id,
+                    deadline=deadline,
+                )
+
+    def _mark_effect_executing_unlocked(
+        self,
+        effect_id: str,
+        *,
+        deadline: float | None,
+    ) -> OutboxDeliveryEffect:
+        self._ensure_open_unlocked()
+        self._synchronize_projection_unlocked(deadline=deadline)
+        record, effect = self._find_effect_unlocked(effect_id)
+        if effect.state in {
+            DeliveryEffectState.EXECUTING,
+            DeliveryEffectState.COMMITTED,
+        }:
+            return effect
+        if effect.state is not DeliveryEffectState.PREPARED:
+            raise OutboxConflictError("Outbox effect cannot execute")
+        self._commit_unlocked(
+            record.outbox_id,
+            JournalEvent(
+                event_type="employee.outbox.effect_executing",
+                aggregate_id=record.outbox_id,
+                payload={"effect_id": effect.effect_id},
+            ),
+            deadline=deadline,
+        )
+        return self._state.by_outbox_id[record.outbox_id].effects[effect.effect_id]
 
     def commit_delivery(
         self,
@@ -414,67 +471,100 @@ class EmployeeOutboxService:
         generation: int,
         connection_id: str,
         message_id: str,
+        deadline: float | None = None,
     ) -> EmployeeOutboxBinding:
-        with self._mutex, self._writer.transaction_guard():
-            self._ensure_open_unlocked()
-            self._synchronize_projection_unlocked()
-            record, effect = self._find_effect_unlocked(effect_id)
-            if effect.state is DeliveryEffectState.COMMITTED:
-                if record.binding is None:
-                    raise OutboxWriteDisabledError("committed delivery lacks binding")
-                return record.binding
-            if effect.state is not DeliveryEffectState.EXECUTING:
-                raise OutboxConflictError("Outbox effect is not EXECUTING")
-            if effect.kind is DeliveryEffectKind.PATCH:
-                current = record.binding
-                if current is None or current.message_id != message_id:
-                    raise OutboxConflictError("Outbox patch message binding mismatch")
-                if current.app_id != app_id:
-                    raise OutboxConflictError("Outbox patch app binding mismatch")
-            binding = EmployeeOutboxBinding(
-                schema_version=1,
-                outbox_id=record.outbox_id,
-                stable_uuid=employee_outbox_uuid(record.outbox_id),
-                app_id=app_id,
-                generation=generation,
-                connection_id=connection_id,
-                message_id=message_id,
-                bound_snapshot_version=effect.snapshot_version,
-            )
-            self._commit_unlocked(
-                record.outbox_id,
-                JournalEvent(
-                    event_type="employee.outbox.delivery_committed",
-                    aggregate_id=record.outbox_id,
-                    payload={
-                        "effect_id": effect.effect_id,
-                        "binding": binding.to_dict(),
-                    },
-                ),
-            )
-            committed = self._state.by_outbox_id[record.outbox_id].binding
-            if committed is None:
-                raise OutboxWriteDisabledError("Outbox delivery binding was not applied")
-            return committed
+        with self._deadline_guard(self._mutex, deadline, "state lock"):
+            with self._writer.transaction_guard(deadline=deadline):
+                return self._commit_delivery_unlocked(
+                    effect_id,
+                    app_id=app_id,
+                    generation=generation,
+                    connection_id=connection_id,
+                    message_id=message_id,
+                    deadline=deadline,
+                )
 
-    def rebuild_projection(self) -> OutboxProjectionState:
-        with self._mutex:
+    def _commit_delivery_unlocked(
+        self,
+        effect_id: str,
+        *,
+        app_id: str,
+        generation: int,
+        connection_id: str,
+        message_id: str,
+        deadline: float | None,
+    ) -> EmployeeOutboxBinding:
+        self._ensure_open_unlocked()
+        self._synchronize_projection_unlocked(deadline=deadline)
+        record, effect = self._find_effect_unlocked(effect_id)
+        if effect.state is DeliveryEffectState.COMMITTED:
+            if record.binding is None:
+                raise OutboxWriteDisabledError("committed delivery lacks binding")
+            return record.binding
+        if effect.state is not DeliveryEffectState.EXECUTING:
+            raise OutboxConflictError("Outbox effect is not EXECUTING")
+        if effect.kind is DeliveryEffectKind.PATCH:
+            current = record.binding
+            if current is None or current.message_id != message_id:
+                raise OutboxConflictError("Outbox patch message binding mismatch")
+            if current.app_id != app_id:
+                raise OutboxConflictError("Outbox patch app binding mismatch")
+        binding = EmployeeOutboxBinding(
+            schema_version=1,
+            outbox_id=record.outbox_id,
+            stable_uuid=employee_outbox_uuid(record.outbox_id),
+            app_id=app_id,
+            generation=generation,
+            connection_id=connection_id,
+            message_id=message_id,
+            bound_snapshot_version=effect.snapshot_version,
+        )
+        self._commit_unlocked(
+            record.outbox_id,
+            JournalEvent(
+                event_type="employee.outbox.delivery_committed",
+                aggregate_id=record.outbox_id,
+                payload={
+                    "effect_id": effect.effect_id,
+                    "binding": binding.to_dict(),
+                },
+            ),
+            deadline=deadline,
+        )
+        committed = self._state.by_outbox_id[record.outbox_id].binding
+        if committed is None:
+            raise OutboxWriteDisabledError("Outbox delivery binding was not applied")
+        return committed
+
+    def rebuild_projection(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> OutboxProjectionState:
+        with self._deadline_guard(self._mutex, deadline, "state lock"):
             self._ensure_open_unlocked()
+            self._require_deadline(deadline, "projection rebuild")
             fresh = OutboxProjectionState()
             anchor = self._writer.anchor.read()
             anchored_hash = GENESIS_HASH
-            for frame in self._writer.replay():
-                if frame.sequence > anchor.sequence:
-                    break
-                for event in frame.events:
-                    if is_outbox_event(event.event_type):
-                        reduce_outbox_event(fresh, event)
-                fresh.cursor_sequence = frame.sequence
-                fresh.cursor_hash = frame.frame_hash
-                anchored_hash = frame.frame_hash
+            try:
+                frames = self._writer.replay(deadline=deadline)
+                for frame in frames:
+                    self._require_deadline(deadline, "projection replay")
+                    if frame.sequence > anchor.sequence:
+                        break
+                    for event in frame.events:
+                        if is_outbox_event(event.event_type):
+                            reduce_outbox_event(fresh, event)
+                    fresh.cursor_sequence = frame.sequence
+                    fresh.cursor_hash = frame.frame_hash
+                    anchored_hash = frame.frame_hash
+            except JournalDeadlineExceededError as exc:
+                raise OutboxDeadlineExceededError("employee Outbox projection deadline exceeded") from exc
             if anchored_hash != anchor.frame_hash:
                 raise OutboxWriteDisabledError("Outbox projection cannot verify the Journal anchor")
             for record in fresh.by_outbox_id.values():
+                self._require_deadline(deadline, "projection hydration")
                 for version, metadata in record.snapshots.items():
                     if version in record.tombstoned_versions:
                         continue
@@ -484,7 +574,8 @@ class EmployeeOutboxService:
                         fresh.closed_employees.add(record.employee_key)
                         break
             self._replace_state_unlocked(fresh)
-            self._quarantine_unreferenced_blobs_unlocked()
+            if deadline is None:
+                self._quarantine_unreferenced_blobs_unlocked()
             return self._state
 
     def quarantine_unreferenced_blobs(self) -> int:
@@ -585,14 +676,19 @@ class EmployeeOutboxService:
         if self._closed or self._blob_store.closed:
             raise OutboxClosedError("employee Outbox service is closed")
 
-    def _synchronize_projection_unlocked(self) -> None:
+    def _synchronize_projection_unlocked(
+        self,
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        self._require_deadline(deadline, "projection synchronization")
         anchor = self._writer.anchor.read()
         cursor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
         if (self._state.cursor_sequence, self._state.cursor_hash) != (
             anchor.sequence,
             cursor_hash,
         ):
-            self.rebuild_projection()
+            self.rebuild_projection(deadline=deadline)
 
     def _replace_state_unlocked(self, fresh: OutboxProjectionState) -> None:
         self._state.by_outbox_id = fresh.by_outbox_id
@@ -600,13 +696,26 @@ class EmployeeOutboxService:
         self._state.cursor_sequence = fresh.cursor_sequence
         self._state.cursor_hash = fresh.cursor_hash
 
-    def _commit_unlocked(self, aggregate_id: str, event: JournalEvent) -> CommitResult:
-        result = self._writer.commit(
-            [event],
-            self._writer.get_aggregate_versions([aggregate_id]),
-            expected_head_sequence=self._state.cursor_sequence,
-            expected_head_hash=self._state.cursor_hash or None,
-        )
+    def _commit_unlocked(
+        self,
+        aggregate_id: str,
+        event: JournalEvent,
+        *,
+        deadline: float | None = None,
+    ) -> CommitResult:
+        try:
+            result = self._writer.commit(
+                [event],
+                self._writer.get_aggregate_versions(
+                    [aggregate_id],
+                    deadline=deadline,
+                ),
+                expected_head_sequence=self._state.cursor_sequence,
+                expected_head_hash=self._state.cursor_hash or None,
+                deadline=deadline,
+            )
+        except JournalDeadlineExceededError as exc:
+            raise OutboxDeadlineExceededError("employee Outbox commit deadline exceeded") from exc
         if result.state != CommitState.ANCHORED:
             raise OutboxWriteDisabledError("Outbox lifecycle event was not anchored")
         for committed_event in result.frame.events:
@@ -615,6 +724,41 @@ class EmployeeOutboxService:
         self._state.cursor_sequence = result.frame.sequence
         self._state.cursor_hash = result.frame.frame_hash
         return result
+
+    @staticmethod
+    def _validate_deadline(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(float(deadline)):
+            raise ValueError("employee Outbox deadline is invalid")
+        return float(deadline)
+
+    @classmethod
+    def _require_deadline(cls, deadline: float | None, label: str) -> None:
+        value = cls._validate_deadline(deadline)
+        if value is not None and time.monotonic() >= value:
+            raise OutboxDeadlineExceededError(f"employee Outbox {label} deadline exceeded")
+
+    @classmethod
+    @contextmanager
+    def _deadline_guard(
+        cls,
+        lock: threading.RLock,
+        deadline: float | None,
+        label: str,
+    ) -> Iterator[None]:
+        value = cls._validate_deadline(deadline)
+        if value is None:
+            with lock:
+                yield
+            return
+        remaining = value - time.monotonic()
+        if remaining <= 0 or not lock.acquire(timeout=min(remaining, threading.TIMEOUT_MAX)):
+            raise OutboxDeadlineExceededError(f"employee Outbox {label} deadline exceeded")
+        try:
+            yield
+        finally:
+            lock.release()
 
     def _quarantine_unreferenced_blobs_unlocked(self) -> int:
         live = {

@@ -42,6 +42,7 @@ from src.autonomous.supervisor.channel_models import (
     ChannelProcessState,
     EmployeeChannelGenerationChanged,
     EmployeeChannelOutboundError,
+    EmployeeChannelOutboundIntegrityError,
     EmployeeChannelOutboundTimeout,
 )
 
@@ -90,6 +91,10 @@ class ChannelSandboxUnavailable(RuntimeError):
         super().__init__("employee Channel sandbox unavailable")
 
 
+class ChannelLaunchUnavailable(RuntimeError):
+    """One employee Channel launch failed without invalidating other identities."""
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxAttestation:
     pid: int
@@ -125,6 +130,7 @@ class ChannelProcessStatus:
     exit_code: int | None = None
     error_code: str = ""
     stale_frames: int = 0
+    delivery_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +153,8 @@ class _PendingSend:
     message_id: str = ""
     operation: str = "send"
     expected_message_id: str = ""
+    failure_kind: str = ""
+    error_code: str = ""
 
 
 class SandboxAttestor(Protocol):
@@ -162,12 +170,15 @@ class _Runtime:
     on_event: Callable[[dict[str, Any]], None]
     tenant_key: str = ""
     bot_principal_id: str = ""
+    delivery_only: bool = False
+    frozen_connection_id: str = ""
     requires_observed_connection: bool = False
     ready: threading.Event = field(default_factory=threading.Event)
     reader: threading.Thread | None = None
     stopping: bool = False
     outbound_sequence: int = 0
     inbound_sequence: int = 0
+    pending_lock: threading.Lock = field(default_factory=threading.Lock)
     pending_sends: dict[str, _PendingSend] = field(default_factory=dict)
     control_lock: threading.Lock = field(default_factory=threading.Lock)
     sandbox_temp_dir: Path | None = None
@@ -192,10 +203,17 @@ class EmployeeChannelSupervisor:
         ingress_binding_resolver: Callable[[str, str], tuple[str, str]] | None = None,
         ingress_ack_timeout: float = 1.5,
     ) -> None:
+        if (
+            isinstance(send_timeout, bool)
+            or not isinstance(send_timeout, (int, float))
+            or not math.isfinite(float(send_timeout))
+            or float(send_timeout) <= 0
+        ):
+            raise ValueError("send_timeout must be positive and finite")
         self._secret_resolver = secret_resolver
         self._ready_timeout = ready_timeout
         self._stop_timeout = stop_timeout
-        self._send_timeout = send_timeout
+        self._send_timeout = float(send_timeout)
         self._worker_path = (
             Path(worker_path).resolve()
             if worker_path is not None
@@ -214,18 +232,11 @@ class EmployeeChannelSupervisor:
         self._ingress_binding_resolver = ingress_binding_resolver
         self._ingress_ack_timeout = float(ingress_ack_timeout)
         self._launcher = launcher or subprocess.Popen
-        if (
-            platform_name is not None
-            and platform_name != sys.platform
-            and worker_path is None
-            and launcher is None
-        ):
+        if platform_name is not None and platform_name != sys.platform and worker_path is None and launcher is None:
             raise ValueError("platform override requires a test launcher or worker")
         self._platform_name = platform_name or sys.platform
         self._automatic_process_fallback = (
-            sandbox_attestor is None
-            and sandbox_prefix is None
-            and self._platform_name == "linux"
+            sandbox_attestor is None and sandbox_prefix is None and self._platform_name == "linux"
         )
         self._sandbox_attestor = sandbox_attestor or attest_process_sandbox
         if sandbox_prefix is not None:
@@ -293,9 +304,7 @@ class EmployeeChannelSupervisor:
             if path.is_file():
                 args.extend(("--ro-bind", str(path), str(path)))
         if not self._worker_path.is_relative_to(source_root):
-            args.extend(
-                ("--ro-bind", str(self._worker_path), str(self._worker_path))
-            )
+            args.extend(("--ro-bind", str(self._worker_path), str(self._worker_path)))
         for path in (
             Path("/etc/hosts"),
             Path("/etc/nsswitch.conf"),
@@ -311,10 +320,7 @@ class EmployeeChannelSupervisor:
         """Build the deny-default macOS Seatbelt launch contract."""
         repository_root = Path(__file__).resolve().parents[3]
         source_root = repository_root / "src"
-        if not all(
-            (repository_root / name).is_file()
-            for name in ("AGENTS.md", "pyproject.toml", "uv.lock")
-        ):
+        if not all((repository_root / name).is_file() for name in ("AGENTS.md", "pyproject.toml", "uv.lock")):
             raise ChannelSandboxUnavailable()
         return (
             "/usr/bin/sandbox-exec",
@@ -347,7 +353,10 @@ class EmployeeChannelSupervisor:
 
     def _agent_lifecycle_lock(self, agent_id: str) -> threading.RLock:
         with self._lifecycle_registry_lock:
-            return self._lifecycle_locks.setdefault(agent_id, threading.RLock())  # leaf lock: never held while acquiring a LockLevel lock
+            return self._lifecycle_locks.setdefault(
+                agent_id,
+                threading.RLock(),  # leaf lock: never held while acquiring a LockLevel lock
+            )
 
     def _launch_candidate(
         self,
@@ -432,7 +441,7 @@ class EmployeeChannelSupervisor:
                 _close_fd(descriptor)
             if sandbox_temp_dir is not None:
                 shutil.rmtree(sandbox_temp_dir, ignore_errors=True)
-            raise RuntimeError("employee Channel launch failed") from None
+            raise ChannelLaunchUnavailable("employee Channel launch failed") from None
         for descriptor in child_fds:
             _close_fd(descriptor)
 
@@ -534,6 +543,37 @@ class EmployeeChannelSupervisor:
                 self._starts_in_flight -= 1
                 self._lifecycle_condition.notify_all()
 
+    def start_delivery_only(
+        self,
+        agent_id: str,
+        app_id: str,
+        credential_ref: str,
+        generation: int,
+        *,
+        frozen_connection_id: str,
+    ) -> ChannelProcessStatus:
+        """Restore frozen outbound authority without reopening employee ingress."""
+
+        with self._lifecycle_condition:
+            if self._closed:
+                raise RuntimeError("employee Channel supervisor is closed")
+            self._starts_in_flight += 1
+        try:
+            with self._agent_lifecycle_lock(agent_id):
+                return self._start_serialized(
+                    agent_id,
+                    app_id,
+                    credential_ref,
+                    generation,
+                    lambda _event: None,
+                    delivery_only=True,
+                    frozen_connection_id=frozen_connection_id,
+                )
+        finally:
+            with self._lifecycle_condition:
+                self._starts_in_flight -= 1
+                self._lifecycle_condition.notify_all()
+
     def _start_serialized(
         self,
         agent_id: str,
@@ -541,17 +581,31 @@ class EmployeeChannelSupervisor:
         credential_ref: str,
         generation: int,
         on_event: Callable[[dict[str, Any]], None],
+        *,
+        delivery_only: bool = False,
+        frozen_connection_id: str = "",
     ) -> ChannelProcessStatus:
         """Launch, attest, bootstrap, and await READY for one employee."""
         self._validate_start(agent_id, app_id, credential_ref, generation, on_event)
+        if (
+            type(delivery_only) is not bool
+            or (
+                delivery_only
+                and (
+                    not isinstance(frozen_connection_id, str)
+                    or not frozen_connection_id.startswith("conn_")
+                    or frozen_connection_id != frozen_connection_id.strip()
+                )
+            )
+            or (not delivery_only and frozen_connection_id)
+        ):
+            raise ValueError("invalid delivery-only Channel binding")
         if self._production_worker and self._ingress_service is None:
             raise RuntimeError("durable employee ingress is not configured")
         tenant_key = "tenant-test-unbound"
         bot_principal_id = "bot_test_unbound"
         if self._ingress_binding_resolver is not None:
-            tenant_key, bot_principal_id = self._ingress_binding_resolver(
-                agent_id, app_id
-            )
+            tenant_key, bot_principal_id = self._ingress_binding_resolver(agent_id, app_id)
             if (
                 not isinstance(tenant_key, str)
                 or not tenant_key
@@ -567,17 +621,18 @@ class EmployeeChannelSupervisor:
             if existing is not None and existing.process.poll() is None:
                 if (
                     existing.status.generation == generation
-                    and existing.status.state
-                    in {ChannelProcessState.STARTING, ChannelProcessState.READY}
+                    and existing.delivery_only == delivery_only
+                    and existing.frozen_connection_id == frozen_connection_id
+                    and existing.status.state in {ChannelProcessState.STARTING, ChannelProcessState.READY}
                 ):
                     return existing.status
         if existing is not None and existing.process.poll() is None:
             self._stop_serialized(agent_id)
             if existing.process.poll() is None:
-                raise RuntimeError("previous employee Channel did not terminate")
+                raise ChannelLaunchUnavailable("previous employee Channel did not terminate")
         with self._lock:
             high = self._generation_high_watermark.get(agent_id, 0)
-            if generation <= high:
+            if generation < high or (generation == high and not delivery_only):
                 raise ValueError("generation must advance after a worker has stopped")
 
         attempts = self._sandbox_attempts()
@@ -600,6 +655,12 @@ class EmployeeChannelSupervisor:
                     on_event=on_event,
                     sandbox_attempt=sandbox_attempt,
                 )
+                runtime.delivery_only = delivery_only
+                runtime.frozen_connection_id = frozen_connection_id
+                runtime.status = replace(
+                    runtime.status,
+                    delivery_only=delivery_only,
+                )
                 with self._lifecycle_condition:
                     supervisor_closed = self._closed
                 if supervisor_closed:
@@ -612,14 +673,10 @@ class EmployeeChannelSupervisor:
                     if self._closed:
                         raise
                 if attempt_index + 1 < len(attempts):
-                    logger.warning(
-                        "employee Channel bwrap launch failed; using process fallback"
-                    )
+                    logger.warning("employee Channel bwrap launch failed; using process fallback")
                     continue
                 if self._sandbox_kind == "macos-seatbelt":
-                    logger.warning(
-                        "employee Channel seatbelt launch failed; sandbox unavailable"
-                    )
+                    logger.warning("employee Channel seatbelt launch failed; sandbox unavailable")
                     raise ChannelSandboxUnavailable() from None
                 raise
             if sandbox_attempt.fallback:
@@ -678,17 +735,13 @@ class EmployeeChannelSupervisor:
             runtime.status = replace(runtime.status, sandbox=attestation)
             if attestation.verified or sandbox_attempt.fallback:
                 if sandbox_attempt.fallback:
-                    logger.warning(
-                        "employee Channel is using unverified process fallback"
-                    )
+                    logger.warning("employee Channel is using unverified process fallback")
                 break
             _close_fd(bootstrap_w)
             bootstrap_w = -1
             self._fail_and_reap(runtime, "sandbox-unavailable")
             if attempt_index + 1 < len(attempts):
-                logger.warning(
-                    "employee Channel bwrap attestation failed; using process fallback"
-                )
+                logger.warning("employee Channel bwrap attestation failed; using process fallback")
                 runtime = None
                 continue
             with self._lock:
@@ -696,18 +749,16 @@ class EmployeeChannelSupervisor:
                 self._generation_high_watermark[agent_id] = generation
             raise ChannelSandboxUnavailable()
         if runtime is None or bootstrap_w < 0:
-            raise RuntimeError("employee Channel launch failed")
+            raise ChannelLaunchUnavailable("employee Channel launch failed")
         with self._lifecycle_condition:
             supervisor_closed = self._closed
             if not supervisor_closed:
                 with self._lock:
                     high = self._generation_high_watermark.get(agent_id, 0)
-                    if generation <= high:
+                    if generation < high or (generation == high and not delivery_only):
                         _close_fd(bootstrap_w)
                         self._fail_and_reap(runtime, "generation-race")
-                        raise ValueError(
-                            "generation must advance after a worker has stopped"
-                        )
+                        raise ValueError("generation must advance after a worker has stopped")
                     self._runtimes[agent_id] = runtime
                     self._generation_high_watermark[agent_id] = generation
         if supervisor_closed:
@@ -726,6 +777,8 @@ class EmployeeChannelSupervisor:
                     tenant_key,
                     bot_principal_id,
                     self._ingress_ack_timeout,
+                    delivery_only,
+                    frozen_connection_id,
                 )
             )
         except Exception:
@@ -846,71 +899,70 @@ class EmployeeChannelSupervisor:
     ) -> ChannelSendReceipt:
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
             raise ValueError("generation must be a positive integer")
-        if (
-            deadline is not None
-            and (
-                isinstance(deadline, bool)
-                or not isinstance(deadline, (int, float))
-                or not math.isfinite(float(deadline))
-            )
+        if deadline is not None and (
+            isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(float(deadline))
         ):
             raise ValueError("employee Channel outbound deadline is invalid")
         receipt_deadline = time.monotonic() + self._send_timeout
         if deadline is not None:
             receipt_deadline = min(receipt_deadline, float(deadline))
         if receipt_deadline <= time.monotonic():
-            raise EmployeeChannelOutboundTimeout(
-                "employee Channel outbound deadline exceeded"
-            )
+            raise EmployeeChannelOutboundTimeout("employee Channel outbound deadline exceeded")
         operation = "send" if frame_type is FrameType.SEND else "update_card"
         request_id = f"{operation}_{uuid.uuid4().hex}"
         pending = _PendingSend(operation=operation, expected_message_id=expected_message_id)
-        with self._lock:
+        remaining = receipt_deadline - time.monotonic()
+        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+            raise EmployeeChannelOutboundTimeout(
+                "employee Channel outbound deadline exceeded"
+            )
+        try:
             runtime = self._runtimes.get(agent_id)
             if runtime is None or runtime.status.state is not ChannelProcessState.READY:
                 raise EmployeeChannelOutboundError("employee Channel is not ready")
             if runtime.status.generation != generation:
-                raise EmployeeChannelGenerationChanged(
-                    "employee Channel generation mismatch"
-                )
-            runtime.pending_sends[request_id] = pending
+                raise EmployeeChannelGenerationChanged("employee Channel generation mismatch")
+            with runtime.pending_lock:
+                runtime.pending_sends[request_id] = pending
             try:
                 control_payload = {"request_id": request_id, **payload}
-                if deadline is None:
-                    sent = self._send_control(runtime, frame_type, control_payload)
-                else:
-                    sent = self._send_control(
-                        runtime,
-                        frame_type,
-                        control_payload,
-                        deadline=receipt_deadline,
-                    )
+                sent = self._send_control(
+                    runtime,
+                    frame_type,
+                    control_payload,
+                    deadline=receipt_deadline,
+                )
             except ProtocolError:
-                runtime.pending_sends.pop(request_id, None)
+                with runtime.pending_lock:
+                    runtime.pending_sends.pop(request_id, None)
                 raise ValueError(f"unsafe {operation.replace('_', ' ')} payload") from None
             except TimeoutError as exc:
-                runtime.pending_sends.pop(request_id, None)
+                with runtime.pending_lock:
+                    runtime.pending_sends.pop(request_id, None)
                 raise EmployeeChannelOutboundTimeout(
                     f"employee Channel {operation.replace('_', ' ')} timed out"
                 ) from exc
             if not sent:
-                runtime.pending_sends.pop(request_id, None)
-                raise EmployeeChannelOutboundError(
-                    f"employee Channel {operation.replace('_', ' ')} failed"
-                )
+                with runtime.pending_lock:
+                    runtime.pending_sends.pop(request_id, None)
+                raise EmployeeChannelOutboundError(f"employee Channel {operation.replace('_', ' ')} failed")
+        finally:
+            self._lock.release()
         remaining = max(0.0, receipt_deadline - time.monotonic())
         if not pending.completed.wait(remaining):
-            with self._lock:
+            with runtime.pending_lock:
                 runtime.pending_sends.pop(request_id, None)
-            raise EmployeeChannelOutboundTimeout(
-                f"employee Channel {operation.replace('_', ' ')} receipt timed out"
-            )
-        with self._lock:
+            raise EmployeeChannelOutboundTimeout(f"employee Channel {operation.replace('_', ' ')} receipt timed out")
+        with runtime.pending_lock:
             runtime.pending_sends.pop(request_id, None)
         if pending.success is not True:
-            raise EmployeeChannelOutboundError(
-                f"employee Channel {operation.replace('_', ' ')} was not acknowledged"
+            message = (
+                f"employee Channel {operation.replace('_', ' ')} failed"
+                f" ({pending.error_code or 'unknown-worker-failure'})"
             )
+            if pending.failure_kind in {"transport", "remote"}:
+                raise EmployeeChannelOutboundError(message)
+            raise EmployeeChannelOutboundIntegrityError(message)
         return ChannelSendReceipt(
             request_id=request_id,
             success=True,
@@ -989,6 +1041,11 @@ class EmployeeChannelSupervisor:
                     except ProtocolError:
                         with self._lock:
                             runtime.status = replace(runtime.status, error_code="protocol-error")
+                            self._fail_pending_sends(
+                                runtime,
+                                failure_kind="internal",
+                                error_code="protocol-error",
+                            )
                         continue
                     if frame.agent_id != runtime.status.agent_id or frame.generation != runtime.status.generation:
                         with self._lock:
@@ -1013,18 +1070,13 @@ class EmployeeChannelSupervisor:
                     crashed = exit_code is not None
                     runtime.status = replace(
                         runtime.status,
-                        state=(
-                            ChannelProcessState.CRASHED
-                            if crashed
-                            else ChannelProcessState.FAILED
-                        ),
+                        state=(ChannelProcessState.CRASHED if crashed else ChannelProcessState.FAILED),
                         ready_at=None,
                         stopped_at=time.time(),
                         exit_code=exit_code,
                         error_code=(
                             "worker-exited-before-ready"
-                            if crashed
-                            and runtime.status.state is ChannelProcessState.STARTING
+                            if crashed and runtime.status.state is ChannelProcessState.STARTING
                             else "worker-exited"
                             if crashed
                             else "event-pipe-closed"
@@ -1052,6 +1104,10 @@ class EmployeeChannelSupervisor:
                 identity = frame.payload["identity"]
                 if identity["app_id"] != runtime.status.app_id:
                     raise ProtocolError("READY app identity does not match runtime")
+                if getattr(runtime, "delivery_only", False) and frame.payload["connection_id"] != getattr(
+                    runtime, "frozen_connection_id", ""
+                ):
+                    raise ProtocolError("delivery-only READY connection does not match frozen authority")
             except (KeyError, ProtocolError, TypeError):
                 with self._lock:
                     runtime.status = replace(runtime.status, error_code="invalid-ready")
@@ -1063,15 +1119,9 @@ class EmployeeChannelSupervisor:
                 or connection.get("secure") is not True
             ):
                 with self._lock:
-                    runtime.status = replace(
-                        runtime.status, error_code="unobserved-connection"
-                    )
+                    runtime.status = replace(runtime.status, error_code="unobserved-connection")
                 return
-            metadata = {
-                key: deepcopy(value)
-                for key, value in frame.payload.items()
-                if key != "identity"
-            }
+            metadata = {key: deepcopy(value) for key, value in frame.payload.items() if key != "identity"}
             with self._lock:
                 runtime.status = replace(
                     runtime.status,
@@ -1084,6 +1134,13 @@ class EmployeeChannelSupervisor:
             runtime.ready.set()
             return
         if frame.frame_type is FrameType.INGRESS:
+            if getattr(runtime, "delivery_only", False):
+                with self._lock:
+                    runtime.status = replace(
+                        runtime.status,
+                        error_code="delivery-only-ingress-rejected",
+                    )
+                return
             self._accept_ingress(runtime, frame)
         elif frame.frame_type is FrameType.EVENT:
             if frame.payload.get("event") == "reconnecting":
@@ -1112,38 +1169,46 @@ class EmployeeChannelSupervisor:
                 success = frame.payload.get("success")
                 if isinstance(request_id, str) and isinstance(success, bool):
                     with self._lock:
-                        pending = runtime.pending_sends.get(request_id)
-                        if pending is not None:
-                            app_id = frame.payload.get("app_id")
-                            generation = frame.payload.get("generation")
-                            connection_id = frame.payload.get("connection_id")
-                            message_id = frame.payload.get("message_id")
-                            valid_evidence = (
-                                success is True
-                                and app_id == runtime.status.app_id
-                                and generation == runtime.status.generation
-                                and isinstance(connection_id, str)
-                                and connection_id
-                                == runtime.status.ready_metadata.get("connection_id")
-                                and isinstance(message_id, str)
-                                and bool(message_id)
-                                and (
-                                    pending.operation == "send"
-                                    or message_id == pending.expected_message_id
+                        with runtime.pending_lock:
+                            pending = runtime.pending_sends.get(request_id)
+                            if pending is not None and not pending.completed.is_set():
+                                app_id = frame.payload.get("app_id")
+                                generation = frame.payload.get("generation")
+                                connection_id = frame.payload.get("connection_id")
+                                message_id = frame.payload.get("message_id")
+                                valid_evidence = (
+                                    success is True
+                                    and app_id == runtime.status.app_id
+                                    and generation == runtime.status.generation
+                                    and isinstance(connection_id, str)
+                                    and connection_id == runtime.status.ready_metadata.get("connection_id")
+                                    and isinstance(message_id, str)
+                                    and bool(message_id)
+                                    and (pending.operation == "send" or message_id == pending.expected_message_id)
                                 )
-                            )
-                            pending.success = valid_evidence
-                            if valid_evidence:
-                                pending.app_id = app_id
-                                pending.generation = generation
-                                pending.connection_id = connection_id
-                                pending.message_id = message_id
-                            elif success is True:
-                                runtime.status = replace(
-                                    runtime.status,
-                                    error_code=f"invalid-{operation.replace('_', '-')}-receipt",
-                                )
-                            pending.completed.set()
+                                pending.success = valid_evidence
+                                if valid_evidence:
+                                    pending.app_id = app_id
+                                    pending.generation = generation
+                                    pending.connection_id = connection_id
+                                    pending.message_id = message_id
+                                elif success is True:
+                                    pending.failure_kind = "internal"
+                                    pending.error_code = "invalid-outbound-receipt"
+                                    runtime.status = replace(
+                                        runtime.status,
+                                        error_code=f"invalid-{operation.replace('_', '-')}-receipt",
+                                    )
+                                else:
+                                    failure_kind = frame.payload.get("failure_kind")
+                                    error_code = frame.payload.get("error_code")
+                                    pending.failure_kind = failure_kind if isinstance(failure_kind, str) else ""
+                                    pending.error_code = error_code if isinstance(error_code, str) else ""
+                                    runtime.status = replace(
+                                        runtime.status,
+                                        error_code=(pending.error_code or "invalid-outbound-failure"),
+                                    )
+                                pending.completed.set()
             with self._lock:
                 runtime.status = replace(
                     runtime.status,
@@ -1166,8 +1231,7 @@ class EmployeeChannelSupervisor:
                     and metadata.bot_principal_id == runtime.bot_principal_id
                     and metadata.app_id == runtime.status.app_id
                     and metadata.channel_generation == runtime.status.generation
-                    and metadata.connection_id
-                    == runtime.status.ready_metadata.get("connection_id")
+                    and metadata.connection_id == runtime.status.ready_metadata.get("connection_id")
                     and frame.payload["app_id"] == runtime.status.app_id
                     and frame.payload["connection_id"] == metadata.connection_id
                 )
@@ -1285,10 +1349,20 @@ class EmployeeChannelSupervisor:
         self._finish_reader(runtime)
 
     @staticmethod
-    def _fail_pending_sends(runtime: _Runtime) -> None:
-        for pending in runtime.pending_sends.values():
-            pending.success = False
-            pending.completed.set()
+    def _fail_pending_sends(
+        runtime: _Runtime,
+        *,
+        failure_kind: str = "transport",
+        error_code: str = "channel-closed",
+    ) -> None:
+        with runtime.pending_lock:
+            for pending in runtime.pending_sends.values():
+                if pending.completed.is_set():
+                    continue
+                pending.success = False
+                pending.failure_kind = failure_kind
+                pending.error_code = error_code
+                pending.completed.set()
 
     def _wait_or_terminate(self, runtime: _Runtime) -> None:
         try:
@@ -1350,10 +1424,7 @@ def attest_process_sandbox(pid: int) -> SandboxAttestation:
             repository_root = Path(__file__).resolve().parents[3]
             child_repository = Path(f"/proc/{pid}/root") / repository_root.relative_to("/")
             source_visible = (child_repository / "src").is_dir()
-            secrets_hidden = not any(
-                (child_repository / name).exists()
-                for name in (".env", ".git", ".Memory")
-            )
+            secrets_hidden = not any((child_repository / name).exists() for name in (".env", ".git", ".Memory"))
             identity_stable = _proc_start_time(pid) == process_start_time
             if (
                 child_user_ns != parent_user_ns
@@ -1468,11 +1539,7 @@ def _with_seatbelt_temp_dir(
         profile_flag = prefix.index("-p")
     except ValueError as exc:
         raise ValueError("invalid seatbelt launch prefix") from exc
-    return (
-        prefix[:profile_flag]
-        + ("-D", f"GHOSTAP_TEMP={path}")
-        + prefix[profile_flag:]
-    )
+    return prefix[:profile_flag] + ("-D", f"GHOSTAP_TEMP={path}") + prefix[profile_flag:]
 
 
 def _read_sandbox_metadata(fd: int) -> dict[str, Any]:
@@ -1517,11 +1584,7 @@ def _write_all(
             view = view[written:]
         return
 
-    if (
-        isinstance(deadline, bool)
-        or not isinstance(deadline, (int, float))
-        or not math.isfinite(float(deadline))
-    ):
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(float(deadline)):
         raise ValueError("employee Channel IPC write deadline is invalid")
     deadline = float(deadline)
     was_blocking = os.get_blocking(fd)

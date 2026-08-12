@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import src.autonomous.gateway.coordinator as coordinator_module
 from src.autonomous.gateway.coordinator import (
     EmployeeDispatchCoordinator,
     EmployeeDispatchError,
@@ -203,6 +204,256 @@ def test_recovery_rebuilds_missing_terminal_snapshot_without_rerunning_acp(
         harness.close()
 
 
+def test_reporting_recovery_result_rejects_invalid_counts_and_duplicate_attempts() -> None:
+    result_type = getattr(
+        coordinator_module,
+        "EmployeeDispatchReportingRecoveryResult",
+        None,
+    )
+    assert result_type is not None
+
+    assert result_type(2, ("att_alpha", "att_beta")).recovered_count == 2
+    with pytest.raises(TypeError, match="recovered_count"):
+        result_type(True, ())
+    with pytest.raises(ValueError, match="non-negative"):
+        result_type(-1, ())
+    with pytest.raises(ValueError, match="unique"):
+        result_type(0, ("att_alpha", "att_alpha"))
+
+
+def test_incomplete_attempt_recovery_defers_one_record_without_blocking_the_next(
+    tmp_path,
+) -> None:
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    deferred_error = getattr(
+        coordinator_module,
+        "EmployeeDispatchReportingDeferredError",
+        None,
+    )
+    assert deferred_error is not None
+    harness = _real_coordinator_harness(tmp_path, second_candidate=True)
+    first = harness.coordinator.prepare_next()
+    second = harness.coordinator.prepare_next()
+    assert first is not None and second is not None
+    calls: list[str] = []
+
+    class _RecordLocalFailure:
+        def terminal(self, binding, _result):
+            calls.append(binding.attempt_id)
+            if binding.attempt_id == first.binding.attempt_id:
+                raise deferred_error("attempt-local reporting unavailable")
+
+    harness.coordinator._attempt_lifecycle = _RecordLocalFailure()  # noqa: SLF001
+    try:
+        with pytest.raises(deferred_error) as raised:
+            harness.coordinator.recover_incomplete_attempts()
+
+        assert raised.value.deferred_attempt_ids == (first.binding.attempt_id,)
+        assert raised.value.recovered_count == 1
+        assert calls == [first.binding.attempt_id, second.binding.attempt_id]
+        state = harness.coordinator.state
+        assert state.attempts[first.binding.attempt_id].terminal_status == "action_required"
+        assert state.attempts[second.binding.attempt_id].terminal_status == "action_required"
+    finally:
+        harness.close()
+
+
+def test_reporting_repair_returns_deferred_record_and_reconciles_later_snapshot(
+    tmp_path,
+) -> None:
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    deferred_error = getattr(
+        coordinator_module,
+        "EmployeeDispatchReportingDeferredError",
+        None,
+    )
+    assert deferred_error is not None
+    harness = _real_coordinator_harness(tmp_path, second_candidate=True)
+    first = harness.coordinator.prepare_next()
+    second = harness.coordinator.prepare_next()
+    assert first is not None and second is not None
+    result = GatewayExecutionResult(
+        GatewayExecutionStatus.ACTION_REQUIRED,
+        safe_error_code="unknown_dispatch_outcome",
+    )
+    harness.coordinator.finalize_attempt(first.binding.attempt_id, result)
+    harness.coordinator.finalize_attempt(second.binding.attempt_id, result)
+    calls: list[str] = []
+
+    class _RecordLocalFailure:
+        def terminal(self, binding, _result):
+            calls.append(binding.attempt_id)
+            if binding.attempt_id == first.binding.attempt_id:
+                raise deferred_error("attempt-local reporting unavailable")
+
+    harness.coordinator._attempt_lifecycle = _RecordLocalFailure()  # noqa: SLF001
+    try:
+        repaired = harness.coordinator.repair_reporting()
+
+        assert repaired.recovered_count == 1
+        assert repaired.deferred_attempt_ids == (first.binding.attempt_id,)
+        assert calls == [first.binding.attempt_id, second.binding.attempt_id]
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    ("error_type", "message"),
+    [
+        pytest.param(NameError, "undefined repair dependency", id="programming"),
+        pytest.param(RuntimeError, "unknown reporting failure", id="unknown"),
+    ],
+)
+def test_incomplete_attempt_recovery_propagates_unknown_record_failures(
+    tmp_path,
+    error_type,
+    message,
+) -> None:
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    harness = _real_coordinator_harness(
+        tmp_path / error_type.__name__,
+        second_candidate=True,
+    )
+    first = harness.coordinator.prepare_next()
+    second = harness.coordinator.prepare_next()
+    assert first is not None and second is not None
+    calls: list[str] = []
+
+    class _ProgrammingFailure:
+        def terminal(self, binding, _result):
+            calls.append(binding.attempt_id)
+            raise error_type(message)
+
+    harness.coordinator._attempt_lifecycle = _ProgrammingFailure()  # noqa: SLF001
+    try:
+        with pytest.raises(error_type, match=message):
+            harness.coordinator.recover_incomplete_attempts()
+
+        assert calls == [first.binding.attempt_id]
+        assert not harness.coordinator.state.attempts[
+            second.binding.attempt_id
+        ].terminal_status
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("error_kind", ["projection", "integrity"])
+def test_reporting_repair_prioritizes_global_failures_over_record_deferrals(
+    tmp_path,
+    monkeypatch,
+    error_kind,
+) -> None:
+    from src.autonomous.data.projection import DataProjectionError
+    from src.autonomous.journal.frame import JournalIntegrityError
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    deferred_error = getattr(
+        coordinator_module,
+        "EmployeeDispatchReportingDeferredError",
+        None,
+    )
+    assert deferred_error is not None
+    harness = _real_coordinator_harness(
+        tmp_path / error_kind,
+        second_candidate=True,
+    )
+    first = harness.coordinator.prepare_next()
+    second = harness.coordinator.prepare_next()
+    assert first is not None and second is not None
+    calls: list[str] = []
+
+    class _RecordLocalFailure:
+        def terminal(self, binding, _result):
+            calls.append(binding.attempt_id)
+            if binding.attempt_id == first.binding.attempt_id:
+                raise deferred_error("attempt-local reporting unavailable")
+
+    failure = (
+        DataProjectionError("invalid data projection")
+        if error_kind == "projection"
+        else JournalIntegrityError("invalid journal integrity")
+    )
+    harness.coordinator._attempt_lifecycle = _RecordLocalFailure()  # noqa: SLF001
+    monkeypatch.setattr(
+        harness.data,
+        "rebuild_projection",
+        lambda: (_ for _ in ()).throw(failure),
+    )
+    try:
+        with pytest.raises(type(failure), match=str(failure)):
+            harness.coordinator.repair_reporting()
+
+        assert calls == [first.binding.attempt_id, second.binding.attempt_id]
+    finally:
+        harness.close()
+
+
+def test_terminal_reconciliation_isolates_typed_poison_and_repairs_later_attempt(
+    tmp_path,
+) -> None:
+    """A bad response record cannot block a healthy missing Outbox snapshot."""
+
+    from src.autonomous.gateway.models import (
+        EmployeeDispatchReportingDeferredError,
+    )
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    harness = _real_coordinator_harness(tmp_path, second_candidate=True)
+    first = harness.coordinator.prepare_next()
+    assert first is not None
+    harness.coordinator.finalize_attempt(
+        first.binding.attempt_id,
+        GatewayExecutionResult(
+            GatewayExecutionStatus.ACTION_REQUIRED,
+            safe_error_code="first_terminal",
+        ),
+    )
+    second = harness.coordinator.prepare_next()
+    assert second is not None
+    harness.coordinator.finalize_attempt(
+        second.binding.attempt_id,
+        GatewayExecutionResult(
+            GatewayExecutionStatus.ACTION_REQUIRED,
+            safe_error_code="second_terminal",
+        ),
+    )
+
+    observed: list[str] = []
+    repaired: list[str] = []
+
+    class _Lifecycle:
+        def terminal(self, binding, _result) -> None:
+            observed.append(binding.attempt_id)
+            if binding.attempt_id == first.binding.attempt_id:
+                raise EmployeeDispatchReportingDeferredError("poison response")
+            repaired.append(binding.attempt_id)
+
+    harness.coordinator._attempt_lifecycle = _Lifecycle()  # noqa: SLF001
+    try:
+        with pytest.raises(EmployeeDispatchReportingDeferredError) as raised:
+            harness.coordinator.reconcile_terminal_snapshots()
+
+        assert raised.value.failed_attempt_ids == (first.binding.attempt_id,)
+        assert raised.value.repaired_count == 1
+        assert observed == [first.binding.attempt_id, second.binding.attempt_id]
+        assert repaired == [second.binding.attempt_id]
+    finally:
+        harness.close()
+
+
 def test_terminal_commit_section_never_replays_full_journal(
     tmp_path,
     monkeypatch,
@@ -388,6 +639,123 @@ def test_anchored_terminal_apply_failure_keeps_live_history_blob(
     restarted = harness.restart()
     assert restarted.recover_incomplete_attempts() == ()
     assert restarted.state.attempts[prepared.binding.attempt_id].terminal_status == "completed"
+    harness.close()
+
+
+def test_terminal_anchor_outcome_unknown_preserves_history_blob_for_restart(
+    tmp_path,
+) -> None:
+    """An exception after FileAnchor replacement cannot orphan an anchored Blob."""
+
+    from src.autonomous.data.projection import DataProjectionState
+    from src.autonomous.data.service import EmployeeDataService
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionState,
+        reduce_gateway_frame,
+    )
+    from src.autonomous.journal.anchor import FileAnchor
+    from src.autonomous.journal.blob_store import (
+        AesGcmEncryptionProvider,
+        BlobStore,
+    )
+    from src.autonomous.journal.writer import JournalWriter
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    harness = _real_coordinator_harness(tmp_path)
+    prepared = harness.coordinator.prepare_next()
+    assert prepared is not None
+    durable_anchor = harness.writer.anchor
+
+    class _RaiseAfterFileAnchorReplace:
+        production_safe = True
+
+        def read(self):
+            return durable_anchor.read()
+
+        def compare_and_swap(self, *args):
+            assert durable_anchor.compare_and_swap(*args) is True
+            raise OSError("anchor directory fsync outcome unknown")
+
+    harness.writer.anchor = _RaiseAfterFileAnchorReplace()
+    with pytest.raises(EmployeeDispatchError, match="was not anchored"):
+        harness.coordinator.finalize_attempt(
+            prepared.binding.attempt_id,
+            GatewayExecutionResult(
+                GatewayExecutionStatus.COMPLETED,
+                output="durable output",
+            ),
+            request_text=prepared.prompt,
+        )
+    harness.close()
+
+    restarted_writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=FileAnchor(tmp_path / "journal-anchor.json"),
+        hmac_key=b"real-coordinator-harness-key-32bytes",
+    )
+    restarted_data = EmployeeDataService(
+        writer=restarted_writer,
+        blob_store=BlobStore(
+            tmp_path / "data-blobs",
+            AesGcmEncryptionProvider(lambda _ref: b"d" * 32),
+        ),
+        data_state=DataProjectionState(),
+        active_key_id="data-key",
+    )
+    try:
+        gateway_state = GatewayProjectionState()
+        for frame in restarted_writer.replay():
+            reduce_gateway_frame(gateway_state, frame)
+        restarted_data.rebuild_projection()
+
+        lifecycle = gateway_state.attempts[prepared.binding.attempt_id]
+        assert lifecycle.terminal_status == "completed"
+        payload = restarted_data.get_history_payload(lifecycle.history_record_id)
+        assert payload.result_text == "durable output"
+        restarted_data.verify_live_blobs()
+    finally:
+        restarted_data.close()
+        restarted_writer.close()
+
+
+def test_terminal_rejected_anchor_releases_history_blob_for_verified_hygiene(
+    tmp_path,
+) -> None:
+    from tests.autonomous.integration.test_employee_team_gateway import (
+        _real_coordinator_harness,
+    )
+
+    harness = _real_coordinator_harness(tmp_path)
+    prepared = harness.coordinator.prepare_next()
+    assert prepared is not None
+    durable_anchor = harness.writer.anchor
+
+    class _RejectingAnchor:
+        production_safe = True
+
+        def read(self):
+            return durable_anchor.read()
+
+        @staticmethod
+        def compare_and_swap(*_args):
+            return False
+
+    harness.writer.anchor = _RejectingAnchor()
+    with pytest.raises(EmployeeDispatchError, match="was not anchored"):
+        harness.coordinator.finalize_attempt(
+            prepared.binding.attempt_id,
+            GatewayExecutionResult(
+                GatewayExecutionStatus.COMPLETED,
+                output="unanchored output",
+            ),
+            request_text=prepared.prompt,
+        )
+
+    assert len(harness.data._blob_store.iter_blob_ids()) == 1  # noqa: SLF001
+    assert harness.data.quarantine_unreferenced_blobs() == 1
+    assert harness.data._blob_store.iter_blob_ids() == ()  # noqa: SLF001
     harness.close()
 
 

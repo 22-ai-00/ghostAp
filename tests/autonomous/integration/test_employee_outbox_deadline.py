@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -99,5 +100,34 @@ def test_expired_outbox_deadline_stops_before_channel_call(tmp_path) -> None:
 
         assert channel.deadlines == []
     finally:
+        service.close()
+        writer.close()
+
+
+def test_outbox_deadline_bounds_projection_lock_contention(tmp_path) -> None:
+    service, writer = _runtime(tmp_path)
+    channel = _DeadlineChannel()
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_projection_lock() -> None:
+        with service._mutex:  # noqa: SLF001 - deterministic fault injection
+            held.set()
+            assert release.wait(2)
+
+    holder = threading.Thread(target=hold_projection_lock)
+    holder.start()
+    try:
+        assert held.wait(1)
+        started = time.monotonic()
+        with pytest.raises(EmployeeOutboxDrainDeadlineExceeded):
+            _coordinator(service, channel).deliver_pending(
+                deadline=started + 0.03,
+            )
+        assert time.monotonic() - started < 0.5
+        assert channel.deadlines == []
+    finally:
+        release.set()
+        holder.join(timeout=1)
         service.close()
         writer.close()

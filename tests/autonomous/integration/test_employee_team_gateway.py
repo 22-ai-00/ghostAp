@@ -1120,6 +1120,12 @@ def _real_coordinator_harness(
         "sender_type": "user",
         "sender_tenant_key": "tenant_1",
         "feishu_thread_id": "omt_1",
+        # Public message coordinates are encrypted payload facts.  The
+        # corresponding metadata below carries only their one-way indexes,
+        # matching the production Channel normalization contract.
+        "remote_chat_id": chat_id,
+        "remote_message_id": "om_current",
+        "remote_root_id": "om_root",
     }
     if targeted_group_task:
         content.update(
@@ -1130,9 +1136,6 @@ def _real_coordinator_harness(
                     "tenant_key": "tenant_1",
                 },
             ),
-            remote_chat_id="oc_team",
-            remote_message_id="om_current",
-            remote_root_id="om_root",
         )
     if team_assignment:
         content = {
@@ -1181,18 +1184,18 @@ def _real_coordinator_harness(
             "team:teamrun_inactive:analysis" if team_assignment else ""
         ),
         chat_id=(
-            "oc_" + hashlib.sha256(b"oc_team").hexdigest()
-            if targeted_group_task
+            "oc_" + hashlib.sha256(chat_id.encode()).hexdigest()
+            if not team_assignment
             else chat_id
         ),
         thread_root_message_id=(
             "om_" + hashlib.sha256(b"om_root").hexdigest()
-            if targeted_group_task
+            if not team_assignment
             else "om_root"
         ),
         message_id=(
             "om_" + hashlib.sha256(b"om_current").hexdigest()
-            if targeted_group_task
+            if not team_assignment
             else "om_current"
         ),
         sender_principal_id=source_requester,
@@ -1234,10 +1237,14 @@ def _real_coordinator_harness(
         assert queued.state == "queued", queued
     acceptance_ids = [acceptance_id]
     if second_candidate:
+        second_content = {
+            **content,
+            "remote_message_id": "om_second",
+        }
         second_payload = EmployeeIngressPayload(
             schema_version=1,
             envelope_id="ing_" + "2" * 64,
-            normalized_parts=(content,),
+            normalized_parts=(second_content,),
             attachment_descriptors=(),
         )
         second_metadata = replace(
@@ -1248,7 +1255,7 @@ def _real_coordinator_harness(
             app_id="cli_beta",
             connection_id="conn_beta",
             event_id="evt_2",
-            message_id="om_second",
+            message_id="om_" + hashlib.sha256(b"om_second").hexdigest(),
             semantic_digest=second_payload.payload_sha256,
             payload_sha256=second_payload.payload_sha256,
             payload_size_bytes=second_payload.canonical_size_bytes,

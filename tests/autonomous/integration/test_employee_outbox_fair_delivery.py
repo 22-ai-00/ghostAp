@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
+from src.autonomous.domain.employees import BotPrincipal, EmployeeDefinition
+from src.autonomous.domain.enums import EmployeeState, WorkerType
 from src.autonomous.journal.anchor import MemoryAnchor
 from src.autonomous.journal.blob_store import AesGcmEncryptionProvider, BlobStore
 from src.autonomous.journal.writer import JournalWriter
@@ -26,8 +29,14 @@ from src.autonomous.outbox.service import (
     EmployeeOutboxService,
     OutboxWriteDisabledError,
 )
+from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+from src.autonomous.provisioning.hire_state import DurableHireState, HirePhase
 from src.autonomous.supervisor.channel_models import EmployeeChannelOutboundError
-from src.autonomous.supervisor.employee_channels import ChannelSendReceipt
+from src.autonomous.supervisor.employee_channels import (
+    ChannelProcessState,
+    ChannelProcessStatus,
+    ChannelSendReceipt,
+)
 
 
 def _snapshot(
@@ -154,6 +163,188 @@ def test_bounded_fair_drain_skips_unavailable_oldest_and_delivers_next(
         assert channel.calls == ["agt_healthy"]
         assert service.get_record(oldest.outbox_id).binding is None
         assert service.get_record(healthy.outbox_id).binding is not None
+    finally:
+        service.close()
+        writer.close()
+def test_production_resolver_isolates_oldest_missing_identity_and_delivers_next(
+    tmp_path,
+) -> None:
+    service, writer = _runtime(tmp_path)
+    oldest = _snapshot(
+        agent_id="agt_oldest",
+        attempt_id="attempt-oldest-production-resolver",
+        created_at="2026-08-12T00:00:00Z",
+    )
+    healthy = _snapshot(
+        agent_id="agt_healthy",
+        attempt_id="attempt-healthy-production-resolver",
+        created_at="2026-08-12T00:00:01Z",
+    )
+    service.append_snapshot(oldest)
+    service.append_snapshot(healthy)
+
+    app_id = "cli_agt_healthy"
+    bot_principal_id = "bot_healthy"
+    connection_id = "conn_agt_healthy"
+    employee = EmployeeDefinition(
+        agent_id=healthy.agent_id,
+        tenant_key=healthy.tenant_key,
+        owner_principal_id="ou_owner",
+        name="Healthy",
+        tool="codex",
+        worker_type=WorkerType.VISIBLE,
+        state=EmployeeState.ACTIVE,
+        bot_principal_id=bot_principal_id,
+    )
+    principal = BotPrincipal(
+        bot_principal_id=bot_principal_id,
+        tenant_key=healthy.tenant_key,
+        agent_id=healthy.agent_id,
+        app_id=app_id,
+        credential_ref="vault://healthy",
+    )
+    hire = DurableHireState(
+        intent_id="hire_healthy",
+        tenant_key=healthy.tenant_key,
+        agent_id=healthy.agent_id,
+        bot_principal_id=bot_principal_id,
+        app_id=app_id,
+        credential_ref=principal.credential_ref,
+        channel_generation=1,
+        channel_identity_app_id=app_id,
+        channel_connection_id=connection_id,
+        phase=HirePhase.ACTIVE,
+    )
+
+    class _ProductionResolverChannel(_Channel):
+        def status(self, agent_id: str) -> ChannelProcessStatus | None:
+            if agent_id != healthy.agent_id:
+                return None
+            return ChannelProcessStatus(
+                agent_id=healthy.agent_id,
+                app_id=app_id,
+                generation=1,
+                pid=101,
+                state=ChannelProcessState.READY,
+                tenant_key=healthy.tenant_key,
+                bot_principal_id=bot_principal_id,
+                identity={"app_id": app_id},
+                ready_metadata={"connection_id": connection_id},
+            )
+
+    channel = _ProductionResolverChannel(calls=[])
+    runtime = EmployeeDepartmentRuntime()
+    runtime._service = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        current_employee_transport_snapshot=lambda: (
+            (employee,),
+            (principal,),
+            (hire,),
+        )
+    )
+    runtime._channels = channel  # type: ignore[assignment]  # noqa: SLF001
+    runtime._outbox = service  # type: ignore[assignment]  # noqa: SLF001
+    runtime._outbox_delivery = EmployeeOutboxDeliveryCoordinator(  # noqa: SLF001
+        outbox=service,
+        channels=channel,
+        authority_resolver=runtime._resolve_outbox_delivery_authority,  # noqa: SLF001
+    )
+    try:
+        assert runtime._drain_employee_outbox_once() is True  # noqa: SLF001
+        assert channel.calls == [healthy.agent_id]
+        assert service.get_record(oldest.outbox_id).binding is None
+        assert service.get_record(healthy.outbox_id).binding is not None
+    finally:
+        service.close()
+        writer.close()
+
+
+def test_production_resolver_configuration_failure_propagates_without_isolation(
+    tmp_path,
+) -> None:
+    service, writer = _runtime(tmp_path)
+    oldest = _snapshot(
+        agent_id="agt_oldest",
+        attempt_id="attempt-programming-error",
+        created_at="2026-08-12T00:00:00Z",
+    )
+    service.append_snapshot(oldest)
+    channel = _Channel(calls=[])
+    runtime = EmployeeDepartmentRuntime()
+    runtime._service = object()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._channels = channel  # type: ignore[assignment]  # noqa: SLF001
+    coordinator = EmployeeOutboxDeliveryCoordinator(
+        outbox=service,
+        channels=channel,
+        authority_resolver=runtime._resolve_outbox_delivery_authority,  # noqa: SLF001
+    )
+    try:
+        with pytest.raises(RuntimeError, match="snapshot is unavailable"):
+            coordinator.deliver_pending(max_items=1)
+        assert channel.calls == []
+    finally:
+        service.close()
+        writer.close()
+
+
+def test_production_resolver_duplicate_hire_authority_is_not_isolated(
+    tmp_path,
+) -> None:
+    service, writer = _runtime(tmp_path)
+    oldest = _snapshot(
+        agent_id="agt_ambiguous",
+        attempt_id="attempt-ambiguous-hire",
+        created_at="2026-08-12T00:00:00Z",
+    )
+    service.append_snapshot(oldest)
+    employee = EmployeeDefinition(
+        agent_id=oldest.agent_id,
+        tenant_key=oldest.tenant_key,
+        owner_principal_id="ou_owner",
+        name="Ambiguous",
+        tool="codex",
+        worker_type=WorkerType.VISIBLE,
+        state=EmployeeState.ACTIVE,
+        bot_principal_id="bot_ambiguous",
+    )
+    principal = BotPrincipal(
+        bot_principal_id=employee.bot_principal_id,
+        tenant_key=oldest.tenant_key,
+        agent_id=oldest.agent_id,
+        app_id="cli_ambiguous",
+        credential_ref="vault://ambiguous",
+    )
+    hire = DurableHireState(
+        intent_id="hire_ambiguous",
+        tenant_key=oldest.tenant_key,
+        agent_id=oldest.agent_id,
+        bot_principal_id=employee.bot_principal_id,
+        app_id=principal.app_id,
+        credential_ref=principal.credential_ref,
+        channel_generation=1,
+        channel_identity_app_id=principal.app_id,
+        channel_connection_id="conn_ambiguous",
+        phase=HirePhase.ACTIVE,
+    )
+    channel = _Channel(calls=[])
+    runtime = EmployeeDepartmentRuntime()
+    runtime._service = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        current_employee_transport_snapshot=lambda: (
+            (employee,),
+            (principal,),
+            (hire, hire),
+        )
+    )
+    runtime._channels = channel  # type: ignore[assignment]  # noqa: SLF001
+    coordinator = EmployeeOutboxDeliveryCoordinator(
+        outbox=service,
+        channels=channel,
+        authority_resolver=runtime._resolve_outbox_delivery_authority,  # noqa: SLF001
+    )
+    try:
+        with pytest.raises(RuntimeError, match="ambiguous") as raised:
+            coordinator.deliver_pending(max_items=1)
+        assert not isinstance(raised.value, EmployeeOutboxItemDeliveryError)
+        assert channel.calls == []
     finally:
         service.close()
         writer.close()

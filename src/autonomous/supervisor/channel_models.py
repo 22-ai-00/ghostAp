@@ -17,6 +17,10 @@ class EmployeeChannelOutboundTimeout(EmployeeChannelOutboundError, TimeoutError)
     """One employee Channel did not acknowledge an outbound operation in time."""
 
 
+class EmployeeChannelOutboundIntegrityError(RuntimeError):
+    """The employee worker reported an internal outbound contract defect."""
+
+
 class ChannelProcessState(str, Enum):
     STARTING = "starting"
     READY = "ready"
@@ -30,5 +34,6 @@ __all__ = [
     "ChannelProcessState",
     "EmployeeChannelGenerationChanged",
     "EmployeeChannelOutboundError",
+    "EmployeeChannelOutboundIntegrityError",
     "EmployeeChannelOutboundTimeout",
 ]

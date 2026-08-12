@@ -22,7 +22,20 @@ from src.autonomous.journal.blob_store import AesGcmEncryptionProvider, BlobStor
 from src.autonomous.journal.frame import GENESIS_HASH, JournalEvent
 from src.autonomous.journal.projections import ProjectionState
 from src.autonomous.journal.writer import JournalWriter
-from src.autonomous.supervisor.employee_channels import ChannelProcessState, ChannelProcessStatus
+from src.autonomous.outbox.delivery import (
+    EmployeeDeliveryAuthority,
+    EmployeeOutboxDeliveryCoordinator,
+)
+from src.autonomous.outbox.lifecycle import EmployeeOutboxLifecycle
+from src.autonomous.outbox.models import employee_outbox_id
+from src.autonomous.outbox.projection import OutboxProjectionState
+from src.autonomous.outbox.service import EmployeeOutboxService
+from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+from src.autonomous.supervisor.employee_channels import (
+    ChannelProcessState,
+    ChannelProcessStatus,
+    ChannelSendReceipt,
+)
 from src.autonomous.workforce.registry import ProjectedAgentRegistry
 
 HMAC_KEY = b"employee-router-integration-hmac!!"
@@ -92,6 +105,120 @@ def _metadata(
         payload_size_bytes=payload.canonical_size_bytes,
         attachment_count=len(payload.attachment_descriptors),
         attachment_total_bytes=payload.attachment_total_bytes,
+    )
+
+
+def _message_payload_with_raw_coordinates(
+    index: int,
+    *,
+    raw_chat_id: str,
+    raw_message_id: str,
+) -> EmployeeIngressPayload:
+    payload = _payload(index)
+    part = dict(payload.normalized_parts[0])
+    part.update(
+        remote_chat_id=raw_chat_id,
+        remote_message_id=raw_message_id,
+    )
+    return EmployeeIngressPayload(
+        schema_version=payload.schema_version,
+        envelope_id=payload.envelope_id,
+        normalized_parts=(part,),
+        attachment_descriptors=payload.attachment_descriptors,
+    )
+
+
+def _remote_index(prefix: str, raw_value: str) -> str:
+    return prefix + hashlib.sha256(raw_value.encode("utf-8")).hexdigest()
+
+
+def _ordinary_acceptance_event(
+    ingress: EmployeeIngressService,
+    metadata: EmployeeIngressMetadata,
+    payload: EmployeeIngressPayload,
+    *,
+    acceptance_id: str,
+    transport_message_proof: bool | None,
+) -> JournalEvent:
+    blob_ref = ingress.blob_store.stage_and_publish(
+        payload.canonical_bytes,
+        {"schema": "employee-router-legacy-test"},
+        "k1",
+    )
+    event_payload = {
+        "metadata": metadata.to_dict(),
+        "acceptance_id": acceptance_id,
+        "accepted_at": "2026-07-13T00:00:00Z",
+        "blob_ref": blob_ref.to_dict(),
+    }
+    if transport_message_proof is not None:
+        event_payload["transport_message_proof"] = transport_message_proof
+    return JournalEvent(
+        event_type="employee.ingress.accepted",
+        aggregate_id=metadata.dedup_key,
+        payload=event_payload,
+    )
+
+
+def _legacy_router_lifecycle_events(
+    *,
+    aggregate_id: str,
+    acceptance_id: str,
+    metadata: EmployeeIngressMetadata,
+    final_state: str,
+) -> tuple[JournalEvent, ...]:
+    authority = _module().RouterAuthoritySnapshot(
+        tenant_key=metadata.tenant_key,
+        agent_id=metadata.agent_id,
+        bot_principal_id=metadata.bot_principal_id,
+        app_id=metadata.app_id,
+        channel_generation=metadata.channel_generation,
+        connection_id=metadata.connection_id,
+        authorization_scope=EmployeeAuthorizationScope.MANAGED_GROUP,
+        team_id=metadata.chat_id,
+        requester_principal_id=metadata.sender_principal_id,
+        projection_sequence=1,
+        projection_hash="",
+        employee_version=1,
+        tool="codex",
+        model="",
+        effort="high",
+    ).to_dict()
+    payloads = (
+        (
+            "authorized",
+            {
+                "acceptance_id": acceptance_id,
+                "authority": authority,
+                "source_requester_principal_id": "ou_requester",
+            },
+        ),
+        ("staging", {"acceptance_id": acceptance_id}),
+        (
+            "queued",
+            {
+                "acceptance_id": acceptance_id,
+                "authority": authority,
+                "queue_position": 1,
+            },
+        ),
+        ("dispatching", {"acceptance_id": acceptance_id}),
+        (
+            "terminal",
+            {
+                "acceptance_id": acceptance_id,
+                "reason_code": "completed",
+            },
+        ),
+    )
+    event_count = {"queued": 3, "dispatching": 4, "terminal": 5}[final_state]
+    return tuple(
+        JournalEvent(
+            event_type=f"employee.ingress.router_{event_name}",
+            aggregate_id=aggregate_id,
+            payload=payload,
+        )
+        for event_name, payload in payloads[:event_count]
     )
 
 
@@ -331,14 +458,465 @@ def _accept(
         sender_union_id=sender_union_id,
         attachment_descriptors=attachment_descriptors,
     )
-    metadata = _metadata(payload, index, agent_id, chat_id=chat_id)
-    metadata = replace(metadata, sender_principal_id=sender)
+    raw_message_id = (
+        f"om_router_{agent_id.removeprefix('agt_')}_{index}"
+    )
+    part = dict(payload.normalized_parts[0])
+    part.update(
+        remote_chat_id=chat_id,
+        remote_message_id=raw_message_id,
+        remote_root_id="om_root",
+    )
+    payload = EmployeeIngressPayload(
+        schema_version=payload.schema_version,
+        envelope_id=payload.envelope_id,
+        normalized_parts=(part,),
+        attachment_descriptors=payload.attachment_descriptors,
+    )
+    metadata = replace(
+        _metadata(payload, index, agent_id),
+        chat_id=_remote_index("oc_", chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+        thread_root_message_id=_remote_index("om_", "om_root"),
+        sender_principal_id=sender,
+    )
     ack = ingress.accept(
         metadata,
         payload,
         request_id=f"req_{agent_id.removeprefix('agt_')}_{index}",
     )
     return ack.acceptance.acceptance_id
+
+
+def test_handoff_denied_acceptance_never_creates_a_router_lane(
+    tmp_path: Path,
+) -> None:
+    _module_ref, writer, ingress, new_router = _stack(tmp_path)
+    router = new_router()
+    raw_chat_id = "oc_handoff_denied"
+    raw_message_id = "om_handoff_denied"
+    payload = _message_payload_with_raw_coordinates(
+        89,
+        raw_chat_id=raw_chat_id,
+        raw_message_id=raw_message_id,
+    )
+    metadata = replace(
+        _metadata(payload, 89, "agt_alpha"),
+        chat_id=_remote_index("oc_", raw_chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+    )
+    coordinates = {
+        "tenant_key": metadata.tenant_key,
+        "agent_id": metadata.agent_id,
+        "bot_principal_id": metadata.bot_principal_id,
+        "app_id": metadata.app_id,
+        "event_type": metadata.event_type,
+        "chat_id": metadata.chat_id,
+        "message_id": metadata.message_id,
+        "channel_generation": metadata.channel_generation,
+        "connection_id": metadata.connection_id,
+    }
+
+    denied = ingress.deny_message_acceptance(**coordinates)
+    ack = ingress.accept(metadata, payload, request_id="req_handoff_denied")
+    ingress_record = ingress.record_snapshot(ack.acceptance.acceptance_id)
+    router.rebuild_projection()
+
+    assert denied.status == "denied"
+    assert ingress_record is not None and ingress_record.terminal is True
+    assert ingress_record.disposition is not None
+    assert ingress_record.disposition.reason_code == "handoff_unconfirmed"
+    assert router.state.cursor_sequence == writer.anchor.read().sequence
+    assert router.record_snapshot(ack.acceptance.acceptance_id) is None
+    assert router.peek_dispatch_candidate() is None
+    with pytest.raises(KeyError):
+        router.route(ack.acceptance.acceptance_id)
+    event_types = [
+        event.event_type
+        for frame in writer.replay()
+        for event in frame.events
+    ]
+    assert event_types == [
+        "employee.ingress.message_acceptance_denied",
+        "employee.ingress.denied_acceptance",
+    ]
+
+    restarted = new_router()
+    assert restarted.state.cursor_sequence == writer.anchor.read().sequence
+    assert restarted.record_snapshot(ack.acceptance.acceptance_id) is None
+    assert restarted.peek_dispatch_candidate() is None
+    ingress.close()
+    writer.close()
+
+
+def test_invalid_public_message_coordinates_ack_without_a_router_lane(
+    tmp_path: Path,
+) -> None:
+    _module_ref, writer, ingress, new_router = _stack(tmp_path)
+    router = new_router()
+    payload = _message_payload_with_raw_coordinates(
+        90,
+        raw_chat_id="oc_authenticated_chat",
+        raw_message_id="om_authenticated_message",
+    )
+    metadata = replace(
+        _metadata(payload, 90, "agt_alpha"),
+        chat_id=_remote_index("oc_", "oc_different_chat"),
+        message_id=_remote_index("om_", "om_different_message"),
+    )
+
+    ack = ingress.accept(metadata, payload, request_id="req_invalid_transport")
+    ingress_record = ingress.record_snapshot(ack.acceptance.acceptance_id)
+    router.rebuild_projection()
+
+    assert ack.duplicate is False
+    assert ingress_record is not None and ingress_record.terminal is True
+    assert ingress_record.disposition is not None
+    assert ingress_record.disposition.reason_code == "invalid_transport_proof"
+    assert router.state.cursor_sequence == writer.anchor.read().sequence
+    assert router.record_snapshot(ack.acceptance.acceptance_id) is None
+    assert router.peek_dispatch_candidate() is None
+    with pytest.raises(KeyError):
+        router.route(ack.acceptance.acceptance_id)
+    event_types = [
+        event.event_type
+        for frame in writer.replay()
+        for event in frame.events
+    ]
+    assert event_types == ["employee.ingress.invalid_transport_acceptance"]
+
+    restarted = new_router()
+    assert restarted.state.cursor_sequence == writer.anchor.read().sequence
+    assert restarted.record_snapshot(ack.acceptance.acceptance_id) is None
+    assert restarted.peek_dispatch_candidate() is None
+    ingress.close()
+    writer.close()
+
+
+@pytest.mark.parametrize("transport_message_proof", [False, None])
+def test_public_acceptance_without_transport_proof_is_ignored_on_replay(
+    tmp_path: Path,
+    transport_message_proof: bool | None,
+) -> None:
+    _module_ref, writer, ingress, new_router = _stack(tmp_path)
+    raw_chat_id = "oc_legacy_public_chat"
+    raw_message_id = "om_legacy_public_message"
+    payload = _message_payload_with_raw_coordinates(
+        87,
+        raw_chat_id=raw_chat_id,
+        raw_message_id=raw_message_id,
+    )
+    metadata = replace(
+        _metadata(payload, 87, "agt_alpha"),
+        chat_id=_remote_index("oc_", raw_chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+    )
+    acceptance_id = "acc_legacy_public_replay"
+    event = _ordinary_acceptance_event(
+        ingress,
+        metadata,
+        payload,
+        acceptance_id=acceptance_id,
+        transport_message_proof=transport_message_proof,
+    )
+    writer.commit(
+        (event,),
+        writer.get_aggregate_versions((event.aggregate_id,)),
+    )
+
+    router = new_router()
+
+    assert router.state.cursor_sequence == writer.anchor.read().sequence
+    assert router.record_snapshot(acceptance_id) is None
+    assert router.peek_dispatch_candidate() is None
+    ingress.close()
+    writer.close()
+
+
+@pytest.mark.parametrize("transport_message_proof", [False, None])
+@pytest.mark.parametrize("final_state", ["queued", "dispatching", "terminal"])
+def test_ignored_legacy_public_acceptance_skips_its_router_history(
+    tmp_path: Path,
+    transport_message_proof: bool | None,
+    final_state: str,
+) -> None:
+    _module_ref, writer, ingress, new_router = _stack(tmp_path)
+    raw_chat_id = "oc_ignored_legacy_chat"
+    raw_message_id = "om_ignored_legacy_message"
+    payload = _message_payload_with_raw_coordinates(
+        85,
+        raw_chat_id=raw_chat_id,
+        raw_message_id=raw_message_id,
+    )
+    metadata = replace(
+        _metadata(payload, 85, "agt_alpha"),
+        chat_id=_remote_index("oc_", raw_chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+    )
+    acceptance_id = "acc_ignored_legacy_history"
+    acceptance_event = _ordinary_acceptance_event(
+        ingress,
+        metadata,
+        payload,
+        acceptance_id=acceptance_id,
+        transport_message_proof=transport_message_proof,
+    )
+    events = (
+        acceptance_event,
+        *_legacy_router_lifecycle_events(
+            aggregate_id=acceptance_event.aggregate_id,
+            acceptance_id=acceptance_id,
+            metadata=metadata,
+            final_state=final_state,
+        ),
+    )
+    for event in events:
+        writer.commit(
+            (event,),
+            writer.get_aggregate_versions((event.aggregate_id,)),
+        )
+
+    router = new_router()
+
+    assert router.state.cursor_sequence == writer.anchor.read().sequence
+    assert router.record_snapshot(acceptance_id) is None
+    assert acceptance_id not in router.state.by_acceptance_id
+    assert router.peek_dispatch_candidate() is None
+    ingress.close()
+    writer.close()
+
+
+def test_ignored_legacy_public_acceptance_rejects_malformed_queued_payload(
+    tmp_path: Path,
+) -> None:
+    module, writer, ingress, new_router = _stack(tmp_path)
+    raw_chat_id = "oc_malformed_legacy_queue"
+    raw_message_id = "om_malformed_legacy_queue"
+    payload = _message_payload_with_raw_coordinates(
+        91,
+        raw_chat_id=raw_chat_id,
+        raw_message_id=raw_message_id,
+    )
+    metadata = replace(
+        _metadata(payload, 91, "agt_alpha"),
+        chat_id=_remote_index("oc_", raw_chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+    )
+    acceptance_id = "acc_malformed_legacy_queue"
+    accepted = _ordinary_acceptance_event(
+        ingress,
+        metadata,
+        payload,
+        acceptance_id=acceptance_id,
+        transport_message_proof=False,
+    )
+    lifecycle = _legacy_router_lifecycle_events(
+        aggregate_id=accepted.aggregate_id,
+        acceptance_id=acceptance_id,
+        metadata=metadata,
+        final_state="queued",
+    )
+    malformed_queued = JournalEvent(
+        event_type=lifecycle[-1].event_type,
+        aggregate_id=lifecycle[-1].aggregate_id,
+        payload={
+            "acceptance_id": acceptance_id,
+            "queue_position": 1,
+        },
+    )
+    for event in (accepted, *lifecycle[:-1], malformed_queued):
+        writer.commit(
+            (event,),
+            writer.get_aggregate_versions((event.aggregate_id,)),
+        )
+
+    with pytest.raises(module.RouterProjectionError, match="queued transition"):
+        new_router()
+
+    ingress.close()
+    writer.close()
+
+
+def test_ignored_legacy_public_acceptance_rejects_out_of_order_lifecycle(
+    tmp_path: Path,
+) -> None:
+    module, writer, ingress, new_router = _stack(tmp_path)
+    raw_chat_id = "oc_out_of_order_legacy_queue"
+    raw_message_id = "om_out_of_order_legacy_queue"
+    payload = _message_payload_with_raw_coordinates(
+        92,
+        raw_chat_id=raw_chat_id,
+        raw_message_id=raw_message_id,
+    )
+    metadata = replace(
+        _metadata(payload, 92, "agt_alpha"),
+        chat_id=_remote_index("oc_", raw_chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+    )
+    acceptance_id = "acc_out_of_order_legacy_queue"
+    accepted = _ordinary_acceptance_event(
+        ingress,
+        metadata,
+        payload,
+        acceptance_id=acceptance_id,
+        transport_message_proof=False,
+    )
+    queued = _legacy_router_lifecycle_events(
+        aggregate_id=accepted.aggregate_id,
+        acceptance_id=acceptance_id,
+        metadata=metadata,
+        final_state="queued",
+    )[-1]
+    for event in (accepted, queued):
+        writer.commit(
+            (event,),
+            writer.get_aggregate_versions((event.aggregate_id,)),
+        )
+
+    with pytest.raises(module.RouterProjectionError, match="queued transition"):
+        new_router()
+
+    ingress.close()
+    writer.close()
+
+
+def test_ignored_legacy_public_acceptance_rejects_unknown_router_lifecycle(
+    tmp_path: Path,
+) -> None:
+    module, writer, ingress, new_router = _stack(tmp_path)
+    raw_chat_id = "oc_unknown_legacy_lifecycle"
+    raw_message_id = "om_unknown_legacy_lifecycle"
+    payload = _message_payload_with_raw_coordinates(
+        93,
+        raw_chat_id=raw_chat_id,
+        raw_message_id=raw_message_id,
+    )
+    metadata = replace(
+        _metadata(payload, 93, "agt_alpha"),
+        chat_id=_remote_index("oc_", raw_chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+    )
+    acceptance_id = "acc_unknown_legacy_lifecycle"
+    accepted = _ordinary_acceptance_event(
+        ingress,
+        metadata,
+        payload,
+        acceptance_id=acceptance_id,
+        transport_message_proof=False,
+    )
+    unknown = JournalEvent(
+        event_type="employee.ingress.router_future_state",
+        aggregate_id=accepted.aggregate_id,
+        payload={"acceptance_id": acceptance_id},
+    )
+    for event in (accepted, unknown):
+        writer.commit(
+            (event,),
+            writer.get_aggregate_versions((event.aggregate_id,)),
+        )
+
+    with pytest.raises(module.RouterProjectionError, match="unknown Router event"):
+        new_router()
+
+    ingress.close()
+    writer.close()
+
+
+def test_unknown_router_history_still_fails_closed(
+    tmp_path: Path,
+) -> None:
+    module, writer, ingress, new_router = _stack(tmp_path)
+    event = JournalEvent(
+        event_type="employee.ingress.router_queued",
+        aggregate_id="dedup_unknown_router_history",
+        payload={
+            "acceptance_id": "acc_unknown_router_history",
+            "authority": {},
+            "queue_position": 1,
+        },
+    )
+    writer.commit(
+        (event,),
+        writer.get_aggregate_versions((event.aggregate_id,)),
+    )
+
+    with pytest.raises(module.RouterProjectionError, match="unknown acceptance"):
+        new_router()
+
+    ingress.close()
+    writer.close()
+
+
+def test_public_acceptance_without_transport_proof_is_ignored_on_live_apply(
+    tmp_path: Path,
+) -> None:
+    _module_ref, writer, ingress, new_router = _stack(tmp_path)
+    router = new_router()
+    raw_chat_id = "oc_live_legacy_public_chat"
+    raw_message_id = "om_live_legacy_public_message"
+    payload = _message_payload_with_raw_coordinates(
+        88,
+        raw_chat_id=raw_chat_id,
+        raw_message_id=raw_message_id,
+    )
+    metadata = replace(
+        _metadata(payload, 88, "agt_alpha"),
+        chat_id=_remote_index("oc_", raw_chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+    )
+    acceptance_id = "acc_legacy_public_live"
+    event = _ordinary_acceptance_event(
+        ingress,
+        metadata,
+        payload,
+        acceptance_id=acceptance_id,
+        transport_message_proof=False,
+    )
+    result = writer.commit(
+        (event,),
+        writer.get_aggregate_versions((event.aggregate_id,)),
+    )
+
+    router.preflight_frame_unlocked(result.frame)
+    router.apply_committed_frame_unlocked(result.frame)
+
+    assert router.state.cursor_sequence == result.frame.sequence
+    assert router.record_snapshot(acceptance_id) is None
+    assert router.peek_dispatch_candidate() is None
+    ingress.close()
+    writer.close()
+
+
+def test_nonpublic_acceptance_without_transport_proof_remains_router_eligible(
+    tmp_path: Path,
+) -> None:
+    _module_ref, writer, ingress, new_router = _stack(tmp_path)
+    payload = _payload(86)
+    metadata = replace(
+        _metadata(payload, 86, "agt_alpha"),
+        event_type="ghostap.team.assignment.v1",
+    )
+    acceptance_id = "acc_legacy_team_replay"
+    event = _ordinary_acceptance_event(
+        ingress,
+        metadata,
+        payload,
+        acceptance_id=acceptance_id,
+        transport_message_proof=False,
+    )
+    writer.commit(
+        (event,),
+        writer.get_aggregate_versions((event.aggregate_id,)),
+    )
+
+    router = new_router()
+
+    record = router.record_snapshot(acceptance_id)
+    assert record is not None
+    assert record.state == "accepted"
+    assert record.event_type == "ghostap.team.assignment.v1"
+    ingress.close()
+    writer.close()
 
 
 def test_owner_p2p_routes_with_union_owner_without_group_membership(
@@ -459,6 +1037,220 @@ def test_owner_p2p_without_explicit_union_resolver_fails_closed(
     writer.close()
 
 
+def test_production_admission_only_routes_one_uniquely_targeted_ready_employee(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real Inbox -> runtime gate -> Router authority boundary."""
+
+    from datetime import UTC, datetime
+
+    from src.autonomous.provisioning.hire_state import DurableHireState, HirePhase
+    from src.trust.models import ManagedGroupOrigin
+    from src.trust.registry import ManagedGroupRegistry
+
+    managed_groups = ManagedGroupRegistry(tmp_path / "managed-groups.json")
+    managed_groups.register(
+        chat_id="oc_team",
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.OWNER_ADOPTED,
+        receiving_bot_ref="main-bot",
+        project_id="project-1",
+        canonical_root_ref="/project",
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+    )
+
+    def resolve_owner(**values: object) -> str | None:
+        return (
+            "ou_owner"
+            if values["sender_union_id"] == "on_owner"
+            and values["owner_principal_id"] == "ou_owner"
+            else None
+        )
+
+    _, writer, ingress, new_router = _stack(
+        tmp_path,
+        requester_acl=RuntimeRequesterChatAcl(
+            allowed_requesters=("ou_owner",),
+            allowed_chats=("oc_team",),
+        ),
+        requester_principal_resolver=resolve_owner,
+        managed_group_registry_provider=lambda: managed_groups,
+        managed_group_owner_id="ou_owner",
+        employee_bot_ids_provider=lambda: frozenset({"ou_bot_alpha"}),
+    )
+    router = new_router()
+    projected = router._registry_provider()._state  # noqa: SLF001
+    hire_state = DurableHireState(
+        intent_id="hire_alpha",
+        tenant_key="tenant_1",
+        requester_principal_id="ou_owner",
+        requester_union_id="on_owner",
+        employee_name="alpha",
+        tool="codex",
+        agent_id="agt_alpha",
+        bot_principal_id="bot_alpha",
+        app_id="cli_alpha",
+        credential_ref="cred_alpha",
+        channel_generation=3,
+        channel_identity_app_id="cli_alpha",
+        channel_connection_id="conn_alpha",
+        phase=HirePhase.ACTIVE,
+    )
+
+    class _RuntimeHireProjection:
+        @staticmethod
+        def synchronize_projection() -> ProjectionState:
+            return projected
+
+        @staticmethod
+        def list_states() -> tuple[DurableHireState, ...]:
+            return (hire_state,)
+
+        @staticmethod
+        def current_employee_transport_snapshot() -> tuple[tuple, tuple, tuple]:
+            return (
+                tuple(projected.employees.values()),
+                tuple(projected.bot_principals.values()),
+                (hire_state,),
+            )
+
+    runtime = EmployeeDepartmentRuntime(
+        managed_group_registry=managed_groups,
+        managed_group_owner_id="ou_owner",
+    )
+    runtime._service = _RuntimeHireProjection()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._channels = router._channels  # type: ignore[assignment]  # noqa: SLF001
+    runtime._ingress = ingress  # type: ignore[assignment]  # noqa: SLF001
+    runtime._router = router  # type: ignore[assignment]  # noqa: SLF001
+
+    def accept_group_observation(
+        index: int,
+        *,
+        text: str,
+        mentions: tuple[dict[str, str], ...],
+    ) -> str:
+        payload = _payload(
+            index,
+            sender="ou_employee_app_owner",
+            sender_union_id="on_owner",
+        )
+        raw_message_id = f"om_runtime_target_{index}"
+        part = dict(payload.normalized_parts[0])
+        part.update(
+            content={"text": text},
+            mentions=mentions,
+            remote_chat_id="oc_team",
+            remote_message_id=raw_message_id,
+            remote_root_id="om_root",
+        )
+        payload = EmployeeIngressPayload(
+            schema_version=1,
+            envelope_id=payload.envelope_id,
+            normalized_parts=(part,),
+            attachment_descriptors=(),
+        )
+        metadata = replace(
+            _metadata(payload, index, "agt_alpha"),
+            sender_principal_id="ou_employee_app_owner",
+            message_id=_remote_index("om_", raw_message_id),
+            chat_id=_remote_index("oc_", "oc_team"),
+            thread_root_message_id=_remote_index("om_", "om_root"),
+        )
+        return ingress.accept(
+            metadata,
+            payload,
+            request_id=f"req_runtime_target_{index}",
+        ).acceptance.acceptance_id
+
+    alpha_mention = {
+        "key": "@_user_1",
+        "open_id": "ou_bot_alpha",
+        "tenant_key": "tenant_1",
+    }
+    beta_mention = {
+        "key": "@_user_2",
+        "open_id": "ou_bot_beta",
+        "tenant_key": "tenant_1",
+    }
+    cases = (
+        (
+            "known-unique",
+            accept_group_observation(
+                940,
+                text="@_user_1 /task finish audit",
+                mentions=(alpha_mention,),
+            ),
+            True,
+        ),
+        (
+            "unknown-unique",
+            accept_group_observation(
+                941,
+                text="@_user_1 /task must not fan out",
+                mentions=(
+                    {
+                        "key": "@_user_1",
+                        "open_id": "ou_unknown_bot",
+                        "tenant_key": "tenant_1",
+                    },
+                ),
+            ),
+            False,
+        ),
+        (
+            "nonunique",
+            accept_group_observation(
+                942,
+                text="@_user_1 @_user_2 /task ambiguous",
+                mentions=(alpha_mention, beta_mention),
+            ),
+            False,
+        ),
+        (
+            "bare",
+            accept_group_observation(
+                943,
+                text="/task unaddressed",
+                mentions=(),
+            ),
+            False,
+        ),
+    )
+
+    try:
+        for label, acceptance_id, should_route in cases:
+            assert runtime._admit_employee_ingress_once_serialized(  # noqa: SLF001
+                acceptance_id
+            ), label
+            routed = router.record_snapshot(acceptance_id)
+            record = ingress.record_snapshot(acceptance_id)
+            assert record is not None
+            if should_route:
+                assert record.disposition is None
+                assert routed is not None and routed.state == "queued"
+                assert routed.authority is not None
+                assert routed.authority.effective_input_kind == "targeted_group_task_v1"
+                grant = router.peek_dispatch_candidate()
+                assert grant is not None
+                assert grant.record.acceptance_id == acceptance_id
+                assert grant.targeted_task is not None
+                assert grant.targeted_task.description == "finish audit"
+            else:
+                # Router replay observes the Inbox acceptance, but the runtime
+                # command gate must prevent it crossing into an authorized or
+                # queued Employee lane.
+                assert routed is not None
+                assert routed.state == "accepted"
+                assert routed.queued_sequence == 0
+                assert routed.authority is None
+                assert record.disposition is not None
+                assert record.disposition.state == "ignored"
+                assert record.disposition.reason_code == "authority_denied"
+    finally:
+        ingress.close()
+        writer.close()
+
+
 def test_targeted_group_task_routes_with_union_owner_and_freezes_input(
     tmp_path: Path,
 ) -> None:
@@ -563,6 +1355,81 @@ def test_targeted_group_task_routes_with_union_owner_and_freezes_input(
     replayed = restarted.peek_dispatch_candidate()
     assert replayed is not None and replayed.targeted_task is not None
     assert replayed.targeted_task.input_digest == grant.targeted_task.input_digest
+    terminal = restarted.reject_dispatch_candidate(
+        acceptance_id,
+        reason_code="context_unavailable",
+    )
+    assert terminal.response_obligation == queued.response_obligation
+    for path in (tmp_path / "blobs").rglob("*"):
+        if path.is_file():
+            path.unlink()
+    outbox = EmployeeOutboxService(
+        writer=writer,
+        blob_store=BlobStore(
+            tmp_path / "outbox-blobs",
+            AesGcmEncryptionProvider(lambda _key_ref: b"o" * 32),
+        ),
+        outbox_state=OutboxProjectionState(),
+        active_key_id="outbox-key",
+    )
+    lifecycle = EmployeeOutboxLifecycle(outbox)
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = ingress  # type: ignore[assignment]  # noqa: SLF001
+    runtime._router = restarted  # type: ignore[assignment]  # noqa: SLF001
+    runtime._outbox_lifecycle = lifecycle  # type: ignore[assignment]  # noqa: SLF001
+
+    assert runtime._reconcile_terminal_ingress() == 1  # noqa: SLF001
+    disposed = ingress.record_snapshot(acceptance_id)
+    assert disposed is not None and disposed.disposition is not None
+    assert disposed.disposition.reason_code == "context_unavailable"
+
+    sends: list[tuple[str, str, object]] = []
+
+    class _DeliveryChannel:
+        @staticmethod
+        def send(
+            agent_id: str,
+            *,
+            generation: int,
+            target: str,
+            message: object,
+            options: object = None,
+            deadline: float | None = None,
+        ) -> ChannelSendReceipt:
+            del options, deadline
+            sends.append((agent_id, target, message))
+            return ChannelSendReceipt(
+                request_id="send_task_failure",
+                success=True,
+                app_id="cli_alpha",
+                generation=generation,
+                connection_id="conn_alpha",
+                message_id="om_task_failure_card",
+            )
+
+        @staticmethod
+        def update_card(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("first task failure delivery must create a card")
+
+    delivery = EmployeeOutboxDeliveryCoordinator(
+        outbox=outbox,
+        channels=_DeliveryChannel(),
+        authority_resolver=lambda _record: EmployeeDeliveryAuthority(
+            app_id="cli_alpha",
+            generation=3,
+            connection_id="conn_alpha",
+        ),
+    )
+    result = delivery.deliver_pending(max_items=16)
+    outbox_id = employee_outbox_id(
+        "tenant_1",
+        "agt_alpha",
+        f"control_{acceptance_id}",
+    )
+    assert result.delivered_outbox_ids == (outbox_id,)
+    assert sends and sends[0][0:2] == ("agt_alpha", "oc_team")
+    assert outbox.get_record(outbox_id).binding is not None
+    outbox.close()
     ingress.close()
     writer.close()
 
@@ -849,11 +1716,119 @@ def test_router_persists_complete_lifecycle_and_atomic_queue_position(tmp_path: 
     frame, event = queued_events[0]
     assert event.payload["queue_position"] == 1
     assert event.payload["authority"]["team_id"] == "oc_team"
+    obligation = event.payload["response_obligation"]
+    assert obligation == {
+        "authority_binding_sha256": obligation["authority_binding_sha256"],
+        "chat_id": "oc_team",
+        "reply_coordinate_kind": "root",
+        "reply_to_message_id": "om_root",
+        "schema_version": 1,
+    }
+    assert len(obligation["authority_binding_sha256"]) == 64
     serialized_authority = repr(event.payload["authority"]).lower()
     assert "credential" not in serialized_authority
     assert "secret" not in serialized_authority
     assert "access_token" not in serialized_authority
     assert frame.sequence == queued.queued_sequence
+    restarted = new_router()
+    assert restarted.state.by_acceptance_id[acceptance_id].response_obligation == (
+        queued.response_obligation
+    )
+    ingress.close()
+    writer.close()
+
+
+def test_router_rejects_forged_root_response_obligation_before_commit(
+    tmp_path: Path,
+) -> None:
+    module, writer, ingress, new_router = _stack(tmp_path)
+    router = new_router()
+    acceptance_id = _accept(ingress, 101)
+    assert router.route(acceptance_id).state == "queued"
+    frames = tuple(writer.replay())
+    queued_frame = frames[-1]
+    queued_event = queued_frame.events[0]
+    assert queued_event.event_type == "employee.ingress.router_queued"
+
+    staged = module.RouterProjectionState()
+    for frame in frames[:-1]:
+        module._apply_router_frame_events(staged, frame)
+        staged.cursor_sequence = frame.sequence
+        staged.cursor_hash = frame.frame_hash
+    forged_payload = dict(queued_event.payload)
+    forged_obligation = dict(forged_payload["response_obligation"])
+    forged_obligation["reply_to_message_id"] = "om_forged_root"
+    forged_payload["response_obligation"] = forged_obligation
+    forged_event = JournalEvent(
+        event_type=queued_event.event_type,
+        aggregate_id=queued_event.aggregate_id,
+        payload=forged_payload,
+    )
+
+    with pytest.raises(
+        module.RouterProjectionError,
+        match="response obligation does not match acceptance",
+    ):
+        module._reduce_router_event(
+            staged,
+            forged_event,
+            sequence=queued_frame.sequence,
+        )
+
+    ingress.close()
+    writer.close()
+
+
+@pytest.mark.parametrize("raw_root", [None, "om_" + "a" * 64])
+def test_router_never_queues_a_root_index_as_a_raw_reply_target(
+    tmp_path: Path,
+    raw_root: object,
+) -> None:
+    _, writer, ingress, new_router = _stack(tmp_path)
+    router = new_router()
+    raw_chat_id = "oc_strict_response_binding"
+    raw_message_id = "om_strict_response_binding"
+    payload = _payload(102)
+    part = dict(payload.normalized_parts[0])
+    part.update(
+        remote_chat_id=raw_chat_id,
+        remote_message_id=raw_message_id,
+        remote_root_id=raw_root,
+    )
+    payload = EmployeeIngressPayload(
+        schema_version=payload.schema_version,
+        envelope_id=payload.envelope_id,
+        normalized_parts=(part,),
+        attachment_descriptors=(),
+    )
+    indexed_root = (
+        _remote_index("om_", "om_actual_root")
+        if raw_root is None
+        else str(raw_root)
+    )
+    metadata = replace(
+        _metadata(payload, 102, "agt_alpha"),
+        chat_id=_remote_index("oc_", raw_chat_id),
+        message_id=_remote_index("om_", raw_message_id),
+        thread_root_message_id=indexed_root,
+    )
+    acceptance_id = ingress.accept(
+        metadata,
+        payload,
+        request_id=f"req_strict_response_{raw_root is None}",
+    ).acceptance.acceptance_id
+
+    terminal = router.route(acceptance_id)
+
+    assert terminal.state == "terminal"
+    assert terminal.reason_code == "sender_invalid"
+    assert terminal.response_obligation is None
+    assert not any(
+        event.event_type == "employee.ingress.router_queued"
+        and event.payload["acceptance_id"] == acceptance_id
+        for frame in writer.replay()
+        for event in frame.events
+    )
     ingress.close()
     writer.close()
 

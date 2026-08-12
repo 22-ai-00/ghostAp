@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -25,6 +29,7 @@ from src.autonomous.ingress.router import (
     DurableEmployeeIngressRouter,
     RouterProjectionError,
     RouterQueueLimits,
+    RouterWriteDisabledError,
 )
 from src.autonomous.ingress.service import EmployeeIngressService
 from src.autonomous.journal.anchor import MemoryAnchor
@@ -38,6 +43,10 @@ from src.autonomous.journal.blob_store import (
 from src.autonomous.journal.frame import GENESIS_HASH, JournalEvent
 from src.autonomous.journal.projections import ProjectionState
 from src.autonomous.journal.writer import JournalWriter
+from src.autonomous.provisioning.composition import (
+    EmployeeDepartmentRuntime,
+    EmployeeMessageHandoffUnknownError,
+)
 from src.autonomous.supervisor.channel_models import ChannelProcessState
 from src.autonomous.supervisor.employee_channels import ChannelProcessStatus
 from src.autonomous.workforce.registry import ProjectedAgentRegistry
@@ -127,6 +136,9 @@ def _stack(tmp_path):
                 "sender_type": "user",
                 "sender_tenant_key": "tenant_1",
                 "feishu_thread_id": "omt_1",
+                "remote_chat_id": "oc_team",
+                "remote_message_id": "om_1",
+                "remote_root_id": "om_root",
             },
         ),
         attachment_descriptors=(),
@@ -141,11 +153,13 @@ def _stack(tmp_path):
         channel_generation=3,
         connection_id="conn_alpha",
         event_id="evt_1",
-        message_id="om_1",
+        message_id="om_" + hashlib.sha256(b"om_1").hexdigest(),
         event_type="im.message.receive_v1",
         action_identity="",
-        chat_id="oc_team",
-        thread_root_message_id="om_root",
+        chat_id="oc_" + hashlib.sha256(b"oc_team").hexdigest(),
+        thread_root_message_id=(
+            "om_" + hashlib.sha256(b"om_root").hexdigest()
+        ),
         sender_principal_id="ou_requester",
         received_at="2026-08-12T00:00:00Z",
         semantic_digest=payload.payload_sha256,
@@ -219,11 +233,13 @@ def test_unconfirmed_handoff_durably_abandons_only_matching_accepted_transport(
 ) -> None:
     stack = _stack(tmp_path)
     try:
+        started = time.monotonic()
         stale = stack.router.abandon_message_handoff(
             stack.acceptance_id,
             channel_generation=4,
             connection_id="conn_reconnected",
         )
+        assert time.monotonic() - started < 0.2
         assert stale.state == "accepted"
 
         abandoned = stack.router.abandon_message_handoff(
@@ -238,6 +254,244 @@ def test_unconfirmed_handoff_durably_abandons_only_matching_accepted_transport(
         restarted = DurableEmployeeIngressRouter(**stack.router_kwargs)
         replayed = restarted.record_snapshot(stack.acceptance_id)
         assert replayed == abandoned
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_unconfirmed_alias_miss_rechecks_concurrent_router_ownership(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = _stack(tmp_path)
+    original_observe = stack.ingress.observe_anchored_message_acceptance
+
+    def miss_after_queue(**kwargs):
+        queued = stack.router.route(stack.acceptance_id)
+        assert queued.state == "queued"
+        return original_observe(**kwargs)
+
+    monkeypatch.setattr(
+        stack.ingress,
+        "observe_anchored_message_acceptance",
+        miss_after_queue,
+    )
+    try:
+        current = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=4,
+            connection_id="conn_missing_alias",
+        )
+        assert current.state == "queued"
+        assert current.queued_sequence > 0
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_unconfirmed_handoff_accepts_an_exact_reconnect_transport_witness(
+    tmp_path,
+) -> None:
+    stack = _stack(tmp_path)
+    try:
+        original = stack.ingress.record_snapshot(stack.acceptance_id)
+        assert original is not None
+        replay = stack.ingress.accept(
+            replace(
+                original.metadata,
+                channel_generation=9,
+                connection_id="conn_reconnected",
+            ),
+            stack.payload,
+            request_id="req_reconnected",
+        )
+        assert replay.duplicate is True
+        assert replay.acceptance.acceptance_id == stack.acceptance_id
+
+        observed = stack.ingress.observe_anchored_message_acceptance(
+            tenant_key=original.metadata.tenant_key,
+            agent_id=original.metadata.agent_id,
+            bot_principal_id=original.metadata.bot_principal_id,
+            app_id=original.metadata.app_id,
+            event_type=original.metadata.event_type,
+            chat_id=original.metadata.chat_id,
+            message_id=original.metadata.message_id,
+            channel_generation=9,
+            connection_id="conn_reconnected",
+        )
+        assert observed is not None
+        assert observed.acceptance == replay.acceptance
+
+        abandoned = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=9,
+            connection_id="conn_reconnected",
+        )
+
+        assert abandoned.state == "terminal"
+        assert abandoned.reason_code == "handoff_unconfirmed"
+        # Router keeps the canonical first acceptance while the exact C2
+        # witness remains a separate append-only Ingress fact.
+        assert abandoned.channel_generation == 3
+        assert abandoned.connection_id == "conn_alpha"
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_unconfirmed_handoff_without_deadline_waits_for_alias_witness_lock(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = _stack(tmp_path)
+    original_snapshot = stack.ingress.record_snapshot
+    begin_contention = threading.Event()
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    result: list[object] = []
+
+    original = original_snapshot(stack.acceptance_id)
+    assert original is not None
+    replay = stack.ingress.accept(
+        replace(
+            original.metadata,
+            channel_generation=9,
+            connection_id="conn_contended_alias",
+        ),
+        stack.payload,
+        request_id="req_contended_alias",
+    )
+    assert replay.duplicate is True
+
+    def hold_ingress_after_canonical_snapshot() -> None:
+        assert begin_contention.wait(1.0)
+        with stack.ingress._mutex:  # noqa: SLF001 - deterministic contention
+            lock_acquired.set()
+            release_lock.wait(1.0)
+
+    def snapshot_then_contend(*args, **kwargs):
+        snapshot = original_snapshot(*args, **kwargs)
+        begin_contention.set()
+        assert lock_acquired.wait(1.0)
+        return snapshot
+
+    monkeypatch.setattr(stack.ingress, "record_snapshot", snapshot_then_contend)
+    holder = threading.Thread(target=hold_ingress_after_canonical_snapshot)
+    waiter = threading.Thread(
+        target=lambda: result.append(
+            stack.router.abandon_message_handoff(
+                stack.acceptance_id,
+                channel_generation=9,
+                connection_id="conn_contended_alias",
+            )
+        )
+    )
+    holder.start()
+    waiter.start()
+    try:
+        assert lock_acquired.wait(1.0)
+        time.sleep(0.05)
+    finally:
+        release_lock.set()
+        holder.join(timeout=1.0)
+        waiter.join(timeout=1.0)
+
+    assert not holder.is_alive()
+    assert not waiter.is_alive()
+    assert len(result) == 1
+    assert result[0].state == "terminal"
+    assert result[0].reason_code == "handoff_unconfirmed"
+    stack.ingress.close()
+    stack.writer.close()
+
+
+def test_unconfirmed_handoff_clamps_long_alias_wait_to_ingress_limit(
+    tmp_path,
+) -> None:
+    stack = _stack(tmp_path)
+    try:
+        original = stack.ingress.record_snapshot(stack.acceptance_id)
+        assert original is not None
+        replay = stack.ingress.accept(
+            replace(
+                original.metadata,
+                channel_generation=9,
+                connection_id="conn_long_deadline_alias",
+            ),
+            stack.payload,
+            request_id="req_long_deadline_alias",
+        )
+        assert replay.duplicate is True
+
+        abandoned = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=9,
+            connection_id="conn_long_deadline_alias",
+            deadline=time.monotonic() + 60.0,
+        )
+
+        assert abandoned.state == "terminal"
+        assert abandoned.reason_code == "handoff_unconfirmed"
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+@pytest.mark.parametrize("prequeue_state", ("authorized", "staging"))
+def test_unconfirmed_handoff_alias_uses_canonical_ingress_coordinates_after_authority(
+    tmp_path,
+    prequeue_state: str,
+) -> None:
+    stack = _stack(tmp_path)
+    try:
+        original = stack.ingress.record_snapshot(stack.acceptance_id)
+        assert original is not None
+        replay = stack.ingress.accept(
+            replace(
+                original.metadata,
+                channel_generation=9,
+                connection_id="conn_authorized_alias",
+            ),
+            stack.payload,
+            request_id=f"req_{prequeue_state}_alias",
+        )
+        assert replay.duplicate is True
+
+        with stack.router._mutex:  # noqa: SLF001 - freeze exact prequeue state
+            stack.router.rebuild_projection()
+            record, ingress_record, payload = stack.router._dispatch_snapshot(  # noqa: SLF001
+                stack.acceptance_id
+            )
+            resolution, reason = stack.router._resolve_authority(  # noqa: SLF001
+                ingress_record.metadata,
+                payload,
+            )
+            assert reason == ""
+            assert resolution is not None
+            record = stack.router._transition_unlocked(  # noqa: SLF001
+                record,
+                "authorized",
+                {
+                    "authority": resolution.snapshot.to_dict(),
+                    "source_requester_principal_id": record.requester_principal_id,
+                },
+            )
+            if prequeue_state == "staging":
+                stack.router._transition_unlocked(  # noqa: SLF001
+                    record,
+                    "staging",
+                    {},
+                )
+
+        abandoned = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=9,
+            connection_id="conn_authorized_alias",
+            deadline=time.monotonic() + 0.5,
+        )
+
+        assert abandoned.state == "terminal"
+        assert abandoned.reason_code == "handoff_unconfirmed"
     finally:
         stack.ingress.close()
         stack.writer.close()
@@ -282,6 +536,237 @@ def test_queued_commit_wins_over_unconfirmed_handoff_abandon(tmp_path) -> None:
         assert after_abandon == queued
         restarted = DurableEmployeeIngressRouter(**stack.router_kwargs)
         assert restarted.record_snapshot(stack.acceptance_id) == queued
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_handoff_abandon_replays_before_taking_writer_transaction_guard(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = _stack(tmp_path)
+    original_guard = stack.writer.transaction_guard
+    original_rebuild = stack.router.rebuild_projection
+    guard_depth = 0
+
+    @contextmanager
+    def tracked_guard():
+        nonlocal guard_depth
+        with original_guard():
+            guard_depth += 1
+            try:
+                yield
+            finally:
+                guard_depth -= 1
+
+    def checked_rebuild(**kwargs):
+        assert guard_depth == 0, "Journal replay must not hold the writer transaction guard"
+        return original_rebuild(**kwargs)
+
+    monkeypatch.setattr(stack.writer, "transaction_guard", tracked_guard)
+    monkeypatch.setattr(stack.router, "rebuild_projection", checked_rebuild)
+    try:
+        result = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=3,
+            connection_id="conn_alpha",
+        )
+
+        assert result.state == "terminal"
+        assert result.reason_code == "handoff_unconfirmed"
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_handoff_abandon_retries_head_drift_and_preserves_concurrent_queue_winner(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = _stack(tmp_path)
+    competing_router = DurableEmployeeIngressRouter(**stack.router_kwargs)
+    original_commit = stack.writer.commit
+    injected = False
+
+    def commit_after_queue_wins(events, expected_versions, **kwargs):
+        nonlocal injected
+        if not injected and any(
+            event.event_type == "employee.ingress.router_terminal"
+            for event in events
+        ):
+            injected = True
+            assert competing_router.route(stack.acceptance_id).state == "queued"
+        return original_commit(events, expected_versions, **kwargs)
+
+    monkeypatch.setattr(stack.writer, "commit", commit_after_queue_wins)
+    try:
+        result = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=3,
+            connection_id="conn_alpha",
+        )
+
+        assert injected is True
+        assert result.state == "queued"
+        assert result.reason_code == ""
+        assert stack.router.record_snapshot(stack.acceptance_id) == result
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_handoff_abandon_expired_deadline_does_not_mutate_router(tmp_path) -> None:
+    stack = _stack(tmp_path)
+    before = tuple(stack.writer.replay())
+    try:
+        started = time.monotonic()
+        with pytest.raises(RouterWriteDisabledError, match="deadline"):
+            stack.router.abandon_message_handoff(
+                stack.acceptance_id,
+                channel_generation=3,
+                connection_id="conn_alpha",
+                deadline=started - 1.0,
+            )
+
+        assert time.monotonic() - started < 0.25
+        stack.router.rebuild_projection()
+        assert stack.router.record_snapshot(stack.acceptance_id).state == "accepted"
+        assert tuple(stack.writer.replay()) == before
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_handoff_projection_router_lock_contention_expires_without_late_mutation(
+    tmp_path,
+) -> None:
+    stack = _stack(tmp_path)
+    stack.router.rebuild_projection()
+    assert stack.router.record_snapshot(stack.acceptance_id).state == "accepted"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def occupy_router() -> None:
+        with stack.router._mutex:  # noqa: SLF001 - deterministic contention
+            entered.set()
+            release.wait(1)
+
+    holder = threading.Thread(target=occupy_router)
+    holder.start()
+    assert entered.wait(1)
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._ingress = stack.ingress
+    runtime._router = stack.router
+    runtime._closing = False
+    before = tuple(stack.writer.replay())
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(EmployeeMessageHandoffUnknownError):
+            runtime.wait_for_employee_message_handoff(
+                tenant_key="tenant_1",
+                agent_id="agt_alpha",
+                bot_principal_id="bot_alpha",
+                app_id="cli_alpha",
+                channel_generation=3,
+                connection_id="conn_alpha",
+                chat_id="oc_team",
+                message_id="om_1",
+                timeout=0.05,
+            )
+        assert time.monotonic() - started < 0.2
+    finally:
+        release.set()
+        holder.join(1)
+
+    assert tuple(stack.writer.replay()) == before
+    assert stack.router.record_snapshot(stack.acceptance_id).state == "accepted"
+    stack.ingress.close()
+    stack.writer.close()
+
+
+def test_handoff_abandon_writer_lock_contention_expires_without_late_mutation(
+    tmp_path,
+) -> None:
+    stack = _stack(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def occupy_writer_transaction() -> None:
+        with stack.writer._transaction_mutex:  # noqa: SLF001 - deterministic contention
+            entered.set()
+            release.wait(1)
+
+    holder = threading.Thread(target=occupy_writer_transaction)
+    holder.start()
+    assert entered.wait(1)
+    before = tuple(stack.writer.replay())
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(RouterWriteDisabledError, match="deadline"):
+            stack.router.abandon_message_handoff(
+                stack.acceptance_id,
+                channel_generation=3,
+                connection_id="conn_alpha",
+                deadline=started + 0.05,
+            )
+        assert time.monotonic() - started < 0.2
+    finally:
+        release.set()
+        holder.join(1)
+
+    assert tuple(stack.writer.replay()) == before
+    assert stack.router.record_snapshot(stack.acceptance_id).state == "accepted"
+    stack.ingress.close()
+    stack.writer.close()
+
+
+def test_handoff_abandon_bounds_retries_under_continuous_head_churn(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = _stack(tmp_path)
+    original_commit = stack.writer.commit
+    churn_count = 0
+
+    def commit_after_unrelated_head_advance(events, expected_versions, **kwargs):
+        nonlocal churn_count
+        if any(
+            event.event_type == "employee.ingress.router_terminal"
+            for event in events
+        ):
+            churn_count += 1
+            aggregate_id = f"test-head-churn:{churn_count}"
+            drift = JournalEvent(
+                event_type="test.concurrent.head_advanced",
+                aggregate_id=aggregate_id,
+                payload={"attempt": churn_count},
+            )
+            original_commit(
+                (drift,),
+                stack.writer.get_aggregate_versions((aggregate_id,)),
+            )
+        return original_commit(events, expected_versions, **kwargs)
+
+    monkeypatch.setattr(stack.writer, "commit", commit_after_unrelated_head_advance)
+    try:
+        with pytest.raises(RouterWriteDisabledError, match="stabilize"):
+            stack.router.abandon_message_handoff(
+                stack.acceptance_id,
+                channel_generation=3,
+                connection_id="conn_alpha",
+            )
+
+        assert churn_count == 4
+        stack.router.rebuild_projection()
+        assert stack.router.record_snapshot(stack.acceptance_id).state == "accepted"
+        assert all(
+            event.event_type != "employee.ingress.router_terminal"
+            for frame in stack.writer.replay()
+            for event in frame.events
+        )
     finally:
         stack.ingress.close()
         stack.writer.close()

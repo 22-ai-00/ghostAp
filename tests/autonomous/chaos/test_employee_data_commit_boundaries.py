@@ -14,6 +14,8 @@ from unittest.mock import patch
 import pytest
 
 from src.autonomous.data.models import (
+    DataKind,
+    EmployeeDataDocumentV1,
     ExecutionAttemptContext,
     ExecutionHistoryPayloadV1,
     ExecutionHistoryRecordV1,
@@ -25,6 +27,7 @@ from src.autonomous.data.service import (
     DataWriteDisabledError,
     EmployeeDataService,
 )
+from src.autonomous.journal.anchor import FileAnchor
 from src.autonomous.journal.blob_store import (
     AesGcmEncryptionProvider,
     BlobPublishError,
@@ -130,6 +133,332 @@ class TestAnchorFailureDisablesWrites:
         )
         with pytest.raises(DataWriteDisabledError):
             svc.start_attempt(_context())
+        blob_store.close()
+        writer.close()
+
+    def test_ambiguous_anchor_preserves_history_blob_for_hygiene_and_restart(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        durable_anchor = FileAnchor(tmp_path / "anchor.json")
+
+        class _RaiseAfterAnchor:
+            production_safe = True
+
+            def read(self):
+                return durable_anchor.read()
+
+            def compare_and_swap(self, *args) -> bool:
+                assert durable_anchor.compare_and_swap(*args) is True
+                raise OSError("anchor directory fsync outcome unknown")
+
+        key = _key()
+        hmac_key = secrets.token_bytes(32)
+        provider = AesGcmEncryptionProvider(lambda _ref: key)
+        blob_store = BlobStore(tmp_path / "blobs", provider)
+        writer = JournalWriter.open(
+            tmp_path / "journal",
+            anchor=_RaiseAfterAnchor(),
+            hmac_key=hmac_key,
+        )
+        svc = EmployeeDataService(
+            writer=writer,
+            blob_store=blob_store,
+            data_state=DataProjectionState(),
+            active_key_id="k1",
+        )
+        record = _record()
+        payload = _payload(record)
+
+        with pytest.raises(DataWriteDisabledError, match="not anchored"):
+            svc.record_history(record, payload)
+
+        assert len(blob_store.iter_blob_ids()) == 1
+        assert tuple((blob_store.root / "quarantine").glob("*.blob")) == ()
+        assert svc.quarantine_unreferenced_blobs() == 0
+        assert len(blob_store.iter_blob_ids()) == 1
+        svc.close()
+        writer.close()
+
+        recovered_store = BlobStore(tmp_path / "blobs", provider)
+        recovered_writer = JournalWriter.open(
+            tmp_path / "journal",
+            anchor=durable_anchor,
+            hmac_key=hmac_key,
+            writer_epoch=1,
+        )
+        recovered = EmployeeDataService(
+            writer=recovered_writer,
+            blob_store=recovered_store,
+            data_state=DataProjectionState(),
+            active_key_id="k1",
+        )
+        try:
+            recovered.rebuild_projection()
+            recovered.verify_live_blobs()
+            assert recovered.get_history_payload(record.record_id) == payload
+        finally:
+            recovered.close()
+            recovered_writer.close()
+
+    def test_anchored_history_apply_failure_preserves_blob_for_restart(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        durable_anchor = FileAnchor(tmp_path / "anchor.json")
+        key = _key()
+        hmac_key = secrets.token_bytes(32)
+        provider = AesGcmEncryptionProvider(lambda _ref: key)
+        blob_store = BlobStore(tmp_path / "blobs", provider)
+        writer = JournalWriter.open(
+            tmp_path / "journal",
+            anchor=durable_anchor,
+            hmac_key=hmac_key,
+        )
+        svc = EmployeeDataService(
+            writer=writer,
+            blob_store=blob_store,
+            data_state=DataProjectionState(),
+            active_key_id="k1",
+        )
+        record = _record()
+        payload = _payload(record)
+
+        with (
+            patch.object(
+                svc,
+                "_apply_frame",
+                side_effect=RuntimeError("projection apply fault"),
+            ),
+            pytest.raises(RuntimeError, match="projection apply fault"),
+        ):
+            svc.record_history(record, payload)
+
+        assert len(blob_store.iter_blob_ids()) == 1
+        svc.close()
+        writer.close()
+
+        recovered_store = BlobStore(tmp_path / "blobs", provider)
+        recovered_writer = JournalWriter.open(
+            tmp_path / "journal",
+            anchor=durable_anchor,
+            hmac_key=hmac_key,
+            writer_epoch=1,
+        )
+        recovered = EmployeeDataService(
+            writer=recovered_writer,
+            blob_store=recovered_store,
+            data_state=DataProjectionState(),
+            active_key_id="k1",
+        )
+        try:
+            recovered.rebuild_projection()
+            recovered.verify_live_blobs()
+            assert recovered.get_history_payload(record.record_id) == payload
+        finally:
+            recovered.close()
+            recovered_writer.close()
+
+    def test_hygiene_serializes_live_snapshot_through_quarantine(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        key = _key()
+        blob_store = BlobStore(
+            tmp_path / "blobs",
+            AesGcmEncryptionProvider(lambda _ref: key),
+        )
+        writer = JournalWriter.open(
+            tmp_path / "journal",
+            anchor=_InMemoryAnchor(),
+            hmac_key=secrets.token_bytes(32),
+        )
+        svc = EmployeeDataService(
+            writer=writer,
+            blob_store=blob_store,
+            data_state=DataProjectionState(),
+            active_key_id="k1",
+        )
+        content = b"# GC-safe memory"
+        document = EmployeeDataDocumentV1(
+            document_id="data_0123456789abcdef",
+            tenant_key="tenant_1",
+            agent_id="agt_alpha",
+            owner_principal_id="principal_owner",
+            kind=DataKind.L1_MEMORY,
+            version=1,
+            source_id="l1_memory",
+            created_at="2026-07-12T01:30:00+00:00",
+            predecessor_sequence=0,
+            predecessor_hash="",
+            content_type="text/markdown",
+            content_hash=hashlib.sha256(content).hexdigest(),
+        )
+        scan_entered = threading.Event()
+        release_scan = threading.Event()
+        publish_done = threading.Event()
+        errors: list[Exception] = []
+        gc_results: list[int] = []
+        original_iter = blob_store.iter_blob_ids
+
+        def blocked_iter():
+            scan_entered.set()
+            assert release_scan.wait(5)
+            return original_iter()
+
+        def collect() -> None:
+            try:
+                gc_results.append(svc.quarantine_unreferenced_blobs())
+            except Exception as exc:
+                errors.append(exc)
+
+        def publish() -> None:
+            try:
+                svc.publish_document(document, content)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                publish_done.set()
+
+        with patch.object(blob_store, "iter_blob_ids", side_effect=blocked_iter):
+            gc_thread = threading.Thread(target=collect)
+            publish_thread = threading.Thread(target=publish)
+            gc_thread.start()
+            assert scan_entered.wait(5)
+            publish_thread.start()
+            assert not publish_done.wait(0.1)
+            release_scan.set()
+            gc_thread.join(5)
+            publish_thread.join(5)
+
+        assert not gc_thread.is_alive()
+        assert not publish_thread.is_alive()
+        assert errors == []
+        assert gc_results == [0]
+        svc.verify_live_blobs()
+        blob_store.close()
+        writer.close()
+
+    def test_hygiene_retains_history_staged_before_commit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        key = _key()
+        blob_store = BlobStore(
+            tmp_path / "blobs",
+            AesGcmEncryptionProvider(lambda _ref: key),
+        )
+        writer = JournalWriter.open(
+            tmp_path / "journal",
+            anchor=_InMemoryAnchor(),
+            hmac_key=secrets.token_bytes(32),
+        )
+        svc = EmployeeDataService(
+            writer=writer,
+            blob_store=blob_store,
+            data_state=DataProjectionState(),
+            active_key_id="k1",
+        )
+        record = _record()
+        payload = _payload(record)
+        stage_done = threading.Event()
+        release_stage = threading.Event()
+        errors: list[Exception] = []
+        original_stage = svc.stage_history_payload
+
+        def blocked_stage(*args, **kwargs):
+            staged = original_stage(*args, **kwargs)
+            stage_done.set()
+            assert release_stage.wait(5)
+            return staged
+
+        def publish() -> None:
+            try:
+                svc.record_history(record, payload)
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(svc, "stage_history_payload", side_effect=blocked_stage):
+            thread = threading.Thread(target=publish)
+            thread.start()
+            try:
+                assert stage_done.wait(5)
+                assert svc.quarantine_unreferenced_blobs() == 0
+                assert len(blob_store.iter_blob_ids()) == 1
+            finally:
+                release_stage.set()
+                thread.join(5)
+
+        assert not thread.is_alive()
+        assert errors == []
+        assert svc.get_history_payload(record.record_id) == payload
+        blob_store.close()
+        writer.close()
+
+    def test_history_publication_is_reserved_before_hygiene_can_scan(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        key = _key()
+        blob_store = BlobStore(
+            tmp_path / "blobs",
+            AesGcmEncryptionProvider(lambda _ref: key),
+        )
+        writer = JournalWriter.open(
+            tmp_path / "journal",
+            anchor=_InMemoryAnchor(),
+            hmac_key=secrets.token_bytes(32),
+        )
+        svc = EmployeeDataService(
+            writer=writer,
+            blob_store=blob_store,
+            data_state=DataProjectionState(),
+            active_key_id="k1",
+        )
+        record = _record()
+        payload = _payload(record)
+        published = threading.Event()
+        release_readback = threading.Event()
+        hygiene_done = threading.Event()
+        errors: list[BaseException] = []
+        original_read = blob_store.read
+
+        def blocked_readback(ref):
+            published.set()
+            assert release_readback.wait(5)
+            return original_read(ref)
+
+        def publish() -> None:
+            try:
+                svc.record_history(record, payload)
+            except BaseException as exc:
+                errors.append(exc)
+
+        def collect() -> None:
+            try:
+                svc.quarantine_unreferenced_blobs()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                hygiene_done.set()
+
+        with patch.object(blob_store, "read", side_effect=blocked_readback):
+            publish_thread = threading.Thread(target=publish)
+            hygiene_thread = threading.Thread(target=collect)
+            publish_thread.start()
+            try:
+                assert published.wait(5)
+                hygiene_thread.start()
+                assert not hygiene_done.wait(0.1)
+            finally:
+                release_readback.set()
+                publish_thread.join(5)
+                hygiene_thread.join(5)
+
+        assert not publish_thread.is_alive()
+        assert not hygiene_thread.is_alive()
+        assert errors == []
+        assert svc.get_history_payload(record.record_id) == payload
         blob_store.close()
         writer.close()
 
