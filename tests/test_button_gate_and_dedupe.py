@@ -1,8 +1,9 @@
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.feishu.ws_client import FeishuWSClient
-from src.tasking import TaskStatus
+from src.tasking import TaskSpec
 
 
 def _make_card_action_data(
@@ -66,49 +67,61 @@ def test_button_is_blocked_while_system_command_inflight():
         mock_get_settings.return_value = mock_settings
 
         client = FeishuWSClient(MagicMock())
-        client._scheduler = MagicMock()
         reply_text = MagicMock()
         client._handler_ctx.handlers["coco"].reply_text = reply_text
-
-        client._control_plane.on_scheduler_event(
-            SimpleNamespace(
-                task_type="system_help",
-                status=TaskStatus.RUNNING,
-                chat_id="oc_1",
-                run_id="run_system_1",
-                project_id=None,
+        system_started = threading.Event()
+        release_system = threading.Event()
+        original_submit = client._scheduler.submit
+        try:
+            original_submit(
+                TaskSpec(
+                    chat_id="oc_1",
+                    name="system-help",
+                    task_type="system_help",
+                    is_system_command=True,
+                ),
+                lambda _ctx: (
+                    system_started.set(),
+                    release_system.wait(timeout=3),
+                ),
             )
-        )
-        assert client._control_plane.is_system_cmd_inflight("oc_1") is True
+            assert system_started.wait(timeout=1)
+            assert client._control_plane.is_system_cmd_inflight("oc_1") is True
 
-        data = _make_card_action_data(open_message_id="om_1", open_chat_id="oc_1", action="enter_coco")
-        submitted: list[tuple[object, object]] = []
+            data = _make_card_action_data(
+                open_message_id="om_1",
+                open_chat_id="oc_1",
+                action="enter_coco",
+            )
+            submitted: list[tuple[object, object]] = []
 
-        def submit(spec, callback):
-            submitted.append((spec, callback))
-            return SimpleNamespace(run_id="gate-follow-up")
+            def submit(spec, callback):
+                submitted.append((spec, callback))
+                return SimpleNamespace(run_id="gate-follow-up")
 
-        client._scheduler.submit.side_effect = submit
-        response = client._handle_card_action_callback(data)
+            client._scheduler.submit = MagicMock(side_effect=submit)
+            response = client._handle_card_action_callback(data)
 
-        assert response.__class__.__name__ == "P2CardActionTriggerResponse"
-        reply_text.assert_not_called()
-        assert submitted == []
-        client._finish_card_advisories(True)
-        assert len(submitted) == 1
-        spec, callback = submitted[0]
-        assert spec.name == "notify_system_command_gate"
-        assert spec.task_type == "card_advisory_follow_up"
-        assert spec.chat_id == "oc_1"
-        assert spec.is_system_command is True
+            assert response.__class__.__name__ == "P2CardActionTriggerResponse"
+            reply_text.assert_not_called()
+            assert submitted == []
+            client._finish_card_advisories(True)
+            assert len(submitted) == 1
+            spec, callback = submitted[0]
+            assert spec.name == "notify_system_command_gate"
+            assert spec.task_type == "card_advisory_follow_up"
+            assert spec.chat_id == "oc_1"
+            assert spec.is_system_command is True
 
-        callback(SimpleNamespace())
-        reply_text.assert_called_once()
-        args, _ = reply_text.call_args
-        assert args[0] == "om_1"
-        assert "系统指令处理中" in args[1]
-
-        client.close()
+            callback(SimpleNamespace())
+            reply_text.assert_called_once()
+            args, _ = reply_text.call_args
+            assert args[0] == "om_1"
+            assert "系统指令处理中" in args[1]
+        finally:
+            client._scheduler.submit = original_submit
+            release_system.set()
+            client.close()
 
 
 def test_system_gate_lookup_failure_acks_and_never_schedules_business_action():

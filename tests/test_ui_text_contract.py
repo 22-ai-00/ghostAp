@@ -111,6 +111,8 @@ def test_employee_help_matches_current_lifecycle_command_contract():
     for command in (
         "`/hire <名字>`",
         "`/h <名字>`",
+        "`/roster`",
+        "`/employee-role <员工名> <职责>`",
         "`/fire <名字或ID> [--drain]`",
         "`/history <名字或ID>`",
         "`/employee-memory <名字或ID>`",
@@ -122,6 +124,22 @@ def test_employee_help_matches_current_lifecycle_command_contract():
     assert "--model" in body
     assert "弹出工具+模型选择" not in body
     assert "--prompt" not in body
+    assert "配置管理员在主 Bot 私聊" in body
+
+
+def test_programming_help_discovers_all_session_info_commands():
+    body = UI_TEXT["system_help_section_modes_body"]
+
+    for command in (
+        "/coco_info",
+        "/claude_info",
+        "/aiden_info",
+        "/codex_info",
+        "/gemini_info",
+        "/traex_info",
+        "/grok_info",
+    ):
+        assert f"`{command}`" in body
 
 
 def test_workflow_help_matches_single_agent_pool_confirmation_contract():

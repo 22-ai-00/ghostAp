@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from src.feishu.message_cache import MessageCache
+
 
 class _Cache:
     def __init__(self, duplicate: bool):
@@ -32,6 +34,52 @@ def test_message_ingress_guard_owns_expiry_and_duplicate_checks():
     assert guard.is_message_expired(0) is False
     assert guard.is_duplicate_message("msg-1") is True
     assert cache.seen == ["msg-1"]
+
+
+def test_message_ingress_reservation_survives_cache_ttl_and_lru_eviction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.feishu.ws_event_router import MessageIngressGuard
+
+    now = [100.0]
+    monkeypatch.setattr("src.feishu.message_cache.time.time", lambda: now[0])
+    cache = MessageCache(ttl=1, max_size=1, cleanup_interval=60)
+    guard = MessageIngressGuard(
+        message_cache=cache,
+        message_expire_seconds=30,
+    )
+
+    owner = guard.reserve("msg-in-flight")
+    assert owner is not None
+    now[0] = 102.0
+    other_owner = guard.reserve("msg-other")
+    assert other_owner is not None
+
+    assert guard.reserve("msg-in-flight") is None
+    assert guard.owns("msg-in-flight", owner)
+
+
+def test_message_ingress_release_and_commit_are_owner_cas() -> None:
+    from src.feishu.ws_event_router import MessageIngressGuard
+
+    cache = MessageCache(ttl=300, max_size=10)
+    guard = MessageIngressGuard(
+        message_cache=cache,
+        message_expire_seconds=30,
+    )
+
+    first_owner = guard.reserve("msg-aba")
+    assert first_owner is not None
+    assert guard.release("msg-aba", first_owner)
+    second_owner = guard.reserve("msg-aba")
+    assert second_owner is not None
+    assert second_owner != first_owner
+
+    assert not guard.release("msg-aba", first_owner)
+    assert not guard.commit("msg-aba", first_owner)
+    assert guard.owns("msg-aba", second_owner)
+    assert guard.commit("msg-aba", second_owner)
+    assert guard.reserve("msg-aba") is None
 
 
 def test_ws_event_router_has_explicit_exception_contract():

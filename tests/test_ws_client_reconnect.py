@@ -193,7 +193,7 @@ def _make_connected_recovery_client(*, recover=None):
     return client
 
 
-def test_employee_recovery_worker_starts_once_across_reconnects() -> None:
+def test_employee_recovery_worker_delegates_startup_once_across_reconnects() -> None:
     client = _make_connected_recovery_client()
 
     client._record_ws_activity("connected")
@@ -205,7 +205,10 @@ def test_employee_recovery_worker_starts_once_across_reconnects() -> None:
         client._employee_department_runtime.membership_service
         .reconcile_projected_memberships
     )
-    reconcile.assert_called_once_with()
+    # Membership audit is part of runtime.recover(), before that runtime can
+    # open admission or start dispatch.  The WS wrapper must not run a second,
+    # necessarily-late audit after recover() returns.
+    reconcile.assert_not_called()
 
 
 def test_employee_recovery_failure_without_required_audit_keeps_restart_participating() -> None:
@@ -460,6 +463,25 @@ def test_observed_ws_client_uses_official_channel_sdk() -> None:
     from src.feishu.ws_lifecycle import ObservedLarkWSClient
 
     assert issubclass(ObservedLarkWSClient, ChannelWSClient)
+
+
+def test_observed_ws_requires_handler_lifecycle_hooks_as_a_pair() -> None:
+    from unittest.mock import patch
+
+    from lark_channel.ws import Client as ChannelWSClient
+
+    from src.feishu.ws_lifecycle import ObservedLarkWSClient
+
+    with (
+        patch.object(ChannelWSClient, "__init__", return_value=None),
+        pytest.raises(ValueError, match="must be configured together"),
+    ):
+        ObservedLarkWSClient(
+            "cli_test",
+            "secret",
+            on_activity=lambda _kind: None,
+            on_handler_scheduled=lambda: True,
+        )
 
 
 def test_observed_ws_client_dispatches_latest_card_callback_frames() -> None:

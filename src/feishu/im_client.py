@@ -68,19 +68,27 @@ class FeishuIMClient:
         self._outbound_audit_failure = outbound_audit_failure
         self._tenant_key_resolver = tenant_key_resolver
 
-    def _audit_outbound(self, operation: str, target: str) -> None:
+    def _audit_outbound(
+        self,
+        operation: str,
+        target: str,
+        *,
+        tenant_key: str | None = None,
+    ) -> None:
         audit = self._outbound_audit
         if audit is None:
             return
-        tenant_key = ""
-        if self._tenant_key_resolver is not None:
+        resolved_tenant_key = tenant_key
+        if resolved_tenant_key is None and self._tenant_key_resolver is not None:
             try:
                 resolved = self._tenant_key_resolver()
-                tenant_key = resolved if isinstance(resolved, str) else ""
+                resolved_tenant_key = resolved if isinstance(resolved, str) else ""
             except Exception:
-                tenant_key = ""
+                resolved_tenant_key = ""
+        if resolved_tenant_key is None:
+            resolved_tenant_key = ""
         try:
-            audit(tenant_key, operation, target)
+            audit(resolved_tenant_key, operation, target)
         except Exception as exc:
             logger.error("main Bot outbound audit failed closed: %s", type(exc).__name__)
             if self._outbound_audit_failure is not None:
@@ -159,6 +167,7 @@ class FeishuIMClient:
         max_retries: Optional[int] = None,
         idempotency_key: str | None = None,
         audit_aliases: tuple[str, ...] | None = None,
+        audit_tenant_key: str | None = None,
     ) -> Optional[Any]:
         """Reply to a message."""
         content = _sanitize_content(content)
@@ -179,7 +188,11 @@ class FeishuIMClient:
             ):
                 raise RuntimeError("main Bot reply recipient scope is unavailable")
             for target in dict.fromkeys((message_id, *audit_aliases)):
-                self._audit_outbound("reply", target)
+                self._audit_outbound(
+                    "reply",
+                    target,
+                    tenant_key=audit_tenant_key,
+                )
         client = self.api_client_factory()
         body = (
             ReplyMessageRequestBody.builder()

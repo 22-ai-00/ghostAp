@@ -71,7 +71,6 @@ from ..project import (
 )
 from ..spec_engine import SpecEngineManager, SpecReporter
 from ..tasking import (
-    TaskEvent,
     TaskPriority,
     TaskQueueFullError,
     TaskScheduler,
@@ -166,6 +165,16 @@ audit_logger = logging.getLogger("ghostap.audit")
 _LARK_MENTION_PLACEHOLDER_RE = re.compile(r"@_user_[0-9]+|@all")
 _EMPLOYEE_HANDOFF_GRACE_SECONDS = 0.25
 _EMPLOYEE_HANDOFF_MAX_SECONDS = 3.0
+_EMPLOYEE_WARNING_RETRY_DELAYS = (0.0, 0.05, 0.2)
+_MAIN_BOT_IDENTITY_RETRY_SECONDS = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class _MentionedGroupCommand:
+    tenant_key: str
+    chat_id: str
+    message_id: str
+    bot_open_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +186,113 @@ class _EmployeeTargetedCommand:
     bot_principal_id: str
     app_id: str
     bot_open_id: str
+    channel_generation: int
+    connection_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MainBotWarningReplyTransport:
+    """Narrow recovered-reply adapter with explicit durable coordinates."""
+
+    handler: Any
+    main_app_id: str
+
+    def send_warning(
+        self,
+        *,
+        message_id: str,
+        tenant_key: str,
+        chat_id: str,
+        text: str,
+        idempotency_key: str,
+    ) -> str:
+        from ..autonomous.acceptance.main_bot_warning_outbox import (
+            MainBotWarningPermanentDeliveryError,
+            MainBotWarningRetryableDeliveryError,
+        )
+        from .handlers.base import (
+            DurableMainBotReplyError,
+            DurableMainBotReplyPermanentError,
+        )
+
+        try:
+            return self.handler.reply_durable_text(
+                message_id=message_id,
+                tenant_key=tenant_key,
+                chat_id=chat_id,
+                text=text,
+                idempotency_key=idempotency_key,
+            )
+        except DurableMainBotReplyPermanentError as exc:
+            raise MainBotWarningPermanentDeliveryError(exc.error_code) from exc
+        except DurableMainBotReplyError as exc:
+            raise MainBotWarningRetryableDeliveryError(str(exc)) from exc
+
+
+class _MessageIngressReservation:
+    """Track whether an admitted scheduler callback ever started."""
+
+    __slots__ = (
+        "_guard",
+        "_lock",
+        "_message_id",
+        "_owner",
+        "_started",
+        "_terminal_claimed",
+    )
+
+    def __init__(
+        self,
+        *,
+        guard: MessageIngressGuard,
+        message_id: str,
+        owner: str,
+    ) -> None:
+        self._guard = guard
+        self._message_id = message_id
+        self._owner = owner
+        self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._started = False
+        self._terminal_claimed = False
+
+    @property
+    def message_id(self) -> str:
+        return self._message_id
+
+    @property
+    def owner(self) -> str:
+        return self._owner
+
+    def owns(self) -> bool:
+        return self._guard.owns(self._message_id, self._owner)
+
+    def mark_started(self) -> bool:
+        with self._lock:
+            if self._terminal_claimed:
+                return False
+            self._started = True
+            return True
+
+    def claim_unstarted_terminal(self) -> bool:
+        """Claim one terminal-before-start disposition exactly once."""
+
+        with self._lock:
+            if self._started or self._terminal_claimed:
+                return False
+            self._terminal_claimed = True
+            return True
+
+    def commit(self) -> bool:
+        return self._guard.commit(self._message_id, self._owner)
+
+    def release(self) -> bool:
+        return self._guard.release(self._message_id, self._owner)
+
+    def release_if_unstarted(self) -> bool:
+        with self._lock:
+            if self._started:
+                return False
+            return self.release()
 
 
 def _employee_hire_status_text(employee_name: str, status: str) -> str | None:
@@ -203,6 +319,11 @@ def _employee_hire_status_text(employee_name: str, status: str) -> str | None:
 
 def _employee_hire_status_uuid(intent_id: str, status: str) -> str:
     return hire_notification_message_uuid(intent_id, status)
+
+
+def _employee_warning_uuid(message_id: str, label: str) -> str:
+    digest = hashlib.sha256(f"{message_id}\0{label}".encode("utf-8")).hexdigest()
+    return "employee-warning-" + digest[:32]
 
 
 def _ignore_ws_event(_data: object) -> None:
@@ -439,7 +560,15 @@ class FeishuWSClient:
         self.message_callback = message_callback
         self._client: Optional[ObservedLarkWSClient] = None
         self._closed = False
+        self._message_ingress_binding_cv = threading.Condition(
+            threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        )
+        self._message_ingress_bindings_inflight = 0
+        self._message_ingress_bindings_fenced = False
         self._api_client: Optional[lark.Client] = None
+        self._main_bot_open_id = ""
+        self._main_bot_identity_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._main_bot_identity_next_retry_at = 0.0
         self._channel_client: Optional[FeishuChannel] = None
         self._slash_command_sync_thread: Optional[threading.Thread] = None
         self._employee_runtime_recovery_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
@@ -726,6 +855,20 @@ class FeishuWSClient:
         handlers["spec"].renderer = SpecRenderer(handlers["spec"])
         self._handler_ctx.managers.update(acp_managers)
         self._handler_ctx.handlers.update(handlers)
+        if self._employee_department_runtime is not None:
+            bind_warning_transport = getattr(
+                self._employee_department_runtime,
+                "bind_main_bot_warning_transport",
+                None,
+            )
+            if not callable(bind_warning_transport):
+                raise RuntimeError("main Bot durable warning transport is unavailable")
+            bind_warning_transport(
+                _MainBotWarningReplyTransport(
+                    handler=handlers["coco"],
+                    main_app_id=self.settings.app_id,
+                )
+            )
         system_handler = handlers["system"]
 
         # Subscribe to hard-timeout reclaim events on RepoLockManager
@@ -869,28 +1012,6 @@ class FeishuWSClient:
                         "retrying once",
                         exc_info=True,
                     )
-            runtime = self._employee_department_runtime
-            membership = (
-                getattr(runtime, "membership_service", None)
-                if runtime is not None
-                else None
-            )
-            reconcile_memberships = getattr(
-                membership,
-                "reconcile_projected_memberships",
-                None,
-            )
-            if callable(reconcile_memberships):
-                summary = reconcile_memberships()
-                removed = int(getattr(summary, "removed", 0) or 0)
-                degraded = int(getattr(summary, "degraded", 0) or 0)
-                if removed or degraded:
-                    logger.warning(
-                        "Employee membership startup audit reconciled "
-                        "removed=%d degraded=%d",
-                        removed,
-                        degraded,
-                    )
         except Exception as exc:
             self._employee_runtime_recovery_error = exc
             runtime = self._employee_department_runtime
@@ -953,19 +1074,7 @@ class FeishuWSClient:
     def _register_scheduler_listeners(self) -> None:
         """Attach scheduler-owned callbacks only after construction succeeds."""
 
-        ingress_listener = self._on_message_ingress_task_event
-        self._scheduler.add_listener(ingress_listener)
-        try:
-            self._scheduler.add_listener(self._control_plane.on_scheduler_event)
-        except BaseException:
-            try:
-                self._scheduler.remove_listener(ingress_listener)
-            except BaseException:
-                logger.error(
-                    "failed to roll back scheduler listener registration",
-                    exc_info=True,
-                )
-            raise
+        self._scheduler.add_listener(self._control_plane.on_scheduler_event)
 
     def _detach_scheduler_listeners(self) -> None:
         """Release scheduler references after its callbacks have quiesced."""
@@ -975,22 +1084,17 @@ class FeishuWSClient:
         if not callable(remove_listener):
             return
 
-        listeners: list[Callable[[TaskEvent], None]] = [
-            self._on_message_ingress_task_event
-        ]
         control_plane = getattr(self, "_control_plane", None)
         control_listener = getattr(control_plane, "on_scheduler_event", None)
-        if callable(control_listener):
-            listeners.append(control_listener)
-
-        for listener in listeners:
-            try:
-                remove_listener(listener)
-            except Exception:
-                logger.debug(
-                    "failed to detach scheduler listener",
-                    exc_info=True,
-                )
+        if not callable(control_listener):
+            return
+        try:
+            remove_listener(control_listener)
+        except Exception:
+            logger.debug(
+                "failed to detach scheduler listener",
+                exc_info=True,
+            )
 
     def _close_scheduler_after_initialization_failure(self) -> None:
         """Stop a partially constructed scheduler without masking the cause."""
@@ -1044,6 +1148,39 @@ class FeishuWSClient:
                 exc_info=True,
             )
 
+    def _begin_message_ingress_binding(self) -> bool:
+        """Join the handler-to-completion-binding shutdown barrier."""
+
+        with self._message_ingress_binding_cv:
+            if self._message_ingress_bindings_fenced:
+                return False
+            self._message_ingress_bindings_inflight += 1
+            return True
+
+    def _finish_message_ingress_binding(self) -> None:
+        with self._message_ingress_binding_cv:
+            if self._message_ingress_bindings_inflight <= 0:
+                raise RuntimeError("message ingress binding barrier underflow")
+            self._message_ingress_bindings_inflight -= 1
+            if self._message_ingress_bindings_inflight == 0:
+                self._message_ingress_binding_cv.notify_all()
+
+    def _fence_message_ingress_bindings(self) -> None:
+        with self._message_ingress_binding_cv:
+            self._message_ingress_bindings_fenced = True
+            self._message_ingress_binding_cv.notify_all()
+
+    def _wait_for_message_ingress_bindings(self, *, deadline: float) -> bool:
+        """Wait for already-dispatched handlers to bind terminal callbacks."""
+
+        with self._message_ingress_binding_cv:
+            while self._message_ingress_bindings_inflight:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._message_ingress_binding_cv.wait(timeout=remaining)
+            return True
+
     def close(self) -> bool:
         """Fence intake, drain work, then clean up dependencies.
 
@@ -1053,6 +1190,7 @@ class FeishuWSClient:
         not tear down lock managers underneath it.
         """
         self._closed = True
+        self._fence_message_ingress_bindings()
         dispatcher = getattr(self, "_card_advisory_dispatcher", None)
         if dispatcher is not None:
             dispatcher.close()
@@ -1081,15 +1219,18 @@ class FeishuWSClient:
         except Exception:
             logger.debug("failed to stop control_plane", exc_info=True)
 
+        scheduler_drain_deadline = (
+            time.monotonic() + _SHUTDOWN_SCHEDULER_DRAIN_S
+        )
         scheduler_idle = False
         try:
             scheduler_idle = self._scheduler.wait_for_idle(
-                _SHUTDOWN_SCHEDULER_DRAIN_S
+                max(0.0, scheduler_drain_deadline - time.monotonic())
             )
             if not scheduler_idle:
                 self._scheduler.cancel_active()
                 scheduler_idle = self._scheduler.wait_for_idle(
-                    _SHUTDOWN_SCHEDULER_DRAIN_S
+                    max(0.0, scheduler_drain_deadline - time.monotonic())
                 )
         except Exception:
             logger.debug("failed to drain scheduler before cleanup", exc_info=True)
@@ -1098,6 +1239,50 @@ class FeishuWSClient:
         if not scheduler_idle:
             logger.error(
                 "scheduler did not reach idle; preserving callback dependencies"
+            )
+            try:
+                self._scheduler.stop(wait=True, shutdown_executor=False)
+            except Exception:
+                logger.debug("failed to stop scheduler dispatcher", exc_info=True)
+            return False
+
+        ingress_bindings_idle = False
+        try:
+            ingress_bindings_idle = self._wait_for_message_ingress_bindings(
+                deadline=scheduler_drain_deadline
+            )
+        except Exception:
+            logger.debug(
+                "failed to drain message ingress bindings before cleanup",
+                exc_info=True,
+            )
+        if not ingress_bindings_idle:
+            logger.error(
+                "message ingress completion bindings did not drain; "
+                "preserving callback dependencies"
+            )
+            try:
+                self._scheduler.stop(wait=True, shutdown_executor=False)
+            except Exception:
+                logger.debug("failed to stop scheduler dispatcher", exc_info=True)
+            return False
+
+        completion_callbacks_idle = False
+        try:
+            completion_callbacks_idle = self._scheduler.wait_for_completion_callbacks(
+                timeout=max(
+                    0.0,
+                    scheduler_drain_deadline - time.monotonic(),
+                )
+            )
+        except Exception:
+            logger.debug(
+                "failed to drain scheduler completion callbacks before cleanup",
+                exc_info=True,
+            )
+        if not completion_callbacks_idle:
+            logger.error(
+                "scheduler completion callbacks did not drain; preserving callback dependencies"
             )
             try:
                 self._scheduler.stop(wait=True, shutdown_executor=False)
@@ -1341,6 +1526,7 @@ class FeishuWSClient:
     def _sync_main_slash_commands(self) -> None:
         """Best-effort convergence of the main Bot's Slash discovery panel."""
 
+        self._sync_main_bot_identity()
         try:
             verified = asyncio.run(
                 reconcile_main_agent_slash_commands(self._get_api_client())
@@ -1362,6 +1548,63 @@ class FeishuWSClient:
             len(verified.updated),
             len(verified.deleted),
         )
+
+    def _sync_main_bot_identity(self) -> str:
+        """Resolve the main app's bot Open ID outside the WS ACK path."""
+
+        from lark_oapi.core.enum import AccessTokenType, HttpMethod
+        from lark_oapi.core.model.base_request import BaseRequest
+        from lark_oapi.core.model.base_response import BaseResponse
+
+        with self._main_bot_identity_lock:
+            if self._main_bot_open_id:
+                return self._main_bot_open_id
+            now = time.monotonic()
+            if now < self._main_bot_identity_next_retry_at:
+                return ""
+            request = (
+                BaseRequest.builder()
+                .http_method(HttpMethod.GET)
+                .uri("/open-apis/bot/v3/info")
+                .token_types({AccessTokenType.TENANT})
+                .paths({})
+                .body(None)
+                .build()
+            )
+            try:
+                response = self._get_api_client().request(request)
+                raw = response.raw if isinstance(response, BaseResponse) else None
+                payload = (
+                    json.loads(raw.content)
+                    if raw is not None and isinstance(raw.content, bytes)
+                    else None
+                )
+                bot = payload.get("bot") if isinstance(payload, dict) else None
+                open_id = bot.get("open_id") if isinstance(bot, dict) else None
+                app_id = bot.get("app_id") if isinstance(bot, dict) else None
+                if (
+                    not isinstance(response, BaseResponse)
+                    or not response.success()
+                    or raw is None
+                    or not isinstance(raw.status_code, int)
+                    or not 200 <= raw.status_code < 300
+                    or not isinstance(payload, dict)
+                    or payload.get("code") != 0
+                    or not isinstance(open_id, str)
+                    or not open_id.startswith("ou_")
+                    or len(open_id) > 256
+                    or app_id != self.settings.app_id
+                ):
+                    raise ValueError("invalid main Bot identity response")
+            except Exception:
+                self._main_bot_identity_next_retry_at = (
+                    time.monotonic() + _MAIN_BOT_IDENTITY_RETRY_SECONDS
+                )
+                logger.warning("Main Bot identity lookup failed closed", exc_info=True)
+                return ""
+            self._main_bot_open_id = open_id
+            self._main_bot_identity_next_retry_at = 0.0
+            return open_id
 
     def _start_main_slash_command_sync(self) -> None:
         """Start at most one non-blocking Slash reconciliation worker."""
@@ -1642,6 +1885,7 @@ class FeishuWSClient:
         }:
             action = ActionKind.GRANT_ADMIN
         elif command_match is not None and command_match.command in {
+            "/employees",
             "/history",
             "/employee-memory",
         }:
@@ -1743,11 +1987,11 @@ class FeishuWSClient:
             return None
         return message_id, chat_id, chat_type, sender_id
 
-    def _resolve_ready_employee_targeted_group_command(
+    def _parse_uniquely_mentioned_group_command(
         self,
         data: P2ImMessageReceiveV1,
-    ) -> _EmployeeTargetedCommand | None:
-        """Freeze a slash command addressed only to one READY employee Bot."""
+    ) -> _MentionedGroupCommand | None:
+        """Parse one uniquely mentioned group slash without consulting runtime state."""
 
         try:
             message = data.event.message
@@ -1799,45 +2043,81 @@ class FeishuWSClient:
             return None
         if SlashCommandParser.parse(command_text.lstrip()) is None:
             return None
+        message_id = getattr(message, "message_id", None)
+        if not isinstance(message_id, str) or not message_id:
+            return None
+        return _MentionedGroupCommand(
+            tenant_key=event_tenant_key,
+            chat_id=chat_id,
+            message_id=message_id,
+            bot_open_id=target_open_id,
+        )
+
+    def _resolve_ready_employee_target(
+        self,
+        candidate: _MentionedGroupCommand,
+    ) -> _EmployeeTargetedCommand | None:
+        """Freeze one READY employee authority on a scheduler worker."""
+
+        from ..autonomous.provisioning.composition import (
+            EmployeeTargetResolutionUnknownError,
+        )
+
         runtime = getattr(self, "_employee_department_runtime", None)
         resolve_target = getattr(runtime, "resolve_ready_employee_bot_target", None)
         if not callable(resolve_target):
-            return None
+            raise EmployeeTargetResolutionUnknownError(
+                "employee target resolver is unavailable"
+            )
         try:
             target = resolve_target(
-                tenant_key=event_tenant_key,
-                chat_id=chat_id,
-                bot_open_id=target_open_id,
+                tenant_key=candidate.tenant_key,
+                chat_id=candidate.chat_id,
+                bot_open_id=candidate.bot_open_id,
             )
-        except Exception:
+        except EmployeeTargetResolutionUnknownError:
             logger.warning("employee Bot identity lookup failed closed", exc_info=True)
+            raise
+        except (OSError, TimeoutError) as exc:
+            logger.warning("employee Bot identity lookup failed closed", exc_info=True)
+            raise EmployeeTargetResolutionUnknownError(
+                "employee target lookup dependency is unavailable"
+            ) from exc
+        if target is None:
             return None
         agent_id = getattr(target, "agent_id", None)
         bot_principal_id = getattr(target, "bot_principal_id", None)
         app_id = getattr(target, "app_id", None)
+        channel_generation = getattr(target, "channel_generation", None)
+        connection_id = getattr(target, "connection_id", None)
         if (
-            getattr(target, "tenant_key", None) != event_tenant_key
-            or getattr(target, "chat_id", None) != chat_id
-            or getattr(target, "bot_open_id", None) != target_open_id
+            getattr(target, "tenant_key", None) != candidate.tenant_key
+            or getattr(target, "chat_id", None) != candidate.chat_id
+            or getattr(target, "bot_open_id", None) != candidate.bot_open_id
             or not isinstance(agent_id, str)
             or not agent_id.startswith("agt_")
             or not isinstance(bot_principal_id, str)
             or not bot_principal_id.startswith("bot_")
             or not isinstance(app_id, str)
             or not app_id.startswith("cli_")
+            or type(channel_generation) is not int
+            or channel_generation <= 0
+            or not isinstance(connection_id, str)
+            or not connection_id.startswith("conn_")
         ):
-            return None
-        message_id = getattr(message, "message_id", None)
-        if not isinstance(message_id, str) or not message_id:
-            return None
+            raise EmployeeTargetResolutionUnknownError(
+                "employee target structure is invalid"
+            )
         return _EmployeeTargetedCommand(
-            tenant_key=event_tenant_key,
-            chat_id=chat_id,
-            message_id=message_id,
+            tenant_key=candidate.tenant_key,
+            chat_id=candidate.chat_id,
+            message_id=candidate.message_id,
             agent_id=agent_id,
             bot_principal_id=bot_principal_id,
             app_id=app_id,
-            bot_open_id=target_open_id,
+            bot_open_id=candidate.bot_open_id,
+            channel_generation=channel_generation,
+            connection_id=connection_id,
         )
 
     def _employee_handoff_timeout(self) -> float:
@@ -1857,51 +2137,345 @@ class FeishuWSClient:
             float(configured) + _EMPLOYEE_HANDOFF_GRACE_SECONDS,
         )
 
+    def _bind_message_ingress_reservation(
+        self,
+        handle: object,
+        reservation: _MessageIngressReservation,
+        *,
+        tenant_key: str,
+        chat_id: str,
+    ) -> None:
+        """Durably report an exact task that terminates before its callback starts."""
+
+        if not reservation.owns():
+            return
+
+        add_done_callback = getattr(handle, "add_done_callback", None)
+        if not callable(add_done_callback):
+            reservation.release_if_unstarted()
+            raise TypeError("scheduler task handle lacks completion callbacks")
+
+        def report_if_unstarted(_event: object) -> None:
+            if not reservation.claim_unstarted_terminal():
+                return
+            anchored = False
+            try:
+                runtime = getattr(self, "_employee_department_runtime", None)
+                queue_warning = getattr(runtime, "queue_main_bot_warning", None)
+                if callable(queue_warning):
+                    anchored = queue_warning(
+                        tenant_key=tenant_key,
+                        chat_id=chat_id,
+                        message_id=reservation.message_id,
+                        text=UI_TEXT["ws_message_prestart_terminal"],
+                    ) is True
+                else:
+                    logger.error(
+                        "pre-start terminal durable warning queue is unavailable"
+                    )
+            except Exception:
+                logger.error(
+                    "pre-start terminal durable warning prepare failed",
+                    exc_info=True,
+                )
+            finally:
+                try:
+                    if anchored:
+                        reservation.commit()
+                    else:
+                        # The scheduler terminal proves this callback never
+                        # started, so platform redelivery cannot duplicate work.
+                        reservation.release()
+                except Exception:
+                    logger.error(
+                        "message ingress terminal disposition failed",
+                        exc_info=True,
+                    )
+
+        try:
+            add_done_callback(report_if_unstarted)
+        except Exception:
+            reservation.release_if_unstarted()
+            raise
+
+    def _run_reserved_message(
+        self,
+        reservation: _MessageIngressReservation,
+        data: P2ImMessageReceiveV1,
+        *,
+        task_ctx: object,
+        shell_fast_tracked: bool,
+        effective_trust: EffectiveTrust | None,
+        employee_candidate: _MentionedGroupCommand | None,
+    ) -> None:
+        if not reservation.mark_started():
+            return
+        self._process_message_async(
+            data,
+            task_ctx=task_ctx,
+            shell_fast_tracked=shell_fast_tracked,
+            effective_trust=effective_trust,
+            employee_candidate=employee_candidate,
+            message_reservation_id=reservation.message_id,
+            message_reservation_owner=reservation.owner,
+        )
+
+    def _employee_target_handoff_confirmed(
+        self,
+        target: _EmployeeTargetedCommand,
+    ) -> bool | None:
+        from ..autonomous.provisioning.composition import (
+            EmployeeMessageHandoffUnknownError,
+        )
+
+        runtime = getattr(self, "_employee_department_runtime", None)
+        wait_for_handoff = getattr(
+            runtime,
+            "wait_for_employee_message_handoff",
+            None,
+        )
+        if not callable(wait_for_handoff):
+            logger.warning(
+                "employee targeted command handoff proof API unavailable"
+            )
+            return None
+        try:
+            result = wait_for_handoff(
+                tenant_key=target.tenant_key,
+                agent_id=target.agent_id,
+                bot_principal_id=target.bot_principal_id,
+                app_id=target.app_id,
+                channel_generation=target.channel_generation,
+                connection_id=target.connection_id,
+                chat_id=target.chat_id,
+                message_id=target.message_id,
+                timeout=self._employee_handoff_timeout(),
+            )
+        except (EmployeeMessageHandoffUnknownError, OSError, TimeoutError):
+            logger.warning(
+                "employee targeted command acceptance proof unavailable",
+                exc_info=True,
+            )
+            return None
+        if result is True:
+            return True
+        if result is False:
+            return False
+        logger.warning(
+            "employee targeted command handoff proof returned invalid result"
+        )
+        return None
+
     def _complete_employee_target_handoff(
         self,
         target: _EmployeeTargetedCommand,
-    ) -> None:
-        runtime = getattr(self, "_employee_department_runtime", None)
-        wait_for_acceptance = getattr(
-            runtime,
-            "wait_for_employee_message_acceptance",
-            None,
+    ) -> bool:
+        """Return whether this origin must remain fenced after handoff."""
+
+        confirmed = self._employee_target_handoff_confirmed(target)
+        if confirmed is True:
+            return True
+        if confirmed is False:
+            return self._reply_employee_handoff_unconfirmed(target)
+        # UNKNOWN may mean the Employee already executed.  Warning persistence
+        # failure therefore cannot authorize a competing main-Bot retry.
+        self._reply_employee_handoff_unknown(target)
+        return True
+
+    def _reply_employee_handoff_unknown(
+        self,
+        target: _EmployeeTargetedCommand | _MentionedGroupCommand,
+    ) -> bool:
+        return self._queue_employee_handoff_warning(
+            target,
+            UI_TEXT["ws_employee_handoff_unknown"],
+            label="employee targeted command handoff unknown",
         )
-        accepted = False
-        if callable(wait_for_acceptance):
-            try:
-                accepted = wait_for_acceptance(
-                    tenant_key=target.tenant_key,
-                    agent_id=target.agent_id,
-                    bot_principal_id=target.bot_principal_id,
-                    app_id=target.app_id,
-                    chat_id=target.chat_id,
-                    message_id=target.message_id,
-                    timeout=self._employee_handoff_timeout(),
-                ) is True
-            except Exception:
-                logger.warning(
-                    "employee targeted command acceptance proof unavailable",
-                    exc_info=True,
-                )
-        if accepted:
-            return
-        self._reply_employee_handoff_unconfirmed(target)
 
     def _reply_employee_handoff_unconfirmed(
         self,
-        target: _EmployeeTargetedCommand,
-    ) -> None:
+        target: _EmployeeTargetedCommand | _MentionedGroupCommand,
+    ) -> bool:
+        return self._queue_employee_handoff_warning(
+            target,
+            UI_TEXT["ws_employee_handoff_unconfirmed"],
+            label="employee targeted command handoff warning",
+        )
+
+    def _queue_employee_handoff_warning(
+        self,
+        target: _EmployeeTargetedCommand | _MentionedGroupCommand,
+        text: str,
+        *,
+        label: str,
+    ) -> bool:
+        """Prepare one warning without performing transport I/O on this task."""
+
+        from ..autonomous.provisioning.composition import (
+            MainBotWarningPreparationError,
+        )
+
+        runtime = getattr(self, "_employee_department_runtime", None)
+        queue_warning = getattr(runtime, "queue_main_bot_warning", None)
+        if not callable(queue_warning):
+            logger.error("%s durable queue is unavailable", label)
+            return False
         try:
-            self._handler_ctx.handlers["coco"].reply_text(
-                target.message_id,
-                UI_TEXT["ws_employee_handoff_unconfirmed"],
+            anchored = queue_warning(
+                tenant_key=target.tenant_key,
+                chat_id=target.chat_id,
+                message_id=target.message_id,
+                text=text,
             )
-        except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
+        except MainBotWarningPreparationError:
+            logger.error("%s durable prepare failed", label, exc_info=True)
+            return False
+        if anchored is not True:
+            logger.error("%s durable queue returned invalid result", label)
+            return False
+        return True
+
+    def _reply_text_with_bounded_retry(
+        self,
+        message_id: str,
+        text: str,
+        *,
+        label: str,
+    ) -> bool:
+        """Deliver one user-visible terminal warning with bounded recovery."""
+
+        idempotency_key = _employee_warning_uuid(message_id, label)
+        for attempt, delay in enumerate(_EMPLOYEE_WARNING_RETRY_DELAYS, start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                reply_id = self._handler_ctx.handlers["coco"].reply_text(
+                    message_id,
+                    text,
+                    idempotency_key=idempotency_key,
+                )
+                if isinstance(reply_id, str) and reply_id:
+                    return True
+            except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
+                logger.debug(
+                    "%s delivery attempt %d raised",
+                    label,
+                    attempt,
+                    exc_info=True,
+                )
+            if attempt < len(_EMPLOYEE_WARNING_RETRY_DELAYS):
+                logger.debug("%s delivery retry %d", label, attempt)
+                continue
+            logger.warning("%s delivery failed", label)
+        return False
+
+    def _schedule_employee_handoff_warning(
+        self,
+        candidate: _MentionedGroupCommand,
+        *,
+        reservation: _MessageIngressReservation,
+        request_id: str,
+        sender_id: str,
+        sender_union_id: str,
+        tenant_key: str,
+    ) -> bool:
+        """Transfer one owned ingress reservation to the system warning lane."""
+
+        spec = TaskSpec(
+            chat_id=candidate.chat_id,
+            name="employee_handoff_warning",
+            task_type="employee_handoff_warning",
+            message_id=candidate.message_id,
+            origin_message_id=candidate.message_id,
+            request_id=request_id,
+            priority=TaskPriority.HIGH,
+            is_system_command=True,
+            is_p2p=False,
+            sender_id=sender_id,
+            sender_union_id=sender_union_id,
+            tenant_key=tenant_key,
+        )
+
+        def warn(_ctx) -> None:
+            if not reservation.mark_started():
+                return
+            if not reservation.owns():
+                return
+            try:
+                main_bot_open_id = (
+                    self._main_bot_open_id or self._sync_main_bot_identity()
+                )
+                if not main_bot_open_id:
+                    delivered = self._reply_text_with_bounded_retry(
+                        candidate.message_id,
+                        UI_TEXT["ws_main_bot_identity_unavailable"],
+                        label="main Bot identity warning",
+                    )
+                elif candidate.bot_open_id == main_bot_open_id:
+                    delivered = self._reply_text_with_bounded_retry(
+                        candidate.message_id,
+                        UI_TEXT["ws_backpressure_generic"],
+                        label="main Bot backpressure warning",
+                    )
+                else:
+                    from ..autonomous.provisioning.composition import (
+                        EmployeeTargetResolutionUnknownError,
+                    )
+
+                    try:
+                        target = self._resolve_ready_employee_target(candidate)
+                    except EmployeeTargetResolutionUnknownError:
+                        try:
+                            self._reply_employee_handoff_unknown(candidate)
+                        finally:
+                            # UNKNOWN may conceal completed Employee execution.
+                            reservation.commit()
+                        return
+                    if target is not None:
+                        confirmed = self._employee_target_handoff_confirmed(target)
+                        if confirmed is False:
+                            if self._reply_employee_handoff_unconfirmed(candidate):
+                                reservation.commit()
+                        elif confirmed is None:
+                            try:
+                                self._reply_employee_handoff_unknown(candidate)
+                            finally:
+                                # UNKNOWN may conceal completed Employee execution.
+                                reservation.commit()
+                        else:
+                            reservation.commit()
+                        return
+                    delivered = self._reply_employee_handoff_unconfirmed(candidate)
+                if delivered:
+                    reservation.commit()
+            finally:
+                reservation.release()
+
+        try:
+            handle = self._scheduler.submit(spec, warn)
+        except (
+            RateLimitExceededException,
+            CircuitBreakerOpenException,
+            TaskQueueFullError,
+            RuntimeError,
+            OSError,
+            TimeoutError,
+            TypeError,
+            ValueError,
+        ):
+            reservation.release()
             logger.warning(
-                "employee targeted command handoff warning delivery failed",
+                "employee handoff warning admission failed closed",
                 exc_info=True,
             )
+            return False
+        self._bind_message_ingress_reservation(
+            handle,
+            reservation,
+            tenant_key=tenant_key,
+            chat_id=candidate.chat_id,
+        )
+        return True
 
     def _handle_message(self, data: P2ImMessageReceiveV1):
         """飞书消息事件入口：只做轻量前置判断，然后交给 scheduler 异步处理。"""
@@ -1911,6 +2485,38 @@ class FeishuWSClient:
             return
         message_id, chat_id, chat_type, _sender_id = ingress_facts
         is_p2p = chat_type == "p2p"
+        employee_candidate = self._parse_uniquely_mentioned_group_command(data)
+        if employee_candidate is not None:
+            main_bot_open_id = self._main_bot_open_id
+            if (
+                not isinstance(main_bot_open_id, str)
+                or not main_bot_open_id.startswith("ou_")
+            ):
+                audit_logger.warning(
+                    "MENTIONED_COMMAND_TARGET_IDENTITY_UNAVAILABLE chat_hash=%s",
+                    self._access_identifier_hash(chat_id),
+                )
+                return
+            if employee_candidate.bot_open_id == main_bot_open_id:
+                # A mention is routing metadata, not an Employee authority
+                # fact.  Self-addressed commands retain the ordinary trust,
+                # project, origin, and control-queue path.
+                employee_candidate = None
+
+        configured_owner = getattr(self, "_managed_group_owner_id", "")
+        defer_employee_target_trust = bool(
+            employee_candidate is not None
+            and isinstance(configured_owner, str)
+            and configured_owner
+            and _sender_id == configured_owner
+        )
+        if (
+            employee_candidate is not None
+            and isinstance(configured_owner, str)
+            and configured_owner
+            and not defer_employee_target_trust
+        ):
+            return
 
         message = data.event.message
         causal_message_id = (
@@ -1918,11 +2524,15 @@ class FeishuWSClient:
             or getattr(message, "root_id", None)
             or ""
         )
-        effective_trust = self._resolve_effective_trust(
-            sender_id=_sender_id,
-            chat_id=chat_id,
-            chat_type=chat_type,
-            message_id=causal_message_id,
+        effective_trust = (
+            None
+            if employee_candidate is not None
+            else self._resolve_effective_trust(
+                sender_id=_sender_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                message_id=causal_message_id,
+            )
         )
         trust_decision = self._managed_trust_access_decision(effective_trust)
         if trust_decision is not None and not trust_decision.allowed:
@@ -1938,22 +2548,33 @@ class FeishuWSClient:
         _raw_tenant_key = getattr(getattr(data, "header", None), "tenant_key", None)
         tenant_key = _raw_tenant_key if isinstance(_raw_tenant_key, str) else ""
 
-        # The event trust root was validated before this content/image parser.
-        # Authorization still precedes project/thread lookup, origin linking,
-        # scheduler submission, image download, Shell, and all handlers.
+        # Ordinary routes have already resolved their current trust.  A
+        # uniquely Employee-addressed command from the configured Owner uses
+        # bounded deferred admission so the WS callback never blocks on the
+        # durable Registry; the worker rechecks that authority before target
+        # lookup, warning delivery, or handoff.
         text = self._extract_text_from_message(data)
         command_match = SlashCommandParser.parse(text)
-        ingress_decision = trust_decision or self._decide_ingress_access(
-            message_id=message_id,
-            sender_id=_sender_id,
-            chat_id=chat_id,
-            chat_type=chat_type,
-            command_match=command_match,
+        ingress_decision = (
+            AccessDecision(
+                allowed=True,
+                operation=AccessOperation.NORMAL_MESSAGE,
+                reason_code="employee_target_deferred_trust",
+                prospective_allowed=True,
+            )
+            if defer_employee_target_trust
+            else trust_decision
+            or self._decide_ingress_access(
+                message_id=message_id,
+                sender_id=_sender_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                command_match=command_match,
+            )
         )
         if not ingress_decision.allowed:
             return
-        employee_target = self._resolve_ready_employee_targeted_group_command(data)
-        if employee_target is None and not self._managed_ingress_action_allowed(
+        if employee_candidate is None and not self._managed_ingress_action_allowed(
             effective_trust,
             text=text,
             command_match=command_match,
@@ -1968,36 +2589,37 @@ class FeishuWSClient:
         )
         project_id = managed_group.project_id if managed_group is not None else None
         thread_root_id = None
-        try:
-            parent_id = getattr(data.event.message, "parent_id", None)
-            root_id = getattr(data.event.message, "root_id", None)
-            thread_root_id = root_id
-            thread_ctx = None
+        if employee_candidate is None:
+            try:
+                parent_id = getattr(data.event.message, "parent_id", None)
+                root_id = getattr(data.event.message, "root_id", None)
+                thread_root_id = root_id
+                thread_ctx = None
 
-            if managed_group is None and root_id and self.settings.thread_programming_enabled:
-                thread_ctx = self._thread_manager.get(root_id)
-                if thread_ctx:
-                    project_id = thread_ctx.project_id
-                    thread_root_id = thread_ctx.thread_root_id
-                    logger.debug(
-                        "[Thread] _handle_message hit: msg_root=%s canonical=%s mode=%s",
-                        root_id[:12] if root_id else "N", thread_ctx.thread_root_id[:12], thread_ctx.mode,
-                    )
-                else:
-                    logger.debug("[Thread] _handle_message miss: msg_root=%s", root_id[:12] if root_id else "N")
+                if managed_group is None and root_id and self.settings.thread_programming_enabled:
+                    thread_ctx = self._thread_manager.get(root_id)
+                    if thread_ctx:
+                        project_id = thread_ctx.project_id
+                        thread_root_id = thread_ctx.thread_root_id
+                        logger.debug(
+                            "[Thread] _handle_message hit: msg_root=%s canonical=%s mode=%s",
+                            root_id[:12] if root_id else "N", thread_ctx.thread_root_id[:12], thread_ctx.mode,
+                        )
+                    else:
+                        logger.debug("[Thread] _handle_message miss: msg_root=%s", root_id[:12] if root_id else "N")
 
-            if managed_group is None and not project_id:
-                for ref in (parent_id, root_id):
-                    if ref:
-                        project_id = self._message_mapper.get_project_id(ref)
-                        if not isinstance(project_id, str):
-                            project_id = None
-                        if project_id:
-                            break
-        except (AttributeError, KeyError, TypeError):
-            project_id = None
+                if managed_group is None and not project_id:
+                    for ref in (parent_id, root_id):
+                        if ref:
+                            project_id = self._message_mapper.get_project_id(ref)
+                            if not isinstance(project_id, str):
+                                project_id = None
+                            if project_id:
+                                break
+            except (AttributeError, KeyError, TypeError):
+                project_id = None
 
-        if managed_group is None and not project_id:
+        if employee_candidate is None and managed_group is None and not project_id:
             try:
                 active = self._project_manager.get_active_project(chat_id)
                 project_id = active.project_id if active else None
@@ -2027,7 +2649,7 @@ class FeishuWSClient:
 
         control_queue_key = self._build_control_queue_key(chat_id=chat_id, project_id=project_id, text=text)
         queue_key = shell_queue_key or control_queue_key
-        if employee_target is not None:
+        if employee_candidate is not None:
             queue_key = f"{chat_id}:employee-handoff"
         if not queue_key and thread_root_id and self.settings.thread_programming_enabled:
             queue_suffix = project_id or "default"
@@ -2054,10 +2676,10 @@ class FeishuWSClient:
         with TraceContext(request_id):
             task_type = (
                 "employee_target_handoff"
-                if employee_target is not None
+                if employee_candidate is not None
                 else ("spec_command" if is_spec else "feishu_message")
             )
-            if employee_target is None and is_system:
+            if employee_candidate is None and is_system:
                 tl = (text or "").strip().lower()
                 if tl in {"/help", "/帮助"}:
                     task_type = "system_help"
@@ -2079,15 +2701,28 @@ class FeishuWSClient:
                 tenant_key=tenant_key,
                 queue_key=queue_key,
             )
+            reservation_owner = self._message_ingress_guard.reserve(message_id)
+            if reservation_owner is None:
+                return
+            reservation = _MessageIngressReservation(
+                guard=self._message_ingress_guard,
+                message_id=message_id,
+                owner=reservation_owner,
+            )
             try:
                 handle = self._scheduler.submit(
                     spec,
-                    lambda ctx, _sf=is_shell_fast, _trust=effective_trust, _target=employee_target: self._process_message_async(
+                    lambda ctx,
+                    _sf=is_shell_fast,
+                    _trust=effective_trust,
+                    _candidate=employee_candidate,
+                    _reservation=reservation: self._run_reserved_message(
+                        _reservation,
                         data,
                         task_ctx=ctx,
                         shell_fast_tracked=_sf,
                         effective_trust=_trust,
-                        employee_target=_target,
+                        employee_candidate=_candidate,
                     ),
                 )
             except (
@@ -2096,13 +2731,43 @@ class FeishuWSClient:
                 TaskQueueFullError,
             ) as e:
                 logger.warning(f"Backpressure applied: {get_error_detail(e)}")
-                if employee_target is not None:
-                    self._reply_employee_handoff_unconfirmed(employee_target)
-                elif is_spec:
-                    self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_backpressure_spec"])
+                if employee_candidate is not None:
+                    if not self._schedule_employee_handoff_warning(
+                        employee_candidate,
+                        reservation=reservation,
+                        request_id=request_id,
+                        sender_id=_sender_id,
+                        sender_union_id=_sender_union_id,
+                        tenant_key=tenant_key,
+                    ):
+                        raise
                 else:
-                    self._handler_ctx.handlers["coco"].reply_text(message_id, UI_TEXT["ws_backpressure_generic"])
+                    warning_text = (
+                        UI_TEXT["ws_backpressure_spec"]
+                        if is_spec
+                        else UI_TEXT["ws_backpressure_generic"]
+                    )
+                    delivered: object = None
+                    try:
+                        delivered = self._handler_ctx.handlers["coco"].reply_text(
+                            message_id,
+                            warning_text,
+                        )
+                    finally:
+                        if isinstance(delivered, str) and delivered:
+                            reservation.commit()
+                        else:
+                            reservation.release()
                 return
+            except (RuntimeError, OSError, TimeoutError, TypeError, ValueError):
+                reservation.release()
+                raise
+            self._bind_message_ingress_reservation(
+                handle,
+                reservation,
+                tenant_key=tenant_key,
+                chat_id=chat_id,
+            )
             try:
                 if message_id:
                     self._message_linker.link_task(message_id, handle.run_id)
@@ -2146,7 +2811,9 @@ class FeishuWSClient:
         task_ctx=None,
         shell_fast_tracked: bool = False,
         effective_trust: EffectiveTrust | None = None,
-        employee_target: _EmployeeTargetedCommand | None = None,
+        employee_candidate: _MentionedGroupCommand | None = None,
+        message_reservation_id: str | None = None,
+        message_reservation_owner: str | None = None,
     ):
         """消息处理主逻辑（运行在 scheduler 线程池中）。
 
@@ -2161,6 +2828,16 @@ class FeishuWSClient:
             set_current_tenant_key,
             set_current_thread_id,
         )
+
+        def release_message_reservation() -> None:
+            if (
+                message_reservation_id is not None
+                and message_reservation_owner is not None
+            ):
+                self._message_ingress_guard.release(
+                    message_reservation_id,
+                    message_reservation_owner,
+                )
 
         message_id = ""
         try:
@@ -2239,18 +2916,81 @@ class FeishuWSClient:
             )
             if not ingress_decision.allowed:
                 return
+            request_id = self._handler_ctx.handlers["coco"].ensure_request_id(message_id, chat_id=chat_id)
+
+            # Validation follows authorization so denied traffic cannot mutate
+            # duplicate/expiry state or trigger unsupported-content replies.
+            if not self._validate_message(
+                message,
+                request_id,
+                message_reservation_owner=message_reservation_owner,
+            ):
+                return
+
+            employee_target = None
+            if employee_candidate is not None:
+                if (
+                    employee_candidate.tenant_key != _tenant_key
+                    or employee_candidate.chat_id != chat_id
+                    or employee_candidate.message_id != message_id
+                ):
+                    audit_logger.warning(
+                        "EMPLOYEE_TARGET_CANDIDATE_EVENT_MISMATCH chat_hash=%s",
+                        self._access_identifier_hash(chat_id),
+                    )
+                    return
+                main_bot_open_id = (
+                    self._main_bot_open_id or self._sync_main_bot_identity()
+                )
+                if not main_bot_open_id:
+                    set_current_sender_id(_sender_id)
+                    set_current_sender_union_id(_sender_union_id or None)
+                    set_current_is_p2p(_is_p2p)
+                    set_current_tenant_key(_tenant_key or None)
+                    delivered = self._reply_text_with_bounded_retry(
+                        employee_candidate.message_id,
+                        UI_TEXT["ws_main_bot_identity_unavailable"],
+                        label="main Bot identity warning",
+                    )
+                    if not delivered:
+                        release_message_reservation()
+                    return
+                if employee_candidate.bot_open_id != main_bot_open_id:
+                    from ..autonomous.provisioning.composition import (
+                        EmployeeTargetResolutionUnknownError,
+                    )
+
+                    try:
+                        employee_target = self._resolve_ready_employee_target(
+                            employee_candidate
+                        )
+                    except EmployeeTargetResolutionUnknownError:
+                        set_current_sender_id(_sender_id)
+                        set_current_sender_union_id(_sender_union_id or None)
+                        set_current_is_p2p(_is_p2p)
+                        set_current_tenant_key(_tenant_key or None)
+                        self._reply_employee_handoff_unknown(employee_candidate)
+                        return
+                    if employee_target is None:
+                        set_current_sender_id(_sender_id)
+                        set_current_sender_union_id(_sender_union_id or None)
+                        set_current_is_p2p(_is_p2p)
+                        set_current_tenant_key(_tenant_key or None)
+                        anchored = self._reply_employee_handoff_unconfirmed(
+                            employee_candidate
+                        )
+                        if not anchored:
+                            # A definite no-READY result cannot conceal
+                            # Employee execution, so a failed warning prepare
+                            # may safely allow the platform to retry this origin.
+                            release_message_reservation()
+                        return
+
             if employee_target is None and not self._managed_ingress_action_allowed(
                 current_trust,
                 text=text,
                 command_match=command_match,
             ):
-                return
-
-            request_id = self._handler_ctx.handlers["coco"].ensure_request_id(message_id, chat_id=chat_id)
-
-            # Validation follows authorization so denied traffic cannot mutate
-            # duplicate/expiry state or trigger unsupported-content replies.
-            if not self._validate_message(message, request_id):
                 return
 
             if employee_target is not None:
@@ -2268,7 +3008,12 @@ class FeishuWSClient:
                 set_current_sender_union_id(_sender_union_id or None)
                 set_current_is_p2p(_is_p2p)
                 set_current_tenant_key(_tenant_key or None)
-                self._complete_employee_target_handoff(employee_target)
+                must_remain_fenced = self._complete_employee_target_handoff(
+                    employee_target
+                )
+                if not must_remain_fenced:
+                    # Only a durable handoff denial reaches this branch.
+                    release_message_reservation()
                 return
 
             if ingress_decision.operation in {
@@ -2506,8 +3251,22 @@ class FeishuWSClient:
                 with self._pending_image_lock:
                     self._pending_image_keys.pop(message_id, None)
                     self._pending_image_only.discard(message_id)
+            if (
+                message_reservation_id is not None
+                and message_reservation_owner is not None
+            ):
+                self._message_ingress_guard.commit(
+                    message_reservation_id,
+                    message_reservation_owner,
+                )
 
-    def _validate_message(self, message, request_id: str) -> bool:
+    def _validate_message(
+        self,
+        message,
+        request_id: str,
+        *,
+        message_reservation_owner: str | None = None,
+    ) -> bool:
         """校验消息是否需要处理（过期/重复/类型不支持等）。"""
         if message.create_time and self._message_ingress_guard.is_message_expired(
             int(message.create_time)
@@ -2515,7 +3274,14 @@ class FeishuWSClient:
             logger.debug("跳过过期消息: %s", message.message_id)
             return False
 
-        if self._message_ingress_guard.is_duplicate_message(message.message_id):
+        if message_reservation_owner is not None:
+            if not self._message_ingress_guard.owns(
+                message.message_id,
+                message_reservation_owner,
+            ):
+                logger.debug("跳过无主消息占位: %s", message.message_id)
+                return False
+        elif self._message_ingress_guard.is_duplicate_message(message.message_id):
             logger.debug("跳过重复消息: %s", message.message_id)
             return False
 
@@ -4183,6 +4949,16 @@ class FeishuWSClient:
         reconnect_delay = getattr(self.settings, "feishu_ws_reconnect_delay_s", 5.0)
 
         while not self._closed:
+            if not self._main_bot_open_id and not self._sync_main_bot_identity():
+                if self._closed:
+                    break
+                logger.warning(
+                    "Main Bot identity unavailable; WS intake remains closed, "
+                    "retrying in %.1fs",
+                    reconnect_delay,
+                )
+                time.sleep(reconnect_delay)
+                continue
             self._client = ObservedLarkWSClient(
                 self.settings.app_id,
                 self.settings.app_secret,
@@ -4195,6 +4971,8 @@ class FeishuWSClient:
                 source="ghostap",
                 on_activity=self._record_ws_activity,
                 on_response_written=self._finish_card_advisories,
+                on_handler_scheduled=self._begin_message_ingress_binding,
+                on_handler_finished=self._finish_message_ingress_binding,
             )
             try:
                 self._client.start()

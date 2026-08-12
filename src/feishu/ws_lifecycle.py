@@ -6,6 +6,7 @@ This module keeps low-level lark-channel WebSocket lifecycle observation out of
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import http
 import logging
@@ -63,11 +64,73 @@ class ObservedLarkWSClient(ws.Client):
         *args,
         on_activity: Callable[[str], None],
         on_response_written: Callable[[bool], None] | None = None,
+        on_handler_scheduled: Callable[[], bool] | None = None,
+        on_handler_finished: Callable[[], None] | None = None,
         **kwargs,
     ):
+        if callable(on_handler_scheduled) != callable(on_handler_finished):
+            raise ValueError(
+                "WebSocket handler lifecycle hooks must be configured together"
+            )
         super().__init__(*args, **kwargs)
         self._on_activity = on_activity
         self._on_response_written = on_response_written
+        self._on_handler_scheduled = on_handler_scheduled
+        self._on_handler_finished = on_handler_finished
+
+    async def _schedule_handle_message(self, msg: bytes) -> None:
+        """Track every SDK handler before its task can outlive shutdown."""
+
+        on_scheduled = getattr(self, "_on_handler_scheduled", None)
+        on_finished = getattr(self, "_on_handler_finished", None)
+        tracked = False
+        if callable(on_scheduled):
+            tracked = on_scheduled() is True
+            if not tracked:
+                # No handler means no response bytes are written for the
+                # frame, so the platform can redeliver after restart.  A
+                # normal return avoids turning orderly shutdown into the
+                # official SDK's reconnect path.
+                return
+
+        async def handle_tracked() -> None:
+            await self._handle_message(msg)
+
+        def finish_task(_task: asyncio.Task[None], *, limited: bool) -> None:
+            if limited:
+                self._handler_semaphore.release()
+            if tracked and callable(on_finished):
+                on_finished()
+
+        if self._handler_semaphore is None:
+            try:
+                task = asyncio.get_running_loop().create_task(handle_tracked())
+                task.add_done_callback(
+                    lambda completed: finish_task(completed, limited=False)
+                )
+            except BaseException:
+                if tracked and callable(on_finished):
+                    on_finished()
+                raise
+            return
+
+        try:
+            await self._handler_semaphore.acquire()
+        except BaseException:
+            if tracked and callable(on_finished):
+                on_finished()
+            raise
+
+        try:
+            task = asyncio.get_running_loop().create_task(handle_tracked())
+            task.add_done_callback(
+                lambda completed: finish_task(completed, limited=True)
+            )
+        except BaseException:
+            self._handler_semaphore.release()
+            if tracked and callable(on_finished):
+                on_finished()
+            raise
 
     async def _connect(self) -> None:
         await super()._connect()

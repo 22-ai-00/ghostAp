@@ -554,6 +554,9 @@ class Settings(BaseSettings):
     autonomous_employee_outbox_blob_dir: str = (
         "~/.ghostap/autonomy/outbox-blobs"
     )
+    autonomous_main_bot_warning_blob_dir: str = (
+        "~/.ghostap/autonomy/main-bot-warning-blobs"
+    )
     autonomous_employee_attachment_staging_dir: str = (
         "~/.ghostap/autonomy/employee-attachments"
     )

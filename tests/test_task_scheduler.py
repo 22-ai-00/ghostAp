@@ -227,6 +227,159 @@ def test_poison_completion_callback_cannot_kill_event_dispatcher() -> None:
         scheduler.stop(wait=True, shutdown_executor=True)
 
 
+def test_completion_quiescence_waits_for_callbacks_without_dispatcher_self_wait() -> None:
+    scheduler, events = _scheduler(max_concurrent=1)
+    task_started = threading.Event()
+    release_task = threading.Event()
+    callback_started = threading.Event()
+    self_wait_returned = threading.Event()
+    release_callback = threading.Event()
+    self_wait_results: list[bool] = []
+    try:
+        handle = scheduler.submit(
+            TaskSpec(chat_id="chat", name="completion-quiescence"),
+            lambda _ctx: (task_started.set(), release_task.wait(timeout=3)),
+        )
+        assert task_started.wait(timeout=1)
+
+        def on_done(_event: TaskEvent) -> None:
+            callback_started.set()
+            try:
+                self_wait_results.append(
+                    scheduler.wait_for_completion_callbacks(timeout=0.1)
+                )
+            finally:
+                self_wait_returned.set()
+            release_callback.wait(timeout=3)
+
+        handle.add_done_callback(on_done)
+        release_task.set()
+        assert events.wait_for(handle.run_id, TaskStatus.SUCCEEDED)
+        assert callback_started.wait(timeout=1)
+        assert self_wait_returned.wait(timeout=1)
+        assert self_wait_results == [False]
+
+        assert scheduler.wait_for_completion_callbacks(timeout=0) is False
+        release_callback.set()
+        assert scheduler.wait_for_completion_callbacks(timeout=1) is True
+    finally:
+        release_task.set()
+        release_callback.set()
+        scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_completion_quiescence_tracks_terminal_replay_on_registering_thread() -> None:
+    scheduler, events = _scheduler(max_concurrent=1)
+    callback_started = threading.Event()
+    self_wait_returned = threading.Event()
+    release_callback = threading.Event()
+    self_wait_results: list[bool] = []
+    registration_thread: threading.Thread | None = None
+    try:
+        handle = scheduler.submit(
+            TaskSpec(chat_id="chat", name="terminal-replay-quiescence"),
+            lambda _ctx: None,
+        )
+        assert events.wait_for(handle.run_id, TaskStatus.SUCCEEDED)
+
+        def on_done(_event: TaskEvent) -> None:
+            callback_started.set()
+            try:
+                self_wait_results.append(
+                    scheduler.wait_for_completion_callbacks(timeout=0.1)
+                )
+            finally:
+                self_wait_returned.set()
+            release_callback.wait(timeout=3)
+
+        registration_thread = threading.Thread(
+            target=handle.add_done_callback,
+            args=(on_done,),
+        )
+        registration_thread.start()
+        assert callback_started.wait(timeout=1)
+        assert self_wait_returned.wait(timeout=1)
+        assert self_wait_results == [False]
+        assert scheduler.wait_for_completion_callbacks(timeout=0) is False
+
+        release_callback.set()
+        registration_thread.join(timeout=1)
+        assert not registration_thread.is_alive()
+        assert scheduler.wait_for_completion_callbacks(timeout=1) is True
+    finally:
+        release_callback.set()
+        if registration_thread is not None:
+            registration_thread.join(timeout=1)
+        scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_terminal_replay_registration_linearizes_before_quiescence_wait() -> None:
+    scheduler, events = _scheduler(max_concurrent=1)
+    completion_lock_exited = threading.Event()
+    release_completion_exit = threading.Event()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    waiter_done = threading.Event()
+    wait_results: list[bool] = []
+    registration_thread: threading.Thread | None = None
+    waiter_thread: threading.Thread | None = None
+    try:
+        handle = scheduler.submit(
+            TaskSpec(chat_id="chat", name="terminal-replay-linearization"),
+            lambda _ctx: None,
+        )
+        assert events.wait_for(handle.run_id, TaskStatus.SUCCEEDED)
+
+        completion = handle._completion
+        original_lock = completion._lock
+
+        class CompletionExitBarrier:
+            def __enter__(self):
+                original_lock.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback) -> None:
+                original_lock.release()
+                completion_lock_exited.set()
+                release_completion_exit.wait(timeout=3)
+
+        completion._lock = CompletionExitBarrier()
+
+        registration_thread = threading.Thread(
+            target=handle.add_done_callback,
+            args=(lambda _event: (callback_started.set(), release_callback.wait(timeout=3)),),
+        )
+        registration_thread.start()
+        assert completion_lock_exited.wait(timeout=1)
+
+        def wait_for_quiescence() -> None:
+            wait_results.append(scheduler.wait_for_completion_callbacks(timeout=0))
+            waiter_done.set()
+
+        waiter_thread = threading.Thread(target=wait_for_quiescence)
+        waiter_thread.start()
+        assert waiter_done.wait(timeout=0.2) is False
+
+        release_completion_exit.set()
+        assert callback_started.wait(timeout=1)
+        assert waiter_done.wait(timeout=1)
+        assert wait_results == [False]
+
+        release_callback.set()
+        registration_thread.join(timeout=1)
+        waiter_thread.join(timeout=1)
+        assert not registration_thread.is_alive()
+        assert not waiter_thread.is_alive()
+    finally:
+        release_completion_exit.set()
+        release_callback.set()
+        if registration_thread is not None:
+            registration_thread.join(timeout=1)
+        if waiter_thread is not None:
+            waiter_thread.join(timeout=1)
+        scheduler.stop(wait=True, shutdown_executor=True)
+
+
 def test_listener_can_reenter_and_remove_itself_without_deadlock() -> None:
     scheduler, events = _scheduler(max_concurrent=1)
     callback_done = threading.Event()
@@ -306,6 +459,7 @@ def test_worker_start_wins_cancel_race_without_double_releasing_slot() -> None:
     )
     callback_started = threading.Event()
     release_callback = threading.Event()
+    completed = threading.Event()
     terminal_events: list[TaskEvent] = []
     try:
         handle = scheduler.submit(
@@ -315,7 +469,9 @@ def test_worker_start_wins_cancel_race_without_double_releasing_slot() -> None:
                 release_callback.wait(timeout=3),
             ),
         )
-        handle.add_done_callback(terminal_events.append)
+        handle.add_done_callback(
+            lambda event: (terminal_events.append(event), completed.set())
+        )
         assert events.wait_for(handle.run_id, TaskStatus.RUNNING)
         assert executor.future is not None
 
@@ -327,6 +483,7 @@ def test_worker_start_wins_cancel_race_without_double_releasing_slot() -> None:
         worker.join(timeout=1)
 
         assert events.wait_for(handle.run_id, TaskStatus.CANCELED)
+        assert completed.wait(timeout=1)
         assert [event.status for event in terminal_events] == [TaskStatus.CANCELED]
         assert scheduler.wait_for_idle(timeout=1)
         with scheduler._lock:
@@ -345,6 +502,7 @@ def test_future_running_before_wrapper_cancel_still_converges_once() -> None:
         worker_executor=executor,
     )
     callback_started = threading.Event()
+    completed = threading.Event()
     terminal_events: list[TaskEvent] = []
     try:
         handle = scheduler.submit(
@@ -355,7 +513,9 @@ def test_future_running_before_wrapper_cancel_still_converges_once() -> None:
             ),
             lambda _ctx: callback_started.set(),
         )
-        handle.add_done_callback(terminal_events.append)
+        handle.add_done_callback(
+            lambda event: (terminal_events.append(event), completed.set())
+        )
         assert events.wait_for(handle.run_id, TaskStatus.RUNNING)
         assert executor.future is not None
         assert executor.future.set_running_or_notify_cancel()
@@ -366,6 +526,7 @@ def test_future_running_before_wrapper_cancel_still_converges_once() -> None:
         worker.join(timeout=1)
 
         assert events.wait_for(handle.run_id, TaskStatus.CANCELED)
+        assert completed.wait(timeout=1)
         assert [event.status for event in terminal_events] == [TaskStatus.CANCELED]
         assert not callback_started.is_set()
         assert scheduler.wait_for_idle(timeout=1)

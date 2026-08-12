@@ -19,7 +19,11 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from ...card.ui_text import UI_TEXT
 from ...utils.engine_identity import resolve_engine_identity
-from ...utils.errors import get_error_detail
+from ...utils.errors import (
+    LARK_CODE_MESSAGE_NOT_FOUND,
+    LARK_CODE_MESSAGE_RECALLED,
+    get_error_detail,
+)
 from ..im_client import FeishuIMClient
 from ..ws_card_action_handler import bind_managed_trust_revisions
 
@@ -45,6 +49,24 @@ if TYPE_CHECKING:
     from ..handler_context import HandlerContext
 
 logger = logging.getLogger(__name__)
+
+
+class DurableMainBotReplyError(RuntimeError):
+    """A durable main-Bot reply did not produce an authoritative receipt."""
+
+
+class DurableMainBotReplyPermanentError(DurableMainBotReplyError):
+    """A durable reply cannot succeed again for this frozen origin."""
+
+    def __init__(self, error_code: str) -> None:
+        super().__init__(error_code)
+        self.error_code = error_code
+
+
+_DURABLE_REPLY_PERMANENT_CODES = {
+    LARK_CODE_MESSAGE_NOT_FOUND: "feishu_message_not_found",
+    LARK_CODE_MESSAGE_RECALLED: "feishu_message_recalled",
+}
 
 
 class _ManagedCardTrustUnavailable(RuntimeError):
@@ -444,6 +466,46 @@ class BaseHandler:
         except Exception as e:
             logger.error("reply_text 异常: %s", e, exc_info=True)
             return None
+
+    def reply_durable_text(
+        self,
+        *,
+        message_id: str,
+        tenant_key: str,
+        chat_id: str,
+        text: str,
+        idempotency_key: str,
+    ) -> str:
+        """Reply from recovered state without volatile linker/request context."""
+
+        coordinates = (message_id, tenant_key, chat_id, text, idempotency_key)
+        if any(not isinstance(value, str) or not value for value in coordinates):
+            raise ValueError("durable main Bot reply coordinates are invalid")
+        response = self.im_client.reply_message(
+            message_id,
+            json.dumps({"text": text}, ensure_ascii=False),
+            msg_type="text",
+            reply_in_thread=False,
+            idempotency_key=idempotency_key,
+            audit_aliases=(chat_id,),
+            audit_tenant_key=tenant_key,
+        )
+        if (
+            response is not None
+            and response.success()
+            and response.data is not None
+            and isinstance(response.data.message_id, str)
+            and response.data.message_id
+        ):
+            return response.data.message_id
+        permanent_error_code = _DURABLE_REPLY_PERMANENT_CODES.get(
+            getattr(response, "code", None)
+        )
+        if permanent_error_code is not None:
+            raise DurableMainBotReplyPermanentError(permanent_error_code)
+        raise DurableMainBotReplyError(
+            "durable main Bot reply receipt is unavailable"
+        )
 
     def reply_card(
         self,

@@ -3,13 +3,18 @@ import hashlib
 import json
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.access_control import IngressAccessPolicy
 from src.agent.intent_recognizer import IntentResult, IntentType, TaskStep
+from src.autonomous.ingress.service import MessageAcceptanceOutcome
+from src.card.ui_text import UI_TEXT
+from src.config import IngressAccessMode
 from src.feishu.image_handler import FeishuImageHandler, ImageDownloadResult
 from src.feishu.slash_command_parser import SlashCommandParser
 from src.feishu.ws_client import (
@@ -20,9 +25,9 @@ from src.feishu.ws_client import (
 )
 from src.mode import InteractionMode
 from src.project import ProjectContext
-from src.tasking import TaskPriority, TaskQueueFullError
+from src.tasking import TaskPriority, TaskQueueFullError, TaskScheduler, TaskSpec, TaskStatus
 from src.thread import get_current_thread_id, set_current_thread_id
-from src.trust.models import TrustZone
+from src.trust.models import ActorKind, TrustZone
 
 
 @pytest.fixture
@@ -44,6 +49,8 @@ def mock_ws_client():
             team_service=object(),
             main_bot_outbound_audit=audit,
             readiness=lambda: SimpleNamespace(ready=True),
+            bind_main_bot_warning_transport=MagicMock(),
+            queue_main_bot_warning=MagicMock(return_value=True),
             _environment_provider=lambda _authority: SimpleNamespace(
                 credential_env={},
                 provider_files={
@@ -103,6 +110,7 @@ def mock_ws_client():
         mock_get_settings.return_value = settings
 
         client = FeishuWSClient(MagicMock())
+        client._main_bot_open_id = "ou_main_bot"
         client._project_manager.get_active_project.return_value = None
         try:
             yield client
@@ -174,6 +182,26 @@ def _ready_employee_target(
         bot_principal_id="bot_alpha",
         app_id="cli_alpha",
         bot_open_id=open_id,
+        channel_generation=3,
+        connection_id="conn_alpha",
+    )
+
+
+def _pending_task_handle(run_id: str) -> SimpleNamespace:
+    return SimpleNamespace(run_id=run_id, add_done_callback=MagicMock())
+
+
+def _accepted_handoff_outcome(
+    acceptance_id: str,
+    *,
+    channel_generation: int = 3,
+    connection_id: str = "conn_alpha",
+) -> MessageAcceptanceOutcome:
+    return MessageAcceptanceOutcome(
+        status="accepted",
+        acceptance=SimpleNamespace(acceptance_id=acceptance_id),
+        channel_generation=channel_generation,
+        connection_id=connection_id,
     )
 
 
@@ -198,8 +226,10 @@ def test_main_bot_yields_only_after_employee_durably_accepts_targeted_command(
             agent_id="agt_target",
         )
     )
-    runtime.wait_for_employee_message_acceptance = MagicMock(return_value=True)
-    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock()
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=True)
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock(
+        return_value="om_warning_reply"
+    )
     mock_ws_client._dispatch_message_logic = MagicMock()
     mention = _sdk_message_mention(
         key="@_user_1",
@@ -210,23 +240,25 @@ def test_main_bot_yields_only_after_employee_durably_accepts_targeted_command(
 
     mock_ws_client._handle_message(event)
 
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "employee_target_handoff"
+    assert spec.is_system_command is True
+    runtime.wait_for_employee_message_handoff.assert_not_called()
+
+    callback(MagicMock())
+
     runtime.resolve_ready_employee_bot_target.assert_called_once_with(
         tenant_key="tenant_test",
         chat_id="oc_456",
         bot_open_id=employee_open_id,
     )
-    spec, callback = mock_ws_client._scheduler.submit.call_args.args
-    assert spec.task_type == "employee_target_handoff"
-    assert spec.is_system_command is True
-    runtime.wait_for_employee_message_acceptance.assert_not_called()
-
-    callback(MagicMock())
-
-    runtime.wait_for_employee_message_acceptance.assert_called_once_with(
+    runtime.wait_for_employee_message_handoff.assert_called_once_with(
         tenant_key="tenant_test",
         agent_id="agt_target",
         bot_principal_id="bot_alpha",
         app_id="cli_alpha",
+        channel_generation=3,
+        connection_id="conn_alpha",
         chat_id="oc_456",
         message_id="om_mentioned_command",
         timeout=1.75,
@@ -235,15 +267,213 @@ def test_main_bot_yields_only_after_employee_durably_accepts_targeted_command(
     mock_ws_client._dispatch_message_logic.assert_not_called()
 
 
-def test_duplicate_main_delivery_runs_one_employee_handoff_and_one_warning(
+def test_unknown_employee_handoff_never_reports_durable_nonexecution(
     mock_ws_client: FeishuWSClient,
 ) -> None:
+    from src.autonomous.provisioning.composition import (
+        EmployeeMessageHandoffUnknownError,
+    )
+
+    target = SimpleNamespace(
+        **vars(_ready_employee_target()),
+        message_id="om_unknown_handoff",
+    )
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.wait_for_employee_message_handoff = MagicMock(
+        side_effect=EmployeeMessageHandoffUnknownError("anchor unavailable")
+    )
+    runtime.queue_main_bot_warning.reset_mock()
+    mock_ws_client._reply_employee_handoff_unconfirmed = MagicMock(return_value=True)
+    direct_reply = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = direct_reply
+
+    assert mock_ws_client._complete_employee_target_handoff(target)
+
+    mock_ws_client._reply_employee_handoff_unconfirmed.assert_not_called()
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id=target.message_id,
+        text=(
+            "⚠️ 无法确认目标员工是否已接收该命令；命令状态未知，请勿重试。"
+            "请先等待目标员工回复，或联系管理员核查。"
+        ),
+    )
+    direct_reply.assert_not_called()
+
+
+def test_main_bot_warning_transport_is_bound_after_handlers_exist(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.bind_main_bot_warning_transport.assert_called_once()
+    transport = runtime.bind_main_bot_warning_transport.call_args.args[0]
+    assert transport.main_app_id == mock_ws_client.settings.app_id
+    durable_reply = MagicMock(return_value="om_warning_receipt")
+    mock_ws_client._handler_ctx.handlers["coco"].reply_durable_text = durable_reply
+
+    receipt = transport.send_warning(
+        message_id="om_origin",
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        text="warning",
+        idempotency_key="employee-warning-stable",
+    )
+
+    assert receipt == "om_warning_receipt"
+    durable_reply.assert_called_once_with(
+        message_id="om_origin",
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        text="warning",
+        idempotency_key="employee-warning-stable",
+    )
+
+
+def test_main_bot_warning_transport_maps_durable_reply_failure_to_retryable(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.autonomous.acceptance.main_bot_warning_outbox import (
+        MainBotWarningRetryableDeliveryError,
+    )
+    from src.feishu.handlers.base import DurableMainBotReplyError
+
+    runtime = mock_ws_client._employee_department_runtime
+    transport = runtime.bind_main_bot_warning_transport.call_args.args[0]
+    mock_ws_client._handler_ctx.handlers["coco"].reply_durable_text = MagicMock(
+        side_effect=DurableMainBotReplyError("receipt unavailable")
+    )
+
+    with pytest.raises(MainBotWarningRetryableDeliveryError, match="receipt"):
+        transport.send_warning(
+            message_id="om_origin",
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            text="warning",
+            idempotency_key="employee-warning-stable",
+        )
+
+
+@pytest.mark.parametrize("invalid_result", (None, "accepted"))
+def test_invalid_employee_handoff_result_remains_unknown(
+    mock_ws_client: FeishuWSClient,
+    invalid_result: object,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.wait_for_employee_message_handoff = MagicMock(
+        return_value=invalid_result
+    )
+    target = SimpleNamespace(
+        **vars(_ready_employee_target()),
+        message_id="om_invalid_handoff_result",
+    )
+
+    assert (
+        mock_ws_client._employee_target_handoff_confirmed(target)
+        is None
+    )
+
+
+def test_employee_handoff_does_not_fall_back_to_weak_acceptance_proof(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    weak_acceptance = MagicMock(return_value=True)
+    mock_ws_client._employee_department_runtime = SimpleNamespace(
+        wait_for_employee_message_acceptance=weak_acceptance,
+    )
+
+    assert (
+        mock_ws_client._employee_target_handoff_confirmed(
+            _ready_employee_target()
+        )
+        is None
+    )
+    weak_acceptance.assert_not_called()
+
+
+def test_employee_handoff_programming_assertion_propagates(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.wait_for_employee_message_handoff = MagicMock(
+        side_effect=AssertionError("programming invariant")
+    )
+    target = SimpleNamespace(
+        **vars(_ready_employee_target()),
+        message_id="om_handoff_assertion",
+    )
+
+    with pytest.raises(AssertionError, match="programming invariant"):
+        mock_ws_client._employee_target_handoff_confirmed(target)
+
+
+@pytest.mark.parametrize(
+    ("handoff_result", "expected_text"),
+    (
+        (
+            False,
+            "⚠️ 尚未确认目标员工已接收该命令；GhostAP 主 Bot 未执行。"
+            "请查看员工回复后再决定是否重试。",
+        ),
+        (
+            OSError("handoff state unavailable"),
+            "⚠️ 无法确认目标员工是否已接收该命令；命令状态未知，请勿重试。"
+            "请先等待目标员工回复，或联系管理员核查。",
+        ),
+    ),
+    ids=("durably-denied", "unknown"),
+)
+def test_started_employee_handoff_fences_message_even_when_notice_fails(
+    mock_ws_client: FeishuWSClient,
+    handoff_result: bool | Exception,
+    expected_text: str,
+) -> None:
+    message_id = "om_started_handoff_terminal"
     runtime = mock_ws_client._employee_department_runtime
     runtime.resolve_ready_employee_bot_target = MagicMock(
         return_value=_ready_employee_target()
     )
-    runtime.wait_for_employee_message_acceptance = MagicMock(return_value=False)
-    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock()
+    runtime.wait_for_employee_message_handoff = MagicMock(
+        side_effect=handoff_result if isinstance(handoff_result, Exception) else None,
+        return_value=handoff_result if isinstance(handoff_result, bool) else False,
+    )
+    runtime.queue_main_bot_warning.reset_mock()
+    reply = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(event)
+    _spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    callback(MagicMock())
+
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id=message_id,
+        text=expected_text,
+    )
+    reply.assert_not_called()
+    assert mock_ws_client._message_ingress_guard.reserve(message_id) is None
+
+
+def test_duplicate_main_delivery_runs_one_employee_handoff_and_one_warning(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(return_value=_ready_employee_target())
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=False)
+    runtime.queue_main_bot_warning.reset_mock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock(
+        return_value="om_warning_reply"
+    )
     mock_ws_client._dispatch_message_logic = MagicMock()
     event = _mentioned_group_command(
         "@_user_1 /stop_wf",
@@ -258,26 +488,70 @@ def test_duplicate_main_delivery_runs_one_employee_handoff_and_one_warning(
     mock_ws_client._handle_message(event)
     mock_ws_client._handle_message(event)
     callbacks = [call.args[1] for call in mock_ws_client._scheduler.submit.call_args_list]
-    assert len(callbacks) == 2
+    assert len(callbacks) == 1
 
     callbacks[0](MagicMock())
-    callbacks[1](MagicMock())
 
-    runtime.wait_for_employee_message_acceptance.assert_called_once()
-    mock_ws_client._handler_ctx.handlers["coco"].reply_text.assert_called_once()
+    runtime.wait_for_employee_message_handoff.assert_called_once()
+    runtime.queue_main_bot_warning.assert_called_once()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text.assert_not_called()
     mock_ws_client._dispatch_message_logic.assert_not_called()
 
 
-def test_employee_handoff_backpressure_replies_without_waiting_on_ws_callback(
+def test_duplicate_employee_target_never_reclassifies_into_main_command(
     mock_ws_client: FeishuWSClient,
 ) -> None:
     runtime = mock_ws_client._employee_department_runtime
     runtime.resolve_ready_employee_bot_target = MagicMock(
         return_value=_ready_employee_target()
     )
-    runtime.wait_for_employee_message_acceptance = MagicMock(return_value=True)
-    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock()
-    mock_ws_client._scheduler.submit.side_effect = TaskQueueFullError("normal", 1)
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=True)
+    mock_ws_client._dispatch_message_logic = MagicMock()
+    event = _mentioned_group_command(
+        "@_user_1 /fire Atlas",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id="om_employee_reclassification_race",
+    )
+
+    mock_ws_client._handle_message(event)
+    mock_ws_client._handle_message(event)
+    callbacks = [call.args[1] for call in mock_ws_client._scheduler.submit.call_args_list]
+
+    callbacks[0](MagicMock())
+
+    runtime.resolve_ready_employee_bot_target.assert_called_once()
+    runtime.wait_for_employee_message_handoff.assert_called_once()
+    mock_ws_client._dispatch_message_logic.assert_not_called()
+
+
+def test_employee_handoff_backpressure_retries_handoff_off_the_ws_callback(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(return_value=_ready_employee_target())
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=True)
+    release = threading.Event()
+
+    def slow_reply(*_args, **_kwargs) -> str:
+        release.wait(1)
+        return "om_warning_reply"
+
+    reply = MagicMock(side_effect=slow_reply)
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply
+    scheduler_calls = 0
+
+    def submit(_spec, callback):
+        nonlocal scheduler_calls
+        scheduler_calls += 1
+        if scheduler_calls == 1:
+            raise TaskQueueFullError("normal", 1)
+        return _pending_task_handle("run_advisory")
+
+    mock_ws_client._scheduler.submit.side_effect = submit
     event = _mentioned_group_command(
         "@_user_1 /stop_wf",
         _sdk_message_mention(
@@ -290,34 +564,1000 @@ def test_employee_handoff_backpressure_replies_without_waiting_on_ws_callback(
 
     started = time.monotonic()
     mock_ws_client._handle_message(event)
+    mock_ws_client._handle_message(event)
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.5
-    runtime.wait_for_employee_message_acceptance.assert_not_called()
-    mock_ws_client._handler_ctx.handlers["coco"].reply_text.assert_called_once_with(
-        "om_employee_handoff_backpressure",
-        "⚠️ 尚未确认目标员工已接收该命令；GhostAP 主 Bot 未执行。请查看员工回复后再决定是否重试。",
-    )
+    assert elapsed < 0.1
+    runtime.wait_for_employee_message_handoff.assert_not_called()
+    assert reply.call_count == 0
+    assert scheduler_calls == 2
+    _spec, callback = mock_ws_client._scheduler.submit.call_args_list[1].args
+    release.set()
+    callback(MagicMock())
+    runtime.resolve_ready_employee_bot_target.assert_called_once()
+    runtime.wait_for_employee_message_handoff.assert_called_once()
+    reply.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "wait_result",
-    [False, RuntimeError("employee ingress unavailable")],
-    ids=("not-accepted", "dependency-failure"),
-)
-def test_main_bot_reports_unconfirmed_employee_handoff_without_executing_command(
+def test_employee_handoff_backpressure_warns_only_after_fallback_abandons(
     mock_ws_client: FeishuWSClient,
-    wait_result: bool | Exception,
 ) -> None:
     runtime = mock_ws_client._employee_department_runtime
     runtime.resolve_ready_employee_bot_target = MagicMock(
         return_value=_ready_employee_target()
     )
-    runtime.wait_for_employee_message_acceptance = MagicMock(
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=False)
+    runtime.queue_main_bot_warning.reset_mock()
+    reply = MagicMock(return_value="om_warning_reply")
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply
+    callbacks = []
+
+    def submit(_spec, callback):
+        callbacks.append(callback)
+        if len(callbacks) == 1:
+            raise TaskQueueFullError("normal", 1)
+        return _pending_task_handle("run_advisory")
+
+    mock_ws_client._scheduler.submit.side_effect = submit
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id="om_employee_fallback_abandoned",
+    )
+
+    mock_ws_client._handle_message(event)
+    callbacks[1](MagicMock())
+
+    runtime.wait_for_employee_message_handoff.assert_called_once()
+    runtime.queue_main_bot_warning.assert_called_once()
+    reply.assert_not_called()
+
+
+def test_employee_handoff_warning_lane_unknown_uses_unknown_notice_and_fences(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    message_id = "om_employee_warning_handoff_unknown"
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(
+        return_value=_ready_employee_target()
+    )
+    runtime.wait_for_employee_message_handoff = MagicMock(
+        side_effect=OSError("handoff state unavailable")
+    )
+    runtime.queue_main_bot_warning.reset_mock()
+    reply = MagicMock(return_value=None)
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply
+    callbacks = []
+
+    def submit(_spec, callback):
+        callbacks.append(callback)
+        if len(callbacks) == 1:
+            raise TaskQueueFullError("normal", 1)
+        return _pending_task_handle("run_warning_unknown")
+
+    mock_ws_client._scheduler.submit.side_effect = submit
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(event)
+    callbacks[1](MagicMock())
+
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id=message_id,
+        text=(
+            "⚠️ 无法确认目标员工是否已接收该命令；命令状态未知，请勿重试。"
+            "请先等待目标员工回复，或联系管理员核查。"
+        ),
+    )
+    reply.assert_not_called()
+    assert mock_ws_client._message_ingress_guard.reserve(message_id) is None
+
+
+def test_employee_target_resolution_unknown_in_warning_lane_never_claims_denial(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.autonomous.provisioning.composition import (
+        EmployeeTargetResolutionUnknownError,
+    )
+
+    message_id = "om_employee_warning_target_unknown"
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(
+        side_effect=EmployeeTargetResolutionUnknownError(
+            "target snapshot unavailable"
+        )
+    )
+    runtime.queue_main_bot_warning.reset_mock()
+    reply = MagicMock(return_value=None)
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply
+    callbacks = []
+
+    def submit(_spec, callback):
+        callbacks.append(callback)
+        if len(callbacks) == 1:
+            raise TaskQueueFullError("normal", 1)
+        return _pending_task_handle("run_target_resolution_unknown")
+
+    mock_ws_client._scheduler.submit.side_effect = submit
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(event)
+    callbacks[1](MagicMock())
+
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id=message_id,
+        text=(
+            "⚠️ 无法确认目标员工是否已接收该命令；命令状态未知，请勿重试。"
+            "请先等待目标员工回复，或联系管理员核查。"
+        ),
+    )
+    reply.assert_not_called()
+    assert mock_ws_client._message_ingress_guard.reserve(message_id) is None
+
+
+def test_employee_handoff_successful_admission_reserves_dedup_before_worker_starts(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    message_id = "om_employee_handoff_admitted_not_started"
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock()
+    first = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+    second = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(first)
+    mock_ws_client._scheduler.submit.side_effect = TaskQueueFullError("normal", 1)
+    mock_ws_client._handle_message(second)
+
+    assert mock_ws_client._scheduler.submit.call_count == 1
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text.assert_not_called()
+
+
+def test_ordinary_message_reserves_dedup_before_worker_starts(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    event = create_mock_message(
+        "hello before worker",
+        message_id="om_ordinary_admitted_not_started",
+    )
+
+    mock_ws_client._handle_message(event)
+    mock_ws_client._handle_message(event)
+
+    assert mock_ws_client._scheduler.submit.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "admission_error",
+    (
+        RuntimeError("TaskScheduler admission is fenced"),
+        ValueError("TaskScheduler rejected an invalid spec"),
+    ),
+    ids=("runtime", "invalid-spec"),
+)
+def test_scheduler_error_releases_its_message_reservation(
+    mock_ws_client: FeishuWSClient,
+    admission_error: Exception,
+) -> None:
+    event = create_mock_message(
+        "hello after scheduler restart",
+        message_id="om_scheduler_runtime_error",
+    )
+    mock_ws_client._scheduler.submit.side_effect = admission_error
+
+    with pytest.raises(type(admission_error), match="TaskScheduler"):
+        mock_ws_client._handle_message(event)
+
+    mock_ws_client._scheduler.submit.side_effect = None
+    mock_ws_client._scheduler.submit.return_value = _pending_task_handle(
+        "run_after_restart"
+    )
+    mock_ws_client._handle_message(event)
+
+    assert mock_ws_client._scheduler.submit.call_count == 2
+
+
+def test_worker_finally_commits_the_original_reservation_after_event_drift(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    original_message_id = "om_worker_event_drift"
+    owner = mock_ws_client._message_ingress_guard.reserve(original_message_id)
+    assert owner is not None
+    event = create_mock_message(
+        "mutated after admission",
+        message_id=original_message_id,
+    )
+    event.event.message.message_id = ""
+
+    mock_ws_client._process_message_async(
+        event,
+        message_reservation_id=original_message_id,
+        message_reservation_owner=owner,
+    )
+
+    assert not mock_ws_client._message_ingress_guard.owns(
+        original_message_id,
+        owner,
+    )
+    assert mock_ws_client._message_ingress_guard.reserve(original_message_id) is None
+
+
+def test_stale_employee_warning_cannot_release_a_new_message_owner(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.autonomous.provisioning.composition import (
+        MainBotWarningPreparationError,
+    )
+
+    message_id = "om_employee_warning_aba"
+    callbacks = []
+    mock_ws_client._employee_department_runtime.resolve_ready_employee_bot_target = (
+        MagicMock(return_value=None)
+    )
+
+    def submit(_spec, callback):
+        if not callbacks:
+            callbacks.append(callback)
+            raise TaskQueueFullError("normal", 1)
+        callbacks.append(callback)
+        return _pending_task_handle("run_warning")
+
+    mock_ws_client._scheduler.submit.side_effect = submit
+    mock_ws_client._employee_department_runtime.queue_main_bot_warning.side_effect = (
+        MainBotWarningPreparationError("warning anchor unavailable")
+    )
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock(
+        return_value=None
+    )
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(event)
+    stale_warning = callbacks[1]
+    stale_warning(MagicMock())
+    new_owner = mock_ws_client._message_ingress_guard.reserve(message_id)
+    assert new_owner is not None
+
+    stale_warning(MagicMock())
+
+    assert mock_ws_client._message_ingress_guard.owns(message_id, new_owner)
+
+
+def test_employee_fallback_releases_owner_after_unexpected_warning_failure(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    message_id = "om_employee_fallback_crash"
+    callbacks = []
+
+    def submit(_spec, callback):
+        callbacks.append(callback)
+        if len(callbacks) == 1:
+            raise TaskQueueFullError("normal", 1)
+        return _pending_task_handle("run_warning")
+
+    mock_ws_client._scheduler.submit.side_effect = submit
+    mock_ws_client._employee_department_runtime.resolve_ready_employee_bot_target = (
+        MagicMock(return_value=None)
+    )
+    mock_ws_client._reply_employee_handoff_unconfirmed = MagicMock(
+        side_effect=RuntimeError("fallback warning crashed")
+    )
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(event)
+    with pytest.raises(RuntimeError, match="fallback warning crashed"):
+        callbacks[1](MagicMock())
+
+    retry_owner = mock_ws_client._message_ingress_guard.reserve(message_id)
+    assert retry_owner is not None
+    assert mock_ws_client._message_ingress_guard.release(message_id, retry_owner)
+
+
+@pytest.mark.parametrize(
+    "warning_admission_error",
+    (
+        TaskQueueFullError("system", 1),
+        ValueError("invalid warning TaskSpec"),
+    ),
+    ids=("full", "invalid-spec"),
+)
+def test_employee_handoff_backpressure_releases_dedup_when_warning_lane_fails(
+    mock_ws_client: FeishuWSClient,
+    warning_admission_error: Exception,
+) -> None:
+    message_id = "om_employee_handoff_all_lanes_full"
+    mock_ws_client._scheduler.submit.side_effect = (
+        TaskQueueFullError("normal", 1),
+        warning_admission_error,
+    )
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    with pytest.raises(TaskQueueFullError):
+        mock_ws_client._handle_message(event)
+
+    assert not mock_ws_client._message_cache.contains(message_id)
+    retry_owner = mock_ws_client._message_ingress_guard.reserve(message_id)
+    assert retry_owner is not None
+    assert mock_ws_client._message_ingress_guard.release(message_id, retry_owner)
+
+
+def test_employee_target_lookup_never_blocks_ws_callback(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+
+    def slow_lookup(**_kwargs):
+        time.sleep(0.2)
+        return _ready_employee_target()
+
+    runtime.resolve_ready_employee_bot_target = slow_lookup
+    event = _mentioned_group_command(
+        "@_user_1 /fire Atlas",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id="om_nonblocking_employee_lookup",
+    )
+
+    started = time.monotonic()
+    mock_ws_client._handle_message(event)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.1
+    _spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    callback(MagicMock())
+    assert runtime.resolve_ready_employee_bot_target is slow_lookup
+
+
+def test_employee_target_trust_snapshot_never_blocks_ws_callback(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    trust_calls = 0
+
+    def slow_trust(**_kwargs):
+        nonlocal trust_calls
+        trust_calls += 1
+        time.sleep(0.2)
+        return None
+
+    mock_ws_client._resolve_effective_trust = slow_trust
+    event = _mentioned_group_command(
+        "@_user_1 /fire Atlas",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id="om_nonblocking_employee_trust",
+    )
+
+    started = time.monotonic()
+    mock_ws_client._handle_message(event)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.1
+    assert trust_calls == 0
+    _spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    callback(MagicMock())
+    assert trust_calls == 1
+
+
+def test_managed_owner_employee_candidate_defers_trust_without_legacy_allowlist(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    owner_id = "ou_managed_owner"
+    mock_ws_client._managed_group_owner_id = owner_id
+    mock_ws_client._ingress_access_policy_provider.swap(
+        IngressAccessPolicy(
+            admin_ids=frozenset({owner_id}),
+            allowed_user_ids=frozenset({owner_id}),
+            allowed_chat_ids=frozenset(),
+            mode=IngressAccessMode.ENFORCED,
+            admin_bootstrap_scope="p2p_only",
+        )
+    )
+    order: list[str] = []
+    managed_trust = SimpleNamespace(
+        zone=TrustZone.MANAGED_AGENT_GROUP,
+        actor=ActorKind.OWNER,
+        managed_group=SimpleNamespace(
+            chat_id="oc_456",
+            project_id="project_managed",
+        ),
+    )
+
+    def resolve_trust(**_kwargs):
+        order.append("trust")
+        return managed_trust
+
+    runtime = mock_ws_client._employee_department_runtime
+    mock_ws_client._resolve_effective_trust = MagicMock(side_effect=resolve_trust)
+    runtime.resolve_ready_employee_bot_target = MagicMock(
+        side_effect=lambda **_kwargs: (
+            order.append("target") or _ready_employee_target()
+        )
+    )
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=True)
+    legacy_decide = mock_ws_client._decide_ingress_access
+    mock_ws_client._decide_ingress_access = MagicMock(wraps=legacy_decide)
+    event = _mentioned_group_command(
+        "@_user_1 /task ship managed release",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id="om_managed_candidate_without_static_chat",
+    )
+    event.event.sender.sender_id.open_id = owner_id
+
+    mock_ws_client._handle_message(event)
+
+    mock_ws_client._resolve_effective_trust.assert_not_called()
+    mock_ws_client._decide_ingress_access.assert_not_called()
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "employee_target_handoff"
+    callback(MagicMock())
+    assert order[:2] == ["trust", "target"]
+    mock_ws_client._resolve_effective_trust.assert_called_once()
+    runtime.wait_for_employee_message_handoff.assert_called_once()
+
+
+def test_deferred_employee_candidate_rechecks_group_before_target_lookup(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    owner_id = "ou_managed_owner"
+    mock_ws_client._managed_group_owner_id = owner_id
+    mock_ws_client._ingress_access_policy_provider.swap(
+        IngressAccessPolicy(
+            admin_ids=frozenset({owner_id}),
+            allowed_user_ids=frozenset({owner_id}),
+            allowed_chat_ids=frozenset(),
+            mode=IngressAccessMode.ENFORCED,
+            admin_bootstrap_scope="p2p_only",
+        )
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(
+        return_value=SimpleNamespace(
+            zone=TrustZone.EXTERNAL_OR_UNKNOWN_GROUP,
+            actor=ActorKind.UNKNOWN,
+            managed_group=None,
+        )
+    )
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(
+        return_value=_ready_employee_target()
+    )
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=True)
+    reply = MagicMock(return_value="om_unexpected_warning")
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply
+    event = _mentioned_group_command(
+        "@_user_1 /task should not run",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id="om_deferred_unmanaged_group",
+    )
+    event.event.sender.sender_id.open_id = owner_id
+
+    mock_ws_client._handle_message(event)
+    _spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    callback(MagicMock())
+
+    mock_ws_client._resolve_effective_trust.assert_called_once()
+    runtime.resolve_ready_employee_bot_target.assert_not_called()
+    runtime.wait_for_employee_message_handoff.assert_not_called()
+    reply.assert_not_called()
+
+
+def test_employee_handoff_warning_only_enqueues_durable_delivery(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.queue_main_bot_warning.reset_mock()
+    reply = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = reply
+    candidate = SimpleNamespace(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id="om_retry_warning",
+        bot_open_id="ou_employee_alpha",
+    )
+
+    mock_ws_client._reply_employee_handoff_unconfirmed(candidate)
+
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id="om_retry_warning",
+        text=(
+            "⚠️ 尚未确认目标员工已接收该命令；GhostAP 主 Bot 未执行。"
+            "请查看员工回复后再决定是否重试。"
+        ),
+    )
+    reply.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "retry_allowed"),
+    (("identity", True), ("target", False), ("handoff", False)),
+)
+def test_employee_warning_delivery_failure_preserves_handoff_fence(
+    mock_ws_client: FeishuWSClient,
+    failure_stage: str,
+    retry_allowed: bool,
+) -> None:
+    message_id = f"om_employee_warning_failed_{failure_stage}"
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(
+        return_value=None if failure_stage == "target" else _ready_employee_target()
+    )
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=False)
+    mock_ws_client._main_bot_open_id = "" if failure_stage == "identity" else "ou_main_bot"
+    mock_ws_client._sync_main_bot_identity = MagicMock(
+        return_value="" if failure_stage == "identity" else "ou_main_bot"
+    )
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock(
+        return_value=None
+    )
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(event)
+    if failure_stage == "identity":
+        mock_ws_client._scheduler.submit.assert_not_called()
+        mock_ws_client._sync_main_bot_identity.assert_not_called()
+        retry_owner = mock_ws_client._message_ingress_guard.reserve(message_id)
+        assert retry_owner is not None
+        assert mock_ws_client._message_ingress_guard.release(
+            message_id,
+            retry_owner,
+        )
+        return
+    _spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    callback(MagicMock())
+
+    retry_owner = mock_ws_client._message_ingress_guard.reserve(message_id)
+    if retry_allowed:
+        assert retry_owner is not None
+        assert mock_ws_client._message_ingress_guard.release(message_id, retry_owner)
+    else:
+        assert retry_owner is None
+
+
+def test_definite_target_absence_warning_anchor_failure_releases_for_safe_retry(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.autonomous.provisioning.composition import (
+        MainBotWarningPreparationError,
+    )
+
+    message_id = "om_target_absent_warning_anchor_failed"
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(return_value=None)
+    runtime.queue_main_bot_warning.reset_mock()
+    runtime.queue_main_bot_warning.side_effect = MainBotWarningPreparationError(
+        "warning PREPARED frame was not anchored"
+    )
+    direct_reply = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = direct_reply
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(event)
+    _spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    callback(MagicMock())
+
+    runtime.queue_main_bot_warning.assert_called_once()
+    direct_reply.assert_not_called()
+    retry_owner = mock_ws_client._message_ingress_guard.reserve(message_id)
+    assert retry_owner is not None
+    assert mock_ws_client._message_ingress_guard.release(message_id, retry_owner)
+
+
+@pytest.mark.parametrize("unknown_stage", ("target", "handoff"))
+def test_unknown_warning_anchor_failure_keeps_reservation_fenced(
+    mock_ws_client: FeishuWSClient,
+    unknown_stage: str,
+) -> None:
+    from src.autonomous.provisioning.composition import (
+        EmployeeMessageHandoffUnknownError,
+        EmployeeTargetResolutionUnknownError,
+        MainBotWarningPreparationError,
+    )
+
+    message_id = f"om_{unknown_stage}_unknown_warning_anchor_failed"
+    runtime = mock_ws_client._employee_department_runtime
+    if unknown_stage == "target":
+        runtime.resolve_ready_employee_bot_target = MagicMock(
+            side_effect=EmployeeTargetResolutionUnknownError("snapshot unavailable")
+        )
+    else:
+        runtime.resolve_ready_employee_bot_target = MagicMock(
+            return_value=_ready_employee_target()
+        )
+        runtime.wait_for_employee_message_handoff = MagicMock(
+            side_effect=EmployeeMessageHandoffUnknownError(
+                "handoff projection unavailable"
+            )
+        )
+    runtime.queue_main_bot_warning.reset_mock()
+    runtime.queue_main_bot_warning.side_effect = MainBotWarningPreparationError(
+        "warning PREPARED frame was not anchored"
+    )
+    direct_reply = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = direct_reply
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_employee_alpha",
+            name="Employee",
+        ),
+        message_id=message_id,
+    )
+
+    mock_ws_client._handle_message(event)
+    _spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    callback(MagicMock())
+
+    runtime.queue_main_bot_warning.assert_called_once()
+    direct_reply.assert_not_called()
+    assert mock_ws_client._message_ingress_guard.reserve(message_id) is None
+
+
+@pytest.mark.parametrize(
+    "reply_error",
+    (RuntimeError("reply transport failed"), KeyError("reply contract failed")),
+    ids=("transport", "unexpected"),
+)
+def test_ordinary_backpressure_reply_exception_releases_message_reservation(
+    mock_ws_client: FeishuWSClient,
+    reply_error: Exception,
+) -> None:
+    message_id = "om_backpressure_reply_raised"
+    mock_ws_client._scheduler.submit.side_effect = TaskQueueFullError("normal", 1)
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock(
+        side_effect=reply_error
+    )
+
+    with pytest.raises(type(reply_error)):
+        mock_ws_client._handle_message(
+            create_mock_message("hello", message_id=message_id)
+        )
+
+    retry_owner = mock_ws_client._message_ingress_guard.reserve(message_id)
+    assert retry_owner is not None
+    assert mock_ws_client._message_ingress_guard.release(message_id, retry_owner)
+
+
+def test_scheduler_guard_failure_durably_warns_and_fences_message_origin(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    @contextmanager
+    def broken_guard():
+        raise RuntimeError("restart gate admission failed")
+        yield
+
+    scheduler = TaskScheduler(
+        max_concurrent=1,
+        per_key_concurrency=1,
+        system_concurrency=1,
+        max_pending_normal=2,
+        max_pending_system=2,
+        max_terminal_history=10,
+        run_guard=broken_guard,
+    )
+    previous_scheduler = mock_ws_client._scheduler
+    mock_ws_client._scheduler = scheduler
+    message_id = "om_restart_guard_failed_before_callback"
+    try:
+        mock_ws_client._handle_message(
+            create_mock_message("hello", message_id=message_id)
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            states = scheduler.list_tasks(
+                chat_id="oc_456",
+                include_done=True,
+                limit=10,
+            )
+            if states and states[0].status is TaskStatus.FAILED:
+                break
+            time.sleep(0.01)
+        assert states and states[0].status is TaskStatus.FAILED
+
+        deadline = time.monotonic() + 2
+        while (
+            time.monotonic() < deadline
+            and not mock_ws_client._employee_department_runtime.queue_main_bot_warning.called
+        ):
+            time.sleep(0.01)
+        mock_ws_client._employee_department_runtime.queue_main_bot_warning.assert_called_once_with(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            message_id=message_id,
+            text=UI_TEXT["ws_message_prestart_terminal"],
+        )
+        assert mock_ws_client._message_ingress_guard.reserve(message_id) is None
+    finally:
+        scheduler.stop(wait=True, shutdown_executor=True)
+        mock_ws_client._scheduler = previous_scheduler
+
+
+def test_scheduler_queued_cancel_durably_warns_and_fences_message_origin(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    scheduler = TaskScheduler(
+        max_concurrent=1,
+        per_key_concurrency=1,
+        system_concurrency=1,
+        max_pending_normal=2,
+        max_pending_system=2,
+        max_terminal_history=10,
+    )
+    previous_scheduler = mock_ws_client._scheduler
+    mock_ws_client._scheduler = scheduler
+    blocker_started = threading.Event()
+    release_blocker = threading.Event()
+    scheduler.submit(
+        TaskSpec(chat_id="oc_456", name="blocker"),
+        lambda _ctx: (blocker_started.set(), release_blocker.wait(timeout=2)),
+    )
+    message_id = "om_queued_message_canceled"
+    try:
+        assert blocker_started.wait(timeout=1)
+        mock_ws_client._handle_message(
+            create_mock_message("hello", message_id=message_id)
+        )
+        queued = next(
+            state
+            for state in scheduler.list_tasks(
+                chat_id="oc_456",
+                include_done=False,
+                limit=10,
+            )
+            if state.spec.message_id == message_id
+        )
+        assert scheduler.cancel(queued.run_id)
+
+        deadline = time.monotonic() + 2
+        while (
+            time.monotonic() < deadline
+            and not mock_ws_client._employee_department_runtime.queue_main_bot_warning.called
+        ):
+            time.sleep(0.01)
+        mock_ws_client._employee_department_runtime.queue_main_bot_warning.assert_called_once_with(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            message_id=message_id,
+            text=UI_TEXT["ws_message_prestart_terminal"],
+        )
+        assert mock_ws_client._message_ingress_guard.reserve(message_id) is None
+    finally:
+        release_blocker.set()
+        scheduler.wait_for_idle(timeout=2)
+        scheduler.stop(wait=True, shutdown_executor=True)
+        mock_ws_client._scheduler = previous_scheduler
+
+
+def test_terminal_before_reservation_bind_replays_after_scheduler_history_reap() -> None:
+    from src.feishu.message_cache import MessageCache
+    from src.feishu.ws_client import _MessageIngressReservation
+    from src.feishu.ws_event_router import MessageIngressGuard
+
+    @contextmanager
+    def broken_guard():
+        raise RuntimeError("restart gate admission failed before callback")
+        yield
+
+    scheduler = TaskScheduler(
+        max_concurrent=1,
+        per_key_concurrency=1,
+        system_concurrency=1,
+        max_pending_normal=2,
+        max_pending_system=2,
+        max_terminal_history=10,
+        run_guard=broken_guard,
+    )
+    client = object.__new__(FeishuWSClient)
+    client._scheduler = scheduler
+    client._employee_department_runtime = SimpleNamespace(
+        queue_main_bot_warning=MagicMock(return_value=True),
+    )
+    guard = MessageIngressGuard(
+        message_cache=MessageCache(ttl=300, max_size=10),
+        message_expire_seconds=30,
+    )
+    message_id = "om_terminal_before_reservation_bind"
+    owner = guard.reserve(message_id)
+    assert owner is not None
+    reservation = _MessageIngressReservation(
+        guard=guard,
+        message_id=message_id,
+        owner=owner,
+    )
+    callback_called = threading.Event()
+
+    try:
+        handle = scheduler.submit(
+            TaskSpec(chat_id="replay-chat", name="never-started"),
+            lambda _ctx: callback_called.set(),
+        )
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            state = scheduler.get_state(handle.run_id)
+            if state is not None and state.status is TaskStatus.FAILED:
+                break
+            time.sleep(0.01)
+        assert state is not None and state.status is TaskStatus.FAILED
+        assert scheduler.wait_for_idle(timeout=2)
+        with scheduler._cv:
+            assert scheduler._reap_completed_states(max_age_seconds=0) == 1
+        assert scheduler.get_state(handle.run_id) is None
+
+        client._bind_message_ingress_reservation(
+            handle,
+            reservation,
+            tenant_key="tenant-replay",
+            chat_id="replay-chat",
+        )
+
+        assert guard.reserve(message_id) is None
+        assert not callback_called.is_set()
+    finally:
+        scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_reservation_completion_callback_contains_cleanup_failure() -> None:
+    class DeferredHandle:
+        run_id = "run_completion_callback_failure"
+
+        def __init__(self) -> None:
+            self.callback = None
+
+        def add_done_callback(self, callback) -> None:
+            self.callback = callback
+
+    client = object.__new__(FeishuWSClient)
+    client._scheduler = MagicMock()
+    client._employee_department_runtime = SimpleNamespace(
+        queue_main_bot_warning=MagicMock(return_value=True),
+    )
+    reservation = MagicMock()
+    reservation.owns.return_value = True
+    reservation.claim_unstarted_terminal.return_value = True
+    reservation.message_id = "om_completion_callback_failure"
+    reservation.commit.side_effect = RuntimeError("reservation cleanup failed")
+    handle = DeferredHandle()
+
+    client._bind_message_ingress_reservation(
+        handle,
+        reservation,
+        tenant_key="tenant-test",
+        chat_id="oc-test",
+    )
+
+    assert handle.callback is not None
+    handle.callback(
+        SimpleNamespace(
+            run_id=handle.run_id,
+            status=TaskStatus.FAILED,
+        )
+    )
+    reservation.commit.assert_called_once_with()
+    client._scheduler.get_state.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("wait_result", "expected_text"),
+    [
+        (
+            False,
+            "⚠️ 尚未确认目标员工已接收该命令；GhostAP 主 Bot 未执行。"
+            "请查看员工回复后再决定是否重试。",
+        ),
+        (
+            OSError("employee ingress unavailable"),
+            "⚠️ 无法确认目标员工是否已接收该命令；命令状态未知，请勿重试。"
+            "请先等待目标员工回复，或联系管理员核查。",
+        ),
+    ],
+    ids=("not-accepted", "dependency-failure"),
+)
+def test_main_bot_reports_employee_handoff_state_without_executing_command(
+    mock_ws_client: FeishuWSClient,
+    wait_result: bool | Exception,
+    expected_text: str,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(return_value=_ready_employee_target())
+    runtime.wait_for_employee_message_handoff = MagicMock(
         side_effect=wait_result if isinstance(wait_result, Exception) else None,
         return_value=wait_result if isinstance(wait_result, bool) else False,
     )
-    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock()
+    runtime.queue_main_bot_warning.reset_mock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock(
+        return_value="om_warning_reply"
+    )
     mock_ws_client._dispatch_message_logic = MagicMock()
     event = _mentioned_group_command(
         "@_user_1 /stop_wf",
@@ -333,19 +1573,27 @@ def test_main_bot_reports_unconfirmed_employee_handoff_without_executing_command
     _spec, callback = mock_ws_client._scheduler.submit.call_args.args
     callback(MagicMock())
 
-    mock_ws_client._handler_ctx.handlers["coco"].reply_text.assert_called_once_with(
-        "om_employee_handoff_unconfirmed",
-        "⚠️ 尚未确认目标员工已接收该命令；GhostAP 主 Bot 未执行。请查看员工回复后再决定是否重试。",
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id="om_employee_handoff_unconfirmed",
+        text=expected_text,
     )
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text.assert_not_called()
     mock_ws_client._dispatch_message_logic.assert_not_called()
 
 
-def test_main_bot_does_not_suppress_ready_employee_outside_current_group(
+def test_main_bot_fails_closed_for_employee_outside_current_group(
     mock_ws_client: FeishuWSClient,
 ) -> None:
     runtime = mock_ws_client._employee_department_runtime
 
     runtime.resolve_ready_employee_bot_target = MagicMock(return_value=None)
+    runtime.queue_main_bot_warning.reset_mock()
+    mock_ws_client._dispatch_message_logic = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock(
+        return_value="om_warning_reply"
+    )
     event = _mentioned_group_command(
         "@_user_1 /stop_wf",
         _sdk_message_mention(
@@ -358,15 +1606,30 @@ def test_main_bot_does_not_suppress_ready_employee_outside_current_group(
 
     mock_ws_client._handle_message(event)
 
-    mock_ws_client._scheduler.submit.assert_called_once()
+    _spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    callback(MagicMock())
+    mock_ws_client._dispatch_message_logic.assert_not_called()
+    runtime.queue_main_bot_warning.assert_called_once()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text.assert_not_called()
 
 
-def test_main_bot_routes_when_scoped_ready_employee_lookup_fails(
+def test_main_bot_fails_closed_when_scoped_employee_lookup_fails(
     mock_ws_client: FeishuWSClient,
 ) -> None:
+    from src.autonomous.provisioning.composition import (
+        EmployeeTargetResolutionUnknownError,
+    )
+
     runtime = mock_ws_client._employee_department_runtime
     runtime.resolve_ready_employee_bot_target = MagicMock(
-        side_effect=RuntimeError("identity snapshot unavailable")
+        side_effect=EmployeeTargetResolutionUnknownError(
+            "identity snapshot unavailable"
+        )
+    )
+    runtime.queue_main_bot_warning.reset_mock()
+    mock_ws_client._dispatch_message_logic = MagicMock()
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text = MagicMock(
+        return_value="om_warning_reply"
     )
     event = _mentioned_group_command(
         "@_user_1 /stop_wf",
@@ -380,7 +1643,69 @@ def test_main_bot_routes_when_scoped_ready_employee_lookup_fails(
 
     mock_ws_client._handle_message(event)
 
-    mock_ws_client._scheduler.submit.assert_called_once()
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "employee_target_handoff"
+    callback(MagicMock())
+    mock_ws_client._dispatch_message_logic.assert_not_called()
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id="om_employee_lookup_failure",
+        text=(
+            "⚠️ 无法确认目标员工是否已接收该命令；命令状态未知，请勿重试。"
+            "请先等待目标员工回复，或联系管理员核查。"
+        ),
+    )
+    mock_ws_client._handler_ctx.handlers["coco"].reply_text.assert_not_called()
+
+
+def test_employee_target_lookup_structure_drift_is_unknown(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.autonomous.provisioning.composition import (
+        EmployeeTargetResolutionUnknownError,
+    )
+
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(
+        return_value=SimpleNamespace(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_employee_alpha",
+            agent_id="agt_alpha",
+            bot_principal_id="bot_alpha",
+            app_id="cli_alpha",
+            channel_generation=3,
+            connection_id=None,
+        )
+    )
+    candidate = SimpleNamespace(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id="om_structure_drift",
+        bot_open_id="ou_employee_alpha",
+    )
+
+    with pytest.raises(EmployeeTargetResolutionUnknownError, match="structure"):
+        mock_ws_client._resolve_ready_employee_target(candidate)
+
+
+def test_employee_target_lookup_programming_assertion_propagates(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(
+        side_effect=AssertionError("programming invariant")
+    )
+    candidate = SimpleNamespace(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id="om_lookup_assertion",
+        bot_open_id="ou_employee_alpha",
+    )
+
+    with pytest.raises(AssertionError, match="programming invariant"):
+        mock_ws_client._resolve_ready_employee_target(candidate)
 
 
 def test_ready_employee_identity_snapshot_supports_tenant_group_scope() -> None:
@@ -408,14 +1733,18 @@ def test_ready_employee_identity_snapshot_supports_tenant_group_scope() -> None:
         employees={"agt_alpha": alpha, "agt_beta": beta},
         bot_principals={
             "bot_alpha": SimpleNamespace(
+                bot_principal_id="bot_alpha",
                 tenant_key="tenant_test",
                 agent_id="agt_alpha",
                 app_id="cli_alpha",
+                credential_ref="cred_alpha",
             ),
             "bot_beta": SimpleNamespace(
+                bot_principal_id="bot_beta",
                 tenant_key="tenant_other",
                 agent_id="agt_beta",
                 app_id="cli_beta",
+                credential_ref="cred_beta",
             ),
         },
     )
@@ -426,7 +1755,9 @@ def test_ready_employee_identity_snapshot_supports_tenant_group_scope() -> None:
             tenant_key="tenant_test",
             bot_principal_id="bot_alpha",
             app_id="cli_alpha",
-            identity={"open_id": "ou_employee_alpha"},
+            generation=3,
+            identity={"app_id": "cli_alpha", "open_id": "ou_employee_alpha"},
+            ready_metadata={"connection_id": "conn_alpha"},
         ),
         "agt_beta": SimpleNamespace(
             state=ChannelProcessState.READY,
@@ -434,11 +1765,40 @@ def test_ready_employee_identity_snapshot_supports_tenant_group_scope() -> None:
             tenant_key="tenant_other",
             bot_principal_id="bot_beta",
             app_id="cli_beta",
-            identity={"open_id": "ou_employee_beta"},
+            generation=4,
+            identity={"app_id": "cli_beta", "open_id": "ou_employee_beta"},
+            ready_metadata={"connection_id": "conn_beta"},
         ),
     }
     runtime = object.__new__(EmployeeDepartmentRuntime)
-    runtime._service = SimpleNamespace(synchronize_projection=lambda: projection)
+    runtime._service = SimpleNamespace(
+        current_employee_transport_snapshot=lambda: (
+            tuple(projection.employees.values()),
+            tuple(projection.bot_principals.values()),
+            (
+                SimpleNamespace(
+                    phase=SimpleNamespace(value="active"),
+                    tenant_key="tenant_test",
+                    agent_id="agt_alpha",
+                    bot_principal_id="bot_alpha",
+                    app_id="cli_alpha",
+                    channel_generation=3,
+                    channel_connection_id="conn_alpha",
+                    channel_identity_app_id="cli_alpha",
+                ),
+                SimpleNamespace(
+                    phase=SimpleNamespace(value="active"),
+                    tenant_key="tenant_other",
+                    agent_id="agt_beta",
+                    bot_principal_id="bot_beta",
+                    app_id="cli_beta",
+                    channel_generation=4,
+                    channel_connection_id="conn_beta",
+                    channel_identity_app_id="cli_beta",
+                ),
+            ),
+        ),
+    )
     runtime._channels = SimpleNamespace(status=statuses.get)
 
     assert runtime.trusted_employee_bot_open_ids() == frozenset(
@@ -461,6 +1821,8 @@ def test_ready_employee_identity_snapshot_supports_tenant_group_scope() -> None:
         target.bot_principal_id,
         target.app_id,
         target.bot_open_id,
+        target.channel_generation,
+        target.connection_id,
     ) == (
         "tenant_test",
         "oc_456",
@@ -468,14 +1830,216 @@ def test_ready_employee_identity_snapshot_supports_tenant_group_scope() -> None:
         "bot_alpha",
         "cli_alpha",
         "ou_employee_alpha",
+        3,
+        "conn_alpha",
     )
+
+
+def test_ready_employee_target_treats_live_durable_binding_drift_as_unknown() -> None:
+    from src.autonomous.domain import EmployeeState, WorkerType
+    from src.autonomous.provisioning.composition import (
+        EmployeeDepartmentRuntime,
+        EmployeeTargetResolutionUnknownError,
+    )
+    from src.autonomous.supervisor.employee_channels import ChannelProcessState
+
+    employee = SimpleNamespace(
+        agent_id="agt_alpha",
+        tenant_key="tenant_test",
+        state=EmployeeState.ACTIVE,
+        worker_type=WorkerType.VISIBLE,
+        bot_principal_id="bot_alpha",
+        member_groups=("oc_456",),
+    )
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._service = SimpleNamespace(
+        current_employee_transport_snapshot=lambda: (
+            (employee,),
+            (
+                SimpleNamespace(
+                    bot_principal_id="bot_alpha",
+                    tenant_key="tenant_test",
+                    agent_id="agt_alpha",
+                    app_id="cli_alpha",
+                    credential_ref="cred_alpha",
+                ),
+            ),
+            (
+                SimpleNamespace(
+                    phase=SimpleNamespace(value="active"),
+                    tenant_key="tenant_test",
+                    agent_id="agt_alpha",
+                    bot_principal_id="bot_alpha",
+                    app_id="cli_alpha",
+                    channel_generation=3,
+                    channel_connection_id="conn_old",
+                    channel_identity_app_id="cli_alpha",
+                ),
+            ),
+        ),
+    )
+    runtime._channels = SimpleNamespace(
+        status=lambda _agent_id: SimpleNamespace(
+            state=ChannelProcessState.READY,
+            agent_id="agt_alpha",
+            tenant_key="tenant_test",
+            bot_principal_id="bot_alpha",
+            app_id="cli_alpha",
+            generation=3,
+            identity={"app_id": "cli_alpha", "open_id": "ou_employee_alpha"},
+            ready_metadata={"connection_id": "conn_reconnected"},
+        )
+    )
+
+    with pytest.raises(EmployeeTargetResolutionUnknownError, match="ambiguous"):
+        runtime.resolve_ready_employee_bot_target(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_employee_alpha",
+        )
+
+    employees, principals, durable_states = (
+        runtime._service.current_employee_transport_snapshot()
+    )
+    runtime._service.current_employee_transport_snapshot = lambda: (
+        employees,
+        principals,
+        (
+            *durable_states,
+            SimpleNamespace(
+                phase=SimpleNamespace(value="active"),
+                tenant_key="tenant_test",
+                agent_id="agt_alpha",
+                bot_principal_id="bot_alpha",
+                app_id="cli_alpha",
+                channel_generation=3,
+                channel_connection_id="conn_reconnected",
+                channel_identity_app_id="cli_alpha",
+            ),
+        ),
+    )
+    with pytest.raises(EmployeeTargetResolutionUnknownError, match="ambiguous"):
+        runtime.resolve_ready_employee_bot_target(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_employee_alpha",
+        )
+
+
+def test_ready_employee_target_snapshot_dependency_failure_is_unknown() -> None:
+    from src.autonomous.provisioning.composition import (
+        EmployeeDepartmentRuntime,
+        EmployeeTargetResolutionUnknownError,
+    )
+
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._service = SimpleNamespace(
+        current_employee_transport_snapshot=MagicMock(
+            side_effect=OSError("snapshot unavailable")
+        )
+    )
+    runtime._channels = SimpleNamespace(status=MagicMock())
+
+    with pytest.raises(EmployeeTargetResolutionUnknownError, match="snapshot"):
+        runtime.resolve_ready_employee_bot_target(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_employee_alpha",
+        )
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    (((), "not-a-tuple", ()), ((), ())),
+    ids=("invalid-member", "invalid-arity"),
+)
+def test_ready_employee_target_snapshot_structure_drift_is_unknown(
+    snapshot: object,
+) -> None:
+    from src.autonomous.provisioning.composition import (
+        EmployeeDepartmentRuntime,
+        EmployeeTargetResolutionUnknownError,
+    )
+
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._service = SimpleNamespace(
+        current_employee_transport_snapshot=lambda: snapshot,
+    )
+    runtime._channels = SimpleNamespace(status=MagicMock())
+
+    with pytest.raises(EmployeeTargetResolutionUnknownError, match="structure"):
+        runtime.resolve_ready_employee_bot_target(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_employee_alpha",
+        )
+
+
+def test_ready_employee_target_snapshot_element_drift_is_unknown() -> None:
+    from src.autonomous.provisioning.composition import (
+        EmployeeDepartmentRuntime,
+        EmployeeTargetResolutionUnknownError,
+    )
+
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._service = SimpleNamespace(
+        current_employee_transport_snapshot=lambda: ((object(),), (), ()),
+    )
+    runtime._channels = SimpleNamespace(status=MagicMock())
+
+    with pytest.raises(EmployeeTargetResolutionUnknownError, match="structure"):
+        runtime.resolve_ready_employee_bot_target(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_employee_alpha",
+        )
+
+
+def test_ready_employee_target_snapshot_programming_assertion_propagates() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._service = SimpleNamespace(
+        current_employee_transport_snapshot=MagicMock(
+            side_effect=AssertionError("programming invariant")
+        )
+    )
+    runtime._channels = SimpleNamespace(status=MagicMock())
+
+    with pytest.raises(AssertionError, match="programming invariant"):
+        runtime.resolve_ready_employee_bot_target(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_employee_alpha",
+        )
+
+
+def test_ready_employee_target_snapshot_untyped_runtime_error_propagates() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._service = SimpleNamespace(
+        current_employee_transport_snapshot=MagicMock(
+            side_effect=RuntimeError("unexpected programming failure")
+        )
+    )
+    runtime._channels = SimpleNamespace(status=MagicMock())
+
+    with pytest.raises(RuntimeError, match="unexpected programming failure"):
+        runtime.resolve_ready_employee_bot_target(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_employee_alpha",
+        )
 
 
 def test_employee_handoff_hashes_raw_cross_app_coordinates_for_durable_proof() -> None:
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 
     ingress = SimpleNamespace(
-        wait_for_anchored_message_acceptance=MagicMock(return_value=object())
+        wait_for_anchored_message_acceptance=MagicMock(
+            return_value=_accepted_handoff_outcome("acc_exact")
+        )
     )
     runtime = object.__new__(EmployeeDepartmentRuntime)
     runtime._ingress = ingress
@@ -485,6 +2049,8 @@ def test_employee_handoff_hashes_raw_cross_app_coordinates_for_durable_proof() -
         agent_id="agt_alpha",
         bot_principal_id="bot_alpha",
         app_id="cli_alpha",
+        channel_generation=3,
+        connection_id="conn_alpha",
         chat_id="oc_raw_cross_app",
         message_id="om_raw_cross_app",
         timeout=1.75,
@@ -499,13 +2065,145 @@ def test_employee_handoff_hashes_raw_cross_app_coordinates_for_durable_proof() -
         event_type="im.message.receive_v1",
         chat_id="oc_" + hashlib.sha256(b"oc_raw_cross_app").hexdigest(),
         message_id="om_" + hashlib.sha256(b"om_raw_cross_app").hexdigest(),
+        channel_generation=3,
+        connection_id="conn_alpha",
         timeout=1.75,
     )
 
 
-def test_ready_employee_target_rejects_ambiguous_open_id_binding() -> None:
-    from src.autonomous.domain import EmployeeState, WorkerType
+@pytest.mark.parametrize(
+    "projection_result",
+    (True, False),
+)
+def test_employee_handoff_requires_proven_router_ownership(
+    projection_result: bool,
+) -> None:
+    from src.autonomous.provisioning import composition as employee_composition
+    from src.autonomous.provisioning.composition import (
+        EmployeeDepartmentRuntime,
+        EmployeeMessageHandoffUnknownError,
+    )
+
+    ingress = SimpleNamespace(
+        wait_for_anchored_message_acceptance=MagicMock(
+            return_value=_accepted_handoff_outcome("acc_bound")
+        ),
+    )
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._ingress = ingress
+    runtime._router = object()
+    runtime._closing = False
+    runtime._employee_handoff_projection_result = MagicMock(
+        return_value=(
+            employee_composition._EmployeeHandoffProjection.OWNED
+            if projection_result
+            else employee_composition._EmployeeHandoffProjection.INVALID_UNKNOWN
+        )
+    )
+
+    def call() -> bool:
+        return runtime.wait_for_employee_message_handoff(
+            tenant_key="tenant_test",
+            agent_id="agt_alpha",
+            bot_principal_id="bot_alpha",
+            app_id="cli_alpha",
+            channel_generation=3,
+            connection_id="conn_alpha",
+            chat_id="oc_raw_cross_app",
+            message_id="om_raw_cross_app",
+            timeout=0,
+        )
+    if projection_result:
+        assert call() is True
+    else:
+        with pytest.raises(EmployeeMessageHandoffUnknownError):
+            call()
+
+
+def test_employee_handoff_returns_immediately_after_durable_acceptance_denial() -> None:
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    denied = MessageAcceptanceOutcome(
+        status="denied",
+        acceptance=None,
+        channel_generation=3,
+        connection_id="conn_alpha",
+    )
+    ingress = SimpleNamespace(
+        wait_for_anchored_message_acceptance=MagicMock(return_value=denied),
+    )
+    runtime = object.__new__(EmployeeDepartmentRuntime)
+    runtime._ingress = ingress
+    runtime._router = object()
+
+    started = time.monotonic()
+    accepted = runtime.wait_for_employee_message_handoff(
+        tenant_key="tenant_test",
+        agent_id="agt_alpha",
+        bot_principal_id="bot_alpha",
+        app_id="cli_alpha",
+        channel_generation=3,
+        connection_id="conn_alpha",
+        chat_id="oc_raw_cross_app",
+        message_id="om_raw_cross_app",
+        timeout=1,
+    )
+
+    assert accepted is False
+    assert time.monotonic() - started < 0.1
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    (
+        "task_invalid_arguments",
+        "stop_cancel_requested",
+        "stop_no_active",
+        "history_completed",
+        "history_denied",
+        "history_failed",
+        "memory_completed",
+        "memory_denied",
+        "memory_failed",
+        "status_completed",
+        "status_unavailable",
+        "status_invalid_arguments",
+    ),
+)
+def test_employee_handoff_recognizes_dispositions_with_anchored_employee_response(
+    reason_code: str,
+) -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    assert EmployeeDepartmentRuntime._employee_handoff_has_response(reason_code)
+
+
+@pytest.mark.parametrize(
+    "reason_code",
+    (
+        "authority_denied",
+        "main_bot_group_command",
+        "stop_coordinates_invalid",
+        "history_coordinates_invalid",
+        "memory_coordinates_invalid",
+    ),
+)
+def test_employee_handoff_rejects_disposition_codes_without_an_employee_response(
+    reason_code: str,
+) -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    assert not EmployeeDepartmentRuntime._employee_handoff_has_response(
+        reason_code
+    )
+
+
+def test_ready_employee_target_reports_ambiguous_open_id_binding_as_unknown() -> None:
+    from src.autonomous.domain import EmployeeState, WorkerType
+    from src.autonomous.provisioning.composition import (
+        EmployeeDepartmentRuntime,
+        EmployeeTargetResolutionUnknownError,
+    )
     from src.autonomous.supervisor.employee_channels import ChannelProcessState
 
     employees = {
@@ -524,9 +2222,11 @@ def test_ready_employee_target_rejects_ambiguous_open_id_binding() -> None:
     }
     principals = {
         bot_id: SimpleNamespace(
+            bot_principal_id=bot_id,
             tenant_key="tenant_test",
             agent_id=agent_id,
             app_id=app_id,
+            credential_ref=f"cred_{agent_id.removeprefix('agt_')}",
         )
         for agent_id, bot_id, app_id in (
             ("agt_alpha", "bot_alpha", "cli_alpha"),
@@ -540,80 +2240,290 @@ def test_ready_employee_target_rejects_ambiguous_open_id_binding() -> None:
             tenant_key="tenant_test",
             bot_principal_id=bot_id,
             app_id=app_id,
-            identity={"open_id": "ou_ambiguous"},
+            generation=generation,
+            identity={"app_id": app_id, "open_id": "ou_ambiguous"},
+            ready_metadata={"connection_id": connection_id},
         )
-        for agent_id, bot_id, app_id in (
-            ("agt_alpha", "bot_alpha", "cli_alpha"),
-            ("agt_beta", "bot_beta", "cli_beta"),
+        for agent_id, bot_id, app_id, generation, connection_id in (
+            ("agt_alpha", "bot_alpha", "cli_alpha", 3, "conn_alpha"),
+            ("agt_beta", "bot_beta", "cli_beta", 4, "conn_beta"),
         )
     }
+    durable_states = tuple(
+        SimpleNamespace(
+            phase=SimpleNamespace(value="active"),
+            tenant_key="tenant_test",
+            agent_id=agent_id,
+            bot_principal_id=bot_id,
+            app_id=app_id,
+            channel_generation=generation,
+            channel_connection_id=connection_id,
+            channel_identity_app_id=app_id,
+        )
+        for agent_id, bot_id, app_id, generation, connection_id in (
+            ("agt_alpha", "bot_alpha", "cli_alpha", 3, "conn_alpha"),
+            ("agt_beta", "bot_beta", "cli_beta", 4, "conn_beta"),
+        )
+    )
     runtime = object.__new__(EmployeeDepartmentRuntime)
     runtime._service = SimpleNamespace(
-        synchronize_projection=lambda: SimpleNamespace(
-            employees=employees,
-            bot_principals=principals,
+        current_employee_transport_snapshot=lambda: (
+            tuple(employees.values()),
+            tuple(principals.values()),
+            durable_states,
         )
     )
     runtime._channels = SimpleNamespace(status=statuses.get)
 
-    assert runtime.resolve_ready_employee_bot_target(
-        tenant_key="tenant_test",
-        chat_id="oc_456",
-        bot_open_id="ou_ambiguous",
-    ) is None
+    with pytest.raises(EmployeeTargetResolutionUnknownError, match="ambiguous"):
+        runtime.resolve_ready_employee_bot_target(
+            tenant_key="tenant_test",
+            chat_id="oc_456",
+            bot_open_id="ou_ambiguous",
+        )
     assert runtime.trusted_employee_bot_open_ids(
         tenant_key="tenant_test",
         chat_id="oc_456",
     ) == frozenset()
 
 
-def test_main_bot_keeps_main_targeted_command_on_original_route(
+@pytest.mark.parametrize(
+    ("command", "message_id"),
+    (
+        ("/stop_wf", "om_main_stop_wf"),
+        ("/stop_workflow", "om_main_stop_workflow"),
+    ),
+)
+def test_main_bot_mention_keeps_control_project_route_and_origin(
     mock_ws_client: FeishuWSClient,
+    command: str,
+    message_id: str,
 ) -> None:
     runtime = mock_ws_client._employee_department_runtime
     runtime.resolve_ready_employee_bot_target = MagicMock(return_value=None)
+    project = ProjectContext("project_main", "Main", "/tmp/main")
+    mock_ws_client._project_manager.get_active_project.return_value = project
     mention = _sdk_message_mention(
         key="@_user_1",
         open_id="ou_main_bot",
         name="GhostAP",
     )
-    event = _mentioned_group_command("@_user_1 /stop_wf", mention)
+    event = _mentioned_group_command(
+        f"@_user_1 {command}",
+        mention,
+        message_id=message_id,
+    )
     mock_ws_client._validate_message = MagicMock(return_value=True)
     mock_ws_client._dispatch_message_logic = MagicMock()
 
     mock_ws_client._handle_message(event)
 
     spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "feishu_message"
     assert spec.is_system_command is True
+    assert spec.project_id == "project_main"
+    assert spec.queue_key == "oc_456:control:project_main"
+    assert spec.origin_message_id == message_id
+    assert mock_ws_client._message_linker.query(message_id)["project_id"] == (
+        "project_main"
+    )
     callback(MagicMock())
     dispatch = mock_ws_client._dispatch_message_logic.call_args
-    assert dispatch.args[2] == "/stop_wf"
+    assert dispatch.args[2] == command
     assert dispatch.kwargs["command_match"].command == "/stop_wf"
+    runtime.resolve_ready_employee_bot_target.assert_not_called()
+
+
+def test_main_bot_mention_uses_managed_trust_without_static_chat_allowlist(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    owner_id = "ou_managed_owner"
+    mock_ws_client._managed_group_owner_id = owner_id
+    mock_ws_client._ingress_access_policy_provider.swap(
+        IngressAccessPolicy(
+            admin_ids=frozenset({owner_id}),
+            allowed_user_ids=frozenset({owner_id}),
+            allowed_chat_ids=frozenset(),
+            mode=IngressAccessMode.ENFORCED,
+            admin_bootstrap_scope="p2p_only",
+        )
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(
+        return_value=SimpleNamespace(
+            zone=TrustZone.MANAGED_AGENT_GROUP,
+            actor=ActorKind.OWNER,
+            managed_group=SimpleNamespace(
+                chat_id="oc_456",
+                project_id="project_managed",
+            ),
+        )
+    )
+    mock_ws_client._decide_ingress_access = MagicMock()
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_main_bot",
+            name="GhostAP",
+        ),
+        message_id="om_main_managed_without_static_chat",
+    )
+    event.event.sender.sender_id.open_id = owner_id
+
+    mock_ws_client._handle_message(event)
+
+    mock_ws_client._resolve_effective_trust.assert_called_once()
+    mock_ws_client._decide_ingress_access.assert_not_called()
+    spec, _callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "feishu_message"
+    assert spec.project_id == "project_managed"
+    assert spec.queue_key == "oc_456:control:project_managed"
+
+
+def test_unknown_main_bot_identity_fails_closed_before_mentioned_command_admission(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(return_value=None)
+    mock_ws_client._main_bot_open_id = ""
+    mock_ws_client._sync_main_bot_identity = MagicMock(return_value="")
+    event = _mentioned_group_command(
+        "@_user_1 /stop_wf",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_main_bot",
+            name="GhostAP",
+        ),
+        message_id="om_main_identity_startup_race",
+    )
+    mock_ws_client._validate_message = MagicMock(return_value=True)
+    mock_ws_client._dispatch_message_logic = MagicMock()
+
+    mock_ws_client._handle_message(event)
+
+    mock_ws_client._scheduler.submit.assert_not_called()
+    mock_ws_client._sync_main_bot_identity.assert_not_called()
+    runtime.resolve_ready_employee_bot_target.assert_not_called()
+    mock_ws_client._dispatch_message_logic.assert_not_called()
+
+
+def test_main_bot_identity_lookup_validates_app_and_retries_after_transient_failure(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from lark_oapi.core.model.base_response import BaseResponse
+    from lark_oapi.core.model.raw_response import RawResponse
+
+    def response(payload: object, *, code: int = 0) -> BaseResponse:
+        result = BaseResponse()
+        result.code = code
+        result.raw = RawResponse()
+        result.raw.status_code = 200
+        result.raw.content = json.dumps(payload).encode()
+        return result
+
+    request = MagicMock(
+        side_effect=(
+            OSError("temporary lookup failure"),
+            response(
+                {
+                    "code": 0,
+                    "bot": {
+                        "app_id": "test_app_id",
+                        "open_id": "ou_main_bot_refreshed",
+                    },
+                }
+            ),
+        )
+    )
+    mock_ws_client._api_client = SimpleNamespace(request=request)
+    mock_ws_client._main_bot_open_id = ""
+
+    assert mock_ws_client._sync_main_bot_identity() == ""
+    mock_ws_client._main_bot_identity_next_retry_at = 0
+    assert mock_ws_client._sync_main_bot_identity() == "ou_main_bot_refreshed"
+    assert request.call_count == 2
+
+
+def test_main_bot_identity_lookup_rejects_a_different_app_binding(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from lark_oapi.core.model.base_response import BaseResponse
+    from lark_oapi.core.model.raw_response import RawResponse
+
+    response = BaseResponse()
+    response.code = 0
+    response.raw = RawResponse()
+    response.raw.status_code = 200
+    response.raw.content = json.dumps(
+        {
+            "code": 0,
+            "bot": {
+                "app_id": "cli_other_app",
+                "open_id": "ou_wrong_main_bot",
+            },
+        }
+    ).encode()
+    mock_ws_client._api_client = SimpleNamespace(
+        request=MagicMock(return_value=response)
+    )
+    mock_ws_client._main_bot_open_id = ""
+
+    assert mock_ws_client._sync_main_bot_identity() == ""
+    assert mock_ws_client._main_bot_open_id == ""
+
+
+def test_start_does_not_open_ws_intake_without_main_bot_identity(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    mock_ws_client._main_bot_open_id = ""
+    mock_ws_client.settings.feishu_ws_reconnect_delay_s = 0.0
+
+    def identity_unavailable() -> str:
+        mock_ws_client._closed = True
+        return ""
+
+    mock_ws_client._sync_main_bot_identity = MagicMock(
+        side_effect=identity_unavailable
+    )
+    with (
+        patch.object(mock_ws_client, "_publish_restart_participation"),
+        patch.object(mock_ws_client, "_build_event_handler", return_value=object()),
+        patch.object(mock_ws_client._message_cache, "start_cleanup_thread"),
+        patch.object(mock_ws_client._card_event_cache, "start_cleanup_thread"),
+        patch.object(mock_ws_client._ws_health_monitor, "start_watchdog"),
+        patch.object(mock_ws_client, "_start_main_slash_command_sync"),
+        patch.object(mock_ws_client, "_restore_trusted_ingress_dependencies"),
+        patch("src.feishu.ws_client.ObservedLarkWSClient") as observed,
+    ):
+        observed.return_value.start.side_effect = lambda: setattr(
+            mock_ws_client,
+            "_closed",
+            True,
+        )
+        mock_ws_client.start()
+
+    mock_ws_client._sync_main_bot_identity.assert_called_once_with()
+    observed.assert_not_called()
 
 
 @pytest.mark.parametrize(
     "event",
     [
-        _mentioned_group_command(
-            "@_user_1 /task unknown target",
-            _sdk_message_mention(
-                key="@_user_1",
-                open_id="ou_not_ready_employee",
-                name="Former Employee",
-            ),
-            message_id="om_unknown_target",
+        create_mock_message(
+            "/task unaddressed group task",
+            message_id="om_unaddressed_task",
         ),
         _mentioned_group_command(
-            "@_user_1 /stop_wf @_user_2",
+            "@_user_1 /task ambiguous target @_user_2",
             _sdk_message_mention(
                 key="@_user_1",
-                open_id="ou_main_bot",
-                name="GhostAP",
+                open_id="ou_employee_alpha",
+                name="Employee Alpha",
             ),
             _sdk_message_mention(
                 key="@_user_2",
-                open_id="ou_employee_alpha",
-                name="Employee",
+                open_id="ou_employee_beta",
+                name="Employee Beta",
             ),
             message_id="om_multiple_targets",
         ),
@@ -656,7 +2566,7 @@ def test_main_bot_keeps_main_targeted_command_on_original_route(
         ),
     ],
     ids=(
-        "unknown",
+        "bare-task",
         "multiple",
         "placeholder-mismatch",
         "unbound-placeholder",
@@ -664,22 +2574,68 @@ def test_main_bot_keeps_main_targeted_command_on_original_route(
         "foreign-tenant",
     ),
 )
-def test_main_bot_does_not_suppress_unproven_employee_command_targets(
+def test_unproven_group_task_target_uses_the_ordinary_main_route(
     mock_ws_client: FeishuWSClient,
     event,
 ) -> None:
     runtime = mock_ws_client._employee_department_runtime
     runtime.resolve_ready_employee_bot_target = MagicMock(
-        side_effect=lambda **kwargs: (
-            _ready_employee_target()
-            if kwargs.get("bot_open_id") == "ou_employee_alpha"
-            else None
-        )
+        return_value=_ready_employee_target()
+    )
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=True)
+    process_main_route = MagicMock()
+    mock_ws_client._process_message_async = process_main_route
+
+    mock_ws_client._handle_message(event)
+
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "feishu_message"
+    assert spec.name == "process_message"
+    callback(SimpleNamespace(run_id="run_main_route"))
+
+    runtime.resolve_ready_employee_bot_target.assert_not_called()
+    runtime.wait_for_employee_message_handoff.assert_not_called()
+    process_main_route.assert_called_once()
+    assert process_main_route.call_args.kwargs["employee_candidate"] is None
+
+
+def test_unique_nonmember_group_task_is_denied_without_employee_or_main_execution(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    runtime = mock_ws_client._employee_department_runtime
+    runtime.resolve_ready_employee_bot_target = MagicMock(return_value=None)
+    runtime.wait_for_employee_message_handoff = MagicMock(return_value=True)
+    runtime.queue_main_bot_warning.reset_mock()
+    mock_ws_client._dispatch_message_logic = MagicMock()
+    event = _mentioned_group_command(
+        "@_user_1 /task unknown target",
+        _sdk_message_mention(
+            key="@_user_1",
+            open_id="ou_not_ready_employee",
+            name="Former Employee",
+        ),
+        message_id="om_unknown_target",
     )
 
     mock_ws_client._handle_message(event)
 
-    mock_ws_client._scheduler.submit.assert_called_once()
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "employee_target_handoff"
+    callback(SimpleNamespace(run_id="run_target_lookup"))
+
+    runtime.resolve_ready_employee_bot_target.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        bot_open_id="ou_not_ready_employee",
+    )
+    runtime.wait_for_employee_message_handoff.assert_not_called()
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_456",
+        message_id="om_unknown_target",
+        text=UI_TEXT["ws_employee_handoff_unconfirmed"],
+    )
+    mock_ws_client._dispatch_message_logic.assert_not_called()
 
 
 def test_handle_message_system_command_routing(mock_ws_client: FeishuWSClient):
@@ -1632,25 +3588,18 @@ def test_close_shuts_down_card_registry_with_one_bounded_wave(
     assert shutdown_all.call_args.kwargs["timeout"] > 0
 
 
-def test_scheduler_listeners_register_once_and_detach_after_idle_close(
+def test_only_control_plane_scheduler_listener_registers_and_detaches_after_idle_close(
     mock_ws_client: FeishuWSClient,
 ) -> None:
     scheduler = mock_ws_client._scheduler
-    ingress_callbacks = [
-        call.args[0]
-        for call in scheduler.add_listener.call_args_list
-        if getattr(call.args[0], "__self__", None) is mock_ws_client
-        and getattr(call.args[0], "__func__", None)
-        is FeishuWSClient._on_message_ingress_task_event
-    ]
     control_plane_callbacks = [
         call.args[0]
         for call in scheduler.add_listener.call_args_list
         if getattr(call.args[0], "__self__", None) is mock_ws_client._control_plane
     ]
 
-    assert len(ingress_callbacks) == 1
     assert len(control_plane_callbacks) == 1
+    assert scheduler.add_listener.call_count == 1
     scheduler.remove_listener.reset_mock()
 
     with patch(
@@ -1659,8 +3608,7 @@ def test_scheduler_listeners_register_once_and_detach_after_idle_close(
     ):
         assert mock_ws_client.close() is True
 
-    scheduler.remove_listener.assert_any_call(ingress_callbacks[0])
-    scheduler.remove_listener.assert_any_call(control_plane_callbacks[0])
+    scheduler.remove_listener.assert_called_once_with(control_plane_callbacks[0])
 
 
 def test_close_keeps_scheduler_listener_until_running_callbacks_drain(
@@ -1673,6 +3621,440 @@ def test_close_keeps_scheduler_listener_until_running_callbacks_drain(
     assert mock_ws_client.close() is False
 
     scheduler.remove_listener.assert_not_called()
+
+
+def test_close_waits_for_completion_callbacks_before_employee_runtime_close(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    scheduler = mock_ws_client._scheduler
+    runtime = mock_ws_client._employee_department_runtime
+    scheduler.wait_for_idle.return_value = True
+    runtime.close.reset_mock()
+
+    def wait_for_completions(*, timeout: float) -> bool:
+        assert timeout > 0
+        runtime.close.assert_not_called()
+        return True
+
+    scheduler.wait_for_completion_callbacks.side_effect = wait_for_completions
+    with patch(
+        "src.card.delivery.registry.delivery_registry.shutdown_all",
+        return_value=True,
+    ):
+        assert mock_ws_client.close() is True
+
+    scheduler.wait_for_completion_callbacks.assert_called_once()
+    runtime.close.assert_called_once_with()
+
+
+def test_close_preserves_employee_runtime_when_completion_callbacks_do_not_drain(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    scheduler = mock_ws_client._scheduler
+    runtime = mock_ws_client._employee_department_runtime
+    cleanup = mock_ws_client._handler_ctx.managers["coco"].cleanup_all
+    scheduler.wait_for_idle.return_value = True
+    scheduler.wait_for_completion_callbacks.return_value = False
+    runtime.close.reset_mock()
+    cleanup.reset_mock()
+
+    with patch(
+        "src.card.delivery.registry.delivery_registry.shutdown_all",
+        return_value=True,
+    ) as shutdown_all:
+        assert mock_ws_client.close() is False
+
+    runtime.close.assert_not_called()
+    shutdown_all.assert_not_called()
+    cleanup.assert_not_called()
+
+
+def test_close_waits_for_terminal_replay_to_anchor_prestart_warning(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.feishu.ws_client import _MessageIngressReservation
+
+    original_scheduler = mock_ws_client._scheduler
+    scheduler = TaskScheduler(max_concurrent=1, system_concurrency=1)
+    mock_ws_client._scheduler = scheduler
+    runtime = mock_ws_client._employee_department_runtime
+    message_id = "om_terminal_replay_shutdown"
+    reservation_owner = mock_ws_client._message_ingress_guard.reserve(message_id)
+    assert reservation_owner is not None
+    reservation = _MessageIngressReservation(
+        guard=mock_ws_client._message_ingress_guard,
+        message_id=message_id,
+        owner=reservation_owner,
+    )
+    terminal = threading.Event()
+    warning_started = threading.Event()
+    release_warning = threading.Event()
+    warning_anchored = threading.Event()
+    close_wait_started = threading.Event()
+    runtime_close_started = threading.Event()
+    close_results: list[bool] = []
+
+    scheduler.add_listener(
+        lambda event: terminal.set()
+        if event.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED}
+        else None
+    )
+    handle = scheduler.submit(
+        TaskSpec(chat_id="oc_group", name="prestart-terminal"),
+        lambda _ctx: None,
+    )
+    assert terminal.wait(timeout=1)
+
+    def queue_warning(**_kwargs) -> bool:
+        warning_started.set()
+        release_warning.wait(timeout=3)
+        warning_anchored.set()
+        return True
+
+    runtime.queue_main_bot_warning.side_effect = queue_warning
+    runtime.close.side_effect = runtime_close_started.set
+    wait_for_completions = scheduler.wait_for_completion_callbacks
+
+    def observe_completion_wait(*, timeout: float) -> bool:
+        close_wait_started.set()
+        return wait_for_completions(timeout=timeout)
+
+    scheduler.wait_for_completion_callbacks = observe_completion_wait  # type: ignore[method-assign]
+    registration_thread = threading.Thread(
+        target=mock_ws_client._bind_message_ingress_reservation,
+        args=(handle, reservation),
+        kwargs={"tenant_key": "tenant-a", "chat_id": "oc_group"},
+    )
+    close_thread = threading.Thread(
+        target=lambda: close_results.append(mock_ws_client.close())
+    )
+
+    try:
+        with patch(
+            "src.card.delivery.registry.delivery_registry.shutdown_all",
+            return_value=True,
+        ):
+            registration_thread.start()
+            assert warning_started.wait(timeout=1)
+            close_thread.start()
+            assert close_wait_started.wait(timeout=1)
+            assert runtime_close_started.wait(timeout=0.2) is False
+
+            release_warning.set()
+            registration_thread.join(timeout=1)
+            close_thread.join(timeout=2)
+
+        assert warning_anchored.is_set()
+        assert close_results == [True]
+        runtime.close.assert_called_once_with()
+        assert mock_ws_client._message_ingress_guard.reserve(message_id) is None
+    finally:
+        release_warning.set()
+        registration_thread.join(timeout=1)
+        close_thread.join(timeout=2)
+        mock_ws_client._scheduler = original_scheduler
+        scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_close_waits_for_dispatched_message_to_bind_prestart_callback(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    """A Channel-dispatched handler must join shutdown before runtime close."""
+
+    class ReplayedTerminalHandle:
+        run_id = "run_submit_bind_shutdown"
+
+        @staticmethod
+        def add_done_callback(callback) -> None:
+            callback(
+                SimpleNamespace(
+                    run_id="run_submit_bind_shutdown",
+                    status=TaskStatus.CANCELED,
+                )
+            )
+
+    scheduler = mock_ws_client._scheduler
+    runtime = mock_ws_client._employee_department_runtime
+    scheduler.submit.return_value = ReplayedTerminalHandle()
+    scheduler.wait_for_idle.return_value = True
+    scheduler.wait_for_completion_callbacks.return_value = True
+    runtime.queue_main_bot_warning.reset_mock()
+    runtime.close.reset_mock()
+
+    bind_entered = threading.Event()
+    release_bind = threading.Event()
+    runtime_closed = threading.Event()
+    close_results: list[bool] = []
+    original_bind = mock_ws_client._bind_message_ingress_reservation
+
+    def block_between_submit_and_bind(*args, **kwargs) -> None:
+        bind_entered.set()
+        assert release_bind.wait(timeout=2)
+        original_bind(*args, **kwargs)
+
+    mock_ws_client._bind_message_ingress_reservation = block_between_submit_and_bind  # type: ignore[method-assign]
+    runtime.close.side_effect = runtime_closed.set
+    handler_thread = threading.Thread(
+        target=mock_ws_client._handle_message,
+        args=(
+            create_mock_message(
+                "hello",
+                message_id="om_submit_bind_shutdown",
+                chat_id="oc_submit_bind_shutdown",
+            ),
+        ),
+    )
+    close_thread = threading.Thread(
+        target=lambda: close_results.append(mock_ws_client.close())
+    )
+
+    try:
+        assert mock_ws_client._begin_message_ingress_binding()
+        with patch(
+            "src.card.delivery.registry.delivery_registry.shutdown_all",
+            return_value=True,
+        ):
+            handler_thread.start()
+            assert bind_entered.wait(timeout=1)
+            close_thread.start()
+            assert runtime_closed.wait(timeout=0.2) is False
+
+            release_bind.set()
+            handler_thread.join(timeout=1)
+            mock_ws_client._finish_message_ingress_binding()
+            close_thread.join(timeout=2)
+
+        assert handler_thread.is_alive() is False
+        assert close_thread.is_alive() is False
+        assert close_results == [True]
+        runtime.queue_main_bot_warning.assert_called_once_with(
+            tenant_key="tenant_test",
+            chat_id="oc_submit_bind_shutdown",
+            message_id="om_submit_bind_shutdown",
+            text=UI_TEXT["ws_message_prestart_terminal"],
+        )
+        runtime.close.assert_called_once_with()
+    finally:
+        release_bind.set()
+        handler_thread.join(timeout=1)
+        if mock_ws_client._message_ingress_bindings_inflight:
+            mock_ws_client._finish_message_ingress_binding()
+        close_thread.join(timeout=2)
+
+
+def test_close_timeout_preserves_runtime_during_submit_bind_window(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    scheduler = mock_ws_client._scheduler
+    runtime = mock_ws_client._employee_department_runtime
+    scheduler.submit.return_value = _pending_task_handle("run_bind_timeout")
+    scheduler.wait_for_idle.return_value = True
+    scheduler.wait_for_completion_callbacks.return_value = True
+    runtime.close.reset_mock()
+    cleanup = mock_ws_client._handler_ctx.managers["coco"].cleanup_all
+    cleanup.reset_mock()
+
+    bind_entered = threading.Event()
+    release_bind = threading.Event()
+    original_bind = mock_ws_client._bind_message_ingress_reservation
+
+    def block_between_submit_and_bind(*args, **kwargs) -> None:
+        bind_entered.set()
+        assert release_bind.wait(timeout=2)
+        original_bind(*args, **kwargs)
+
+    mock_ws_client._bind_message_ingress_reservation = block_between_submit_and_bind  # type: ignore[method-assign]
+    handler_thread = threading.Thread(
+        target=mock_ws_client._handle_message,
+        args=(
+            create_mock_message(
+                "hello",
+                message_id="om_bind_timeout",
+                chat_id="oc_bind_timeout",
+            ),
+        ),
+    )
+
+    try:
+        assert mock_ws_client._begin_message_ingress_binding()
+        handler_thread.start()
+        assert bind_entered.wait(timeout=1)
+        started = time.monotonic()
+        with (
+            patch("src.feishu.ws_client._SHUTDOWN_SCHEDULER_DRAIN_S", 0.05),
+            patch(
+                "src.card.delivery.registry.delivery_registry.shutdown_all",
+                return_value=True,
+            ) as shutdown_all,
+        ):
+            assert mock_ws_client.close() is False
+        assert time.monotonic() - started < 0.5
+        runtime.close.assert_not_called()
+        cleanup.assert_not_called()
+        shutdown_all.assert_not_called()
+    finally:
+        release_bind.set()
+        handler_thread.join(timeout=1)
+        if mock_ws_client._message_ingress_bindings_inflight:
+            mock_ws_client._finish_message_ingress_binding()
+
+
+def test_observed_ws_tracks_scheduled_handler_before_business_entry(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.feishu.ws_lifecycle import ObservedLarkWSClient
+
+    runtime = mock_ws_client._employee_department_runtime
+    scheduler = mock_ws_client._scheduler
+    scheduler.submit.return_value = SimpleNamespace(
+        run_id="run_scheduled_before_entry",
+        add_done_callback=lambda callback: callback(
+            SimpleNamespace(
+                run_id="run_scheduled_before_entry",
+                status=TaskStatus.CANCELED,
+            )
+        ),
+    )
+    scheduler.wait_for_idle.return_value = True
+    scheduler.wait_for_completion_callbacks.return_value = True
+    runtime.queue_main_bot_warning.reset_mock()
+    runtime.close.reset_mock()
+
+    observed = ObservedLarkWSClient.__new__(ObservedLarkWSClient)
+    observed._handler_semaphore = None
+    observed._on_handler_scheduled = mock_ws_client._begin_message_ingress_binding
+    observed._on_handler_finished = mock_ws_client._finish_message_ingress_binding
+    allow_business_entry: asyncio.Event
+    runtime_closed = threading.Event()
+    close_results: list[bool] = []
+    runtime.close.side_effect = runtime_closed.set
+    message = create_mock_message(
+        "hello",
+        message_id="om_scheduled_before_entry",
+        chat_id="oc_scheduled_before_entry",
+    )
+
+    async def exercise() -> None:
+        nonlocal allow_business_entry
+        allow_business_entry = asyncio.Event()
+
+        async def delayed_handler(_raw) -> None:
+            await allow_business_entry.wait()
+            await asyncio.to_thread(mock_ws_client._handle_message, message)
+
+        observed._handle_message = delayed_handler  # type: ignore[method-assign]
+        await observed._schedule_handle_message(b"raw-frame")
+        close_thread = threading.Thread(
+            target=lambda: close_results.append(mock_ws_client.close())
+        )
+        with patch(
+            "src.card.delivery.registry.delivery_registry.shutdown_all",
+            return_value=True,
+        ):
+            close_thread.start()
+            assert await asyncio.to_thread(runtime_closed.wait, 0.2) is False
+            allow_business_entry.set()
+            await asyncio.to_thread(close_thread.join, 2)
+        assert close_thread.is_alive() is False
+
+    asyncio.run(exercise())
+
+    assert close_results == [True]
+    runtime.queue_main_bot_warning.assert_called_once_with(
+        tenant_key="tenant_test",
+        chat_id="oc_scheduled_before_entry",
+        message_id="om_scheduled_before_entry",
+        text=UI_TEXT["ws_message_prestart_terminal"],
+    )
+    runtime.close.assert_called_once_with()
+
+
+def test_observed_ws_rejects_handler_scheduled_after_shutdown_fence(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    from src.feishu.ws_lifecycle import ObservedLarkWSClient
+
+    observed = ObservedLarkWSClient.__new__(ObservedLarkWSClient)
+    observed._handler_semaphore = None
+    observed._on_handler_scheduled = mock_ws_client._begin_message_ingress_binding
+    observed._on_handler_finished = mock_ws_client._finish_message_ingress_binding
+    handled = MagicMock()
+
+    async def handle_message(_raw) -> None:
+        handled()
+
+    observed._handle_message = handle_message  # type: ignore[method-assign]
+    mock_ws_client._fence_message_ingress_bindings()
+
+    asyncio.run(observed._schedule_handle_message(b"late-frame"))
+
+    handled.assert_not_called()
+    assert mock_ws_client._message_ingress_bindings_inflight == 0
+
+
+def test_observed_ws_immediate_cancel_releases_handler_tracking() -> None:
+    from src.feishu.ws_lifecycle import ObservedLarkWSClient
+
+    scheduled = MagicMock(return_value=True)
+    finished = MagicMock()
+    handled = MagicMock()
+
+    async def exercise() -> None:
+        observed = ObservedLarkWSClient.__new__(ObservedLarkWSClient)
+        observed._handler_semaphore = None
+        observed._on_handler_scheduled = scheduled
+        observed._on_handler_finished = finished
+
+        async def handle_message(_raw) -> None:
+            handled()
+
+        observed._handle_message = handle_message  # type: ignore[method-assign]
+        before = asyncio.all_tasks()
+        await observed._schedule_handle_message(b"cancel-before-start")
+        created = asyncio.all_tasks() - before
+        assert len(created) == 1
+        task = created.pop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+    scheduled.assert_called_once_with()
+    finished.assert_called_once_with()
+    handled.assert_not_called()
+
+
+def test_observed_ws_immediate_cancel_releases_handler_semaphore() -> None:
+    from src.feishu.ws_lifecycle import ObservedLarkWSClient
+
+    scheduled = MagicMock(return_value=True)
+    finished = MagicMock()
+    handled = MagicMock()
+
+    async def exercise() -> None:
+        observed = ObservedLarkWSClient.__new__(ObservedLarkWSClient)
+        observed._handler_semaphore = asyncio.Semaphore(1)
+        observed._on_handler_scheduled = scheduled
+        observed._on_handler_finished = finished
+
+        async def handle_message(_raw) -> None:
+            handled()
+
+        observed._handle_message = handle_message  # type: ignore[method-assign]
+        before = asyncio.all_tasks()
+        await observed._schedule_handle_message(b"cancel-before-start")
+        created = asyncio.all_tasks() - before
+        assert len(created) == 1
+        task = created.pop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(observed._handler_semaphore.acquire(), timeout=0.1)
+
+    asyncio.run(exercise())
+
+    scheduled.assert_called_once_with()
+    finished.assert_called_once_with()
+    handled.assert_not_called()
 
 
 def test_close_preserves_dependencies_when_card_registry_shutdown_times_out(

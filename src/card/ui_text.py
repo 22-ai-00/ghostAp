@@ -232,7 +232,7 @@ UI_TEXT = {
         "`/traex` · 进入 Traex 编程模式\n"
         "`/grok` · 进入 Grok 编程模式（xAI Grok Build）\n"
         "`/exit` · 退出当前编程模式\n"
-        "`/coco_info` · `/claude_info` · `/aiden_info` · `/codex_info` · `/traex_info` · `/grok_info` · 查看会话/模型信息"
+        "`/coco_info` · `/claude_info` · `/aiden_info` · `/codex_info` · `/gemini_info` · `/traex_info` · `/grok_info` · 查看会话/模型信息"
     ),
     "system_help_section_deep": "💭 Deep Engine · 复杂任务一次交付",
     "system_help_section_deep_body": (
@@ -273,7 +273,8 @@ UI_TEXT = {
         "`/hire <名字>` · 自动选择推荐可用工具和后端默认模型\n"
         "`/h <名字>` · `/hire` 的简写\n"
         "`/hire <名字> --tool codex --model <模型>` · 受控覆盖工具或模型\n"
-        "`/employees` · 查看在职员工\n"
+        "`/employees`（`/roster`） · 查看在职员工\n"
+        "`/employee-role <员工名> <职责>` · 设置员工职责\n"
         "`/fire <名字或ID> [--drain]` · 退役员工，可等待当前任务排空\n"
         "`/history <名字或ID>` · 查看员工执行历史\n"
         "`/employee-memory <名字或ID>` · 查看员工记忆\n"
@@ -467,9 +468,21 @@ UI_TEXT = {
     "ws_backpressure_generic": "⚠️ 系统繁忙，请稍后再试",
     "ws_message_timeout": "⏳ 处理消息超时，请稍后重试",
     "ws_message_internal_error": "❌ 处理消息时发生内部错误，请稍后重试",
+    "ws_message_prestart_terminal": (
+        "⚠️ 消息任务在开始执行前因服务中断而终止，GhostAP 主 Bot 未执行。"
+        "请重新发送该命令。"
+    ),
     "ws_employee_handoff_unconfirmed": (
         "⚠️ 尚未确认目标员工已接收该命令；GhostAP 主 Bot 未执行。"
         "请查看员工回复后再决定是否重试。"
+    ),
+    "ws_employee_handoff_unknown": (
+        "⚠️ 无法确认目标员工是否已接收该命令；命令状态未知，请勿重试。"
+        "请先等待目标员工回复，或联系管理员核查。"
+    ),
+    "ws_main_bot_identity_unavailable": (
+        "⚠️ 暂时无法确认该命令的处理方；GhostAP 主 Bot 未执行。"
+        "命令状态未知，请勿立即重试，先等待目标 Bot 回复。"
     ),
     "ws_unsupported_msg_type": "⚠️ 目前仅支持文本、图片和富文本消息",
     "ws_image_only_prefix": "请查看并理解以下图片",

@@ -111,3 +111,19 @@ class MessageCache:
     def contains(self, message_id: str) -> bool:
         with self._lock:
             return message_id in self._cache
+
+    def discard(self, message_id: str) -> None:
+        """Remove one reservation after downstream admission fails."""
+
+        with self._lock:
+            self._cache.pop(message_id, None)
+
+    def mark_seen(self, message_id: str) -> None:
+        """Record a completed message with a fresh duplicate-window timestamp."""
+
+        current_time = time.time()
+        with self._lock:
+            self._cache.pop(message_id, None)
+            self._cache[message_id] = current_time
+            if len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)

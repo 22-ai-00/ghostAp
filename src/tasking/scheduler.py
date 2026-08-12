@@ -37,11 +37,9 @@ class TaskPriority(IntEnum):
 
 SYSTEM_QUEUE_SUFFIX = ":SYSTEM"
 DEFAULT_QUEUE_SUFFIX = ":DEFAULT"
-_CURRENT_TASK_RUN_ID: contextvars.ContextVar[str | None] = (
-    contextvars.ContextVar(
-        "ghostap_current_task_run_id",
-        default=None,
-    )
+_CURRENT_TASK_RUN_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "ghostap_current_task_run_id",
+    default=None,
 )
 
 
@@ -53,6 +51,7 @@ def get_current_task_run_id() -> str | None:
 
 class TaskSpec(BaseModel):
     """Metadata that influences routing and scheduling."""
+
     model_config = ConfigDict(frozen=True)
 
     chat_id: str
@@ -87,8 +86,10 @@ class TaskSpec(BaseModel):
             return f"{self.chat_id}:{self.project_id}"
         return f"{self.chat_id}{DEFAULT_QUEUE_SUFFIX}"
 
+
 class TaskEvent(BaseModel):
     """任务状态/进度事件（用于 listeners 与可观测性输出）。"""
+
     model_config = ConfigDict(frozen=True)
 
     run_id: str
@@ -147,6 +148,7 @@ class TaskQueueFullError(RateLimitExceededException):
 
 class TaskRunState(BaseModel):
     """任务运行态（调度器内部 SSOT）。"""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     spec: TaskSpec
@@ -183,11 +185,12 @@ class TaskContext:
 
 class _QueuedTask(BaseModel):
     """队列中的任务项（内部数据结构）。"""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     run_id: str
     spec: TaskSpec
-    fn: Callable[['TaskContext'], Any]
+    fn: Callable[["TaskContext"], Any]
     context: contextvars.Context
 
 
@@ -195,19 +198,18 @@ class _TaskCompletion:
     """One-shot terminal event retained by the public task handle."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()  # leaf lock: never acquires scheduler state
+        self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._event: TaskEvent | None = None
         self._callbacks: list[Callable[[TaskEvent], None]] = []
 
-    def add_done_callback(self, callback: Callable[[TaskEvent], None]) -> None:
+    def register(self, callback: Callable[[TaskEvent], None]) -> TaskEvent | None:
         if not callable(callback):
             raise TypeError("callback must be callable")
         with self._lock:
             event = self._event
             if event is None:
                 self._callbacks.append(callback)
-                return
-        self._invoke(callback, event)
+            return event
 
     def complete(self, event: TaskEvent) -> tuple[Callable[[TaskEvent], None], ...]:
         with self._lock:
@@ -251,7 +253,8 @@ class TaskHandle:
         Callback failures are isolated from task accounting.
         """
 
-        self._completion.add_done_callback(callback)
+        self._scheduler._register_completion_callback(self._completion, callback)
+
 
 class TaskScheduler:
     """Thread-safe scheduler with project serialization and a system fast lane."""
@@ -305,9 +308,7 @@ class TaskScheduler:
         self._max_pending_normal = max_pending_normal
         self._max_pending_system = max_pending_system
         self._max_terminal_history = max_terminal_history
-        self._run_guard_timeout_s = (
-            float(run_guard_timeout_s) if run_guard_timeout_s is not None else None
-        )
+        self._run_guard_timeout_s = float(run_guard_timeout_s) if run_guard_timeout_s is not None else None
         self._run_guard = run_guard or nullcontext
         guard_owner = getattr(run_guard, "__self__", None)
         cancellable_run_guard = getattr(
@@ -315,9 +316,7 @@ class TaskScheduler:
             "cancellable_task_guard",
             None,
         )
-        self._cancellable_run_guard = (
-            cancellable_run_guard if callable(cancellable_run_guard) else None
-        )
+        self._cancellable_run_guard = cancellable_run_guard if callable(cancellable_run_guard) else None
         self._run_guard_cancel = run_guard_cancel or getattr(
             guard_owner,
             "cancel_waiters",
@@ -357,9 +356,11 @@ class TaskScheduler:
             ]
             | None
         ] = queue.Queue()
-        self._completion_queue: queue.Queue[
-            tuple[TaskEvent, tuple[Callable[[TaskEvent], None], ...]] | None
-        ] = queue.Queue()
+        self._completion_queue: queue.Queue[tuple[TaskEvent, tuple[Callable[[TaskEvent], None], ...]] | None] = (
+            queue.Queue()
+        )
+        self._completion_callbacks_pending = 0
+        self._completion_callback_local = threading.local()
         self._event_dispatch_stopping = False
         self._completion_dispatch_stopping = False
         self._event_dispatcher = threading.Thread(
@@ -411,21 +412,14 @@ class TaskScheduler:
         """Remove every match and quiesce callbacks already in progress."""
 
         with self._cv:
-            removed_ids = {
-                id(registered)
-                for registered in self._listeners
-                if registered == listener
-            }
+            removed_ids = {id(registered) for registered in self._listeners if registered == listener}
             retained = [registered for registered in self._listeners if registered != listener]
             if len(retained) == len(self._listeners):
                 return False
             self._listeners = retained
             if threading.current_thread() is not self._event_dispatcher:
                 self._cv.wait_for(
-                    lambda: not any(
-                        self._listener_inflight.get(listener_id, 0)
-                        for listener_id in removed_ids
-                    )
+                    lambda: not any(self._listener_inflight.get(listener_id, 0) for listener_id in removed_ids)
                 )
             return True
 
@@ -612,7 +606,9 @@ class TaskScheduler:
             state.cancellation.cancel()
 
             if state.status == TaskStatus.QUEUED:
-                self._remove_from_queue_unlocked(run_id, state.assigned_queue_key or state.spec.get_effective_queue_key())
+                self._remove_from_queue_unlocked(
+                    run_id, state.assigned_queue_key or state.spec.get_effective_queue_key()
+                )
                 self._transition_unlocked(run_id, TaskStatus.CANCELED)
                 self._cv.notify_all()
                 return True
@@ -655,9 +651,7 @@ class TaskScheduler:
             return False
         with self._lock:
             return any(
-                state is not None
-                and state.status is TaskStatus.RUNNING
-                and state.spec.task_type in task_types
+                state is not None and state.status is TaskStatus.RUNNING and state.spec.task_type in task_types
                 for run_id in self._by_chat.get(chat_id, ())
                 if (state := self._states.get(run_id)) is not None
             )
@@ -752,9 +746,7 @@ class TaskScheduler:
                 self._admission_fenced = True
                 self._drain_queued_tasks_unlocked()
                 futures_to_cancel = [
-                    future
-                    for run_id, future in self._worker_futures.items()
-                    if run_id not in self._worker_started
+                    future for run_id, future in self._worker_futures.items() if run_id not in self._worker_started
                 ]
                 self._cv.notify_all()
         for future in futures_to_cancel:
@@ -794,6 +786,25 @@ class TaskScheduler:
         deadline = time.monotonic() + timeout
         with self._cv:
             while self._running_total_normal or self._running_total_system:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(timeout=remaining)
+            return True
+
+    def wait_for_completion_callbacks(self, timeout: float) -> bool:
+        """Wait for queued and in-flight task completion callbacks to finish."""
+
+        if timeout < 0:
+            raise ValueError("timeout must be >= 0")
+        with self._cv:
+            if (
+                getattr(self._completion_callback_local, "depth", 0) > 0
+                or threading.current_thread() is self._completion_dispatcher
+            ):
+                return self._completion_callbacks_pending == 0
+            deadline = time.monotonic() + timeout
+            while self._completion_callbacks_pending:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -863,7 +874,11 @@ class TaskScheduler:
                     continue
 
                 state = self._states.get(task.run_id)
-                key = state.assigned_queue_key if state and state.assigned_queue_key else task.spec.get_effective_queue_key()
+                key = (
+                    state.assigned_queue_key
+                    if state and state.assigned_queue_key
+                    else task.spec.get_effective_queue_key()
+                )
                 is_system = self._is_system_queue(key)
                 if is_system:
                     self._running_total_system += 1
@@ -1016,11 +1031,7 @@ class TaskScheduler:
             if self._cancellable_run_guard is None:
                 guard = self._run_guard()
             else:
-                deadline = (
-                    None
-                    if self._run_guard_timeout_s is None
-                    else time.monotonic() + self._run_guard_timeout_s
-                )
+                deadline = None if self._run_guard_timeout_s is None else time.monotonic() + self._run_guard_timeout_s
                 guard = self._cancellable_run_guard(
                     canceled=canceled_before_callback,
                     deadline=deadline,
@@ -1033,10 +1044,7 @@ class TaskScheduler:
                 # attempted admission.  A fail-closed admission must converge
                 # that reservation exactly once.
                 if state:
-                    canceled = (
-                        self._admission_fenced
-                        or state.cancellation.is_canceled
-                    )
+                    canceled = self._admission_fenced or state.cancellation.is_canceled
                     self._transition_unlocked(
                         task.run_id,
                         TaskStatus.CANCELED if canceled else TaskStatus.FAILED,
@@ -1071,8 +1079,7 @@ class TaskScheduler:
                 guard.__exit__(type(canceled), canceled, canceled.__traceback__)
             except BaseException:
                 logger.exception(
-                    "run guard release failed after pre-callback cancellation "
-                    "run_id=%s",
+                    "run guard release failed after pre-callback cancellation run_id=%s",
                     task.run_id,
                 )
             return None
@@ -1085,8 +1092,7 @@ class TaskScheduler:
                 suppressed = guard.__exit__(exc_type, exc, traceback)
             except BaseException:
                 logger.exception(
-                    "run guard release failed after task terminal accounting "
-                    "run_id=%s",
+                    "run guard release failed after task terminal accounting run_id=%s",
                     task.run_id,
                 )
                 suppressed = False
@@ -1102,8 +1108,7 @@ class TaskScheduler:
             # changing SUCCEEDED to FAILED here would expose two contradictory
             # terminal events to callers.
             logger.exception(
-                "run guard release failed after task terminal accounting "
-                "run_id=%s",
+                "run guard release failed after task terminal accounting run_id=%s",
                 task.run_id,
             )
         return value
@@ -1114,11 +1119,7 @@ class TaskScheduler:
         self._worker_futures.pop(task.run_id, None)
         self._worker_started.discard(task.run_id)
         state = self._states.get(task.run_id)
-        key = (
-            state.assigned_queue_key
-            if state and state.assigned_queue_key
-            else task.spec.get_effective_queue_key()
-        )
+        key = state.assigned_queue_key if state and state.assigned_queue_key else task.spec.get_effective_queue_key()
         if self._is_system_queue(key):
             self._running_total_system = max(0, self._running_total_system - 1)
         else:
@@ -1213,6 +1214,7 @@ class TaskScheduler:
                 completion_callbacks = completion.complete(ev)
         self._event_queue.put((ev, tuple(self._listeners)))
         if completion_callbacks:
+            self._completion_callbacks_pending += len(completion_callbacks)
             self._completion_queue.put((ev, completion_callbacks))
 
     def _event_dispatch_loop(self) -> None:
@@ -1226,9 +1228,7 @@ class TaskScheduler:
                 with self._cv:
                     if listener not in self._listeners:
                         continue
-                    self._listener_inflight[listener_id] = (
-                        self._listener_inflight.get(listener_id, 0) + 1
-                    )
+                    self._listener_inflight[listener_id] = self._listener_inflight.get(listener_id, 0) + 1
                 try:
                     listener(event)
                 except BaseException:
@@ -1250,21 +1250,43 @@ class TaskScheduler:
                 return
             event, callbacks = item
             for callback in callbacks:
-                _TaskCompletion._invoke(callback, event)
+                self._invoke_tracked_completion_callback(callback, event)
+
+    def _register_completion_callback(
+        self,
+        completion: _TaskCompletion,
+        callback: Callable[[TaskEvent], None],
+    ) -> None:
+        with self._cv:
+            event = completion.register(callback)
+            if event is None:
+                return
+            self._completion_callbacks_pending += 1
+        self._invoke_tracked_completion_callback(callback, event)
+
+    def _invoke_tracked_completion_callback(
+        self,
+        callback: Callable[[TaskEvent], None],
+        event: TaskEvent,
+    ) -> None:
+        previous_depth = getattr(self._completion_callback_local, "depth", 0)
+        self._completion_callback_local.depth = previous_depth + 1
+        try:
+            _TaskCompletion._invoke(callback, event)
+        finally:
+            if previous_depth:
+                self._completion_callback_local.depth = previous_depth
+            else:
+                del self._completion_callback_local.depth
+            with self._cv:
+                self._completion_callbacks_pending -= 1
+                self._cv.notify_all()
 
     def _maybe_stop_event_dispatcher_unlocked(self) -> None:
-        if (
-            self._stopped
-            and not self._active_run_ids
-            and not self._event_dispatch_stopping
-        ):
+        if self._stopped and not self._active_run_ids and not self._event_dispatch_stopping:
             self._event_dispatch_stopping = True
             self._event_queue.put(None)
-        if (
-            self._stopped
-            and not self._active_run_ids
-            and not self._completion_dispatch_stopping
-        ):
+        if self._stopped and not self._active_run_ids and not self._completion_dispatch_stopping:
             self._completion_dispatch_stopping = True
             self._completion_queue.put(None)
 
