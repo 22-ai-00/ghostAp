@@ -146,6 +146,7 @@ _TERMINAL_REASONS = frozenset(
         "queue_rebalanced",
         "context_coordinates_invalid",
         "inbox_not_dispatchable",
+        "handoff_unconfirmed",
         "completed",
         "failed",
         "canceled",
@@ -163,6 +164,7 @@ _TERMINAL_REASONS = frozenset(
 _DISPATCH_TERMINAL_REASONS = frozenset(
     {"completed", "failed", "canceled", "timeout", "action_required"}
 )
+_PREQUEUE_ONLY_TERMINAL_REASONS = frozenset({"handoff_unconfirmed"})
 _DISPATCH_REJECTION_REASONS = frozenset(
     {
         "team_unavailable",
@@ -674,6 +676,13 @@ def _reduce_router_event(
             and reason in _LEGACY_REPLAY_TERMINAL_REASONS
         ):
             raise RouterProjectionError("invalid Router terminal reason")
+        if (
+            reason in _PREQUEUE_ONLY_TERMINAL_REASONS
+            and record.state not in {"accepted", "authorized", "staging"}
+        ):
+            raise RouterProjectionError(
+                "Router terminal reason does not match lifecycle"
+            )
         if (record.state == "dispatching") != (
             reason in _DISPATCH_TERMINAL_REASONS
         ):
@@ -774,6 +783,14 @@ class DurableEmployeeIngressRouter:
     @property
     def state(self) -> RouterProjectionState:
         return self._state
+
+    def record_snapshot(self, acceptance_id: str) -> RouterLifecycleRecord | None:
+        """Return one immutable in-memory record without replaying the Journal."""
+
+        if not isinstance(acceptance_id, str) or not acceptance_id:
+            return None
+        with self._mutex:
+            return self._state.by_acceptance_id.get(acceptance_id)
 
     @contextmanager
     def _ingress_dispatch_guard(self) -> Iterator[None]:
@@ -1237,6 +1254,38 @@ class DurableEmployeeIngressRouter:
             if record.state != "queued":
                 raise RouterProjectionError("only queued Router work can be rejected")
             return self._terminal_unlocked(record, reason_code)
+
+    def abandon_message_handoff(
+        self,
+        acceptance_id: str,
+        *,
+        channel_generation: int,
+        connection_id: str,
+    ) -> RouterLifecycleRecord:
+        """Durably stop work that has not committed to the Employee queue.
+
+        A concurrent route or dispatch that already crossed into ``queued``
+        wins; callers must then treat the Employee lane as authoritative.
+        Stale transport callers can observe the current record but cannot
+        mutate it.
+        """
+
+        if type(channel_generation) is not int or channel_generation <= 0:
+            raise ValueError("channel_generation must be a positive integer")
+        if not isinstance(connection_id, str) or not connection_id.startswith(
+            "conn_"
+        ):
+            raise ValueError("connection_id is invalid")
+        with self._mutex, self._writer.transaction_guard():
+            self.rebuild_projection()
+            record = self._record(acceptance_id)
+            if (
+                record.channel_generation != channel_generation
+                or record.connection_id != connection_id
+                or record.state not in {"accepted", "authorized", "staging"}
+            ):
+                return record
+            return self._terminal_unlocked(record, "handoff_unconfirmed")
 
     def defer_dispatch_candidate(
         self,

@@ -23,6 +23,7 @@ from src.autonomous.ingress.models import (
 from src.autonomous.ingress.projection import IngressProjectionState
 from src.autonomous.ingress.router import (
     DurableEmployeeIngressRouter,
+    RouterProjectionError,
     RouterQueueLimits,
 )
 from src.autonomous.ingress.service import EmployeeIngressService
@@ -34,7 +35,7 @@ from src.autonomous.journal.blob_store import (
     BlobStore,
     KeyResolutionError,
 )
-from src.autonomous.journal.frame import GENESIS_HASH
+from src.autonomous.journal.frame import GENESIS_HASH, JournalEvent
 from src.autonomous.journal.projections import ProjectionState
 from src.autonomous.journal.writer import JournalWriter
 from src.autonomous.supervisor.channel_models import ChannelProcessState
@@ -208,6 +209,122 @@ def test_transient_payload_read_waits_then_routes_without_losing_command(
         stack.now[0] += timedelta(seconds=1)
         assert stack.router.route(stack.acceptance_id).state == "queued"
         assert calls > 1
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_unconfirmed_handoff_durably_abandons_only_matching_accepted_transport(
+    tmp_path,
+) -> None:
+    stack = _stack(tmp_path)
+    try:
+        stale = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=4,
+            connection_id="conn_reconnected",
+        )
+        assert stale.state == "accepted"
+
+        abandoned = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=3,
+            connection_id="conn_alpha",
+        )
+        assert abandoned.state == "terminal"
+        assert abandoned.reason_code == "handoff_unconfirmed"
+        assert stack.router.route(stack.acceptance_id) == abandoned
+
+        restarted = DurableEmployeeIngressRouter(**stack.router_kwargs)
+        replayed = restarted.record_snapshot(stack.acceptance_id)
+        assert replayed == abandoned
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_unconfirmed_handoff_does_not_synchronously_sweep_attachments(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = _stack(tmp_path)
+
+    def fail_if_swept() -> None:
+        pytest.fail("handoff must not block on attachment cleanup")
+
+    monkeypatch.setattr(stack.router, "_sweep_terminal_attachments", fail_if_swept)
+    try:
+        abandoned = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=3,
+            connection_id="conn_alpha",
+        )
+
+        assert abandoned.state == "terminal"
+        assert abandoned.reason_code == "handoff_unconfirmed"
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+def test_queued_commit_wins_over_unconfirmed_handoff_abandon(tmp_path) -> None:
+    stack = _stack(tmp_path)
+    try:
+        queued = stack.router.route(stack.acceptance_id)
+        assert queued.state == "queued"
+
+        after_abandon = stack.router.abandon_message_handoff(
+            stack.acceptance_id,
+            channel_generation=3,
+            connection_id="conn_alpha",
+        )
+
+        assert after_abandon == queued
+        restarted = DurableEmployeeIngressRouter(**stack.router_kwargs)
+        assert restarted.record_snapshot(stack.acceptance_id) == queued
+    finally:
+        stack.ingress.close()
+        stack.writer.close()
+
+
+@pytest.mark.parametrize("state", ("queued", "dispatching"))
+def test_handoff_terminal_reducer_rejects_postqueue_journal_history(
+    tmp_path,
+    state: str,
+) -> None:
+    stack = _stack(tmp_path)
+    try:
+        queued = stack.router.route(stack.acceptance_id)
+        assert queued.state == "queued"
+        if state == "dispatching":
+            with stack.writer.transaction_guard(), stack.router._mutex:  # noqa: SLF001
+                stack.router.rebuild_projection()
+                queued = stack.router.state.by_acceptance_id[stack.acceptance_id]
+                stack.router._transition_unlocked(  # noqa: SLF001
+                    queued,
+                    "dispatching",
+                    {},
+                )
+
+        record = stack.router.state.by_acceptance_id[stack.acceptance_id]
+        assert record.state == state
+        invalid = JournalEvent(
+            event_type="employee.ingress.router_terminal",
+            aggregate_id=record.aggregate_id,
+            payload={
+                "acceptance_id": stack.acceptance_id,
+                "reason_code": "handoff_unconfirmed",
+            },
+        )
+        committed = stack.writer.commit(
+            (invalid,),
+            stack.writer.get_aggregate_versions((invalid.aggregate_id,)),
+        )
+
+        with pytest.raises(RouterProjectionError, match="terminal reason"):
+            stack.router.preflight_frame_unlocked(committed.frame)
+        with pytest.raises(RouterProjectionError, match="terminal reason"):
+            DurableEmployeeIngressRouter(**stack.router_kwargs)
     finally:
         stack.ingress.close()
         stack.writer.close()
