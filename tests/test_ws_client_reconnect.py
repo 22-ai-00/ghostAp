@@ -861,6 +861,61 @@ def test_ws_client_init_failure_after_employee_runtime_composition_closes_once(
     runtime.close.assert_called_once_with()
 
 
+def test_ws_client_init_failure_does_not_leave_scheduler_holding_client(
+    monkeypatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from src.autonomous.provisioning.composition import (
+        EmployeeDepartmentRuntime,
+    )
+    from src.feishu import ws_client as ws
+
+    runtime = SimpleNamespace(close=MagicMock())
+    initialization_error = RuntimeError("handler construction failed")
+    schedulers = []
+    build_scheduler = ws._build_task_scheduler
+
+    def capture_scheduler(*args, **kwargs):
+        scheduler = build_scheduler(*args, **kwargs)
+        schedulers.append(scheduler)
+        return scheduler
+
+    monkeypatch.setattr(
+        EmployeeDepartmentRuntime,
+        "from_settings",
+        lambda *_args, **_kwargs: runtime,
+    )
+    monkeypatch.setattr(ws, "_build_task_scheduler", capture_scheduler)
+    monkeypatch.setattr(
+        ws,
+        "_main_bot_outbound_wiring",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(initialization_error),
+    )
+
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            ws.FeishuWSClient(message_callback=lambda *_args: None)
+
+        assert caught.value is initialization_error
+        assert len(schedulers) == 1
+        scheduler = schedulers[0]
+        assert not scheduler._dispatcher.is_alive()
+        with scheduler._lock:
+            listener_owners = {
+                getattr(listener, "__self__", None)
+                for listener in scheduler._listeners
+            }
+        assert not any(
+            isinstance(owner, ws.FeishuWSClient) for owner in listener_owners
+        )
+    finally:
+        for scheduler in schedulers:
+            scheduler.stop(wait=True, shutdown_executor=True)
+            with scheduler._lock:
+                scheduler._listeners.clear()
+
+
 def test_lifecycle_fatal_errors_are_not_silently_swallowed():
     from src.feishu.ws_lifecycle import WSLifecycleAction, classify_lifecycle_error
 

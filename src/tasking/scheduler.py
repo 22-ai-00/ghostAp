@@ -308,6 +308,16 @@ class TaskScheduler:
         with self._lock:
             self._listeners.append(listener)
 
+    def remove_listener(self, listener: Callable[[TaskEvent], None]) -> bool:
+        """Remove every matching listener and report whether one was present."""
+
+        with self._lock:
+            retained = [registered for registered in self._listeners if registered != listener]
+            if len(retained) == len(self._listeners):
+                return False
+            self._listeners = retained
+            return True
+
     @staticmethod
     def _build_project_serial_key(chat_id: str, project_id: Optional[str]) -> Optional[str]:
         if not project_id:

@@ -70,7 +70,13 @@ from ..project import (
     ProjectManager,
 )
 from ..spec_engine import SpecEngineManager, SpecReporter
-from ..tasking import TaskPriority, TaskQueueFullError, TaskScheduler, TaskSpec
+from ..tasking import (
+    TaskEvent,
+    TaskPriority,
+    TaskQueueFullError,
+    TaskScheduler,
+    TaskSpec,
+)
 from ..thread import (
     get_current_tenant_key,
     get_current_thread_id,
@@ -406,6 +412,7 @@ class FeishuWSClient:
         try:
             self._initialize(message_callback)
         except BaseException:
+            self._close_scheduler_after_initialization_failure()
             self._close_employee_runtime_after_initialization_failure()
             raise
 
@@ -800,7 +807,6 @@ class FeishuWSClient:
             project_manager=self._project_manager,
             exit_handler_fn=system_handler.exit_current_mode,
         )
-        self._scheduler.add_listener(self._control_plane.on_scheduler_event)
         # --- Message Dispatcher ---
         from .dispatcher import MessageDispatcher
         self._message_dispatcher = MessageDispatcher(self)
@@ -811,6 +817,7 @@ class FeishuWSClient:
 
         # Configure trace logging
         configure_logging_with_trace()
+        self._register_scheduler_listeners()
 
     def _recover_employee_runtime_after_handler_binding(
         self,
@@ -932,6 +939,81 @@ class FeishuWSClient:
         thread.join(timeout=timeout)
         return not thread.is_alive()
 
+    def _register_scheduler_listeners(self) -> None:
+        """Attach scheduler-owned callbacks only after construction succeeds."""
+
+        ingress_listener = self._on_message_ingress_task_event
+        self._scheduler.add_listener(ingress_listener)
+        try:
+            self._scheduler.add_listener(self._control_plane.on_scheduler_event)
+        except BaseException:
+            try:
+                self._scheduler.remove_listener(ingress_listener)
+            except BaseException:
+                logger.error(
+                    "failed to roll back scheduler listener registration",
+                    exc_info=True,
+                )
+            raise
+
+    def _detach_scheduler_listeners(self) -> None:
+        """Release scheduler references after its callbacks have quiesced."""
+
+        scheduler = getattr(self, "_scheduler", None)
+        remove_listener = getattr(scheduler, "remove_listener", None)
+        if not callable(remove_listener):
+            return
+
+        listeners: list[Callable[[TaskEvent], None]] = [
+            self._on_message_ingress_task_event
+        ]
+        control_plane = getattr(self, "_control_plane", None)
+        control_listener = getattr(control_plane, "on_scheduler_event", None)
+        if callable(control_listener):
+            listeners.append(control_listener)
+
+        for listener in listeners:
+            try:
+                remove_listener(listener)
+            except Exception:
+                logger.debug(
+                    "failed to detach scheduler listener",
+                    exc_info=True,
+                )
+
+    def _close_scheduler_after_initialization_failure(self) -> None:
+        """Stop a partially constructed scheduler without masking the cause."""
+
+        control_plane = getattr(self, "_control_plane", None)
+        stop_control_plane = getattr(control_plane, "stop", None)
+        if callable(stop_control_plane):
+            try:
+                stop_control_plane()
+            except BaseException:
+                logger.error(
+                    "ControlPlane cleanup failed after initialization error",
+                    exc_info=True,
+                )
+
+        try:
+            self._detach_scheduler_listeners()
+        except BaseException:
+            logger.error(
+                "scheduler listener cleanup failed after initialization error",
+                exc_info=True,
+            )
+
+        scheduler = getattr(self, "_scheduler", None)
+        stop_scheduler = getattr(scheduler, "stop", None)
+        if callable(stop_scheduler):
+            try:
+                stop_scheduler(wait=True, shutdown_executor=True)
+            except BaseException:
+                logger.error(
+                    "scheduler cleanup failed after initialization error",
+                    exc_info=True,
+                )
+
     def _close_employee_runtime_after_initialization_failure(self) -> None:
         """Close a composed runtime once without masking the init failure."""
 
@@ -1011,6 +1093,8 @@ class FeishuWSClient:
             except Exception:
                 logger.debug("failed to stop scheduler dispatcher", exc_info=True)
             return False
+
+        self._detach_scheduler_listeners()
 
         # Ask every delegated execution surface to stop before destroying ACP
         # sessions.  Employee runtime close waits for its Team executor; Team

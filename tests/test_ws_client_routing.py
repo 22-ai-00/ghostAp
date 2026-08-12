@@ -1632,6 +1632,49 @@ def test_close_shuts_down_card_registry_with_one_bounded_wave(
     assert shutdown_all.call_args.kwargs["timeout"] > 0
 
 
+def test_scheduler_listeners_register_once_and_detach_after_idle_close(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    scheduler = mock_ws_client._scheduler
+    ingress_callbacks = [
+        call.args[0]
+        for call in scheduler.add_listener.call_args_list
+        if getattr(call.args[0], "__self__", None) is mock_ws_client
+        and getattr(call.args[0], "__func__", None)
+        is FeishuWSClient._on_message_ingress_task_event
+    ]
+    control_plane_callbacks = [
+        call.args[0]
+        for call in scheduler.add_listener.call_args_list
+        if getattr(call.args[0], "__self__", None) is mock_ws_client._control_plane
+    ]
+
+    assert len(ingress_callbacks) == 1
+    assert len(control_plane_callbacks) == 1
+    scheduler.remove_listener.reset_mock()
+
+    with patch(
+        "src.card.delivery.registry.delivery_registry.shutdown_all",
+        return_value=True,
+    ):
+        assert mock_ws_client.close() is True
+
+    scheduler.remove_listener.assert_any_call(ingress_callbacks[0])
+    scheduler.remove_listener.assert_any_call(control_plane_callbacks[0])
+
+
+def test_close_keeps_scheduler_listener_until_running_callbacks_drain(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    scheduler = mock_ws_client._scheduler
+    scheduler.wait_for_idle.return_value = False
+    scheduler.remove_listener.reset_mock()
+
+    assert mock_ws_client.close() is False
+
+    scheduler.remove_listener.assert_not_called()
+
+
 def test_close_preserves_dependencies_when_card_registry_shutdown_times_out(
     mock_ws_client: FeishuWSClient,
 ) -> None:
