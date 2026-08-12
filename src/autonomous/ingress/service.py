@@ -553,13 +553,20 @@ class EmployeeIngressService:
             raise IngressBlobError("ingress blob payload verification failed")
 
     def _read_record_payload(self, record: IngressRecord) -> EmployeeIngressPayload:
-        if dict(record.blob_ref.labels or {}) != _blob_labels(record.metadata):
-            raise IngressBlobError("ingress blob labels do not match authority")
-        raw = self._blob_store.read(record.blob_ref)
-        decoded = json.loads(raw)
-        payload = EmployeeIngressPayload.from_dict(decoded)
-        self._validate_incoming_payload(record.metadata, payload)
-        return payload
+        try:
+            if dict(record.blob_ref.labels or {}) != _blob_labels(record.metadata):
+                raise IngressBlobError("ingress blob labels do not match authority")
+            raw = self._blob_store.read(record.blob_ref)
+            decoded = json.loads(raw)
+            payload = EmployeeIngressPayload.from_dict(decoded)
+            self._validate_incoming_payload(record.metadata, payload)
+            return payload
+        except IngressBlobError:
+            raise
+        except (BlobError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise IngressBlobError(
+                "authenticated ingress payload is unavailable"
+            ) from exc
 
     def _quarantine_new_blobs_unlocked(self, before_ids: set[str]) -> None:
         try:

@@ -244,6 +244,28 @@ def test_corrupt_original_blob_turns_duplicate_into_closed_ingress(
     writer.close()
 
 
+@pytest.mark.parametrize("damage", ("missing", "corrupt"))
+def test_live_unreadable_blob_uses_the_ingress_error_contract(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    service, writer, _store_value = _service(tmp_path)
+    payload = _payload()
+    ack = service.accept(_metadata(payload), payload, request_id="req_1")
+    record = service.state.by_acceptance_id[ack.acceptance.acceptance_id]
+    path = tmp_path / "ingress-blobs" / f"{record.blob_ref.blob_id}.blob"
+    if damage == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"corrupt")
+
+    with pytest.raises(IngressBlobError):
+        service.get_payload(ack.acceptance.acceptance_id)
+
+    service.close()
+    writer.close()
+
+
 def test_blob_publish_failure_has_no_journal_acceptance(tmp_path: Path) -> None:
     service, writer, store = _service(tmp_path)
     payload = _payload()

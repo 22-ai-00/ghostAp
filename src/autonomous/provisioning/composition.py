@@ -57,7 +57,11 @@ from ..ingress.attachments import AttachmentStagingService
 from ..ingress.models import EmployeeIngressMetadata, EmployeeIngressPayload
 from ..ingress.projection import IngressProjectionState
 from ..ingress.router import DurableEmployeeIngressRouter, RouterQueueLimits
-from ..ingress.service import EmployeeIngressService, IngressConflictError
+from ..ingress.service import (
+    EmployeeIngressService,
+    IngressBlobError,
+    IngressConflictError,
+)
 from ..ingress.targeted_task import (
     TargetedTaskParseResult,
     TargetedTaskState,
@@ -1968,27 +1972,32 @@ class EmployeeDepartmentRuntime:
         worked = False
         for acceptance_id, record in tuple(ingress.state.by_acceptance_id.items()):
             if record.disposition is None:
-                payload_unavailable = False
                 try:
                     payload = ingress.get_payload(acceptance_id)
-                    first = (
-                        payload.normalized_parts[0]
-                        if len(payload.normalized_parts) == 1
-                        else None
-                    )
-                    if (
-                        isinstance(first, Mapping)
-                        and first.get("type") == "membership_event"
-                        and self._handle_control_ingress(acceptance_id)
-                    ):
-                        worked = True
-                        continue
-                except Exception:
-                    payload = None
-                    payload_unavailable = True
-                if payload_unavailable:
-                    # A transient blob/read failure is not an authority denial.
-                    # Preserve the pending ingress for a later bounded retry.
+                except IngressBlobError:
+                    # Let the Router durably converge every authenticated
+                    # payload failure to inbox_not_dispatchable.  Retrying a
+                    # missing or corrupt Blob forever would create a hot loop.
+                    routed = router.state.by_acceptance_id.get(acceptance_id)
+                    if routed is None or routed.state not in {
+                        "queued",
+                        "dispatching",
+                        "terminal",
+                    }:
+                        router.route(acceptance_id)
+                    worked = True
+                    continue
+                first = (
+                    payload.normalized_parts[0]
+                    if len(payload.normalized_parts) == 1
+                    else None
+                )
+                if (
+                    isinstance(first, Mapping)
+                    and first.get("type") == "membership_event"
+                    and self._handle_control_ingress(acceptance_id)
+                ):
+                    worked = True
                     continue
                 try:
                     owner_p2p_requester = self._owner_p2p_requester(
@@ -2020,9 +2029,19 @@ class EmployeeDepartmentRuntime:
                     and targeted_group_task.state
                     is TargetedTaskState.INDETERMINATE
                 ):
-                    # Authority dependencies can be temporarily unavailable.
-                    # Preserve the pending ingress so the next bounded drain
-                    # retries instead of terminally suppressing the command.
+                    # One independent Router pass is the bounded recovery for
+                    # a classifier dependency failure.  The Router either
+                    # queues the authenticated command or records an explicit
+                    # terminal denial; this record never remains a hot retry.
+                    self._record_employee_ingress_group_event(acceptance_id)
+                    routed = router.state.by_acceptance_id.get(acceptance_id)
+                    if routed is None or routed.state not in {
+                        "queued",
+                        "dispatching",
+                        "terminal",
+                    }:
+                        router.route(acceptance_id)
+                    worked = True
                     continue
                 if (
                     owner_p2p_requester is None

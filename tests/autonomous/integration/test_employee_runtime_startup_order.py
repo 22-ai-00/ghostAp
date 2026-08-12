@@ -488,13 +488,12 @@ def test_production_dispatch_ignores_main_bot_group_command_observation(
     assert pending.disposition.reason_code == "main_bot_group_command"
 
 
-def test_production_dispatch_retries_indeterminate_targeted_group_task_once_per_drain(
+def test_production_dispatch_falls_back_to_router_on_indeterminate_targeted_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.autonomous.ingress.targeted_task import (
         TargetedTaskParseResult,
         TargetedTaskState,
-        targeted_group_task_digest,
     )
     from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
 
@@ -507,12 +506,6 @@ def test_production_dispatch_retries_indeterminate_targeted_group_task_once_per_
             action_identity="",
         ),
     )
-    task = TargetedTaskParseResult(
-        TargetedTaskState.TARGETED_VALID,
-        description="finish audit",
-        input_digest=targeted_group_task_digest("finish audit"),
-    )
-
     class _Ingress:
         state = SimpleNamespace(by_acceptance_id={acceptance_id: pending})
 
@@ -567,17 +560,12 @@ def test_production_dispatch_retries_indeterminate_targeted_group_task_once_per_
     runtime._dispatch = _Dispatch()  # type: ignore[assignment]  # noqa: SLF001
     classifications = 0
 
-    classifications_by_drain = (
-        TargetedTaskParseResult(TargetedTaskState.INDETERMINATE),
-        task,
-    )
-
     def classify_once(_record, _payload):
         nonlocal classifications
         classifications += 1
-        if classifications > len(classifications_by_drain):
+        if classifications > 1:
             pytest.fail("an ingress drain classified the targeted task twice")
-        return classifications_by_drain[classifications - 1]
+        return TargetedTaskParseResult(TargetedTaskState.INDETERMINATE)
 
     monkeypatch.setattr(
         runtime,
@@ -598,14 +586,8 @@ def test_production_dispatch_retries_indeterminate_targeted_group_task_once_per_
     runtime._drain_employee_dispatch_once()  # noqa: SLF001
 
     assert pending.disposition is None
-    assert calls == ["dispatch", "gc_payload"]
+    assert calls == ["project_group_context", "route", "dispatch", "gc_payload"]
     assert classifications == 1
-
-    calls.clear()
-    runtime._drain_employee_dispatch_once()  # noqa: SLF001
-
-    assert calls == ["project_group_context", "route", "dispatch"]
-    assert classifications == 2
 
 
 def test_targeted_group_task_authority_ignores_unavailable_ingress_payload() -> None:
@@ -622,6 +604,79 @@ def test_targeted_group_task_authority_ignores_unavailable_ingress_payload() -> 
         SimpleNamespace(metadata=SimpleNamespace()),
         None,
     ) is None
+
+
+def test_production_dispatch_terminalizes_unreadable_payload_through_router() -> None:
+    from src.autonomous.ingress.service import IngressBlobError
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    calls: list[str] = []
+    acceptance_id = "acc_unreadable_payload"
+    pending = SimpleNamespace(disposition=None)
+
+    class _Ingress:
+        state = SimpleNamespace(by_acceptance_id={acceptance_id: pending})
+
+        def rebuild_projection(self):
+            return None
+
+        def get_payload(self, observed_acceptance_id: str):
+            assert observed_acceptance_id == acceptance_id
+            raise IngressBlobError("authenticated payload is unreadable")
+
+        def record_disposition(
+            self,
+            observed_acceptance_id: str,
+            *,
+            state: str,
+            reason_code: str,
+        ):
+            assert observed_acceptance_id == acceptance_id
+            pending.disposition = SimpleNamespace(
+                state=state,
+                reason_code=reason_code,
+            )
+            calls.append("terminal_ingress")
+
+        def gc_terminal_payloads(self):
+            calls.append("gc_payload")
+            return 0
+
+    class _Router:
+        state = SimpleNamespace(by_acceptance_id={})
+
+        def rebuild_projection(self):
+            return None
+
+        def route(self, observed_acceptance_id: str):
+            assert observed_acceptance_id == acceptance_id
+            self.state.by_acceptance_id[acceptance_id] = SimpleNamespace(
+                state="terminal",
+                reason_code="inbox_not_dispatchable",
+            )
+            calls.append("route_terminal")
+
+    class _Dispatch:
+        employee_runtime = None
+
+        def dispatch_next(self):
+            calls.append("dispatch")
+            return None
+
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = _Ingress()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._router = _Router()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._dispatch = _Dispatch()  # type: ignore[assignment]  # noqa: SLF001
+
+    runtime._drain_employee_dispatch_once()  # noqa: SLF001
+
+    assert pending.disposition.reason_code == "inbox_not_dispatchable"
+    assert calls == [
+        "route_terminal",
+        "dispatch",
+        "terminal_ingress",
+        "gc_payload",
+    ]
 
 
 def test_targeted_group_task_usage_is_anchored_before_ingress_disposition(
