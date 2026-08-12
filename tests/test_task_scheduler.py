@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import pytest
 
+import src.tasking.scheduler as scheduler_module
 from src.tasking.scheduler import (
     TaskEvent,
     TaskRunState,
@@ -15,6 +16,7 @@ from src.tasking.scheduler import (
     TaskSpec,
     TaskStatus,
 )
+from src.utils.rate_limit import RateLimitExceededException
 
 TERMINAL = frozenset({TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELED})
 
@@ -270,4 +272,179 @@ def test_terminal_ttl_reap_cleans_state_and_indexes() -> None:
         assert scheduler.list_tasks(chat_id="chat", include_done=True) == []
         assert scheduler.list_tasks(project_id="project", include_done=True) == []
     finally:
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_pending_capacity_is_independent_and_rejection_leaves_no_partial_state() -> None:
+    assert issubclass(scheduler_module.TaskQueueFullError, RateLimitExceededException)
+
+    scheduler, events = _scheduler(
+        max_concurrent=1,
+        system_concurrency=1,
+        max_pending_normal=1,
+        max_pending_system=1,
+    )
+    normal_started = threading.Event()
+    system_started = threading.Event()
+    release = threading.Event()
+
+    def block(started: threading.Event):
+        def run(_ctx) -> None:
+            started.set()
+            release.wait(timeout=3)
+
+        return run
+
+    try:
+        normal_running = scheduler.submit(
+            TaskSpec(chat_id="normal-running", name="normal-running"),
+            block(normal_started),
+        )
+        system_running = scheduler.submit(
+            TaskSpec(
+                chat_id="system-running",
+                name="system-running",
+                is_system_command=True,
+            ),
+            block(system_started),
+        )
+        assert normal_started.wait(timeout=1)
+        assert system_started.wait(timeout=1)
+
+        normal_pending = scheduler.submit(
+            TaskSpec(chat_id="normal-pending", name="normal-pending"),
+            lambda _ctx: None,
+        )
+        system_pending = scheduler.submit(
+            TaskSpec(
+                chat_id="system-pending",
+                name="system-pending",
+                is_system_command=True,
+            ),
+            lambda _ctx: None,
+        )
+
+        with pytest.raises(scheduler_module.TaskQueueFullError):
+            scheduler.submit(
+                TaskSpec(
+                    chat_id="normal-rejected",
+                    project_id="rejected-project",
+                    task_id="rejected-task-id",
+                    name="normal-rejected",
+                ),
+                lambda _ctx: None,
+            )
+        with pytest.raises(scheduler_module.TaskQueueFullError):
+            scheduler.submit(
+                TaskSpec(
+                    chat_id="system-rejected",
+                    project_id="rejected-system-project",
+                    task_id="rejected-system-task-id",
+                    name="system-rejected",
+                    is_system_command=True,
+                ),
+                lambda _ctx: None,
+            )
+
+        with scheduler._lock:
+            assert all(
+                state.spec.chat_id not in {"normal-rejected", "system-rejected"}
+                for state in scheduler._states.values()
+            )
+            assert "normal-rejected" not in scheduler._by_chat
+            assert "system-rejected" not in scheduler._by_chat
+            assert "rejected-project" not in scheduler._by_project
+            assert "rejected-system-project" not in scheduler._by_project
+            assert "rejected-task-id" not in scheduler._by_task_id
+            assert "rejected-system-task-id" not in scheduler._by_task_id
+            assert "normal-rejected:rejected-project" not in scheduler._queues
+            assert "system-rejected:SYSTEM" not in scheduler._queues
+
+        release.set()
+        for handle in (
+            normal_running,
+            system_running,
+            normal_pending,
+            system_pending,
+        ):
+            assert events.wait_for(handle.run_id, TaskStatus.SUCCEEDED)
+    finally:
+        release.set()
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_terminal_history_and_idle_keys_stay_bounded_after_sustained_activity() -> None:
+    scheduler, events = _scheduler(
+        max_concurrent=4,
+        per_key_concurrency=1,
+        max_pending_normal=100,
+        max_terminal_history=3,
+    )
+    try:
+        handles = [
+            scheduler.submit(
+                TaskSpec(
+                    chat_id=f"history-chat-{index}",
+                    project_id=f"history-project-{index}",
+                    task_id=f"history-task-{index}",
+                    name=f"history-{index}",
+                ),
+                lambda _ctx: None,
+            )
+            for index in range(30)
+        ]
+        assert all(
+            events.wait_for(handle.run_id, TaskStatus.SUCCEEDED, timeout=5)
+            for handle in handles
+        )
+        assert scheduler.wait_for_idle(timeout=2)
+
+        with scheduler._lock:
+            terminal_states = [
+                state
+                for state in scheduler._states.values()
+                if state.status in TERMINAL
+            ]
+            assert len(terminal_states) <= 3
+            assert scheduler._queues == {}
+            assert scheduler._running_by_key == {}
+            assert scheduler._running_by_project == {}
+            assert scheduler._pending_normal == 0
+            assert scheduler._pending_system == 0
+            assert len(scheduler._by_chat) <= 3
+            assert len(scheduler._by_project) <= 3
+            assert len(scheduler._by_task_id) <= 3
+    finally:
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_reaping_old_duplicate_task_id_preserves_newer_mapping() -> None:
+    scheduler, events = _scheduler(max_concurrent=1, max_terminal_history=10)
+    release = threading.Event()
+    replacement_started = threading.Event()
+    try:
+        old = scheduler.submit(
+            TaskSpec(chat_id="chat", task_id="shared-task-id", name="old"),
+            lambda _ctx: None,
+        )
+        assert events.wait_for(old.run_id, TaskStatus.SUCCEEDED)
+
+        def block(_ctx) -> None:
+            replacement_started.set()
+            release.wait(timeout=3)
+
+        replacement = scheduler.submit(
+            TaskSpec(chat_id="chat", task_id="shared-task-id", name="replacement"),
+            block,
+        )
+        assert replacement_started.wait(timeout=1)
+
+        with scheduler._cv:
+            assert scheduler._reap_completed_states(max_age_seconds=0) == 1
+
+        state = scheduler.get_state_by_task_id("shared-task-id", "chat")
+        assert state is not None
+        assert state.run_id == replacement.run_id
+    finally:
+        release.set()
         scheduler.stop(shutdown_executor=True)

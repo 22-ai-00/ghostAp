@@ -34,7 +34,9 @@ class _FakeProgrammingCardSession:
 
     def __init__(self, *_args, **kwargs):
         self.failed_text = None
+        self.fail_kwargs = {}
         self.finished = False
+        self.finish_kwargs = {}
         self.cancelled_reason = None
         self.continuation_boundaries = 0
         self.kwargs = kwargs
@@ -67,11 +69,13 @@ class _FakeProgrammingCardSession:
     def get_final_text(self):
         return getattr(self, "final_text", "")
 
-    def finish(self, **_kwargs):
+    def finish(self, **kwargs):
         self.finished = True
+        self.finish_kwargs = kwargs
 
-    def fail(self, text, **_kwargs):
+    def fail(self, text, **kwargs):
         self.failed_text = text
+        self.fail_kwargs = kwargs
 
     def cancel(self, *, reason):
         self.cancelled_reason = reason
@@ -318,12 +322,17 @@ def test_prompt_execution_log_allowlists_provider_goal_status(
 
 
 @contextmanager
-def _streaming_environment(adapter_cls=_FakeProgrammingCardSession):
+def _streaming_environment(
+    adapter_cls=_FakeProgrammingCardSession,
+    *,
+    delivery=None,
+):
+    delivery = delivery or MagicMock()
     with ExitStack() as stack:
         stack.enter_context(
             patch(
                 "src.card.delivery.factory.create_card_delivery",
-                return_value=MagicMock(),
+                return_value=delivery,
             )
         )
         stack.enter_context(
@@ -350,7 +359,89 @@ def _streaming_environment(adapter_cls=_FakeProgrammingCardSession):
                 create=True,
             )
         )
-        yield
+        yield delivery
+
+
+def test_programming_owned_delivery_shuts_down_after_success():
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = _QueuedPromptSession(_completed_result())
+    delivery = MagicMock()
+    delivery.shutdown.return_value = True
+
+    with _streaming_environment(delivery=delivery):
+        handler.handle_response(
+            "msg-owned-success",
+            "chat-1",
+            "finish",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    delivery.shutdown.assert_called_once()
+
+
+def test_programming_owned_delivery_shuts_down_after_initial_card_fallback():
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    call_order: list[str] = []
+    handler._handle_response_non_streaming = MagicMock(
+        side_effect=lambda *_args, **_kwargs: call_order.append("fallback")
+    )
+    delivery = MagicMock()
+    delivery.shutdown.side_effect = lambda **_kwargs: (
+        call_order.append("shutdown") or True
+    )
+
+    class _InvisibleProgrammingCardSession(_FakeProgrammingCardSession):
+        def wait_until_visible(self, _timeout):
+            return False
+
+    with _streaming_environment(
+        _InvisibleProgrammingCardSession,
+        delivery=delivery,
+    ):
+        handler.handle_response(
+            "msg-owned-fallback",
+            "chat-1",
+            "finish",
+            MagicMock(),
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    delivery.shutdown.assert_called_once()
+    handler._handle_response_non_streaming.assert_called_once()
+    assert call_order == ["shutdown", "fallback"]
+
+
+def test_programming_owned_delivery_shuts_down_when_execution_raises():
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler._execute_programming_response = MagicMock(
+        side_effect=RuntimeError("unexpected execution failure")
+    )
+    delivery = MagicMock()
+    delivery.shutdown.return_value = True
+
+    with (
+        _streaming_environment(delivery=delivery),
+        pytest.raises(RuntimeError, match="unexpected execution failure"),
+    ):
+        handler.handle_response(
+            "msg-owned-exception",
+            "chat-1",
+            "finish",
+            MagicMock(),
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    delivery.shutdown.assert_called_once()
 
 
 def test_streaming_pending_plan_continues_on_same_session_and_finishes():
@@ -406,6 +497,67 @@ def test_streaming_retries_pending_plan_three_times_then_reports_incomplete():
     assert adapter.continuation_boundaries == 3
     assert adapter.finished is False
     assert adapter.failed_text is not None
+    assert adapter.fail_kwargs["details"]
+    assert adapter.fail_kwargs["detail_action"]["action"] == "show_error_details"
+
+
+def test_streaming_stale_child_history_becomes_completed_with_diagnostic() -> None:
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = MagicMock()
+    session.session_id = "stale-child-history"
+    session.message_count = 1
+    result = PromptResult(
+        stop_reason="end_turn",
+        text="完整审计结果",
+        tool_calls=[
+            ToolCallInfo(
+                id="stale-child-activity",
+                title="subagent activity",
+                kind="other",
+                status="completed",
+                subagent_source_id="child-a",
+                subagent_activity="interacted",
+            )
+        ],
+    )
+    execution = PromptContinuationResult(
+        result=result,
+        assessment=classify_prompt_result(result),
+        automatic_continuations=1,
+        entered_finalization=False,
+    )
+
+    proof = MagicMock()
+    proof.all_observed_children_terminal.return_value = True
+
+    with (
+        _streaming_environment(_FakeProgrammingCardSession),
+        patch(
+            "src.feishu.handlers.programming.AuthoritativeChildLifecycleProof",
+            return_value=proof,
+        ),
+        patch(
+            "src.feishu.handlers.programming.run_prompt_across_execution_windows",
+            return_value=execution,
+        ),
+    ):
+        handler.handle_response(
+            "msg-stale-child",
+            "chat-1",
+            "audit",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    adapter = _FakeProgrammingCardSession.last
+    assert adapter.finished is True
+    assert adapter.failed_text is None
+    assert "不影响" in adapter.finish_kwargs["warning"]
+    assert adapter.finish_kwargs["details"]
+    assert adapter.finish_kwargs["detail_action"]["action"] == "show_error_details"
 
 
 def test_non_streaming_pending_plan_continues_and_replies_with_success():

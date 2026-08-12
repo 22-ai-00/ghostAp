@@ -37,6 +37,7 @@ class SessionLockPool:
     Public interface:
         acquire(session_id) -> RLock          # get-or-create per-session lock
         release(session_id) -> None           # remove lock entry (on session close)
+        try_enter_delivery() -> bool           # atomic admission + in-flight increment
         drain(timeout) -> bool                # wait for all in-flight to finish
         fence() -> None                       # stop accepting new work
         shutdown() -> None                    # stop eviction thread
@@ -136,9 +137,17 @@ class SessionLockPool:
             self._timestamps.pop(session_id, None)
 
     def enter_delivery(self) -> None:
-        """Increment in-flight counter (call before starting I/O)."""
+        """Increment in-flight counter for an already-admitted internal caller."""
         with self._in_flight_condition:
             self._in_flight_count += 1
+
+    def try_enter_delivery(self) -> bool:
+        """Atomically admit one delivery unless shutdown fencing has begun."""
+        with self._in_flight_condition:
+            if not self._accepting_work.is_set():
+                return False
+            self._in_flight_count += 1
+            return True
 
     def exit_delivery(self) -> None:
         """Decrement in-flight counter (call after I/O completes, in finally)."""
@@ -149,7 +158,11 @@ class SessionLockPool:
 
     def fence(self) -> None:
         """Stop accepting new work (used before drain)."""
-        self._accepting_work.clear()
+        # Admission and fencing share the in-flight condition lock. Therefore
+        # a successful drain observes every delivery admitted before this fence,
+        # while every later try_enter_delivery() is rejected.
+        with self._in_flight_condition:
+            self._accepting_work.clear()
 
     def drain(self, timeout: float = 5.0) -> bool:
         """Wait until all in-flight deliveries complete. O(1) wait.

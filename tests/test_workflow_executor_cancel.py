@@ -180,6 +180,26 @@ def test_cancel_guard_does_not_fire_for_normal_completion(tmp_path, make_executo
         mock_session.close.assert_called_once()
 
 
+def test_executor_session_enables_full_tool_capture(tmp_path, make_executor):
+    """Workflow is the sole engine lane that opts into raw tool payloads."""
+    executor = make_executor(tmp_path)
+    mock_session = MagicMock()
+    mock_session.send_prompt.return_value = SimpleNamespace(
+        text="ok",
+        output_tokens=0,
+        stop_reason="end_turn",
+    )
+
+    with patch(
+        "src.agent_session.factory.create_engine_session",
+        return_value=mock_session,
+    ) as mock_create:
+        result = executor.execute(AgentCallParams(prompt="hello", tool="coco"))
+
+    assert result.error is None
+    assert mock_create.call_args.kwargs["capture_full_tool_content"] is True
+
+
 def test_cancel_before_execution_no_session_created(tmp_path, make_executor):
     """If cancel_event is already set before execute runs, it returns early
     without creating a session (no cancel guard needed)."""

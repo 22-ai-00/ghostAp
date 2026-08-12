@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.project.context import ProjectContext
+from src.project.context import ProjectContext, ProjectStatus
 from src.project.manager import ProjectManager
 
 
@@ -132,6 +132,33 @@ class TestCrossChatAccess:
 
         assert pm.find_project_by_name("collab", chat_id="chatA") is not None
         assert pm.find_project_by_name("collab", chat_id="chatB") is not None
+
+    def test_identical_active_project_refresh_skips_snapshot_rewrite(self, pm):
+        pm.create_project(None, "hot", "/tmp/hot_iso", chat_id="chatA")
+        ctx = pm.get_project_for_diagnostics("hot")
+        prior_chat_touch = ctx.allowed_chat_ids["chatA"]
+        prior_project_touch = ctx.last_active
+        pm._save_projects = MagicMock(return_value=True)
+
+        ok, _ = pm.set_active_project("chatA", "hot")
+
+        assert ok is True
+        pm._save_projects.assert_not_called()
+        assert ctx.allowed_chat_ids["chatA"] >= prior_chat_touch
+        assert ctx.last_active >= prior_project_touch
+
+    def test_identical_active_binding_repairs_missing_membership_and_persists(self, pm):
+        pm.create_project(None, "repair", "/tmp/repair_iso", chat_id="chatOwner")
+        ctx = pm.get_project_for_diagnostics("repair")
+        pm._active_project["chatMissing"] = "repair"
+        ctx.status = ProjectStatus.ACTIVE
+        pm._save_projects = MagicMock(return_value=True)
+
+        ok, _ = pm.set_active_project("chatMissing", "repair")
+
+        assert ok is True
+        assert "chatMissing" in ctx.allowed_chat_ids
+        pm._save_projects.assert_called_once_with()
 
 
 class TestSnapshotPersistence:

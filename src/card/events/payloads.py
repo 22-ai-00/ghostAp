@@ -12,11 +12,17 @@ class CompletedPayload(TypedDict, total=False):
     """Payload for COMPLETED event."""
     summary: str
     duration_seconds: float
+    warning: str
+    details: str
+    detail_action: dict[str, Any]
 
 
 class FailedPayload(TypedDict):
     """Payload for FAILED event."""
     error: str
+    details: NotRequired[str]
+    detail_action: NotRequired[dict[str, Any]]
+    retry_action: NotRequired[dict[str, Any]]
     duration_seconds: NotRequired[float]
 
 

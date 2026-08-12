@@ -240,7 +240,15 @@ def _apply_compaction_once(
             return SyncACPSession(**kwargs)
 
     try:
-        new_sess = builder(agent_type=agent_type, cwd=cwd, agent_cmd=agent_cmd, agent_args=list(agent_args))
+        new_sess = builder(
+            agent_type=agent_type,
+            cwd=cwd,
+            agent_cmd=agent_cmd,
+            agent_args=list(agent_args),
+            capture_full_tool_content=bool(
+                getattr(session, "_capture_full_tool_content", False)
+            ),
+        )
         new_sess.start(startup_timeout=timeout_s)
         return new_sess
     except (RuntimeError, OSError, TimeoutError):

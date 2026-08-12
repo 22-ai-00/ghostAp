@@ -51,6 +51,194 @@ class TestCardSessionDispatch:
         return session, client, delivery
 
 
+class TestAsyncSnapshotCoalescing:
+    def test_blocked_delivery_renders_only_first_and_latest_terminal_snapshot(self):
+        from src.card.render.renderer import render_card as real_render_card
+
+        class _BlockingDelivery:
+            def __init__(self):
+                self.first_started = threading.Event()
+                self.release_first = threading.Event()
+                self.calls = 0
+
+            def open_session(self, _session_id, _chat_id):
+                return None
+
+            def deliver(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    self.first_started.set()
+                    self.release_first.wait(timeout=3.0)
+                return [MutationOutcome(kind="applied")]
+
+            def close(self, _session_id):
+                return None
+
+            def release_session_lock(self, _session_id):
+                return None
+
+        delivery = _BlockingDelivery()
+        config = SessionConfig(
+            metadata=CardMetadata(mode_name="Coalesce"),
+            sync_delivery=False,
+        )
+        session = CardSession(
+            chat_id="chat-coalesce",
+            config=config,
+            delivery=delivery,
+            session_id="session-coalesce",
+        )
+        # The global test fixture forces synchronous delivery; this contract is
+        # specifically about the production asynchronous path.
+        session._sync_delivery = False
+        session._timers.close()
+        rendered_snapshots: list[tuple[int, str | None]] = []
+
+        def _recording_render(state, budget):
+            rendered_snapshots.append((state.version, state.terminal_reason))
+            return real_render_card(state, budget)
+
+        try:
+            with patch("src.card.session.core.render_card", side_effect=_recording_render):
+                session.dispatch(CardEvent.started())
+                assert delivery.first_started.wait(timeout=2.0)
+
+                session.dispatch(CardEvent.text_delta("main", "one"))
+                session.dispatch(CardEvent.text_delta("main", "two"))
+                session.dispatch(CardEvent.completed(summary="done"))
+
+                # Rendering is expensive: pending immutable states must be
+                # coalesced before it, with the terminal state winning.
+                assert rendered_snapshots == [(1, None)]
+
+                delivery.release_first.set()
+                assert session.wait_delivery_idle(timeout=3.0)
+        finally:
+            delivery.release_first.set()
+            session.wait_delivery_idle(timeout=3.0)
+
+        assert len(rendered_snapshots) == 2
+        assert rendered_snapshots[-1][1] == "completed"
+        assert delivery.calls == 2
+
+    def test_close_fences_snapshot_blocked_in_render_before_delivery(self):
+        render_started = threading.Event()
+        release_render = threading.Event()
+        delivery = MagicMock()
+        session = CardSession(
+            chat_id="chat-close-render",
+            config=SessionConfig(
+                metadata=CardMetadata(mode_name="CloseFence"),
+                sync_delivery=False,
+            ),
+            delivery=delivery,
+            session_id="session-close-render",
+        )
+        session._sync_delivery = False
+        session._timers.close()
+        session._deliver_and_track = MagicMock()
+
+        def _blocked_render(_state, _budget):
+            render_started.set()
+            release_render.wait()
+            return [
+                RenderedCard(
+                    _card_json={"body": {"elements": []}},
+                    structure_signature="close-fence",
+                )
+            ]
+
+        with patch("src.card.session.core.render_card", side_effect=_blocked_render):
+            worker = threading.Thread(target=lambda: session.dispatch(CardEvent.started()))
+            worker.start()
+            assert render_started.wait(timeout=1.0)
+
+            close_done = threading.Event()
+            close_worker = threading.Thread(
+                target=lambda: (session.close(), close_done.set())
+            )
+            close_worker.start()
+            assert close_done.wait(timeout=0.1) is False
+            release_render.set()
+            worker.join(timeout=2.0)
+            close_worker.join(timeout=2.0)
+            assert session.wait_delivery_idle(timeout=2.0)
+
+        assert worker.is_alive() is False
+        assert close_worker.is_alive() is False
+        assert close_done.is_set()
+        session._deliver_and_track.assert_not_called()
+
+    def test_external_close_waits_for_pre_close_dispatched_hook(self):
+        hook_started = threading.Event()
+        release_hook = threading.Event()
+        close_done = threading.Event()
+
+        class _BlockingHook:
+            def on_dispatched(self, _event, _state):
+                hook_started.set()
+                release_hook.wait()
+
+        session = CardSession(
+            chat_id="chat-close-hook",
+            config=SessionConfig(metadata=CardMetadata(mode_name="HookFence")),
+            delivery=MagicMock(),
+            session_id="session-close-hook",
+            hooks=(_BlockingHook(),),
+        )
+        session._timers.close()
+        session.dispatch(CardEvent.started())
+        assert hook_started.wait(timeout=1.0)
+
+        close_worker = threading.Thread(
+            target=lambda: (session.close(), close_done.set())
+        )
+        close_worker.start()
+        try:
+            assert close_done.wait(timeout=0.1) is False
+            release_hook.set()
+            close_worker.join(timeout=2.0)
+            assert close_done.is_set()
+        finally:
+            release_hook.set()
+            close_worker.join(timeout=2.0)
+
+    def test_dispatched_hook_close_skips_self_but_waits_for_sibling(self):
+        sibling_started = threading.Event()
+        release_sibling = threading.Event()
+        hook_close_returned = threading.Event()
+        session_ref = []
+
+        class _ClosingHook:
+            def on_dispatched(self, _event, _state):
+                assert sibling_started.wait(timeout=1.0)
+                session_ref[0].close()
+                hook_close_returned.set()
+
+        class _SiblingHook:
+            def on_dispatched(self, _event, _state):
+                sibling_started.set()
+                release_sibling.wait()
+
+        session = CardSession(
+            chat_id="chat-self-close-hook",
+            config=SessionConfig(metadata=CardMetadata(mode_name="HookSelfFence")),
+            delivery=MagicMock(),
+            session_id="session-self-close-hook",
+            hooks=(_ClosingHook(), _SiblingHook()),
+        )
+        session_ref.append(session)
+        session._timers.close()
+        session.dispatch(CardEvent.started())
+        assert sibling_started.wait(timeout=1.0)
+        try:
+            assert hook_close_returned.wait(timeout=0.1) is False
+            release_sibling.set()
+            assert hook_close_returned.wait(timeout=2.0)
+        finally:
+            release_sibling.set()
+
+
 
 
 

@@ -66,12 +66,17 @@ const AGENT_UNLIMITED_BACKSTOP_MS = 30 * 24 * 3600 * 1000;
 // long (but real) watchdog instead of an instant abort.
 const MAX_SAFE_TIMER_MS = 2147483647;
 
-// Stack of request-ID interceptors. race() and pipeline() push a collector
-// Set onto this stack; sendRequest checks all active collectors after each
-// agent_call so multiple nested primitives can track their own request IDs
-// concurrently without overwriting each other.
-const requestInterceptors = [];
+// Lexically-scoped request collectors. Descendant async work inherits the
+// current lineage while concurrent siblings remain isolated. A global stack
+// cannot provide that guarantee because overlapping race()/pipeline() calls
+// would register each sibling's request IDs in every active collector.
+const requestCollectorContext = new AsyncLocalStorage();
 const raceContext = new AsyncLocalStorage();
+
+function withRequestCollector(collector, callback) {
+  const parentLineage = requestCollectorContext.getStore() || [];
+  return requestCollectorContext.run([...parentLineage, collector], callback);
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -237,12 +242,13 @@ function sendRequest(method, params = {}) {
 
   const id = ++requestId;
 
-  // Notify all active interceptors (race/pipeline tracking)
-  if (method === 'agent_call' && requestInterceptors.length > 0) {
-    for (const interceptor of requestInterceptors) {
-      interceptor.ids.add(id);
+  // Notify collectors in this request's lexical async lineage only.
+  const collectorLineage = requestCollectorContext.getStore() || [];
+  if (method === 'agent_call' && collectorLineage.length > 0) {
+    for (const collector of collectorLineage) {
+      collector.ids.add(id);
       if (params && params.label) {
-        interceptor.labels.set(id, params.label);
+        collector.labels.set(id, params.label);
       }
     }
   }
@@ -684,16 +690,8 @@ async function pipeline(items, ...args) {
 
   if (!continueOnFailure) {
     pipelineInterceptor = { ids: new Set(), labels: new Map() };
-    requestInterceptors.push(pipelineInterceptor);
     pipelineRequestIds = pipelineInterceptor.ids;
     pipelineRequestLabels = pipelineInterceptor.labels;
-  }
-
-  function restoreSendRequest() {
-    if (pipelineInterceptor) {
-      const idx = requestInterceptors.indexOf(pipelineInterceptor);
-      if (idx !== -1) requestInterceptors.splice(idx, 1);
-    }
   }
 
   function abortInFlight(firstError) {
@@ -744,7 +742,10 @@ async function pipeline(items, ...args) {
       return current;
     });
 
-  const results = await parallel(itemTasks).finally(restoreSendRequest);
+  const runItems = () => parallel(itemTasks);
+  const results = pipelineInterceptor
+    ? await withRequestCollector(pipelineInterceptor, runItems)
+    : await runItems();
 
   return results;
 }
@@ -1451,7 +1452,6 @@ async function race(contestants, opts = {}) {
   const tracker = { ids: new Set(), labels: new Map() };
   const timeoutMessage = `race() timed out after ${requestedTimeout}s`;
   const scope = { cancelled: false, timeoutMessage, failures: [] };
-  requestInterceptors.push(tracker);
   const remainingMs = remainingWorkflowMs();
   const requestedMs = Math.max(1, Math.ceil(requestedTimeout * 1000));
   const boundedTimeoutMs = Number.isFinite(remainingMs)
@@ -1462,7 +1462,10 @@ async function race(contestants, opts = {}) {
   let timer = null;
 
   try {
-    const racePromise = Promise.resolve().then(() => raceCore(normalizedContestants, opts, scope));
+    const racePromise = withRequestCollector(
+      tracker,
+      () => Promise.resolve().then(() => raceCore(normalizedContestants, opts, scope)),
+    );
     const deadlinePromise = new Promise((resolveDeadline) => {
       timer = setTimeout(() => resolveDeadline(timeoutSentinel), timeoutMs);
     });
@@ -1500,8 +1503,6 @@ async function race(contestants, opts = {}) {
     };
   } finally {
     if (timer !== null) clearTimeout(timer);
-    const trackerIndex = requestInterceptors.lastIndexOf(tracker);
-    if (trackerIndex >= 0) requestInterceptors.splice(trackerIndex, 1);
   }
 }
 
@@ -1513,18 +1514,17 @@ async function raceCore(contestants, opts = {}, scope = null) {
 
   const validate = opts.validate || ((r) => r != null && r !== '' && !r.error);
 
-  return new Promise((resolve, reject) => {
+  const raceRequestIds = new Set();
+  const requestLabels = new Map();
+  const collector = { ids: raceRequestIds, labels: requestLabels };
+
+  return withRequestCollector(collector, () => new Promise((resolve, reject) => {
     let settled = false;
     let completed = 0;
     const failures = scope ? scope.failures : [];
 
     // Track all agent_call request IDs created by this race, plus their
     // labels, so we can abort losers and report which agent was aborted.
-    const raceRequestIds = new Set();
-    const requestLabels = new Map();
-    const interceptor = { ids: raceRequestIds, labels: requestLabels };
-    requestInterceptors.push(interceptor);
-
     function abortLosers() {
       for (const rid of raceRequestIds) {
         const entry = pendingRequests.get(rid);
@@ -1543,9 +1543,6 @@ async function raceCore(contestants, opts = {}, scope = null) {
     function finish(fn, arg) {
       if (settled) return;
       settled = true;
-      // Remove our interceptor from the stack
-      const idx = requestInterceptors.indexOf(interceptor);
-      if (idx !== -1) requestInterceptors.splice(idx, 1);
       fn(arg);
     }
 
@@ -1579,7 +1576,7 @@ async function raceCore(contestants, opts = {}, scope = null) {
         }
       });
     });
-  });
+  }));
 }
 
 // ---------------------------------------------------------------------------

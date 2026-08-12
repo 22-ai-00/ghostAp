@@ -134,6 +134,15 @@ class TaskCanceledError(RuntimeError):
     pass
 
 
+class TaskQueueFullError(RateLimitExceededException):
+    """Raised when a scheduler admission lane has reached its pending limit."""
+
+    def __init__(self, lane: str, limit: int):
+        self.lane = lane
+        self.limit = limit
+        super().__init__(f"Task scheduler {lane} queue is full (limit={limit})")
+
+
 class TaskRunState(BaseModel):
     """任务运行态（调度器内部 SSOT）。"""
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -207,6 +216,9 @@ class TaskScheduler:
         max_concurrent: int = 10,
         per_key_concurrency: int = 1,
         system_concurrency: int = 10,
+        max_pending_normal: int = 1000,
+        max_pending_system: int = 100,
+        max_terminal_history: int = 5000,
         worker_executor: Optional[ThreadPoolExecutor] = None,
         system_executor: Optional[ThreadPoolExecutor] = None,
         thread_name_prefix: str = "task_worker",
@@ -217,10 +229,21 @@ class TaskScheduler:
             raise ValueError("max_concurrent must be > 0")
         if per_key_concurrency <= 0:
             raise ValueError("per_key_concurrency must be > 0")
+        if system_concurrency <= 0:
+            raise ValueError("system_concurrency must be > 0")
+        if max_pending_normal <= 0:
+            raise ValueError("max_pending_normal must be > 0")
+        if max_pending_system <= 0:
+            raise ValueError("max_pending_system must be > 0")
+        if max_terminal_history <= 0:
+            raise ValueError("max_terminal_history must be > 0")
 
         self._max_concurrent = max_concurrent
         self._per_key = per_key_concurrency
         self._system_concurrency = system_concurrency
+        self._max_pending_normal = max_pending_normal
+        self._max_pending_system = max_pending_system
+        self._max_terminal_history = max_terminal_history
         self._run_guard = run_guard or nullcontext
         guard_owner = getattr(run_guard, "__self__", None)
         self._run_guard_cancel = run_guard_cancel or getattr(
@@ -245,7 +268,11 @@ class TaskScheduler:
         self._running_by_project: dict[str, int] = defaultdict(int)
         self._running_total_normal = 0
         self._running_total_system = 0
+        self._pending_normal = 0
+        self._pending_system = 0
+        self._active_run_ids: set[str] = set()
         self._states: dict[str, TaskRunState] = {}
+        self._terminal_order: Deque[str] = deque()
         self._listeners: list[Callable[[TaskEvent], None]] = []
 
         self._rate_limiters: dict[str, RateLimiter] = {}
@@ -292,13 +319,24 @@ class TaskScheduler:
             q.appendleft(item)
         else:
             q.append(item)
+        if self._is_system_queue(queue_key):
+            self._pending_system += 1
+        else:
+            self._pending_normal += 1
+
+    def _decrement_pending_unlocked(self, queue_key: str) -> None:
+        if self._is_system_queue(queue_key):
+            self._pending_system = max(0, self._pending_system - 1)
+        else:
+            self._pending_normal = max(0, self._pending_normal - 1)
 
     def _drain_queued_tasks_unlocked(self) -> None:
         for key, q in list(self._queues.items()):
             while q:
                 item = q.popleft()
+                self._decrement_pending_unlocked(key)
                 self._transition_unlocked(item.run_id, TaskStatus.CANCELED)
-            self._queues[key] = deque()
+            self._queues.pop(key, None)
 
     def _transition_unlocked(
         self,
@@ -319,8 +357,11 @@ class TaskScheduler:
             state.ended_at = now
             state.progress_message = None
             state.progress_percent = None
+            self._terminal_order.append(run_id)
         state.error = error
         self._emit(state)
+        if status in self._TERMINAL_STATUSES:
+            self._reap_completed_states()
         return state
 
     def submit(self, spec: TaskSpec, fn: Callable[[TaskContext], Any]) -> TaskHandle:
@@ -332,7 +373,17 @@ class TaskScheduler:
 
         通过后才会生成 `run_id`、落地 `TaskRunState`，并推入对应的队列。
         """
-        with self._lock:
+        key = spec.get_effective_queue_key()
+        with self._cv:
+            if self._stopped or self._admission_fenced:
+                raise RuntimeError("TaskScheduler admission is fenced")
+
+            is_system = self._is_system_queue(key)
+            pending = self._pending_system if is_system else self._pending_normal
+            pending_limit = self._max_pending_system if is_system else self._max_pending_normal
+            if pending >= pending_limit:
+                raise TaskQueueFullError("system" if is_system else "normal", pending_limit)
+
             rl = self._rate_limiters.get(spec.task_type)
             cb = self._circuit_breakers.get(spec.task_type)
 
@@ -342,29 +393,25 @@ class TaskScheduler:
             if rl and not rl.acquire(1, blocking=False):
                 raise RateLimitExceededException(f"Rate limit exceeded for task type {spec.task_type}")
 
-        run_id = str(uuid.uuid4())[:10]
-        key = spec.get_effective_queue_key()
-        state = TaskRunState(
-            spec=spec,
-            run_id=run_id,
-            assigned_queue_key=key,
-            project_serial_key=self._build_project_serial_key(spec.chat_id, spec.project_id),
-        )
-
-        with self._cv:
-            if self._stopped or self._admission_fenced:
-                raise RuntimeError("TaskScheduler admission is fenced")
+            run_id = str(uuid.uuid4())[:10]
+            state = TaskRunState(
+                spec=spec,
+                run_id=run_id,
+                assigned_queue_key=key,
+                project_serial_key=self._build_project_serial_key(spec.chat_id, spec.project_id),
+            )
+            item = _QueuedTask(
+                run_id=run_id,
+                spec=spec,
+                fn=fn,
+                context=contextvars.copy_context(),
+            )
             self._states[run_id] = state
             if spec.task_id:
                 self._by_task_id[spec.task_id] = run_id
             self._by_chat[spec.chat_id].append(run_id)
             if spec.project_id:
                 self._by_project[str(spec.project_id)].append(run_id)
-            self._queues[key]
-
-            ctx = contextvars.copy_context()
-            item = _QueuedTask(run_id=run_id, spec=spec, fn=fn, context=ctx)
-
             self._requeue_item_unlocked(key, item)
 
             self._emit(state)
@@ -404,6 +451,8 @@ class TaskScheduler:
                     self._running_by_project[state.project_serial_key] = max(
                         0, self._running_by_project[state.project_serial_key] - 1
                     )
+                    if self._running_by_project[state.project_serial_key] == 0:
+                        self._running_by_project.pop(state.project_serial_key, None)
                 if new_project_key:
                     self._running_by_project[new_project_key] += 1
 
@@ -580,19 +629,46 @@ class TaskScheduler:
 
     def _reap_completed_states(self, max_age_seconds: float = _REAP_DEFAULT_MAX_AGE) -> int:
         cutoff = time.time() - max_age_seconds
-        to_remove = [
-            run_id
-            for run_id, state in self._states.items()
-            if state.status in self._TERMINAL_STATUSES and (state.ended_at or state.created_at) <= cutoff
-        ]
-        for run_id in to_remove:
-            state = self._states.pop(run_id)
-            self._remove_from_index_unlocked(self._by_chat, state.spec.chat_id, run_id)
-            if state.spec.project_id:
-                self._remove_from_index_unlocked(self._by_project, state.spec.project_id, run_id)
-            if state.spec.task_id:
-                self._by_task_id.pop(state.spec.task_id, None)
-        return len(to_remove)
+        removed = 0
+
+        while self._terminal_order:
+            run_id = self._terminal_order[0]
+            state = self._states.get(run_id)
+            if state is None:
+                self._terminal_order.popleft()
+                continue
+            if run_id in self._active_run_ids:
+                break
+            if (state.ended_at or state.created_at) > cutoff:
+                break
+            self._terminal_order.popleft()
+            self._remove_state_unlocked(run_id, state)
+            removed += 1
+
+        deferred_active: list[str] = []
+        terminal_count = len(self._terminal_order)
+        while terminal_count > self._max_terminal_history and self._terminal_order:
+            run_id = self._terminal_order.popleft()
+            state = self._states.get(run_id)
+            if state is None:
+                terminal_count -= 1
+                continue
+            if run_id in self._active_run_ids:
+                deferred_active.append(run_id)
+                continue
+            self._remove_state_unlocked(run_id, state)
+            terminal_count -= 1
+            removed += 1
+        self._terminal_order.extendleft(reversed(deferred_active))
+        return removed
+
+    def _remove_state_unlocked(self, run_id: str, state: TaskRunState) -> None:
+        self._states.pop(run_id, None)
+        self._remove_from_index_unlocked(self._by_chat, state.spec.chat_id, run_id)
+        if state.spec.project_id:
+            self._remove_from_index_unlocked(self._by_project, str(state.spec.project_id), run_id)
+        if state.spec.task_id and self._by_task_id.get(state.spec.task_id) == run_id:
+            self._by_task_id.pop(state.spec.task_id, None)
 
     def _dispatch_loop(self):
         """调度循环：不断从队列中挑选可运行任务并投递到线程池。
@@ -624,6 +700,7 @@ class TaskScheduler:
                     self._running_by_project[state.project_serial_key] += 1
                 if state:
                     self._transition_unlocked(task.run_id, TaskStatus.RUNNING)
+                self._active_run_ids.add(task.run_id)
                 self._cv.notify_all()
 
                 try:
@@ -631,17 +708,9 @@ class TaskScheduler:
                     fut = executor.submit(self._run_wrapper, task)
                 except Exception as e:
                     # rollback running counters and converge to terminal state
-                    if is_system:
-                        self._running_total_system = max(0, self._running_total_system - 1)
-                    else:
-                        self._running_total_normal = max(0, self._running_total_normal - 1)
-                    self._running_by_key[key] = max(0, self._running_by_key[key] - 1)
-                    if state and state.project_serial_key:
-                        self._running_by_project[state.project_serial_key] = max(
-                            0, self._running_by_project[state.project_serial_key] - 1
-                        )
                     if state:
                         self._transition_unlocked(task.run_id, TaskStatus.FAILED, error=get_error_detail(e))
+                    self._release_running_slot_unlocked(task)
                     self._cv.notify_all()
                     continue
                 del fut
@@ -660,6 +729,7 @@ class TaskScheduler:
         """挑选一个当前可运行的任务（调用方需持有 `_cv` 锁）。"""
         for key, q in list(self._queues.items()):
             if not q:
+                self._queues.pop(key, None)
                 continue
 
             # Global capacity gate:
@@ -680,9 +750,11 @@ class TaskScheduler:
                 st = self._states.get(item.run_id)
                 if not st or st.status is not TaskStatus.QUEUED:
                     q.popleft()
+                    self._decrement_pending_unlocked(key)
                     continue
                 if st.cancellation.is_canceled:
                     q.popleft()
+                    self._decrement_pending_unlocked(key)
                     self._transition_unlocked(item.run_id, TaskStatus.CANCELED)
                     continue
                 if st and st.project_serial_key and self._running_by_project.get(st.project_serial_key, 0) >= 1:
@@ -694,9 +766,14 @@ class TaskScheduler:
                 break
 
             if not q:
+                self._queues.pop(key, None)
                 continue
 
-            return q.popleft()
+            item = q.popleft()
+            self._decrement_pending_unlocked(key)
+            if not q:
+                self._queues.pop(key, None)
+            return item
 
         return None
 
@@ -785,12 +862,22 @@ class TaskScheduler:
             self._running_total_system = max(0, self._running_total_system - 1)
         else:
             self._running_total_normal = max(0, self._running_total_normal - 1)
-        self._running_by_key[key] = max(0, self._running_by_key[key] - 1)
+        remaining_by_key = max(0, self._running_by_key.get(key, 0) - 1)
+        if remaining_by_key:
+            self._running_by_key[key] = remaining_by_key
+        else:
+            self._running_by_key.pop(key, None)
         if state and state.project_serial_key:
-            self._running_by_project[state.project_serial_key] = max(
+            remaining_by_project = max(
                 0,
-                self._running_by_project[state.project_serial_key] - 1,
+                self._running_by_project.get(state.project_serial_key, 0) - 1,
             )
+            if remaining_by_project:
+                self._running_by_project[state.project_serial_key] = remaining_by_project
+            else:
+                self._running_by_project.pop(state.project_serial_key, None)
+        self._active_run_ids.discard(task.run_id)
+        self._reap_completed_states()
 
     def _do_run(self, task: _QueuedTask):
         """执行任务并维护状态（运行在 worker thread 中）。"""
@@ -875,7 +962,12 @@ class TaskScheduler:
                 found = item
                 continue
             new_q.append(item)
-        self._queues[key] = new_q
+        if found is not None:
+            self._decrement_pending_unlocked(key)
+        if new_q:
+            self._queues[key] = new_q
+        else:
+            self._queues.pop(key, None)
         return found
 
     def _remove_from_queue_unlocked(self, run_id: str, key: str):

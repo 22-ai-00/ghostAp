@@ -95,6 +95,7 @@ def _start_base_session(
     *,
     allow_cli: bool,
     auto_approve: bool | None = None,
+    capture_full_tool_content: bool = False,
     employee_env: dict[str, str] | None = None,
     startup_timeout: float | None = None,
     startup_retries: int | None = None,
@@ -119,6 +120,8 @@ def _start_base_session(
         kwargs["log_failures"] = startup_log_failures
     if employee_env is not None:
         kwargs["env"] = employee_env
+    if capture_full_tool_content:
+        kwargs["capture_full_tool_content"] = True
     return start_session_with_retry(
         agent_type=agent_type,
         cwd=cwd,
@@ -151,6 +154,7 @@ def create_engine_session(
     *,
     thread_id: Optional[str] = None,
     auto_approve: bool | None = None,
+    capture_full_tool_content: bool = False,
     require_tool_filter: bool = False,
     startup_timeout: Optional[float] = None,
     startup_retries: Optional[int] = None,
@@ -173,6 +177,7 @@ def create_engine_session(
         model,
         allow_cli=not require_tool_filter or employee_env is not None,
         auto_approve=auto_approve,
+        capture_full_tool_content=capture_full_tool_content,
         employee_env=employee_env,
         startup_timeout=startup_timeout,
         startup_retries=startup_retries,

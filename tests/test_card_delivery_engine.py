@@ -5,7 +5,8 @@ import threading
 import time
 
 from src.card.delivery.engine import CardDelivery
-from src.card.delivery.types import SequenceConflictError, TransportError
+from src.card.delivery.registry import DeliveryRegistry
+from src.card.delivery.types import MutationOutcome, SequenceConflictError, TransportError
 from src.card.programming_adapter import build_programming_metadata
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import render_card
@@ -666,6 +667,86 @@ class TestDeliverRejectedAtCapacity:
         result = delivery.deliver("session_overflow", "chat_1", rendered)
         assert result[0].kind == "applied"
         delivery._shutdown()
+
+
+class TestDeliveryLifecycle:
+    def test_public_shutdown_drains_stops_and_unregisters_once(self):
+        client = MockCardClient()
+        registry = DeliveryRegistry()
+        registry.install_atexit = lambda: None
+        delivery = CardDelivery(client, registry=registry)
+
+        assert delivery.shutdown(timeout=1.0) is True
+        assert delivery.shutdown(timeout=1.0) is True
+        assert delivery._lock_pool.accepting_work is False
+        assert delivery._lock_pool._eviction_thread.is_alive() is False
+        assert delivery not in registry._instances
+
+    def test_failed_shutdown_drain_stays_registered_for_retry(self, monkeypatch):
+        client = MockCardClient()
+        registry = DeliveryRegistry()
+        registry.install_atexit = lambda: None
+        delivery = CardDelivery(client, registry=registry)
+        real_drain = delivery._lock_pool.drain
+        monkeypatch.setattr(delivery._lock_pool, "drain", lambda *, timeout: False)
+
+        assert delivery.shutdown(timeout=0.01) is False
+        assert delivery in registry._instances
+        assert delivery._lock_pool._eviction_thread.is_alive() is True
+
+        monkeypatch.setattr(delivery._lock_pool, "drain", real_drain)
+        assert delivery.shutdown(timeout=1.0) is True
+
+    def test_successful_shutdown_fences_delivery_before_remote_create(self):
+        client = MockCardClient()
+        delivery = CardDelivery(client)
+        admission_checked = threading.Event()
+        continue_delivery = threading.Event()
+        original_open_session = delivery.open_session
+        outcomes: list[MutationOutcome] = []
+
+        def _blocked_open_session(session_id: str, chat_id: str) -> None:
+            admission_checked.set()
+            assert continue_delivery.wait(timeout=2.0)
+            original_open_session(session_id, chat_id)
+
+        delivery.open_session = _blocked_open_session
+        rendered = [
+            RenderedCard(
+                _card_json={"body": {"elements": []}},
+                structure_signature="shutdown-fence",
+            )
+        ]
+        worker = threading.Thread(
+            target=lambda: outcomes.extend(
+                delivery.deliver("shutdown-race", "chat-1", rendered)
+            )
+        )
+        worker.start()
+        assert admission_checked.wait(timeout=1.0)
+
+        shutdown_result: list[bool] = []
+        shutdown_done = threading.Event()
+
+        def _shutdown() -> None:
+            shutdown_result.append(delivery.shutdown(timeout=2.0))
+            shutdown_done.set()
+
+        shutdown_worker = threading.Thread(target=_shutdown)
+        shutdown_worker.start()
+        assert shutdown_done.wait(timeout=0.05) is False
+        continue_delivery.set()
+        worker.join(timeout=2.0)
+        shutdown_worker.join(timeout=2.0)
+
+        assert worker.is_alive() is False
+        assert shutdown_worker.is_alive() is False
+        assert shutdown_result == [True]
+        assert len(client.creates) == 1
+
+        after_shutdown = delivery.deliver("too-late", "chat-1", rendered)
+        assert [outcome.kind for outcome in after_shutdown] == ["rejected"]
+        assert len(client.creates) == 1
 
     def test_existing_session_not_rejected(self):
         client = MockCardClient()

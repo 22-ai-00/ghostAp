@@ -6,6 +6,7 @@ from .scheduler import (
     TaskEvent,
     TaskHandle,
     TaskPriority,
+    TaskQueueFullError,
     TaskScheduler,
     TaskSpec,
     TaskStatus,
@@ -15,6 +16,7 @@ from .scheduler import (
 __all__ = [
     "TaskScheduler",
     "TaskPriority",
+    "TaskQueueFullError",
     "TaskStatus",
     "TaskSpec",
     "TaskHandle",

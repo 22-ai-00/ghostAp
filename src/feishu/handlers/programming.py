@@ -18,10 +18,12 @@ from ...acp import (
     run_prompt_across_execution_windows,
     run_prompt_with_continuation,
 )
+from ...acp.collaboration import AuthoritativeChildLifecycleProof
 from ...acp.manager import ACPSessionManager
 from ...acp.outcome import PromptAssessment, PromptOutcome
 from ...acp.providers import normalize_acp_model_name
 from ...agent_session import SyncSession
+from ...card.actions import dispatch as card_action_ids
 from ...card.builders.core import CoreBuilder
 from ...card.builders.project import ProjectBuilder
 from ...card.builders.system import SystemBuilder
@@ -128,6 +130,62 @@ def _log_prompt_execution(mode_name: str, execution: object) -> None:
         assessment.unresolved_child_tool_calls,
         ";".join(assessment.incomplete_tool_diagnostics) or "none",
     )
+
+
+def _execution_diagnostic_details(execution: object) -> str:
+    """Return a bounded, provider-allowlisted diagnostic for card callbacks."""
+    assessment = execution.assessment
+    diagnostics = ";".join(assessment.incomplete_tool_diagnostics) or "none"
+    return "\n".join(
+        (
+            f"outcome={assessment.outcome.value}",
+            f"stop_reason={assessment.stop_reason or 'unknown'}",
+            f"execution_windows={max(1, int(getattr(execution, 'execution_windows', 1)))}",
+            f"entered_finalization={bool(execution.entered_finalization)}",
+            f"automatic_continuations={max(0, int(execution.automatic_continuations))}",
+            f"pending_plan_entries={assessment.pending_plan_entries}",
+            f"incomplete_tool_calls={assessment.incomplete_tool_calls}",
+            f"incomplete_outer_tool_calls={assessment.incomplete_outer_tool_calls}",
+            f"unresolved_child_tool_calls={assessment.unresolved_child_tool_calls}",
+            f"unresolved_tools={diagnostics}",
+        )
+    )
+
+
+def _diagnostic_action(chat_id: str, message_id: str) -> dict[str, str]:
+    return {
+        "action": card_action_ids.SHOW_ERROR_DETAILS,
+        "chat_id": chat_id,
+        "origin_message_id": message_id,
+    }
+
+
+def _has_reconciled_stale_child_history(
+    execution: object,
+    child_lifecycle_proof: AuthoritativeChildLifecycleProof,
+) -> bool:
+    """Accept only a final explicit list_agents proof, never a display inference."""
+    if execution.entered_finalization:
+        return False
+    if getattr(execution, "window_limit_reached", False):
+        return False
+    assessment = execution.assessment
+    if (
+        assessment.outcome is not PromptOutcome.INCOMPLETE
+        or assessment.stop_reason != "end_turn"
+        or assessment.pending_plan_entries != 0
+        or assessment.incomplete_outer_tool_calls != 0
+        or assessment.unresolved_child_tool_calls <= 0
+        or assessment.incomplete_tool_calls
+        != assessment.unresolved_child_tool_calls
+    ):
+        return False
+    goal = getattr(execution.result, "goal", None)
+    raw_goal_status = getattr(goal, "status", "") if goal is not None else ""
+    goal_status = str(getattr(raw_goal_status, "value", raw_goal_status) or "").strip().casefold()
+    if goal is not None and goal_status != "completed":
+        return False
+    return child_lifecycle_proof.all_observed_children_terminal()
 
 
 def build_programming_session_callbacks(
@@ -903,8 +961,7 @@ class ProgrammingModeHandler(BaseHandler):
     ):
         from ...card.delivery.channel_client import LarkChannelCardAPIClient
         from ...card.delivery.factory import create_card_delivery
-        from ...card.programming_adapter import ProgrammingCardSession, build_programming_metadata
-        from ...card.session import CardSession
+        from ...card.programming_adapter import build_programming_metadata
 
         project_name = project.project_name if project else None
         project_path = project.root_path if project else global_working_dir
@@ -964,13 +1021,6 @@ class ProgrammingModeHandler(BaseHandler):
             ),
             trust_revision_provider=self._managed_card_trust_revisions,
         )
-        from ...card.session.config import SessionConfig
-        card_callbacks = build_programming_session_callbacks(
-            reply_text_fn=self.reply_text,
-            add_reaction=self.add_reaction,
-            message_id=message_id,
-            chat_id=chat_id,
-        )
         try:
             delivery_timeout = max(
                 2.0,
@@ -978,6 +1028,72 @@ class ProgrammingModeHandler(BaseHandler):
             )
         except Exception:
             delivery_timeout = 12.0
+
+        fallback_to_text = False
+        try:
+            fallback_to_text = self._handle_response_with_delivery(
+                message_id=message_id,
+                chat_id=chat_id,
+                text=text,
+                session=session,
+                project=project,
+                cwd=cwd,
+                global_working_dir=global_working_dir,
+                metadata=metadata,
+                delivery=delivery,
+                delivery_timeout=delivery_timeout,
+                project_id=project_id,
+                _repo_lock_mgr=_repo_lock_mgr,
+                _root_path=_root_path,
+                _finalization_task_text=_finalization_task_text,
+            )
+        finally:
+            self._shutdown_owned_programming_delivery(
+                delivery,
+                timeout=delivery_timeout,
+            )
+        if fallback_to_text:
+            self._handle_response_non_streaming(
+                message_id,
+                chat_id,
+                text,
+                session,
+                project,
+                global_working_dir,
+                _repo_lock_mgr=_repo_lock_mgr,
+                _root_path=_root_path,
+                _finalization_task_text=_finalization_task_text,
+            )
+
+    def _handle_response_with_delivery(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        text: str,
+        session: SyncSession,
+        project,
+        cwd: str,
+        global_working_dir: str,
+        metadata,
+        delivery,
+        delivery_timeout: float,
+        project_id: str | None,
+        _repo_lock_mgr=None,
+        _root_path: str | None = None,
+        _finalization_task_text: str | None = None,
+    ) -> bool:
+        """Run one streaming response against a task-owned delivery engine."""
+        from ...card.programming_adapter import ProgrammingCardSession
+        from ...card.session import CardSession
+        from ...card.session.config import SessionConfig
+
+        card_callbacks = build_programming_session_callbacks(
+            reply_text_fn=self.reply_text,
+            add_reaction=self.add_reaction,
+            message_id=message_id,
+            chat_id=chat_id,
+        )
 
         def _create_programming_card_session(
             session_metadata,
@@ -1007,22 +1123,12 @@ class ProgrammingModeHandler(BaseHandler):
         except Exception as e:
             logger.warning("创建流式卡片失败: %s", str(e))
             prog_session.abort()
-            self._handle_response_non_streaming(
-                message_id, chat_id, text, session, project, global_working_dir,
-                _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
-                _finalization_task_text=_finalization_task_text,
-            )
-            return
+            return True
 
         if not prog_session.wait_until_visible(delivery_timeout):
             logger.warning("首张 lark-channel 编程卡片未成功投递，回退到非流式文本输出")
             prog_session.abort()
-            self._handle_response_non_streaming(
-                message_id, chat_id, text, session, project, global_working_dir,
-                _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
-                _finalization_task_text=_finalization_task_text,
-            )
-            return
+            return True
 
         card_message_id = prog_session.get_message_id()
         if card_message_id:
@@ -1050,6 +1156,19 @@ class ProgrammingModeHandler(BaseHandler):
             _root_path=_root_path,
             _finalization_task_text=_finalization_task_text,
         )
+        return False
+
+    @staticmethod
+    def _shutdown_owned_programming_delivery(delivery, *, timeout: float) -> None:
+        """Best-effort cleanup for a per-task Channel delivery engine."""
+        try:
+            if not delivery.shutdown(timeout=timeout):
+                logger.warning(
+                    "lark-channel 编程卡片资源未在 %.1fs 内排空；保留进程级关闭重试",
+                    timeout,
+                )
+        except Exception:
+            logger.exception("关闭 lark-channel 编程卡片资源失败")
 
     def _execute_programming_response(
         self,
@@ -1099,9 +1218,11 @@ class ProgrammingModeHandler(BaseHandler):
         image_keys: list[str] = []
         seen_image_ids: set[str] = set()
         image_failures = [0]
+        child_lifecycle_proof = AuthoritativeChildLifecycleProof()
 
         def on_event(event) -> None:
             update_count[0] += 1
+            child_lifecycle_proof.observe_event(event)
             if prog_session is not None:
                 try:
                     prog_session.on_event(event)
@@ -1257,6 +1378,18 @@ class ProgrammingModeHandler(BaseHandler):
             _log_prompt_execution(self.mode_name, execution)
             prompt_outcome = assessment.outcome
             prompt_stop_reason = assessment.stop_reason
+            reconciled_stale_children = _has_reconciled_stale_child_history(
+                execution,
+                child_lifecycle_proof,
+            )
+            if reconciled_stale_children:
+                prompt_outcome = PromptOutcome.COMPLETED
+                logger.warning(
+                    "%s ACP历史子代理状态已由最终权威快照完成对账: "
+                    "stale_child_records=%d",
+                    self.mode_name,
+                    assessment.unresolved_child_tool_calls,
+                )
             result_text = (getattr(result, "text", None) or "").strip()
             streamed_response = (
                 prog_session.get_final_text()
@@ -1268,13 +1401,27 @@ class ProgrammingModeHandler(BaseHandler):
                 if prog_session is not None
                 else result_text or streamed_response
             )
-            if assessment.outcome is PromptOutcome.COMPLETED:
+            if prompt_outcome is PromptOutcome.COMPLETED:
                 if prog_session is not None and not streamed_response and result_text:
                     prog_session.on_text(result_text)
                 final_response = response_text or UI_TEXT["mode_exec_complete"]
                 if prog_session is not None:
-                    prog_session.finish()
-            elif assessment.outcome is PromptOutcome.CANCELLED:
+                    if reconciled_stale_children:
+                        prog_session.finish(
+                            warning=UI_TEXT[
+                                "mode_exec_child_history_reconciled"
+                            ].format(
+                                count=assessment.unresolved_child_tool_calls,
+                            ),
+                            details=_execution_diagnostic_details(execution),
+                            detail_action=_diagnostic_action(
+                                chat_id,
+                                message_id,
+                            ),
+                        )
+                    else:
+                        prog_session.finish()
+            elif prompt_outcome is PromptOutcome.CANCELLED:
                 terminal_notice = UI_TEXT["mode_exec_cancelled_msg"].format(
                     reason=assessment.detail,
                 )
@@ -1298,6 +1445,8 @@ class ProgrammingModeHandler(BaseHandler):
                             if execution.entered_finalization
                             else "failed"
                         ),
+                        details=_execution_diagnostic_details(execution),
+                        detail_action=_diagnostic_action(chat_id, message_id),
                     )
         except TimeoutError as e:
             terminal_exception = e
@@ -1322,6 +1471,8 @@ class ProgrammingModeHandler(BaseHandler):
                 prog_session.fail(
                     terminal_notice,
                     unfinished_subagent_status="cancelled",
+                    details=f"stop_reason=timeout\nerror={get_error_detail(e)}",
+                    detail_action=_diagnostic_action(chat_id, message_id),
                 )
         except Exception as e:
             terminal_exception = e
@@ -1352,6 +1503,11 @@ class ProgrammingModeHandler(BaseHandler):
                     unfinished_subagent_status=(
                         "cancelled" if entered_finalization[0] else "failed"
                     ),
+                    details=(
+                        f"stop_reason=exception\n"
+                        f"error={get_error_detail(e)}"
+                    ),
+                    detail_action=_diagnostic_action(chat_id, message_id),
                 )
             from ...utils.errors import GhostAPError
             if prog_session is not None and isinstance(e, GhostAPError) and e.quick_actions:

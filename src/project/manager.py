@@ -484,11 +484,18 @@ class ProjectManager:
 
             old_project_id = self._active_project.get(chat_id)
             if old_project_id == project_id and ctx.status == ProjectStatus.ACTIVE:
+                already_authorized = chat_id in ctx.allowed_chat_ids
                 refresh_result = ctx.add_chat_id(chat_id)  # Refresh LRU timestamp
                 if refresh_result == ADD_CHAT_ID_REJECTED:
                     return False, f"项目 {ctx.project_name} 的群绑定数已满，无法关联当前群"
                 ctx.touch()
-                self._save_projects()
+                # Recency is an in-memory routing hint.  If the active binding
+                # and authorization set are already disk-equivalent, rewriting
+                # and fsyncing the complete project snapshot adds no recovery
+                # value.  A missing/legacy membership still changes authority
+                # and must remain durable.
+                if not already_authorized:
+                    self._save_projects()
                 return True, f"已切换到项目 {ctx.project_name}"
 
             old_status = None

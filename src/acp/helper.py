@@ -28,13 +28,14 @@ from .traex_selection import (
 logger = logging.getLogger(__name__)
 
 _TOOLS = ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok")
-_PROBE_TTL = 300.0
+_PROBE_TTL = 1800.0
 _CODEX_PROBE_TTL = 1800.0
-_NEGATIVE_TTL = 45.0
+_NEGATIVE_TTL = 300.0
 
 _probe_cache: dict[tuple[str, str], tuple[float, list[ACPModelOption]]] = {}
 _negative_cache: dict[tuple[str, str], float] = {}
-_inflight: dict[tuple[str, str], threading.Event] = {}
+_cache_generation: dict[tuple[str, str], int] = {}
+_inflight: dict[tuple[tuple[str, str], int], threading.Event] = {}
 _cache_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
 
@@ -97,13 +98,21 @@ def _cached(
     return None, False
 
 
-def _store(key: tuple[str, str], models: list[ACPModelOption]) -> None:
+def _store(
+    key: tuple[str, str],
+    models: list[ACPModelOption],
+    *,
+    generation: int,
+) -> bool:
     with _cache_lock:
+        if _cache_generation.get(key, 0) != generation:
+            return False
         if models:
             _probe_cache[key] = (time.time(), _copy(models))
             _negative_cache.pop(key, None)
         else:
             _negative_cache[key] = time.time()
+        return True
 
 
 def invalidate_acp_model_cache(
@@ -113,6 +122,11 @@ def invalidate_acp_model_cache(
     with _cache_lock:
         _probe_cache.pop(key, None)
         _negative_cache.pop(key, None)
+        _cache_generation[key] = _cache_generation.get(key, 0) + 1
+    if key[0] == "coco":
+        from ..coco_model import get_coco_model_manager
+
+        get_coco_model_manager().invalidate_cache()
 
 
 def is_programming_tool_available(
@@ -513,23 +527,44 @@ def fetch_acp_models(
         return _fallback(tool, current_model)
 
     key = _key(tool, cwd)
-    models, failed = _cached(key, tool)
-    if models is not None:
-        return _mark_default(models, current_model)
-    if failed:
-        return _fallback(tool, current_model)
-
-    leader = False
-    with _cache_lock:
-        event = _inflight.get(key)
-        if event is None:
-            event = threading.Event()
-            _inflight[key] = event
-            leader = True
-
     timeout = _probe_timeout(probe_timeout)
-    if not leader:
+    while True:
+        models, failed = _cached(key, tool)
+        if models is not None:
+            return _mark_default(models, current_model)
+        if failed:
+            return _fallback(tool, current_model)
+
+        leader = False
+        with _cache_lock:
+            generation = _cache_generation.get(key, 0)
+            flight_key = (key, generation)
+            event = _inflight.get(flight_key)
+            if event is None:
+                event = threading.Event()
+                _inflight[flight_key] = event
+                leader = True
+
+        if leader:
+            # A previous leader may have filled the cache after our first
+            # miss but before this flight was registered.  Recheck while our
+            # reservation prevents another probe for the same generation.
+            models, failed = _cached(key, tool)
+            if models is not None or failed:
+                with _cache_lock:
+                    _inflight.pop(flight_key, None)
+                event.set()
+                return (
+                    _mark_default(models, current_model)
+                    if models is not None
+                    else _fallback(tool, current_model)
+                )
+            break
         event.wait(timeout=timeout + 5.0)
+        with _cache_lock:
+            invalidated = _cache_generation.get(key, 0) != generation
+        if invalidated:
+            continue
         models, _failed = _cached(key, tool)
         return (
             _mark_default(models, current_model)
@@ -539,10 +574,10 @@ def fetch_acp_models(
 
     try:
         models = _probe_blocking(tool, cwd, current_model, timeout)
-        _store(key, models)
+        _store(key, models, generation=generation)
     finally:
         with _cache_lock:
-            _inflight.pop(key, None)
+            _inflight.pop(flight_key, None)
         event.set()
 
     return _mark_default(models, current_model) if models else _fallback(tool, current_model)

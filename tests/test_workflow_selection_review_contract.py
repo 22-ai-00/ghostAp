@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.acp.options import ACPModelOption, ACPModelSelectionVariant
 from src.card.render.model_cascade import resolve_model_cascade
 from src.feishu.handlers.workflow import WorkflowHandler, _WorkflowLifecycleOwner
@@ -205,6 +207,263 @@ def test_renderer_uses_callback_selects_without_cardkit_form_submit() -> None:
     assert selects["tool_name"]["behaviors"] == [
         {"type": "callback", "value": selects["tool_name"]["value"]}
     ]
+
+
+def test_add_agent_payload_changes_with_the_resolved_draft_state() -> None:
+    pending = PendingWorkflow(
+        requirement="build",
+        selection_session_key="selection-1",
+        project_id="project-1",
+        draft_tool_name="codex",
+        draft_model_name="gpt",
+        draft_profile="standard",
+        draft_effort="high",
+    )
+    codex_state = resolve_model_cascade(
+        _catalog("codex"),
+        selected_model="gpt",
+        selected_profile="standard",
+        selected_effort="high",
+    )
+
+    def add_value(model_state) -> dict:
+        card = WorkflowAgentSelectionRenderer(
+            pending,
+            project_id="project-1",
+            tool_options={"codex": "Codex", "traex": "Traex"},
+            model_state=model_state,
+        ).render()
+        return next(
+            item["value"]
+            for item in _walk(card)
+            if item.get("tag") == "button"
+            and item.get("value", {}).get("action") == "workflow_add_agent"
+        )
+
+    codex_value = add_value(codex_state)
+    assert codex_value["_selection_sig"]
+    assert add_value(codex_state)["_selection_sig"] == codex_value["_selection_sig"]
+
+    pending.agent_pool = (_binding("A1", "codex", "gpt/standard/high"),)
+    pending.next_agent_sequence = 2
+    assert add_value(codex_state)["_selection_sig"] != codex_value["_selection_sig"]
+
+    pending.agent_pool = ()
+    removed_value = add_value(codex_state)
+    assert removed_value["_selection_sig"] != codex_value["_selection_sig"]
+
+    pending.draft_tool_name = "traex"
+    pending.draft_model_name = "openrouter-3o"
+    pending.draft_profile = "standard"
+    pending.draft_effort = "xhigh"
+    traex_state = resolve_model_cascade(
+        [
+            ACPModelOption(
+                name="openrouter-3o",
+                selection_variants=(
+                    ACPModelSelectionVariant(
+                        name="openrouter-3o/standard/xhigh",
+                        model="openrouter-3o",
+                        profile="standard",
+                        effort="xhigh",
+                    ),
+                ),
+            )
+        ],
+        selected_model="openrouter-3o",
+        selected_profile="standard",
+        selected_effort="xhigh",
+    )
+    traex_value = add_value(traex_state)
+
+    assert traex_value["_selection_sig"] != codex_value["_selection_sig"]
+
+
+@pytest.mark.parametrize(
+    ("action", "option"),
+    [
+        ("workflow_select_model", "gpt"),
+        ("workflow_select_profile", "standard"),
+        ("workflow_select_effort", "high"),
+        ("workflow_add_agent", None),
+    ],
+)
+def test_selection_action_reads_the_model_catalog_once(
+    tmp_path,
+    action: str,
+    option: str | None,
+) -> None:
+    pending = PendingWorkflow(
+        requirement="build",
+        initiator_user_id="user-1",
+        selection_session_key="selection-1",
+        project_id="project-1",
+        draft_tool_name="codex",
+        draft_model_name="gpt",
+        draft_profile="standard",
+        draft_effort="low",
+    )
+    handler, _engine, project = _selection(tmp_path, pending=pending)
+    payload = {
+        "action": action,
+        "project_id": project.project_id,
+        "selection_session_key": "selection-1",
+    }
+    if option is not None:
+        payload["_option"] = {"value": option}
+    fetch_models = MagicMock(return_value=_catalog("codex"))
+
+    with (
+        patch("src.thread.get_current_sender_id", return_value="user-1"),
+        patch(
+            "src.workflow_engine.tool_registry.get_available_tools",
+            return_value={"codex": "Codex"},
+        ),
+        patch("src.acp.helper.fetch_acp_models", fetch_models),
+    ):
+        handler.handle_workflow_agent_action(
+            "selection-card",
+            "chat-1",
+            project.project_id,
+            payload,
+        )
+
+    assert fetch_models.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "option"),
+    [
+        ("workflow_select_model", "retired-model"),
+        ("workflow_select_profile", "retired-profile"),
+        ("workflow_select_effort", "retired-effort"),
+    ],
+)
+def test_invalid_cascade_callback_redraws_the_authoritative_draft_state(
+    tmp_path,
+    action: str,
+    option: str,
+) -> None:
+    pending = PendingWorkflow(
+        requirement="build",
+        initiator_user_id="user-1",
+        selection_session_key="selection-1",
+        project_id="project-1",
+        draft_tool_name="codex",
+        draft_model_name="gpt",
+        draft_profile="standard",
+        draft_effort="high",
+    )
+    handler, engine, project = _selection(tmp_path, pending=pending)
+    fetch_models = MagicMock(return_value=_catalog("codex"))
+    payload = {
+        "action": action,
+        "project_id": project.project_id,
+        "selection_session_key": "selection-1",
+        "_option": {"value": option},
+    }
+
+    with (
+        patch("src.thread.get_current_sender_id", return_value="user-1"),
+        patch(
+            "src.workflow_engine.tool_registry.get_available_tools",
+            return_value={"codex": "Codex"},
+        ),
+        patch("src.acp.helper.fetch_acp_models", fetch_models),
+    ):
+        handler.handle_workflow_agent_action(
+            "selection-card",
+            "chat-1",
+            project.project_id,
+            payload,
+        )
+
+    assert fetch_models.call_count == 1
+    assert engine.project.pending.draft_model_name == "gpt"
+    assert engine.project.pending.draft_profile == "standard"
+    assert engine.project.pending.draft_effort == "high"
+    card = handler.update_card.call_args.args[1]
+    effort_select = next(
+        item
+        for item in _walk(card)
+        if item.get("tag") == "select_static"
+        and item.get("name") == "model_effort"
+    )
+    assert effort_select["initial_option"] == "high"
+
+
+@pytest.mark.parametrize(
+    (
+        "draft_model",
+        "draft_profile",
+        "draft_effort",
+        "expected_effort",
+    ),
+    [
+        ("retired-model", None, None, "low"),
+        ("gpt", "retired-profile", "high", "high"),
+        ("gpt", "standard", "retired-effort", "low"),
+    ],
+)
+def test_stale_add_reconciles_the_draft_to_the_visible_catalog_once(
+    tmp_path,
+    draft_model: str,
+    draft_profile: str | None,
+    draft_effort: str | None,
+    expected_effort: str,
+) -> None:
+    pending = PendingWorkflow(
+        requirement="build",
+        initiator_user_id="user-1",
+        selection_session_key="selection-1",
+        project_id="project-1",
+        draft_tool_name="codex",
+        draft_model_name=draft_model,
+        draft_profile=draft_profile,
+        draft_effort=draft_effort,
+    )
+    handler, engine, project = _selection(tmp_path, pending=pending)
+    fetch_models = MagicMock(return_value=_catalog("codex"))
+
+    with (
+        patch("src.thread.get_current_sender_id", return_value="user-1"),
+        patch(
+            "src.workflow_engine.tool_registry.get_available_tools",
+            return_value={"codex": "Codex"},
+        ),
+        patch("src.acp.helper.fetch_acp_models", fetch_models),
+    ):
+        handler.handle_workflow_agent_action(
+            "selection-card",
+            "chat-1",
+            project.project_id,
+            {
+                "action": "workflow_add_agent",
+                "project_id": project.project_id,
+                "selection_session_key": "selection-1",
+            },
+        )
+
+    assert fetch_models.call_count == 1
+    assert engine.project.pending.agent_pool == ()
+    assert engine.project.pending.selection_error
+    assert engine.project.pending.draft_model_name == "gpt"
+    assert engine.project.pending.draft_profile == "standard"
+    assert engine.project.pending.draft_effort == expected_effort
+    card = handler.update_card.call_args.args[1]
+    selects = {
+        item["name"]: item
+        for item in _walk(card)
+        if item.get("tag") == "select_static"
+    }
+    assert selects["model_group"]["initial_option"] == "gpt"
+    assert selects["model_profile"]["initial_option"] == "standard"
+    assert selects["model_effort"]["initial_option"] == expected_effort
+    assert any(
+        item.get("tag") == "button"
+        and item.get("value", {}).get("action") == "workflow_add_agent"
+        for item in _walk(card)
+    )
 
 
 def test_server_consumes_trusted_options_and_builds_same_tool_different_model_pool(tmp_path) -> None:

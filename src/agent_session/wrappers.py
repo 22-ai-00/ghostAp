@@ -384,6 +384,9 @@ class ModelFailureAwareSession(_SessionWrapper):
                 cwd=cwd,
                 agent_cmd=agent_cmd,
                 agent_args=list(new_args),
+                capture_full_tool_content=bool(
+                    getattr(base, "_capture_full_tool_content", False)
+                ),
             )
 
         return self._replace_inner_strictly(

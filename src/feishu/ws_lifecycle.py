@@ -58,9 +58,16 @@ def frame_header_value(frame: Any, key: str) -> Optional[str]:
 class ObservedLarkWSClient(ws.Client):
     """Wrap the official Channel SDK WS client with activity hooks."""
 
-    def __init__(self, *args, on_activity: Callable[[str], None], **kwargs):
+    def __init__(
+        self,
+        *args,
+        on_activity: Callable[[str], None],
+        on_response_written: Callable[[bool], None] | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self._on_activity = on_activity
+        self._on_response_written = on_response_written
 
     async def _connect(self) -> None:
         await super()._connect()
@@ -84,9 +91,37 @@ class ObservedLarkWSClient(ws.Client):
 
     async def _handle_data_frame(self, frame):
         self._on_activity("data")
-        if frame_header_value(frame, HEADER_TYPE) == MessageType.CARD.value:
+        message_type = frame_header_value(frame, HEADER_TYPE)
+        if message_type == MessageType.CARD.value:
             return await self._handle_card_callback_frame(frame)
-        return await super()._handle_data_frame(frame)
+        if message_type != MessageType.EVENT.value:
+            return await super()._handle_data_frame(frame)
+        try:
+            result = await super()._handle_data_frame(frame)
+        except BaseException:
+            self._notify_response_written(False)
+            raise
+        self._notify_response_written(self._response_is_success(frame))
+        return result
+
+    @staticmethod
+    def _response_is_success(frame: Any) -> bool:
+        try:
+            payload = JSON.unmarshal(frame.payload.decode(UTF_8), dict)
+            return payload.get("code") == http.HTTPStatus.OK
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+    def _notify_response_written(self, written: bool) -> None:
+        callback = getattr(self, "_on_response_written", None)
+        if not callable(callback):
+            return
+        try:
+            callback(written)
+        except Exception:
+            # ACK bytes are already committed (or the write has failed).
+            # Advisory cleanup must never rewrite transport outcome.
+            logger.warning("post-response callback failed", exc_info=True)
 
     async def _handle_card_callback_frame(self, frame: Any) -> None:
         """Dispatch callback frames that the upstream WS client drops.
@@ -131,4 +166,9 @@ class ObservedLarkWSClient(ws.Client):
             response = Response(code=http.HTTPStatus.INTERNAL_SERVER_ERROR)
 
         frame.payload = JSON.marshal(response).encode(UTF_8)
-        await self._write_message(frame.SerializeToString())
+        try:
+            await self._write_message(frame.SerializeToString())
+        except BaseException:
+            self._notify_response_written(False)
+            raise
+        self._notify_response_written(response.code == http.HTTPStatus.OK)

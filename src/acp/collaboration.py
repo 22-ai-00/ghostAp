@@ -24,6 +24,130 @@ _KNOWN_CHILD_ACTIVITIES = frozenset(
 )
 
 
+class AuthoritativeChildLifecycleProof:
+    """Track a final explicit ``list_agents`` proof outside presentation code.
+
+    The proof is invalidated whenever a known child starts a new generation or
+    emits later activity. Malformed identities/statuses remain fail-closed.
+    """
+
+    def __init__(self) -> None:
+        self._observed_sources: set[str] = set()
+        self._authoritative_statuses: dict[str, str] = {}
+        self._ambiguous = False
+
+    def observe_event(self, event: object) -> None:
+        tool_call = getattr(event, "tool_call", None)
+        if tool_call is None:
+            return
+        event_name = str(
+            getattr(getattr(event, "event_type", None), "name", "") or ""
+        )
+        outer_status = str(
+            getattr(tool_call, "status", "") or ""
+        ).strip().casefold()
+        action = _child_action(tool_call)
+        activity = str(
+            getattr(tool_call, "subagent_activity", "") or ""
+        ).strip().casefold()
+        receiver_items, receivers_malformed = _receiver_items(
+            getattr(tool_call, "collaboration_receivers", ())
+        )
+        receivers: set[str] = set()
+        for raw_receiver in receiver_items:
+            source_id = strict_source_id(raw_receiver)
+            if source_id is None:
+                receivers_malformed = True
+            else:
+                receivers.add(source_id)
+
+        states: dict[str, str] = {}
+        states_malformed = False
+        for item in _state_items(getattr(tool_call, "subagent_states", ())):
+            if not isinstance(item, Mapping):
+                states_malformed = True
+                continue
+            source_id = strict_source_id(item.get("source_id"))
+            status = strict_child_status(item.get("status"))
+            if source_id is None or status is None:
+                states_malformed = True
+                continue
+            prior = states.get(source_id)
+            if prior is not None and prior != status:
+                states_malformed = True
+                continue
+            states[source_id] = status
+
+        activity_source = strict_source_id(
+            getattr(tool_call, "subagent_source_id", None)
+        )
+        if activity and (
+            activity not in _KNOWN_CHILD_ACTIVITIES
+            or activity_source is None
+        ):
+            states_malformed = True
+
+        sources = {*receivers, *states}
+        if activity_source is not None:
+            sources.add(activity_source)
+        self._observed_sources.update(sources)
+
+        has_child_evidence = bool(
+            sources
+            or activity
+            or getattr(tool_call, "child_metadata_malformed", False)
+        )
+        known_activity_action = action.startswith("activity:")
+        if (
+            receivers_malformed
+            or states_malformed
+            or getattr(tool_call, "child_metadata_malformed", False) is not False
+            or (
+                has_child_evidence
+                and action not in _KNOWN_CHILD_ACTIONS
+                and not known_activity_action
+            )
+        ):
+            self._ambiguous = True
+            self._authoritative_statuses.clear()
+
+        starts_generation = (
+            event_name == "TOOL_CALL_DONE"
+            and outer_status == "completed"
+            and action in _CHILD_GENERATION_ACTIONS
+        )
+        if starts_generation or activity in _KNOWN_CHILD_ACTIVITIES:
+            for source_id in sources:
+                self._authoritative_statuses.pop(source_id, None)
+
+        if action != "list_agents" or event_name != "TOOL_CALL_DONE":
+            return
+        if outer_status != "completed":
+            return
+        if (
+            receivers_malformed
+            or states_malformed
+            or not states
+            or not receivers.issubset(states)
+        ):
+            self._ambiguous = True
+            self._authoritative_statuses.clear()
+            return
+        self._authoritative_statuses = states
+
+    def all_observed_children_terminal(self) -> bool:
+        """Whether the latest clean list snapshot covers all known children."""
+        if self._ambiguous or not self._observed_sources:
+            return False
+        if not self._observed_sources.issubset(self._authoritative_statuses):
+            return False
+        return all(
+            self._authoritative_statuses[source_id]
+            in TERMINAL_CHILD_STATUSES
+            for source_id in self._observed_sources
+        )
+
+
 def strict_source_id(value: object) -> str | None:
     """Return a validated provider child identity without coercing values."""
     if not isinstance(value, str):
@@ -404,6 +528,7 @@ def merge_tool_call_sequence(
 
 
 __all__ = [
+    "AuthoritativeChildLifecycleProof",
     "KNOWN_CHILD_STATUSES",
     "TERMINAL_CHILD_STATUSES",
     "TRANSIENT_CHILD_STATUSES",

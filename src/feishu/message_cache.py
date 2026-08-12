@@ -73,7 +73,13 @@ class MessageCache:
                 self._last_cleanup = current_time
 
             if message_id in self._cache:
-                return True
+                timestamp = self._cache[message_id]
+                if current_time - timestamp < self._ttl:
+                    return True
+                # The per-entry TTL is authoritative.  Periodic cleanup only
+                # bounds memory; it must not stretch a 1-second action debounce
+                # into the cleanup interval (30 seconds in production).
+                del self._cache[message_id]
 
             self._cache[message_id] = current_time
 

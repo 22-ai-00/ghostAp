@@ -8,7 +8,9 @@ Covers:
 - AC-R15: spec_review_max_parallel boundary values (0, -1, 21) rejected
 """
 
-from unittest.mock import patch
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -356,3 +358,54 @@ class TestAutonomousTeamAndContextRetrySettings:
                 autonomous_context_retry_base_seconds=31.0,
                 autonomous_context_retry_max_seconds=30.0,
             )
+
+
+class TestTaskSchedulerBoundedSettings:
+    def test_defaults_are_positive_and_bounded(self):
+        settings = Settings(_env_file=None)
+
+        assert settings.task_scheduler_max_pending_normal == 1000
+        assert settings.task_scheduler_max_pending_system == 100
+        assert settings.task_scheduler_max_terminal_history == 5000
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "task_scheduler_max_pending_normal",
+            "task_scheduler_max_pending_system",
+            "task_scheduler_max_terminal_history",
+        ],
+    )
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_non_positive_limits_are_rejected(self, field: str, value: int):
+        with pytest.raises(Exception):
+            Settings(_env_file=None, **{field: value})
+
+    def test_scheduler_builder_wires_all_bounded_limits(self):
+        from src.feishu.ws_client import _build_task_scheduler
+
+        settings = SimpleNamespace(
+            restart_gate_dir="",
+            task_scheduler_max_concurrent=2,
+            task_scheduler_per_key_concurrency=1,
+            system_command_concurrency=1,
+            task_scheduler_max_pending_normal=17,
+            task_scheduler_max_pending_system=5,
+            task_scheduler_max_terminal_history=23,
+        )
+        gate = MagicMock()
+        gate.task_guard = nullcontext
+        gate.cancel_waiters = MagicMock()
+
+        with patch(
+            "src.feishu.ws_client.RestartGate.for_project",
+            return_value=gate,
+        ):
+            scheduler = _build_task_scheduler(settings)
+
+        try:
+            assert scheduler._max_pending_normal == 17
+            assert scheduler._max_pending_system == 5
+            assert scheduler._max_terminal_history == 23
+        finally:
+            scheduler.stop(wait=True, shutdown_executor=True)

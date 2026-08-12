@@ -17,6 +17,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import threading
+import time
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, Protocol, runtime_checkable
 
@@ -39,6 +40,8 @@ DISPATCHED_HOOK_TIMEOUT = 3.0
 
 # Threshold: rebuild executor after this many consecutive timeouts
 _MAX_CONSECUTIVE_TIMEOUTS = 2
+
+_dispatched_hook_context = threading.local()
 
 
 class _HookExecutorManager:
@@ -346,6 +349,9 @@ class HookFirer:
         self._executor = executor or _hook_executor_manager
         self._fired = threading.Event()  # ensures fire_terminal executes at most once
         self._fire_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._dispatched_condition = threading.Condition(threading.Lock())  # leaf lock: never held while acquiring a LockLevel lock
+        self._dispatched_pending = 0
+        self._dispatched_self_drainers = 0
 
     def append_hook(self, hook: SessionHook) -> None:
         """Append a hook after construction (thread-safe atomic tuple replacement).
@@ -372,24 +378,118 @@ class HookFirer:
             return
         sid = self._session_id
         executor = self._executor
-        import time
         submit_time = time.monotonic()
         for hook in self._hooks:
             fn = getattr(hook, "on_dispatched", None)
             if fn is None:
                 continue
-            future = executor.submit(fn, event, state)
-            if future is not None:
-                hook_name = type(hook).__name__
-                future.add_done_callback(
-                    lambda f, _sid=sid, _name=hook_name, _t0=submit_time, _ex=executor: self._on_dispatched_done(f, _sid, _name, _t0, _ex)
+            with self._dispatched_condition:
+                self._dispatched_pending += 1
+            completion_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+            completion_done = [False]
+
+            def _finish_once(
+                _lock: threading.Lock = completion_lock,
+                _done: list[bool] = completion_done,
+            ) -> None:
+                with _lock:
+                    if _done[0]:
+                        return
+                    _done[0] = True
+                self._finish_dispatched_hook()
+
+            try:
+                future = executor.submit(
+                    self._run_dispatched_hook,
+                    fn,
+                    event,
+                    state,
+                    _finish_once,
                 )
+            except Exception:
+                _finish_once()
+                raise
+            if future is None:
+                _finish_once()
+                continue
+            hook_name = type(hook).__name__
+            future.add_done_callback(
+                lambda f, _finish=_finish_once: _finish()
+            )
+            future.add_done_callback(
+                lambda f, _sid=sid, _name=hook_name, _t0=submit_time, _ex=executor: self._on_dispatched_done(f, _sid, _name, _t0, _ex)
+            )
+
+    def _run_dispatched_hook(
+        self,
+        fn: Callable[[CardEvent, CardState], None],
+        event: CardEvent,
+        state: CardState,
+        finish: Callable[[], None],
+    ) -> None:
+        """Run one hook while marking this callback as self-drain exempt."""
+        active = getattr(_dispatched_hook_context, "active_firers", None)
+        if active is None:
+            active = {}
+            _dispatched_hook_context.active_firers = active
+        firer_id = id(self)
+        active[firer_id] = active.get(firer_id, 0) + 1
+        try:
+            fn(event, state)
+        finally:
+            remaining = active[firer_id] - 1
+            if remaining:
+                active[firer_id] = remaining
+            else:
+                active.pop(firer_id, None)
+            finish()
+
+    def _finish_dispatched_hook(self) -> None:
+        with self._dispatched_condition:
+            self._dispatched_pending -= 1
+            self._dispatched_condition.notify_all()
+
+    def drain_dispatched(self, timeout: float | None = None) -> bool:
+        """Wait for pre-close dispatched hooks, excluding the calling hook.
+
+        A hook may call ``CardSession.close()`` itself. Such a callback cannot
+        wait for its own Future, but it still waits for every sibling hook from
+        the same session. Multiple self-closing siblings are exempt together to
+        avoid a cyclic wait.
+        """
+        active = getattr(_dispatched_hook_context, "active_firers", {})
+        called_from_hook = active.get(id(self), 0) > 0
+        timeout_s = DISPATCHED_HOOK_TIMEOUT if timeout is None else timeout
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with self._dispatched_condition:
+            if called_from_hook:
+                self._dispatched_self_drainers += 1
+                self._dispatched_condition.notify_all()
+            try:
+                while True:
+                    exempt = (
+                        self._dispatched_self_drainers
+                        if called_from_hook
+                        else 0
+                    )
+                    if self._dispatched_pending <= exempt:
+                        return True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._dispatched_condition.wait(timeout=remaining)
+            finally:
+                if called_from_hook:
+                    self._dispatched_self_drainers -= 1
+                    self._dispatched_condition.notify_all()
 
     @staticmethod
     def _on_dispatched_done(f: concurrent.futures.Future, sid: str, hook_name: str, submit_time: float, executor: _HookExecutorManager) -> None:
         """Done-callback for dispatched hooks: log errors and detect timeouts."""
-        import time
-        exc = f.exception()
+        try:
+            exc = f.exception()
+        except concurrent.futures.CancelledError:
+            return
         if exc is not None:
             logger.warning("HookFirer %s: on_dispatched failed (%s): %s", sid, hook_name, repr(exc))
         elapsed = time.monotonic() - submit_time

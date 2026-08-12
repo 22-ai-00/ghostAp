@@ -398,6 +398,7 @@ class AgentExecutor:
             cwd=self.cwd,
             model_name=params.model,
             cancel_event=call_cancel,
+            capture_full_tool_content=True,
         )
         configured = _settings_int(
             "workflow_session_create_timeout_s",

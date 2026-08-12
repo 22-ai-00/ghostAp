@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>普通编程任务可见性预览</title>
   <style>
-    :root { --ink:#17202a; --muted:#68717d; --paper:#fffdf7; --line:#ddd6c7; --blue:#1769aa; --blue-soft:#eaf5ff; --amber:#9a5b00; --amber-soft:#fff4da; --green:#18794e; --gray-soft:#f1f2f4; }
+    :root { --ink:#17202a; --muted:#68717d; --paper:#fffdf7; --line:#ddd6c7; --blue:#1769aa; --blue-soft:#eaf5ff; --amber:#9a5b00; --amber-soft:#fff4da; --green:#18794e; --green-soft:#eaf7f0; --red:#a43d34; --red-soft:#fff0ee; --gray-soft:#f1f2f4; }
     * { box-sizing: border-box; }
     body { margin:0; color:var(--ink); background:radial-gradient(circle at 12% 8%,#d9eefc 0 9%,transparent 30%),radial-gradient(circle at 90% 88%,#f8dfae 0 8%,transparent 28%),#edf0eb; font-family:"Avenir Next","PingFang SC","Microsoft YaHei",sans-serif; }
     main { width:min(1080px,calc(100% - 28px)); margin:36px auto; }
@@ -14,6 +14,7 @@
     .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px; }
     .card { overflow:hidden; border:1px solid rgba(23,32,42,.13); border-radius:20px; background:var(--paper); box-shadow:0 18px 48px rgba(23,32,42,.12); }
     .card header { padding:18px 20px; color:white; background:linear-gradient(110deg,#155f96,#228ac0); }
+    .card.completed-warning header { background:linear-gradient(110deg,#176a48,#229767); }
     .card.failed header { background:linear-gradient(110deg,#7e2f2f,#b24a38); }
     .card h2 { margin:0; font-size:18px; }
     .body { padding:18px; }
@@ -22,6 +23,15 @@
     .action strong { color:var(--blue); }
     .command { margin-top:9px; overflow-wrap:anywhere; font-family:"SFMono-Regular",Consolas,monospace; font-size:12px; line-height:1.55; }
     .panel { border-color:#dfad57; background:var(--amber-soft); }
+    .outcome { margin-bottom:14px; border:1px solid var(--line); border-radius:14px; padding:14px 16px; }
+    .outcome.success { border-color:#9bcdb4; background:var(--green-soft); }
+    .outcome.error { border-color:#e5aaa4; background:var(--red-soft); }
+    .outcome-title { margin-bottom:5px; font-weight:750; }
+    .outcome.success .outcome-title { color:var(--green); }
+    .outcome.error .outcome-title { color:var(--red); }
+    .warning { margin:12px 0; padding:11px 13px; border-left:4px solid #d8901f; border-radius:8px; color:#704400; background:var(--amber-soft); font-size:13px; line-height:1.55; }
+    .buttons { display:flex; flex-wrap:wrap; gap:9px; margin-top:13px; }
+    .button { padding:8px 13px; border:1px solid #9ba5b1; border-radius:9px; background:white; color:var(--ink); font-size:13px; font-weight:650; }
     .panel-title { color:var(--amber); font-weight:700; }
     .task { display:grid; grid-template-columns:auto 1fr; gap:9px; padding:11px 0; border-bottom:1px dashed rgba(154,91,0,.25); }
     .task:last-child { border-bottom:0; }
@@ -67,8 +77,32 @@
           <footer>📂 ~/work/github/ghostAp<br>🔧 codex · 🧩 gpt-5.6-sol/ultra · ⏱ 用时 01:59:38</footer>
         </div>
       </article>
+      <article class="card completed-warning">
+        <header><h2>任务已完成</h2></header>
+        <div class="body">
+          <section class="outcome success">
+            <div class="outcome-title">✅ 结果已完整交付</div>
+            <div>计划项 3/3 完成，外层工具调用全部终态，并行子任务 3/3 完成。</div>
+            <div class="warning">⚠️ 状态对账提醒：检测到 2 条历史子代理执行记录未闭合；最后一次权威 Agent 状态已确认全部终态，不影响本次结果。</div>
+            <div class="buttons"><span class="button">查看诊断</span></div>
+          </section>
+          <footer>📂 ~/work/github/ghostAp<br>🔧 codex · 🧩 gpt-5.6-sol/ultra · ⏱ 用时 00:28:15</footer>
+        </div>
+      </article>
+      <article class="card failed">
+        <header><h2>执行未完成</h2></header>
+        <div class="body">
+          <section class="outcome error">
+            <div class="outcome-title">❌ 仍有任务未进入终态</div>
+            <div>检测到 1 个子代理仍在运行，当前结果不能证明任务已经完成。</div>
+            <div class="warning">已安全停止当前操作。诊断仅包含状态、计数和允许公开的错误摘要，不包含提示词、命令正文或内部标识。</div>
+            <div class="buttons"><span class="button">查看诊断</span></div>
+          </section>
+          <footer>📂 ~/work/github/ghostAp<br>🔧 codex · 🧩 gpt-5.6-sol/ultra · ⏱ 用时 00:28:15</footer>
+        </div>
+      </article>
     </section>
-    <p class="note">终态卡不再显示残留的 Context compacting 或“执行中”；内部 snake_case 标题会转换为可读短语，但不会伪造不存在的任务说明。</p>
+    <p class="note">终态卡不再显示残留的 Context compacting 或“执行中”；历史记录异常与任务失败分层展示。“查看诊断”只在真实、安全绑定的回调存在时出现，不再用“查看状态”冒充。</p>
   </main>
 </body>
 </html>

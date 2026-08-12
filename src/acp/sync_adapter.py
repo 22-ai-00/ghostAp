@@ -372,6 +372,7 @@ def start_session_with_retry(
     env: Optional[dict[str, str]] = None,
     retries: Optional[int] = None,
     auto_approve: bool | None = None,
+    capture_full_tool_content: bool = False,
 ) -> SyncACPSession:
     """Start an ACP session with retry and progressive timeout.
 
@@ -396,16 +397,30 @@ def start_session_with_retry(
         session_cls = SyncACPSession
 
     def construct_session(**kwargs: object) -> SyncACPSession:
-        try:
-            return session_cls(**kwargs, auto_approve=auto_approve)
-        except TypeError as exc:
-            if "auto_approve" not in str(exc):
-                raise
-            logger.debug(
-                "session_cls does not accept auto_approve, using legacy signature",
-                exc_info=True,
-            )
-            return session_cls(**kwargs)
+        optional_kwargs: dict[str, object] = {
+            "auto_approve": auto_approve,
+            "capture_full_tool_content": bool(capture_full_tool_content),
+        }
+        while True:
+            try:
+                return session_cls(**kwargs, **optional_kwargs)
+            except TypeError as exc:
+                unsupported = next(
+                    (
+                        name
+                        for name in optional_kwargs
+                        if name in str(exc)
+                    ),
+                    None,
+                )
+                if unsupported is None:
+                    raise
+                optional_kwargs.pop(unsupported)
+                logger.debug(
+                    "session_cls does not accept %s, using legacy signature",
+                    unsupported,
+                    exc_info=True,
+                )
 
     for attempt in range(1, retries + 1):
         try:
@@ -611,6 +626,7 @@ class SyncACPSession:
         model_name: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         auto_approve: bool | None = None,
+        capture_full_tool_content: bool = False,
     ):
         self._agent_type = agent_type
         self._cwd = cwd
@@ -624,6 +640,7 @@ class SyncACPSession:
         self._model_name = (model_name or "").strip() or None
         self._explicit_env = dict(env) if env is not None else None
         self._auto_approve = auto_approve
+        self._capture_full_tool_content = bool(capture_full_tool_content)
         self._log_failures = True
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread: Optional[threading.Thread] = None
@@ -825,6 +842,7 @@ class SyncACPSession:
             cwd=self._cwd,
             env=env_override,
             auto_approve=self._auto_approve,
+            capture_full_tool_content=self._capture_full_tool_content,
         )
         session_id = await self._acp_session.start()
 

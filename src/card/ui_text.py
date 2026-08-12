@@ -540,6 +540,10 @@ UI_TEXT = {
     "card_lifecycle_continue_degraded_unknown_ack": "当前暂未确定可继续模式，请重新发送原命令或查看诊断。",
     "card_lifecycle_show_details": "查看详情",
     "card_lifecycle_details_collapsed": "🔒 详情已收起：点击“查看详情”后将返回已脱敏、截断的诊断信息。",
+    "mode_exec_child_history_reconciled": (
+        "⚠️ 状态对账提醒：检测到 {count} 条历史子代理执行记录未闭合；"
+        "最后一次权威 Agent 状态已确认全部终态，不影响本次结果。"
+    ),
     "card_lifecycle_cancelled_block": "⚠️ 已取消",
     "card_lifecycle_cancelled_status": "已取消",
     "card_lifecycle_paused": "⏸ 已暂停",
@@ -571,7 +575,7 @@ UI_TEXT = {
     "card_session_toast_factory_error": "操作异常，请在对话中重新输入命令重试",
     "card_session_toast_dispatch_error": "系统暂时繁忙，请稍等片刻后重新发送命令",
     "card_session_toast_action_ack": "操作已提交，正在处理",
-    "card_session_toast_dedup": "操作已受理，请勿重复点击",
+    "card_session_toast_dedup": "操作正在处理中，请稍候",
     "workflow_selection_toast_processing": "正在应用选择，卡片将自动更新",
     "card_session_terminal_retry_failed": "⚠️ 任务已结束（卡片未能刷新最终状态）。可发送状态命令查看结果；开始新任务请发送 {engine_cmd} <需求描述>",
     # TTL expiry messages — mutually exclusive triggers:

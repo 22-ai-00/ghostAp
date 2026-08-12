@@ -22,12 +22,11 @@ DEFAULT_MODELS = [
     CocoModel(name="doubao-1.5-pro", description="Doubao 1.5 Pro"),
 ]
 
-CACHE_TTL_SECONDS = 300
+CACHE_TTL_SECONDS = 1800
 # When the ACP probe fails and we degrade to the static DEFAULT_MODELS list, we
-# must NOT pin that stale list for the full 5 minutes — otherwise the "刷新模型列表"
-# button (and every other caller) keeps seeing fake models until the TTL expires.
-# Use a short retry window so the next request re-attempts the real probe.
-FALLBACK_CACHE_TTL_SECONDS = 20
+# must NOT pin that stale list for the full 30 minutes.  A five-minute retry
+# window avoids repeatedly starting Coco while keeping explicit refresh useful.
+FALLBACK_CACHE_TTL_SECONDS = 300
 
 
 class CocoModelManager:
@@ -230,7 +229,7 @@ class CocoModelManager:
         ``coco acp serve`` cold-start + initialize handshake is slow and highly
         variable (4-12s observed), so probing it lazily on the first ``/coco``
         click frequently times out and degrades to the static DEFAULT_MODELS.
-        Kicking it off at process startup populates the 5min cache so the
+        Kicking it off at process startup populates the 30min cache so the
         interactive path normally just reads a fresh list.
         """
 

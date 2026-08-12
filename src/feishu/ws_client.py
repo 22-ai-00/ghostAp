@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -67,7 +68,7 @@ from ..project import (
     ProjectManager,
 )
 from ..spec_engine import SpecEngineManager, SpecReporter
-from ..tasking import TaskPriority, TaskScheduler, TaskSpec
+from ..tasking import TaskPriority, TaskQueueFullError, TaskScheduler, TaskSpec
 from ..thread import (
     get_current_tenant_key,
     get_current_thread_id,
@@ -242,6 +243,7 @@ _READONLY_CARD_ACTIONS = {
 _CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
 _SHUTDOWN_SCHEDULER_DRAIN_S = 5.0
 _SHUTDOWN_DELEGATED_DRAIN_S = 5.0
+_MAX_PENDING_CARD_ADVISORIES = 128
 # The managed-trust cutover first shipped at 2026-07-31 20:25 UTC.  Archives
 # created after this boundary may be the startup regression repaired by the
 # legacy Team migration; older dissolved markers remain permanently retired.
@@ -264,15 +266,111 @@ def _build_task_scheduler(
         project_dir or _CHECKOUT_ROOT,
         override=configured_gate_dir or None,
     )
+
+    def positive_int_setting(name: str, default: int) -> int:
+        value = getattr(settings, name, default)
+        return value if type(value) is int and value > 0 else default
+
     scheduler = TaskScheduler(
         max_concurrent=settings.task_scheduler_max_concurrent,
         per_key_concurrency=settings.task_scheduler_per_key_concurrency,
         system_concurrency=settings.system_command_concurrency,
+        max_pending_normal=positive_int_setting(
+            "task_scheduler_max_pending_normal",
+            1000,
+        ),
+        max_pending_system=positive_int_setting(
+            "task_scheduler_max_pending_system",
+            100,
+        ),
+        max_terminal_history=positive_int_setting(
+            "task_scheduler_max_terminal_history",
+            5000,
+        ),
         thread_name_prefix="ghost_worker",
         run_guard=gate.task_guard,
     )
     scheduler._restart_gate = gate
     return scheduler
+
+
+class _CardAdvisoryDispatcher:
+    """Bound callback-scoped advisory work until the typed handler returns.
+
+    The SDK callback adapter opens one thread-local scope, calls the typed card
+    handler, and only then drains the captured scheduler submissions.  A
+    process-wide reservation count keeps concurrent callback scopes bounded.
+    """
+
+    def __init__(self, *, max_pending: int) -> None:
+        self._max_pending = max_pending
+        self._pending_count = 0
+        self._closed = False
+        self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._active: contextvars.ContextVar[
+            list[Callable[[], object]] | None
+        ] = contextvars.ContextVar(
+            f"ghostap_card_advisory_active_{id(self)}",
+            default=None,
+        )
+        self._sealed: contextvars.ContextVar[
+            tuple[Callable[[], object], ...] | None
+        ] = contextvars.ContextVar(
+            f"ghostap_card_advisory_sealed_{id(self)}",
+            default=None,
+        )
+
+    def begin(self) -> list[Callable[[], object]]:
+        if self._active.get() is not None or self._sealed.get() is not None:
+            raise RuntimeError("nested card advisory scope")
+        pending: list[Callable[[], object]] = []
+        self._active.set(pending)
+        return pending
+
+    def defer(self, callback: Callable[[], object]) -> bool:
+        pending = self._active.get()
+        if pending is None:
+            return False
+        with self._lock:
+            if self._closed or self._pending_count >= self._max_pending:
+                return False
+            self._pending_count += 1
+        pending.append(callback)
+        return True
+
+    def seal(self, pending: list[Callable[[], object]]) -> None:
+        if self._active.get() is not pending:
+            raise RuntimeError("card advisory scope identity mismatch")
+        self._active.set(None)
+        self._sealed.set(tuple(pending))
+
+    def finish_response(self, *, written: bool) -> None:
+        pending = self._sealed.get()
+        if pending is None:
+            return
+        self._sealed.set(None)
+        for callback in pending:
+            with self._lock:
+                self._pending_count = max(0, self._pending_count - 1)
+                should_dispatch = written and not self._closed
+            if should_dispatch:
+                try:
+                    callback()
+                except Exception:
+                    logger.warning(
+                        "card advisory post-response handoff failed",
+                        exc_info=True,
+                    )
+
+    def discard(self, pending: list[Callable[[], object]]) -> None:
+        if self._active.get() is pending:
+            self._active.set(None)
+        with self._lock:
+            self._pending_count = max(0, self._pending_count - len(pending))
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
 
 
 class FeishuWSClient:
@@ -351,6 +449,9 @@ class FeishuWSClient:
         self._card_event_cache = MessageCache(ttl=self.settings.message_cache_ttl, max_size=self.settings.message_cache_max_size, cleanup_interval=60)
         # Card action dedupe (user rapid clicks): short TTL, per-action key.
         self._card_action_dedup_cache = MessageCache(ttl=self.settings.card.action_dedup_ttl, max_size=self.settings.card.action_dedup_max_size, cleanup_interval=30)
+        self._card_advisory_dispatcher = _CardAdvisoryDispatcher(
+            max_pending=_MAX_PENDING_CARD_ADVISORIES
+        )
         # Chat lock gate: initialized after handler_ctx is available (see below).
         self._chat_lock_gate = None  # type: ignore[assignment]
         self._scheduler = _build_task_scheduler(self.settings)
@@ -843,6 +944,9 @@ class FeishuWSClient:
         not tear down lock managers underneath it.
         """
         self._closed = True
+        dispatcher = getattr(self, "_card_advisory_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.close()
 
         self._ws_health_monitor.stop_watchdog()
 
@@ -950,11 +1054,15 @@ class FeishuWSClient:
 
         from ..card.delivery.registry import delivery_registry
 
-        if not delivery_registry.drain_in_flight(
+        # ``shutdown_all`` fences, drains, and shuts down every registered
+        # delivery under one shared deadline.  Calling ``drain_in_flight``
+        # first would give the same delivery two independent timeout budgets
+        # and leave its eviction worker alive after a successful drain.
+        if not delivery_registry.shutdown_all(
             timeout=_SHUTDOWN_DELEGATED_DRAIN_S
         ):
             logger.error(
-                "card delivery did not drain; preserving shared dependencies"
+                "card delivery did not shut down; preserving shared dependencies"
             )
             try:
                 self._scheduler.stop(wait=True, shutdown_executor=False)
@@ -2480,6 +2588,122 @@ class FeishuWSClient:
             logger.warning("managed stale card refresh failed closed", exc_info=True)
             return False
 
+    def _submit_card_advisory_follow_up(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        name: str,
+        callback: Callable[[], object],
+        project_id: str | None = None,
+        tenant_key: str = "",
+    ) -> bool:
+        """Submit advisory remote I/O after the typed callback has returned.
+
+        These jobs use the scheduler's reserved system lane, but they never
+        change the allow/deny result of the submitted card action.  A fenced
+        or full lane therefore drops only the advisory work and must not fall
+        back to synchronous network I/O on the three-second callback path.
+        """
+
+        def _run(_task_ctx):
+            previous_tenant_key = get_current_tenant_key()
+            set_current_tenant_key(tenant_key or None)
+            try:
+                return callback()
+            finally:
+                set_current_tenant_key(previous_tenant_key)
+
+        spec = TaskSpec(
+            chat_id=chat_id,
+            name=name,
+            task_type="card_advisory_follow_up",
+            message_id=message_id,
+            origin_message_id=message_id,
+            project_id=project_id,
+            priority=TaskPriority.HIGH,
+            is_system_command=True,
+            tenant_key=tenant_key,
+        )
+        try:
+            self._scheduler.submit(spec, _run)
+            return True
+        except (
+            TaskQueueFullError,
+            RateLimitExceededException,
+            CircuitBreakerOpenException,
+            RuntimeError,
+        ) as exc:
+            logger.warning(
+                "card advisory follow-up dropped: name=%s chat=%s reason=%s",
+                name,
+                self._access_identifier_hash(chat_id),
+                get_error_detail(exc),
+            )
+            return False
+
+    def _enqueue_card_advisory_follow_up(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        name: str,
+        callback: Callable[[], object],
+        project_id: str | None = None,
+        tenant_key: str = "",
+    ) -> bool:
+        """Capture one bounded advisory for the outer SDK callback adapter."""
+
+        dispatcher = getattr(self, "_card_advisory_dispatcher", None)
+        if dispatcher is None:
+            logger.warning("card advisory follow-up dropped without callback scope")
+            return False
+        accepted = dispatcher.defer(
+            lambda: self._submit_card_advisory_follow_up(
+                chat_id=chat_id,
+                message_id=message_id,
+                name=name,
+                callback=callback,
+                project_id=project_id,
+                tenant_key=tenant_key,
+            )
+        )
+        if not accepted:
+            logger.warning(
+                "card advisory follow-up dropped before handoff: name=%s chat=%s",
+                name,
+                self._access_identifier_hash(chat_id),
+            )
+        return accepted
+
+    def _handle_card_action_callback(
+        self,
+        data: P2CardActionTrigger,
+    ) -> P2CardActionTriggerResponse:
+        """SDK adapter that hands advisories off after typed ACK creation."""
+
+        dispatcher = getattr(self, "_card_advisory_dispatcher", None)
+        if dispatcher is None:
+            dispatcher = _CardAdvisoryDispatcher(
+                max_pending=_MAX_PENDING_CARD_ADVISORIES
+            )
+            self._card_advisory_dispatcher = dispatcher
+        pending = dispatcher.begin()
+        try:
+            response = self._handle_card_action(data)
+        except BaseException:
+            dispatcher.discard(pending)
+            raise
+        # Seal the batch in this async Context.  ObservedLarkWSClient releases
+        # it only after the typed ACK bytes have been written successfully.
+        dispatcher.seal(pending)
+        return response
+
+    def _finish_card_advisories(self, written: bool) -> None:
+        dispatcher = getattr(self, "_card_advisory_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.finish_response(written=written)
+
     def _handle_card_action(
         self,
         data: P2CardActionTrigger,
@@ -2503,6 +2727,9 @@ class FeishuWSClient:
             )
         except (AttributeError, TypeError):
             return empty_card_action_response()
+
+        _raw_tenant_key = getattr(getattr(data, "header", None), "tenant_key", None)
+        tenant_key = _raw_tenant_key if isinstance(_raw_tenant_key, str) else ""
 
         effective_trust = self._resolve_effective_trust(
             sender_id=operator_id,
@@ -2566,10 +2793,19 @@ class FeishuWSClient:
                     "MANAGED_CARD_STALE_REVISION_DENIED chat_hash=%s",
                     self._access_identifier_hash(open_chat_id),
                 )
-                self._refresh_managed_card_revisions(
-                    open_message_id,
-                    open_chat_id,
-                    effective_trust,
+                self._enqueue_card_advisory_follow_up(
+                    chat_id=open_chat_id,
+                    message_id=open_message_id,
+                    name="refresh_stale_managed_card",
+                    project_id=effective_trust.managed_group.project_id,
+                    tenant_key=tenant_key,
+                    callback=lambda _message_id=open_message_id,
+                    _chat_id=open_chat_id,
+                    _trust=effective_trust: self._refresh_managed_card_revisions(
+                        _message_id,
+                        _chat_id,
+                        _trust,
+                    ),
                 )
                 return empty_card_action_response()
 
@@ -2605,9 +2841,6 @@ class FeishuWSClient:
             )
         except (AttributeError, TypeError, KeyError) as e:
             logger.warning("卡片回调基础信息解析失败: %s", get_error_detail(e))
-        _raw_tenant_key = getattr(getattr(data, "header", None), "tenant_key", None)
-        tenant_key = _raw_tenant_key if isinstance(_raw_tenant_key, str) else ""
-
         action_type_preview = ""
         try:
             action_type_preview = CardActionInspector.action_type(data.event.action)
@@ -2621,11 +2854,23 @@ class FeishuWSClient:
                 and action_type_preview not in _READONLY_CARD_ACTIONS
             ):
                 if open_message_id:
-                    self._handler_ctx.handlers["coco"].reply_text(open_message_id, UI_TEXT["ws_system_cmd_gate_blocked"])
+                    self._enqueue_card_advisory_follow_up(
+                        chat_id=open_chat_id,
+                        message_id=open_message_id,
+                        name="notify_system_command_gate",
+                        tenant_key=tenant_key,
+                        callback=lambda _message_id=open_message_id: self._handler_ctx.handlers[
+                            "coco"
+                        ].reply_text(
+                            _message_id,
+                            UI_TEXT["ws_system_cmd_gate_blocked"],
+                        ),
+                    )
                 return empty_card_action_response()
         except (RuntimeError, OSError, TypeError, ValueError):
             classify_card_action_error(RuntimeError("system command gate failed"), phase="dispatch")
             logger.debug("failed to check system command gate", exc_info=True)
+            return empty_card_action_response()
 
         operator_union_id = ""
         try:
@@ -3574,7 +3819,7 @@ class FeishuWSClient:
             .register_p2_im_message_reaction_created_v1(_ignore_ws_event)
             .register_p2_im_chat_member_bot_deleted_v1(self._handle_bot_deleted)
             .register_p2_im_message_message_read_v1(_ignore_ws_event)
-            .register_p2_card_action_trigger(self._handle_card_action)
+            .register_p2_card_action_trigger(self._handle_card_action_callback)
         )
         # lark-channel-sdk 1.1.0 omits the typed p2p-chat-entered registrar,
         # while Feishu still delivers the subscribed event. Falling back to a
@@ -3638,6 +3883,7 @@ class FeishuWSClient:
                 log_level=ChannelLogLevel.WARNING,
                 source="ghostap",
                 on_activity=self._record_ws_activity,
+                on_response_written=self._finish_card_advisories,
             )
             try:
                 self._client.start()

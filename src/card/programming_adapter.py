@@ -10,6 +10,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
 
@@ -295,15 +296,30 @@ class ProgrammingCardSession:
             self._text_turn_seq,
         )
 
-    def finish(self) -> None:
+    def finish(
+        self,
+        *,
+        warning: str = "",
+        details: str = "",
+        detail_action: Mapping[str, object] | None = None,
+    ) -> None:
         """Complete the session; result text must already be in the stream."""
-        self._terminate(CardEvent.completed(), subagent_status="cancelled")
+        self._terminate(
+            CardEvent.completed(
+                warning=warning,
+                details=details,
+                detail_action=detail_action,
+            ),
+            subagent_status="cancelled",
+        )
 
     def fail(
         self,
         error: str = "",
         *,
         unfinished_subagent_status: str = "failed",
+        details: str = "",
+        detail_action: Mapping[str, object] | None = None,
     ) -> None:
         """Mark the session as failed."""
         terminal_status = (
@@ -311,7 +327,14 @@ class ProgrammingCardSession:
             if unfinished_subagent_status in {"failed", "cancelled"}
             else "failed"
         )
-        self._terminate(CardEvent.failed(error), subagent_status=terminal_status)
+        self._terminate(
+            CardEvent.failed(
+                error,
+                details=details,
+                detail_action=detail_action,
+            ),
+            subagent_status=terminal_status,
+        )
 
     def cancel(self, *, reason: str = "cancelled") -> None:
         """Mark the parent and unresolved children as cancelled."""

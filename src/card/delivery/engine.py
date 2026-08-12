@@ -28,8 +28,8 @@ class CardDelivery:
     - Manages sequence numbers for optimistic concurrency
     - Handles reconciliation on conflict
 
-    Public API: deliver() and close() only.
-    Lifecycle management (shutdown/drain) is accessed via DeliveryRegistry.
+    Public API: deliver(), close(), and shutdown().
+    Process-wide lifecycle coordination is available through DeliveryRegistry.
 
     Thread-safety: deliver() and close() are idempotent and concurrency-safe.
     After close(session_id) completes, subsequent deliver() calls for that
@@ -75,12 +75,31 @@ class CardDelivery:
         self._eviction_interval = eviction_interval
 
         self._registry = registry or delivery_registry
+        self._shutdown_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._shutdown_complete = False
         self._registry.register(self)
 
     def _shutdown(self) -> None:
-        """Stop background eviction thread. Called via DeliveryRegistry on graceful shutdown."""
-        self._lock_pool.shutdown()
-        self._registry.unregister(self)
+        """Compatibility shim for older process-shutdown integrations."""
+        self.shutdown()
+
+    def shutdown(self, timeout: float = 5.0) -> bool:
+        """Fence, drain, and release this engine's background resources.
+
+        The operation is idempotent.  A timed-out drain deliberately leaves
+        the eviction worker and registry membership intact so process-level
+        shutdown can retry after the outstanding delivery finishes.
+        """
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return True
+            self._lock_pool.fence()
+            if not self._lock_pool.drain(timeout=max(0.0, timeout)):
+                return False
+            self._lock_pool.shutdown()
+            self._registry.unregister(self)
+            self._shutdown_complete = True
+            return True
 
     def _drain(self, timeout: float = 5.0) -> bool:
         """Wait for all in-flight deliveries on this instance to finish.
@@ -131,24 +150,23 @@ class CardDelivery:
         Callers should NOT wrap deliver() in an external timeout — doing so risks
         leaving per-session locks unreleased.
         """
-        if not self._lock_pool.accepting_work:
+        if not self._lock_pool.try_enter_delivery():
             return [MutationOutcome(kind="rejected", message="delivery shutting down")]
-        with self._closed_lock:
-            if session_id in self._closed_sessions:
-                return []
-        self.open_session(session_id, chat_id)
-        # Acquire per-session lock (creates if needed, may evict LRU)
         try:
-            session_lock = self._lock_pool.acquire(session_id)
-        except RuntimeError:
-            logger.error(
-                "Session lock capacity exhausted, rejecting new session %s",
-                session_id,
-            )
-            return [MutationOutcome(kind="rejected", message="session lock capacity exhausted")]
+            with self._closed_lock:
+                if session_id in self._closed_sessions:
+                    return []
+            self.open_session(session_id, chat_id)
+            # Acquire per-session lock (creates if needed, may evict LRU)
+            try:
+                session_lock = self._lock_pool.acquire(session_id)
+            except RuntimeError:
+                logger.error(
+                    "Session lock capacity exhausted, rejecting new session %s",
+                    session_id,
+                )
+                return [MutationOutcome(kind="rejected", message="session lock capacity exhausted")]
 
-        self._lock_pool.enter_delivery()
-        try:
             with session_lock:
                 return self._deliver_unlocked(
                     session_id,

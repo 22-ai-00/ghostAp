@@ -83,6 +83,9 @@ class CardEvent(Generic[P]):
         cls,
         summary: str = "",
         *,
+        warning: str = "",
+        details: str = "",
+        detail_action: Mapping[str, Any] | None = None,
         duration_seconds: float | None = None,
     ) -> CardEvent[CompletedPayload]:
         """Signal successful completion of the engine session.
@@ -95,6 +98,16 @@ class CardEvent(Generic[P]):
         payload = {}
         if summary:
             payload["summary"] = summary
+        if warning:
+            payload["warning"] = str(warning)
+        if details:
+            payload["details"] = str(details)
+        if detail_action:
+            payload["detail_action"] = cls._diagnostic_action(
+                detail_action,
+                summary=warning or summary or "任务已完成，但检测到状态对账提醒。",
+                details=details,
+            )
         if duration_seconds is not None:
             if (
                 isinstance(duration_seconds, bool)
@@ -127,25 +140,11 @@ class CardEvent(Generic[P]):
         if details:
             payload["details"] = str(details)
         if detail_action:
-            action_payload = dict(detail_action)
-            if "diagnostic_token" not in action_payload:
-                from src.card.error_diagnostics import register_error_diagnostic
-
-                action_payload = {
-                    key: value
-                    for key, value in action_payload.items()
-                    if key not in {"details", "detail", "stderr", "stdout", "error", "exception", "traceback"}
-                }
-                action_payload["diagnostic_token"] = register_error_diagnostic(
-                    title="错误详情",
-                    summary=error,
-                    details=str(details or error),
-                    chat_id=action_payload.get("chat_id"),
-                    origin_message_id=action_payload.get("origin_message_id"),
-                    request_id=action_payload.get("request_id"),
-                    trace_id=action_payload.get("trace_id"),
-                )
-            payload["detail_action"] = action_payload
+            payload["detail_action"] = cls._diagnostic_action(
+                detail_action,
+                summary=error,
+                details=details or error,
+            )
         if retry_action:
             payload["retry_action"] = dict(retry_action)
         if duration_seconds is not None:
@@ -158,6 +157,44 @@ class CardEvent(Generic[P]):
                 raise ValueError("duration_seconds must be a finite non-negative number")
             payload["duration_seconds"] = float(duration_seconds)
         return cls(type=CardEventType.FAILED, payload=payload)
+
+    @staticmethod
+    def _diagnostic_action(
+        detail_action: Mapping[str, Any],
+        *,
+        summary: str,
+        details: str,
+    ) -> dict[str, Any]:
+        """Create a callback-safe action backed by the redacted diagnostic store."""
+        action_payload = dict(detail_action)
+        if "diagnostic_token" in action_payload:
+            return action_payload
+        from src.card.error_diagnostics import register_error_diagnostic
+
+        action_payload = {
+            key: value
+            for key, value in action_payload.items()
+            if key
+            not in {
+                "details",
+                "detail",
+                "stderr",
+                "stdout",
+                "error",
+                "exception",
+                "traceback",
+            }
+        }
+        action_payload["diagnostic_token"] = register_error_diagnostic(
+            title="诊断详情",
+            summary=summary,
+            details=str(details or summary),
+            chat_id=action_payload.get("chat_id"),
+            origin_message_id=action_payload.get("origin_message_id"),
+            request_id=action_payload.get("request_id"),
+            trace_id=action_payload.get("trace_id"),
+        )
+        return action_payload
 
     @classmethod
     def cancelled(cls, *, reason: str | None = None) -> CardEvent[Mapping[str, Any]]:

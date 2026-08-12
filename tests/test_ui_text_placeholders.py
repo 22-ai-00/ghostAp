@@ -59,7 +59,8 @@ class TestNewPhase3Keys:
 
     def test_toast_dedup_key_exists(self):
         assert "card_session_toast_dedup" in UI_TEXT
-        assert "重复" in UI_TEXT["card_session_toast_dedup"]
+        assert "处理中" in UI_TEXT["card_session_toast_dedup"]
+        assert "重复" not in UI_TEXT["card_session_toast_dedup"]
 
     def test_ttl_lock_contention_key_exists(self):
         assert "card_session_ttl_lock_contention" in UI_TEXT

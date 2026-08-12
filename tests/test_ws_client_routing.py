@@ -1,4 +1,6 @@
+import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,8 +19,9 @@ from src.feishu.ws_client import (
 )
 from src.mode import InteractionMode
 from src.project import ProjectContext
-from src.tasking import TaskPriority
+from src.tasking import TaskPriority, TaskQueueFullError
 from src.thread import get_current_thread_id, set_current_thread_id
+from src.trust.models import TrustZone
 
 
 @pytest.fixture
@@ -868,6 +871,225 @@ def test_card_action_rejects_old_callback_before_scheduling(
 
     assert response.__class__.__name__ == "P2CardActionTriggerResponse"
     mock_ws_client._scheduler.submit.assert_not_called()
+
+
+def test_stale_managed_card_refresh_runs_only_in_system_follow_up(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    trust = SimpleNamespace(
+        zone=TrustZone.MANAGED_AGENT_GROUP,
+        managed_group=SimpleNamespace(chat_id="chat_managed", project_id="project_1"),
+        group_revision=7,
+        grant_revision=11,
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(return_value=trust)
+    mock_ws_client._managed_trust_access_decision = MagicMock(return_value=None)
+    mock_ws_client._refresh_managed_card_revisions = MagicMock(return_value=True)
+    submitted: list[tuple[object, object]] = []
+
+    def submit(spec, callback):
+        submitted.append((spec, callback))
+        return SimpleNamespace(run_id="follow-up-1")
+
+    mock_ws_client._scheduler.submit.side_effect = submit
+    data = _card_action_data(
+        event_id="evt_stale_managed",
+        message_id="msg_stale_managed",
+        chat_id="chat_managed",
+        operator_id="ou_admin",
+    )
+    data.event.action.value.update({"group_revision": 6, "grant_revision": 11})
+
+    response = mock_ws_client._handle_card_action_callback(data)
+
+    assert response.__class__.__name__ == "P2CardActionTriggerResponse"
+    mock_ws_client._refresh_managed_card_revisions.assert_not_called()
+    assert submitted == []
+    mock_ws_client._finish_card_advisories(True)
+    assert len(submitted) == 1
+    spec, callback = submitted[0]
+    assert spec.name == "refresh_stale_managed_card"
+    assert spec.task_type == "card_advisory_follow_up"
+    assert spec.chat_id == "chat_managed"
+    assert spec.is_system_command is True
+    callback(SimpleNamespace())
+    mock_ws_client._refresh_managed_card_revisions.assert_called_once_with(
+        "msg_stale_managed", "chat_managed", trust
+    )
+
+
+def test_registered_card_callback_submits_advisory_only_after_inner_ack_returns(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    """A real scheduler worker cannot race the stale refresh ahead of ACK creation."""
+    from src.tasking import TaskScheduler
+
+    trust = SimpleNamespace(
+        zone=TrustZone.MANAGED_AGENT_GROUP,
+        managed_group=SimpleNamespace(chat_id="chat_managed", project_id="project_1"),
+        group_revision=7,
+        grant_revision=11,
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(return_value=trust)
+    mock_ws_client._managed_trust_access_decision = MagicMock(return_value=None)
+    remote_started = threading.Event()
+
+    def refresh(*_args):
+        remote_started.set()
+        return True
+
+    mock_ws_client._refresh_managed_card_revisions = refresh
+    real_scheduler = TaskScheduler(
+        max_concurrent=1,
+        system_concurrency=1,
+        max_pending_normal=4,
+        max_pending_system=4,
+    )
+    original_scheduler = mock_ws_client._scheduler
+    mock_ws_client._scheduler = real_scheduler
+    from lark_channel.ws.pb.pbbp2_pb2 import Frame
+
+    payload = {
+        "schema": "2.0",
+        "header": {
+            "event_id": "evt_stale_real_worker",
+            "event_type": "card.action.trigger",
+            "tenant_key": "tenant_card",
+        },
+        "event": {
+            "context": {
+                "open_message_id": "msg_stale_real_worker",
+                "open_chat_id": "chat_managed",
+            },
+            "operator": {"open_id": "ou_admin"},
+            "action": {
+                "tag": "button",
+                "value": {
+                    "action": "show_status",
+                    "group_revision": 6,
+                    "grant_revision": 11,
+                },
+            },
+        },
+    }
+    frame = Frame()
+    frame.SeqID = 1
+    frame.LogID = 1
+    frame.service = 1
+    frame.method = 1
+    for key, value in (
+        ("type", "card"),
+        ("message_id", "msg-stale-real-worker"),
+        ("trace_id", "trace-stale-real-worker"),
+        ("sum", "1"),
+        ("seq", "0"),
+    ):
+        header = frame.headers.add()
+        header.key = key
+        header.value = value
+    frame.payload = json.dumps(payload).encode()
+
+    from src.feishu.ws_lifecycle import ObservedLarkWSClient
+
+    observed = ObservedLarkWSClient.__new__(ObservedLarkWSClient)
+    observed._on_activity = lambda _kind: None
+    observed._on_response_written = mock_ws_client._finish_card_advisories
+    observed._event_handler = mock_ws_client._build_event_handler()
+    observed._conn_id = ""
+
+    try:
+        async def exercise() -> None:
+            write_started = asyncio.Event()
+            release_write = asyncio.Event()
+
+            async def write_message(_raw):
+                write_started.set()
+                await release_write.wait()
+
+            observed._write_message = write_message
+            callback_task = asyncio.create_task(observed._handle_data_frame(frame))
+            await asyncio.wait_for(write_started.wait(), timeout=2)
+            assert remote_started.is_set() is False
+            release_write.set()
+            await asyncio.wait_for(callback_task, timeout=2)
+            assert await asyncio.to_thread(remote_started.wait, 2)
+
+        asyncio.run(exercise())
+    finally:
+        real_scheduler.stop(wait=True)
+        mock_ws_client._scheduler = original_scheduler
+
+
+@pytest.mark.parametrize(
+    "admission_error",
+    [
+        TaskQueueFullError("system", 1),
+        RuntimeError("TaskScheduler admission is fenced"),
+    ],
+    ids=["system-lane-full", "admission-fenced"],
+)
+def test_stale_managed_card_follow_up_rejection_never_refreshes_synchronously(
+    mock_ws_client: FeishuWSClient,
+    admission_error: Exception,
+) -> None:
+    trust = SimpleNamespace(
+        zone=TrustZone.MANAGED_AGENT_GROUP,
+        managed_group=SimpleNamespace(chat_id="chat_managed", project_id="project_1"),
+        group_revision=7,
+        grant_revision=11,
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(return_value=trust)
+    mock_ws_client._managed_trust_access_decision = MagicMock(return_value=None)
+    mock_ws_client._refresh_managed_card_revisions = MagicMock(return_value=True)
+    mock_ws_client._scheduler.submit.side_effect = admission_error
+    data = _card_action_data(
+        event_id="evt_stale_full",
+        message_id="msg_stale_full",
+        chat_id="chat_managed",
+        operator_id="ou_admin",
+    )
+    data.event.action.value.update({"group_revision": 6, "grant_revision": 11})
+
+    response = mock_ws_client._handle_card_action_callback(data)
+
+    assert response.__class__.__name__ == "P2CardActionTriggerResponse"
+    mock_ws_client._refresh_managed_card_revisions.assert_not_called()
+    mock_ws_client._finish_card_advisories(True)
+    assert mock_ws_client._scheduler.submit.call_count == 1
+
+
+def test_close_shuts_down_card_registry_with_one_bounded_wave(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    with (
+        patch(
+            "src.card.delivery.registry.delivery_registry.shutdown_all",
+            return_value=True,
+        ) as shutdown_all,
+        patch(
+            "src.card.delivery.registry.delivery_registry.drain_in_flight",
+            return_value=True,
+        ) as drain_in_flight,
+    ):
+        assert mock_ws_client.close() is True
+
+    drain_in_flight.assert_not_called()
+    shutdown_all.assert_called_once()
+    assert shutdown_all.call_args.kwargs["timeout"] > 0
+
+
+def test_close_preserves_dependencies_when_card_registry_shutdown_times_out(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    cleanup = mock_ws_client._handler_ctx.managers["coco"].cleanup_all
+    cleanup.reset_mock()
+    with patch(
+        "src.card.delivery.registry.delivery_registry.shutdown_all",
+        return_value=False,
+    ):
+        assert mock_ws_client.close() is False
+
+    cleanup.assert_not_called()
 
 
 def test_card_action_restores_p2p_from_trusted_message_origin(mock_ws_client: FeishuWSClient):

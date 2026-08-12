@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from src.acp import collaboration
 from src.acp.models import (
     ACPEvent,
     ACPEventType,
@@ -118,6 +119,119 @@ def test_agent_completion_updates_main_summary_without_completing_parent() -> No
         assert "父任务继续输出" in programming.get_final_text()
     finally:
         programming.abort()
+
+
+def test_authoritative_terminal_snapshot_is_invalidated_by_new_generation() -> None:
+    proof = collaboration.AuthoritativeChildLifecycleProof()
+
+    def collaboration_event(
+        tool: str,
+        status: str,
+        *,
+        activity: str | None = None,
+    ) -> ACPEvent:
+        return ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id=f"{tool}-{status}-{activity or 'snapshot'}",
+                title=tool,
+                kind="other",
+                status="completed",
+                collaboration_tool=tool,
+                collaboration_receivers=("child-a",),
+                subagent_source_id="child-a" if activity else None,
+                subagent_activity=activity,
+                subagent_states=(
+                    {"source_id": "child-a", "status": status},
+                ),
+            ),
+        )
+
+    proof.observe_event(collaboration_event("spawn_agent", "running"))
+    proof.observe_event(collaboration_event("list_agents", "completed"))
+    assert proof.all_observed_children_terminal() is True
+
+    proof.observe_event(
+        collaboration_event("followup_task", "running", activity="interacted")
+    )
+    assert proof.all_observed_children_terminal() is False
+
+    proof.observe_event(collaboration_event("list_agents", "completed"))
+    assert proof.all_observed_children_terminal() is True
+
+
+def test_malformed_authoritative_snapshot_remains_fail_closed() -> None:
+    proof = collaboration.AuthoritativeChildLifecycleProof()
+
+    malformed = ACPEvent(
+        event_type=ACPEventType.TOOL_CALL_DONE,
+        tool_call=ToolCallInfo(
+            id="malformed-list",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            collaboration_tool="list_agents",
+            collaboration_receivers=("child-a",),
+            subagent_states=(
+                {"source_id": "child-a", "status": "future-state"},
+            ),
+        ),
+    )
+    clean = ACPEvent(
+        event_type=ACPEventType.TOOL_CALL_DONE,
+        tool_call=ToolCallInfo(
+            id="clean-list",
+            title="list_agents",
+            kind="other",
+            status="completed",
+            collaboration_tool="list_agents",
+            collaboration_receivers=("child-a",),
+            subagent_states=(
+                {"source_id": "child-a", "status": "completed"},
+            ),
+        ),
+    )
+
+    proof.observe_event(malformed)
+    proof.observe_event(clean)
+
+    assert proof.all_observed_children_terminal() is False
+
+
+def test_malformed_child_activity_cannot_be_hidden_by_clean_snapshot() -> None:
+    proof = collaboration.AuthoritativeChildLifecycleProof()
+
+    proof.observe_event(
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="malformed-activity",
+                title="subagent activity",
+                kind="other",
+                status="completed",
+                subagent_activity="interacted",
+                subagent_source_id=None,
+            ),
+        )
+    )
+    proof.observe_event(
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_DONE,
+            tool_call=ToolCallInfo(
+                id="clean-list-after-malformed-activity",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=("child-a",),
+                subagent_states=(
+                    {"source_id": "child-a", "status": "completed"},
+                ),
+            ),
+        )
+    )
+
+    assert proof.all_observed_children_terminal() is False
 
 
 def test_agent_call_uses_main_summary_not_tool_or_child_card() -> None:

@@ -409,12 +409,14 @@ class ACPSession:
         cwd: str,
         env: Optional[dict[str, str]] = None,
         auto_approve: bool | None = None,
+        capture_full_tool_content: bool = False,
     ):
         self._agent_cmd = agent_cmd
         self._agent_args = agent_args
         self._cwd = cwd
         self._env_override = dict(env) if isinstance(env, dict) else None
         self._auto_approve = auto_approve
+        self._capture_full_tool_content = bool(capture_full_tool_content)
         self._conn = None  # ClientSideConnection
         self._proc = None  # subprocess
         self._ctx_manager = None  # async context manager
@@ -669,6 +671,7 @@ class ACPSession:
             on_event=self._dispatch_event,
             auto_approve=auto_approve,
             root_dir=self._cwd,
+            capture_full_tool_content=self._capture_full_tool_content,
         )
         self._client = client
         self._bind_session_info_callback()

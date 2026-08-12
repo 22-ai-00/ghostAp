@@ -606,7 +606,14 @@ def test_race_cancel_real_node_process(tmp_path):
         bridge.stop()
 
 
-def _run_real_node_workflow(tmp_path, script, on_agent_call, *, max_concurrent=4):
+def _run_real_node_workflow(
+    tmp_path,
+    script,
+    on_agent_call,
+    *,
+    max_concurrent=4,
+    on_agent_aborted=None,
+):
     import os
 
     script_path = tmp_path / f"runtime_regression_{time.time_ns()}.js"
@@ -617,6 +624,7 @@ def _run_real_node_workflow(tmp_path, script, on_agent_call, *, max_concurrent=4
         cwd=project_root,
         max_concurrent=max_concurrent,
         on_agent_call=on_agent_call,
+        on_agent_aborted=on_agent_aborted,
     )
     try:
         bridge.start()
@@ -624,6 +632,188 @@ def _run_real_node_workflow(tmp_path, script, on_agent_call, *, max_concurrent=4
         return json.loads(raw) if raw else None
     finally:
         bridge.stop()
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_parallel_sibling_races_abort_only_their_own_losers(tmp_path):
+    """A race winner must not cancel requests owned by a sibling race."""
+    expected_labels = {"a-fast", "a-slow", "b-fast", "b-slow"}
+    started_labels: set[str] = set()
+    started_lock = threading.Lock()
+    all_started = threading.Event()
+    a_slow_cancelled = threading.Event()
+    b_fast_returned = threading.Event()
+    b_fast_cancelled_early = threading.Event()
+    b_slow_cancelled = threading.Event()
+    b_slow_cancelled_early = threading.Event()
+    aborted_labels: list[str] = []
+
+    def mark_started(label: str) -> None:
+        with started_lock:
+            started_labels.add(label)
+            if started_labels == expected_labels:
+                all_started.set()
+
+    def wait_for_cancel(cancel_event, observed: threading.Event) -> AgentCallResult:
+        for _ in range(600):
+            if cancel_event is not None and cancel_event.is_set():
+                observed.set()
+                return AgentCallResult(error="cancelled", tool="coco")
+            time.sleep(0.005)
+        return AgentCallResult(output="unexpected-timeout", tool="coco")
+
+    def on_agent_call(params, *, cancel_event=None, **_kwargs):
+        label = params.label or ""
+        mark_started(label)
+        if label == "a-fast":
+            all_started.wait(timeout=2.0)
+            return AgentCallResult(output="a-wins", tool=params.tool)
+        if label == "a-slow":
+            return wait_for_cancel(cancel_event, a_slow_cancelled)
+        if label == "b-fast":
+            # Keep race B alive until race A has already cancelled its loser.
+            # A global interceptor stack incorrectly cancels this request too.
+            a_slow_cancelled.wait(timeout=2.0)
+            time.sleep(0.05)
+            if cancel_event is not None and cancel_event.is_set():
+                b_fast_cancelled_early.set()
+                return AgentCallResult(error="cancelled early", tool=params.tool)
+            b_fast_returned.set()
+            return AgentCallResult(output="b-wins", tool=params.tool)
+        if label == "b-slow":
+            result = wait_for_cancel(cancel_event, b_slow_cancelled)
+            if not b_fast_returned.is_set():
+                b_slow_cancelled_early.set()
+            return result
+        return AgentCallResult(error=f"unexpected label: {label}", tool=params.tool)
+
+    def on_agent_aborted(label, _reason, **_kwargs):
+        aborted_labels.append(label)
+
+    result = _run_real_node_workflow(
+        tmp_path,
+        """
+export const meta = { name: 'sibling-races', description: 'isolated races', phases: [{ title: 'race', detail: 'run' }] };
+export default async function main() {
+  return parallel([
+    () => race([
+      { prompt: 'A fast', label: 'a-fast', tool: 'coco' },
+      { prompt: 'A slow', label: 'a-slow', tool: 'coco' },
+    ]),
+    () => race([
+      { prompt: 'B fast', label: 'b-fast', tool: 'coco' },
+      { prompt: 'B slow', label: 'b-slow', tool: 'coco' },
+    ]),
+  ]);
+}
+""",
+        on_agent_call,
+        max_concurrent=4,
+        on_agent_aborted=on_agent_aborted,
+    )
+
+    assert result == ["a-wins", "b-wins"]
+    assert a_slow_cancelled.wait(timeout=2.0)
+    assert b_slow_cancelled.wait(timeout=2.0)
+    assert not b_fast_cancelled_early.is_set()
+    assert not b_slow_cancelled_early.is_set()
+    assert sorted(aborted_labels) == ["a-slow", "b-slow"]
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_pipeline_collector_inherits_nested_race_without_cancelling_sibling(tmp_path):
+    """A pipeline abort reaches descendant requests but not a parallel sibling."""
+    nested_one_cancelled = threading.Event()
+    nested_two_cancelled = threading.Event()
+    sibling_fast_returned = threading.Event()
+    sibling_fast_cancelled_early = threading.Event()
+    sibling_slow_cancelled = threading.Event()
+    sibling_slow_cancelled_early = threading.Event()
+    aborted_labels: list[str] = []
+
+    def wait_for_cancel(cancel_event, observed: threading.Event) -> AgentCallResult:
+        for _ in range(600):
+            if cancel_event is not None and cancel_event.is_set():
+                observed.set()
+                return AgentCallResult(error="cancelled", tool="coco")
+            time.sleep(0.005)
+        return AgentCallResult(output="unexpected-timeout", tool="coco")
+
+    def on_agent_call(params, *, cancel_event=None, **_kwargs):
+        label = params.label or ""
+        if label == "nested-one":
+            return wait_for_cancel(cancel_event, nested_one_cancelled)
+        if label == "nested-two":
+            return wait_for_cancel(cancel_event, nested_two_cancelled)
+        if label == "sibling-fast":
+            # The pipeline's failing item should first abort both requests in
+            # its nested race, while this lexical sibling remains untouched.
+            nested_one_cancelled.wait(timeout=2.0)
+            nested_two_cancelled.wait(timeout=2.0)
+            if cancel_event is not None and cancel_event.is_set():
+                sibling_fast_cancelled_early.set()
+                return AgentCallResult(error="cancelled early", tool=params.tool)
+            sibling_fast_returned.set()
+            return AgentCallResult(output="sibling-wins", tool=params.tool)
+        if label == "sibling-slow":
+            result = wait_for_cancel(cancel_event, sibling_slow_cancelled)
+            if not sibling_fast_returned.is_set():
+                sibling_slow_cancelled_early.set()
+            return result
+        return AgentCallResult(error=f"unexpected label: {label}", tool=params.tool)
+
+    def on_agent_aborted(label, _reason, **_kwargs):
+        aborted_labels.append(label)
+
+    result = _run_real_node_workflow(
+        tmp_path,
+        """
+export const meta = { name: 'nested-collectors', description: 'nested collector lineage', phases: [{ title: 'pipeline', detail: 'run' }] };
+export default async function main() {
+  const [pipelineResult, siblingResult] = await parallel([
+    async () => {
+      try {
+        return await pipeline(['nested', 'fail'], async (item) => {
+          if (item === 'fail') {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            throw new Error('pipeline boom');
+          }
+          return race([
+            { prompt: 'nested one', label: 'nested-one', tool: 'coco' },
+            { prompt: 'nested two', label: 'nested-two', tool: 'coco' },
+          ]);
+        });
+      } catch (error) {
+        return { error: error.message };
+      }
+    },
+    () => race([
+      { prompt: 'sibling fast', label: 'sibling-fast', tool: 'coco' },
+      { prompt: 'sibling slow', label: 'sibling-slow', tool: 'coco' },
+    ]),
+  ]);
+  return { pipelineResult, siblingResult };
+}
+""",
+        on_agent_call,
+        max_concurrent=4,
+        on_agent_aborted=on_agent_aborted,
+    )
+
+    assert result["pipelineResult"] == {"error": "pipeline boom"}
+    assert result["siblingResult"] == "sibling-wins"
+    assert nested_one_cancelled.wait(timeout=2.0)
+    assert nested_two_cancelled.wait(timeout=2.0)
+    assert sibling_slow_cancelled.wait(timeout=2.0)
+    assert not sibling_fast_cancelled_early.is_set()
+    assert not sibling_slow_cancelled_early.is_set()
+    assert sorted(aborted_labels) == ["nested-one", "nested-two", "sibling-slow"]
 
 
 @pytest.mark.skipif(

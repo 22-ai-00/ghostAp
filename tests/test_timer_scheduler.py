@@ -162,6 +162,101 @@ class TestTimerSchedulerConcurrency:
 
         assert fired.wait(timeout=2.0), "Scheduler should survive callback exception"
 
+    def test_slow_callback_does_not_stall_due_timer_submission(self):
+        scheduler = TimerScheduler(callback_workers=2)
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+        fast_fired = threading.Event()
+
+        def _slow():
+            slow_started.set()
+            release_slow.wait(timeout=2.0)
+
+        try:
+            scheduler.schedule(0, _slow, session_id="slow")
+            scheduler.schedule(0, fast_fired.set, session_id="fast")
+
+            assert slow_started.wait(timeout=1.0)
+            assert fast_fired.wait(timeout=0.5), (
+                "a slow callback must not block the timer dequeue thread"
+            )
+        finally:
+            release_slow.set()
+            scheduler.shutdown(timeout=1.0)
+
+    def test_shutdown_cancels_submitted_callback_that_has_not_started(self):
+        scheduler = TimerScheduler(callback_workers=1)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        queued_fired = threading.Event()
+
+        def _first():
+            first_started.set()
+            release_first.wait(timeout=2.0)
+
+        try:
+            scheduler.schedule(0, _first, session_id="running")
+            scheduler.schedule(0, queued_fired.set, session_id="queued")
+            assert first_started.wait(timeout=1.0)
+
+            scheduler.shutdown(timeout=0.2)
+            release_first.set()
+            time.sleep(0.05)
+
+            assert queued_fired.is_set() is False
+        finally:
+            release_first.set()
+            scheduler.shutdown(timeout=1.0)
+
+    def test_saturated_callback_queue_retries_every_accepted_timer(self):
+        scheduler = TimerScheduler(callback_workers=1, callback_queue_size=1)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        completed: list[str] = []
+        completed_lock = threading.Lock()
+        all_done = threading.Event()
+
+        def _record(name: str) -> None:
+            with completed_lock:
+                completed.append(name)
+                if len(completed) == 3:
+                    all_done.set()
+
+        def _first() -> None:
+            first_started.set()
+            release_first.wait(timeout=2.0)
+            _record("first")
+
+        try:
+            scheduler.schedule(0, _first, session_id="first")
+            scheduler.schedule(0, lambda: _record("second"), session_id="second")
+            scheduler.schedule(0, lambda: _record("third"), session_id="third")
+            assert first_started.wait(timeout=1.0)
+            time.sleep(0.05)
+            release_first.set()
+
+            assert all_done.wait(timeout=2.0)
+            assert set(completed) == {"first", "second", "third"}
+        finally:
+            release_first.set()
+            scheduler.shutdown(timeout=1.0)
+
+    def test_shutdown_timeout_reports_running_callback_then_can_finish(self):
+        scheduler = TimerScheduler(callback_workers=1)
+        callback_started = threading.Event()
+        release_callback = threading.Event()
+
+        def _running() -> None:
+            callback_started.set()
+            release_callback.wait(timeout=2.0)
+
+        scheduler.schedule(0, _running, session_id="running")
+        assert callback_started.wait(timeout=1.0)
+
+        assert scheduler.shutdown(timeout=0.02) is False
+        release_callback.set()
+        assert scheduler.shutdown(timeout=1.0) is True
+
 
 class TestTimerSchedulerGlobalSingleton:
     """Test get_timer_scheduler() singleton behavior."""

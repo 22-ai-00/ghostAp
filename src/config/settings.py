@@ -375,6 +375,9 @@ class Settings(BaseSettings):
     # Task scheduler (thread-based) settings
     task_scheduler_max_concurrent: int = 20
     task_scheduler_per_key_concurrency: int = 1
+    task_scheduler_max_pending_normal: int = Field(default=1000, gt=0)
+    task_scheduler_max_pending_system: int = Field(default=100, gt=0)
+    task_scheduler_max_terminal_history: int = Field(default=5000, gt=0)
     # Cross-process restart gate. Empty means the checkout's stable locator
     # chooses a private gate under the checkout parent's registry; an override
     # must be an absolute dedicated directory.

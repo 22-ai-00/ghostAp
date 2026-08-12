@@ -1111,7 +1111,11 @@ def _parse_collaboration_metadata(
     return tool, receivers, model, tuple(states)
 
 
-def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
+def _parse_tool_call(
+    update: ToolCallStart | ToolCallProgress,
+    *,
+    capture_full_tool_content: bool = False,
+) -> ToolCallInfo:
     """Extract ToolCallInfo from a ToolCallStart or ToolCallProgress."""
     locations = [loc.path for loc in (update.locations or [])]
     title = update.title or ""
@@ -1166,7 +1170,8 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
     full_content: Any = None
     if raw_input and _is_todo_tool(title, raw_input):
         content = _format_todo_content(raw_input)
-        full_content = raw_input
+        if capture_full_tool_content:
+            full_content = raw_input
         use_output = False
 
     if not use_output and not content:
@@ -1198,7 +1203,11 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
             elif isinstance(raw_input, str):
                 content = raw_input
 
-        if full_content is None and raw_input is not None:
+        if (
+            capture_full_tool_content
+            and full_content is None
+            and raw_input is not None
+        ):
             full_content = raw_input
         content = _truncate((content or "").strip("\n"), 4000)
     else:
@@ -1225,14 +1234,18 @@ def _parse_tool_call(update: ToolCallStart | ToolCallProgress) -> ToolCallInfo:
                 content = _text(raw_output)
 
         unbounded_content = (content or "").strip("\n")
-        full_content = raw_output if raw_output is not None else unbounded_content
+        if capture_full_tool_content:
+            full_content = (
+                raw_output if raw_output is not None else unbounded_content
+            )
         content = _truncate(unbounded_content, 12000)
 
     if collaboration_tool and status != "failed" and isinstance(raw_input, Mapping):
         prompt = str(raw_input.get("prompt") or "").strip()
         if prompt:
             content = _truncate(prompt.splitlines()[0].strip(), 4000)
-            full_content = raw_input
+            if capture_full_tool_content:
+                full_content = raw_input
 
     return ToolCallInfo(
         id=update.tool_call_id,
@@ -1403,11 +1416,13 @@ class GhostAPClient(Client):
         on_session_info: Callable[[str, ACPSessionInfo], None] | None = None,
         auto_approve: bool = True,
         root_dir: str = ".",
+        capture_full_tool_content: bool = False,
     ):
         self._on_event = on_event
         self._on_session_info = on_session_info
         self._auto_approve = auto_approve
         self._root_dir = os.path.abspath(os.path.expanduser(root_dir or "."))
+        self._capture_full_tool_content = bool(capture_full_tool_content)
         self._sandbox = SandboxExecutor()
         self._terminals: dict[str, _TerminalRecord] = {}
         self._terminals_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
@@ -1528,7 +1543,10 @@ class GhostAPClient(Client):
             logger.debug("Unhandled ACP chunk content: %s", type(content))
 
     def _handle_tool_call_start(self, update: ToolCallStart) -> None:
-        tool_info = _parse_tool_call(update)
+        tool_info = _parse_tool_call(
+            update,
+            capture_full_tool_content=self._capture_full_tool_content,
+        )
         self._on_event(
             ACPEvent(
                 event_type=ACPEventType.TOOL_CALL_START,
@@ -1539,7 +1557,10 @@ class GhostAPClient(Client):
         self._emit_tool_images(update)
 
     def _handle_tool_call_progress(self, update: ToolCallProgress) -> None:
-        tool_info = _parse_tool_call(update)
+        tool_info = _parse_tool_call(
+            update,
+            capture_full_tool_content=self._capture_full_tool_content,
+        )
         status = tool_info.status
         if status in ("completed", "failed"):
             event_type = ACPEventType.TOOL_CALL_DONE

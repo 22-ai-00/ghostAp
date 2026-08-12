@@ -54,6 +54,24 @@ class TestMessageCache:
         cache.is_duplicate("msg_002")
         assert cache.contains("msg_001") is False
 
+    def test_same_key_expires_at_its_ttl_before_periodic_cleanup(self, monkeypatch):
+        now = [100.0]
+        monkeypatch.setattr("src.feishu.message_cache.time.time", lambda: now[0])
+        cache = MessageCache(ttl=1, max_size=100, cleanup_interval=30)
+
+        assert cache.is_duplicate("workflow_add_agent") is False
+        now[0] = 101.0
+
+        assert cache.is_duplicate("workflow_add_agent") is False
+        assert cache.size() == 1
+
+    def test_zero_ttl_disables_duplicate_window(self, monkeypatch):
+        monkeypatch.setattr("src.feishu.message_cache.time.time", lambda: 100.0)
+        cache = MessageCache(ttl=0, max_size=100, cleanup_interval=30)
+
+        assert cache.is_duplicate("workflow_add_agent") is False
+        assert cache.is_duplicate("workflow_add_agent") is False
+
     def test_thread_safety(self):
         cache = MessageCache(ttl=300, max_size=1000)
         results = []

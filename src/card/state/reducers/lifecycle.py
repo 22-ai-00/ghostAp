@@ -57,15 +57,25 @@ def _compute_duration(
     return max(0.0, float(now) - float(started_at))
 
 
-def _format_unified_error_block(error: str, *, engine_cmd: str) -> str:
+def _format_unified_error_block(
+    error: str,
+    *,
+    engine_cmd: str,
+    has_details: bool,
+) -> str:
     """Unified user-visible error card content for engine/session failures."""
     summary = (error or "").strip() or UI_TEXT["card_lifecycle_error_fallback"].format(engine_cmd=engine_cmd)
+    current_status = (
+        "当前操作已停止；可查看脱敏诊断并按提示重新发起。\n\n"
+        f"{UI_TEXT['card_lifecycle_details_collapsed']}"
+        if has_details
+        else "当前操作已停止；可点击“查看状态”确认当前会话状态后重新发起。"
+    )
     return (
         "❌ **错误摘要**\n"
         f"{summary}\n\n"
         "**当前状态**\n"
-        "当前操作已停止；可查看脱敏诊断并按提示重新发起。\n\n"
-        f"{UI_TEXT['card_lifecycle_details_collapsed']}"
+        f"{current_status}"
     )
 
 
@@ -183,6 +193,20 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                 ),)
             engine_cmd = _ENGINE_CMD.get(state.metadata.engine_type or "", "").lstrip("/")
             cta_text = UI_TEXT["card_completed_cta_fmt"].format(engine_cmd=engine_cmd) if engine_cmd else ""
+            detail_action = payload_c.get("detail_action")
+            detail_action_id = (
+                str(detail_action.get("action") or "")
+                if isinstance(detail_action, dict)
+                else ""
+            )
+            buttons = (
+                ButtonSpec(
+                    text=UI_TEXT["card_lifecycle_show_details"],
+                    action_id=detail_action_id,
+                    value=dict(detail_action),
+                ),
+            ) if detail_action_id else ()
+            warning = str(payload_c.get("warning") or "").strip()
             return replace(state, terminal="completed", terminal_reason="completed",
                            header=header, footer=FooterState(
                                progress_pct=100,
@@ -192,8 +216,11 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                                    payload_c.get("duration_seconds"),
                                ),
                                status_text=cta_text,
+                               warning_banner=warning or None,
+                               warning_type="warning" if warning else None,
+                               persistent_warning=bool(warning),
                            ),
-                           buttons=(), blocks=blocks)
+                           buttons=buttons, blocks=blocks)
 
         case CardEventType.FAILED:
             # Idempotency guard: prevent duplicate terminal transitions
@@ -216,7 +243,15 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                     "spec": "card_lifecycle_error_fallback_spec",
                 }.get(state.metadata.engine_type or "", "card_lifecycle_error_fallback")
                 error = UI_TEXT[_fallback_key].format(engine_cmd=engine_cmd)
-            error_text = _format_unified_error_block(error, engine_cmd=engine_cmd)
+            detail_action = payload_f.get("detail_action") if isinstance(payload_f, dict) else None
+            detail_action_id = None
+            if isinstance(detail_action, dict):
+                detail_action_id = str(detail_action.get("action") or "") or None
+            error_text = _format_unified_error_block(
+                error,
+                engine_cmd=engine_cmd,
+                has_details=bool(detail_action_id),
+            )
             blocks = blocks + (TextBlock(
                 block_id="_error", content=error_text
             ),)
@@ -236,10 +271,6 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
                     confirm=UI_TEXT["card_btn_confirm_retry_body"],
                     value=dict(retry_action) if isinstance(retry_action, dict) else None,
                 ))
-            detail_action = payload_f.get("detail_action") if isinstance(payload_f, dict) else None
-            detail_action_id = None
-            if isinstance(detail_action, dict):
-                detail_action_id = str(detail_action.get("action") or "") or None
             if detail_action_id:
                 buttons_list.append(ButtonSpec(
                     text=UI_TEXT["card_lifecycle_show_details"],

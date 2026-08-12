@@ -72,6 +72,15 @@ class TestFence:
         pool.fence()
         assert pool.accepting_work is False
 
+    def test_try_enter_delivery_is_atomically_rejected_after_fence(self, pool):
+        assert pool.try_enter_delivery() is True
+        pool.exit_delivery()
+
+        pool.fence()
+
+        assert pool.try_enter_delivery() is False
+        assert pool.drain(timeout=0.1) is True
+
 
 class TestDrain:
     def test_drain_returns_true_when_no_in_flight(self, pool: SessionLockPool):

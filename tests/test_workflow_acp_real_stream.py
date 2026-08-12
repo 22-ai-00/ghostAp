@@ -97,7 +97,10 @@ def test_real_acp_updates_keep_safe_full_workflow_payload_and_compact_default() 
         full_bridge.on_event(event)
         compact_bridge.on_event(event)
 
-    client = GhostAPClient(on_event=on_event)
+    client = GhostAPClient(
+        on_event=on_event,
+        capture_full_tool_content=True,
+    )
     asyncio.run(client.session_update("session", _tool_start(raw_input)))
     asyncio.run(
         client.session_update(
@@ -199,7 +202,10 @@ def test_real_acp_workflow_payload_redacts_collaboration_ids_and_paths() -> None
 
     sink = _StateSink()
     bridge = ACPStreamBridge(sink, preserve_tool_content=True)
-    client = GhostAPClient(on_event=bridge.on_event)
+    client = GhostAPClient(
+        on_event=bridge.on_event,
+        capture_full_tool_content=True,
+    )
     raw_input = payload(visible_input)
 
     asyncio.run(
@@ -259,7 +265,10 @@ def test_real_terminal_only_acp_progress_creates_workflow_tool_block(
     secret = "TERMINAL_ONLY_SECRET_MUST_NOT_LEAK"
     sink = _StateSink()
     bridge = ACPStreamBridge(sink, preserve_tool_content=True)
-    client = GhostAPClient(on_event=bridge.on_event)
+    client = GhostAPClient(
+        on_event=bridge.on_event,
+        capture_full_tool_content=True,
+    )
 
     asyncio.run(
         client.session_update(
@@ -289,7 +298,10 @@ def test_real_in_progress_update_without_start_materializes_active_tool_block() 
     secret = "MISSING_START_PROGRESS_SECRET"
     sink = _StateSink()
     bridge = ACPStreamBridge(sink, preserve_tool_content=True)
-    client = GhostAPClient(on_event=bridge.on_event)
+    client = GhostAPClient(
+        on_event=bridge.on_event,
+        capture_full_tool_content=True,
+    )
 
     asyncio.run(
         client.session_update(

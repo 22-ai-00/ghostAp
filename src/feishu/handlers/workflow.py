@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 _SCRIPT_GENERATION_MAX_ATTEMPTS = 3
 _GENERATION_ACTIVITY_MAX_CHARS = 180
 _GENERATION_ACTIVITY_BREAKS = frozenset("。！？.!?；;\n")
+_UNSET_WORKFLOW_MODEL_STATE = object()
 
 
 @dataclass(slots=True)
@@ -544,14 +545,33 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         selected_effort: str | None = None,
     ) -> tuple[list[Any], Any]:
         from ...acp.helper import fetch_acp_models
-        from ...card.render.model_cascade import resolve_model_cascade
 
         models = fetch_acp_models(
             tool_name,
             cwd=root_path,
             current_model=None,
         )
-        state = resolve_model_cascade(
+        state = WorkflowHandler._workflow_model_state_from_catalog(
+            models=models,
+            pending=pending,
+            selected_model=selected_model,
+            selected_profile=selected_profile,
+            selected_effort=selected_effort,
+        )
+        return models, state
+
+    @staticmethod
+    def _workflow_model_state_from_catalog(
+        *,
+        models: list[Any],
+        pending: Any,
+        selected_model: str | None = None,
+        selected_profile: str | None = None,
+        selected_effort: str | None = None,
+    ) -> Any:
+        from ...card.render.model_cascade import resolve_model_cascade
+
+        return resolve_model_cascade(
             models,
             selected_model=(
                 pending.draft_model_name
@@ -569,7 +589,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 else selected_effort
             ),
         )
-        return models, state
 
     @classmethod
     def _validated_workflow_draft_binding(
@@ -578,6 +597,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         pending: Any,
         root_path: str,
         available_tools: dict[str, str],
+        models: list[Any] | None = None,
     ) -> tuple[str | None, str | None, str | None]:
         from ...card.render.model_cascade import (
             available_model_efforts,
@@ -594,11 +614,12 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 raise ValueError("Backend default 模型不能携带 Profile 或 Effort。")
             return None, None, None
 
-        models, _state = cls._workflow_selection_model_state(
-            tool_name=tool_name,
-            root_path=root_path,
-            pending=pending,
-        )
+        if models is None:
+            models, _state = cls._workflow_selection_model_state(
+                tool_name=tool_name,
+                root_path=root_path,
+                pending=pending,
+            )
         model_name = str(pending.draft_model_name).strip()
         names = available_model_names(models)
         if model_name not in names:
@@ -662,17 +683,19 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         project_id: str,
         root_path: str,
         available_tools: dict[str, str],
+        model_state: Any = _UNSET_WORKFLOW_MODEL_STATE,
     ) -> dict[str, Any]:
         from ...workflow_engine.renderer import WorkflowAgentSelectionRenderer
 
-        model_state = None
-        tool_name = str(pending.draft_tool_name or "").strip().lower()
-        if tool_name in available_tools:
-            _models, model_state = cls._workflow_selection_model_state(
-                tool_name=tool_name,
-                root_path=root_path,
-                pending=pending,
-            )
+        if model_state is _UNSET_WORKFLOW_MODEL_STATE:
+            model_state = None
+            tool_name = str(pending.draft_tool_name or "").strip().lower()
+            if tool_name in available_tools:
+                _models, model_state = cls._workflow_selection_model_state(
+                    tool_name=tool_name,
+                    root_path=root_path,
+                    pending=pending,
+                )
         return WorkflowAgentSelectionRenderer(
             pending,
             project_id=project_id,
@@ -855,6 +878,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         pending = None
         owner_valid = False
         authorized = False
+        render_model_state: Any = _UNSET_WORKFLOW_MODEL_STATE
 
         with engine._lock:
             owner = vars(engine).get("_workflow_selection_owner")
@@ -900,7 +924,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     pending.draft_profile = None
                     pending.draft_effort = None
                 else:
-                    _models, state = self._workflow_selection_model_state(
+                    models, state = self._workflow_selection_model_state(
                         tool_name=tool_name,
                         root_path=root_path,
                         pending=pending,
@@ -910,13 +934,18 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     )
                     if model_name not in state.model_names:
                         error = ("invalid_argument", "所选模型族当前不可用。")
+                        render_model_state = self._workflow_model_state_from_catalog(
+                            models=models,
+                            pending=pending,
+                        )
                     else:
                         pending.draft_model_name = state.selected_model
                         pending.draft_profile = state.selected_profile
                         pending.draft_effort = state.selected_effort
+                        render_model_state = state
             elif authorized and action == "workflow_select_profile":
                 profile = str(selected_option or "").strip().lower()
-                _models, state = self._workflow_selection_model_state(
+                models, state = self._workflow_selection_model_state(
                     tool_name=pending.draft_tool_name or "",
                     root_path=root_path,
                     pending=pending,
@@ -925,12 +954,17 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 )
                 if not pending.draft_model_name or profile not in state.profiles:
                     error = ("invalid_argument", "所选 Profile 不属于当前模型能力。")
+                    render_model_state = self._workflow_model_state_from_catalog(
+                        models=models,
+                        pending=pending,
+                    )
                 else:
                     pending.draft_profile = state.selected_profile
                     pending.draft_effort = state.selected_effort
+                    render_model_state = state
             elif authorized and action == "workflow_select_effort":
                 effort = str(selected_option or "").strip().lower()
-                _models, state = self._workflow_selection_model_state(
+                models, state = self._workflow_selection_model_state(
                     tool_name=pending.draft_tool_name or "",
                     root_path=root_path,
                     pending=pending,
@@ -938,8 +972,13 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 )
                 if not pending.draft_model_name or effort not in state.efforts:
                     error = ("invalid_argument", "所选 Effort 不属于当前模型能力。")
+                    render_model_state = self._workflow_model_state_from_catalog(
+                        models=models,
+                        pending=pending,
+                    )
                 else:
                     pending.draft_effort = state.selected_effort
+                    render_model_state = state
             elif authorized and action == "workflow_add_agent":
                 tool_name = str(pending.draft_tool_name or "").lower()
                 if tool_name not in available_tools:
@@ -950,14 +989,34 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         f"并发 Agent Pool 最多允许 {MAX_WORKFLOW_AGENT_POOL_SIZE} 个 Agent。",
                     )
                 else:
+                    validation_models = None
+                    if pending.draft_model_name:
+                        (
+                            validation_models,
+                            render_model_state,
+                        ) = self._workflow_selection_model_state(
+                            tool_name=tool_name,
+                            root_path=root_path,
+                            pending=pending,
+                        )
                     try:
                         model_name, profile, effort = self._validated_workflow_draft_binding(
                             pending=pending,
                             root_path=root_path,
                             available_tools=available_tools,
+                            models=validation_models,
                         )
                     except ValueError as exc:
                         error = ("invalid_argument", str(exc))
+                        if validation_models is not None:
+                            pending.draft_model_name = (
+                                render_model_state.selected_model or None
+                            )
+                            pending.draft_profile = render_model_state.selected_profile
+                            pending.draft_effort = render_model_state.selected_effort
+                        elif not pending.draft_model_name:
+                            pending.draft_profile = None
+                            pending.draft_effort = None
                     if error is None:
                         if any(
                             binding.tool_name == tool_name
@@ -1118,6 +1177,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     project_id=project_id,
                     root_path=root_path,
                     available_tools=available_tools,
+                    model_state=render_model_state,
                 )
                 self._replace_or_send_workflow_rendered_card(
                     card_message_id=message_id,
@@ -1174,6 +1234,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             project_id=project_id,
             root_path=root_path,
             available_tools=available_tools,
+            model_state=render_model_state,
         )
         self._replace_or_send_workflow_rendered_card(
             card_message_id=message_id,

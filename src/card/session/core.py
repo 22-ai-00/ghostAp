@@ -14,7 +14,7 @@ import uuid
 import warnings
 import weakref
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from src.card.actions.router import ActionRouter
@@ -40,6 +40,16 @@ if TYPE_CHECKING:
     from src.card.timers.scheduler import TimerHandle
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _DeliverySnapshot:
+    """Immutable reduced state awaiting render and delivery."""
+
+    state: "CardState"
+    is_terminal: bool
+    event: CardEvent
+    revision: int
 
 # Terminal events that trigger immediate flush
 _TERMINAL_EVENTS = frozenset({
@@ -170,10 +180,12 @@ class CardSession:
         self._pending_card_split: tuple[str, str, str | None] | None = None
         self.on_card_split_completed: Callable[..., None] | None = None
         self._delivery_gate = threading.Condition(threading.Lock())  # leaf lock: never held while acquiring a LockLevel lock
+        self._dispatch_side_effect_gate = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._delivery_in_flight = False
         self._delivery_in_flight_terminal = False
-        self._delivery_pending: tuple[list, bool, CardEvent, int | None] | None = None
+        self._delivery_pending: _DeliverySnapshot | None = None
         self._delivery_highest_revision = -1
+        self._delivery_owner_thread_id: int | None = None
         self._first_deliver_fired: bool = False
         self._state: CardState | None = None
         self._ttl_warned = False
@@ -384,19 +396,42 @@ class CardSession:
                 elif event.type in _TERMINAL_EVENTS:
                     self._cancel_stop_escalation()
 
-        # Phase 1b: Render outside lock (CPU-bound, operates on frozen snapshot)
         if ttl_expired:
             self._ttl_handler.on_ttl_expired()
             return
-        rendered = self._render_safe(state_snapshot, event)
-        if rendered is None:
-            rendered = render_fallback_card(state_snapshot, self._metadata.engine_type if self._metadata else None)
+        # Serialize hook submission with close(). If close wins, no new hook is
+        # admitted; if dispatch wins, HookFirer tracks the submitted Future for
+        # the close-time drain below.
+        with self._dispatch_side_effect_gate:
+            if self._closed.is_set():
+                return
+            self._hook_firer.fire_dispatched(event, self._state)
+        if self._closed.is_set():
+            return
+        if self._sync_delivery:
+            # Deterministic/test mode keeps the historical synchronous path.
+            rendered = self._render_snapshot(state_snapshot, event)
             if rendered is None:
                 return
+            self._submit_delivery(
+                rendered,
+                is_terminal,
+                event,
+                revision=state_snapshot.version,
+            )
+            return
 
-        # Phase 2: Deliver outside lock (I/O-bound) — submit to thread pool
-        self._hook_firer.fire_dispatched(event, self._state)
-        self._submit_delivery(rendered, is_terminal, event, revision=state_snapshot.version)
+        # Production async path queues the frozen reducer snapshot first.  If a
+        # delivery is already in flight, newer snapshots replace older pending
+        # ones before either incurs render cost.
+        self._submit_snapshot(
+            _DeliverySnapshot(
+                state=state_snapshot,
+                is_terminal=is_terminal,
+                event=event,
+                revision=state_snapshot.version,
+            )
+        )
 
     def _should_ignore_dispatch_locked(self, event: CardEvent) -> bool:
         """Fence dispatches after close or a logical terminal transition."""
@@ -498,6 +533,77 @@ class CardSession:
             )
             return None
 
+    def _render_snapshot(
+        self,
+        state_snapshot: "CardState",
+        event: CardEvent,
+    ) -> list | None:
+        rendered = self._render_safe(state_snapshot, event)
+        if rendered is not None:
+            return rendered
+        return render_fallback_card(
+            state_snapshot,
+            self._metadata.engine_type if self._metadata else None,
+        )
+
+    def _submit_snapshot(self, snapshot: _DeliverySnapshot) -> None:
+        """Coalesce an immutable async snapshot before rendering it."""
+        if self._closed.is_set():
+            return
+        with self._delivery_gate:
+            if not self._accept_delivery_revision(snapshot.revision):
+                return
+            if self._delivery_in_flight:
+                if self._delivery_in_flight_terminal:
+                    return
+                pending_is_terminal = bool(
+                    self._delivery_pending
+                    and self._delivery_pending.is_terminal
+                )
+                if snapshot.is_terminal or not pending_is_terminal:
+                    self._delivery_pending = snapshot
+                return
+            self._delivery_in_flight = True
+            self._delivery_in_flight_terminal = snapshot.is_terminal
+        self._render_and_submit_snapshot(snapshot)
+
+    def _render_and_submit_snapshot(self, snapshot: _DeliverySnapshot) -> None:
+        current_thread_id = threading.get_ident()
+        with self._delivery_gate:
+            if self._closed.is_set():
+                self._delivery_pending = None
+                self._delivery_in_flight = False
+                self._delivery_in_flight_terminal = False
+                self._delivery_gate.notify_all()
+                return
+            self._delivery_owner_thread_id = current_thread_id
+        try:
+            rendered = self._render_snapshot(snapshot.state, snapshot.event)
+        except Exception:
+            logger.exception(
+                "CardSession %s: fallback render failed for event %s",
+                self._session_id,
+                snapshot.event.type,
+            )
+            rendered = None
+        with self._delivery_gate:
+            if self._delivery_owner_thread_id == current_thread_id:
+                self._delivery_owner_thread_id = None
+            if self._closed.is_set():
+                self._delivery_pending = None
+                self._delivery_in_flight = False
+                self._delivery_in_flight_terminal = False
+                self._delivery_gate.notify_all()
+                return
+        if rendered is None:
+            self._submit_pending_delivery_if_any()
+            return
+        self._submit_delivery_job(
+            rendered,
+            snapshot.is_terminal,
+            snapshot.event,
+        )
+
     def _submit_delivery(
         self,
         rendered: list,
@@ -506,38 +612,19 @@ class CardSession:
         *,
         revision: int | None = None,
     ) -> None:
-        """Submit delivery to the global thread pool (non-blocking).
-
-        When ``_sync_delivery`` is True (configured via SessionConfig.sync_delivery),
-        delivery runs synchronously on the calling thread for deterministic test behavior.
+        """Deliver an already-rendered synchronous snapshot.
 
         ``revision`` is the monotonic CardState version that produced ``rendered``.
-        Rendering happens outside the state lock, so a lower revision may finish after
-        a newer one. The delivery gate fences those stale renders before they can make
-        the visible card move backwards.
+        The production asynchronous path queues reduced snapshots through
+        :meth:`_submit_snapshot` and does not call this method.
         """
         closed_event = getattr(self, "_closed", None)
         if closed_event is not None and closed_event.is_set():
             return
-        if self._sync_delivery:
-            with self._delivery_gate:
-                if not self._accept_delivery_revision(revision):
-                    return
-                self._deliver_and_track(rendered, is_terminal, event=event)
-            return
         with self._delivery_gate:
             if not self._accept_delivery_revision(revision):
                 return
-            if self._delivery_in_flight:
-                if self._delivery_in_flight_terminal:
-                    return
-                pending_is_terminal = bool(self._delivery_pending and self._delivery_pending[1])
-                if is_terminal or not pending_is_terminal:
-                    self._delivery_pending = (rendered, is_terminal, event, revision)
-                return
-            self._delivery_in_flight = True
-            self._delivery_in_flight_terminal = is_terminal
-        CardSession._submit_delivery_job(self, rendered, is_terminal, event)
+            self._deliver_and_track(rendered, is_terminal, event=event)
 
     def _accept_delivery_revision(self, revision: int | None) -> bool:
         """Accept one render revision while ``_delivery_gate`` is held."""
@@ -567,9 +654,17 @@ class CardSession:
             CardSession._run_delivery_job(self, rendered, is_terminal, event)
 
     def _run_delivery_job(self, rendered: list, is_terminal: bool, event: CardEvent) -> None:
+        current_thread_id = threading.get_ident()
+        with self._delivery_gate:
+            self._delivery_owner_thread_id = current_thread_id
+            closed = self._closed.is_set()
         try:
-            self._deliver_and_track(rendered, is_terminal, event=event)
+            if not closed:
+                self._deliver_and_track(rendered, is_terminal, event=event)
         finally:
+            with self._delivery_gate:
+                if self._delivery_owner_thread_id == current_thread_id:
+                    self._delivery_owner_thread_id = None
             CardSession._submit_pending_delivery_if_any(self)
 
     def wait_delivery_idle(self, timeout: float = 2.0) -> bool:
@@ -605,9 +700,8 @@ class CardSession:
                 self._delivery_gate.notify_all()
                 return
             self._delivery_pending = None
-            self._delivery_in_flight_terminal = pending[1]
-        rendered, is_terminal, event, _revision = pending
-        CardSession._submit_delivery_job(self, rendered, is_terminal, event)
+            self._delivery_in_flight_terminal = pending.is_terminal
+        self._render_and_submit_snapshot(pending)
 
     def _deliver_and_track(self, rendered: list, is_terminal: bool, *, event: CardEvent | None = None) -> None:
         """Deliver rendered cards via coordinator and handle outcomes."""
@@ -689,20 +783,26 @@ class CardSession:
     def close(self) -> None:
         """Explicitly close the session. Idempotent."""
         if self._closed.is_set():
+            self._fence_async_delivery_for_close()
             return
+        already_closed = False
         with self._lock:
             if self._closed.is_set():
-                return
-            # If state is still running, dispatch cancelled to trigger terminal hooks
-            if self._state is not None and self._state.terminal == "running":
-                try:
-                    self._state = reduce_card_state(
-                        self._state, CardEvent.cancelled(reason="explicit_close"), self._metadata
-                    )
-                    self._terminal_reason = "cancelled"
-                except Exception as exc:
-                    logger.debug("CardSession %s: close() cancel reduce failed: %s", self._session_id, repr(exc))
-            self._closed.set()
+                already_closed = True
+            else:
+                # If state is still running, dispatch cancelled to trigger terminal hooks
+                if self._state is not None and self._state.terminal == "running":
+                    try:
+                        self._state = reduce_card_state(
+                            self._state, CardEvent.cancelled(reason="explicit_close"), self._metadata
+                        )
+                        self._terminal_reason = "cancelled"
+                    except Exception as exc:
+                        logger.debug("CardSession %s: close() cancel reduce failed: %s", self._session_id, repr(exc))
+                self._closed.set()
+        self._fence_async_delivery_for_close()
+        if already_closed:
+            return
         try:
             self._delivery.close(self._session_id)
         except Exception as exc:
@@ -712,6 +812,24 @@ class CardSession:
         if self._state is not None:
             reason = self._terminal_reason or "cancelled"
             self._hook_firer.fire_terminal(self._state, reason)
+
+    def _fence_async_delivery_for_close(self) -> None:
+        """Wait until no pre-close hook/render/delivery can escape the fence."""
+        with self._dispatch_side_effect_gate:
+            pass
+        if not self._hook_firer.drain_dispatched():
+            logger.warning(
+                "CardSession %s: dispatched hooks exceeded close drain budget",
+                self._session_id,
+            )
+        current_thread_id = threading.get_ident()
+        with self._delivery_gate:
+            self._delivery_pending = None
+            while (
+                self._delivery_in_flight
+                and self._delivery_owner_thread_id != current_thread_id
+            ):
+                self._delivery_gate.wait()
 
     def release_terminal_resources(self) -> None:
         """Release timer/finalizer references after a session becomes terminal."""

@@ -385,7 +385,14 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
     import src.acp.session as session_mod
     from src.acp.session import ACPSession
 
-    calls = {"env": None}
+    calls = {"env": None, "capture_full_tool_content": None}
+    real_client = session_mod.GhostAPClient
+
+    def capturing_client(*args, **kwargs):
+        calls["capture_full_tool_content"] = kwargs.get(
+            "capture_full_tool_content"
+        )
+        return real_client(*args, **kwargs)
 
     class FakeConn:
         async def initialize(self, protocol_version: int = 1):
@@ -410,6 +417,7 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
         return FakeCtx()
 
     monkeypatch.setattr(session_mod, "spawn_agent_process", fake_spawn)
+    monkeypatch.setattr(session_mod, "GhostAPClient", capturing_client)
     monkeypatch.setattr(
         session_mod,
         "get_settings",
@@ -418,9 +426,15 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
 
     with monkeypatch.context() as m:
         m.setenv("CLAUDECODE", "1")
-        s = ACPSession(agent_cmd="claude", agent_args=["acp", "serve"], cwd="/tmp")
+        s = ACPSession(
+            agent_cmd="claude",
+            agent_args=["acp", "serve"],
+            cwd="/tmp",
+            capture_full_tool_content=True,
+        )
         sid = asyncio.run(s.start())
         assert sid == "s_test"
+        assert calls["capture_full_tool_content"] is True
         assert calls["env"] is not None
         assert "CLAUDECODE" not in calls["env"]
 
@@ -648,6 +662,26 @@ class MockPlanEntry:
 
 
 class TestParseToolCall:
+
+    def test_full_tool_content_capture_is_opt_in_and_bounded_by_default(self):
+        tail = "RAW_TOOL_OUTPUT_TAIL"
+        raw_output = {"stdout": "x" * 13000 + tail, "token": "secret"}
+        update = MockToolCallProgress(
+            title="bash",
+            kind="execute",
+            status="completed",
+            raw_input={"command": "echo test"},
+            raw_output=raw_output,
+        )
+
+        compact = _parse_tool_call(update)
+        captured = _parse_tool_call(update, capture_full_tool_content=True)
+
+        assert compact.full_content is None
+        assert tail not in compact.content
+        assert compact.content.endswith("\n... (truncated)")
+        assert captured.full_content == raw_output
+        assert tail in captured.full_content["stdout"]
 
 
     def test_agent_tool_keeps_task_description_for_task_cards(self):

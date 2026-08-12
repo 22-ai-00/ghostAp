@@ -1,8 +1,10 @@
 """Integration test: graceful_shutdown with multiple active CardSessions."""
+import gc
 import threading
+import weakref
 
 from src.card.delivery.engine import CardDelivery
-from src.card.delivery.registry import delivery_registry
+from src.card.delivery.registry import DeliveryRegistry, delivery_registry
 from src.card.events import CardEvent
 from src.card.session import CardSession
 from src.card.session.config import SessionCallbacks, SessionConfig
@@ -39,6 +41,54 @@ def _make_session(chat_id: str, client: _SlowClient) -> CardSession:
 
 
 class TestMultiSessionGracefulShutdown:
+    def test_registry_does_not_keep_unowned_delivery_alive(self):
+        client = _SlowClient()
+        delivery = CardDelivery(client)
+        delivery_ref = weakref.ref(delivery)
+        # Stop the owned worker explicitly so this WeakSet-only assertion does
+        # not leave a daemon thread behind in the test process.
+        delivery._lock_pool.shutdown()
+
+        del delivery
+        gc.collect()
+
+        assert delivery_ref() is None
+
+    def test_register_after_shutdown_is_closed_by_next_shutdown_wave(self):
+        first = CardDelivery(_SlowClient())
+        assert delivery_registry.shutdown_all() is True
+        assert first._shutdown_complete is True
+
+        second = CardDelivery(_SlowClient())
+        assert second._shutdown_complete is False
+        assert delivery_registry.shutdown_all() is True
+        assert second._shutdown_complete is True
+
+    def test_instance_registered_during_shutdown_requires_next_wave(self):
+        registry = DeliveryRegistry()
+        registry.install_atexit = lambda: None
+
+        class _DeliveryStub:
+            def __init__(self, on_shutdown=None):
+                self.shutdown_calls = 0
+                self._on_shutdown = on_shutdown
+
+            def shutdown(self, timeout=5.0):
+                self.shutdown_calls += 1
+                registry.unregister(self)
+                if self._on_shutdown is not None:
+                    self._on_shutdown()
+                return True
+
+        late = _DeliveryStub()
+        first = _DeliveryStub(on_shutdown=lambda: registry.register(late))
+        registry.register(first)
+
+        assert registry.shutdown_all() is False
+        assert late.shutdown_calls == 0
+        assert registry.shutdown_all() is True
+        assert late.shutdown_calls == 1
+
     def test_graceful_shutdown_drains_all_sessions(self):
         """N=3 active sessions dispatching → graceful_shutdown → all closed."""
         client = _SlowClient()

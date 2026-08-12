@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from src.acp.models import PromptResult
-from src.acp.sync_adapter import SyncACPSession
+from src.acp.sync_adapter import SyncACPSession, start_session_with_retry
 from src.agent_session.factory import create_engine_session
+from src.agent_session.model_diagnostics import _apply_compaction_once
 from src.agent_session.wrappers import ModelFailureAwareSession, RateLimitAwareSession
 
 
@@ -94,6 +96,154 @@ def _factory_chain(tmp_path, base: SyncACPSession) -> ModelFailureAwareSession:
     assert isinstance(session._inner, RateLimitAwareSession)
     assert session._inner._inner is base
     return session
+
+
+def test_sync_acp_capture_policy_defaults_false(tmp_path) -> None:
+    session = SyncACPSession(
+        agent_type="codex",
+        cwd=str(tmp_path),
+        agent_cmd="codex",
+    )
+
+    assert session._capture_full_tool_content is False
+
+
+def test_start_retry_forwards_explicit_capture_policy(tmp_path) -> None:
+    captured: list[bool] = []
+
+    class CapturingSession:
+        def __init__(
+            self,
+            *,
+            agent_type,
+            cwd,
+            auto_approve=None,
+            capture_full_tool_content=False,
+        ):
+            del agent_type, cwd, auto_approve
+            captured.append(capture_full_tool_content)
+
+        def start(self, startup_timeout=20):
+            return "started"
+
+    start_session_with_retry(
+        agent_type="codex",
+        cwd=str(tmp_path),
+        session_cls=CapturingSession,
+        retries=1,
+        capture_full_tool_content=True,
+    )
+
+    assert captured == [True]
+
+
+def test_sync_session_forwards_capture_policy_to_async_session(tmp_path) -> None:
+    session = SyncACPSession(
+        agent_type="coco",
+        cwd=str(tmp_path),
+        agent_cmd="coco",
+        capture_full_tool_content=True,
+    )
+    async_session = AsyncMock()
+    async_session.start.return_value = "session-id"
+
+    with patch(
+        "src.acp.sync_adapter.ACPSession",
+        return_value=async_session,
+    ) as constructor:
+        assert asyncio.run(session._start_session()) == "session-id"
+
+    assert constructor.call_args.kwargs["capture_full_tool_content"] is True
+
+
+def test_engine_factory_forwards_explicit_capture_policy(tmp_path) -> None:
+    base = _sync_acp_base([], [])
+    settings = _settings()
+    with (
+        patch(
+            "src.agent_session.factory._resolve_inputs",
+            return_value=("codex", str(tmp_path), None),
+        ),
+        patch(
+            "src.agent_session.factory._start_base_session",
+            return_value=base,
+        ) as mock_start,
+        patch("src.agent_session.factory.get_settings", return_value=settings),
+        patch("src.agent_session.wrappers.get_settings", return_value=settings),
+    ):
+        create_engine_session(
+            "codex",
+            str(tmp_path),
+            require_tool_filter=True,
+            capture_full_tool_content=True,
+        )
+
+    assert mock_start.call_args.kwargs["capture_full_tool_content"] is True
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_compaction_replacement_preserves_capture_policy(
+    tmp_path,
+    capture: bool,
+) -> None:
+    old = _sync_acp_base([], [])
+    old._agent_type = "codex"
+    old._cwd = str(tmp_path)
+    old._agent_cmd = "codex"
+    old._agent_args = ["acp", "serve"]
+    old._capture_full_tool_content = capture
+    constructor_kwargs: dict[str, object] = {}
+
+    class Replacement:
+        def start(self, startup_timeout=20):
+            return "replacement"
+
+    def build(**kwargs):
+        constructor_kwargs.update(kwargs)
+        return Replacement()
+
+    assert _apply_compaction_once(
+        session=old,
+        session_builder=build,
+        startup_timeout_s=1.0,
+    ) is not None
+    assert constructor_kwargs["capture_full_tool_content"] is capture
+
+
+@pytest.mark.parametrize("capture", [False, True])
+def test_failover_replacement_preserves_capture_policy(
+    tmp_path,
+    capture: bool,
+) -> None:
+    first = _sync_acp_base([], [])
+    first._agent_cmd = "codex"
+    first._agent_args = ["--model", "old"]
+    first._agent_type = "codex"
+    first._cwd = str(tmp_path)
+    first._capture_full_tool_content = capture
+    first.close = MethodType(lambda _self: None, first)
+    replacement = _sync_acp_base([], [])
+    replacement.start = MethodType(
+        lambda _self, startup_timeout=20: "replacement",
+        replacement,
+    )
+    constructor_kwargs: dict[str, object] = {}
+
+    def build(**kwargs):
+        constructor_kwargs.update(kwargs)
+        return replacement
+
+    session = _factory_chain(tmp_path, first)
+    with (
+        patch("src.agent_session.wrappers.SyncACPSession", side_effect=build),
+        patch(
+            "src.agent_session.wrappers._replace_model_in_agent_args",
+            return_value=(["--model", "new"], True),
+        ),
+    ):
+        assert session._do_failover(from_model="old", to_model="new") is True
+
+    assert constructor_kwargs["capture_full_tool_content"] is capture
 
 
 def test_real_factory_wrapper_chain_forwards_workflow_activity_contract(tmp_path) -> None:

@@ -565,6 +565,36 @@ class WorkflowAgentSelectionRenderer:
             **extra,
         }
 
+    def _selection_signature(self) -> str:
+        """Identify the rendered draft/pool state for action deduplication."""
+
+        material = {
+            "next_agent_sequence": int(self.pending.next_agent_sequence),
+            "draft": [
+                str(self.pending.draft_tool_name or "").strip().lower(),
+                str(self.pending.draft_model_name or "").strip(),
+                str(self.pending.draft_profile or "").strip().lower(),
+                str(self.pending.draft_effort or "").strip().lower(),
+            ],
+            "pool": [
+                [
+                    str(binding.agent_id or ""),
+                    str(binding.tool_name or "").strip().lower(),
+                    str(binding.model_name or "").strip(),
+                    str(binding.profile or "").strip().lower(),
+                    str(binding.effort or "").strip().lower(),
+                ]
+                for binding in tuple(self.pending.agent_pool or ())
+            ],
+        }
+        canonical = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+
     @staticmethod
     def _button(text: str, value: dict[str, Any], *, kind: str = "default") -> dict[str, Any]:
         return {
@@ -664,7 +694,10 @@ class WorkflowAgentSelectionRenderer:
         )
         add_button = self._button(
             "+ 添加 Agent",
-            self._value("workflow_add_agent"),
+            self._value(
+                "workflow_add_agent",
+                _selection_sig=self._selection_signature(),
+            ),
         )
         elements.extend(
             [
@@ -674,7 +707,12 @@ class WorkflowAgentSelectionRenderer:
                 model_select,
             ]
         )
-        if draft_model and self.model_state is not None:
+        draft_model_is_active = bool(
+            draft_model
+            and self.model_state is not None
+            and draft_model in self.model_state.model_names
+        )
+        if draft_model_is_active and self.model_state is not None:
             if self.model_state.profiles:
                 elements.extend(
                     [
