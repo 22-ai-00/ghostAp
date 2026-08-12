@@ -112,10 +112,13 @@ class EmployeeFireService:
         self._authority = authority
         self._effects = dict(effects)
         self._mutex = RLock()
+        self._pending_drains: set[str] = set()
 
     def start_fire(self, request: EmployeeFireRequest) -> DurableFireState:
         with self._mutex:
-            return self._start_fire(request)
+            state = self._start_fire(request)
+            self._track_drain(state)
+            return state
 
     def _start_fire(self, request: EmployeeFireRequest) -> DurableFireState:
         if not isinstance(request, EmployeeFireRequest):
@@ -153,7 +156,9 @@ class EmployeeFireService:
 
     def resume(self, intent_id: str) -> DurableFireState:
         with self._mutex:
-            return self._resume(intent_id)
+            state = self._resume(intent_id)
+            self._track_drain(state)
+            return state
 
     def _resume(self, intent_id: str) -> DurableFireState:
         state = self._require(intent_id)
@@ -235,6 +240,12 @@ class EmployeeFireService:
                 pass
             observed = self._observe(state, effect_type)
             if observed is not True:
+                if state.drain and effect_type == "execution_quiesce":
+                    # A drain is an asynchronous wait, not an ambiguous side
+                    # effect.  Keep the anchored EXECUTING frame recoverable;
+                    # the department loop will reconcile it after the active
+                    # assignment reaches a terminal state.
+                    return self._require(intent_id)
                 return self._action_required(state, effect_type, "outcome_unknown")
             self._transition(intent_id, effect_type, FireEffectState.COMMITTED)
             if effect_type == "credential_destroy":
@@ -377,7 +388,17 @@ class EmployeeFireService:
         if len(failed_effects) != 1:
             raise FireServiceError("fire recovery effect is ambiguous")
         effect_type = failed_effects[0]
-        if self._observe(state, effect_type) is not True:
+        if state.drain and effect_type == "execution_quiesce":
+            # Historical builds marked a long drain ACTION_REQUIRED.  Once
+            # work is terminal, execute the idempotent actor retirement fence
+            # before reconciling that durable effect as committed.
+            try:
+                self._effects[effect_type].execute(state)
+            except Exception:
+                return state
+            if self._observe(state, effect_type) is not True:
+                return state
+        elif self._observe(state, effect_type) is not True:
             return state
         self._commit(
             JournalEvent(
@@ -390,6 +411,50 @@ class EmployeeFireService:
             )
         )
         return self.resume(intent_id)
+
+    def reconcile_draining(self) -> tuple[DurableFireState, ...]:
+        """Advance drains whose active assignments have naturally finished.
+
+        Waiting drains remain unchanged and are omitted from the result so a
+        caller can poll this method without turning an idle worker into a hot
+        loop.  The Journal state is the cursor, so restart recovery preserves
+        exactly the same bounded operation.
+        """
+
+        with self._mutex:
+            if not self._pending_drains:
+                return ()
+            progressed: list[DurableFireState] = []
+            for intent_id in tuple(sorted(self._pending_drains)):
+                state = self._require(intent_id)
+                if not state.drain or state.phase not in {
+                    FirePhase.RETIRING,
+                    FirePhase.ACTION_REQUIRED,
+                }:
+                    self._pending_drains.discard(intent_id)
+                    continue
+                effect_state = state.effect_state("execution_quiesce")
+                if effect_state not in {
+                    FireEffectState.EXECUTING,
+                    FireEffectState.ACTION_REQUIRED,
+                }:
+                    continue
+                if effect_state is FireEffectState.ACTION_REQUIRED:
+                    current = self._retry_action_required(state.intent_id)
+                else:
+                    current = self.resume(state.intent_id)
+                if current.last_sequence != state.last_sequence:
+                    progressed.append(current)
+            return tuple(progressed)
+
+    def _track_drain(self, state: DurableFireState) -> None:
+        if state.drain and state.phase in {
+            FirePhase.RETIRING,
+            FirePhase.ACTION_REQUIRED,
+        }:
+            self._pending_drains.add(state.intent_id)
+        else:
+            self._pending_drains.discard(state.intent_id)
 
     def _coalesce_equivalent(
         self,
@@ -435,6 +500,7 @@ class EmployeeFireService:
         with self._mutex:
             recovered: list[DurableFireState] = []
             grouped: dict[tuple[str, str], list[DurableFireState]] = {}
+            self._pending_drains.clear()
             for state in self._states().values():
                 if state.phase is FirePhase.SUPERSEDED:
                     continue
@@ -444,10 +510,19 @@ class EmployeeFireService:
                 ).append(state)
             for identity in sorted(grouped):
                 state = self._coalesce_equivalent(grouped[identity])
+                self._track_drain(state)
                 if state.phase is FirePhase.RETIRING:
-                    recovered.append(self.resume(state.intent_id))
+                    current = self.resume(state.intent_id)
+                    self._track_drain(current)
+                    recovered.append(current)
                 elif state.phase is FirePhase.ACTION_REQUIRED:
-                    self._authority.mark_action_required(state.agent_id)
+                    if state.drain:
+                        current = self._retry_action_required(state.intent_id)
+                        self._track_drain(current)
+                        if current.last_sequence != state.last_sequence:
+                            recovered.append(current)
+                    else:
+                        self._authority.mark_action_required(state.agent_id)
             return tuple(recovered)
 
     def list_states(self) -> tuple[DurableFireState, ...]:
@@ -466,8 +541,18 @@ class EmployeeFireService:
         state: DurableFireState,
         effect_type: str,
     ) -> DurableFireState:
-        observed = self._observe(state, effect_type)
-        if observed is not True:
+        if state.drain and effect_type == "execution_quiesce":
+            try:
+                self._effects[effect_type].execute(state)
+            except Exception:
+                return self._action_required(
+                    state,
+                    effect_type,
+                    "recovery_outcome_unknown",
+                )
+            if self._observe(state, effect_type) is not True:
+                return state
+        elif self._observe(state, effect_type) is not True:
             return self._action_required(state, effect_type, "recovery_outcome_unknown")
         self._transition(state.intent_id, effect_type, FireEffectState.COMMITTED)
         return self.resume(state.intent_id)

@@ -253,6 +253,12 @@ class EmployeeRuntimeSupervisor:
         if actor is not None:
             actor.close()
 
+    def is_retired(self, agent_id: str) -> bool:
+        """Return whether the process-local recreation fence is installed."""
+
+        with self._lock:
+            return agent_id in self._retired
+
     def sweep_idle(self) -> int:
         with self._lock:
             actors = tuple(self._actors.values())

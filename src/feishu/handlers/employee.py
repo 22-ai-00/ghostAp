@@ -427,7 +427,16 @@ class EmployeeHandler(BaseHandler):
             self.reply_text(message_id, text)
             return
         effects = dict(getattr(state, "effects", ()) or ())
-        if getattr(state, "error_code", "") == "external_cleanup_authority_unavailable":
+        if (
+            getattr(state, "drain", False) is True
+            and effects.get("execution_quiesce") is FireEffectState.EXECUTING
+        ):
+            self.reply_text(
+                message_id,
+                "⏳ 已关闭员工的新任务入口，正在等待当前任务自然结束；"
+                "结束后系统会自动继续停止托管、清理凭据并归档。",
+            )
+        elif getattr(state, "error_code", "") == "external_cleanup_authority_unavailable":
             disposition = getattr(state, "app_id", "") or "NO_APP_FOUND"
             self.reply_text(
                 message_id,

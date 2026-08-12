@@ -24,6 +24,14 @@ class ExecutionQuiesceEffect:
     def execute(self, state: DurableFireState) -> None:
         if self._coordinator is None:
             raise RuntimeError("employee dispatch coordinator unavailable")
+        if state.drain:
+            # Drain polling must be non-blocking.  The first request and every
+            # background reconciliation simply install the actor fence once
+            # the last assignment is terminal.
+            if self._has_active_attempts(state):
+                return
+            self._retire_actor(state)
+            return
         if not state.drain:
             attempts = tuple(self._coordinator.state.attempts.values())
             for attempt in attempts:
@@ -38,6 +46,9 @@ class ExecutionQuiesceEffect:
         deadline = time.monotonic() + self._grace
         while time.monotonic() < deadline and self.observe(state) is not True:
             time.sleep(0.05)
+        self._retire_actor(state)
+
+    def _retire_actor(self, state: DurableFireState) -> None:
         runtime = getattr(self._coordinator, "employee_runtime", None)
         retire = getattr(runtime, "retire_employee", None)
         if callable(retire):
@@ -46,7 +57,19 @@ class ExecutionQuiesceEffect:
     def observe(self, state: DurableFireState) -> bool | None:
         if self._coordinator is None:
             return None
-        return not any(
+        if self._has_active_attempts(state):
+            return False
+        runtime = getattr(self._coordinator, "employee_runtime", None)
+        is_retired = getattr(runtime, "is_retired", None)
+        if callable(is_retired):
+            retired = is_retired(state.agent_id)
+            return retired if type(retired) is bool else None
+        # External gateways have no process-local actor fence.  Absence of an
+        # introspection port means terminal attempts are the full contract.
+        return True
+
+    def _has_active_attempts(self, state: DurableFireState) -> bool:
+        return any(
             attempt.binding.agent_id == state.agent_id and not attempt.terminal_status
             for attempt in self._coordinator.state.attempts.values()
         )

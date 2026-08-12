@@ -82,6 +82,42 @@ def test_dispatch_soft_failure_preserves_owned_main_bot_audit(
         audit.close()
 
 
+def test_idle_dispatch_loop_reconciles_completed_employee_drains() -> None:
+    from src.autonomous.provisioning.composition import EmployeeDepartmentRuntime
+
+    calls: list[str] = []
+
+    class _ProjectionPort:
+        state = SimpleNamespace(by_acceptance_id={})
+
+        def rebuild_projection(self):
+            return None
+
+    class _Ingress(_ProjectionPort):
+        def gc_terminal_payloads(self):
+            return 0
+
+    class _Dispatch:
+        employee_runtime = None
+
+        def dispatch_next(self):
+            calls.append("dispatch")
+            return None
+
+    runtime = EmployeeDepartmentRuntime()
+    runtime._ingress = _Ingress()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._router = _ProjectionPort()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._dispatch = _Dispatch()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._fire = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        reconcile_draining=lambda: calls.append("reconcile_drain") or (object(),)
+    )
+
+    worked = runtime._drain_employee_dispatch_once()  # noqa: SLF001
+
+    assert worked is True
+    assert calls == ["dispatch", "reconcile_drain"]
+
+
 def test_team_recovery_waits_for_shared_dispatch_projections() -> None:
     calls: list[str] = []
     empty_state = SimpleNamespace(by_acceptance_id={})

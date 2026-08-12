@@ -7,7 +7,11 @@ import pytest
 
 from src.autonomous.data.query import AuditFailedError
 from src.autonomous.provisioning.fire_service import EmployeeFireRequest
-from src.autonomous.provisioning.fire_state import FireCleanupMode, FirePhase
+from src.autonomous.provisioning.fire_state import (
+    FireCleanupMode,
+    FireEffectState,
+    FirePhase,
+)
 from src.autonomous.provisioning.hire_service import HireAdmissionError
 from src.feishu.dispatcher import MessageDispatcher
 from src.feishu.handlers.employee import EmployeeHandler
@@ -325,6 +329,26 @@ def test_fire_builds_authoritative_confirmation_request() -> None:
     reply = handler.reply_text.call_args.args[1]
     assert "处置确认" in reply
     assert "GhostAP 已删除" not in reply
+
+
+def test_fire_drain_reports_automatic_completion_after_active_work() -> None:
+    handler, ctx = _handler()
+    _authorize()
+    ctx.employee_fire_service.start_fire.return_value = SimpleNamespace(
+        phase=FirePhase.RETIRING,
+        drain=True,
+        effects=(("execution_quiesce", FireEffectState.EXECUTING),),
+        error_code="",
+    )
+
+    handler.fire_employee("om_fire", "oc_admin_dm", "Atlas --drain")
+
+    request = ctx.employee_fire_service.start_fire.call_args.args[0]
+    assert request.drain is True
+    visible = handler.reply_text.call_args.args[1]
+    assert "自然结束" in visible
+    assert "自动继续" in visible
+    assert "人工核对" not in visible
 
 
 @pytest.mark.parametrize(

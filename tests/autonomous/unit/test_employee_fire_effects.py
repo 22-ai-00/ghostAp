@@ -138,3 +138,55 @@ def test_execution_quiesce_retires_actor_before_later_fire_effects() -> None:
     )
     ExecutionQuiesceEffect(coordinator, grace_seconds=0).execute(_state())
     assert retired == ["agt_alpha"]
+
+
+def test_execution_quiesce_drain_never_retires_an_active_actor_after_grace() -> None:
+    retired: list[str] = []
+    attempt = SimpleNamespace(
+        binding=SimpleNamespace(agent_id="agt_alpha"),
+        terminal_status="",
+    )
+    runtime = SimpleNamespace(retire_employee=lambda agent_id: retired.append(agent_id))
+    coordinator = SimpleNamespace(
+        state=SimpleNamespace(attempts={"att_active": attempt}),
+        employee_runtime=runtime,
+    )
+    state = replace(_state(), drain=True)
+
+    ExecutionQuiesceEffect(coordinator, grace_seconds=0).execute(state)
+
+    assert retired == []
+    assert ExecutionQuiesceEffect(coordinator, grace_seconds=0).observe(state) is False
+
+
+def test_execution_quiesce_drain_closes_terminal_race_before_commit() -> None:
+    retired: set[str] = set()
+    terminal_reads = iter(("", "completed", "completed", "completed"))
+
+    class _Attempt:
+        binding = SimpleNamespace(agent_id="agt_alpha")
+
+        @property
+        def terminal_status(self):
+            return next(terminal_reads)
+
+    runtime = SimpleNamespace(
+        retire_employee=lambda agent_id: retired.add(agent_id),
+        is_retired=lambda agent_id: agent_id in retired,
+    )
+    coordinator = SimpleNamespace(
+        state=SimpleNamespace(attempts={"att_race": _Attempt()}),
+        employee_runtime=runtime,
+    )
+    state = replace(_state(), drain=True)
+    effect = ExecutionQuiesceEffect(coordinator, grace_seconds=0)
+
+    effect.execute(state)
+
+    assert effect.observe(state) is False
+    assert retired == set()
+
+    effect.execute(state)
+
+    assert effect.observe(state) is True
+    assert retired == {"agt_alpha"}

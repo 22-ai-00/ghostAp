@@ -2105,6 +2105,14 @@ class EmployeeDepartmentRuntime:
                     router.route(acceptance_id)
                     worked = True
         worked = dispatch.dispatch_next() is not None or worked
+        if self._fire is not None:
+            try:
+                worked = bool(self._fire.reconcile_draining()) or worked
+            except Exception as exc:
+                logger.error(
+                    "employee drain reconciliation failed closed: %s",
+                    type(exc).__name__,
+                )
         worked = self._reconcile_terminal_ingress() > 0 or worked
         worked = self._drain_employee_outbox_once() or worked
         gc_now = time.monotonic()

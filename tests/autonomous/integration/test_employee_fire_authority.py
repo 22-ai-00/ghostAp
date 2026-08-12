@@ -77,6 +77,21 @@ class _Effect:
         return True
 
 
+def test_reconcile_draining_is_constant_time_without_pending_drains() -> None:
+    class _Writer:
+        def replay(self):
+            pytest.fail("idle drain reconciliation replayed the Journal")
+
+    service = EmployeeFireService(
+        writer=_Writer(),  # type: ignore[arg-type]
+        authority=object(),  # type: ignore[arg-type]
+        effects={name: _Effect(name, []) for name in FIRE_EFFECT_ORDER},
+    )
+
+    assert service.reconcile_draining() == ()
+    assert service.reconcile_draining() == ()
+
+
 def _pre_binding_hire_state(
     *,
     register_state: HireEffectState = HireEffectState.PREPARED,
@@ -267,6 +282,85 @@ def test_pre_binding_employee_can_be_fired_and_archived(tmp_path):
     assert result.phase is FirePhase.ARCHIVED
     assert state.employees["agt_1"].state.value == "archived"
     assert ("tenant_1", "agt_1") in ingress.state.closed_employees
+    ingress.close()
+    writer.close()
+
+
+def test_drain_waits_without_action_required_then_auto_reconciles(tmp_path):
+    writer = make_writer(tmp_path)
+    state = ProjectionState()
+    commit_events(writer, state, employee_created())
+    commit_events(writer, state, *bot_binding_events())
+    commit_events(
+        writer,
+        state,
+        JournalEvent(
+            event_type="employee.state_changed",
+            aggregate_id="agt_1",
+            payload={"state": "active"},
+        ),
+    )
+    ingress = EmployeeIngressService(
+        writer=writer,
+        blob_store=BlobStore(
+            tmp_path / "blobs",
+            AesGcmEncryptionProvider(
+                lambda _key: b"fire-ingress-data-key-32-bytes!!"
+            ),
+        ),
+        ingress_state=IngressProjectionState(),
+        active_key_id="k1",
+    )
+    authority = JournalFireAuthority(
+        writer=writer,
+        hire_service=_HireProjectionOwner(state),
+        ingress_service=ingress,
+        admin_principal_ids=frozenset({"ou_admin"}),
+    )
+    active = True
+    retired: list[str] = []
+    calls: list[str] = []
+
+    class _DrainEffect:
+        def execute(self, fire_state):
+            if not active:
+                retired.append(fire_state.agent_id)
+
+        def observe(self, _state):
+            return not active
+
+    effects = {name: _Effect(name, calls) for name in FIRE_EFFECT_ORDER}
+    effects["execution_quiesce"] = _DrainEffect()
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects=effects,
+    )
+    request = EmployeeFireRequest(
+        employee="Atlas",
+        tenant_key="tenant_1",
+        message_id="om_fire_drain",
+        chat_id="oc_dm",
+        requester_principal_id="ou_admin",
+        drain=True,
+    )
+
+    waiting = service.start_fire(request)
+
+    assert waiting.phase is FirePhase.RETIRING
+    assert dict(waiting.effects)["execution_quiesce"].value == "executing"
+    assert state.employees["agt_1"].state.value == "retiring"
+    assert retired == []
+    assert calls == []
+
+    active = False
+    reconciled = service.reconcile_draining()
+
+    assert len(reconciled) == 1
+    assert reconciled[0].phase is FirePhase.ARCHIVED
+    assert retired == ["agt_1"]
+    assert calls == list(FIRE_EFFECT_ORDER[1:])
+    assert state.employees["agt_1"].state.value == "archived"
     ingress.close()
     writer.close()
 
