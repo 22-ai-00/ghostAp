@@ -607,10 +607,16 @@ class EmployeeExecutionInput:
             raise TypeError("request must be AuthorizedContextRequest")
         if not isinstance(self.context, AssembledContext):
             raise TypeError("context must be AssembledContext")
-        for field_name in ("tool", "model", "effort"):
+        for field_name in ("tool", "effort"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field_name} is required")
+        if (
+            not isinstance(self.model, str)
+            or self.model != self.model.strip()
+            or any(ord(character) < 32 for character in self.model)
+        ):
+            raise ValueError("model must be a trimmed string")
         watermark = self.context.watermark
         if watermark is None or (
             watermark.tenant_key != self.request.tenant_key

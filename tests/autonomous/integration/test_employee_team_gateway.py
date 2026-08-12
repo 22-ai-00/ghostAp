@@ -118,6 +118,32 @@ def test_owner_p2p_dispatches_once_and_replay_preserves_scope(
     harness.close()
 
 
+def test_backend_default_model_dispatches_and_records_terminal_history(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    harness = _real_coordinator_harness(tmp_path, employee_model="")
+    monkeypatch.setattr(
+        harness.engine,
+        "_run_acp_session",
+        lambda *_args, **_kwargs: "default model result",
+    )
+    try:
+        prepared = harness.coordinator.prepare_next()
+        assert prepared is not None
+        assert prepared.binding.model == ""
+        assert prepared.permit.agent.model_name == ""
+
+        finalized = harness.coordinator.execute_prepared(prepared)
+
+        assert finalized.status.value == "completed"
+        history = tuple(harness.data.state.history_records.values())
+        assert len(history) == 1
+        assert history[0].model == ""
+    finally:
+        harness.close()
+
+
 def test_targeted_group_task_reaches_acp_as_only_untrusted_business_text(
     tmp_path,
 ) -> None:
@@ -886,6 +912,7 @@ def _real_coordinator_harness(
     owner_p2p: bool = False,
     targeted_group_task: bool = False,
     targeted_task_description: str = "finish the targeted audit",
+    employee_model: str = "gpt-5.6-sol",
 ):
     import threading as local_threading
     from contextlib import contextmanager
@@ -955,7 +982,7 @@ def _real_coordinator_harness(
         owner_principal_id="ou_owner",
         name="alpha",
         tool="traex",
-        model="gpt-5.6-sol",
+        model=employee_model,
         profile="max",
         effort="xhigh",
         persona="projected employee persona",
@@ -1099,7 +1126,6 @@ def _real_coordinator_harness(
             mentions=(
                 {
                     "key": "@_user_1",
-                    "mentioned_type": "bot",
                     "open_id": "ou_bot_alpha",
                     "tenant_key": "tenant_1",
                 },

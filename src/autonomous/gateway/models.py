@@ -145,7 +145,6 @@ class DispatchBinding:
             "chat_id",
             "team_chat_id",
             "tool",
-            "model",
             "profile",
             "effort",
             "security_profile",
@@ -157,6 +156,7 @@ class DispatchBinding:
             "thread_root_id",
             _optional_text(self.thread_root_id, "thread_root_id"),
         )
+        object.__setattr__(self, "model", _optional_text(self.model, "model"))
         if self.security_profile != "employee_v1":
             raise ValueError("dispatch binding requires employee_v1 security profile")
         for name, prefix in (

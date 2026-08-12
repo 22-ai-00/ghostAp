@@ -260,11 +260,17 @@ class RouterAuthoritySnapshot:
             self.team_id,
             self.requester_principal_id,
             self.tool,
-            self.model,
             self.effort,
         )
         if not all(isinstance(value, str) and value for value in required):
             raise ValueError("Router authority snapshot contains blank identity")
+        if (
+            not isinstance(self.model, str)
+            or self.model != self.model.strip()
+            or len(self.model) > 4096
+            or any(ord(character) < 32 for character in self.model)
+        ):
+            raise ValueError("Router authority snapshot contains invalid model")
         if not isinstance(
             self.authorization_scope,
             EmployeeAuthorizationScope,

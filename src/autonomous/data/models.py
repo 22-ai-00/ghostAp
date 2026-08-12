@@ -270,9 +270,14 @@ class ExecutionAttemptContext:
     )
 
     def __post_init__(self) -> None:
-        for name in self._FIELDS - {"terminal_epoch", "thread_root_id"}:
+        for name in self._FIELDS - {"terminal_epoch", "thread_root_id", "model"}:
             value = getattr(self, name)
             object.__setattr__(self, name, _strict_str(value, name))
+        object.__setattr__(
+            self,
+            "model",
+            _strict_str(self.model, "model", allow_empty=True),
+        )
         object.__setattr__(
             self,
             "thread_root_id",
@@ -345,9 +350,14 @@ class ExecutionHistoryRecordV1:
             raise ValueError("unsupported history schema")
         for name in (
             "tenant_key", "owner_principal_id", "requester_principal_id", "task_id",
-            "run_id", "attempt_id", "message_id", "chat_id", "tool", "model", "effort",
+            "run_id", "attempt_id", "message_id", "chat_id", "tool", "effort",
         ):
             object.__setattr__(self, name, _strict_str(getattr(self, name), name))
+        object.__setattr__(
+            self,
+            "model",
+            _strict_str(self.model, "model", allow_empty=True),
+        )
         object.__setattr__(
             self, "thread_root_id", _strict_str(self.thread_root_id, "thread_root_id", allow_empty=True)
         )
