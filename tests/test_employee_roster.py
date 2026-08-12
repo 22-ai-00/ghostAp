@@ -9,6 +9,22 @@ import pytest
 from src.agent.intent_recognizer import IntentRecognizer, IntentType
 from src.card.builders.system import SystemBuilder
 from src.feishu.slash_command_parser import SlashCommandParser
+from src.thread import (
+    set_current_is_p2p,
+    set_current_sender_id,
+    set_current_tenant_key,
+)
+
+
+@pytest.fixture(autouse=True)
+def _authorized_roster_request():
+    set_current_sender_id("ou_admin")
+    set_current_tenant_key("tenant-a")
+    set_current_is_p2p(True)
+    yield
+    set_current_sender_id(None)
+    set_current_tenant_key(None)
+    set_current_is_p2p(False)
 
 
 def _employee(
@@ -44,6 +60,7 @@ def _handler(*, roster=(), error: Exception | None = None):
     from src.feishu.handlers.employee import EmployeeHandler
 
     ctx = MagicMock()
+    ctx.settings = SimpleNamespace(admin_user_ids=frozenset({"ou_admin"}))
     ctx.tenant_key_resolver = MagicMock(return_value="tenant-a")
     ctx.employee_hire_service = MagicMock()
     if error is None:

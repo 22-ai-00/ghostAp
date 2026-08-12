@@ -74,7 +74,7 @@ class MessageDispatcher:
             return
         if (
             command_match is not None
-            and command_match.command in {"/history", "/employee-memory"}
+            and command_match.command in {"/employees", "/history", "/employee-memory"}
             and not self._action_matrix_allows(
                 effective_trust,
                 action_name="system_admin",

@@ -128,6 +128,14 @@ class EmployeeHandler(BaseHandler):
                 "⛔ 该命令仅允许配置管理员在主 Bot 私聊中使用。",
             )
             return None
+        transport_tenant = get_current_tenant_key() or ""
+        if (
+            not isinstance(transport_tenant, str)
+            or not transport_tenant
+            or transport_tenant != transport_tenant.strip()
+        ):
+            self.reply_text(message_id, "租户身份不可用；未执行任何员工操作。")
+            return None
         resolver = getattr(self.ctx, "tenant_key_resolver", None)
         if not callable(resolver):
             self.reply_text(message_id, "租户身份不可用；未执行任何员工操作。")
@@ -136,7 +144,6 @@ class EmployeeHandler(BaseHandler):
             tenant_key = resolver()
         except Exception:
             tenant_key = ""
-        transport_tenant = get_current_tenant_key() or ""
         if (
             not isinstance(tenant_key, str)
             or not tenant_key
@@ -674,18 +681,18 @@ class EmployeeHandler(BaseHandler):
         """Render every visible employee from the caller's tenant projection."""
 
         del chat_id, project
-        resolver = self.ctx.tenant_key_resolver
-        service = self.ctx.employee_hire_service
+        identity = self._admin_request_context(message_id)
+        if identity is None:
+            return
+        _sender_id, _union_id, tenant_key = identity
+        service = getattr(self.ctx, "employee_hire_service", None)
         list_roster = getattr(service, "list_employee_roster", None)
-        if not callable(resolver) or not callable(list_roster):
+        if not callable(list_roster):
             self.reply_text(message_id, _ROSTER_UNAVAILABLE)
             return
 
         try:
-            tenant_key = resolver()
-            if not isinstance(tenant_key, str) or not tenant_key.strip():
-                raise RuntimeError("employee roster tenant is unavailable")
-            employees = list_roster(tenant_key.strip(), include_archived=False)
+            employees = list_roster(tenant_key, include_archived=False)
             entries = [self._display_entry(employee) for employee in employees]
             _msg_type, card_content = SystemBuilder.build_employee_roster_card(entries)
         except Exception as exc:

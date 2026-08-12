@@ -202,6 +202,49 @@ def test_hire_denies_before_readiness_or_service(
     handler.reply_text.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("sender", "p2p", "transport_tenant"),
+    [
+        ("ou_intruder", True, "tenant-a"),
+        ("ou_admin", False, "tenant-a"),
+        ("", True, "tenant-a"),
+        ("ou_admin", True, ""),
+    ],
+    ids=("non-admin", "group", "missing-sender", "missing-tenant"),
+)
+def test_employee_roster_denies_before_tenant_resolution_or_projection(
+    sender: str,
+    p2p: bool,
+    transport_tenant: str,
+) -> None:
+    handler, ctx = _handler()
+    set_current_sender_id(sender or None)
+    set_current_tenant_key(transport_tenant or None)
+    set_current_is_p2p(p2p)
+
+    handler.list_employees_roster("om_roster", "oc_admin_dm")
+
+    ctx.tenant_key_resolver.assert_not_called()
+    ctx.employee_hire_service.list_employee_roster.assert_not_called()
+    handler.reply_card.assert_not_called()
+    handler.reply_text.assert_called_once()
+
+
+def test_employee_roster_allows_configured_admin_p2p_for_bound_tenant() -> None:
+    handler, ctx = _handler()
+    _authorize()
+    ctx.employee_hire_service.list_employee_roster.return_value = ()
+
+    handler.list_employees_roster("om_roster", "oc_admin_dm")
+
+    ctx.tenant_key_resolver.assert_called_once_with()
+    ctx.employee_hire_service.list_employee_roster.assert_called_once_with(
+        "tenant-a",
+        include_archived=False,
+    )
+    handler.reply_card.assert_called_once()
+
+
 def test_hire_uses_strictly_available_recommended_tool_and_backend_default_model() -> None:
     handler, ctx = _handler()
     _authorize()
@@ -547,6 +590,42 @@ def test_dispatcher_applies_system_admin_gate_before_sensitive_employee_read(
     dispatcher.system.handle_intercepted_command.assert_not_called()
 
 
+@pytest.mark.parametrize("command", ["/employees", "/roster"])
+def test_dispatcher_applies_system_admin_gate_before_employee_roster(
+    command: str,
+) -> None:
+    client = MagicMock()
+    client._handler_ctx.handlers = {
+        "coco": MagicMock(),
+        "system": MagicMock(),
+        "project": MagicMock(),
+    }
+    client._get_effective_mode.return_value = (InteractionMode.SMART, False)
+    client._current_trust_can_dispatch.return_value = True
+    client._handler_ctx.handlers[
+        "system"
+    ].is_interceptable_command_match.return_value = True
+    dispatcher = MessageDispatcher(client)
+    dispatcher._action_matrix_allows = MagicMock(return_value=False)
+    command_match = SlashCommandParser.parse(command)
+
+    assert command_match is not None
+    assert command_match.command == "/employees"
+    dispatcher.process_with_intent(
+        "om_roster",
+        "oc_admin_dm",
+        command,
+        command_match=command_match,
+        effective_trust=MagicMock(),
+    )
+
+    dispatcher._action_matrix_allows.assert_called_once_with(
+        ANY,
+        action_name="system_admin",
+    )
+    dispatcher.system.handle_intercepted_command.assert_not_called()
+
+
 @pytest.mark.parametrize("command", ["/history Atlas", "/employee-memory Atlas"])
 def test_ws_ingress_classifies_sensitive_employee_read_as_system_admin(
     command: str,
@@ -566,6 +645,35 @@ def test_ws_ingress_classifies_sensitive_employee_read_as_system_admin(
             trust,
             text=command,
             command_match=SlashCommandParser.parse(command),
+        )
+
+    assert allowed is False
+    request = matrix.return_value.decide.call_args.args[0]
+    assert request.action.value == "system_admin"
+
+
+@pytest.mark.parametrize("command", ["/employees", "/roster"])
+def test_ws_ingress_classifies_employee_roster_as_system_admin(
+    command: str,
+) -> None:
+    client = object.__new__(FeishuWSClient)
+    trust = EffectiveTrust(
+        zone=TrustZone.MANAGED_AGENT_GROUP,
+        actor=ActorKind.OWNER,
+        managed_group=MagicMock(revision=1),
+        group_revision=1,
+        grant_revision=1,
+    )
+    command_match = SlashCommandParser.parse(command)
+    assert command_match is not None
+    assert command_match.command == "/employees"
+    with patch("src.feishu.ws_client.ActionMatrix") as matrix:
+        matrix.return_value.decide.return_value = TrustActionDecision.DENY
+
+        allowed = client._managed_ingress_action_allowed(
+            trust,
+            text=command,
+            command_match=command_match,
         )
 
     assert allowed is False
