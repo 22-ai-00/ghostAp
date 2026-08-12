@@ -289,7 +289,12 @@ class EmployeeHandler(BaseHandler):
         except HireAdmissionError as exc:
             logger.warning("employee hire admission rejected: %s", type(exc).__name__)
             reason = str(exc)
-            if "capacity" in reason or "visible_employee_limit" in reason:
+            if reason == "provisioning submission failed after durable admission":
+                visible = (
+                    "⚠️ 雇佣准入已持久化，但本次自动调度失败。请勿重复发起雇佣；"
+                    "系统会在运行时恢复流程中继续该记录，请检查服务健康状态。"
+                )
+            elif "capacity" in reason or "visible_employee_limit" in reason:
                 visible = "员工容量已满；请求未受理。"
             elif "conflict" in reason:
                 visible = "员工名称、应用或请求幂等信息冲突；请求未受理。"

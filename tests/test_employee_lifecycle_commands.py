@@ -8,6 +8,7 @@ import pytest
 from src.autonomous.data.query import AuditFailedError
 from src.autonomous.provisioning.fire_service import EmployeeFireRequest
 from src.autonomous.provisioning.fire_state import FireCleanupMode, FirePhase
+from src.autonomous.provisioning.hire_service import HireAdmissionError
 from src.feishu.handlers.employee import EmployeeHandler
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
@@ -201,6 +202,25 @@ def test_hire_fails_before_journal_when_no_tool_is_strictly_available() -> None:
 
     ctx.employee_hire_service.start_hire.assert_not_called()
     assert "可用" in handler.reply_text.call_args.args[1]
+
+
+def test_hire_reports_durable_admission_when_async_submission_fails() -> None:
+    handler, ctx = _handler()
+    _authorize()
+    ctx.employee_hire_service.start_hire.side_effect = HireAdmissionError(
+        "provisioning submission failed after durable admission"
+    )
+
+    with patch(
+        "src.feishu.handlers.employee.list_acp_tools",
+        return_value=[SimpleNamespace(name="codex")],
+    ):
+        handler.hire_employee("om_hire", "oc_admin_dm", "Atlas")
+
+    visible = handler.reply_text.call_args.args[1]
+    assert "已持久化" in visible
+    assert "未受理" not in visible
+    assert "请勿重复" in visible
 
 
 def test_fire_builds_authoritative_confirmation_request() -> None:
