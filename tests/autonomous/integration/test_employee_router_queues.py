@@ -568,6 +568,143 @@ def test_targeted_group_task_routes_with_union_owner_and_freezes_input(
 
 
 @pytest.mark.parametrize(
+    "unavailable_dependency",
+    (
+        "registry_provider",
+        "channel_status",
+        "requester_resolver",
+        "managed_group_registry_provider",
+        "employee_bot_ids_provider",
+        "membership_health",
+        "requester_acl",
+    ),
+)
+def test_targeted_group_task_retries_transient_authority_dependency_failure(
+    tmp_path: Path,
+    unavailable_dependency: str,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from src.autonomous.ingress.targeted_task import TargetedTaskState
+    from src.trust.models import ManagedGroupOrigin
+    from src.trust.registry import ManagedGroupRegistry
+
+    registry = ManagedGroupRegistry(tmp_path / "managed-groups.json")
+    registry.register(
+        chat_id="oc_team",
+        owner_id="ou_owner",
+        origin=ManagedGroupOrigin.OWNER_ADOPTED,
+        receiving_bot_ref="main-bot",
+        project_id="project-1",
+        canonical_root_ref="/project",
+        created_at=datetime(2026, 8, 12, tzinfo=UTC),
+    )
+
+    def resolve_owner(**values):
+        return (
+            "ou_owner"
+            if values["sender_union_id"] == "on_owner"
+            and values["owner_principal_id"] == "ou_owner"
+            else None
+        )
+
+    _, writer, ingress, new_router = _stack(
+        tmp_path,
+        requester_acl=RuntimeRequesterChatAcl(
+            allowed_requesters=("ou_owner",),
+            allowed_chats=("oc_team",),
+        ),
+        requester_principal_resolver=resolve_owner,
+        managed_group_registry_provider=lambda: registry,
+        managed_group_owner_id="ou_owner",
+        employee_bot_ids_provider=lambda: frozenset({"ou_bot_alpha"}),
+    )
+    router = new_router()
+    payload = _payload(
+        96,
+        sender="ou_employee_app_owner",
+        sender_union_id="on_owner",
+    )
+    part = dict(payload.normalized_parts[0])
+    part.update(
+        content={"text": "@_user_1 /task finish audit"},
+        mentions=(
+            {
+                "key": "@_user_1",
+                "open_id": "ou_bot_alpha",
+                "tenant_key": "tenant_1",
+            },
+        ),
+        remote_chat_id="oc_team",
+        remote_message_id="om_transient_authority",
+        remote_root_id="om_root",
+    )
+    payload = EmployeeIngressPayload(
+        schema_version=1,
+        envelope_id=payload.envelope_id,
+        normalized_parts=(part,),
+        attachment_descriptors=(),
+    )
+    metadata = replace(
+        _metadata(payload, 96, "agt_alpha"),
+        sender_principal_id="ou_employee_app_owner",
+        message_id="om_"
+        + hashlib.sha256(b"om_transient_authority").hexdigest(),
+        chat_id="oc_" + hashlib.sha256(b"oc_team").hexdigest(),
+        thread_root_message_id="om_" + hashlib.sha256(b"om_root").hexdigest(),
+    )
+    acceptance_id = ingress.accept(
+        metadata,
+        payload,
+        request_id="req_transient_authority",
+    ).acceptance.acceptance_id
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+    router._clock = lambda: now  # noqa: SLF001
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("temporary authority dependency failure")
+
+    class UnavailablePort:
+        status = unavailable
+        is_degraded = unavailable
+        is_authorized = unavailable
+
+    dependency_attributes = {
+        "registry_provider": ("_registry_provider", unavailable),
+        "channel_status": ("_channels", UnavailablePort()),
+        "requester_resolver": ("_requester_principal_resolver", unavailable),
+        "managed_group_registry_provider": (
+            "_managed_group_registry_provider",
+            unavailable,
+        ),
+        "employee_bot_ids_provider": ("_employee_bot_ids_provider", unavailable),
+        "membership_health": ("_membership_health", UnavailablePort()),
+        "requester_acl": ("_requester_acl", UnavailablePort()),
+    }
+    dependency_attribute, unavailable_value = dependency_attributes[
+        unavailable_dependency
+    ]
+    healthy_value = getattr(router, dependency_attribute)
+    setattr(router, dependency_attribute, unavailable_value)
+
+    classified = router.classify_targeted_group_task(metadata, payload)
+    deferred = router.route(acceptance_id)
+
+    assert classified is not None
+    assert classified.state is TargetedTaskState.INDETERMINATE
+    assert deferred.state == "accepted"
+    assert deferred.reason_code == ""
+    assert deferred.inbox_failures == 1
+
+    setattr(router, dependency_attribute, healthy_value)
+    now += timedelta(seconds=1)
+
+    assert router.route(acceptance_id).state == "queued"
+    ingress.close()
+    writer.close()
+
+
+@pytest.mark.parametrize(
     ("mention_open_id", "sender_union_id", "resolved_requester"),
     (
         ("ou_bot_beta", "on_owner", "ou_owner"),

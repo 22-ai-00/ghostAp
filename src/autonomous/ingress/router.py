@@ -59,6 +59,7 @@ _ROUTER_EVENTS = frozenset(
 )
 
 _INBOX_MAX_FAILURES = 3
+_AUTHORITY_DEPENDENCY_UNAVAILABLE = "authority_dependency_unavailable"
 
 
 
@@ -1023,6 +1024,8 @@ class DurableEmployeeIngressRouter:
             ingress_record.metadata,
             payload,
         )
+        if resolution is None and reason == _AUTHORITY_DEPENDENCY_UNAVAILABLE:
+            return self.defer_inbox_candidate(acceptance_id)
         if (
             resolution is not None
             and resolution.targeted_task is not None
@@ -1082,6 +1085,8 @@ class DurableEmployeeIngressRouter:
                 payload,
             )
             if staging_resolution is None:
+                if staging_reason == _AUTHORITY_DEPENDENCY_UNAVAILABLE:
+                    return self.defer_inbox_candidate(acceptance_id)
                 return self._terminal_after_external(
                     acceptance_id,
                     staging_reason,
@@ -1131,6 +1136,11 @@ class DurableEmployeeIngressRouter:
             current_ingress.metadata,
             current_payload,
         )
+        if (
+            current_resolution is None
+            and current_reason == _AUTHORITY_DEPENDENCY_UNAVAILABLE
+        ):
+            return self.defer_inbox_candidate(acceptance_id)
         current = (
             current_resolution.snapshot
             if current_resolution is not None
@@ -1302,10 +1312,13 @@ class DurableEmployeeIngressRouter:
             if current.state != "queued":
                 continue
             snapshot_identity = self._ingress_identity(ingress_record, payload)
-            resolution, _reason = self._resolve_authority(
+            resolution, reason = self._resolve_authority(
                 ingress_record.metadata,
                 payload,
             )
+            if resolution is None and reason == _AUTHORITY_DEPENDENCY_UNAVAILABLE:
+                self.defer_inbox_candidate(candidate.acceptance_id)
+                continue
             authority = resolution.snapshot if resolution is not None else None
             if authority is None or not self._authority_matches(current.authority, authority):
                 self._terminal_for_snapshot(
@@ -1381,7 +1394,9 @@ class DurableEmployeeIngressRouter:
     ) -> TargetedTaskParseResult | None:
         """Return an authorized target view, re-derived from authenticated ingress."""
 
-        resolution, _reason = self._resolve_authority(metadata, payload)
+        resolution, reason = self._resolve_authority(metadata, payload)
+        if resolution is None and reason == _AUTHORITY_DEPENDENCY_UNAVAILABLE:
+            return TargetedTaskParseResult(TargetedTaskState.INDETERMINATE)
         return None if resolution is None else resolution.targeted_task
 
     def finish(self, acceptance_id: str, *, reason_code: str) -> RouterLifecycleRecord:
@@ -1735,7 +1750,7 @@ class DurableEmployeeIngressRouter:
                         channel_identity_app_id=identity_app_id,
                     )
                 except Exception:
-                    return None, "requester_denied"
+                    return None, _AUTHORITY_DEPENDENCY_UNAVAILABLE
             if (
                 not isinstance(requester_principal_id, str)
                 or not requester_principal_id
@@ -1799,7 +1814,7 @@ class DurableEmployeeIngressRouter:
                         ):
                             return None, "authority_denied"
                     except Exception:
-                        return None, "authority_denied"
+                        return None, _AUTHORITY_DEPENDENCY_UNAVAILABLE
             binding = registry.context_binding(
                 tenant_key=metadata.tenant_key,
                 agent_id=metadata.agent_id,
@@ -1848,7 +1863,7 @@ class DurableEmployeeIngressRouter:
                         remote_chat_id,
                     )
                 except Exception:
-                    return None, "membership_degraded"
+                    return None, _AUTHORITY_DEPENDENCY_UNAVAILABLE
                 if (
                     type(membership_degraded) is not bool
                     or membership_degraded is not False
@@ -1900,7 +1915,7 @@ class DurableEmployeeIngressRouter:
             try:
                 requester_authorized = self._requester_acl.is_authorized(request)
             except Exception:
-                return None, "requester_denied"
+                return None, _AUTHORITY_DEPENDENCY_UNAVAILABLE
             if type(requester_authorized) is not bool or requester_authorized is not True:
                 return None, "requester_denied"
             credential_ref = principal.credential_ref
@@ -1912,7 +1927,7 @@ class DurableEmployeeIngressRouter:
                 targeted_task,
             ), ""
         except Exception:
-            return None, "authority_denied"
+            return None, _AUTHORITY_DEPENDENCY_UNAVAILABLE
 
     def _projection_missed_workforce_change(
         self,
