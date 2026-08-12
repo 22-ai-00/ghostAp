@@ -15,8 +15,10 @@ from src.utils.path import canonicalize_user_home_path
 from ..journal.blob_store import (
     AesGcmEncryptionProvider,
     BlobError,
+    BlobReadError,
     BlobRef,
     BlobStore,
+    KeyResolutionError,
 )
 from ..journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
 from ..journal.writer import CommitResult, CommitState, JournalWriter
@@ -48,6 +50,10 @@ class IngressCorrelationError(IngressServiceError):
 
 class IngressBlobError(IngressServiceError):
     """Encrypted ingress payload publication or verification failed."""
+
+
+class IngressBlobRetryableError(IngressBlobError):
+    """An authenticated ingress payload dependency is temporarily unavailable."""
 
 
 class IngressWriteDisabledError(IngressServiceError):
@@ -410,6 +416,9 @@ class EmployeeIngressService:
         with self._mutex:
             self._ensure_open_unlocked()
             fresh = IngressProjectionState()
+            verify_all = not getattr(self, "_projection_verified", False)
+            known_acceptance_ids = frozenset(self._state.by_acceptance_id)
+            inbox_retry_identities: set[tuple[str, str]] = set()
             anchor = self._writer.anchor.read()
             cursor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
             if getattr(self, "_projection_verified", False) and (
@@ -429,6 +438,16 @@ class EmployeeIngressService:
                             frame_sequence=frame.sequence,
                             frame_hash=frame.frame_hash,
                         )
+                    elif event.event_type == "employee.ingress.router_inbox_retry":
+                        acceptance_id = (
+                            event.payload.get("acceptance_id")
+                            if isinstance(event.payload, dict)
+                            else None
+                        )
+                        if isinstance(acceptance_id, str):
+                            inbox_retry_identities.add(
+                                (event.aggregate_id, acceptance_id)
+                            )
                 fresh.cursor_sequence = frame.sequence
                 fresh.cursor_hash = frame.frame_hash
                 anchored_frame_hash = frame.frame_hash
@@ -439,8 +458,21 @@ class EmployeeIngressService:
             for record in fresh.by_acceptance_id.values():
                 if record.terminal or record.payload_tombstoned:
                     continue
+                if (
+                    record.aggregate_id,
+                    record.acceptance.acceptance_id,
+                ) in inbox_retry_identities:
+                    # The Router has already anchored the availability budget;
+                    # it alone decides when the next authenticated read is due.
+                    continue
+                if not verify_all and record.acceptance.acceptance_id in known_acceptance_ids:
+                    continue
                 try:
                     self._read_record_payload(record)
+                except IngressBlobRetryableError:
+                    # Availability failures do not revoke employee admission.
+                    # The Router owns the durable retry budget once dispatch runs.
+                    continue
                 except (
                     BlobError,
                     IngressBlobError,
@@ -530,6 +562,10 @@ class EmployeeIngressService:
             raise IngressConflictError("durable employee ingress conflict")
         try:
             self._verify_ref_and_payload(record.blob_ref, existing, payload)
+        except (BlobReadError, KeyResolutionError, OSError) as exc:
+            raise IngressBlobRetryableError(
+                "authenticated ingress payload is temporarily unavailable"
+            ) from exc
         except (
             BlobError,
             IngressBlobError,
@@ -561,6 +597,10 @@ class EmployeeIngressService:
             payload = EmployeeIngressPayload.from_dict(decoded)
             self._validate_incoming_payload(record.metadata, payload)
             return payload
+        except (BlobReadError, KeyResolutionError, OSError) as exc:
+            raise IngressBlobRetryableError(
+                "authenticated ingress payload is temporarily unavailable"
+            ) from exc
         except IngressBlobError:
             raise
         except (BlobError, TypeError, ValueError, json.JSONDecodeError) as exc:

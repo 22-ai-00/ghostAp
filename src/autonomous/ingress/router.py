@@ -32,7 +32,11 @@ from ..workforce.registry import (
     ProjectedContextBinding,
 )
 from .models import EmployeeIngressMetadata, EmployeeIngressPayload
-from .service import EmployeeIngressService, IngressBlobError
+from .service import (
+    EmployeeIngressService,
+    IngressBlobError,
+    IngressBlobRetryableError,
+)
 from .targeted_task import (
     TARGETED_TASK_INPUT_KIND,
     TargetedTaskParseResult,
@@ -47,12 +51,14 @@ _ROUTER_EVENTS = frozenset(
         _ROUTER_PREFIX + "authorized",
         _ROUTER_PREFIX + "staging",
         _ROUTER_PREFIX + "queued",
+        _ROUTER_PREFIX + "inbox_retry",
         _ROUTER_PREFIX + "context_retry",
         _ROUTER_PREFIX + "dispatching",
         _ROUTER_PREFIX + "terminal",
     }
 )
 
+_INBOX_MAX_FAILURES = 3
 
 
 
@@ -78,6 +84,12 @@ def _is_eligible(record: "RouterLifecycleRecord", now: datetime) -> bool:
     if not record.next_eligible_at:
         return True
     return _parse_canonical_utc(record.next_eligible_at) <= now.astimezone(UTC)
+
+
+def _is_inbox_eligible(record: "RouterLifecycleRecord", now: datetime) -> bool:
+    if not record.inbox_next_eligible_at:
+        return True
+    return _parse_canonical_utc(record.inbox_next_eligible_at) <= now.astimezone(UTC)
 
 
 def _remote_index(value: str, prefix: str) -> str:
@@ -417,6 +429,8 @@ class RouterLifecycleRecord:
     authority: RouterAuthoritySnapshot | None = None
     queue_position: int = 0
     queued_sequence: int = 0
+    inbox_failures: int = 0
+    inbox_next_eligible_at: str = ""
     context_failures: int = 0
     next_eligible_at: str = ""
     reason_code: str = ""
@@ -577,6 +591,33 @@ def _reduce_router_event(
         if set(payload) != {"acceptance_id"} or record.state != "queued":
             raise RouterProjectionError("invalid Router dispatch transition")
         updated = replace(record, state="dispatching")
+    elif event.event_type == _ROUTER_PREFIX + "inbox_retry":
+        if set(payload) != {
+            "acceptance_id",
+            "failure_count",
+            "next_eligible_at",
+        } or record.state not in {"accepted", "authorized", "staging", "queued"}:
+            raise RouterProjectionError("invalid Router inbox retry transition")
+        failure_count = payload["failure_count"]
+        if (
+            isinstance(failure_count, bool)
+            or not isinstance(failure_count, int)
+            or failure_count != record.inbox_failures + 1
+        ):
+            raise RouterProjectionError("invalid Router inbox retry count")
+        try:
+            canonical_eligibility = _canonical_utc(
+                _parse_canonical_utc(payload["next_eligible_at"])
+            )
+        except (TypeError, ValueError) as exc:
+            raise RouterProjectionError(
+                "invalid Router inbox retry eligibility"
+            ) from exc
+        updated = replace(
+            record,
+            inbox_failures=failure_count,
+            inbox_next_eligible_at=canonical_eligibility,
+        )
     elif event.event_type == _ROUTER_PREFIX + "context_retry":
         if set(payload) != {
             "acceptance_id",
@@ -881,6 +922,57 @@ class DurableEmployeeIngressRouter:
             self._projection_verified = True
             return self._state
 
+    def is_inbox_candidate_eligible(self, acceptance_id: str) -> bool:
+        """Return whether pre-dispatch payload work may read its Blob now."""
+
+        with self._mutex:
+            self.rebuild_projection()
+            record = self._record(acceptance_id)
+            if record.state not in {"accepted", "authorized", "staging"}:
+                return False
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("Router clock must return an aware datetime")
+            return _is_inbox_eligible(record, now)
+
+    def defer_inbox_candidate(
+        self,
+        acceptance_id: str,
+        *,
+        max_failures: int = _INBOX_MAX_FAILURES,
+    ) -> RouterLifecycleRecord:
+        """Persist one payload availability failure and bound retries durably."""
+
+        if isinstance(max_failures, bool) or not isinstance(max_failures, int):
+            raise TypeError("max_failures must be an integer")
+        if max_failures < 1:
+            raise ValueError("max_failures must be positive")
+        with self._mutex, self._writer.transaction_guard():
+            self.rebuild_projection()
+            record = self._record(acceptance_id)
+            if record.state == "terminal":
+                return record
+            if record.state not in {"accepted", "authorized", "staging", "queued"}:
+                raise RouterProjectionError(
+                    "only pre-dispatch Router work can defer an Inbox read"
+                )
+            failure_count = record.inbox_failures + 1
+            if failure_count >= max_failures:
+                return self._terminal_unlocked(record, "inbox_not_dispatchable")
+            delay = min(
+                self._context_retry_max_seconds,
+                self._context_retry_base_seconds * (2 ** (failure_count - 1)),
+            )
+            eligible_at = _canonical_utc(self._clock() + timedelta(seconds=delay))
+            return self._transition_unlocked(
+                record,
+                "inbox_retry",
+                {
+                    "failure_count": failure_count,
+                    "next_eligible_at": eligible_at,
+                },
+            )
+
     def route(self, acceptance_id: str) -> RouterLifecycleRecord:
         try:
             return self._route(acceptance_id)
@@ -890,8 +982,20 @@ class DurableEmployeeIngressRouter:
     def _route(self, acceptance_id: str) -> RouterLifecycleRecord:
         """Authorize, stage, and atomically admit one accepted Inbox record."""
 
+        with self._mutex:
+            self.rebuild_projection()
+            current = self._record(acceptance_id)
+            if current.state in {"queued", "dispatching", "terminal"}:
+                return current
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("Router clock must return an aware datetime")
+            if not _is_inbox_eligible(current, now):
+                return current
         try:
             record, ingress_record, payload = self._dispatch_snapshot(acceptance_id)
+        except IngressBlobRetryableError:
+            return self.defer_inbox_candidate(acceptance_id)
         except IngressBlobError:
             return self._terminal_inbox_failure(acceptance_id)
         if record.state in {"queued", "dispatching", "terminal"}:
@@ -962,6 +1066,8 @@ class DurableEmployeeIngressRouter:
                     )
                 elif not self._authority_matches(record.authority, authority):
                     return self._terminal_unlocked(record, "authority_stale")
+        except IngressBlobRetryableError:
+            return self.defer_inbox_candidate(acceptance_id)
         except IngressBlobError:
             return self._terminal_inbox_failure(acceptance_id)
 
@@ -1008,6 +1114,8 @@ class DurableEmployeeIngressRouter:
             record, current_ingress, current_payload = self._dispatch_snapshot(
                 acceptance_id
             )
+        except IngressBlobRetryableError:
+            return self.defer_inbox_candidate(acceptance_id)
         except IngressBlobError:
             return self._terminal_inbox_failure(acceptance_id)
         if record.state in {"queued", "dispatching", "terminal"}:
@@ -1079,6 +1187,8 @@ class DurableEmployeeIngressRouter:
                         "queue_position": position,
                     },
                 )
+        except IngressBlobRetryableError:
+            return self.defer_inbox_candidate(acceptance_id)
         except IngressBlobError:
             return self._terminal_inbox_failure(acceptance_id)
 
@@ -1172,6 +1282,7 @@ class DurableEmployeeIngressRouter:
                         if record.state == "queued"
                         and record.agent_id not in active
                         and _is_eligible(record, now)
+                        and _is_inbox_eligible(record, now)
                     ),
                     key=lambda record: (record.queued_sequence, record.acceptance_id),
                 )
@@ -1182,6 +1293,9 @@ class DurableEmployeeIngressRouter:
                 current, ingress_record, payload = self._dispatch_snapshot(
                     candidate.acceptance_id
                 )
+            except IngressBlobRetryableError:
+                self.defer_inbox_candidate(candidate.acceptance_id)
+                continue
             except IngressBlobError:
                 self._terminal_inbox_failure(candidate.acceptance_id)
                 continue
@@ -1253,6 +1367,9 @@ class DurableEmployeeIngressRouter:
                         payload,
                         targeted_task,
                     )
+            except IngressBlobRetryableError:
+                self.defer_inbox_candidate(candidate.acceptance_id)
+                continue
             except IngressBlobError:
                 self._terminal_inbox_failure(candidate.acceptance_id)
                 continue
@@ -1468,6 +1585,8 @@ class DurableEmployeeIngressRouter:
                 if self._ingress_identity(ingress_record, payload) != expected_identity:
                     reason_code = "inbox_not_dispatchable"
                 return self._terminal_unlocked(record, reason_code)
+        except IngressBlobRetryableError:
+            return self.defer_inbox_candidate(acceptance_id)
         except IngressBlobError:
             return self._terminal_inbox_failure(acceptance_id)
 

@@ -60,6 +60,7 @@ from ..ingress.router import DurableEmployeeIngressRouter, RouterQueueLimits
 from ..ingress.service import (
     EmployeeIngressService,
     IngressBlobError,
+    IngressBlobRetryableError,
     IngressConflictError,
 )
 from ..ingress.targeted_task import (
@@ -1972,19 +1973,26 @@ class EmployeeDepartmentRuntime:
         worked = False
         for acceptance_id, record in tuple(ingress.state.by_acceptance_id.items()):
             if record.disposition is None:
+                routed = router.state.by_acceptance_id.get(acceptance_id)
+                if routed is not None and routed.state in {
+                    "queued",
+                    "dispatching",
+                    "terminal",
+                }:
+                    continue
+                eligibility = getattr(router, "is_inbox_candidate_eligible", None)
+                if callable(eligibility) and not eligibility(acceptance_id):
+                    continue
                 try:
                     payload = ingress.get_payload(acceptance_id)
+                except IngressBlobRetryableError:
+                    router.defer_inbox_candidate(acceptance_id)
+                    worked = True
+                    continue
                 except IngressBlobError:
                     # Let the Router durably converge every authenticated
-                    # payload failure to inbox_not_dispatchable.  Retrying a
-                    # missing or corrupt Blob forever would create a hot loop.
-                    routed = router.state.by_acceptance_id.get(acceptance_id)
-                    if routed is None or routed.state not in {
-                        "queued",
-                        "dispatching",
-                        "terminal",
-                    }:
-                        router.route(acceptance_id)
+                    # permanent payload failure to inbox_not_dispatchable.
+                    router.route(acceptance_id)
                     worked = True
                     continue
                 first = (
