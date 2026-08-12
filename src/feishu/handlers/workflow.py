@@ -3764,6 +3764,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 session = None
                 should_fallback = False
                 activity_buffer = _WorkflowGenerationActivityBuffer()
+                attempt_cancel_event = threading.Event()
                 try:
                     session_owner = current_generation_owner()
                     if session_owner is None:
@@ -3780,7 +3781,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         auto_approve=False,
                         require_tool_filter=True,
                         model_name=binding.model_name,
-                        cancel_event=cancel_event,
+                        cancel_event=attempt_cancel_event,
                     )
                     if session is None:
                         last_error = f"{binding.agent_id}: unable to create generation session"

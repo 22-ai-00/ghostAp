@@ -3817,6 +3817,8 @@ class FeishuWSClient:
             ChannelEventDispatcherHandler.builder("", "")
             .register_p2_im_message_receive_v1(self._handle_message)
             .register_p2_im_message_reaction_created_v1(_ignore_ws_event)
+            .register_p2_im_message_reaction_deleted_v1(_ignore_ws_event)
+            .register_p2_im_chat_member_bot_added_v1(_ignore_ws_event)
             .register_p2_im_chat_member_bot_deleted_v1(self._handle_bot_deleted)
             .register_p2_im_message_message_read_v1(_ignore_ws_event)
             .register_p2_card_action_trigger(self._handle_card_action_callback)

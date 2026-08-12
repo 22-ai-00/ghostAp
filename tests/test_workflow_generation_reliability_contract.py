@@ -128,7 +128,15 @@ def _engine(tmp_path, *, pool=None, orchestrator: str = "A-2") -> WorkflowEngine
     return engine
 
 
-def _generate(handler, engine, tmp_path, session_factory, progress_callback=None):
+def _generate(
+    handler,
+    engine,
+    tmp_path,
+    session_factory,
+    progress_callback=None,
+    *,
+    cancel_event: threading.Event | None = None,
+):
     output = tmp_path / ".ghostap" / "workflow_scripts" / "generated.js"
     with (
         patch("src.agent_session.create_engine_session", side_effect=session_factory),
@@ -144,7 +152,7 @@ def _generate(handler, engine, tmp_path, session_factory, progress_callback=None
             engine,
             progress_callback=progress_callback,
             output_path=str(output),
-            cancel_event=threading.Event(),
+            cancel_event=cancel_event or threading.Event(),
         )
 
 
@@ -200,6 +208,49 @@ def test_timeout_transport_and_rate_limit_fallback_orchestrator_first_with_stric
 
     assert created == [("gemini", "pro"), ("codex", "fast")]
     assert lifecycle[:2] == ["A-2:cancel", "A-2:close"]
+
+
+def test_attempt_timeout_cancellation_does_not_set_workflow_stop_event(tmp_path) -> None:
+    workflow_stop = threading.Event()
+    created_cancel_events: list[threading.Event] = []
+    outcomes = iter(
+        [
+            TimeoutError("attempt hard cap reached"),
+            PromptResult(stop_reason="end_turn", text=_script("A-1", "codex")),
+        ]
+    )
+
+    class _EventCoupledSession(_Session):
+        def __init__(self, outcome, *, name: str, cancel_event: threading.Event):
+            super().__init__(outcome, name=name)
+            self.cancel_event = cancel_event
+
+        def cancel(self, wait: bool = False, timeout: float = 2.0) -> bool:
+            self.cancel_event.set()
+            return super().cancel(wait=wait, timeout=timeout)
+
+    def factory(**kwargs):
+        attempt_cancel = kwargs["cancel_event"]
+        created_cancel_events.append(attempt_cancel)
+        return _EventCoupledSession(
+            next(outcomes),
+            name=kwargs["agent_type"],
+            cancel_event=attempt_cancel,
+        )
+
+    path, meta = _generate(
+        _handler(),
+        _engine(tmp_path),
+        tmp_path,
+        factory,
+        cancel_event=workflow_stop,
+    )
+
+    assert path.endswith("generated.js")
+    assert meta["agentPlan"][0]["agentId"] == "A-1"
+    assert workflow_stop.is_set() is False
+    assert len(created_cancel_events) == 2
+    assert all(event is not workflow_stop for event in created_cancel_events)
 
 
 def test_close_failure_blocks_binding_fallback(tmp_path) -> None:

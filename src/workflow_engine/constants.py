@@ -10,7 +10,7 @@ from __future__ import annotations
 # (more permissive) default.
 AGENT_CALL_TIMEOUT_S: int = 600  # Per agent() call timeout (seconds); 0 in Settings disables the per-agent deadline (unlimited)
 AGENT_IDLE_TIMEOUT_S: int = 120  # Adaptive idle timeout: kill only after N seconds of no ACP events
-SCRIPT_GEN_TIMEOUT_S: int = 180  # AI workflow script generation timeout
+SCRIPT_GEN_TIMEOUT_S: int = 600  # Shared hard cap for AI workflow script generation
 WORKFLOW_TOTAL_TIMEOUT_S: int = 3600  # Total workflow execution timeout (60 min); 0 in Settings disables the total deadline (unlimited)
 WORKFLOW_TIMEOUT_HEADROOM_S: int = 5  # Reserved seconds before total deadline
 SESSION_CREATE_TIMEOUT_S: int = 120

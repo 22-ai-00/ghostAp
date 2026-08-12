@@ -375,6 +375,52 @@ def test_main_dispatcher_acknowledges_p2p_chat_entered_event() -> None:
     assert result is None
 
 
+@pytest.mark.parametrize(
+    "event_type,event",
+    [
+        ("im.chat.member.bot.added_v1", {"chat_id": "oc_added"}),
+        (
+            "im.message.reaction.deleted_v1",
+            {
+                "message_id": "om_reacted",
+                "reaction_type": {"emoji_type": "OK"},
+                "operator_type": "user",
+                "user_id": {"open_id": "ou_actor"},
+            },
+        ),
+    ],
+)
+def test_main_dispatcher_acknowledges_subscribed_informational_events(
+    event_type: str,
+    event: dict[str, object],
+) -> None:
+    from src.feishu.ws_client import FeishuWSClient
+
+    client = object.__new__(FeishuWSClient)
+    client._handle_message = lambda _event: None
+    client._handle_bot_deleted = lambda _event: None
+    client._handle_card_action = lambda _event: None
+    event_handler = client._build_event_handler()
+    payload = {
+        "schema": "2.0",
+        "header": {
+            "event_id": f"evt-{event_type}",
+            "event_type": event_type,
+            "create_time": "1785500978668",
+            "token": "",
+            "app_id": "cli_test",
+            "tenant_key": "tenant_test",
+        },
+        "event": event,
+    }
+
+    result = event_handler._do_without_validation(
+        json.dumps(payload).encode("utf-8")
+    )
+
+    assert result is None
+
+
 
 
 # ---------------------------------------------------------------------------

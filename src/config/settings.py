@@ -207,9 +207,9 @@ class Settings(BaseSettings):
         description="Adaptive idle timeout for agent() calls (seconds). When >0, the per-agent timeout becomes activity-based: as long as ACP events (tool calls, text output) keep arriving, the agent stays alive. Only after this many seconds of complete silence is the agent killed. The hard cap (workflow_agent_call_timeout_s) still applies as an absolute maximum. Set 0 to disable adaptive timeout and use fixed timeout only.",
     )
     workflow_script_gen_timeout_s: int = Field(
-        default=180,
+        default=600,
         ge=10,
-        description="AI workflow script generation timeout (seconds).",
+        description="AI workflow script generation attempt timeout (seconds), bounded by the shared 600-second generation deadline.",
     )
     workflow_session_create_timeout_s: int = Field(
         default=120,

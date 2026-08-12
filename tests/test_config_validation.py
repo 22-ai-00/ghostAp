@@ -272,8 +272,12 @@ class TestWorkflowTimeoutSettings:
         s = Settings(_env_file=None)
         assert s.workflow_total_timeout_s == 3600
         assert s.workflow_agent_call_timeout_s == 600
-        assert s.workflow_script_gen_timeout_s == 180
+        assert s.workflow_script_gen_timeout_s == 600
         assert s.workflow_session_create_timeout_s == 120
+
+        from src.workflow_engine.constants import SCRIPT_GEN_TIMEOUT_S
+
+        assert SCRIPT_GEN_TIMEOUT_S == s.workflow_script_gen_timeout_s
 
     def test_env_override_applied(self):
         s = Settings(
