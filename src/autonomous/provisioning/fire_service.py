@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import time
 from dataclasses import dataclass
 from threading import RLock
-from typing import Protocol
+from typing import Callable, Protocol
 
 from ..journal.frame import JournalEvent
 from ..journal.writer import CommitState, JournalWriter
@@ -105,14 +107,26 @@ class EmployeeFireService:
         writer: JournalWriter,
         authority: FireAuthority,
         effects: dict[str, FireEffectPort],
+        drain_reconcile_interval_seconds: float = 0.5,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         if set(effects) != set(FIRE_EFFECT_ORDER):
             raise ValueError("all fire effects must be configured exactly once")
+        interval = float(drain_reconcile_interval_seconds)
+        if not 0.5 <= interval <= 1.0:
+            raise ValueError(
+                "drain reconcile interval must be between 0.5 and 1.0 seconds"
+            )
+        if monotonic is not None and not callable(monotonic):
+            raise TypeError("monotonic must be callable")
         self._writer = writer
         self._authority = authority
         self._effects = dict(effects)
         self._mutex = RLock()
         self._pending_drains: set[str] = set()
+        self._drain_reconcile_interval = interval
+        self._monotonic = monotonic or time.monotonic
+        self._next_drain_reconcile_at = 0.0
 
     def start_fire(self, request: EmployeeFireRequest) -> DurableFireState:
         with self._mutex:
@@ -424,6 +438,14 @@ class EmployeeFireService:
         with self._mutex:
             if not self._pending_drains:
                 return ()
+            now = float(self._monotonic())
+            if not math.isfinite(now):
+                raise FireServiceError("drain reconcile clock is invalid")
+            if now < self._next_drain_reconcile_at:
+                return ()
+            self._next_drain_reconcile_at = (
+                now + self._drain_reconcile_interval
+            )
             progressed: list[DurableFireState] = []
             for intent_id in tuple(sorted(self._pending_drains)):
                 state = self._require(intent_id)
@@ -448,13 +470,39 @@ class EmployeeFireService:
             return tuple(progressed)
 
     def _track_drain(self, state: DurableFireState) -> None:
-        if state.drain and state.phase in {
-            FirePhase.RETIRING,
-            FirePhase.ACTION_REQUIRED,
-        }:
+        if (
+            state.drain
+            and state.phase in {FirePhase.RETIRING, FirePhase.ACTION_REQUIRED}
+            and state.effect_state("execution_quiesce")
+            in {FireEffectState.EXECUTING, FireEffectState.ACTION_REQUIRED}
+        ):
+            if state.intent_id not in self._pending_drains:
+                self._next_drain_reconcile_at = 0.0
             self._pending_drains.add(state.intent_id)
         else:
             self._pending_drains.discard(state.intent_id)
+            if not self._pending_drains:
+                self._next_drain_reconcile_at = 0.0
+
+    def _restore_committed_drain_fence(
+        self,
+        state: DurableFireState,
+    ) -> None:
+        if (
+            not state.drain
+            or state.phase not in {FirePhase.RETIRING, FirePhase.ACTION_REQUIRED}
+            or state.effect_state("execution_quiesce")
+            is not FireEffectState.COMMITTED
+        ):
+            return
+        try:
+            self._effects["execution_quiesce"].execute(state)
+        except Exception as exc:
+            raise FireServiceError(
+                "committed drain actor fence could not be restored"
+            ) from exc
+        if self._observe(state, "execution_quiesce") is not True:
+            raise FireServiceError("committed drain actor fence is unavailable")
 
     def _coalesce_equivalent(
         self,
@@ -501,6 +549,7 @@ class EmployeeFireService:
             recovered: list[DurableFireState] = []
             grouped: dict[tuple[str, str], list[DurableFireState]] = {}
             self._pending_drains.clear()
+            self._next_drain_reconcile_at = 0.0
             for state in self._states().values():
                 if state.phase is FirePhase.SUPERSEDED:
                     continue
@@ -510,6 +559,7 @@ class EmployeeFireService:
                 ).append(state)
             for identity in sorted(grouped):
                 state = self._coalesce_equivalent(grouped[identity])
+                self._restore_committed_drain_fence(state)
                 self._track_drain(state)
                 if state.phase is FirePhase.RETIRING:
                     current = self.resume(state.intent_id)

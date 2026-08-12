@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from src.autonomous.journal.blob_store import AesGcmEncryptionProvider, BlobStor
 from src.autonomous.journal.frame import JournalEvent
 from src.autonomous.journal.projections import ProjectionState, apply_frame
 from src.autonomous.provisioning.fire_authority import JournalFireAuthority
+from src.autonomous.provisioning.fire_effects import ExecutionQuiesceEffect
 from src.autonomous.provisioning.fire_service import (
     EmployeeFireRequest,
     EmployeeFireService,
@@ -19,6 +21,7 @@ from src.autonomous.provisioning.fire_service import (
 from src.autonomous.provisioning.fire_state import (
     FIRE_EFFECT_ORDER,
     FireCleanupMode,
+    FireEffectState,
     FirePhase,
 )
 from src.autonomous.provisioning.hire_state import (
@@ -75,6 +78,40 @@ class _Effect:
 
     def observe(self, _state):
         return True
+
+
+def _active_bound_fire_authority(tmp_path):
+    writer = make_writer(tmp_path)
+    state = ProjectionState()
+    commit_events(writer, state, employee_created())
+    commit_events(writer, state, *bot_binding_events())
+    commit_events(
+        writer,
+        state,
+        JournalEvent(
+            event_type="employee.state_changed",
+            aggregate_id="agt_1",
+            payload={"state": "active"},
+        ),
+    )
+    ingress = EmployeeIngressService(
+        writer=writer,
+        blob_store=BlobStore(
+            tmp_path / "blobs",
+            AesGcmEncryptionProvider(
+                lambda _key: b"fire-ingress-data-key-32-bytes!!"
+            ),
+        ),
+        ingress_state=IngressProjectionState(),
+        active_key_id="k1",
+    )
+    authority = JournalFireAuthority(
+        writer=writer,
+        hire_service=_HireProjectionOwner(state),
+        ingress_service=ingress,
+        admin_principal_ids=frozenset({"ou_admin"}),
+    )
+    return writer, state, ingress, authority
 
 
 def test_reconcile_draining_is_constant_time_without_pending_drains() -> None:
@@ -360,6 +397,196 @@ def test_drain_waits_without_action_required_then_auto_reconciles(tmp_path):
     assert reconciled[0].phase is FirePhase.ARCHIVED
     assert retired == ["agt_1"]
     assert calls == list(FIRE_EFFECT_ORDER[1:])
+    assert state.employees["agt_1"].state.value == "archived"
+    ingress.close()
+    writer.close()
+
+
+def test_drain_action_required_after_quiesce_is_not_polled_again(tmp_path):
+    writer, _state, ingress, authority = _active_bound_fire_authority(tmp_path)
+
+    class _CountingWriter:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.replay_count = 0
+
+        def replay(self, *args, **kwargs):
+            self.replay_count += 1
+            return self.wrapped.replay(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+    class _UnresolvedCleanup:
+        def execute(self, _state):
+            raise RuntimeError("cleanup unavailable")
+
+        def observe(self, _state):
+            return False
+
+    counting_writer = _CountingWriter(writer)
+    effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    effects["slash_cleanup"] = _UnresolvedCleanup()
+    service = EmployeeFireService(
+        writer=counting_writer,
+        authority=authority,
+        effects=effects,
+    )
+    waiting = service.start_fire(
+        EmployeeFireRequest(
+            employee="Atlas",
+            tenant_key="tenant_1",
+            message_id="om_fire_drain_cleanup_failure",
+            chat_id="oc_dm",
+            requester_principal_id="ou_admin",
+            drain=True,
+        )
+    )
+    counting_writer.replay_count = 0
+
+    assert waiting.phase is FirePhase.ACTION_REQUIRED
+    assert waiting.effect_state("execution_quiesce") is FireEffectState.COMMITTED
+    assert waiting.effect_state("slash_cleanup") is FireEffectState.ACTION_REQUIRED
+    assert service.reconcile_draining() == ()
+    assert service.reconcile_draining() == ()
+    assert counting_writer.replay_count == 0
+    ingress.close()
+    writer.close()
+
+
+def test_pending_drain_reconciliation_is_throttled_but_converges_on_due_poll(
+    tmp_path,
+):
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+    now = 10.0
+    active = True
+    quiesce_calls: list[str] = []
+
+    def monotonic() -> float:
+        return now
+
+    class _DrainEffect:
+        def execute(self, _state):
+            quiesce_calls.append("execute")
+
+        def observe(self, _state):
+            return not active
+
+    effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    effects["execution_quiesce"] = _DrainEffect()
+    service = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects=effects,
+        drain_reconcile_interval_seconds=0.5,
+        monotonic=monotonic,
+    )
+    waiting = service.start_fire(
+        EmployeeFireRequest(
+            employee="Atlas",
+            tenant_key="tenant_1",
+            message_id="om_fire_throttled_drain",
+            chat_id="oc_dm",
+            requester_principal_id="ou_admin",
+            drain=True,
+        )
+    )
+    quiesce_calls.clear()
+
+    assert waiting.phase is FirePhase.RETIRING
+    assert service.reconcile_draining() == ()
+    assert quiesce_calls == ["execute"]
+
+    assert service.reconcile_draining() == ()
+    now += 0.49
+    assert service.reconcile_draining() == ()
+    assert quiesce_calls == ["execute"]
+
+    active = False
+    now += 0.01
+    reconciled = service.reconcile_draining()
+    assert len(reconciled) == 1
+    assert reconciled[0].phase is FirePhase.ARCHIVED
+    assert quiesce_calls == ["execute", "execute"]
+    assert state.employees["agt_1"].state.value == "archived"
+    ingress.close()
+    writer.close()
+
+
+def test_recovery_reinstalls_committed_drain_actor_fence_before_cleanup(tmp_path):
+    writer, state, ingress, authority = _active_bound_fire_authority(tmp_path)
+
+    class _SimulatedCrash(BaseException):
+        pass
+
+    class _CrashDuringCleanup:
+        def execute(self, _state):
+            raise _SimulatedCrash
+
+        def observe(self, _state):
+            return False
+
+    initial_effects = {name: _Effect(name, []) for name in FIRE_EFFECT_ORDER}
+    initial_effects["slash_cleanup"] = _CrashDuringCleanup()
+    initial = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects=initial_effects,
+    )
+    with pytest.raises(_SimulatedCrash):
+        initial.start_fire(
+            EmployeeFireRequest(
+                employee="Atlas",
+                tenant_key="tenant_1",
+                message_id="om_fire_restart_after_quiesce",
+                chat_id="oc_dm",
+                requester_principal_id="ou_admin",
+                drain=True,
+            )
+        )
+
+    order: list[str] = []
+    retired: set[str] = set()
+
+    class _Runtime:
+        def retire_employee(self, agent_id):
+            order.append("retire_actor")
+            retired.add(agent_id)
+
+        def is_retired(self, agent_id):
+            return agent_id in retired
+
+    runtime = _Runtime()
+
+    class _FenceAwareCleanup:
+        def execute(self, _state):
+            pytest.fail("an already executing cleanup must be observed, not repeated")
+
+        def observe(self, fire_state):
+            order.append("observe_cleanup")
+            return runtime.is_retired(fire_state.agent_id)
+
+    restarted_effects = {name: _Effect(name, order) for name in FIRE_EFFECT_ORDER}
+    restarted_effects["execution_quiesce"] = ExecutionQuiesceEffect(
+        SimpleNamespace(
+            state=SimpleNamespace(attempts={}),
+            employee_runtime=runtime,
+        ),
+        grace_seconds=0,
+    )
+    restarted_effects["slash_cleanup"] = _FenceAwareCleanup()
+    restarted = EmployeeFireService(
+        writer=writer,
+        authority=authority,
+        effects=restarted_effects,
+    )
+
+    recovered = restarted.recover()
+
+    assert len(recovered) == 1
+    assert recovered[0].phase is FirePhase.ARCHIVED
+    assert order[:2] == ["retire_actor", "observe_cleanup"]
+    assert retired == {"agt_1"}
     assert state.employees["agt_1"].state.value == "archived"
     ingress.close()
     writer.close()
