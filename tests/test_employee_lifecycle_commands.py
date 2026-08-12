@@ -441,6 +441,8 @@ def test_memory_redacts_credentials_and_absolute_paths_before_delivery() -> None
         content=(
             'api_key="plain-secret-value"\n'
             '{"nested":{"client_secret":"nested-secret-value"}}\n'
+            "password='top secret phrase'\n"
+            '{"client_secret":"unterminated-secret-value\n'
             "workspace=/data00/home/alice/private/project/config.yaml\n"
             "windows=C:\\Users\\alice\\private\\settings.json"
         ),
@@ -453,6 +455,9 @@ def test_memory_redacts_credentials_and_absolute_paths_before_delivery() -> None
     for forbidden in (
         "plain-secret-value",
         "nested-secret-value",
+        "top secret phrase",
+        "secret phrase",
+        "unterminated-secret-value",
         "/data00/home/alice/private/project/config.yaml",
         "C:\\Users\\alice\\private\\settings.json",
     ):

@@ -84,8 +84,12 @@ _WINDOWS_ABSOLUTE_PATH = re.compile(
 )
 _QUOTED_SECRET_VALUE = re.compile(
     r'''(?ix)
-    (["']?[^\s"']*(?:token|secret|password|passwd|credential|api[_-]?key|private[_-]?key)[^\s"']*["']?\s*[:=]\s*)
-    (["'])[^"'\n]*\2
+    (
+        ["']?[A-Z0-9_.-]{0,64}
+        (?:token|secret|password|passwd|credential|api[_-]?key|private[_-]?key)
+        [A-Z0-9_.-]{0,64}["']?\s*[:=]\s*
+    )
+    (["'])[^"'\n]*(?:\2|(?=\n|\Z))
     '''
 )
 
@@ -198,8 +202,10 @@ class EmployeeHandler(BaseHandler):
             for character in text
             if character in {"\n", "\t"} or ord(character) >= 32
         )
-        text = redact_sensitive(text)
+        # Redact the complete quoted value before the generic scanner can
+        # partially replace a whitespace-delimited prefix and expose its tail.
         text = _QUOTED_SECRET_VALUE.sub(r"\1\2<redacted>\2", text)
+        text = redact_sensitive(text)
         text = _POSIX_ABSOLUTE_PATH.sub("<redacted:path>", text)
         text = _WINDOWS_ABSOLUTE_PATH.sub("<redacted:path>", text)
         if len(text) <= limit:
