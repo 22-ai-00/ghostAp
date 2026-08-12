@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import math
 import re
 import threading
@@ -26,7 +28,11 @@ from ..workforce.projection import (
     workforce_projection_guard,
 )
 from .callback_bridge import AsyncCallbackBridge
-from .hire_port import EmployeeHireRequest, EmployeeRoleUpdateRequest
+from .hire_port import (
+    EmployeeHireRequest,
+    EmployeeRoleUpdateRequest,
+    complete_employee_hire_request,
+)
 from .hire_state import (
     DurableHireState,
     HireEffectState,
@@ -107,6 +113,15 @@ RegistrationLinkCallback = Callable[
 RegistrationStatusCallback = Callable[
     [DurableHireState, str], object | Awaitable[object]
 ]
+
+
+def _stable_id(prefix: str, tenant_key: str, message_id: str) -> str:
+    canonical = json.dumps(
+        [prefix, tenant_key, message_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{prefix}_{hashlib.sha256(canonical).hexdigest()}"
 
 
 
@@ -330,6 +345,156 @@ class ProductionEmployeeHireService:
         self._reconcile_recovered_hires()
         with self.employee_dispatch_guard():
             return self._hire_projection
+
+    def start_hire(self, request: EmployeeHireRequest) -> DurableHireState:
+        """Authorize and durably admit one visible employee before submission."""
+
+        try:
+            request = complete_employee_hire_request(request)
+        except (TypeError, ValueError):
+            raise HireAdmissionError("invalid employee profile") from None
+        self._validate_request(request)
+        intent_id = _stable_id("hire", request.tenant_key, request.message_id)
+        submit_after_commit = False
+        with self.employee_dispatch_guard(), self._writer.transaction_guard():
+            self._synchronize_projection_to_journal_locked()
+            try:
+                raw_admins = self._admin_principal_ids_provider()
+                if not isinstance(raw_admins, (frozenset, set, tuple, list)):
+                    raise TypeError("invalid admin provider result")
+                admins = frozenset(raw_admins)
+                if any(
+                    not isinstance(admin, str)
+                    or not admin
+                    or admin != admin.strip()
+                    for admin in admins
+                ):
+                    raise TypeError("invalid admin provider result")
+            except Exception:
+                raise HireAdmissionError("employee hire is not authorized") from None
+            if request.requester_principal_id not in admins:
+                raise HireAdmissionError("employee hire is not authorized")
+            if self._closed:
+                raise HireAdmissionError("closed")
+            if self._admission_closed:
+                raise HireAdmissionError("admission_closed")
+            existing = self._hire_projection.get(intent_id)
+            if existing is not None:
+                if not self._matches_request(existing, request):
+                    raise HireAdmissionError("hire idempotency conflict")
+                submit_after_commit = (
+                    self._provisioning_submitter is not None
+                    and self.readiness().ready
+                    and existing.phase
+                    in {
+                        HirePhase.PROVISIONING_APP,
+                        HirePhase.STORING_CREDENTIAL,
+                        HirePhase.CONFIGURING,
+                        HirePhase.VALIDATING,
+                    }
+                )
+                admitted = existing
+            else:
+                readiness = self.readiness()
+                if not readiness.ready:
+                    raise HireAdmissionError(",".join(readiness.blockers))
+                if request.existing_app_id and self._app_id_assigned_locked(
+                    request.existing_app_id
+                ):
+                    raise HireAdmissionError("existing app already assigned")
+                visible_count = sum(
+                    employee.worker_type is WorkerType.VISIBLE
+                    and employee.state is not EmployeeState.ARCHIVED
+                    for employee in self._projection_state.employees.values()
+                )
+                if visible_count >= self._visible_employee_limit:
+                    raise HireAdmissionError(
+                        "visible_employee_limit capacity reached"
+                    )
+                agent_id = _stable_id("agt", request.tenant_key, request.message_id)
+                bot_principal_id = _stable_id(
+                    "bot",
+                    request.tenant_key,
+                    request.message_id,
+                )
+                attempt_id = _stable_id(
+                    "attempt",
+                    request.tenant_key,
+                    request.message_id,
+                )
+                created = JournalEvent(
+                    event_type="employee.created",
+                    aggregate_id=agent_id,
+                    payload={
+                        "agent_id": agent_id,
+                        "tenant_key": request.tenant_key,
+                        "owner_principal_id": request.requester_principal_id,
+                        "requester_union_id": request.requester_union_id,
+                        "name": request.employee_name,
+                        "tool": request.tool,
+                        "model": request.model,
+                        "profile": request.profile,
+                        "effort": request.effort,
+                        "role": request.role,
+                        "persona": request.persona,
+                        "personality_traits": list(request.personality_traits),
+                        "capabilities": list(request.capabilities),
+                        "permissions": list(request.permissions),
+                        "existing_app_id": request.existing_app_id,
+                        "worker_type": WorkerType.VISIBLE.value,
+                        "state": EmployeeState.PROVISIONING_APP.value,
+                        "hire_schema_version": 2,
+                        "hire_intent_id": intent_id,
+                        "hire_message_id": request.message_id,
+                        "hire_chat_id": request.chat_id,
+                        "planned_bot_principal_id": bot_principal_id,
+                        "provisioning_attempt_id": attempt_id,
+                    },
+                )
+                name_owner_id = self._projection_state.employee_name_keys.get(
+                    (request.tenant_key, request.employee_name.casefold())
+                )
+                name_owner = (
+                    self._projection_state.employees.get(name_owner_id)
+                    if name_owner_id is not None
+                    else None
+                )
+                release_events = (
+                    (
+                        JournalEvent(
+                            event_type="employee.name_released",
+                            aggregate_id=name_owner.agent_id,
+                            payload={"name": name_owner.name},
+                        ),
+                    )
+                    if name_owner is not None
+                    and name_owner.state is EmployeeState.ARCHIVED
+                    else ()
+                )
+                try:
+                    commit_workforce_events_unlocked(
+                        self._writer,
+                        self._projection_state,
+                        (*release_events, created),
+                    )
+                except ProjectionError as exc:
+                    detail = "name" if "name" in str(exc).casefold() else "projection"
+                    raise HireAdmissionError(f"hire {detail} conflict") from exc
+                self._hire_projection = HireProjection.rebuild(self._writer.replay())
+                admitted = self._hire_projection.get(intent_id)
+                if admitted is None:
+                    raise HireAdmissionError(
+                        "anchored hire admission did not replay"
+                    )
+                submit_after_commit = self._provisioning_submitter is not None
+        if submit_after_commit and self._provisioning_submitter is not None:
+            try:
+                self._provisioning_submitter(admitted.intent_id)
+            except Exception:
+                raise HireAdmissionError(
+                    "provisioning submission failed after durable admission"
+                ) from None
+        return admitted
 
     @staticmethod
     def _single_event_frame_matches(
@@ -1493,7 +1658,6 @@ class ProductionEmployeeHireService:
             "tenant_key": request.tenant_key,
             "employee_name": request.employee_name,
             "tool": request.tool,
-            "model": request.model,
             "effort": request.effort,
             "profile": request.profile,
             "chat_id": request.chat_id,
@@ -1503,6 +1667,11 @@ class ProductionEmployeeHireService:
         for field_name, value in required.items():
             if not isinstance(value, str) or not value.strip():
                 raise HireAdmissionError(f"{field_name} is required")
+        if (
+            not isinstance(request.model, str)
+            or request.model != request.model.strip()
+        ):
+            raise HireAdmissionError("invalid employee model selection")
         if not isinstance(request.role, str) or not isinstance(request.persona, str):
             raise HireAdmissionError("role and persona must be strings")
         if (
@@ -1525,6 +1694,7 @@ class ProductionEmployeeHireService:
             raise HireAdmissionError("existing_app_id is invalid")
         if (
             not isinstance(request.requester_union_id, str)
+            or not request.requester_union_id
             or request.requester_union_id != request.requester_union_id.strip()
         ):
             raise HireAdmissionError("requester_union_id is invalid")

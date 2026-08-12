@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    pass
+    from .hire_state import DurableHireState
 
 
 @dataclass(frozen=True)
@@ -228,7 +228,9 @@ def complete_employee_hire_request(request: EmployeeHireRequest) -> EmployeeHire
 
 
 class EmployeeHireService(Protocol):
-    pass
+    def start_hire(self, request: EmployeeHireRequest) -> DurableHireState:
+        """Start a durable hire workflow and submit it asynchronously."""
+        ...
 
 
 __all__ = [

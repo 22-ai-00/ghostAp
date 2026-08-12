@@ -136,6 +136,14 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/employee-role": lambda m, c, t, p: self.employee.update_employee_role(
                 m, c, ""
             ),
+            "/hire": lambda m, c, t, p: self.employee.hire_employee(m, c, ""),
+            "/fire": lambda m, c, t, p: self.employee.fire_employee(m, c, ""),
+            "/history": lambda m, c, t, p: self.employee.show_employee_history(
+                m, c, ""
+            ),
+            "/employee-memory": lambda m, c, t, p: self.employee.show_employee_memory(
+                m, c, ""
+            ),
         }
 
         # Prefix match handlers: prefix -> handler_func(message_id, chat_id, text, project)
@@ -150,6 +158,38 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             (
                 "/employee-role",
                 lambda m, c, t, p: self.employee.update_employee_role(
+                    m,
+                    c,
+                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
+                ),
+            ),
+            (
+                "/hire",
+                lambda m, c, t, p: self.employee.hire_employee(
+                    m,
+                    c,
+                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
+                ),
+            ),
+            (
+                "/fire",
+                lambda m, c, t, p: self.employee.fire_employee(
+                    m,
+                    c,
+                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
+                ),
+            ),
+            (
+                "/history",
+                lambda m, c, t, p: self.employee.show_employee_history(
+                    m,
+                    c,
+                    (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
+                ),
+            ),
+            (
+                "/employee-memory",
+                lambda m, c, t, p: self.employee.show_employee_memory(
                     m,
                     c,
                     (SlashCommandParser.parse(t).args if SlashCommandParser.parse(t) else ""),
@@ -371,6 +411,10 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/access",
             "/employees",
             "/employee-role",
+            "/hire",
+            "/fire",
+            "/history",
+            "/employee-memory",
             "/btw",
             "/goals",
             "/runs",
@@ -392,6 +436,10 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/setadmin",
             "/access",
             "/employee-role",
+            "/hire",
+            "/fire",
+            "/history",
+            "/employee-memory",
             "/goal",
             "/approve",
             "/runs",

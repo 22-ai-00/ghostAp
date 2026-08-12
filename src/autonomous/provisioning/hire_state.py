@@ -183,6 +183,13 @@ def _required_string(payload: Mapping[str, object], key: str) -> str:
     return value
 
 
+def _model_string(payload: Mapping[str, object]) -> str:
+    value = payload.get("model")
+    if not isinstance(value, str):
+        raise HireProjectionError("model must be a string")
+    return value
+
+
 def _created_state(event: JournalEvent, sequence: int) -> DurableHireState | None:
     payload = event.payload
     if event.event_type != "employee.created" or "hire_intent_id" not in payload:
@@ -217,7 +224,7 @@ def _created_state(event: JournalEvent, sequence: int) -> DurableHireState | Non
         requester_union_id=requester_union_id,
         employee_name=_required_string(payload, "name"),
         tool=_required_string(payload, "tool"),
-        model=_required_string(payload, "model"),
+        model=_model_string(payload),
         effort=_required_string(payload, "effort"),
         profile=_required_string(payload, "profile"),
         role=str(payload.get("role", "")),
