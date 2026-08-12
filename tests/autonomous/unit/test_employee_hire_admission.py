@@ -495,3 +495,122 @@ def test_canonical_employee_tools_accept_backend_default_model(
     assert admitted.tool == tool
     assert admitted.model == ""
     assert len(tuple(writer.replay())) == 1
+
+
+def test_provider_registry_extension_is_not_an_employee_tool_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.acp.providers as providers
+
+    monkeypatch.setattr(
+        providers,
+        "get_providers",
+        lambda: {"traex": object(), "custom-provider": object()},
+    )
+    service, writer, _projection = _service(
+        tmp_path,
+        visible_employee_limit=1,
+    )
+
+    with pytest.raises(HireAdmissionError, match="tool"):
+        service.start_hire(
+            replace(
+                _request(model=""),
+                tool="custom-provider",
+                effort="default",
+            )
+        )
+
+    assert tuple(writer.replay()) == ()
+    admitted = service.start_hire(_request(model=""))
+    assert admitted.tool == "traex"
+    assert len(tuple(writer.replay())) == 1
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "software\nengineer",
+        "software\tengineer",
+        "software\x00engineer",
+        "software\x7fengineer",
+    ],
+)
+def test_registration_description_control_characters_are_rejected_before_admission(
+    tmp_path: Path,
+    role: str,
+) -> None:
+    service, writer, _projection = _service(
+        tmp_path,
+        visible_employee_limit=1,
+    )
+
+    with pytest.raises(HireAdmissionError, match="description"):
+        service.start_hire(replace(_request(), role=role))
+
+    assert tuple(writer.replay()) == ()
+    admitted = service.start_hire(_request())
+    assert admitted.role == "software engineer"
+    assert len(tuple(writer.replay())) == 1
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"profile": " standard"},
+        {"profile": "standard "},
+        {"effort": " high"},
+        {"effort": "high "},
+    ],
+)
+def test_backend_default_model_does_not_normalize_invalid_profile_or_effort(
+    tmp_path: Path,
+    changes: dict[str, object],
+) -> None:
+    service, writer, _projection = _service(
+        tmp_path,
+        visible_employee_limit=1,
+    )
+
+    with pytest.raises(HireAdmissionError, match="model"):
+        service.start_hire(replace(_request(model=""), **changes))
+
+    assert tuple(writer.replay()) == ()
+    admitted = service.start_hire(_request(model=""))
+    assert admitted.model == ""
+    assert len(tuple(writer.replay())) == 1
+
+
+@pytest.mark.parametrize("employee_name", [None, 123, b"Atlas", ["Atlas"]])
+def test_registration_employee_name_requires_a_string_without_capacity_use(
+    tmp_path: Path,
+    employee_name: object,
+) -> None:
+    service, writer, _projection = _service(
+        tmp_path,
+        visible_employee_limit=1,
+    )
+
+    with pytest.raises(HireAdmissionError, match="employee_name|name"):
+        service.start_hire(replace(_request(), employee_name=employee_name))  # type: ignore[arg-type]
+
+    assert tuple(writer.replay()) == ()
+    assert service.start_hire(_request()).employee_name == "Atlas"
+
+
+@pytest.mark.parametrize(
+    "employee_name",
+    ["Atlas Prime", "阿特拉斯", "工程师 Atlas", "Atlas\u3000Prime"],
+)
+def test_registration_employee_name_preserves_unicode_and_internal_space(
+    tmp_path: Path,
+    employee_name: str,
+) -> None:
+    service, writer, projection = _service(tmp_path)
+
+    admitted = service.start_hire(_request(employee_name=employee_name))
+
+    assert admitted.employee_name == employee_name
+    assert projection.employees[admitted.agent_id].name == employee_name
+    assert tuple(writer.replay())

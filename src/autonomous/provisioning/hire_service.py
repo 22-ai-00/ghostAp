@@ -65,6 +65,10 @@ _EFFECT_METADATA_KEYS = frozenset(
     }
 )
 
+_CANONICAL_EMPLOYEE_TOOLS = frozenset(
+    {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok"}
+)
+
 
 class HireAdmissionError(RuntimeError):
     """A visible employee request was rejected before external activity."""
@@ -1667,15 +1671,25 @@ class ProductionEmployeeHireService:
         for field_name, value in required.items():
             if not isinstance(value, str) or not value.strip():
                 raise HireAdmissionError(f"{field_name} is required")
+        registration_description = (
+            request.role or request.persona or "GhostAP employee"
+        )
         try:
-            registration_name = RegistrationRequest(
+            registration_request = RegistrationRequest(
                 name=request.employee_name,
-                description="GhostAP employee",
-            ).name
+                description=registration_description,
+            )
         except (TypeError, ValueError):
-            raise HireAdmissionError("invalid employee name") from None
-        if registration_name != request.employee_name:
-            raise HireAdmissionError("invalid employee name")
+            raise HireAdmissionError(
+                "invalid employee registration name or description"
+            ) from None
+        if (
+            registration_request.name != request.employee_name
+            or registration_request.description != registration_description
+        ):
+            raise HireAdmissionError(
+                "invalid employee registration name or description"
+            )
         try:
             from src.acp.providers import get_providers
 
@@ -1685,6 +1699,7 @@ class ProductionEmployeeHireService:
         if (
             not isinstance(configured_tools, Mapping)
             or request.tool != request.tool.strip().casefold()
+            or request.tool not in _CANONICAL_EMPLOYEE_TOOLS
             or request.tool not in configured_tools
         ):
             raise HireAdmissionError("invalid employee tool selection")
@@ -1692,6 +1707,11 @@ class ProductionEmployeeHireService:
             not isinstance(request.model, str)
             or request.model != request.model.strip()
             or any(character.isspace() for character in request.model)
+        ):
+            raise HireAdmissionError("invalid employee model selection")
+        if (
+            request.profile != request.profile.strip().casefold()
+            or request.effort != request.effort.strip().casefold()
         ):
             raise HireAdmissionError("invalid employee model selection")
         if not isinstance(request.role, str) or not isinstance(request.persona, str):
