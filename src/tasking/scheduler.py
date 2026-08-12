@@ -1,11 +1,13 @@
 import contextvars
 import logging
+import math
+import queue
 import sys
 import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from enum import Enum, IntEnum
 from typing import Any, Callable, ContextManager, Deque, Optional
@@ -189,16 +191,67 @@ class _QueuedTask(BaseModel):
     context: contextvars.Context
 
 
+class _TaskCompletion:
+    """One-shot terminal event retained by the public task handle."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()  # leaf lock: never acquires scheduler state
+        self._event: TaskEvent | None = None
+        self._callbacks: list[Callable[[TaskEvent], None]] = []
+
+    def add_done_callback(self, callback: Callable[[TaskEvent], None]) -> None:
+        if not callable(callback):
+            raise TypeError("callback must be callable")
+        with self._lock:
+            event = self._event
+            if event is None:
+                self._callbacks.append(callback)
+                return
+        self._invoke(callback, event)
+
+    def complete(self, event: TaskEvent) -> tuple[Callable[[TaskEvent], None], ...]:
+        with self._lock:
+            if self._event is not None:
+                return ()
+            self._event = event
+            callbacks = tuple(self._callbacks)
+            self._callbacks.clear()
+            return callbacks
+
+    @staticmethod
+    def _invoke(callback: Callable[[TaskEvent], None], event: TaskEvent) -> None:
+        try:
+            callback(event)
+        except BaseException:
+            logger.debug("task completion callback raised an exception", exc_info=True)
+
+
 class TaskHandle:
     """Non-blocking task identity and cancellation handle."""
 
-    def __init__(self, scheduler: "TaskScheduler", run_id: str):
+    def __init__(
+        self,
+        scheduler: "TaskScheduler",
+        run_id: str,
+        completion: _TaskCompletion,
+    ):
         self._scheduler = scheduler
         self.run_id = run_id
+        self._completion = completion
 
     def cancel(self) -> bool:
         """请求取消任务。"""
         return self._scheduler.cancel(self.run_id)
+
+    def add_done_callback(self, callback: Callable[[TaskEvent], None]) -> None:
+        """Run *callback* once with the immutable terminal event.
+
+        Registration is race-free with completion.  A late registration is
+        replayed immediately and does not depend on scheduler history retention.
+        Callback failures are isolated from task accounting.
+        """
+
+        self._completion.add_done_callback(callback)
 
 class TaskScheduler:
     """Thread-safe scheduler with project serialization and a system fast lane."""
@@ -225,6 +278,7 @@ class TaskScheduler:
         thread_name_prefix: str = "task_worker",
         run_guard: Optional[Callable[[], ContextManager[Any]]] = None,
         run_guard_cancel: Optional[Callable[[], None]] = None,
+        run_guard_timeout_s: float | None = None,
     ):
         if max_concurrent <= 0:
             raise ValueError("max_concurrent must be > 0")
@@ -238,15 +292,32 @@ class TaskScheduler:
             raise ValueError("max_pending_system must be > 0")
         if max_terminal_history <= 0:
             raise ValueError("max_terminal_history must be > 0")
-
+        if run_guard_timeout_s is not None and (
+            not isinstance(run_guard_timeout_s, (int, float))
+            or isinstance(run_guard_timeout_s, bool)
+            or not math.isfinite(run_guard_timeout_s)
+            or run_guard_timeout_s <= 0
+        ):
+            raise ValueError("run_guard_timeout_s must be finite and > 0")
         self._max_concurrent = max_concurrent
         self._per_key = per_key_concurrency
         self._system_concurrency = system_concurrency
         self._max_pending_normal = max_pending_normal
         self._max_pending_system = max_pending_system
         self._max_terminal_history = max_terminal_history
+        self._run_guard_timeout_s = (
+            float(run_guard_timeout_s) if run_guard_timeout_s is not None else None
+        )
         self._run_guard = run_guard or nullcontext
         guard_owner = getattr(run_guard, "__self__", None)
+        cancellable_run_guard = getattr(
+            guard_owner,
+            "cancellable_task_guard",
+            None,
+        )
+        self._cancellable_run_guard = (
+            cancellable_run_guard if callable(cancellable_run_guard) else None
+        )
         self._run_guard_cancel = run_guard_cancel or getattr(
             guard_owner,
             "cancel_waiters",
@@ -272,9 +343,28 @@ class TaskScheduler:
         self._pending_normal = 0
         self._pending_system = 0
         self._active_run_ids: set[str] = set()
+        self._worker_futures: dict[str, Future[Any]] = {}
+        self._worker_started: set[str] = set()
         self._states: dict[str, TaskRunState] = {}
         self._terminal_order: Deque[str] = deque()
+        self._completions: dict[str, _TaskCompletion] = {}
         self._listeners: list[Callable[[TaskEvent], None]] = []
+        self._listener_inflight: dict[int, int] = {}
+        self._event_queue: queue.Queue[
+            tuple[
+                TaskEvent,
+                tuple[Callable[[TaskEvent], None], ...],
+                tuple[Callable[[TaskEvent], None], ...],
+            ]
+            | None
+        ] = queue.Queue()
+        self._event_dispatch_stopping = False
+        self._event_dispatcher = threading.Thread(
+            target=self._event_dispatch_loop,
+            name="task_scheduler_events",
+            daemon=True,
+        )
+        self._event_dispatcher.start()
 
         self._rate_limiters: dict[str, RateLimiter] = {}
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
@@ -309,13 +399,25 @@ class TaskScheduler:
             self._listeners.append(listener)
 
     def remove_listener(self, listener: Callable[[TaskEvent], None]) -> bool:
-        """Remove every matching listener and report whether one was present."""
+        """Remove every match and quiesce callbacks already in progress."""
 
-        with self._lock:
+        with self._cv:
+            removed_ids = {
+                id(registered)
+                for registered in self._listeners
+                if registered == listener
+            }
             retained = [registered for registered in self._listeners if registered != listener]
             if len(retained) == len(self._listeners):
                 return False
             self._listeners = retained
+            if threading.current_thread() is not self._event_dispatcher:
+                self._cv.wait_for(
+                    lambda: not any(
+                        self._listener_inflight.get(listener_id, 0)
+                        for listener_id in removed_ids
+                    )
+                )
             return True
 
     @staticmethod
@@ -416,6 +518,7 @@ class TaskScheduler:
                 assigned_queue_key=key,
                 project_serial_key=self._build_project_serial_key(spec.chat_id, spec.project_id),
             )
+            completion = _TaskCompletion()
             item = _QueuedTask(
                 run_id=run_id,
                 spec=spec,
@@ -423,6 +526,7 @@ class TaskScheduler:
                 context=contextvars.copy_context(),
             )
             self._states[run_id] = state
+            self._completions[run_id] = completion
             if spec.task_id:
                 self._by_task_id[spec.task_id] = run_id
             self._by_chat[spec.chat_id].append(run_id)
@@ -433,7 +537,7 @@ class TaskScheduler:
             self._emit(state)
             self._cv.notify_all()
 
-        return TaskHandle(self, run_id)
+        return TaskHandle(self, run_id, completion)
 
     def update_project_id(self, run_id: str, project_id: Optional[str]) -> bool:
         """Best-effort update of project_id for an existing task.
@@ -488,6 +592,7 @@ class TaskScheduler:
         - 若任务仍在队列中：移除并标记为 `CANCELED`。
         - 若任务已在运行：仅设置取消令牌，任务需主动检查。
         """
+        future_to_cancel: Future[Any] | None = None
         with self._cv:
             state = self._states.get(run_id)
             if not state:
@@ -503,8 +608,12 @@ class TaskScheduler:
                 self._cv.notify_all()
                 return True
 
+            if run_id not in self._worker_started:
+                future_to_cancel = self._worker_futures.get(run_id)
             self._cv.notify_all()
-            return True
+        if future_to_cancel is not None:
+            future_to_cancel.cancel()
+        return True
 
     def update_progress(self, run_id: str, *, message: str, percent: Optional[float] = None):
         """更新任务进度（仅 RUNNING 状态有效）。"""
@@ -585,6 +694,7 @@ class TaskScheduler:
         self.fence_admission()
         with self._cv:
             self._stopped = True
+            self._maybe_stop_event_dispatcher_unlocked()
             self._cv.notify_all()
         if wait or shutdown_executor:
             self._dispatcher.join(timeout=2)
@@ -594,6 +704,8 @@ class TaskScheduler:
                     executor.shutdown(wait=False, cancel_futures=True)
                 except Exception:
                     logger.debug("failed to shutdown executor", exc_info=True)
+        if wait and self._event_dispatch_stopping:
+            self._event_dispatcher.join(timeout=2)
 
     def fence_admission(self) -> None:
         """Reject new work and cancel work that has not entered its callback.
@@ -604,11 +716,19 @@ class TaskScheduler:
         shutdown proceeds.
         """
 
+        futures_to_cancel: list[Future[Any]] = []
         with self._cv:
             if not self._admission_fenced:
                 self._admission_fenced = True
                 self._drain_queued_tasks_unlocked()
+                futures_to_cancel = [
+                    future
+                    for run_id, future in self._worker_futures.items()
+                    if run_id not in self._worker_started
+                ]
                 self._cv.notify_all()
+        for future in futures_to_cancel:
+            future.cancel()
         if callable(self._run_guard_cancel):
             try:
                 self._run_guard_cancel()
@@ -619,6 +739,7 @@ class TaskScheduler:
         """Request cooperative cancellation for every non-terminal worker."""
 
         canceled = 0
+        futures_to_cancel: list[Future[Any]] = []
         with self._cv:
             for state in self._states.values():
                 if state.status != TaskStatus.RUNNING:
@@ -626,7 +747,13 @@ class TaskScheduler:
                 if not state.cancellation.is_canceled:
                     state.cancellation.cancel()
                     canceled += 1
+                if state.run_id not in self._worker_started:
+                    future = self._worker_futures.get(state.run_id)
+                    if future is not None:
+                        futures_to_cancel.append(future)
             self._cv.notify_all()
+        for future in futures_to_cancel:
+            future.cancel()
         return canceled
 
     def wait_for_idle(self, timeout: float) -> bool:
@@ -661,21 +788,20 @@ class TaskScheduler:
             self._remove_state_unlocked(run_id, state)
             removed += 1
 
-        deferred_active: list[str] = []
         terminal_count = len(self._terminal_order)
         while terminal_count > self._max_terminal_history and self._terminal_order:
-            run_id = self._terminal_order.popleft()
+            run_id = self._terminal_order[0]
             state = self._states.get(run_id)
             if state is None:
+                self._terminal_order.popleft()
                 terminal_count -= 1
                 continue
             if run_id in self._active_run_ids:
-                deferred_active.append(run_id)
-                continue
+                break
+            self._terminal_order.popleft()
             self._remove_state_unlocked(run_id, state)
             terminal_count -= 1
             removed += 1
-        self._terminal_order.extendleft(reversed(deferred_active))
         return removed
 
     def _remove_state_unlocked(self, run_id: str, state: TaskRunState) -> None:
@@ -694,6 +820,8 @@ class TaskScheduler:
         - 选择策略：优先 SYSTEM 队列（高并发），否则按队列公平选择（尽量避免饥饿）
         """
         while True:
+            future_to_observe: Future[Any] | None = None
+            observed_task: _QueuedTask | None = None
             with self._cv:
                 if self._stopped:
                     return
@@ -729,7 +857,15 @@ class TaskScheduler:
                     self._release_running_slot_unlocked(task)
                     self._cv.notify_all()
                     continue
-                del fut
+                self._worker_futures[task.run_id] = fut
+                future_to_observe = fut
+                observed_task = task
+            if future_to_observe is not None and observed_task is not None:
+                future_to_observe.add_done_callback(
+                    lambda future, run_id=observed_task.run_id, task=observed_task: (
+                        self._on_worker_future_done(run_id, task, future)
+                    )
+                )
 
     def _is_system_queue(self, key: str) -> bool:
         """判断队列 key 是否为系统快通道。"""
@@ -795,7 +931,31 @@ class TaskScheduler:
 
     def _run_wrapper(self, task: _QueuedTask):
         """Wrapper to run the task in its captured context."""
+        with self._cv:
+            if task.run_id not in self._active_run_ids:
+                return None
+            self._worker_started.add(task.run_id)
         return task.context.run(self._run_in_task_context, task)
+
+    def _on_worker_future_done(
+        self,
+        run_id: str,
+        task: _QueuedTask,
+        future: Future[Any],
+    ) -> None:
+        if not future.cancelled():
+            return
+        with self._cv:
+            if self._worker_futures.get(run_id) is not future:
+                return
+            self._worker_futures.pop(run_id, None)
+            if run_id in self._worker_started:
+                return
+            state = self._states.get(run_id)
+            if state is not None:
+                self._transition_unlocked(run_id, TaskStatus.CANCELED)
+            self._release_running_slot_unlocked(task)
+            self._cv.notify_all()
 
     def _run_in_task_context(self, task: _QueuedTask):
         """Publish this run id while executing guard, callback, and terminal work."""
@@ -813,8 +973,28 @@ class TaskScheduler:
         but never rewrites or re-emits an already-published terminal state.
         """
 
+        with self._cv:
+            state = self._states.get(task.run_id)
+            cancellation = state.cancellation if state is not None else CancellationToken()
+            if state is None:
+                cancellation.cancel()
+
+        def canceled_before_callback() -> bool:
+            return cancellation.is_canceled or self._admission_fenced
+
         try:
-            guard = self._run_guard()
+            if self._cancellable_run_guard is None:
+                guard = self._run_guard()
+            else:
+                deadline = (
+                    None
+                    if self._run_guard_timeout_s is None
+                    else time.monotonic() + self._run_guard_timeout_s
+                )
+                guard = self._cancellable_run_guard(
+                    canceled=canceled_before_callback,
+                    deadline=deadline,
+                )
             guard.__enter__()
         except BaseException as exc:
             with self._cv:
@@ -835,6 +1015,37 @@ class TaskScheduler:
                 self._release_running_slot_unlocked(task)
                 self._cv.notify_all()
             raise
+
+        # This locked check is the callback-start linearization point.  A
+        # cancellation or admission fence that wins the condition lock keeps
+        # the callback from starting even when the cross-process locks were
+        # acquired immediately beforehand.
+        with self._cv:
+            state = self._states.get(task.run_id)
+            callback_rejected = bool(
+                state is None
+                or state.status is not TaskStatus.RUNNING
+                or state.cancellation.is_canceled
+                or self._admission_fenced
+            )
+            if callback_rejected:
+                if state is not None and state.status is TaskStatus.RUNNING:
+                    self._transition_unlocked(task.run_id, TaskStatus.CANCELED)
+                if task.run_id in self._active_run_ids:
+                    self._release_running_slot_unlocked(task)
+                self._cv.notify_all()
+
+        if callback_rejected:
+            canceled = TaskCanceledError("task canceled before callback")
+            try:
+                guard.__exit__(type(canceled), canceled, canceled.__traceback__)
+            except BaseException:
+                logger.exception(
+                    "run guard release failed after pre-callback cancellation "
+                    "run_id=%s",
+                    task.run_id,
+                )
+            return None
 
         try:
             value = self._do_run(task)
@@ -868,6 +1079,10 @@ class TaskScheduler:
         return value
 
     def _release_running_slot_unlocked(self, task: _QueuedTask) -> None:
+        if task.run_id not in self._active_run_ids:
+            return
+        self._worker_futures.pop(task.run_id, None)
+        self._worker_started.discard(task.run_id)
         state = self._states.get(task.run_id)
         key = (
             state.assigned_queue_key
@@ -894,6 +1109,7 @@ class TaskScheduler:
                 self._running_by_project.pop(state.project_serial_key, None)
         self._active_run_ids.discard(task.run_id)
         self._reap_completed_states()
+        self._maybe_stop_event_dispatcher_unlocked()
 
     def _do_run(self, task: _QueuedTask):
         """执行任务并维护状态（运行在 worker thread 中）。"""
@@ -943,7 +1159,7 @@ class TaskScheduler:
                 self._cv.notify_all()
 
     def _emit(self, st: TaskRunState):
-        """向所有监听器广播一次任务事件（best-effort）。"""
+        """Queue an immutable event; user callbacks always run outside locks."""
         ev = TaskEvent(
             run_id=st.run_id,
             chat_id=st.spec.chat_id,
@@ -960,12 +1176,51 @@ class TaskScheduler:
             progress_percent=st.progress_percent,
             error=st.error,
         )
-        for listener in list(self._listeners):
-            try:
-                listener(ev)
-            except Exception:
-                # listeners must never break scheduler
-                logger.debug("event listener raised an exception", exc_info=True)
+        completion_callbacks: tuple[Callable[[TaskEvent], None], ...] = ()
+        if st.status in self._TERMINAL_STATUSES:
+            completion = self._completions.pop(st.run_id, None)
+            if completion is not None:
+                completion_callbacks = completion.complete(ev)
+        self._event_queue.put((ev, tuple(self._listeners), completion_callbacks))
+
+    def _event_dispatch_loop(self) -> None:
+        while True:
+            item = self._event_queue.get()
+            if item is None:
+                return
+            event, listeners, completion_callbacks = item
+            for callback in completion_callbacks:
+                _TaskCompletion._invoke(callback, event)
+            for listener in listeners:
+                listener_id = id(listener)
+                with self._cv:
+                    if listener not in self._listeners:
+                        continue
+                    self._listener_inflight[listener_id] = (
+                        self._listener_inflight.get(listener_id, 0) + 1
+                    )
+                try:
+                    listener(event)
+                except BaseException:
+                    # listeners must never break scheduler
+                    logger.debug("event listener raised an exception", exc_info=True)
+                finally:
+                    with self._cv:
+                        remaining = self._listener_inflight.get(listener_id, 0) - 1
+                        if remaining > 0:
+                            self._listener_inflight[listener_id] = remaining
+                        else:
+                            self._listener_inflight.pop(listener_id, None)
+                        self._cv.notify_all()
+
+    def _maybe_stop_event_dispatcher_unlocked(self) -> None:
+        if (
+            self._stopped
+            and not self._active_run_ids
+            and not self._event_dispatch_stopping
+        ):
+            self._event_dispatch_stopping = True
+            self._event_queue.put(None)
 
     def _pop_queued_item_unlocked(self, run_id: str, key: str) -> Optional[_QueuedTask]:
         q = self._queues.get(key)

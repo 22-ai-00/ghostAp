@@ -44,6 +44,43 @@ class EventLog:
             return [event for event in self._events if event.run_id == run_id]
 
 
+class HoldingExecutor:
+    """Executor test double that exposes a pending Future without running it."""
+
+    def __init__(self) -> None:
+        self.future: scheduler_module.Future[object] | None = None
+        self._fn = None
+        self._args: tuple[object, ...] = ()
+
+    def submit(self, fn, *args):
+        self.future = scheduler_module.Future()
+        self._fn = fn
+        self._args = args
+        return self.future
+
+    def run(self) -> None:
+        assert self.future is not None
+        assert self._fn is not None
+        if not self.future.set_running_or_notify_cancel():
+            return
+        self.invoke()
+
+    def invoke(self) -> None:
+        assert self.future is not None
+        assert self._fn is not None
+        try:
+            result = self._fn(*self._args)
+        except BaseException as exc:
+            self.future.set_exception(exc)
+        else:
+            self.future.set_result(result)
+
+    def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+        del wait
+        if cancel_futures and self.future is not None:
+            self.future.cancel()
+
+
 def _scheduler(**kwargs) -> tuple[TaskScheduler, EventLog]:
     scheduler = TaskScheduler(**kwargs)
     events = EventLog()
@@ -108,6 +145,235 @@ def test_terminal_state_fences_cancel_progress_and_late_transition() -> None:
         assert state.status is TaskStatus.SUCCEEDED
         assert state.progress_message is None
         assert [event.status for event in events.for_run(handle.run_id)].count(TaskStatus.SUCCEEDED) == 1
+    finally:
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_handle_completion_replays_terminal_after_history_reap() -> None:
+    scheduler, events = _scheduler(max_concurrent=1, max_terminal_history=1)
+    try:
+        first = scheduler.submit(
+            TaskSpec(chat_id="chat", name="first"),
+            lambda _ctx: None,
+        )
+        assert events.wait_for(first.run_id, TaskStatus.SUCCEEDED)
+        second = scheduler.submit(
+            TaskSpec(chat_id="chat", name="second"),
+            lambda _ctx: None,
+        )
+        assert events.wait_for(second.run_id, TaskStatus.SUCCEEDED)
+        assert scheduler.get_state(first.run_id) is None
+
+        completed = threading.Event()
+        observed: list[TaskEvent] = []
+
+        def on_done(event: TaskEvent) -> None:
+            observed.append(event)
+            completed.set()
+
+        first.add_done_callback(on_done)
+
+        assert completed.wait(timeout=1)
+        assert [event.status for event in observed] == [TaskStatus.SUCCEEDED]
+        assert observed[0].run_id == first.run_id
+    finally:
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_handle_completion_callback_can_reenter_scheduler() -> None:
+    scheduler, events = _scheduler(max_concurrent=1)
+    callback_done = threading.Event()
+    try:
+        handle = scheduler.submit(
+            TaskSpec(chat_id="chat", name="reentrant"),
+            lambda _ctx: None,
+        )
+
+        def on_done(event: TaskEvent) -> None:
+            assert scheduler.get_state(event.run_id) is not None
+            callback_done.set()
+
+        handle.add_done_callback(on_done)
+
+        assert events.wait_for(handle.run_id, TaskStatus.SUCCEEDED)
+        assert callback_done.wait(timeout=1)
+    finally:
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_poison_completion_callback_cannot_kill_event_dispatcher() -> None:
+    scheduler, events = _scheduler(max_concurrent=1)
+    survivor_completed = threading.Event()
+    try:
+        poison = scheduler.submit(
+            TaskSpec(chat_id="chat", name="poison"),
+            lambda _ctx: None,
+        )
+        poison.add_done_callback(
+            lambda _event: (_ for _ in ()).throw(SystemExit("poison callback"))
+        )
+        assert events.wait_for(poison.run_id, TaskStatus.SUCCEEDED)
+
+        survivor = scheduler.submit(
+            TaskSpec(chat_id="chat", name="survivor"),
+            lambda _ctx: None,
+        )
+        survivor.add_done_callback(lambda _event: survivor_completed.set())
+
+        assert events.wait_for(survivor.run_id, TaskStatus.SUCCEEDED)
+        assert survivor_completed.wait(timeout=1)
+        assert scheduler._event_dispatcher.is_alive()
+    finally:
+        scheduler.stop(wait=True, shutdown_executor=True)
+
+
+def test_listener_can_reenter_and_remove_itself_without_deadlock() -> None:
+    scheduler, events = _scheduler(max_concurrent=1)
+    callback_done = threading.Event()
+    observed: list[tuple[str, TaskStatus]] = []
+
+    def listener(event: TaskEvent) -> None:
+        observed.append((event.run_id, event.status))
+        assert scheduler.get_state(event.run_id) is not None
+        if event.status is TaskStatus.SUCCEEDED:
+            assert scheduler.remove_listener(listener) is True
+            scheduler.submit(
+                TaskSpec(chat_id="follow-up", name="follow-up"),
+                lambda _ctx: None,
+            )
+            callback_done.set()
+
+    scheduler.add_listener(listener)
+    try:
+        handle = scheduler.submit(
+            TaskSpec(chat_id="chat", name="reentrant-listener"),
+            lambda _ctx: None,
+        )
+        assert events.wait_for(handle.run_id, TaskStatus.SUCCEEDED)
+        assert callback_done.wait(timeout=1)
+        assert [status for run_id, status in observed if run_id == handle.run_id] == [
+            TaskStatus.QUEUED,
+            TaskStatus.RUNNING,
+            TaskStatus.SUCCEEDED,
+        ]
+    finally:
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_executor_prestart_cancel_completes_and_releases_slot_once() -> None:
+    executor = ThreadPoolExecutor(max_workers=1)
+    executor_blocked = threading.Event()
+    release_executor = threading.Event()
+    blocker = executor.submit(
+        lambda: (executor_blocked.set(), release_executor.wait(timeout=3))
+    )
+    assert executor_blocked.wait(timeout=1)
+    scheduler, events = _scheduler(max_concurrent=1, worker_executor=executor)
+    completed = threading.Event()
+    terminal_events: list[TaskEvent] = []
+    callback_started = threading.Event()
+    try:
+        handle = scheduler.submit(
+            TaskSpec(chat_id="chat", name="prestart-cancel"),
+            lambda _ctx: callback_started.set(),
+        )
+        handle.add_done_callback(
+            lambda event: (terminal_events.append(event), completed.set())
+        )
+        assert events.wait_for(handle.run_id, TaskStatus.RUNNING)
+
+        scheduler.stop(shutdown_executor=True)
+
+        assert completed.wait(timeout=1)
+        assert [event.status for event in terminal_events] == [TaskStatus.CANCELED]
+        assert not callback_started.is_set()
+        assert scheduler.wait_for_idle(timeout=1)
+        with scheduler._lock:
+            assert scheduler._running_total_normal == 0
+            assert scheduler._active_run_ids == set()
+            assert scheduler._running_by_key == {}
+    finally:
+        release_executor.set()
+        blocker.result(timeout=1)
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_worker_start_wins_cancel_race_without_double_releasing_slot() -> None:
+    executor = HoldingExecutor()
+    scheduler, events = _scheduler(
+        max_concurrent=1,
+        worker_executor=executor,
+    )
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    terminal_events: list[TaskEvent] = []
+    try:
+        handle = scheduler.submit(
+            TaskSpec(chat_id="chat", name="start-wins"),
+            lambda _ctx: (
+                callback_started.set(),
+                release_callback.wait(timeout=3),
+            ),
+        )
+        handle.add_done_callback(terminal_events.append)
+        assert events.wait_for(handle.run_id, TaskStatus.RUNNING)
+        assert executor.future is not None
+
+        worker = threading.Thread(target=executor.run)
+        worker.start()
+        assert callback_started.wait(timeout=1)
+        assert handle.cancel() is True
+        release_callback.set()
+        worker.join(timeout=1)
+
+        assert events.wait_for(handle.run_id, TaskStatus.CANCELED)
+        assert [event.status for event in terminal_events] == [TaskStatus.CANCELED]
+        assert scheduler.wait_for_idle(timeout=1)
+        with scheduler._lock:
+            assert scheduler._running_total_normal == 0
+            assert scheduler._active_run_ids == set()
+            assert scheduler._running_by_key == {}
+    finally:
+        release_callback.set()
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_future_running_before_wrapper_cancel_still_converges_once() -> None:
+    executor = HoldingExecutor()
+    scheduler, events = _scheduler(
+        max_concurrent=1,
+        worker_executor=executor,
+    )
+    callback_started = threading.Event()
+    terminal_events: list[TaskEvent] = []
+    try:
+        handle = scheduler.submit(
+            TaskSpec(
+                chat_id="chat",
+                project_id="project",
+                name="future-running-wrapper-pending",
+            ),
+            lambda _ctx: callback_started.set(),
+        )
+        handle.add_done_callback(terminal_events.append)
+        assert events.wait_for(handle.run_id, TaskStatus.RUNNING)
+        assert executor.future is not None
+        assert executor.future.set_running_or_notify_cancel()
+
+        assert handle.cancel() is True
+        worker = threading.Thread(target=executor.invoke)
+        worker.start()
+        worker.join(timeout=1)
+
+        assert events.wait_for(handle.run_id, TaskStatus.CANCELED)
+        assert [event.status for event in terminal_events] == [TaskStatus.CANCELED]
+        assert not callback_started.is_set()
+        assert scheduler.wait_for_idle(timeout=1)
+        with scheduler._lock:
+            assert scheduler._running_total_normal == 0
+            assert scheduler._active_run_ids == set()
+            assert scheduler._running_by_key == {}
+            assert scheduler._running_by_project == {}
     finally:
         scheduler.stop(shutdown_executor=True)
 
@@ -607,6 +873,40 @@ def test_terminal_history_and_idle_keys_stay_bounded_after_sustained_activity() 
             assert len(scheduler._by_chat) <= 3
             assert len(scheduler._by_project) <= 3
             assert len(scheduler._by_task_id) <= 3
+    finally:
+        scheduler.stop(shutdown_executor=True)
+
+
+def test_terminal_history_does_not_reap_newer_state_behind_active_head() -> None:
+    scheduler = TaskScheduler(max_concurrent=1, max_terminal_history=1)
+    try:
+        old = TaskRunState(
+            spec=TaskSpec(chat_id="chat", name="old-active"),
+            run_id="old-active",
+            status=TaskStatus.SUCCEEDED,
+            ended_at=time.time(),
+        )
+        newer = TaskRunState(
+            spec=TaskSpec(chat_id="chat", name="newer-inactive"),
+            run_id="newer-inactive",
+            status=TaskStatus.SUCCEEDED,
+            ended_at=time.time(),
+        )
+        with scheduler._lock:
+            scheduler._states = {old.run_id: old, newer.run_id: newer}
+            scheduler._terminal_order = scheduler_module.deque(
+                (old.run_id, newer.run_id)
+            )
+            scheduler._active_run_ids.add(old.run_id)
+
+            assert scheduler._reap_completed_states() == 0
+            assert list(scheduler._terminal_order) == [old.run_id, newer.run_id]
+            assert set(scheduler._states) == {old.run_id, newer.run_id}
+
+            scheduler._active_run_ids.remove(old.run_id)
+            assert scheduler._reap_completed_states() == 1
+            assert list(scheduler._terminal_order) == [newer.run_id]
+            assert set(scheduler._states) == {newer.run_id}
     finally:
         scheduler.stop(shutdown_executor=True)
 

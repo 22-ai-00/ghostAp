@@ -293,6 +293,13 @@ def _build_task_scheduler(
         value = getattr(settings, name, default)
         return value if type(value) is int and value > 0 else default
 
+    def positive_float_setting(name: str, default: float) -> float:
+        value = getattr(settings, name, default)
+        if type(value) not in {int, float}:
+            return default
+        normalized = float(value)
+        return normalized if 0 < normalized < float("inf") else default
+
     scheduler = TaskScheduler(
         max_concurrent=settings.task_scheduler_max_concurrent,
         per_key_concurrency=settings.task_scheduler_per_key_concurrency,
@@ -311,6 +318,10 @@ def _build_task_scheduler(
         ),
         thread_name_prefix="ghost_worker",
         run_guard=gate.task_guard,
+        run_guard_timeout_s=positive_float_setting(
+            "restart_gate_timeout",
+            7200.0,
+        ),
     )
     scheduler._restart_gate = gate
     return scheduler
