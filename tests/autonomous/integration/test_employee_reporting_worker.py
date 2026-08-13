@@ -8,6 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.autonomous.acceptance.main_bot_warning_outbox import (
+    MainBotWarningRetryableDeliveryError,
+)
 from src.autonomous.ingress.service import IngressBlobRetryableError
 from src.autonomous.outbox.delivery import (
     EmployeeOutboxDrainResult,
@@ -122,6 +125,38 @@ def test_reporting_worker_delivers_running_card_while_execution_is_blocked() -> 
         assert dispatch.execute_started.wait(2.0)
         assert running_delivered.wait(2.0)
         assert not dispatch.release_execute.is_set()
+    finally:
+        _stop_runtime_workers(runtime, dispatch)
+
+
+def test_warning_retry_backoff_survives_unrelated_reporting_wakeups() -> None:
+    runtime, dispatch = _blocking_runtime()
+    warning_attempts: list[float] = []
+    employee_ticks = 0
+    first_warning = threading.Event()
+
+    def warning() -> bool:
+        warning_attempts.append(time.monotonic())
+        first_warning.set()
+        raise MainBotWarningRetryableDeliveryError("projection deadline")
+
+    def drain_employee() -> bool:
+        nonlocal employee_ticks
+        employee_ticks += 1
+        return False
+
+    runtime._drain_main_bot_warning_outbox_once = warning  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._reconcile_terminal_ingress = lambda: 0  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._recover_retirement_delivery_channels = lambda: ()  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._drain_employee_outbox_once = drain_employee  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._start_reporting_worker()  # noqa: SLF001
+    try:
+        assert first_warning.wait(1.0)
+        for _ in range(20):
+            runtime._reporting_wakeup.set()  # noqa: SLF001
+            time.sleep(0.005)
+        assert len(warning_attempts) == 1
+        assert employee_ticks > 1
     finally:
         _stop_runtime_workers(runtime, dispatch)
 

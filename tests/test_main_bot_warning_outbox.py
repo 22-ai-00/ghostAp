@@ -638,6 +638,41 @@ def test_explicit_permanent_failure_becomes_action_required(tmp_path: Path) -> N
         writer.close()
 
 
+def test_projection_catches_up_from_verified_journal_tail_without_full_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unrelated Journal traffic must not make an empty warning poll replay history."""
+
+    from src.autonomous.journal.frame import JournalEvent
+
+    outbox, writer, _blob_store = _runtime(tmp_path)
+    for index in range(64):
+        event = JournalEvent(
+            event_type="test.other_domain",
+            aggregate_id=f"other-{index}",
+            payload={},
+        )
+        writer.commit(
+            (event,),
+            writer.get_aggregate_versions((event.aggregate_id,)),
+        )
+
+    monkeypatch.setattr(
+        writer,
+        "replay",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("projection catch-up re-read the full Journal")
+        ),
+    )
+    try:
+        assert outbox.pending_records(deadline=time.monotonic() + 0.05) == ()
+        assert outbox._cursor_sequence == writer.get_last_frame().sequence  # noqa: SLF001
+    finally:
+        outbox.close()
+        writer.close()
+
+
 @pytest.mark.parametrize(
     ("feishu_code", "safe_error_code"),
     (

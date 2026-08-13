@@ -649,6 +649,9 @@ class EmployeeDepartmentRuntime:
         self._reporting_lifecycle_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._reporting_repair_failures = 0
         self._reporting_repair_not_before = 0.0
+        self._warning_reporting_failures = 0
+        self._warning_reporting_not_before = 0.0
+        self._warning_reporting_next_log_at = 0.0
         self._employee_admission_locks_guard = (
             threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         )
@@ -2599,17 +2602,34 @@ class EmployeeDepartmentRuntime:
         """Repair and deliver durable views without sharing the execution lane."""
 
         worked = False
-        warning_deferred: MainBotWarningRetryableDeliveryError | None = None
-        try:
-            worked = self._drain_main_bot_warning_outbox_once()
-        except MainBotWarningRetryableDeliveryError as exc:
-            # Main-Bot warnings and Employee response delivery are independent
-            # durable components.  Preserve the retry signal for this tick, but
-            # do not let one warning transport poison starve Employee repair or
-            # already-anchored Employee Outbox records.
-            warning_deferred = exc
-        fatal_repair_error: Exception | None = None
         now = time.monotonic()
+        warning_deferred = False
+        if now >= getattr(self, "_warning_reporting_not_before", 0.0):
+            try:
+                worked = self._drain_main_bot_warning_outbox_once()
+            except MainBotWarningRetryableDeliveryError as exc:
+                warning_deferred = True
+                failures = getattr(self, "_warning_reporting_failures", 0) + 1
+                self._warning_reporting_failures = failures
+                self._warning_reporting_not_before = now + min(
+                    0.5 * (2 ** min(failures - 1, 4)),
+                    5.0,
+                )
+                if failures == 1 or now >= getattr(
+                    self, "_warning_reporting_next_log_at", 0.0
+                ):
+                    logger.error(
+                        "main Bot warning reporting deferred; retrying with backoff: %s",
+                        type(exc).__name__,
+                    )
+                    self._warning_reporting_next_log_at = now + 30.0
+            else:
+                if getattr(self, "_warning_reporting_failures", 0):
+                    logger.info("main Bot warning reporting recovered")
+                self._warning_reporting_failures = 0
+                self._warning_reporting_not_before = 0.0
+                self._warning_reporting_next_log_at = 0.0
+        fatal_repair_error: Exception | None = None
         repair_deferred = bool(getattr(self, "_dispatch_recovery_pending", False))
         if getattr(self, "_dispatch_recovery_pending", False) and now >= getattr(
             self, "_reporting_repair_not_before", 0.0
@@ -2659,9 +2679,7 @@ class EmployeeDepartmentRuntime:
         # attempt repair is deferred.  Delivery isolates typed record-local
         # transport faults; integrity failures escape and fence this tick.
         worked = self._drain_employee_outbox_once() or worked
-        if warning_deferred is not None:
-            raise warning_deferred
-        if repair_deferred:
+        if warning_deferred or repair_deferred:
             return worked
 
         gc_now = time.monotonic()

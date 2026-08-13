@@ -756,15 +756,39 @@ class MainBotWarningOutbox:
     ) -> None:
         self._require_deadline(deadline, "projection synchronization")
         try:
-            anchor = self._writer.anchor.read()
-        except (AnchorCorruptionError, OSError) as exc:
-            raise MainBotWarningCorruptionError("warning projection cannot read Journal anchor") from exc
+            anchor, frames = self._writer.committed_tail(
+                self._cursor_sequence + 1,
+                deadline=deadline,
+            )
+        except JournalDeadlineExceededError as exc:
+            raise MainBotWarningRetryableDeliveryError(
+                "main-Bot warning projection deadline exceeded"
+            ) from exc
+        except (AnchorCorruptionError, JournalIntegrityError, OSError) as exc:
+            raise MainBotWarningCorruptionError("warning projection cannot read Journal tail") from exc
         cursor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
-        if (self._cursor_sequence, self._cursor_hash) != (
+        if (self._cursor_sequence, self._cursor_hash) == (
             anchor.sequence,
             cursor_hash,
         ):
-            self._rebuild_projection_unlocked(deadline=deadline)
+            return
+        if self._cursor_sequence > anchor.sequence or not frames:
+            raise MainBotWarningCorruptionError("warning projection cursor is ahead of Journal anchor")
+        expected_sequence = self._cursor_sequence + 1
+        expected_previous_hash = self._cursor_hash or GENESIS_HASH
+        for frame in frames:
+            self._require_deadline(deadline, "projection synchronization")
+            if frame.sequence != expected_sequence or frame.previous_hash != expected_previous_hash:
+                raise MainBotWarningCorruptionError("warning projection Journal tail is discontinuous")
+            for event in frame.events:
+                if event.event_type.startswith(_WARNING_EVENT_PREFIX):
+                    self._apply_event_unlocked(event)
+            expected_sequence += 1
+            expected_previous_hash = frame.frame_hash
+        if frames[-1].sequence != anchor.sequence or frames[-1].frame_hash != anchor.frame_hash:
+            raise MainBotWarningCorruptionError("warning projection cannot verify Journal anchor")
+        self._cursor_sequence = anchor.sequence
+        self._cursor_hash = cursor_hash
 
     def _apply_event_unlocked(self, event: JournalEvent) -> None:
         self._apply_event_to(event, self._records)

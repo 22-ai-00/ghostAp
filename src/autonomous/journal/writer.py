@@ -443,6 +443,40 @@ class JournalWriter:
             if frame.sequence >= from_sequence:
                 yield frame
 
+    def committed_tail(
+        self,
+        from_sequence: int,
+        *,
+        deadline: float | None = None,
+    ) -> tuple[AnchorState, tuple[TransactionFrame, ...]]:
+        """Return the already-verified in-memory tail through the durable anchor.
+
+        JournalWriter is the process-wide append authority. Frames enter its
+        cache only after load-time verification or a durable append, so
+        projections can catch up with unrelated domain commits without
+        re-reading and re-authenticating the whole Journal on every poll.
+        """
+
+        if isinstance(from_sequence, bool) or not isinstance(from_sequence, int) or from_sequence < 1:
+            raise ValueError("from_sequence must be >= 1")
+        with self._deadline_guard(
+            self._mutex,
+            deadline,
+            operation="Journal committed-tail lookup",
+        ):
+            self._ensure_before_deadline(deadline, operation="Journal committed-tail lookup")
+            anchor = self.anchor.read()
+            if anchor.sequence > self._sequence:
+                raise AnchorMismatchError("anchor is ahead of the verified Journal cache")
+            if anchor.sequence:
+                anchored_frame = self._frames[anchor.sequence - 1]
+                if anchored_frame.sequence != anchor.sequence or anchored_frame.frame_hash != anchor.frame_hash:
+                    raise AnchorMismatchError("anchor does not match the verified Journal cache")
+            elif anchor.frame_hash != GENESIS_HASH:
+                raise AnchorMismatchError("genesis anchor hash mismatch")
+            start = min(from_sequence - 1, anchor.sequence)
+            return anchor, tuple(self._frames[start : anchor.sequence])
+
     def get_last_frame(self) -> TransactionFrame | None:
         with self._mutex:
             return self._frames[-1] if self._frames else None

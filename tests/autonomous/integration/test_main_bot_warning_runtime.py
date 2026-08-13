@@ -543,12 +543,7 @@ def test_main_bot_warning_deferred_does_not_block_employee_reporting() -> None:
         gc_terminal_payloads=lambda: events.append("ingress_gc") or 0,
     )
 
-    try:
-        runtime._drain_employee_reporting_once()  # noqa: SLF001
-    except MainBotWarningRetryableDeliveryError as exc:
-        assert "warning poison" in str(exc)
-    else:  # pragma: no cover - contract assertion
-        raise AssertionError("warning delivery deferral was hidden")
+    assert runtime._drain_employee_reporting_once() is True  # noqa: SLF001
 
     assert events == [
         "main_bot_warning",
@@ -556,6 +551,8 @@ def test_main_bot_warning_deferred_does_not_block_employee_reporting() -> None:
         "retirement",
         "employee_outbox",
     ]
+    assert runtime._warning_reporting_failures == 1  # noqa: SLF001
+    assert runtime._warning_reporting_not_before > time.monotonic()  # noqa: SLF001
 
 
 def test_reporting_tick_bounds_blocked_warning_and_reuses_inflight_send(
@@ -629,12 +626,7 @@ def test_reporting_tick_bounds_blocked_warning_and_reuses_inflight_send(
 
     started = time.monotonic()
     try:
-        try:
-            runtime._drain_employee_reporting_once()  # noqa: SLF001
-        except MainBotWarningRetryableDeliveryError as exc:
-            assert "deferred" in str(exc)
-        else:  # pragma: no cover - contract assertion
-            raise AssertionError("blocked warning did not defer its reporting tick")
+        assert runtime._drain_employee_reporting_once() is True  # noqa: SLF001
 
         assert entered.wait(1.0)
         assert time.monotonic() - started < 0.5
@@ -643,6 +635,7 @@ def test_reporting_tick_bounds_blocked_warning_and_reuses_inflight_send(
         assert outbox.pending_records()[0].state is MainBotWarningState.EXECUTING
 
         release.set()
+        runtime._warning_reporting_not_before = 0.0  # noqa: SLF001
         assert runtime._drain_employee_reporting_once() is True  # noqa: SLF001
         assert events == [
             "terminal",
