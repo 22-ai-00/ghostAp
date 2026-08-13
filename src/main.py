@@ -243,6 +243,11 @@ class Application:
         self._install_signal_handlers()
 
         _fmt, _EmojiReaction, FeishuWSClient = _load_feishu_runtime()
+        try:
+            from feishu.sdk_logging import configure_lark_sdk_logging
+        except ImportError:
+            from .feishu.sdk_logging import configure_lark_sdk_logging
+        configure_lark_sdk_logging()
         self.feishu_client = FeishuWSClient(message_callback=self.handle_message)
 
         logger.info("启动飞书长连接服务...")

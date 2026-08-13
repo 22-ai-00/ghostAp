@@ -13,6 +13,59 @@ from src.feishu.ws_client import (
 )
 
 
+def test_ws_health_logs_recovery_duration_after_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from src.feishu.ws_health import WSHealthMonitor
+
+    now = iter((100.0, 110.0, 112.5))
+    monkeypatch.setattr("src.feishu.ws_health.time.time", lambda: next(now))
+    monitor = WSHealthMonitor(SimpleNamespace(), SimpleNamespace())
+
+    with caplog.at_level("INFO", logger="src.feishu.ws_health"):
+        monitor.record_activity("connected")
+        monitor.record_activity("disconnected")
+        monitor.record_activity("connected")
+
+    assert "WS重连成功: outage_seconds=2.500" in caplog.text
+    assert "[METRIC] ws_reconnected outage_seconds=2.500" in caplog.text
+
+
+def test_lark_sdk_logging_is_single_and_downgrades_recoverable_disconnect(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+
+    from src.feishu.sdk_logging import configure_lark_sdk_logging
+
+    sdk_logger = logging.getLogger("Lark")
+    previous_handlers = list(sdk_logger.handlers)
+    previous_filters = list(sdk_logger.filters)
+    previous_propagate = sdk_logger.propagate
+    first = logging.StreamHandler()
+    second = logging.StreamHandler()
+    sdk_logger.handlers = [first, second]
+    sdk_logger.filters = []
+    sdk_logger.propagate = False
+    try:
+        configure_lark_sdk_logging()
+        with caplog.at_level(logging.WARNING):
+            sdk_logger.error(
+                "receive message loop exit, err: no close frame received or sent"
+            )
+        assert sdk_logger.handlers == []
+        assert sdk_logger.propagate is True
+        records = [record for record in caplog.records if record.name == "Lark"]
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        assert records[0].levelname == "WARNING"
+    finally:
+        sdk_logger.handlers = previous_handlers
+        sdk_logger.filters = previous_filters
+        sdk_logger.propagate = previous_propagate
+
+
 def _bind_reply_transport(client, *, return_value=None):
     from unittest.mock import MagicMock
 

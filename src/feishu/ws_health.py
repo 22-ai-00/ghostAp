@@ -26,22 +26,29 @@ class WSHealthMonitor:
 
     def record_activity(self, kind: str) -> None:
         now = time.time()
+        reconnect_outage: float | None = None
         with self._health_lock:
             if kind == "connected":
+                if self._reconnect_requested_at > 0.0:
+                    reconnect_outage = max(0.0, now - self._reconnect_requested_at)
                 self._last_connect_at = now
                 self._last_frame_at = now
                 self._last_pong_at = now
                 self._reconnect_requested_at = 0.0
-                return
-            if kind in {"pong", "ping", "control", "data"}:
+            elif kind in {"pong", "ping", "control", "data"}:
                 self._last_frame_at = now
                 if kind == "pong":
                     self._last_pong_at = now
-                return
-            if kind == "disconnected" and self._reconnect_requested_at <= 0.0:
+            elif kind == "disconnected" and self._reconnect_requested_at <= 0.0:
                 self._reconnect_requested_at = now
                 logger.warning("WS断连，已触发重连请求: ts=%.3f", now)
                 logger.warning("[METRIC] ws_disconnect")
+        if reconnect_outage is not None:
+            logger.info("WS重连成功: outage_seconds=%.3f", reconnect_outage)
+            logger.info(
+                "[METRIC] ws_reconnected outage_seconds=%.3f",
+                reconnect_outage,
+            )
 
     def _get_watchdog_interval(self) -> float:
         value = getattr(self.settings, "feishu_ws_watchdog_interval", 15.0)
