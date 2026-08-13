@@ -1593,7 +1593,11 @@ class FeishuWSClient:
                     or not isinstance(open_id, str)
                     or not open_id.startswith("ou_")
                     or len(open_id) > 256
-                    or app_id != self.settings.app_id
+                    # `/bot/v3/info` is already scoped by the tenant token
+                    # minted from this configured app.  The official response
+                    # currently omits `app_id`; if a future response includes
+                    # it, retain the extra binding check.
+                    or (app_id is not None and app_id != self.settings.app_id)
                 ):
                     raise ValueError("invalid main Bot identity response")
             except Exception:

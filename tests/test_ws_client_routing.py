@@ -2444,6 +2444,43 @@ def test_main_bot_identity_lookup_validates_app_and_retries_after_transient_fail
     assert request.call_count == 2
 
 
+def test_main_bot_identity_accepts_official_response_without_app_id(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    """The tenant-token Bot info response does not expose an app_id field."""
+
+    from lark_oapi.core.model.base_response import BaseResponse
+    from lark_oapi.core.model.raw_response import RawResponse
+
+    response = BaseResponse()
+    response.code = 0
+    response.raw = RawResponse()
+    response.raw.status_code = 200
+    response.raw.content = json.dumps(
+        {
+            "code": 0,
+            "msg": "success",
+            "bot": {
+                "activate_status": 2,
+                "app_name": "GhostAP",
+                "avatar_url": "https://example.invalid/avatar.png",
+                "ip_white_list": [],
+                "open_id": "ou_main_bot_official_shape",
+            },
+        }
+    ).encode()
+    mock_ws_client._api_client = SimpleNamespace(
+        request=MagicMock(return_value=response)
+    )
+    mock_ws_client._main_bot_open_id = ""
+
+    assert (
+        mock_ws_client._sync_main_bot_identity()
+        == "ou_main_bot_official_shape"
+    )
+    assert mock_ws_client._main_bot_open_id == "ou_main_bot_official_shape"
+
+
 def test_main_bot_identity_lookup_rejects_a_different_app_binding(
     mock_ws_client: FeishuWSClient,
 ) -> None:
