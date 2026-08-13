@@ -355,7 +355,7 @@ class ProgrammingModeHandler(BaseHandler):
         self._active_programming_runs: dict[
             tuple[str, str, str], _ActiveProgrammingRun
         ] = {}
-        self._active_programming_runs_lock = threading.Lock()
+        self._active_programming_runs_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
     @staticmethod
     def _active_run_key(
