@@ -117,7 +117,7 @@ class DangerousPatternCheckStrategy(SecurityCheckStrategy):
     """危险模式检查策略"""
 
     DANGEROUS_PATTERNS = [
-        r"rm\s+(-[rf]+\s+)?/($|\s)",
+        r"rm\s+(-[rf]+\s+)?/(?:['\"])?(?:$|\s|[;&|])",
         r"rm\s+(-[rf]+\s+)?/\*",
         r"mkfs\.",
         r"dd\s+if=",
@@ -137,12 +137,6 @@ class DangerousPatternCheckStrategy(SecurityCheckStrategy):
         self._compiled_patterns = [re.compile(p, re.IGNORECASE) for p in self.DANGEROUS_PATTERNS]
 
     def check(self, command: str, settings) -> tuple[bool, Optional[str]]:
-        # 无条件检查 shell 控制字符（不依赖白名单模式）
-        shell_control_chars = [';', '&&', '||', '|', '`', '$(', ')']
-        for char in shell_control_chars:
-            if char in command:
-                return False, f"包含不安全的 shell 控制字符: {char}"
-
         for pattern in self._compiled_patterns:
             if pattern.search(command):
                 return False, f"命令包含危险操作模式: {pattern.pattern}"

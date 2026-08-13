@@ -263,7 +263,7 @@ def _permission_tool_request(
         command_value = raw_input
     command, argv = _normalize_permission_execute_command(command_value)
     if command is None:
-        return "execute", tool_args, None
+        raise ValueError("execute permission request is missing command")
 
     tool_args["command"] = command
     if argv is not None:

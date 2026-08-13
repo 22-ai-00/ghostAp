@@ -139,7 +139,14 @@ def test_deep_preserves_pending_context_when_follow_up_is_incomplete() -> None:
 
 
 def test_deep_cancelled_transport_is_terminal_not_paused() -> None:
-    _engine, project = _run(_Session(PromptResult(stop_reason="cancelled")))
+    _engine, project = _run(
+        _Session(
+            PromptResult(
+                stop_reason="cancelled",
+                cancellation_source="user",
+            )
+        )
+    )
 
     assert project.status is DeepProjectStatus.CANCELLED
     assert project.completed_at is not None

@@ -804,6 +804,7 @@ class ProgrammingModeHandler(BaseHandler):
                     chat_id,
                     project_id=project_id,
                     thread_id=thread_id,
+                    user_initiated=not silent,
                 )
             has_session = manager.end_session(chat_id, project_id=project_id, thread_id=thread_id)
             if silent:

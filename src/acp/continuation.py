@@ -26,10 +26,12 @@ MAX_ORDINARY_CONTINUATIONS = 3
 MAX_CHILD_RECONCILIATIONS = 1
 MAX_AUTOMATIC_DECISIONS = 1
 MAX_GOAL_RECOVERIES = 1
+MAX_INTERRUPTION_RECOVERIES = 1
 _monotonic = time.monotonic
 _PLAN_CONTINUATION = "plan"
 _CHILD_RECONCILIATION = "child_reconciliation"
 _GOAL_RECOVERY = "goal_recovery"
+_INTERRUPTION_RECOVERY = "interruption_recovery"
 _USER_INPUT_MARKERS = (
     "请确认",
     "请选择",
@@ -249,6 +251,19 @@ def _build_goal_recovery_prompt(status: str) -> str:
     )
 
 
+def _build_interruption_recovery_prompt() -> str:
+    return (
+        "[GhostAP ACP 中断恢复指令]\n"
+        "上一轮被 provider 或权限拒绝中断；这不是用户取消。请在同一会话中"
+        "仅继续原任务范围内其余已授权、安全、可逆的工作。若某一步权限被拒绝，"
+        "跳过该步并清楚记录原因，不要重复请求或寻找绕过方式。\n"
+        "本指令不新增任何权限，不得扩大原始授权；所有 ACP、sandbox 和工具权限"
+        "继续有效且不得绕过。不得猜测凭据，不得新增发布、部署、删除数据或"
+        "不可逆外部副作用。完成安全部分后如实给出结果；若仍无法完成，明确"
+        "报告剩余阻塞，不要再次自行恢复。"
+    )
+
+
 def _send_child_reconciliation_prompt(
     session: SessionT,
     text: str,
@@ -325,11 +340,11 @@ def _continuation_kind(
     *,
     entered_finalization: bool,
 ) -> str | None:
-    if (
-        entered_finalization
-        or assessment.outcome is not PromptOutcome.INCOMPLETE
-        or assessment.stop_reason != "end_turn"
-    ):
+    if entered_finalization or assessment.outcome is not PromptOutcome.INCOMPLETE:
+        return None
+    if assessment.stop_reason in {"cancelled", "canceled"}:
+        return _INTERRUPTION_RECOVERY
+    if assessment.stop_reason != "end_turn":
         return None
     if _requests_explicit_user_input(result):
         return None
@@ -429,6 +444,7 @@ def run_prompt_with_continuation(
     child_reconciliations = 0
     automatic_decisions = 0
     goal_recoveries = 0
+    interruption_recoveries = 0
 
     while True:
         continuation_kind = _continuation_kind(
@@ -483,6 +499,9 @@ def run_prompt_with_continuation(
         ) or (
             continuation_kind == _GOAL_RECOVERY
             and goal_recoveries >= MAX_GOAL_RECOVERIES
+        ) or (
+            continuation_kind == _INTERRUPTION_RECOVERY
+            and interruption_recoveries >= MAX_INTERRUPTION_RECOVERIES
         ):
             break
 
@@ -495,6 +514,8 @@ def run_prompt_with_continuation(
             if continuation_kind == _PLAN_CONTINUATION
             else _build_goal_recovery_prompt(goal_status)
             if continuation_kind == _GOAL_RECOVERY
+            else _build_interruption_recovery_prompt()
+            if continuation_kind == _INTERRUPTION_RECOVERY
             else _build_child_reconciliation_prompt(
                 assessment.unresolved_child_tool_calls
             )
@@ -505,7 +526,11 @@ def run_prompt_with_continuation(
             break
         reconciliation_started_at: float | None = None
         reconciliation_finished_at: float | None = None
-        if continuation_kind in {_PLAN_CONTINUATION, _GOAL_RECOVERY}:
+        if continuation_kind in {
+            _PLAN_CONTINUATION,
+            _GOAL_RECOVERY,
+            _INTERRUPTION_RECOVERY,
+        }:
             next_result, entered_finalization = run_turn(
                 continuation_prompt,
                 remaining_budget,
@@ -513,8 +538,10 @@ def run_prompt_with_continuation(
             )
             if continuation_kind == _PLAN_CONTINUATION:
                 plan_continuations += 1
-            else:
+            elif continuation_kind == _GOAL_RECOVERY:
                 goal_recoveries += 1
+            else:
+                interruption_recoveries += 1
         else:
             # Reconciliation is itself the single safe cleanup turn. Running it
             # through the ordinary timeout-finalization wrapper could send a

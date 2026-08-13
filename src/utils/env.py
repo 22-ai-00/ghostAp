@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import getpass
 import os
 import sys
+import tempfile
 import threading
 from typing import Callable, Optional
 
@@ -166,6 +168,15 @@ def build_clean_env(base: Optional[dict[str, str]] = None) -> dict[str, str]:
     env = dict(base) if base is not None else os.environ.copy()
     for key in _GUARD_KEYS:
         env.pop(key, None)
+    get_uid = getattr(os, "getuid", None)
+    user_scope = str(get_uid()) if callable(get_uid) else getpass.getuser()
+    env.setdefault(
+        "UV_CACHE_DIR",
+        os.path.join(
+            tempfile.gettempdir(),
+            f"ghostap-uv-cache-{user_scope}",
+        ),
+    )
     env = _ensure_npm_global_in_path(
         env,
         explicit_home=None if base is None else env.get("HOME", ""),

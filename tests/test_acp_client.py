@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import os
 import shutil
+import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -15,6 +18,7 @@ from src.acp.helper import SessionKeyCodec
 from src.acp.models import ACPEvent, ACPGoalInfo, ACPSessionInfo, PromptResult
 from src.acp.outcome import PromptOutcome, classify_prompt_result
 from src.acp.sync_adapter import resolve_agent_spec
+from src.utils.env import build_clean_env
 
 
 def _session_info_update(codex: dict) -> SessionInfoUpdate:
@@ -24,6 +28,25 @@ def _session_info_update(codex: dict) -> SessionInfoUpdate:
             "_meta": {"codex": codex},
         }
     )
+
+
+def test_build_clean_env_supplies_user_scoped_uv_cache_default() -> None:
+    env = build_clean_env({"HOME": "/tmp/ghostap-test-home"})
+
+    cache_dir = Path(env["UV_CACHE_DIR"])
+    cache_dir.relative_to(Path(tempfile.gettempdir()))
+    assert str(os.getuid()) in cache_dir.name
+
+
+def test_build_clean_env_preserves_explicit_uv_cache_override() -> None:
+    env = build_clean_env(
+        {
+            "HOME": "/tmp/ghostap-test-home",
+            "UV_CACHE_DIR": "/operator/uv-cache",
+        }
+    )
+
+    assert env["UV_CACHE_DIR"] == "/operator/uv-cache"
 
 
 def test_codex_goal_session_info_is_control_plane_not_render_event(
@@ -550,6 +573,68 @@ def test_acp_manager_unhealthy_session_is_cleaned(monkeypatch):
     assert m.get_session("chat1") is None
     assert dead.closed is True
     assert key not in m._sessions
+
+
+def test_manager_marks_only_the_active_prompt_generation_as_user_cancelled() -> None:
+    from src.acp.manager import ACPSessionManager
+
+    class _Session:
+        def __init__(self) -> None:
+            self.session_id = "session-user-cancel"
+            self.last_active = time.time()
+            self.message_count = 0
+            self.marked: list[int] = []
+            self.order: list[str] = []
+
+        def active_prompt_generation(self) -> int | None:
+            return 7
+
+        def mark_user_cancel(self, generation: int) -> None:
+            self.order.append("mark")
+            self.marked.append(generation)
+
+        def cancel(self, *, wait: bool, timeout: float) -> bool:
+            self.order.append("cancel")
+            assert wait is False
+            assert timeout == 2.0
+            return True
+
+    manager = ACPSessionManager("coco")
+    session = _Session()
+    manager._sessions[SessionKeyCodec.encode("chat-user-cancel")] = session
+
+    assert manager.cancel_session("chat-user-cancel", user_initiated=True) is True
+    assert session.marked == [7]
+    assert session.order == ["mark", "cancel"]
+
+
+def test_sync_adapter_user_cancel_marker_is_bound_to_active_generation(
+    monkeypatch,
+) -> None:
+    from src.acp.sync_adapter import SyncACPSession
+
+    session = SyncACPSession("coco", "/tmp", agent_cmd="coco")
+    generations: list[int] = []
+
+    def cancelled_turn(*_args, **_kwargs):
+        generation = session.active_prompt_generation()
+        assert generation is not None
+        generations.append(generation)
+        session.mark_user_cancel(generation)
+        return PromptResult(stop_reason="cancelled")
+
+    monkeypatch.setattr(session, "_send_prompt_once", cancelled_turn)
+    first = session.send_prompt("first")
+
+    def stale_marker_turn(*_args, **_kwargs):
+        session.mark_user_cancel(generations[0])
+        return PromptResult(stop_reason="cancelled")
+
+    monkeypatch.setattr(session, "_send_prompt_once", stale_marker_turn)
+    second = session.send_prompt("second")
+
+    assert first.cancellation_source == "user"
+    assert second.cancellation_source == "provider"
 
 
 def test_acp_manager_session_starter_success_is_not_overwritten(monkeypatch):
@@ -1162,7 +1247,6 @@ def test_tool_filter_blocks_auto_approved_permission_request():
         ("other", {"operation": "custom"}, "other", {"operation": "custom"}),
         ("think", {"topic": "plan"}, "think", {"topic": "plan"}),
         ("switch_mode", {"mode": "code"}, "switch_mode", {"mode": "code"}),
-        ("execute", {"opaque": "missing command"}, "execute", {"opaque": "missing command"}),
         ("future_kind", {"operation": "future"}, "other", {"operation": "future"}),
         (None, {"operation": "unspecified"}, "other", {"operation": "unspecified"}),
     ],
@@ -1244,6 +1328,92 @@ def test_permission_bridge_dangerous_argv_remains_fail_closed():
     )
 
     assert response.outcome.outcome == "cancelled"
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "rm -rf /",
+        ["zsh", "-c", "rm -rf /"],
+    ),
+)
+def test_permission_bridge_rejects_root_removal_in_plain_and_wrapped_forms(
+    command,
+):
+    client = GhostAPClient(on_event=lambda _event: None, auto_approve=True)
+    option = PermissionOption(
+        optionId="allow-once",
+        name="Allow once",
+        kind="allow_once",
+    )
+
+    response = asyncio.run(
+        client.request_permission(
+            options=[option],
+            session_id="s1",
+            tool_call=SimpleNamespace(
+                kind="execute",
+                raw_input={"command": command},
+            ),
+        )
+    )
+
+    assert response.outcome.outcome == "cancelled"
+
+
+def test_permission_bridge_accepts_safe_production_shaped_zsh_command():
+    seen: list[tuple[str, dict]] = []
+    client = GhostAPClient(on_event=lambda _event: None, auto_approve=True)
+    client.set_tool_filter(
+        lambda tool, args: seen.append((tool, args or {})) or tool == "shell"
+    )
+    option = PermissionOption(
+        optionId="allow-once",
+        name="Allow once",
+        kind="allow_once",
+    )
+    script = (
+        "cd /workspace && python - <<'PY' > /tmp/result\n"
+        "print('ok')\nPY\ncat /tmp/result | sed -n '1p'"
+    )
+
+    response = asyncio.run(
+        client.request_permission(
+            options=[option],
+            session_id="s1",
+            tool_call=SimpleNamespace(
+                kind="execute",
+                raw_input={"command": ["zsh", "-c", script]},
+            ),
+        )
+    )
+
+    assert response.outcome.outcome == "selected"
+    assert seen and seen[0][0] == "shell"
+
+
+def test_permission_bridge_missing_execute_command_fails_closed():
+    seen: list[tuple[str, dict]] = []
+    client = GhostAPClient(on_event=lambda _event: None, auto_approve=True)
+    client.set_tool_filter(
+        lambda tool, args: seen.append((tool, args or {})) or True
+    )
+    option = PermissionOption(
+        optionId="allow-once",
+        name="Allow once",
+        kind="allow_once",
+    )
+
+    response = asyncio.run(
+        client.request_permission(
+            options=[option],
+            session_id="s1",
+            tool_call=SimpleNamespace(kind="execute", raw_input={"opaque": "x"}),
+        )
+    )
+
+    assert response.outcome.outcome == "cancelled"
+    assert seen == []
 
 
 def test_permission_bridge_accepts_safe_canonical_argv():

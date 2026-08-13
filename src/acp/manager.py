@@ -726,6 +726,7 @@ class ACPSessionManager:
         thread_id: Optional[str] = None,
         wait: bool = False,
         timeout: float = 2.0,
+        user_initiated: bool = False,
     ) -> bool:
         """Cancel the currently selected session without changing mode state.
         This is intentionally narrower than ``end_session``: the caller keeps
@@ -739,6 +740,15 @@ class ACPSessionManager:
         )
         if session is None:
             return False
+        if user_initiated:
+            active_generation = getattr(
+                session,
+                "active_prompt_generation",
+                lambda: None,
+            )()
+            mark_user_cancel = getattr(session, "mark_user_cancel", None)
+            if active_generation is not None and callable(mark_user_cancel):
+                mark_user_cancel(active_generation)
         result = session.cancel(wait=wait, timeout=timeout)
         return result is not False
     def _end_session_unlocked(self, key: str, *, remove_key_lock: bool = False) -> Optional[dict]:

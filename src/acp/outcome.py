@@ -395,10 +395,24 @@ def classify_prompt_result(result: object) -> PromptAssessment:
     }
 
     if stop_reason in _CANCELLED_REASONS:
+        cancellation_source = str(
+            getattr(result, "cancellation_source", "") or ""
+        ).strip().casefold()
         return PromptAssessment(
-            outcome=PromptOutcome.CANCELLED,
+            outcome=(
+                PromptOutcome.CANCELLED
+                if cancellation_source == "user"
+                else PromptOutcome.INCOMPLETE
+            ),
             stop_reason=stop_reason,
-            detail=f"ACP 停止原因：{stop_reason}",
+            detail=(
+                "用户已明确取消当前 ACP 任务"
+                if cancellation_source == "user"
+                else (
+                    f"ACP 停止原因：{stop_reason}"
+                    f"（中断来源：{cancellation_source or 'provider'}）"
+                )
+            ),
             **counts,
         )
     if stop_reason != "end_turn":

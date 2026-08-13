@@ -126,7 +126,11 @@ def test_natural_incomplete_result_does_not_open_new_window() -> None:
 
 
 def test_cancelled_result_does_not_open_new_window() -> None:
-    cancelled = PromptResult(stop_reason="cancelled", text="stopped")
+    cancelled = PromptResult(
+        stop_reason="cancelled",
+        text="stopped",
+        cancellation_source="user",
+    )
     execute, _calls = _queued_executor(
         PromptContinuationResult(
             result=cancelled,

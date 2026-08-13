@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -842,8 +844,8 @@ def test_late_agent_image_stays_in_main_card_with_task_attribution() -> None:
     ("stop_reason", "expected"),
     [
         ("end_turn", PromptOutcome.COMPLETED),
-        ("cancelled", PromptOutcome.CANCELLED),
-        ("canceled", PromptOutcome.CANCELLED),
+        ("cancelled", PromptOutcome.INCOMPLETE),
+        ("canceled", PromptOutcome.INCOMPLETE),
         ("max_turn_requests", PromptOutcome.INCOMPLETE),
         ("max_tokens", PromptOutcome.INCOMPLETE),
         ("refusal", PromptOutcome.INCOMPLETE),
@@ -859,6 +861,64 @@ def test_prompt_stop_reason_is_not_implicitly_successful(
 ) -> None:
     assessment = classify_prompt_result(PromptResult(stop_reason=stop_reason))
     assert assessment.outcome is expected
+
+
+def test_only_manager_marked_user_cancel_is_cancelled() -> None:
+    result = PromptResult(
+        stop_reason="cancelled",
+        cancellation_source="user",
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert assessment.outcome is PromptOutcome.CANCELLED
+
+
+def test_silent_programming_mode_switch_is_not_marked_as_user_cancel() -> None:
+    from src.feishu.handlers.programming import ProgrammingModeHandler
+
+    handler = object.__new__(ProgrammingModeHandler)
+    session = SimpleNamespace(last_query="task", message_count=1, session_id="s1")
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    manager.end_session.return_value = True
+    handler._get_session_manager = lambda: manager
+    handler._is_in_this_mode = lambda *_args, **_kwargs: True
+    handler.ctx = SimpleNamespace(
+        settings=SimpleNamespace(thread_programming_enabled=False),
+        mode_manager=MagicMock(),
+    )
+    handler.add_reaction = MagicMock()
+
+    with patch("src.thread.get_current_thread_id", return_value=None):
+        handler.exit_mode("message", "chat", silent=True)
+
+    manager.cancel_session.assert_called_once_with(
+        "chat",
+        project_id=None,
+        thread_id=None,
+        user_initiated=False,
+    )
+
+
+def test_permission_denied_cancelled_is_infrastructure_interruption() -> None:
+    result = PromptResult(stop_reason="cancelled")
+    result.ingest_history(
+        [
+            {
+                "kind": "permission",
+                "data": {
+                    "outcome": "cancelled",
+                    "reason": "dangerous_execute",
+                },
+            }
+        ]
+    )
+
+    assessment = classify_prompt_result(result)
+
+    assert result.cancellation_source == "permission_denied"
+    assert assessment.outcome is PromptOutcome.INCOMPLETE
 
 
 def test_end_turn_with_pending_plan_is_incomplete() -> None:
@@ -952,7 +1012,7 @@ def test_no_provider_goal_uses_ordinary_completion_checks() -> None:
 @pytest.mark.parametrize(
     ("stop_reason", "expected"),
     [
-        ("cancelled", PromptOutcome.CANCELLED),
+        ("cancelled", PromptOutcome.INCOMPLETE),
         ("max_tokens", PromptOutcome.INCOMPLETE),
     ],
 )

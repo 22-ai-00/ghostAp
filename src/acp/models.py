@@ -183,6 +183,7 @@ class PromptResult:
     modified_files: set[str] = field(default_factory=set)
     output_tokens: Optional[int] = None  # Output token count for discussion budget tracking
     goal: ACPGoalInfo | None = None
+    cancellation_source: str | None = None
 
     # ---- aggregation helpers ----
     def add_text(self, chunk: str) -> None:
@@ -221,6 +222,12 @@ class PromptResult:
             data = e.get("data") if isinstance(e.get("data"), dict) else {}
             if kind:
                 self.tool_results.append(e)
+            if (
+                kind == "permission"
+                and str(data.get("outcome") or "").strip().casefold()
+                in {"cancelled", "canceled"}
+            ):
+                self.cancellation_source = "permission_denied"
             # Track modified files from tool results
             if kind in ("write_file", "read_file"):
                 p = data.get("path")

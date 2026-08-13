@@ -790,6 +790,94 @@ def test_timeout_exception_does_not_start_ordinary_continuation() -> None:
     assert len(session.calls) == 1
 
 
+def test_provider_cancelled_recovers_once_on_same_session() -> None:
+    runner = _runner()
+    session = _FakeSession(
+        PromptResult(stop_reason="cancelled", text="interrupted"),
+        _complete_result(),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=60,
+        finalization_reserve_s=0,
+    )
+
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.automatic_continuations == 1
+    assert session.continuation_calls == session.calls[1:]
+    assert "本指令不新增任何权限" in session.calls[1].text
+    assert "sandbox" in session.calls[1].text
+
+
+def test_repeated_provider_cancelled_stops_incomplete_after_one_recovery() -> None:
+    runner = _runner()
+    session = _FakeSession(
+        PromptResult(stop_reason="cancelled", text="first interruption"),
+        PromptResult(stop_reason="cancelled", text="second interruption"),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=60,
+        finalization_reserve_s=0,
+    )
+
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.automatic_continuations == 1
+    assert len(session.calls) == 2
+
+
+def test_permission_denied_cancelled_gets_one_safe_recovery() -> None:
+    runner = _runner()
+    denied = PromptResult(
+        stop_reason="cancelled",
+        tool_results=[
+            {
+                "kind": "permission",
+                "data": {
+                    "outcome": "cancelled",
+                    "reason": "dangerous_execute",
+                },
+            }
+        ],
+    )
+    session = _FakeSession(denied, _complete_result())
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=60,
+        finalization_reserve_s=0,
+    )
+
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.automatic_continuations == 1
+
+
+def test_manager_marked_user_cancel_never_continues() -> None:
+    runner = _runner()
+    session = _FakeSession(
+        PromptResult(
+            stop_reason="cancelled",
+            cancellation_source="user",
+        )
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=60,
+        finalization_reserve_s=0,
+    )
+
+    assert execution.assessment.outcome is PromptOutcome.CANCELLED
+    assert execution.automatic_continuations == 0
+    assert len(session.calls) == 1
+
+
 def test_continuation_uses_only_the_original_deadline_remaining_budget() -> None:
     runner = _runner()
     clock = _FakeClock()
@@ -861,4 +949,3 @@ def test_continuation_prompt_uses_safe_defaults_without_adding_authority() -> No
     assert "不可逆外部副作用" in continuation_prompt
     assert "ACP、sandbox 或工具权限" in continuation_prompt
     assert "不得绕过" in continuation_prompt
-
