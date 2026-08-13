@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,6 +109,39 @@ class _CancelledChannel:
         raise asyncio.CancelledError
 
 
+@pytest.fixture(autouse=True)
+def _isolate_asyncio_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_in_thread(func, *args, **kwargs):
+        context = contextvars.copy_context()
+        result = []
+        errors: list[BaseException] = []
+        done = threading.Event()
+
+        def invoke() -> None:
+            try:
+                result.append(context.run(func, *args, **kwargs))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(
+            target=invoke,
+            name="test-external-mutation",
+        )
+        worker.start()
+        while not done.is_set():
+            await asyncio.sleep(0.01)
+        worker.join(timeout=1.0)
+        if worker.is_alive():
+            raise TimeoutError("test external mutation thread did not stop")
+        if errors:
+            raise errors[0]
+        return result[0]
+
+    monkeypatch.setattr(asyncio, "to_thread", run_in_thread)
+
+
 @pytest.mark.asyncio
 async def test_retirement_fence_blocks_slash_and_channel_before_external_calls(
     tmp_path: Path,
@@ -159,6 +193,7 @@ async def test_retirement_waits_for_inflight_slash_terminal_anchor(
     runtime._vault = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
         resolve=lambda *_args: "secret"
     )
+
     runtime._slash_factory = lambda *_args: slash  # noqa: SLF001
     state = service.get_state("hire_recover")
     assert state is not None
@@ -183,15 +218,17 @@ async def test_retirement_waits_for_inflight_slash_terminal_anchor(
     assert retirement.done() is False
 
     slash.release.set()
-    await reconcile
-    assert await retirement is True
-    current = service.get_state("hire_recover")
-    assert current is not None
-    assert (
-        current.effect_state("slash-reconcile:2:1")
-        is HireEffectState.COMMITTED
-    )
-    service.close()
+    try:
+        await reconcile
+        assert await retirement is True
+        current = service.get_state("hire_recover")
+        assert current is not None
+        assert (
+            current.effect_state("slash-reconcile:2:1")
+            is HireEffectState.COMMITTED
+        )
+    finally:
+        service.close()
 
 
 @pytest.mark.asyncio
