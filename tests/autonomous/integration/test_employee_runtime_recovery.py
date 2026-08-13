@@ -591,6 +591,7 @@ def _seed_action_required(
     effect_type: str = "slash_reconciliation",
     effect_id: str = "slash-reconcile:2:1",
     terminal: bool = True,
+    error_code: str = "recovery_exhausted",
 ) -> ProductionEmployeeHireService:
     _seed_active_employee(tmp_path)
     epoch_two = _service(_writer(tmp_path, 2))
@@ -609,7 +610,7 @@ def _seed_action_required(
     if terminal:
         epoch_two.mark_recovery_action_required(
             "hire_recover",
-            error_code="recovery_exhausted",
+            error_code=error_code,
         )
     else:
         commit_workforce_events(
@@ -666,6 +667,33 @@ def test_recovery_exhausted_slash_is_atomically_reopened_and_uses_fresh_attempt(
     ]
     assert marker_frames[0].events[0].payload == {"generation": 1}
     assert marker_frames[0].events[1].payload == {"state": "validating"}
+
+
+def test_terminal_anchor_failed_slash_is_reopened_as_convergent_reconciliation(
+    tmp_path: Path,
+) -> None:
+    service = _seed_action_required(
+        tmp_path,
+        error_code="terminal_anchor_failed",
+    )
+
+    result = service.recover_replay_safe_action_required()
+
+    assert result == hire_service.ActionRequiredRecoveryResult(
+        eligible=1,
+        repaired_intent_ids=("hire_recover",),
+        skipped=0,
+        failed=0,
+    )
+    state = service.get_state("hire_recover")
+    assert state is not None
+    assert state.phase is HirePhase.VALIDATING
+    assert service.select_slash_reconcile_effect(
+        state.intent_id,
+        generation=2,
+        force_refresh=True,
+        allow_action_required_refresh=True,
+    ) == "slash-reconcile:2:2"
 
 
 def test_same_epoch_crash_and_exhaustion_requires_restart_then_recovers(

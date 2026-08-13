@@ -195,6 +195,76 @@ async def test_retirement_waits_for_inflight_slash_terminal_anchor(
 
 
 @pytest.mark.asyncio
+async def test_slash_credential_failure_is_recorded_as_replay_safe(
+    tmp_path: Path,
+) -> None:
+    _seed_active_employee(tmp_path)
+    service = _recovery_service(_writer(tmp_path, 2))
+    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
+    runtime._service = service  # noqa: SLF001
+    runtime._vault = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        resolve=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("cannot schedule new futures after shutdown")
+        )
+    )
+    runtime._slash_factory = lambda *_args: pytest.fail(  # noqa: SLF001
+        "Slash API must not run when credential resolution failed"
+    )
+    state = service.get_state("hire_recover")
+    assert state is not None
+
+    with pytest.raises(RuntimeError, match="credential resolution failed"):
+        await runtime._reconcile_slash(  # noqa: SLF001
+            state,
+            generation=2,
+            force_refresh=True,
+            allow_action_required_refresh=False,
+        )
+
+    current = service.get_state("hire_recover")
+    assert current is not None
+    assert current.effect_state("slash-reconcile:2:1") is HireEffectState.ACTION_REQUIRED
+    assert dict(current.metadata_for("slash-reconcile:2:1")) == {
+        "error_code": "recovery_exhausted"
+    }
+    service.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_runtime_does_not_start_slash_credential_resolution(
+    tmp_path: Path,
+) -> None:
+    _seed_active_employee(tmp_path)
+    service = _recovery_service(_writer(tmp_path, 2))
+    runtime = EmployeeDepartmentRuntime(runtime_enabled=True)
+    runtime._service = service  # noqa: SLF001
+    runtime._closing = True  # noqa: SLF001
+    runtime._vault = SimpleNamespace(  # type: ignore[assignment]  # noqa: SLF001
+        resolve=lambda *_args: pytest.fail("closing runtime must not use its executor")
+    )
+    runtime._slash_factory = lambda *_args: pytest.fail(  # noqa: SLF001
+        "closing runtime must not call the Slash API"
+    )
+    state = service.get_state("hire_recover")
+    assert state is not None
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime._reconcile_slash(  # noqa: SLF001
+            state,
+            generation=2,
+            force_refresh=True,
+            allow_action_required_refresh=False,
+        )
+
+    current = service.get_state("hire_recover")
+    assert current is not None
+    assert dict(current.metadata_for("slash-reconcile:2:1")) == {
+        "error_code": "recovery_exhausted"
+    }
+    service.close()
+
+
+@pytest.mark.asyncio
 async def test_retirement_waits_for_inflight_channel_ready_anchor(
     tmp_path: Path,
 ) -> None:

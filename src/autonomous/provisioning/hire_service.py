@@ -533,7 +533,7 @@ class ProductionEmployeeHireService:
         *,
         recovery_writer_epoch: int,
     ) -> bool:
-        """Accept only the known Slash exhaustion after a prior clean activation."""
+        """Accept only convergent Slash failures after a prior clean activation."""
 
         generation = state.channel_generation
         channel_effect_id = f"channel-start:{generation}"
@@ -591,7 +591,10 @@ class ProductionEmployeeHireService:
             or dict(state.effect_types).get(failed_effect_id)
             != "slash_reconciliation"
             or dict(state.metadata_for(failed_effect_id))
-            != {"error_code": "recovery_exhausted"}
+            not in (
+                {"error_code": "recovery_exhausted"},
+                {"error_code": "terminal_anchor_failed"},
+            )
             or any(
                 effect_state
                 not in {HireEffectState.COMMITTED, HireEffectState.ACTION_REQUIRED}
@@ -646,7 +649,7 @@ class ProductionEmployeeHireService:
                 aggregate_id=state.intent_id,
                 payload={
                     **effect_payload,
-                    "metadata": {"error_code": "recovery_exhausted"},
+                    "metadata": dict(state.metadata_for(failed_effect_id)),
                 },
             )
             and cls._single_event_frame_matches(
@@ -891,7 +894,7 @@ class ProductionEmployeeHireService:
                 and state.effect_state(effect_id) is HireEffectState.ACTION_REQUIRED
                 and dict(state.effect_types).get(effect_id) == "slash_reconciliation"
                 and dict(state.metadata_for(effect_id)).get("error_code")
-                == "recovery_exhausted"
+                in {"recovery_exhausted", "terminal_anchor_failed"}
             )
             if force_refresh and refreshable:
                 return f"slash-reconcile:{generation}:{attempt + 1}"

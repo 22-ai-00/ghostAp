@@ -6156,7 +6156,16 @@ class EmployeeDepartmentRuntime:
                 raise RuntimeError("Slash reconciliation requires manual action")
             if self._vault is None or self._slash_factory is None:
                 raise RuntimeError("Slash composition unavailable")
-            external_started = True
+            if self._closing:
+                service.commit_effect_transition(
+                    state.intent_id,
+                    effect_id=effect_id,
+                    effect_type="slash_reconciliation",
+                    next_state=HireEffectState.ACTION_REQUIRED,
+                    metadata={"error_code": "recovery_exhausted"},
+                )
+                disposition_anchored = True
+                raise asyncio.CancelledError
             resolve_task = asyncio.create_task(
                 asyncio.to_thread(
                     self._vault.resolve,
@@ -6169,11 +6178,41 @@ class EmployeeDepartmentRuntime:
             try:
                 secret, resolve_cancelled = await self._await_external_task_terminal(resolve_task)
             except ExternalTaskTerminalError as exc:
+                service.commit_effect_transition(
+                    state.intent_id,
+                    effect_id=effect_id,
+                    effect_type="slash_reconciliation",
+                    next_state=HireEffectState.ACTION_REQUIRED,
+                    metadata={"error_code": "recovery_exhausted"},
+                )
+                disposition_anchored = True
                 if exc.caller_cancelled:
                     raise asyncio.CancelledError from None
                 raise RuntimeError("Slash credential resolution failed") from None
+            except Exception:
+                service.commit_effect_transition(
+                    state.intent_id,
+                    effect_id=effect_id,
+                    effect_type="slash_reconciliation",
+                    next_state=HireEffectState.ACTION_REQUIRED,
+                    metadata={"error_code": "recovery_exhausted"},
+                )
+                disposition_anchored = True
+                raise RuntimeError("Slash credential resolution failed") from None
             deferred_cancel = deferred_cancel or resolve_cancelled
+            if deferred_cancel or self._closing:
+                secret = ""
+                service.commit_effect_transition(
+                    state.intent_id,
+                    effect_id=effect_id,
+                    effect_type="slash_reconciliation",
+                    next_state=HireEffectState.ACTION_REQUIRED,
+                    metadata={"error_code": "recovery_exhausted"},
+                )
+                disposition_anchored = True
+                raise asyncio.CancelledError
             reconciler = self._slash_factory(current.app_id, secret)
+            external_started = True
             reconcile_task = asyncio.create_task(
                 reconciler.reconcile(),
                 name=external_task_name("slash-reconciliation"),
