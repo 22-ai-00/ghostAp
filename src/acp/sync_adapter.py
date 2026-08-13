@@ -34,6 +34,7 @@ from .diagnostics import (
     format_startup_diagnostics_summary as format_startup_diagnostics,
 )
 from .models import ACPEvent, PromptResult
+from .prompt_generation import PromptGenerationTracker
 from .session import ACPResumeRejected, ACPSession, ACPStartupError
 from .startup_utils import initial_startup_diagnostics
 
@@ -610,7 +611,7 @@ def start_session_with_retry(
     ) from last_err
 
 
-class SyncACPSession:
+class SyncACPSession(PromptGenerationTracker):
     """Synchronous wrapper for ACPSession.
 
     Runs an asyncio event loop in a background thread and provides blocking
@@ -953,10 +954,8 @@ class SyncACPSession:
             self._prompt_lock = prompt_lock
         if not prompt_lock.acquire(blocking=False):
             raise RuntimeError("ACP prompt is already running for this session")
-        with self._prompt_generation_lock:
-            self._prompt_generation += 1
-            prompt_generation = self._prompt_generation
-            self._active_prompt_generation = prompt_generation
+        prompt_generation = self._begin_prompt_generation()
+        generation_consumed = False
         try:
             result = self._send_prompt_once(
                 text,
@@ -968,34 +967,21 @@ class SyncACPSession:
                 await_child_quiescence=await_child_quiescence,
                 replay_deferred_child_events=replay_deferred_child_events,
             )
-            if (
-                str(result.stop_reason or "").strip().casefold()
-                in {"cancelled", "canceled"}
-                and result.cancellation_source is None
-            ):
-                result.cancellation_source = "provider"
-            with self._prompt_generation_lock:
-                if self._user_cancel_generation == prompt_generation:
+            user_cancelled = self._consume_prompt_generation(prompt_generation)
+            generation_consumed = True
+            if str(result.stop_reason or "").strip().casefold() in {
+                "cancelled",
+                "canceled",
+            }:
+                if user_cancelled:
                     result.cancellation_source = "user"
+                elif result.cancellation_source is None:
+                    result.cancellation_source = "provider"
             return result
         finally:
-            with self._prompt_generation_lock:
-                if self._active_prompt_generation == prompt_generation:
-                    self._active_prompt_generation = None
-                if self._user_cancel_generation == prompt_generation:
-                    self._user_cancel_generation = None
+            if not generation_consumed:
+                self._consume_prompt_generation(prompt_generation)
             prompt_lock.release()
-
-    def active_prompt_generation(self) -> int | None:
-        """Return the exact prompt generation currently owned by this wrapper."""
-        with self._prompt_generation_lock:
-            return self._active_prompt_generation
-
-    def mark_user_cancel(self, generation: int) -> None:
-        """Bind an explicit user cancellation to one active prompt generation."""
-        with self._prompt_generation_lock:
-            if self._active_prompt_generation == generation:
-                self._user_cancel_generation = generation
 
     def send_finalization_prompt(
         self,

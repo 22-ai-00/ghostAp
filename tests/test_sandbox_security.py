@@ -50,6 +50,14 @@ class TestDangerousPatterns:
             "zsh -c 'rm -rf /'",
             "rm -rf /; echo should-not-run",
             "rm -rf / && echo should-not-run",
+            "rm --no-preserve-root -rf /",
+            "rm -rf -- /",
+            'rm -rf "/"',
+            "rm / -rf",
+            "zsh -c 'cd /tmp && rm --no-preserve-root -rf \"/\"'",
+            "sudo rm --no-preserve-root -rf /",
+            "echo $(rm --no-preserve-root -rf /)",
+            "echo `rm --no-preserve-root -rf /`",
         ],
     )
     def test_blocks_destructive_root_removal(self, strategy, settings, command):
@@ -60,6 +68,24 @@ class TestDangerousPatterns:
 
     def test_allows_safe_command(self, strategy, settings):
         is_safe, reason = strategy.check("ls -la /tmp", settings)
+        assert is_safe is True
+        assert reason is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm -rf /tmp/build-output",
+            "echo rm --no-preserve-root -rf /",
+            "printf '%s' 'rm -rf /'",
+        ],
+    )
+    def test_allows_non_executed_root_removal_text(
+        self,
+        strategy,
+        settings,
+        command,
+    ):
+        is_safe, reason = strategy.check(command, settings)
         assert is_safe is True
         assert reason is None
 

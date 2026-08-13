@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # Import acp.models first to break circular import chain
-from src.acp.models import ACPEvent, ACPEventType
+from src.acp.models import ACPEvent, ACPEventType, PromptResult
 from src.agent_session.claude_cli import SyncClaudeCLISession
 from src.agent_session.factory import create_auxiliary_session, create_engine_session
 from src.agent_session.model_diagnostics import classify_model_failure
@@ -97,6 +97,26 @@ class TestSyncClaudeCLISession:
         assert not sess._cancel_event.is_set()
         sess.cancel()
         assert sess._cancel_event.is_set()
+
+    def test_explicit_user_cancel_is_bound_to_active_prompt_generation(
+        self,
+        monkeypatch,
+    ):
+        sess = SyncClaudeCLISession(cwd="/tmp")
+        sess.session_id = "test-session"
+
+        def cancelled_turn(*_args, **_kwargs):
+            generation = sess.active_prompt_generation()
+            assert generation is not None
+            sess.mark_user_cancel(generation)
+            return PromptResult(stop_reason="cancelled")
+
+        monkeypatch.setattr(sess, "_send_prompt_once", cancelled_turn, raising=False)
+
+        result = sess.send_prompt("stop this turn")
+
+        assert result.cancellation_source == "user"
+        assert sess.active_prompt_generation() is None
 
 
     def test_send_prompt_auto_starts(self):

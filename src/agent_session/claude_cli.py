@@ -19,6 +19,7 @@ from ..acp.client import (
     snapshot_local_image_artifacts,
 )
 from ..acp.models import ACPEvent, ACPEventType, PromptResult
+from ..acp.prompt_generation import PromptGenerationTracker
 from ..config import get_settings
 from ..utils.errors import get_error_detail
 from .employee_cli_sandbox import EmployeeCLISandbox
@@ -55,7 +56,7 @@ class ClaudeCLIConfig:
     bypass_permissions: Optional[bool] = None  # None → use config.claude_cli_skip_permissions
 
 
-class SyncClaudeCLISession(_PromptRetryMixin):
+class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
     """Claude Code CLI backend.
 
     - Uses `claude -p` (print and exit) per prompt.
@@ -77,6 +78,10 @@ class SyncClaudeCLISession(_PromptRetryMixin):
         self._proc: Optional[subprocess.Popen] = None
         self._proc_group_id: int | None = None
         self._cancel_event = threading.Event()
+        self._prompt_generation_lock = threading.Lock()
+        self._prompt_generation = 0
+        self._active_prompt_generation: int | None = None
+        self._user_cancel_generation: int | None = None
         self._force_dead = False
         self._tool_filter = None
         self._employee_sandbox = (
@@ -163,10 +168,39 @@ class SyncClaudeCLISession(_PromptRetryMixin):
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         timeout: Optional[int] = None,
     ) -> PromptResult:
+        self._cancel_event.clear()
+        prompt_generation = self._begin_prompt_generation()
+        generation_consumed = False
+        try:
+            result = self._send_prompt_once(
+                text,
+                on_event=on_event,
+                timeout=timeout,
+            )
+            user_cancelled = self._consume_prompt_generation(prompt_generation)
+            generation_consumed = True
+            if str(result.stop_reason or "").strip().casefold() in {
+                "cancelled",
+                "canceled",
+            }:
+                if user_cancelled:
+                    result.cancellation_source = "user"
+                elif result.cancellation_source is None:
+                    result.cancellation_source = "provider"
+            return result
+        finally:
+            if not generation_consumed:
+                self._consume_prompt_generation(prompt_generation)
+
+    def _send_prompt_once(
+        self,
+        text: str,
+        on_event: Optional[Callable[[ACPEvent], None]] = None,
+        timeout: Optional[int] = None,
+    ) -> PromptResult:
         if not self.session_id:
             self.start()
 
-        self._cancel_event.clear()
         self.last_active = time.time()
         self.message_count += 1
         self.last_query = text

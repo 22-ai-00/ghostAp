@@ -612,6 +612,11 @@ def run_prompt_with_continuation(
             result,
             classify_prompt_result(result),
         )
+        if (
+            continuation_kind == _INTERRUPTION_RECOVERY
+            and assessment.outcome is PromptOutcome.INCOMPLETE
+        ):
+            break
 
     return PromptContinuationResult(
         result=result,

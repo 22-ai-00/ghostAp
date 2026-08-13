@@ -1,4 +1,5 @@
 import logging
+import posixpath
 import re
 import shlex
 import subprocess
@@ -117,8 +118,6 @@ class DangerousPatternCheckStrategy(SecurityCheckStrategy):
     """危险模式检查策略"""
 
     DANGEROUS_PATTERNS = [
-        r"rm\s+(-[rf]+\s+)?/(?:['\"])?(?:$|\s|[;&|])",
-        r"rm\s+(-[rf]+\s+)?/\*",
         r"mkfs\.",
         r"dd\s+if=",
         r">\s*/dev/sd[a-z]",
@@ -136,7 +135,94 @@ class DangerousPatternCheckStrategy(SecurityCheckStrategy):
     def __init__(self):
         self._compiled_patterns = [re.compile(p, re.IGNORECASE) for p in self.DANGEROUS_PATTERNS]
 
+    @staticmethod
+    def _is_root_operand(token: str) -> bool:
+        if not token or token.startswith("-"):
+            return False
+        return token.startswith("/") and (
+            not token.strip("/") or posixpath.normpath(token) == "/"
+        )
+
+    @classmethod
+    def _contains_root_removal(cls, command: str, *, depth: int = 0) -> bool:
+        """Parse rm operands across shell composition and common ``*-c`` wrappers."""
+        if depth > 4:
+            return False
+        try:
+            lexer = shlex.shlex(
+                command,
+                posix=True,
+                punctuation_chars=";&|()`",
+            )
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except ValueError:
+            # A malformed shell command cannot execute successfully. Keep the
+            # legacy regex checks below as the conservative fallback.
+            return False
+
+        operators = {
+            ";",
+            ";;",
+            "&",
+            "&&",
+            "|",
+            "||",
+            "(",
+            ")",
+            "`",
+        }
+        segment: list[str] = []
+        segments: list[list[str]] = []
+        for token in tokens:
+            if token in operators:
+                if segment:
+                    segments.append(segment)
+                    segment = []
+                continue
+            segment.append(token)
+        if segment:
+            segments.append(segment)
+
+        shell_names = {"bash", "dash", "fish", "ksh", "sh", "zsh"}
+        launchers = {"command", "env", "exec", "nohup", "sudo", "time", "timeout"}
+        for items in segments:
+            if not items:
+                continue
+            first_executable = posixpath.basename(items[0]).casefold()
+            candidate_indices = (
+                range(len(items))
+                if first_executable in launchers
+                else range(1)
+            )
+            for index in candidate_indices:
+                token = items[index]
+                executable = posixpath.basename(token).casefold()
+                if executable == "rm" and any(
+                    cls._is_root_operand(argument)
+                    for argument in items[index + 1 :]
+                ):
+                    return True
+                if executable not in shell_names:
+                    continue
+                for flag_index in range(index + 1, len(items) - 1):
+                    flag = items[flag_index]
+                    if (
+                        flag.startswith("-")
+                        and not flag.startswith("--")
+                        and "c" in flag[1:]
+                        and cls._contains_root_removal(
+                            items[flag_index + 1],
+                            depth=depth + 1,
+                        )
+                    ):
+                        return True
+        return False
+
     def check(self, command: str, settings) -> tuple[bool, Optional[str]]:
+        if self._contains_root_removal(command):
+            return False, "命令包含危险操作模式: rm root operand"
         for pattern in self._compiled_patterns:
             if pattern.search(command):
                 return False, f"命令包含危险操作模式: {pattern.pattern}"

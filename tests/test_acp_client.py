@@ -1,6 +1,7 @@
 """Tests for acp.client — GhostAPClient event handling."""
 
 import asyncio
+import getpass
 import logging
 import os
 import shutil
@@ -35,7 +36,37 @@ def test_build_clean_env_supplies_user_scoped_uv_cache_default() -> None:
 
     cache_dir = Path(env["UV_CACHE_DIR"])
     cache_dir.relative_to(Path(tempfile.gettempdir()))
-    assert str(os.getuid()) in cache_dir.name
+    get_uid = getattr(os, "getuid", None)
+    identity = str(get_uid()) if callable(get_uid) else getpass.getuser()
+    assert identity in cache_dir.name
+
+
+def test_build_clean_env_uses_numeric_uid_when_available(monkeypatch) -> None:
+    import src.utils.env as env_module
+
+    monkeypatch.setattr(env_module.os, "getuid", lambda: 4242, raising=False)
+    monkeypatch.setattr(
+        env_module.getpass,
+        "getuser",
+        lambda: pytest.fail("username fallback must not run when getuid exists"),
+    )
+
+    env = env_module.build_clean_env({"HOME": "/tmp/ghostap-test-home"})
+
+    assert Path(env["UV_CACHE_DIR"]).name == "ghostap-uv-cache-4242"
+
+
+def test_build_clean_env_uses_username_when_getuid_is_unavailable(
+    monkeypatch,
+) -> None:
+    import src.utils.env as env_module
+
+    monkeypatch.delattr(env_module.os, "getuid", raising=False)
+    monkeypatch.setattr(env_module.getpass, "getuser", lambda: "windows-user")
+
+    env = env_module.build_clean_env({"HOME": "C:/Users/windows-user"})
+
+    assert Path(env["UV_CACHE_DIR"]).name == "ghostap-uv-cache-windows-user"
 
 
 def test_build_clean_env_preserves_explicit_uv_cache_override() -> None:
@@ -635,6 +666,28 @@ def test_sync_adapter_user_cancel_marker_is_bound_to_active_generation(
 
     assert first.cancellation_source == "user"
     assert second.cancellation_source == "provider"
+
+
+def test_sync_adapter_legacy_factory_lazily_initializes_generation_state(
+    monkeypatch,
+) -> None:
+    """Older wrapper factories only initialized the prompt serialization lock."""
+    import threading
+
+    from src.acp.sync_adapter import SyncACPSession
+
+    session = object.__new__(SyncACPSession)
+    session._prompt_lock = threading.Lock()
+    monkeypatch.setattr(
+        session,
+        "_send_prompt_once",
+        lambda *_args, **_kwargs: PromptResult(stop_reason="end_turn"),
+    )
+
+    result = session.send_prompt("legacy factory")
+
+    assert result.stop_reason == "end_turn"
+    assert session.active_prompt_generation() is None
 
 
 def test_acp_manager_session_starter_success_is_not_overwritten(monkeypatch):
@@ -1335,6 +1388,10 @@ def test_permission_bridge_dangerous_argv_remains_fail_closed():
     (
         "rm -rf /",
         ["zsh", "-c", "rm -rf /"],
+        "rm --no-preserve-root -rf /",
+        "rm -rf -- /",
+        'rm -rf "/"',
+        ["zsh", "-c", 'cd /tmp && rm --no-preserve-root -rf "/"'],
     ),
 )
 def test_permission_bridge_rejects_root_removal_in_plain_and_wrapped_forms(

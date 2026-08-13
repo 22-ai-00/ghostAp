@@ -857,6 +857,28 @@ def test_permission_denied_cancelled_gets_one_safe_recovery() -> None:
     assert execution.automatic_continuations == 1
 
 
+def test_incomplete_interruption_recovery_does_not_switch_continuation_kind() -> None:
+    """One interrupted turn gets one retry, never a second prompt of another kind."""
+    runner = _runner()
+    interrupted = PromptResult(
+        stop_reason="cancelled",
+        cancellation_source="provider",
+    )
+    still_pending = _pending_result(pending_count=1)
+    session = _FakeSession(interrupted, still_pending, _complete_result())
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=60,
+        finalization_reserve_s=0,
+    )
+
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.automatic_continuations == 1
+    assert len(session.calls) == 2
+
+
 def test_manager_marked_user_cancel_never_continues() -> None:
     runner = _runner()
     session = _FakeSession(
