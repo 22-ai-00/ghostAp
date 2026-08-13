@@ -117,6 +117,10 @@ class _WorkflowGenerationCloseUncertain(RuntimeError):
     """The prior binding may still be live, so fallback is unsafe."""
 
 
+class _WorkflowGenerationExhausted(RuntimeError):
+    """All model paths and the deterministic pool fallback were exhausted."""
+
+
 def _workflow_pending_statuses():
     """States that own a pending Workflow card/session rather than a runtime run."""
     from ...workflow_engine.models import WorkflowStatus
@@ -376,7 +380,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             # a sanitized user-facing hint when one is available so the user
             # sees "脚本被篡改/验证失败"这类可操作信息 rather than a
             # generic "服务内部错误".
-            if safe_detail:
+            if safe_detail and category != "internal_error":
                 body = raw_body.rstrip() + "\n\n🔎 细节：" + safe_detail
             else:
                 body = raw_body
@@ -3531,6 +3535,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         from ...workflow_engine.script_gen import (
             build_script_gen_prompt,
             extract_meta_from_script,
+            generate_simple_script,
             validate_generated_script,
         )
         from ...workflow_engine.tool_registry import get_available_tools
@@ -3578,7 +3583,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
 
         captured_session_key = pending.engine_session_key
         started_at = time.monotonic()
-        hard_deadline = started_at + 600.0
+        hard_deadline = started_at + float(SCRIPT_GEN_TIMEOUT_S)
         configured_attempt_timeout = float(
             getattr(
                 self.settings,
@@ -3698,11 +3703,20 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
 
         session_owner: _WorkflowLifecycleOwner | None = None
 
-        def close_strict(session: Any, *, cancel: bool) -> None:
+        def close_strict(
+            session: Any,
+            *,
+            cancel: bool,
+            read_only_fenced: bool,
+            quarantine_event: threading.Event,
+            provider_cancel_event: threading.Event,
+        ) -> None:
+            quarantine_event.set()
             cancel_confirmed = True
             close_confirmed = True
             details: list[str] = []
             if cancel:
+                provider_cancel_event.set()
                 try:
                     cancelled = session.cancel(wait=True, timeout=2.0)
                     if cancelled is False:
@@ -3723,6 +3737,14 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     if callable(release_owner):
                         release_owner(session_owner)
                 return
+            if read_only_fenced:
+                if session_owner is not None:
+                    unbind_active_session(session_owner, session)
+                logger.warning(
+                    "Workflow read-only generation session cleanup was not confirmed; "
+                    "quarantining it and continuing within the frozen pool"
+                )
+                return
             raise _WorkflowGenerationCloseUncertain("; ".join(details))
 
         def transport_failure(exc: BaseException) -> bool:
@@ -3742,13 +3764,55 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 for token in ("permission", "forbidden", "unauthorized", "unsafe", "policy")
             )
 
+        def validate_and_write(script_content: str) -> tuple[str, dict[str, Any]]:
+            is_valid, errors = validate_generated_script(
+                script_content,
+                review_agents=[],
+                agent_pool=pool,
+            )
+            if not is_valid:
+                raise ValueError(
+                    "; ".join(errors[:3]) or "script validation failed"
+                )
+            meta = extract_meta_from_script(script_content) or {}
+            unsupported = sorted(
+                set(meta.get("tools", [])) - {item.tool_name for item in pool}
+            )
+            if unsupported:
+                raise ValueError(
+                    "脚本引用未确认工具: " + ", ".join(unsupported)
+                )
+            ensure_current()
+            lock_context = artifact_lock if artifact_lock is not None else nullcontext()
+            with lock_context:
+                ensure_current()
+                with open(output_path, "w", encoding="utf-8") as file:
+                    file.write(script_content)
+            return output_path, meta
+
         last_error = "模型未返回有效脚本"
-        for binding in ordered_pool:
+        for binding_index, binding in enumerate(ordered_pool):
+            ensure_current()
+            now = time.monotonic()
+            remaining_hard_budget = hard_deadline - now
+            if remaining_hard_budget <= 0:
+                last_error = "Workflow generation total timeout exceeded"
+                break
+            remaining_bindings = len(ordered_pool) - binding_index
+            member_deadline = now + (
+                remaining_hard_budget / max(1, remaining_bindings)
+            )
             for repair_attempt in range(1, _SCRIPT_GENERATION_MAX_ATTEMPTS + 1):
                 ensure_current()
-                remaining = hard_deadline - time.monotonic()
+                now = time.monotonic()
+                remaining = hard_deadline - now
+                member_remaining = member_deadline - now
                 if remaining <= 0:
-                    raise RuntimeError("Workflow generation total timeout exceeded")
+                    last_error = "Workflow generation total timeout exceeded"
+                    break
+                if member_remaining <= 0:
+                    last_error = f"{binding.agent_id} generation slice exhausted"
+                    break
                 if progress_callback:
                     progress_callback(
                         f"{binding.agent_id} 正在生成编排脚本（修复 {repair_attempt}/"
@@ -3766,6 +3830,8 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 should_fallback = False
                 activity_buffer = _WorkflowGenerationActivityBuffer()
                 attempt_cancel_event = threading.Event()
+                attempt_quarantined = threading.Event()
+                read_only_fenced = False
                 try:
                     session_owner = current_generation_owner()
                     if session_owner is None:
@@ -3790,41 +3856,75 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         break
                     if not bind_active_session(session_owner, session):
                         anchor_session_for_cleanup(session_owner, session)
-                        close_strict(session, cancel=True)
+                        close_strict(
+                            session,
+                            cancel=True,
+                            read_only_fenced=False,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                         session = None
                         raise RuntimeError(
                             "stale Workflow generation owner before session bind"
                         )
                     session.set_tool_filter(tool_filter)
+                    read_only_fenced = True
                     if not active_session_is_current(session_owner, session):
-                        close_strict(session, cancel=True)
+                        close_strict(
+                            session,
+                            cancel=True,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                         session = None
                         raise RuntimeError(
                             "stale Workflow generation owner before prompt send"
                         )
 
-                    def on_event(event: Any) -> None:
+                    def on_event(
+                        event: Any,
+                        *,
+                        _session: Any = session,
+                        _session_owner: _WorkflowLifecycleOwner = session_owner,
+                        _quarantine_event: threading.Event = attempt_quarantined,
+                        _activity_buffer: _WorkflowGenerationActivityBuffer = activity_buffer,
+                        _binding_agent_id: str = binding.agent_id,
+                        _progress_callback: Any = progress_callback,
+                    ) -> None:
+                        if (
+                            _quarantine_event.is_set()
+                            or not active_session_is_current(
+                                _session_owner,
+                                _session,
+                            )
+                        ):
+                            return
                         text = str(getattr(event, "text", "") or "")
                         event_type = getattr(event, "event_type", None)
                         event_name = str(getattr(event_type, "value", event_type) or "").lower()
                         meaningful = self._workflow_generation_event_is_meaningful(event)
-                        if not meaningful or not progress_callback:
+                        if not meaningful or not _progress_callback:
                             return
-                        summaries = activity_buffer.feed(text) if text else ()
+                        summaries = _activity_buffer.feed(text) if text else ()
                         if not text:
                             summaries = (
-                                *activity_buffer.flush(),
+                                *_activity_buffer.flush(),
                                 event_name.replace("_", " "),
                             )
                         for summary in summaries:
-                            progress_callback(
-                                f"{binding.agent_id} last activity: {summary[:180]}"
+                            _progress_callback(
+                                f"{_binding_agent_id} last activity: {summary[:180]}"
                             )
 
                     try:
                         attempt_timeout = max(
                             0.001,
-                            min(configured_attempt_timeout, remaining),
+                            min(
+                                configured_attempt_timeout,
+                                remaining,
+                                member_remaining,
+                            ),
                         )
                         result = session.send_prompt(
                             base_prompt + retry_note,
@@ -3842,20 +3942,40 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     try:
                         ensure_current()
                     except Exception:
-                        close_strict(session, cancel=True)
+                        close_strict(
+                            session,
+                            cancel=True,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                         session = None
                         raise
 
                     stop_reason = str(getattr(result, "stop_reason", "") or "").strip().lower()
                     if stop_reason in {"cancelled", "canceled"}:
-                        close_strict(session, cancel=True)
-                        session = None
-                        raise _WorkflowGenerationCancelled(
-                            f"Workflow generation cancelled by {binding.agent_id}"
+                        last_error = (
+                            f"{binding.agent_id} terminal stop_reason={stop_reason}"
                         )
+                        close_strict(
+                            session,
+                            cancel=True,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
+                        session = None
+                        should_fallback = True
+                        break
                     if stop_reason in {"timeout", "timed_out", "error", "failed", "failure"}:
                         last_error = f"{binding.agent_id} terminal stop_reason={stop_reason}"
-                        close_strict(session, cancel=True)
+                        close_strict(
+                            session,
+                            cancel=True,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                         session = None
                         should_fallback = True
                         break
@@ -3863,14 +3983,26 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         "end_turn", "completed", "complete", "success", "done",
                     }:
                         last_error = f"{binding.agent_id} terminal stop_reason={stop_reason}"
-                        close_strict(session, cancel=True)
+                        close_strict(
+                            session,
+                            cancel=True,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                         session = None
                         should_fallback = True
                         break
                     text = str(getattr(result, "text", "") or "").strip()
                     if not text:
                         last_error = f"{binding.agent_id}: model returned an empty script"
-                        close_strict(session, cancel=False)
+                        close_strict(
+                            session,
+                            cancel=False,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                         session = None
                         continue
                     script_content = self._strip_markdown_fences(text)
@@ -3881,10 +4013,14 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     )
                     if not is_valid:
                         last_error = "; ".join(errors[:3]) or "script validation failed"
-                        close_strict(session, cancel=False)
+                        close_strict(
+                            session,
+                            cancel=False,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                         session = None
-                        if permission_or_unsafe(last_error) or "[capability]" in last_error.lower():
-                            raise RuntimeError(last_error)
                         continue
                     meta = extract_meta_from_script(script_content) or {}
                     unsupported = sorted(
@@ -3892,40 +4028,53 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     )
                     if unsupported:
                         last_error = "脚本引用未确认工具: " + ", ".join(unsupported)
-                        close_strict(session, cancel=False)
+                        close_strict(
+                            session,
+                            cancel=False,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                         session = None
                         continue
 
-                    close_strict(session, cancel=False)
+                    close_strict(
+                        session,
+                        cancel=False,
+                        read_only_fenced=read_only_fenced,
+                        quarantine_event=attempt_quarantined,
+                        provider_cancel_event=attempt_cancel_event,
+                    )
                     session = None
-                    ensure_current()
-                    lock_context = artifact_lock if artifact_lock is not None else nullcontext()
-                    with lock_context:
-                        ensure_current()
-                        with open(output_path, "w", encoding="utf-8") as file:
-                            file.write(script_content)
-                    return output_path, meta
+                    return validate_and_write(script_content)
                 except _WorkflowGenerationCloseUncertain:
                     raise
                 except _WorkflowGenerationCancelled:
                     if session is not None:
-                        close_strict(session, cancel=True)
+                        close_strict(
+                            session,
+                            cancel=True,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
                     raise
                 except Exception as exc:
                     if session is not None:
-                        if permission_or_unsafe(exc):
-                            close_strict(session, cancel=True)
-                            raise
-                        if transport_failure(exc):
-                            close_strict(session, cancel=True)
+                        close_strict(
+                            session,
+                            cancel=True,
+                            read_only_fenced=read_only_fenced,
+                            quarantine_event=attempt_quarantined,
+                            provider_cancel_event=attempt_cancel_event,
+                        )
+                        session = None
+                        if transport_failure(exc) or permission_or_unsafe(exc):
                             session = None
                             last_error = f"{type(exc).__name__}: {exc}"
                             should_fallback = True
                             break
-                        close_strict(session, cancel=True)
                     if "stale" in str(exc).lower() or "superseded" in str(exc).lower():
-                        raise
-                    if permission_or_unsafe(exc):
                         raise
                     last_error = f"{type(exc).__name__}: {exc}"
                     logger.warning(
@@ -3937,10 +4086,35 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     continue
                 if should_fallback:
                     break
-            if hard_deadline - time.monotonic() <= 0:
-                raise RuntimeError("Workflow generation total timeout exceeded")
 
-        raise RuntimeError(f"Workflow generation failed: {last_error}")
+        ensure_current()
+        if progress_callback:
+            progress_callback(
+                "模型编排未完成，正在切换池内确定性编排并继续执行"
+            )
+        try:
+            fallback_script = generate_simple_script(
+                requirement,
+                agent_pool=pool,
+                orchestrator_agent_id=orchestrator_agent_id,
+            )
+            ensure_current()
+            return validate_and_write(fallback_script)
+        except _WorkflowGenerationCancelled:
+            raise
+        except Exception as exc:
+            if "stale" in str(exc).lower() or "superseded" in str(exc).lower():
+                raise
+            logger.error(
+                "Workflow deterministic pool fallback failed after model generation: %s; "
+                "last model error: %s",
+                exc,
+                last_error,
+                exc_info=True,
+            )
+            raise _WorkflowGenerationExhausted(
+                "Workflow 自动编排恢复未完成，请重新发起 `/wf`。"
+            ) from exc
 
     @staticmethod
     def _workflow_generation_event_is_meaningful(event: Any) -> bool:

@@ -59,6 +59,7 @@ class _Session:
         events: list[str] | None = None,
         close_error: BaseException | None = None,
         cancel_result: bool = True,
+        filter_error: BaseException | None = None,
         on_send: Any = None,
         streamed_events: list[ACPEvent] | None = None,
     ) -> None:
@@ -67,16 +68,21 @@ class _Session:
         self.events = events if events is not None else []
         self.close_error = close_error
         self.cancel_result = cancel_result
+        self.filter_error = filter_error
         self.on_send = on_send
         self.streamed_events = streamed_events or []
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.filter = None
+        self.event_callback = None
 
     def set_tool_filter(self, callback) -> None:
+        if self.filter_error:
+            raise self.filter_error
         self.filter = callback
 
     def send_prompt(self, prompt: str, **kwargs: Any) -> PromptResult:
         self.calls.append((prompt, kwargs))
+        self.event_callback = kwargs.get("on_event")
         if self.on_send:
             self.on_send()
         callback = kwargs.get("on_event")
@@ -253,7 +259,10 @@ def test_attempt_timeout_cancellation_does_not_set_workflow_stop_event(tmp_path)
     assert all(event is not workflow_stop for event in created_cancel_events)
 
 
-def test_close_failure_blocks_binding_fallback(tmp_path) -> None:
+def test_read_only_close_failure_is_quarantined_and_binding_fallback_continues(
+    tmp_path,
+) -> None:
+    progress: list[str] = []
     first = _Session(
         PromptResult(stop_reason="timeout", text=_script("A-2", "gemini")),
         name="A-2",
@@ -265,13 +274,31 @@ def test_close_failure_blocks_binding_fallback(tmp_path) -> None:
     )
     factory = MagicMock(side_effect=[first, second])
 
-    with pytest.raises(RuntimeError, match="close|关闭|uncertain"):
-        _generate(_handler(), _engine(tmp_path), tmp_path, factory)
+    engine = _engine(tmp_path)
+    path, meta = _generate(
+        _handler(),
+        engine,
+        tmp_path,
+        factory,
+        progress_callback=progress.append,
+    )
 
-    assert factory.call_count == 1
+    assert path.endswith("generated.js")
+    assert meta["agentPlan"][0]["agentId"] == "A-1"
+    assert factory.call_count == 2
+    assert engine.has_uncertain_lifecycle_session() is False
+    assert engine._script_generation_owner.active_generation_session is None
+
+    assert first.event_callback is not None
+    first.event_callback(
+        ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="late stale activity")
+    )
+    assert not any("late stale activity" in item for item in progress)
 
 
-def test_cancel_uncertainty_still_closes_and_fences_new_workflow(tmp_path) -> None:
+def test_read_only_cancel_uncertainty_is_quarantined_and_does_not_fence(
+    tmp_path,
+) -> None:
     engine = _engine(tmp_path)
     owner = _WorkflowLifecycleOwner("generation-1", "user-1")
     engine._script_generation_owner = owner
@@ -282,22 +309,38 @@ def test_cancel_uncertainty_still_closes_and_fences_new_workflow(tmp_path) -> No
     )
     handler = _handler()
 
-    with pytest.raises(RuntimeError, match="cancel|close|uncertain"):
-        _generate(handler, engine, tmp_path, MagicMock(return_value=session))
-
-    assert session.events == ["A-2:cancel", "A-2:close"]
-    assert owner.active_generation_session is session
-    assert not owner.done_event.is_set()
-    ok, error, _new_owner = handler._supersede_incomplete_workflow(
-        engine,
-        root_path=str(tmp_path),
-        current_user="user-1",
+    fallback = _Session(
+        PromptResult(stop_reason="end_turn", text=_script("A-1", "codex")),
+        name="A-1",
     )
-    assert ok is False
-    assert error == "invalid_state"
+    factory = MagicMock(side_effect=[session, fallback])
+
+    path, _meta = _generate(handler, engine, tmp_path, factory)
+
+    assert path.endswith("generated.js")
+    assert session.events == ["A-2:cancel", "A-2:close"]
+    assert owner.active_generation_session is None
+    assert engine.has_uncertain_lifecycle_session() is False
 
 
-def test_configured_attempt_timeout_preserves_shared_generation_fallback_budget(
+def test_unfenced_session_cleanup_uncertainty_still_blocks_fallback(tmp_path) -> None:
+    engine = _engine(tmp_path)
+    owner = engine._script_generation_owner
+    session = _Session(
+        PromptResult(stop_reason="end_turn", text=_script("A-2", "gemini")),
+        name="A-2",
+        filter_error=RuntimeError("filter installation failed"),
+        close_error=RuntimeError("close uncertain"),
+    )
+
+    with pytest.raises(RuntimeError, match="close|uncertain"):
+        _generate(_handler(), engine, tmp_path, MagicMock(return_value=session))
+
+    assert owner.active_generation_session is session
+    assert engine.has_uncertain_lifecycle_session() is True
+
+
+def test_fair_member_slice_preserves_later_binding_budget_and_bounds_repairs(
     tmp_path,
 ) -> None:
     clock = [0.0]
@@ -318,8 +361,8 @@ def test_configured_attempt_timeout_preserves_shared_generation_fallback_budget(
         ],
     )
     second = _Session(
-        PromptResult(stop_reason="end_turn", text=_script("A-2", "gemini")),
-        name="A-2-retry",
+        PromptResult(stop_reason="end_turn", text=_script("A-1", "codex")),
+        name="A-1",
     )
     factory = MagicMock(side_effect=[first, second])
 
@@ -340,6 +383,36 @@ def test_configured_attempt_timeout_preserves_shared_generation_fallback_budget(
     assert second_kwargs["idle_timeout"] <= 50
     assert any("A-2" in item and "working" in item for item in progress)
     assert not any("heartbeat" in item.lower() for item in progress)
+
+
+def test_unused_member_slice_rolls_forward_to_later_binding(tmp_path) -> None:
+    clock = [0.0]
+    handler = _handler()
+    handler.ctx.settings.workflow_script_gen_timeout_s = 600
+
+    def use_part_of_first_slice() -> None:
+        clock[0] = 100.0
+
+    first = _Session(
+        PromptResult(stop_reason="timeout", text=""),
+        name="A-2",
+        on_send=use_part_of_first_slice,
+    )
+    second = _Session(
+        PromptResult(stop_reason="end_turn", text=_script("A-1", "codex")),
+        name="A-1",
+    )
+
+    with patch("src.feishu.handlers.workflow.time.monotonic", side_effect=lambda: clock[0]):
+        _generate(
+            handler,
+            _engine(tmp_path),
+            tmp_path,
+            MagicMock(side_effect=[first, second]),
+        )
+
+    assert first.calls[0][1]["timeout"] == pytest.approx(300.0)
+    assert second.calls[0][1]["timeout"] == pytest.approx(500.0)
 
 
 def test_generation_activity_coalesces_token_chunks_into_complete_sentences(
@@ -376,20 +449,107 @@ def test_generation_activity_coalesces_token_chunks_into_complete_sentences(
 
 
 @pytest.mark.parametrize("stop_reason", [None, "", "timeout", "cancelled", "error"])
-def test_bad_stop_reason_rejects_valid_looking_script(tmp_path, stop_reason) -> None:
+def test_bad_provider_stop_reason_uses_deterministic_pool_fallback(
+    tmp_path,
+    stop_reason,
+) -> None:
     only = (_binding("A-1", "codex", "fast"),)
     session = _Session(
         PromptResult(stop_reason=stop_reason, text=_script("A-1", "codex")),
         name="A-1",
     )
 
-    with pytest.raises(RuntimeError, match="stop_reason|timeout|cancel|error|终止|失败"):
-        _generate(
-            _handler(),
-            _engine(tmp_path, pool=only, orchestrator="A-1"),
-            tmp_path,
-            MagicMock(return_value=session),
-        )
+    output_path, meta = _generate(
+        _handler(),
+        _engine(tmp_path, pool=only, orchestrator="A-1"),
+        tmp_path,
+        MagicMock(return_value=session),
+    )
+
+    content = (tmp_path / ".ghostap" / "workflow_scripts" / "generated.js").read_text()
+    assert output_path.endswith("generated.js")
+    assert meta["agentPlan"][0]["agentId"] == "A-1"
+    assert 'agentId: "A-1"' in content
+    assert "rogue" not in content
+
+
+def test_deterministic_fallback_failure_is_typed_and_hides_cleanup_details(
+    tmp_path,
+) -> None:
+    from src.feishu.handlers.workflow import _WorkflowGenerationExhausted
+
+    first = _Session(
+        PromptResult(stop_reason="timeout", text=""),
+        name="A-2",
+        close_error=RuntimeError("private close uncertain"),
+    )
+    second = _Session(
+        PromptResult(stop_reason="error", text=""),
+        name="A-1",
+    )
+
+    with patch(
+        "src.workflow_engine.script_gen.generate_simple_script",
+        return_value="not a valid workflow",
+    ):
+        with pytest.raises(_WorkflowGenerationExhausted) as raised:
+            _generate(
+                _handler(),
+                _engine(tmp_path),
+                tmp_path,
+                MagicMock(side_effect=[first, second]),
+            )
+
+    assert "private" not in str(raised.value)
+    assert "close" not in str(raised.value).lower()
+
+
+def test_explicit_owner_stop_wins_before_deterministic_fallback_write(tmp_path) -> None:
+    from src.feishu.handlers.workflow import _WorkflowGenerationCancelled
+
+    only = (_binding("A-1", "codex", "fast"),)
+    stop_event = threading.Event()
+    session = _Session(
+        PromptResult(stop_reason="cancelled", text=""),
+        name="A-1",
+    )
+
+    def stop_then_generate(*args, **kwargs):
+        del args, kwargs
+        stop_event.set()
+        return _script("A-1", "codex")
+
+    with patch(
+        "src.workflow_engine.script_gen.generate_simple_script",
+        side_effect=stop_then_generate,
+    ):
+        with pytest.raises(_WorkflowGenerationCancelled):
+            _generate(
+                _handler(),
+                _engine(tmp_path, pool=only, orchestrator="A-1"),
+                tmp_path,
+                MagicMock(return_value=session),
+                cancel_event=stop_event,
+            )
+
+    assert not (
+        tmp_path / ".ghostap" / "workflow_scripts" / "generated.js"
+    ).exists()
+
+
+def test_workflow_internal_error_card_never_tells_user_to_contact_admin() -> None:
+    card = _handler()._build_error_card(
+        "internal_error",
+        detail=(
+            "generation session cancellation was not confirmed; "
+            "generation session close uncertain"
+        ),
+    )
+
+    rendered = str(card)
+    assert "联系管理员" not in rendered
+    assert "generation session" not in rendered
+    assert "/wf" in rendered
 
 
 def test_stale_timeout_attempt_cannot_fallback_or_mutate_new_workflow(tmp_path) -> None:
