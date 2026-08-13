@@ -19,6 +19,12 @@ def test_close_drains_pending_loop_callbacks_before_loop_close():
 
     def run_loop() -> None:
         asyncio.set_event_loop(loop)
+
+        def keep_loop_responsive() -> None:
+            if loop.is_running():
+                loop.call_later(0.05, keep_loop_responsive)
+
+        loop.call_soon(keep_loop_responsive)
         started.set()
         loop.run_forever()
 
@@ -67,6 +73,12 @@ def test_sync_close_cancels_active_goal_waiter_and_clears_collector(tmp_path):
 
     def run_loop() -> None:
         asyncio.set_event_loop(loop)
+
+        def keep_loop_responsive() -> None:
+            if loop.is_running():
+                loop.call_later(0.05, keep_loop_responsive)
+
+        loop.call_soon(keep_loop_responsive)
         started.set()
         loop.run_forever()
 
