@@ -3980,7 +3980,7 @@ def test_observed_ws_tracks_scheduled_handler_before_business_entry(
 
         async def delayed_handler(_raw) -> None:
             await allow_business_entry.wait()
-            await asyncio.to_thread(mock_ws_client._handle_message, message)
+            mock_ws_client._handle_message(message)
 
         observed._handle_message = delayed_handler  # type: ignore[method-assign]
         await observed._schedule_handle_message(b"raw-frame")
@@ -3992,9 +3992,14 @@ def test_observed_ws_tracks_scheduled_handler_before_business_entry(
             return_value=True,
         ):
             close_thread.start()
-            assert await asyncio.to_thread(runtime_closed.wait, 0.2) is False
+            deadline = asyncio.get_running_loop().time() + 0.2
+            while not runtime_closed.is_set() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            assert runtime_closed.is_set() is False
             allow_business_entry.set()
-            await asyncio.to_thread(close_thread.join, 2)
+            deadline = asyncio.get_running_loop().time() + 2
+            while close_thread.is_alive() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
         assert close_thread.is_alive() is False
 
     asyncio.run(exercise())
