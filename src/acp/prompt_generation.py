@@ -19,7 +19,7 @@ class PromptGenerationTracker:
         if lock is None:
             lock = state.setdefault(
                 "_prompt_generation_lock",
-                threading.Lock(),
+                threading.Lock(),  # leaf lock: never held while acquiring a LockLevel lock
             )
         with lock:
             state.setdefault("_prompt_generation", 0)

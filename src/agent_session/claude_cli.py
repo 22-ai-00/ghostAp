@@ -78,7 +78,7 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
         self._proc: Optional[subprocess.Popen] = None
         self._proc_group_id: int | None = None
         self._cancel_event = threading.Event()
-        self._prompt_generation_lock = threading.Lock()
+        self._prompt_generation_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._prompt_generation = 0
         self._active_prompt_generation: int | None = None
         self._user_cancel_generation: int | None = None
