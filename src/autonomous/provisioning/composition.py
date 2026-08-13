@@ -4740,6 +4740,8 @@ class EmployeeDepartmentRuntime:
         transport = self._main_bot_warning_transport
         if outbox is None or transport is None:
             return False
+        if not outbox.has_local_pending_records():
+            return False
         result = outbox.recover_pending(
             transport,
             max_items=_EMPLOYEE_OUTBOX_DELIVERY_BATCH,

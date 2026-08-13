@@ -152,6 +152,54 @@ def test_reporting_lane_drains_main_bot_warning_outbox() -> None:
     )
 
 
+def test_empty_warning_outbox_skips_busy_unrelated_journal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.autonomous.provisioning.composition._MAIN_BOT_WARNING_REPORTING_DRAIN_SECONDS",
+        0.02,
+    )
+    writer = JournalWriter.open(
+        tmp_path / "journal",
+        anchor=FileAnchor(tmp_path / "journal.anchor"),
+        hmac_key=b"j" * 32,
+        writer_epoch=1,
+    )
+    outbox = MainBotWarningOutbox(
+        writer=writer,
+        blob_store=BlobStore(
+            tmp_path / "warning-blobs",
+            AesGcmEncryptionProvider(lambda _key_ref: b"b" * 32),
+        ),
+        active_key_id="data-key-1",
+        main_app_id="cli_main_bot",
+    )
+    runtime = EmployeeDepartmentRuntime()
+    runtime._main_bot_warning_outbox = outbox  # type: ignore[assignment]  # noqa: SLF001
+    runtime._main_bot_warning_transport = MagicMock()  # noqa: SLF001
+    lock_held = threading.Event()
+    release = threading.Event()
+
+    def hold_unrelated_journal_write_lock() -> None:
+        with writer._mutex:  # noqa: SLF001 - deterministic contention regression
+            lock_held.set()
+            release.wait(1.0)
+
+    holder = threading.Thread(target=hold_unrelated_journal_write_lock)
+    holder.start()
+    try:
+        assert lock_held.wait(1.0)
+        started = time.monotonic()
+        assert runtime._drain_main_bot_warning_outbox_once() is False  # noqa: SLF001
+        assert time.monotonic() - started < 0.02
+    finally:
+        release.set()
+        holder.join(1.0)
+        outbox.close()
+        writer.close()
+
+
 def test_reporting_lane_surfaces_all_retryable_warning_batch_for_backoff() -> None:
     runtime = _runtime()
     runtime._main_bot_warning_outbox.recover_pending.return_value = (

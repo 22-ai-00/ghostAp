@@ -601,6 +601,27 @@ class MainBotWarningOutbox:
                 self._require_deadline(deadline, "payload hydration")
             return tuple(records)
 
+    def has_local_pending_records(self) -> bool:
+        """Return whether this process-owned outbox has warning work.
+
+        Startup recovery fully rebuilds this projection, and every production
+        warning admission updates the same outbox under ``_lock``. Unrelated
+        domains may advance the shared Journal head, but cannot create warning
+        work. This check therefore avoids contending on the Journal writer for
+        an empty reporting poll without weakening warning recovery.
+        """
+
+        with self._lock:
+            self._ensure_open_unlocked()
+            return any(
+                metadata.state
+                in {
+                    MainBotWarningState.PREPARED,
+                    MainBotWarningState.EXECUTING,
+                }
+                for metadata in self._records.values()
+            )
+
     def recover_pending(
         self,
         transport: MainBotWarningTransport,
