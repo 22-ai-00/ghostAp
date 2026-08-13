@@ -592,6 +592,7 @@ def _seed_action_required(
     effect_id: str = "slash-reconcile:2:1",
     terminal: bool = True,
     error_code: str = "recovery_exhausted",
+    duplicate_revalidation: bool = False,
 ) -> ProductionEmployeeHireService:
     _seed_active_employee(tmp_path)
     epoch_two = _service(_writer(tmp_path, 2))
@@ -608,10 +609,31 @@ def _seed_action_required(
         next_state=HireEffectState.EXECUTING,
     )
     if terminal:
-        epoch_two.mark_recovery_action_required(
-            "hire_recover",
-            error_code=error_code,
-        )
+        if duplicate_revalidation:
+            epoch_two.commit_effect_transition(
+                "hire_recover",
+                effect_id=effect_id,
+                effect_type=effect_type,
+                next_state=HireEffectState.ACTION_REQUIRED,
+                metadata={"error_code": error_code},
+            )
+            epoch_two.close()
+            recovery_epoch = _service(_writer(tmp_path, 3))
+            recovery_epoch.begin_channel_revalidation(
+                "hire_recover",
+                observed_generation=1,
+            )
+            recovery_epoch.mark_recovery_action_required(
+                "hire_recover",
+                error_code="recovery_exhausted",
+            )
+            recovery_epoch.close()
+            return _service(_writer(tmp_path, 4))
+        else:
+            epoch_two.mark_recovery_action_required(
+                "hire_recover",
+                error_code=error_code,
+            )
     else:
         commit_workforce_events(
             epoch_two._writer,  # noqa: SLF001
@@ -694,6 +716,28 @@ def test_terminal_anchor_failed_slash_is_reopened_as_convergent_reconciliation(
         force_refresh=True,
         allow_action_required_refresh=True,
     ) == "slash-reconcile:2:2"
+
+
+def test_terminal_anchor_failed_slash_with_recovery_revalidation_is_reopened(
+    tmp_path: Path,
+) -> None:
+    service = _seed_action_required(
+        tmp_path,
+        error_code="terminal_anchor_failed",
+        duplicate_revalidation=True,
+    )
+
+    result = service.recover_replay_safe_action_required()
+
+    assert result == hire_service.ActionRequiredRecoveryResult(
+        eligible=1,
+        repaired_intent_ids=("hire_recover",),
+        skipped=0,
+        failed=0,
+    )
+    state = service.get_state("hire_recover")
+    assert state is not None
+    assert state.phase is HirePhase.VALIDATING
 
 
 def test_same_epoch_crash_and_exhaustion_requires_restart_then_recovers(

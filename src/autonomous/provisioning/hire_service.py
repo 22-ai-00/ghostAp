@@ -613,56 +613,85 @@ class ProductionEmployeeHireService:
         )
         if len(related) < 7 or state.last_sequence != related[-1].sequence:
             return False
-        tail = related[-6:]
         effect_payload = {
             "effect_id": failed_effect_id,
             "effect_type": "slash_reconciliation",
         }
-        if not (
+        terminal_payload = {
+            **effect_payload,
+            "metadata": dict(state.metadata_for(failed_effect_id)),
+        }
+
+        def matches_failure_prefix(tail: tuple[TransactionFrame, ...]) -> bool:
+            return len(tail) >= 6 and (
+                cls._single_event_frame_matches(
+                    tail[0],
+                    event_type="hire.channel.crashed",
+                    aggregate_id=state.intent_id,
+                    payload={"generation": generation},
+                )
+                and cls._single_event_frame_matches(
+                    tail[1],
+                    event_type="employee.state_changed",
+                    aggregate_id=state.agent_id,
+                    payload={"state": HirePhase.VALIDATING.value},
+                )
+                and cls._single_event_frame_matches(
+                    tail[2],
+                    event_type="hire.effect.prepared",
+                    aggregate_id=state.intent_id,
+                    payload=effect_payload,
+                )
+                and cls._single_event_frame_matches(
+                    tail[3],
+                    event_type="hire.effect.executing",
+                    aggregate_id=state.intent_id,
+                    payload=effect_payload,
+                )
+                and cls._single_event_frame_matches(
+                    tail[4],
+                    event_type="hire.effect.action_required",
+                    aggregate_id=state.intent_id,
+                    payload=terminal_payload,
+                )
+                and tail[0].writer_epoch == tail[1].writer_epoch
+                and len({frame.writer_epoch for frame in tail[2:5]}) == 1
+            )
+
+        standard_tail = related[-6:]
+        standard_failure = matches_failure_prefix(standard_tail) and (
             cls._single_event_frame_matches(
-                tail[0],
+                standard_tail[5],
+                event_type="employee.state_changed",
+                aggregate_id=state.agent_id,
+                payload={"state": HirePhase.ACTION_REQUIRED.value},
+            )
+            and len({frame.writer_epoch for frame in standard_tail[2:]}) == 1
+            and standard_tail[5].writer_epoch != recovery_writer_epoch
+        )
+        revalidated_tail = related[-7:]
+        revalidated_failure = matches_failure_prefix(revalidated_tail) and (
+            cls._single_event_frame_matches(
+                revalidated_tail[5],
                 event_type="hire.channel.crashed",
                 aggregate_id=state.intent_id,
                 payload={"generation": generation},
             )
             and cls._single_event_frame_matches(
-                tail[1],
-                event_type="employee.state_changed",
-                aggregate_id=state.agent_id,
-                payload={"state": HirePhase.VALIDATING.value},
-            )
-            and cls._single_event_frame_matches(
-                tail[2],
-                event_type="hire.effect.prepared",
-                aggregate_id=state.intent_id,
-                payload=effect_payload,
-            )
-            and cls._single_event_frame_matches(
-                tail[3],
-                event_type="hire.effect.executing",
-                aggregate_id=state.intent_id,
-                payload=effect_payload,
-            )
-            and cls._single_event_frame_matches(
-                tail[4],
-                event_type="hire.effect.action_required",
-                aggregate_id=state.intent_id,
-                payload={
-                    **effect_payload,
-                    "metadata": dict(state.metadata_for(failed_effect_id)),
-                },
-            )
-            and cls._single_event_frame_matches(
-                tail[5],
+                revalidated_tail[6],
                 event_type="employee.state_changed",
                 aggregate_id=state.agent_id,
                 payload={"state": HirePhase.ACTION_REQUIRED.value},
             )
-            and tail[0].writer_epoch == tail[1].writer_epoch
-            and len({frame.writer_epoch for frame in tail[2:]}) == 1
-            and tail[5].writer_epoch != recovery_writer_epoch
-        ):
+            and revalidated_tail[5].writer_epoch
+            == revalidated_tail[6].writer_epoch
+            and revalidated_tail[4].writer_epoch
+            != revalidated_tail[5].writer_epoch
+            and revalidated_tail[6].writer_epoch != recovery_writer_epoch
+        )
+        if not standard_failure and not revalidated_failure:
             return False
+        failure_tail_length = 6 if standard_failure else 7
 
         expected_activation_payload = {
             "tenant_key": state.tenant_key,
@@ -684,7 +713,7 @@ class ProductionEmployeeHireService:
             and frame.events[1].event_type == "employee.state_changed"
             and frame.events[1].aggregate_id == state.agent_id
             and frame.events[1].payload == {"state": HirePhase.ACTIVE.value}
-            for frame in related[:-6]
+            for frame in related[:-failure_tail_length]
         )
 
     def recover_replay_safe_action_required(self) -> ActionRequiredRecoveryResult:
