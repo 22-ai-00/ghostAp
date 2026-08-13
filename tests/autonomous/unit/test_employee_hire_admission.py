@@ -27,8 +27,14 @@ from src.autonomous.provisioning.hire_service import (
 from src.autonomous.provisioning.hire_state import HireProjection
 from src.autonomous.provisioning.lark_app import RegistrationResult
 from src.autonomous.workforce.projection import commit_workforce_events
+from tests.autonomous.asyncio_thread_helpers import run_in_isolated_thread
 
 HMAC_KEY = b"employee-hire-admission-test-key!"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_asyncio_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(asyncio, "to_thread", run_in_isolated_thread)
 
 
 def _request(

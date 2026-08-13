@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +23,7 @@ from src.autonomous.provisioning.fire_service import (
 from src.autonomous.provisioning.fire_state import FIRE_EFFECT_ORDER, FirePhase
 from src.autonomous.provisioning.hire_state import HireEffectState
 from src.autonomous.supervisor.employee_channels import ChannelProcessState
+from tests.autonomous.asyncio_thread_helpers import run_in_isolated_thread
 from tests.autonomous.integration.test_employee_runtime_recovery import (
     _seed_active_employee,
     _writer,
@@ -111,35 +111,7 @@ class _CancelledChannel:
 
 @pytest.fixture(autouse=True)
 def _isolate_asyncio_threads(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def run_in_thread(func, *args, **kwargs):
-        context = contextvars.copy_context()
-        result = []
-        errors: list[BaseException] = []
-        done = threading.Event()
-
-        def invoke() -> None:
-            try:
-                result.append(context.run(func, *args, **kwargs))
-            except BaseException as exc:
-                errors.append(exc)
-            finally:
-                done.set()
-
-        worker = threading.Thread(
-            target=invoke,
-            name="test-external-mutation",
-        )
-        worker.start()
-        while not done.is_set():
-            await asyncio.sleep(0.01)
-        worker.join(timeout=1.0)
-        if worker.is_alive():
-            raise TimeoutError("test external mutation thread did not stop")
-        if errors:
-            raise errors[0]
-        return result[0]
-
-    monkeypatch.setattr(asyncio, "to_thread", run_in_thread)
+    monkeypatch.setattr(asyncio, "to_thread", run_in_isolated_thread)
 
 
 @pytest.mark.asyncio
