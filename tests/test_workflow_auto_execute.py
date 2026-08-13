@@ -4,8 +4,6 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from src.feishu.handlers.workflow import WorkflowHandler, _WorkflowLifecycleOwner
 from src.workflow_engine.agent_pool import WorkflowAgentBinding
 from src.workflow_engine.models import PendingWorkflow, WorkflowProject, WorkflowStatus
@@ -84,7 +82,9 @@ def test_script_generation_retries_then_accepts_valid_output(tmp_path) -> None:
     assert script_path.endswith(".js")
 
 
-def test_unsupported_generated_tool_fails_after_bounded_retries(tmp_path) -> None:
+def test_unsupported_generated_tool_uses_pool_bound_fallback_after_retries(
+    tmp_path,
+) -> None:
     unsupported = _VALID_SCRIPT.replace('["coco"]', '["missing"]', 1)
     session = MagicMock()
     session.send_prompt.return_value = SimpleNamespace(
@@ -94,9 +94,8 @@ def test_unsupported_generated_tool_fails_after_bounded_retries(tmp_path) -> Non
     with (
         patch("src.agent_session.create_engine_session", return_value=session),
         patch("src.workflow_engine.tool_registry.get_available_tools", return_value={"coco": "Coco"}),
-        pytest.raises(RuntimeError, match="failed|未确认工具|agent_pool"),
     ):
-        _handler()._generate_script_via_ai(
+        script_path, meta = _handler()._generate_script_via_ai(
             "implement the automatic workflow",
             str(tmp_path),
             ["coco"],
@@ -105,3 +104,8 @@ def test_unsupported_generated_tool_fails_after_bounded_retries(tmp_path) -> Non
         )
 
     assert session.send_prompt.call_count == 3
+    assert script_path.endswith("generated.js")
+    assert meta["tools"] == ["coco"]
+    generated = (tmp_path / ".ghostap" / "workflow_scripts" / "generated.js").read_text()
+    assert "missing" not in generated
+    assert 'agentId: "A-1"' in generated
