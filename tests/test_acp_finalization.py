@@ -492,6 +492,12 @@ def test_sync_prompt_timeout_dual_cancel_failure_reaches_exact_retirement(
 
     def run_loop() -> None:
         asyncio.set_event_loop(loop)
+
+        def keep_loop_responsive() -> None:
+            if loop.is_running():
+                loop.call_later(0.05, keep_loop_responsive)
+
+        loop.call_soon(keep_loop_responsive)
         loop_ready.set()
         loop.run_forever()
 
