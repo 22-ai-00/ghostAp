@@ -938,15 +938,11 @@ def test_legacy_unproved_message_is_disposed_before_router_eligibility(
     assert router.routed == [healthy_id]
 
 
-def test_channel_admission_uses_runtime_executor_when_default_executor_is_saturated() -> None:
+def test_channel_admission_uses_runtime_executor_when_default_executor_is_saturated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runtime = EmployeeDepartmentRuntime()
     admitted = threading.Event()
-    default_worker_started = threading.Event()
-    release_default_worker = threading.Event()
-
-    def occupy_default_executor() -> None:
-        default_worker_started.set()
-        assert release_default_worker.wait(5.0)
 
     runtime._admit_employee_ingress_once = (  # type: ignore[method-assign]  # noqa: SLF001
         lambda _acceptance_id: admitted.set() or True
@@ -954,34 +950,29 @@ def test_channel_admission_uses_runtime_executor_when_default_executor_is_satura
 
     async def scenario() -> None:
         loop = asyncio.get_running_loop()
-        default_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        loop.set_default_executor(default_executor)
-        occupied = loop.run_in_executor(None, occupy_default_executor)
-        try:
-            deadline = time.monotonic() + 2.0
-            while not default_worker_started.is_set() and time.monotonic() < deadline:
-                await asyncio.sleep(0.01)
-            assert default_worker_started.is_set()
+        original_run_in_executor = loop.run_in_executor
 
-            admission = asyncio.create_task(
-                runtime._handle_channel_event(  # noqa: SLF001
-                    "hire_alpha",
-                    1,
-                    {
-                        "event": "durableIngressAccepted",
-                        "data": {"acceptance_id": "acc_dedicated_executor"},
-                    },
-                )
+        def reject_default_executor(executor, func, *args):
+            if executor is None:
+                raise RuntimeError("default executor is saturated")
+            return original_run_in_executor(executor, func, *args)
+
+        monkeypatch.setattr(loop, "run_in_executor", reject_default_executor)
+        admission = asyncio.create_task(
+            runtime._handle_channel_event(  # noqa: SLF001
+                "hire_alpha",
+                1,
+                {
+                    "event": "durableIngressAccepted",
+                    "data": {"acceptance_id": "acc_dedicated_executor"},
+                },
             )
-            deadline = time.monotonic() + 2.0
-            while not admitted.is_set() and time.monotonic() < deadline:
-                await asyncio.sleep(0.01)
-            assert admitted.is_set()
-            await admission
-        finally:
-            release_default_worker.set()
-            await occupied
-            default_executor.shutdown(wait=True)
+        )
+        deadline = time.monotonic() + 2.0
+        while not admitted.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert admitted.is_set()
+        await admission
 
     try:
         asyncio.run(scenario())
