@@ -369,7 +369,9 @@ def reduce_card_state(
 
     ``retain_all_blocks`` is reserved for durable projections whose delivery
     layer paginates the complete history (for example one Workflow direct
-    call). Ordinary live cards keep the bounded retention windows below.
+    call). Metadata may also opt into full retention when its adapter owns a
+    semantic continuation boundary; other live cards keep the bounded windows
+    below.
     """
     if state is None:
         # Initialize with metadata
@@ -384,7 +386,7 @@ def reduce_card_state(
     if new_state.version == previous_version:
         return new_state
 
-    if retain_all_blocks:
+    if retain_all_blocks or new_state.metadata.retain_full_history:
         return new_state
 
     # Sliding window: trim completed tool blocks to MAX_COMPLETED_TOOL_BLOCKS.

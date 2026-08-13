@@ -388,17 +388,6 @@ def render_footer(state: CardState, budget: RenderBudget | None = None) -> list[
             {"tag": "markdown", "content": UI_TEXT["card_footer_last_updated"].format(timestamp=_ts_display), "text_size": "notation"}
         )
 
-    # Frozen card continuation hint
-    if (
-        not state.metadata.is_subagent
-        and state.metadata.frozen
-        and state.metadata.continuation_seq > 0
-    ):
-        next_seq = state.metadata.continuation_seq + 1
-        elements.append(
-            {"tag": "markdown", "content": UI_TEXT["card_footer_frozen_continuation"].format(next_seq=next_seq), "text_size": "notation"}
-        )
-
     return elements
 
 

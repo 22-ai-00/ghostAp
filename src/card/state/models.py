@@ -65,6 +65,9 @@ class CardMetadata:
     live_ticker_frame: str | None = None
     subagents: tuple[dict, ...] = ()
     programming_text_sections: bool = False
+    # Ordinary programming cards use a semantic continuation boundary instead
+    # of the generic reducer's raw 100-block/50-tool retention window.
+    retain_full_history: bool = False
     # Preserve every semantic text/reasoning/tool block in event order while
     # retaining ordinary programming-card visuals. Workflow direct-call cards
     # opt in; the default compact execution digest remains unchanged.

@@ -649,7 +649,6 @@ UI_TEXT = {
     "card_footer_elapsed_total_fmt": "已执行 {duration}",
     "card_footer_system_notice": "（系统提示）",
     "card_footer_idle_timeout_hint": "长时间无更新超过 {timeout_display} 后才会回收；执行中任务会自动顺延",
-    "card_footer_frozen_continuation": "本卡已停止更新 · 续接 #{next_seq} ↓",
     "duration_sub_second": "< 1 秒",
     "duration_secs": "{seconds} 秒",
     "duration_mins_secs": "{minutes} 分钟 {seconds} 秒",

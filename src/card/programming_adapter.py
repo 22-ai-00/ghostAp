@@ -28,9 +28,14 @@ from src.card.media_bridge import ACPImagePublisher
 from src.card.render.live_ticker import LiveTicker
 from src.card.session import CardSession
 from src.card.session.rotator import SessionRotator
-from src.card.state.models import CardMetadata, CardState, TaskListBlock, ToolBlock
+from src.card.state.models import (
+    CardMetadata,
+    CardState,
+    TaskListBlock,
+    TextBlock,
+    ToolBlock,
+)
 from src.card.state.reducer import (
-    MAX_COMPLETED_TOOL_BLOCKS,
     MAX_TOTAL_BLOCKS,
     card_state_requires_continuation,
 )
@@ -57,6 +62,22 @@ _TOOL_CARD_EVENT_TYPES = frozenset({
     CardEventType.TOOL_DELTA,
     CardEventType.TOOL_DONE,
     CardEventType.TOOL_FAILED,
+})
+
+# One ordinary programming card should normally carry a useful span of the
+# conversation instead of rotating because many raw tool events were folded
+# into one visible execution-history panel. Platform byte/node pagination is
+# still authoritative and may split earlier when content itself is large.
+PROGRAMMING_PROGRESS_BLOCKS_PER_CARD = 12
+_PROGRAMMING_MAX_TOTAL_BLOCKS = (
+    MAX_TOTAL_BLOCKS * PROGRAMMING_PROGRESS_BLOCKS_PER_CARD
+)
+_PROGRAMMING_MAX_COMPLETED_TOOL_BLOCKS = _PROGRAMMING_MAX_TOTAL_BLOCKS
+_SYSTEM_TEXT_BLOCK_IDS = frozenset({
+    "_error",
+    "_cancelled",
+    "_archived_hint",
+    "_archived_nav_hint",
 })
 
 
@@ -89,6 +110,7 @@ def build_programming_metadata(
         engine_type=None,  # Programming mode is not an engine
         working_dir=working_dir,
         programming_text_sections=True,
+        retain_full_history=True,
     )
 
 
@@ -511,14 +533,29 @@ class ProgrammingCardSession:
 
     @staticmethod
     def _requires_capacity_rotation(state: CardState, event: CardEvent) -> bool:
-        if event.type is CardEventType.TOOL_STARTED:
-            completed_tools = sum(
-                block.kind == "tool_call" and block.status == "completed"
-                for block in state.blocks
+        if event.type is CardEventType.TEXT_STARTED:
+            block_id = str((event.payload or {}).get("block_id") or "")
+            starts_new_section = bool(
+                block_id and block_id not in state.block_index
             )
-            if completed_tools >= MAX_COMPLETED_TOOL_BLOCKS:
-                return True
-        return card_state_requires_continuation(state, event)
+            if starts_new_section:
+                visible_progress_blocks = sum(
+                    isinstance(block, TextBlock)
+                    and block.block_id not in _SYSTEM_TEXT_BLOCK_IDS
+                    and bool(str(block.content or "").strip())
+                    for block in state.blocks
+                )
+                if (
+                    visible_progress_blocks
+                    >= PROGRAMMING_PROGRESS_BLOCKS_PER_CARD
+                ):
+                    return True
+        return card_state_requires_continuation(
+            state,
+            event,
+            total_block_limit=_PROGRAMMING_MAX_TOTAL_BLOCKS,
+            completed_tool_limit=_PROGRAMMING_MAX_COMPLETED_TOOL_BLOCKS,
+        )
 
     def _rotate_for_capacity(
         self,
