@@ -24,6 +24,7 @@ from .traex_selection import (
     compose_traex_model_selection,
     load_traex_model_metadata,
 )
+from .transport import LateFrameTolerantMessageQueue
 
 logger = logging.getLogger(__name__)
 
@@ -465,6 +466,7 @@ async def _probe_acp_models(
         *args,
         env=build_clean_env(),
         cwd=cwd or str(Path.cwd()),
+        queue=LateFrameTolerantMessageQueue(),
     ) as (connection, _process):
         await connection.initialize(protocol_version=1)
         response = await connection.new_session(cwd=cwd or str(Path.cwd()))

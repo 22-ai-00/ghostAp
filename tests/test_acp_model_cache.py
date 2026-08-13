@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import threading
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from src.acp import helper
 from src.acp.options import ACPModelOption
+from src.acp.transport import LateFrameTolerantMessageQueue
 
 
 @pytest.fixture(autouse=True)
@@ -104,6 +108,68 @@ def test_coco_catalog_uses_the_same_long_cache_policy() -> None:
 
     assert manager.CACHE_TTL_SECONDS == 1_800
     assert manager.FALLBACK_CACHE_TTL_SECONDS == 300
+
+
+def test_generic_model_probe_uses_late_frame_tolerant_queue(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Connection:
+        async def initialize(self, protocol_version: int = 1) -> None:
+            assert protocol_version == 1
+
+        async def new_session(self, cwd: str):
+            return SimpleNamespace(models=None)
+
+    @asynccontextmanager
+    async def spawn(*_args, **kwargs):
+        captured.update(kwargs)
+        yield Connection(), object()
+
+    provider = SimpleNamespace(get_serve_command=lambda _model: ("agent", []))
+    monkeypatch.setattr(helper, "get_providers", lambda: {"aiden": provider})
+    monkeypatch.setattr(helper, "spawn_agent_process", spawn)
+
+    assert asyncio.run(helper._probe_acp_models("aiden", str(tmp_path))) == []
+    queue = captured.get("queue")
+    assert isinstance(queue, LateFrameTolerantMessageQueue)
+
+    async def publish_after_close() -> None:
+        await queue.close()
+        await queue.publish(object())
+
+    asyncio.run(publish_after_close())
+
+
+def test_coco_model_probe_uses_late_frame_tolerant_queue(
+    monkeypatch,
+) -> None:
+    from src.coco_model import manager as coco_manager
+
+    captured: dict[str, object] = {}
+
+    class Connection:
+        async def initialize(self, protocol_version: int = 1) -> None:
+            assert protocol_version == 1
+
+        async def new_session(self, cwd: str):
+            return SimpleNamespace(models=None)
+
+    @asynccontextmanager
+    async def spawn(*_args, **kwargs):
+        captured.update(kwargs)
+        yield Connection(), object()
+
+    monkeypatch.setattr(coco_manager, "spawn_agent_process", spawn)
+
+    manager = coco_manager.CocoModelManager()
+    assert manager._load_models_via_acp(current_model=None) == []
+    assert isinstance(
+        captured.get("queue"),
+        LateFrameTolerantMessageQueue,
+    )
 
 
 def test_coco_real_catalog_and_fallback_obey_their_cache_windows(

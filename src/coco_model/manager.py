@@ -7,6 +7,7 @@ from typing import Optional
 import yaml
 from acp.stdio import spawn_agent_process
 
+from ..acp.transport import LateFrameTolerantMessageQueue
 from ..utils.async_helpers import safe_wait_for
 from ..utils.errors import get_error_detail
 from .models import CocoModel, ModelListResult
@@ -131,7 +132,15 @@ class CocoModelManager:
                 env = build_clean_env()
 
                 client = GhostAPClient(on_event=lambda _ev: None, auto_approve=True)
-                async with spawn_agent_process(client, "coco", "acp", "serve", env=env, cwd=str(Path.cwd())) as (
+                async with spawn_agent_process(
+                    client,
+                    "coco",
+                    "acp",
+                    "serve",
+                    env=env,
+                    cwd=str(Path.cwd()),
+                    queue=LateFrameTolerantMessageQueue(),
+                ) as (
                     conn,
                     _proc,
                 ):
