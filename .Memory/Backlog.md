@@ -45,6 +45,10 @@
 | B083 | 2026-08-12 | `FeishuWSClient.close()` 已在 SDK handler 创建前安装 binding barrier，但忽略 `WSHealthMonitor.disconnect()` 的 `False`；当 SDK disconnect 五秒超时或无可观测连接时，关闭仍可继续并返回成功。新 handler 会被 fence 拒绝，已调度 handler 也由 barrier 保护，因此未证明数据丢失；但底层 WS 资源仍可能滞留。需将 disconnect 结果纳入关闭结果/可重试资源所有权，并区分“本来无连接”与“断开超时”。 | Medium | WS 关闭 barrier 复审 | Open | — |
 | B084 | 2026-08-12 | Scheduler completion callback 内若重入调用 `FeishuWSClient.close()`，`wait_for_completion_callbacks()` 会检测自身并返回未空，关闭随后进入 best-effort `scheduler.stop(wait=True)`；虽不会销毁 callback 依赖，但会经历自等待超时并返回 `False`。需显式拒绝 callback 内关闭或将关闭转移给独立 owner 线程，避免无效延迟与含糊返回值。 | Low | Scheduler completion 关闭复审 | Open | — |
 
+| B085 | 2026-08-13 | Workflow 完整结果正文目前按 27 KiB 无损分页，超大模型输出可能产生数十张账本消息；需为用户可见卡片建立总页数/总字节上限，超量部分自动改由已生成的 HTML/Markdown 报告附件交付，同时保留摘要和恢复指引。 | Medium | Workflow 结果账本可读化审计 | Open | — |
+| B086 | 2026-08-13 | Workflow 结果正文分页仍按 Unicode code point 选择切点，极窄边界可能把组合重音、肤色修饰符或 regional-indicator 字素拆到两页；需引入 grapheme-aware split boundary，并覆盖 emoji/组合字符/CJK wire 回归。 | Medium | Workflow 结果账本可读化审计 | Open | — |
+| B087 | 2026-08-13 | 完整工具载荷净化虽已有 64 层/10000 节点上限，但高基数 opaque ID × 文本叶仍可能形成二次复杂度，净化后 mapping key 碰撞也可能覆盖先前值；需增加总字节/opaque 基数预算、线性多模式替换及稳定碰撞后缀。非 full-content JSON 解析也应统一捕获深层递归失败。 | Medium | Workflow 结果账本可读化审计 | Open | — |
+
 > **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。强化多副本档的外部验收条件由 [employee runtime profiles ADR](../docs/adr-employee-runtime-profiles.md) 持续承载，不作为本地代码已证明能力。
 
 - 2026-08-10 [中/安全契约] `create_engine_session(require_tool_filter=True)` 当前只强制 ACP transport，不在工厂入口验证/安装具体 filter；现役 Workflow/Employee 调用方会随后安装 filter，但 API 容易被新调用方误用。后续应改为类型化 lane permission profile 或将 `tool_filter` 作为必填参数并在首个 prompt 前 fail-closed。

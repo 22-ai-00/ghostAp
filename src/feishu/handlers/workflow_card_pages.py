@@ -11,6 +11,10 @@ from typing import Any
 _STOP_ACTION = "workflow_stop_running"
 _PAGE_KEY_FIELD = "_workflow_page_key"
 _PAGE_KEY_KINDS = frozenset({"status", "agent", "ledger"})
+_TERMINAL_STATUS_PAGE_CONTENT = (
+    "📎 **运行进度已收起**\n"
+    "任务已结束；本页仅用于运行期分页，最终状态请查看首张 Workflow 卡片。"
+)
 _PageIdentity = int | str
 _PageKey = tuple[str, _PageIdentity, int]
 
@@ -252,11 +256,31 @@ class WorkflowCardPageDelivery:
                 page_key
                 for page_key in self._known_page_keys
                 if page_key not in incoming_keys
+                and not (
+                    _is_status_continuation(page_key)
+                    and self._key_to_message_id.get(page_key) is None
+                )
             )
 
+        terminal_status_page = next(
+            (
+                page
+                for page_key, page in zip(incoming_keys, incoming_pages)
+                if page_key == ("status", -1, 0)
+            ),
+            None,
+        )
         pages: list[tuple[_PageKey, dict[str, Any]]] = []
         for page_key in delivery_keys:
-            page = copy.deepcopy(self._last_pages_by_key[page_key])
+            if (
+                terminal
+                and page_key not in incoming_keys
+                and _is_status_continuation(page_key)
+            ):
+                page = _retired_status_page(terminal_status_page)
+                page[_PAGE_KEY_FIELD] = page_key
+            else:
+                page = copy.deepcopy(self._last_pages_by_key[page_key])
             if terminal:
                 page = _without_stop_actions(page)
                 self._last_pages_by_key[page_key] = copy.deepcopy(page)
@@ -348,6 +372,40 @@ def _without_page_key(card: dict[str, Any]) -> dict[str, Any]:
     cleaned = copy.deepcopy(card)
     cleaned.pop(_PAGE_KEY_FIELD, None)
     return cleaned
+
+
+def _is_status_continuation(page_key: _PageKey) -> bool:
+    """Whether a key names a transient status page after the primary page."""
+    kind, page_identity, local_page_index = page_key
+    return kind == "status" and page_identity == -1 and local_page_index > 0
+
+
+def _retired_status_page(
+    terminal_status_page: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Replace a stale running-only status continuation with a terminal stub."""
+    header_source = (
+        terminal_status_page.get("header")
+        if isinstance(terminal_status_page, dict)
+        else None
+    )
+    header = (
+        copy.deepcopy(header_source)
+        if isinstance(header_source, dict)
+        else {
+            "title": {"tag": "plain_text", "content": "Workflow · 已结束"},
+            "template": "grey",
+        }
+    )
+    return {
+        "header": header,
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": _TERMINAL_STATUS_PAGE_CONTENT,
+            }
+        ],
+    }
 
 
 def _without_stop_actions(card: dict[str, Any]) -> dict[str, Any]:

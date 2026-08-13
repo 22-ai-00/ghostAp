@@ -23,7 +23,9 @@ FEISHU_CARD_TABLE_LIMIT = 5
 _TABLE_WARNING_CONTENT = (
     "⚠️ 表格数量超过飞书卡片限制，已将 Markdown 表格按代码块展示，避免卡片发送失败。"
 )
-_FENCE_PREFIXES = ("```", "~~~")
+_FENCE_LINE_RE = re.compile(
+    r"^\s{0,3}(?P<fence>`{3,}|~{3,})(?P<tail>.*)$"
+)
 _TABLE_SEPARATOR_RE = re.compile(r"^:?-{3,}:?$")
 _FEISHU_CARD_CONTENT_MAX_BYTES = 30 * 1024
 
@@ -45,6 +47,27 @@ def count_tagged_nodes(obj: Any) -> int:
 def count_markdown_table_blocks(text: str) -> int:
     """Count markdown pipe-table blocks outside fenced code blocks."""
     return _rewrite_markdown_tables_as_code(text, rewrite=False)[1]
+
+
+def normalize_markdown_tables_for_card(
+    text: str,
+    *,
+    table_limit: int = FEISHU_CARD_TABLE_LIMIT,
+    include_warning: bool = True,
+) -> str:
+    """Rewrite an over-limit Markdown table set as inert code blocks.
+
+    Text at or below Feishu's table limit is returned unchanged. When a single
+    Markdown value contains more than the limit, every recognized table block is
+    rewritten and one user-facing warning is appended.
+    """
+    if count_markdown_table_blocks(text) <= max(0, table_limit):
+        return text
+
+    rewritten, _ = _rewrite_markdown_tables_as_code(text, rewrite=True)
+    if not include_warning:
+        return rewritten
+    return f"{rewritten}\n\n{_TABLE_WARNING_CONTENT}"
 
 
 def _count_explicit_table_nodes(obj: Any) -> int:
@@ -133,20 +156,28 @@ def _rewrite_markdown_tables_as_code(text: str, *, rewrite: bool) -> tuple[str, 
 
     out: list[str] = []
     table_count = 0
-    in_fence = False
+    open_fence = ""
     i = 0
 
     while i < len(lines):
         line = lines[i]
-        stripped = line.lstrip()
-        if stripped.startswith(_FENCE_PREFIXES):
-            in_fence = not in_fence
+        fence_match = _FENCE_LINE_RE.match(line)
+        if fence_match:
+            fence = fence_match.group("fence")
+            if not open_fence:
+                open_fence = fence
+            elif (
+                fence[0] == open_fence[0]
+                and len(fence) >= len(open_fence)
+                and not fence_match.group("tail").strip()
+            ):
+                open_fence = ""
             out.append(line)
             i += 1
             continue
 
         if (
-            not in_fence
+            not open_fence
             and i + 1 < len(lines)
             and _looks_like_table_row(line)
             and _is_table_separator_line(lines[i + 1])
@@ -213,8 +244,15 @@ def check_and_truncate_payload(
                 # Fall through to truncation logic
             else:
                 if table_guarded:
-                    return json.dumps(table_guarded_card, ensure_ascii=False)
-                return card_content
+                    guarded_content = json.dumps(
+                        table_guarded_card,
+                        ensure_ascii=False,
+                    )
+                    if len(guarded_content.encode("utf-8")) <= max_size:
+                        return guarded_content
+                    card_content = guarded_content
+                else:
+                    return card_content
         except (json.JSONDecodeError, Exception):
             return card_content
     else:

@@ -14,7 +14,9 @@ BASE_OVERHEAD = 500
 # Fixed node overhead for elements injected after pagination:
 # header/config(3) + banner(3) + footer(8) + buttons(6) = 20
 FIXED_NODE_OVERHEAD = 20
-_FENCE_LINE_RE = re.compile(r"^\s{0,3}(?P<fence>`{3,}|~{3,})")
+_FENCE_LINE_RE = re.compile(
+    r"^\s{0,3}(?P<fence>`{3,}|~{3,})(?P<tail>.*)$"
+)
 
 
 def split_atom(atom: RenderAtom, remaining_bytes: int) -> list[RenderAtom] | None:
@@ -129,7 +131,7 @@ def _make_split_atoms(
 ) -> list[RenderAtom]:
     """Create split atom parts from content pieces."""
     if atom.kind in {"text", "reasoning", "tool_panel"}:
-        first_content, rest_content = _stabilize_markdown_split(first_content, rest_content)
+        first_content, rest_content = stabilize_markdown_split(first_content, rest_content)
 
     first_atom = RenderAtom(
         kind=atom.kind,
@@ -154,7 +156,8 @@ def _make_split_atoms(
     return [first_atom, rest_atom]
 
 
-def _stabilize_markdown_split(first_content: str, rest_content: str) -> tuple[str, str]:
+def stabilize_markdown_split(first_content: str, rest_content: str) -> tuple[str, str]:
+    """Close and reopen Markdown spans split across independently rendered pages."""
     fence = _open_markdown_fence(first_content)
     if fence:
         first_suffix = "" if first_content.endswith("\n") else "\n"
@@ -170,33 +173,44 @@ def _stabilize_markdown_split(first_content: str, rest_content: str) -> tuple[st
 
 def _open_markdown_fence(content: str) -> str:
     open_fence = ""
-    in_fence = False
     for raw_line in str(content).splitlines():
-        match = _FENCE_LINE_RE.match(raw_line)
-        if not match:
-            continue
-        fence = match.group("fence")
-        normalized = fence[:3]
-        if in_fence:
-            in_fence = False
-            open_fence = ""
-        else:
-            in_fence = True
-            open_fence = normalized
-    return open_fence if in_fence else ""
+        open_fence = _advance_markdown_fence(open_fence, raw_line)
+    return open_fence
+
+
+def _advance_markdown_fence(open_fence: str, raw_line: str) -> str:
+    """Advance one CommonMark-style fenced-code delimiter state."""
+    match = _FENCE_LINE_RE.match(raw_line)
+    if not match:
+        return open_fence
+
+    fence = match.group("fence")
+    if not open_fence:
+        return fence
+
+    closes_current = (
+        fence[0] == open_fence[0]
+        and len(fence) >= len(open_fence)
+        and not match.group("tail").strip()
+    )
+    return "" if closes_current else open_fence
 
 
 def _last_unclosed_inline_code_tick(content: str) -> str:
     last_unclosed = ""
-    in_fence = False
+    open_fence = ""
     for raw_line in str(content).splitlines():
-        if _FENCE_LINE_RE.match(raw_line):
-            in_fence = not in_fence
+        next_fence = _advance_markdown_fence(open_fence, raw_line)
+        if next_fence != open_fence:
+            open_fence = next_fence
             continue
-        if in_fence:
+        if open_fence:
             continue
         for tick in _iter_unescaped_inline_backtick_runs(raw_line):
-            last_unclosed = "" if last_unclosed == tick else tick
+            if not last_unclosed:
+                last_unclosed = tick
+            elif last_unclosed == tick:
+                last_unclosed = ""
     return last_unclosed
 
 

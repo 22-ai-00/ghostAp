@@ -12,6 +12,7 @@ from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 from src.card.events import CardEvent, CardEventType
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import render_card
+from src.card.schema import require_card_json_2
 from src.card.shared.truncation import count_tagged_nodes
 from src.card.state.models import (
     CardMetadata,
@@ -654,6 +655,8 @@ def test_workflow_handler_applies_final_payload_audit_guard() -> None:
     )
 
     rendered = _all_text(card)
+    assert card["config"]["compact_width"] is False
+    assert card["config"]["summary"]["content"] == "Workflow"
     assert "dev@example.com" not in rendered
     assert "[redacted:email]" in rendered
     assert "file:///tmp/private.png" not in rendered
@@ -661,6 +664,379 @@ def test_workflow_handler_applies_final_payload_audit_guard() -> None:
     assert rendered.count("（图片引用已移除）") == 2
     assert _card_size(card) <= 27 * 1024
     assert count_tagged_nodes(card) <= 180
+
+
+def test_workflow_result_pages_reserve_wire_wrapper_without_truncation() -> None:
+    """Final schema/config wrapping must not consume lossless ledger content."""
+    markers = [f"WIRE_RESULT_{index:03d}" for index in range(120)]
+    result_body = "".join(f"{marker}{'x' * 700}" for marker in markers)
+    project = WorkflowProject(
+        name="wire-budget-result",
+        status=WorkflowStatus.COMPLETED,
+        result=json.dumps(
+            {
+                "card_summary": {
+                    "verdict": "passed",
+                    "conclusion": "Wire budget verified.",
+                },
+                "result": result_body,
+            }
+        ),
+    )
+
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in render_completion_cards(project)
+    ]
+    wire_text = _all_text(wire_cards)
+
+    assert all(card["schema"] == "2.0" for card in wire_cards)
+    assert all(card["config"]["compact_width"] is False for card in wire_cards)
+    assert all(card["config"]["summary"]["content"] for card in wire_cards)
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert all(_card_size(card) <= 27 * 1024 for card in wire_cards)
+    assert all(count_tagged_nodes(card) <= 180 for card in wire_cards)
+    assert all(wire_text.count(marker) == 1 for marker in markers)
+
+
+def test_workflow_result_wire_normalization_is_lossless_before_pagination() -> None:
+    """Audit expansion, image removal, and table rewriting happen before fit."""
+    mail_markers = [f"MAILMARK{index:04d}" for index in range(2_000)]
+    table_markers = [f"TABLEMARK{index:04d}" for index in range(700)]
+    body = "\n".join(f"{marker} a@b.co" for marker in mail_markers)
+    body += "\n\n![private](file:///tmp/private.png)\n\n"
+    body += "\n\n".join(
+        f"| {marker} |\n| --- |\n| ok |" for marker in table_markers
+    )
+    project = WorkflowProject(
+        name="wire-normalized-result",
+        status=WorkflowStatus.COMPLETED,
+        result=json.dumps(
+            {
+                "card_summary": {
+                    "verdict": "passed",
+                    "conclusion": "Wire normalization verified.",
+                },
+                "result": body,
+            }
+        ),
+    )
+
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in render_completion_cards(project)
+    ]
+    wire_text = _all_text(wire_cards)
+
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert all(_card_size(card) <= 27 * 1024 for card in wire_cards)
+    assert all(count_tagged_nodes(card) <= 180 for card in wire_cards)
+    assert all(wire_text.count(marker) == 1 for marker in mail_markers)
+    assert all(wire_text.count(marker) == 1 for marker in table_markers)
+    assert "a@b.co" not in wire_text
+    assert wire_text.count("[redacted:email]") == len(mail_markers)
+    assert "file:///tmp/private.png" not in wire_text
+    assert wire_text.count("（图片引用已移除）") == 1
+    assert "表格数量超过飞书卡片限制" in wire_text
+
+
+def test_workflow_execution_wire_normalization_is_lossless_before_pagination() -> None:
+    """Direct-call pages fit the final audit/table-normalized wire text."""
+    mail_markers = [f"EXECMAIL{index:04d}" for index in range(1_000)]
+    table_markers = [f"EXECTABLE{index:04d}" for index in range(700)]
+    body = "\n".join(f"{marker} a@b.co" for marker in mail_markers)
+    body += "\n\n![private](file:///tmp/private.png)\n\n"
+    body += "\n\n".join(
+        f"| {marker} |\n| --- |\n| ok |" for marker in table_markers
+    )
+    body += (
+        "\n\n```\n<at id=all>EXECUTION_MENTION</at> "
+        "[unsafe](file:///tmp/private.txt)\n````"
+    )
+    body += "\n\nEXECUTION_WIRE_TAIL_MARKER"
+    agent = AgentProgress(
+        label="wire-normalized-call",
+        agent_id="A1",
+        tool="codex",
+        status=AgentStatus.RUNNING,
+        call_index=0,
+        execution_blocks=[
+            ContentBlock(
+                kind="text",
+                block_id="wire-normalized-output",
+                content=body,
+                status="active",
+            )
+        ],
+    )
+    project = WorkflowProject(
+        name="wire-normalized-execution",
+        status=WorkflowStatus.RUNNING,
+        phases=[PhaseProgress(title="Build", agents=[agent])],
+    )
+
+    fragments = WorkflowProgressRenderer(project).render_progress_cards(project)
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in fragments
+        if "A1" in _header_title(card)
+    ]
+    wire_text = _all_text(wire_cards)
+
+    assert len(wire_cards) >= 2
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert all(_card_size(card) <= 27 * 1024 for card in wire_cards)
+    assert all(count_tagged_nodes(card) <= 180 for card in wire_cards)
+    assert all(wire_text.count(marker) == 1 for marker in mail_markers)
+    assert all(wire_text.count(marker) == 1 for marker in table_markers)
+    assert wire_text.count("EXECUTION_WIRE_TAIL_MARKER") == 1
+    assert "a@b.co" not in wire_text
+    assert wire_text.count("[redacted:email]") == len(mail_markers)
+    assert "file:///tmp/private.png" not in wire_text
+    assert "file:///tmp/private.txt" not in wire_text
+    assert "<at id=all>" not in wire_text
+    assert "EXECUTION_MENTION" in wire_text
+    assert wire_text.count("（图片引用已移除）") == 1
+    assert wire_text.count("表格数量超过飞书卡片限制") == 1
+
+
+def test_workflow_result_wire_neutralizes_feishu_control_markup() -> None:
+    secret = "sk-1234567890abcdefghijklmnop"
+    unsafe = (
+        f"SAFEBODY {secret} <at id=all></at> "
+        "<font color='red'>spoof</font> "
+        "[bad](javascript:alert(1)) [good](https://example.test/report)"
+    )
+    project = WorkflowProject(
+        name="wire-safe-result",
+        status=WorkflowStatus.COMPLETED,
+        result=json.dumps(
+            {
+                "card_summary": {
+                    "verdict": "passed",
+                    "conclusion": unsafe,
+                },
+                "result": unsafe,
+            }
+        ),
+    )
+
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in render_completion_cards(project)
+    ]
+    wire_text = _all_text(wire_cards)
+
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert secret not in wire_text
+    assert "<at" not in wire_text
+    assert "<font color='red'" not in wire_text
+    assert "＜font color='red'＞spoof＜/font＞" in wire_text
+    assert "javascript:" not in wire_text.lower()
+    assert "bad" in wire_text
+    assert "[good](https://example.test/report)" in wire_text
+
+
+def test_workflow_terminal_wire_replaces_lone_surrogates_in_plain_metadata() -> None:
+    surrogate = chr(0xD800)
+    agent = AgentProgress(
+        label=f"bad-label-{surrogate}",
+        agent_id="A1",
+        tool=f"bad-tool-{surrogate}",
+        model=f"bad-model-{surrogate}",
+        status=AgentStatus.DONE,
+        result="SAFE_RESULT",
+    )
+    project = WorkflowProject(
+        name=f"bad-name-{surrogate}",
+        requirement=f"bad-requirement-{surrogate}",
+        status=WorkflowStatus.COMPLETED,
+        phases=[PhaseProgress(title=f"bad-phase-{surrogate}", agents=[agent])],
+        result="SAFE_FINAL",
+    )
+
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in render_completion_cards(project)
+    ]
+
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert all(_card_size(card) <= 27 * 1024 for card in wire_cards)
+    assert all(surrogate not in _all_text(card) for card in wire_cards)
+
+
+def test_workflow_result_ledger_neutralizes_agent_metadata_controls() -> None:
+    agent = AgentProgress(
+        label="<at id=all>LABEL</at>",
+        agent_id="A1",
+        tool="<font color='red'>TOOL</font>",
+        model="<a href='javascript:x'>MODEL</a>",
+        current_activity="<at id=all>ACTIVITY</at>",
+        status=AgentStatus.DONE,
+        result="SAFE_AGENT_RESULT",
+    )
+    project = WorkflowProject(
+        name="safe-agent-metadata",
+        status=WorkflowStatus.COMPLETED,
+        phases=[PhaseProgress(title="Safe", agents=[agent])],
+    )
+
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in render_completion_cards(project)
+    ]
+    wire_text = _all_text(wire_cards)
+
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert "<at id=all>" not in wire_text
+    assert "<font color='red'>" not in wire_text
+    assert "<a href='javascript:x'>" not in wire_text
+    assert "LABEL" in wire_text
+    assert "TOOL" in wire_text
+    assert "MODEL" in wire_text
+    assert "ACTIVITY" in wire_text
+
+
+def test_workflow_progress_wire_neutralizes_all_dynamic_status_fields() -> None:
+    agent = AgentProgress(
+        label="<at id=all>LABEL</at>",
+        agent_id="<at id=all>A1</at>",
+        tool="<font color='red'>TOOL</font>",
+        model="[MODEL](javascript:x)",
+        task_summary="[TASK](javascript:alert(1))",
+        current_activity="<at id=all>ACTIVITY</at>",
+        status=AgentStatus.RUNNING,
+    )
+    project = WorkflowProject(
+        name="<at id=all>PROJECT</at>",
+        requirement="<at id=all>REQUIREMENT</at>",
+        status=WorkflowStatus.RUNNING,
+        phases=[
+            PhaseProgress(
+                title="<font color='red'>PHASE</font>",
+                agents=[agent],
+            )
+        ],
+    )
+
+    fragments = WorkflowProgressRenderer(project).render_progress_cards(project)
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in fragments
+    ]
+    wire_text = _all_text(wire_cards)
+
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert "<at id=all>" not in wire_text
+    assert "<font color='red'>" not in wire_text
+    assert "javascript:" not in wire_text.lower()
+    for marker in (
+        "PROJECT",
+        "REQUIREMENT",
+        "PHASE",
+        "LABEL",
+        "TOOL",
+        "MODEL",
+        "TASK",
+        "ACTIVITY",
+    ):
+        assert marker in wire_text
+
+
+def test_workflow_completion_status_wire_neutralizes_dynamic_process_fields() -> None:
+    project = WorkflowProject(
+        name="<at id=all>PROJECT</at>",
+        requirement="[REQUIREMENT](javascript:alert(1))",
+        status=WorkflowStatus.COMPLETED,
+        phases=[
+            PhaseProgress(
+                title="<at id=all>PHASE</at>",
+                agents=[AgentProgress(label="done", status=AgentStatus.DONE)],
+                started_at=1.0,
+                finished_at=2.0,
+            )
+        ],
+        result="SAFE_FINAL",
+    )
+
+    status_fragment = render_completion_cards(project)[0]
+    wire_card = WorkflowHandler._build_workflow_card_from_renderer_data(
+        status_fragment
+    )
+    wire_text = _all_text(wire_card)
+
+    assert require_card_json_2(wire_card) is wire_card
+    assert "<at id=all>" not in wire_text
+    assert "javascript:" not in wire_text.lower()
+    assert "PROJECT" in wire_text
+    assert "REQUIREMENT" in wire_text
+    assert "PHASE" in wire_text
+    assert "<font color='grey'>耗时</font>" in wire_text
+
+
+def test_workflow_many_result_rows_stay_within_final_wire_node_budget() -> None:
+    agents = [
+        AgentProgress(
+            label=f"agent-{index:03d}",
+            agent_id=f"A{index:03d}",
+            tool="codex",
+            status=AgentStatus.DONE,
+            result=f"NODEMARK{index:03d}",
+            call_index=index,
+        )
+        for index in range(220)
+    ]
+    project = WorkflowProject(
+        name="wire-node-budget",
+        status=WorkflowStatus.COMPLETED,
+        phases=[PhaseProgress(title="Many", agents=agents)],
+    )
+
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in render_completion_cards(project)
+    ]
+    wire_text = _all_text(wire_cards)
+
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert all(_card_size(card) <= 27 * 1024 for card in wire_cards)
+    assert all(count_tagged_nodes(card) <= 180 for card in wire_cards)
+    assert all(wire_text.count(f"NODEMARK{index:03d}") == 1 for index in range(220))
+
+
+def test_workflow_progress_pages_reserve_complete_wire_envelope() -> None:
+    agents = [
+        AgentProgress(
+            label=f"PROGRESSMARK{index:03d}",
+            agent_id=f"A{index:03d}",
+            tool="codex",
+            model="gpt-5",
+            task_summary="inspect and verify " + ("x" * 80),
+            current_activity="running checks " + ("y" * 80),
+            status=AgentStatus.RUNNING,
+            call_index=index,
+        )
+        for index in range(100)
+    ]
+    project = WorkflowProject(
+        name="progress-wire-budget",
+        requirement="exercise final wrapper capacity",
+        status=WorkflowStatus.RUNNING,
+        phases=[PhaseProgress(title="Progress", agents=agents)],
+    )
+
+    fragments = WorkflowProgressRenderer(project).render_progress_cards(project)
+    wire_cards = [
+        WorkflowHandler._build_workflow_card_from_renderer_data(card)
+        for card in fragments
+    ]
+    wire_text = _all_text(wire_cards)
+
+    assert len(wire_cards) >= 2
+    assert all(require_card_json_2(card) is card for card in wire_cards)
+    assert all(_card_size(card) <= 27 * 1024 for card in wire_cards)
+    assert all(count_tagged_nodes(card) <= 180 for card in wire_cards)
+    assert all(f"PROGRESSMARK{index:03d}" in wire_text for index in range(100))
 
 
 def test_workflow_text_and_reasoning_streams_are_sanitized_before_persistence(

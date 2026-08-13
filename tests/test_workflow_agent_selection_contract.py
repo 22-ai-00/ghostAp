@@ -504,6 +504,32 @@ def test_generation_renderer_is_read_only_and_shows_complete_agent_bindings() ->
     assert not any("behaviors" in node or "value" in node for node in nodes)
 
 
+def test_generation_renderer_neutralizes_dynamic_status_markdown() -> None:
+    from src.workflow_engine.renderer import WorkflowGenerationRenderer
+
+    raw_agent_id = "A1"
+    pool = (
+        WorkflowAgentBinding(
+            agent_id=raw_agent_id,
+            tool_name="<font color='red'>TOOL</font>",
+            model_name="[MODEL](javascript:x)",
+            display_name="<at id=all>DISPLAY</at>",
+        ),
+    )
+    card = WorkflowGenerationRenderer(
+        requirement="<at id=all>REQUIREMENT</at>",
+        agent_pool=pool,
+        orchestrator_agent_id=raw_agent_id,
+    ).render(current_activity="[ACTIVITY](javascript:alert(1))")
+    serialized = json.dumps(card, ensure_ascii=False)
+
+    assert "<at id=all>" not in serialized
+    assert "<font color='red'>" not in serialized
+    assert "javascript:" not in serialized.lower()
+    for marker in ("A1", "tool", "MODEL", "DISPLAY", "REQUIREMENT", "ACTIVITY"):
+        assert marker in serialized
+
+
 def test_generation_card_formats_wait_time_as_hours_minutes_and_seconds() -> None:
     from src.workflow_engine.renderer import WorkflowGenerationRenderer
 

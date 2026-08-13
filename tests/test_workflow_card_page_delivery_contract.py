@@ -299,9 +299,13 @@ def test_keyed_pages_do_not_overwrite_next_agent_when_call_gains_a_page() -> Non
     assert "agent-a1-page-2-v1" in str(handler.send_card_to_chat.call_args.args[1])
 
 
-def test_keyed_terminal_refresh_retains_missing_known_page_and_strips_stop() -> None:
+def test_keyed_terminal_refresh_retains_missing_agent_page_and_strips_stop() -> None:
     handler = _make_handler(
-        continuation_results=["agent-a2-message", "agent-a1-message"],
+        continuation_results=[
+            "agent-a2-message",
+            "ledger-message",
+            "agent-a1-message",
+        ],
     )
     callbacks = _build_callbacks(handler)
     callbacks.on_progress(
@@ -315,6 +319,11 @@ def test_keyed_terminal_refresh_retains_missing_known_page_and_strips_stop() -> 
                 "agent-a2-progress",
                 include_stop=True,
                 page_key=("agent", 1, 0),
+            ),
+            _renderer_page(
+                "ledger-progress",
+                include_stop=True,
+                page_key=("ledger", -1, 0),
             ),
         ]
     )
@@ -352,6 +361,7 @@ def test_keyed_terminal_refresh_retains_missing_known_page_and_strips_stop() -> 
     assert "status-terminal" in updated["status-message"]
     assert "agent-a2-progress" in updated["agent-a2-message"]
     assert "agent-a1-terminal" not in updated["agent-a2-message"]
+    assert "ledger-progress" in updated["ledger-message"]
     assert all(
         "workflow_stop_running" not in payload
         for payload in updated.values()
@@ -359,6 +369,81 @@ def test_keyed_terminal_refresh_retains_missing_known_page_and_strips_stop() -> 
     handler.send_card_to_chat.assert_called_once()
     assert "agent-a1-terminal" in str(handler.send_card_to_chat.call_args.args[1])
     assert "workflow_stop_running" not in str(handler.send_card_to_chat.call_args.args[1])
+
+
+def test_120_agent_terminal_retires_missing_status_pages_without_replaying_running_content() -> None:
+    handler = _make_handler(
+        continuation_results=[
+            "status-page-2",
+            "ledger-message-1",
+            "ledger-message-2",
+            "ledger-message-3",
+        ],
+    )
+    callbacks = _build_callbacks(handler)
+    running_agents = [
+        AgentProgress(
+            label=f"PROGRESSMARK{index:03d}",
+            agent_id=f"A{index:03d}",
+            tool="codex",
+            model="gpt-5",
+            task_summary="inspect and verify " + ("x" * 80),
+            current_activity="RUNNINGMARK " + ("y" * 80),
+            status=AgentStatus.RUNNING,
+            call_index=index,
+        )
+        for index in range(120)
+    ]
+    running_project = WorkflowProject(
+        name="many-agent-terminal",
+        requirement="retire every transient progress page",
+        status=WorkflowStatus.RUNNING,
+        phases=[PhaseProgress(title="Progress", agents=running_agents)],
+    )
+    progress_pages = WorkflowProgressRenderer(running_project).render_progress_cards(
+        running_project
+    )
+
+    assert [page["_workflow_page_key"] for page in progress_pages] == [
+        ("status", -1, 0),
+        ("status", -1, 1),
+    ]
+    callbacks.on_progress(progress_pages)
+    assert handler.send_card_to_chat.call_args_list[0].args[0] == "chat-1"
+
+    handler.update_card.reset_mock()
+    handler.send_card_to_chat.reset_mock()
+    completed_agents = []
+    for running_agent in running_agents:
+        completed_agent = running_agent.model_copy(deep=True)
+        completed_agent.status = AgentStatus.DONE
+        completed_agent.result = None
+        completed_agent.current_activity = ""
+        completed_agents.append(completed_agent)
+    completed_project = WorkflowProject(
+        name="many-agent-terminal",
+        requirement="retire every transient progress page",
+        status=WorkflowStatus.COMPLETED,
+        phases=[PhaseProgress(title="Progress", agents=completed_agents)],
+        result="FINAL_RESULT_MARKER",
+    )
+
+    callbacks.on_done(completed_project)
+
+    updated = {
+        call.args[0]: str(call.args[1])
+        for call in handler.update_card.call_args_list
+    }
+    assert "status-message" in updated
+    assert "status-page-2" in updated
+    retired_status_page = updated["status-page-2"]
+    assert "运行进度已收起" in retired_status_page
+    assert "RUNNINGMARK" not in retired_status_page
+    assert "PROGRESSMARK" not in retired_status_page
+    assert "workflow_stop_running" not in retired_status_page
+    assert "FINAL_RESULT_MARKER" in "\n".join(_sent_payload_labels(handler))
+    assert all("RUNNINGMARK" not in payload for payload in _sent_payload_labels(handler))
+    handler._reply_workflow_completion_fallback.assert_not_called()
 
 
 def test_keyed_delivery_skips_only_successfully_delivered_unchanged_payloads() -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -469,15 +470,32 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             root_elements = card_data.get("elements") if isinstance(card_data, dict) else None
             elements = list(root_elements) if isinstance(root_elements, list) else []
 
+        summary_content = " ".join(title_content.split()) or "Workflow 运行状态"
+        if len(summary_content) < 8:
+            summary_content = f"Workflow · {summary_content}"
+        if len(summary_content) > 60:
+            summary_content = f"{summary_content[:59]}…"
         card = {
             "schema": "2.0",
-            "config": {"wide_screen_mode": True},
+            "config": {
+                "compact_width": False,
+                "wide_screen_mode": True,
+                "summary": {"content": summary_content},
+            },
             "header": header,
             "body": {"elements": elements},
         }
         from ...card.delivery.page_mutator import guard_card_payload
 
-        return guard_card_payload(card)
+        return guard_card_payload(
+            json.loads(
+                json.dumps(
+                    card,
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8", errors="replace").decode("utf-8")
+            )
+        )
 
     def _replace_or_send_workflow_rendered_card(
         self,

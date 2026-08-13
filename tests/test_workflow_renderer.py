@@ -81,7 +81,7 @@ class TestWorkflowProgressRenderer(unittest.TestCase):
             self._extract_all_text(card.get("elements", [])) for card in cards
         )
         for index in range(25):
-            self.assertIn(f"agent_{index}", all_text)
+            self.assertIn(f"agent\\_{index}", all_text)
 
     def test_cancelled_agents_in_mixed_state_render_correctly(self):
         """CANCELLED agents must appear in a "已取消" grey group and NOT
@@ -481,7 +481,18 @@ class TestRenderCompletionCard(unittest.TestCase):
             if element.get("tag") == "collapsible_panel" and "执行过程" in str(element)
         )
         self.assertLess(conclusion_index, process_index)
-        self.assertFalse(card["elements"][process_index]["expanded"])
+        process_panel = card["elements"][process_index]
+        self.assertFalse(process_panel["expanded"])
+        self.assertEqual(
+            process_panel["header"]["icon"],
+            {
+                "tag": "standard_icon",
+                "token": "down_outlined",
+                "color": "grey",
+            },
+        )
+        self.assertEqual(process_panel["header"]["icon_position"], "right")
+        self.assertEqual(process_panel["header"]["icon_expanded_angle"], -180)
 
     def test_completion_card_stays_under_payload_limit_without_slicing_result_items(self):
         findings = [

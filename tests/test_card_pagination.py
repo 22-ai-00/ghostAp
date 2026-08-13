@@ -3,7 +3,7 @@
 from src.card.render.atoms import RenderAtom, estimate_atom_size
 from src.card.render.budget import RenderBudget
 from src.card.render.layout import SectionLayout, paginate_layout
-from src.card.render.pagination import split_atom
+from src.card.render.pagination import split_atom, stabilize_markdown_split
 
 
 def _paginate_body(atoms: list[RenderAtom], budget: RenderBudget) -> list[list[RenderAtom]]:
@@ -120,6 +120,29 @@ class TestPaginateAtoms:
         assert result[0].content.count("```") % 2 == 0
         assert result[1].content.count("```") % 2 == 0
 
+    def test_long_fences_preserve_delimiter_and_require_matching_closer(self) -> None:
+        open_cases = (
+            ("````markdown\npayload\n```", "````"),
+            ("````markdown\npayload\n~~~~", "````"),
+            ("~~~~text\npayload\n~~~", "~~~~"),
+            ("~~~~text\npayload\n````", "~~~~"),
+            ("````markdown\npayload\n`````not-a-closer", "````"),
+        )
+        for first_content, fence in open_cases:
+            first, rest = stabilize_markdown_split(first_content, "remaining")
+            assert first.splitlines()[-1] == fence
+            assert rest.splitlines()[0] == fence
+
+        closed_cases = (
+            "````markdown\npayload\n`````",
+            "~~~~text\npayload\n~~~~~~  ",
+        )
+        for first_content in closed_cases:
+            assert stabilize_markdown_split(first_content, "remaining") == (
+                first_content,
+                "remaining",
+            )
+
     def test_text_split_inside_inline_code_makes_each_part_parseable(self) -> None:
         content = "`" + ("x" * 3200) + "` after"
         atom = RenderAtom(kind="text", content=content, splittable=True, node_count=1)
@@ -132,6 +155,14 @@ class TestPaginateAtoms:
         assert result[1].content.startswith("`")
         assert result[0].content.count("`") % 2 == 0
         assert result[1].content.count("`") % 2 == 0
+
+    def test_different_inline_backtick_length_does_not_close_span(self) -> None:
+        first_content = "``code with ` literal``"
+
+        assert stabilize_markdown_split(first_content, "remaining") == (
+            first_content,
+            "remaining",
+        )
 
     def test_no_content_lost(self) -> None:
         """All paragraph text is preserved after pagination (split separators at page boundaries are not duplicated)."""

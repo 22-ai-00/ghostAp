@@ -5,88 +5,26 @@ from __future__ import annotations
 import copy
 import json
 import logging
-import re
 import uuid
 
 from src.card.delivery.binding import BindingStore, PageBinding
 from src.card.delivery.sequence import SequenceManager
 from src.card.delivery.types import MutationOutcome, SequenceConflictError, TransportError
+from src.card.shared.text_safety import (
+    sanitize_card_text_for_audit,
+    sanitize_markdown_image_references,
+)
 from src.card.shared.truncation import check_and_truncate_payload
 from src.card.types import RenderedCard
 
 logger = logging.getLogger(__name__)
 
 _PAGE_CREATE_NAMESPACE = uuid.UUID("4388eebc-b0bc-5d6a-9c65-6ac058db0324")
-_EMAIL_ADDRESS_RE = re.compile(
-    r"(?<![\w.+-])[\w.+-]+@(?:[\w-]+\.)+[A-Za-z]{2,}(?![\w.-])"
-)
-_MARKDOWN_IMAGE_REMOVED_TEXT = "（图片引用已移除）"
 _SAFE_INVALID_REASON_PATTERNS = (
     ("invalid image key", "invalid image key"),
     ("content parse failed", "content parse failed"),
     ("card table number over limit", "card table number over limit"),
 )
-
-
-def sanitize_card_text_for_audit(text: str) -> str:
-    """Remove text patterns known to trigger Feishu card content audit."""
-    if not text:
-        return text
-    return _EMAIL_ADDRESS_RE.sub("[redacted:email]", text)
-
-
-def _bounded_plain_image_label(_alt: str) -> str:
-    return _MARKDOWN_IMAGE_REMOVED_TEXT
-
-
-def sanitize_markdown_image_references(text: str) -> str:
-    """Neutralize local/remote Markdown image targets before CardKit sees them."""
-    if "![" not in text:
-        return text
-
-    output: list[str] = []
-    cursor = 0
-    while True:
-        start = text.find("![", cursor)
-        if start < 0:
-            output.append(text[cursor:])
-            break
-        output.append(text[cursor:start])
-        alt_end = text.find("](", start + 2)
-        if alt_end < 0:
-            output.append("！[")
-            cursor = start + 2
-            continue
-
-        depth = 1
-        escaped = False
-        target_end: int | None = None
-        index = alt_end + 2
-        while index < len(text):
-            char = text[index]
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    target_end = index
-                    break
-            index += 1
-
-        if target_end is None:
-            output.append("！[")
-            cursor = start + 2
-            continue
-
-        output.append(
-            _bounded_plain_image_label(text[start + 2 : alt_end])
-        )
-        cursor = target_end + 1
-    return "".join(output)
 
 
 def _sanitize_payload_markdown_images(node):
