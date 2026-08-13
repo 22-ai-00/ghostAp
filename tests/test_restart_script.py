@@ -15,7 +15,7 @@ def test_restart_script_preheats_codex_acp_fallback_dependency():
     text = RESTART_SCRIPT.read_text(encoding="utf-8")
 
     assert "CODEX_ACP_NPM_PACKAGE=" in text
-    assert "@agentclientprotocol/codex-acp@1.1.7" in text
+    assert "@agentclientprotocol/codex-acp@1.2.0" in text
     assert "PREPARE_CODEX_ACP=" in text
     assert "prepare_codex_acp_dependency()" in text
     assert 'npx --yes "$CODEX_ACP_NPM_PACKAGE" --version' in text
