@@ -3559,7 +3559,10 @@ def test_registered_card_callback_submits_advisory_only_after_inner_ack_returns(
             assert remote_started.is_set() is False
             release_write.set()
             await asyncio.wait_for(callback_task, timeout=2)
-            assert await asyncio.to_thread(remote_started.wait, 2)
+            deadline = asyncio.get_running_loop().time() + 2
+            while not remote_started.is_set() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            assert remote_started.is_set()
 
         asyncio.run(exercise())
     finally:
