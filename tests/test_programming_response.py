@@ -25,6 +25,7 @@ from src.acp.outcome import (
 )
 from src.feishu.handlers.programming import (
     ClaudeModeHandler,
+    _ActiveProgrammingRun,
     _log_prompt_execution,
 )
 
@@ -206,6 +207,191 @@ def test_handler_helper_matches_claude_initialization_contract():
 
     assert handler._current_model is None
     assert handler._get_model_name_override() is None
+
+
+def test_btw_without_running_task_forwards_only_the_question():
+    handler = _make_handler()
+    handler.handle_message = MagicMock()
+
+    handler.handle_btw("btw-message", "chat", "顺便解释一下", None)
+
+    handler.handle_message.assert_called_once_with(
+        "btw-message", "chat", "顺便解释一下", None
+    )
+
+
+def test_btw_during_running_task_uses_read_only_auxiliary_session():
+    handler = _make_handler()
+    handler.settings.acp_startup_timeout = 20
+    handler.handle_message = MagicMock()
+    key = handler._active_run_key("chat", None)
+    state = _ActiveProgrammingRun(
+        task_text="修复截图识别问题",
+        cwd="/tmp/project",
+        agent_type="codex",
+        model_name="gpt-test",
+    )
+    state.observe(
+        ACPEvent(
+            event_type=ACPEventType.TOOL_CALL_START,
+            tool_call=ToolCallInfo(
+                id="view-1",
+                title="查看 bug 截图",
+                kind="read",
+                status="in_progress",
+                content="检查截图细节",
+            ),
+        )
+    )
+    handler._active_programming_runs[key] = state
+    sidecar = MagicMock()
+    sidecar.send_prompt.return_value = PromptResult(
+        stop_reason="end_turn",
+        text="反复查看是为了确认不同区域的细节。",
+    )
+
+    with (
+        patch(
+            "src.agent_session.create_auxiliary_session",
+            return_value=sidecar,
+        ) as create_auxiliary,
+        patch("src.agent_session.close_session_safely") as close_session,
+    ):
+        handler.handle_btw(
+            "btw-message", "chat", "为什么反复查看？", None
+        )
+
+    handler.handle_message.assert_not_called()
+    create_auxiliary.assert_called_once_with(
+        agent_type="codex",
+        cwd="/tmp/project",
+        model_name="gpt-test",
+        thread_id="btw-observer",
+        startup_timeout=20.0,
+        startup_retries=1,
+        startup_log_failures=False,
+    )
+    prompt = sidecar.send_prompt.call_args.args[0]
+    assert "修复截图识别问题" in prompt
+    assert "查看 bug 截图" in prompt
+    assert "为什么反复查看？" in prompt
+    assert sidecar.send_prompt.call_args.kwargs == {"timeout": 90}
+    close_session.assert_called_once_with(sidecar)
+    replies = [call.args[1] for call in handler.reply_text.call_args_list]
+    assert "主任务不会被中断" in replies[0]
+    assert "反复查看是为了确认不同区域的细节" in replies[1]
+
+
+def test_btw_auxiliary_failure_keeps_main_task_running_and_reports_snapshot():
+    handler = _make_handler()
+    handler.settings.acp_startup_timeout = 20
+    key = handler._active_run_key("chat", None)
+    state = _ActiveProgrammingRun(
+        task_text="主任务",
+        cwd="/tmp/project",
+        agent_type="codex",
+        model_name=None,
+    )
+    state.observe(
+        ACPEvent(
+            event_type=ACPEventType.THOUGHT_CHUNK,
+            text="正在定位重复读取来源",
+        )
+    )
+    handler._active_programming_runs[key] = state
+
+    with patch(
+        "src.agent_session.create_auxiliary_session",
+        side_effect=RuntimeError("observer unavailable"),
+    ):
+        handler.handle_btw("btw-message", "chat", "现在进展如何？", None)
+
+    replies = [call.args[1] for call in handler.reply_text.call_args_list]
+    assert "主任务不会被中断" in replies[0]
+    assert "主任务未被中断" in replies[1]
+    assert "正在定位重复读取来源" in replies[1]
+    assert state.claim_btw() is True
+    state.release_btw()
+
+
+def test_btw_rejects_a_second_parallel_side_question():
+    handler = _make_handler()
+    key = handler._active_run_key("chat", None)
+    state = _ActiveProgrammingRun(
+        task_text="主任务",
+        cwd="/tmp/project",
+        agent_type="codex",
+        model_name=None,
+    )
+    assert state.claim_btw() is True
+    handler._active_programming_runs[key] = state
+
+    handler.handle_btw("second", "chat", "第二个问题", None)
+
+    assert "已有一个旁路问题" in handler.reply_text.call_args.args[1]
+    state.release_btw()
+
+
+def test_btw_snapshot_is_bounded_and_preserves_task_header():
+    state = _ActiveProgrammingRun(
+        task_text="必须保留的主任务",
+        cwd="/tmp/project",
+        agent_type="codex",
+        model_name=None,
+    )
+    state.observe(ACPEvent(event_type=ACPEventType.THOUGHT_CHUNK, text="第一段"))
+    state.observe(ACPEvent(event_type=ACPEventType.THOUGHT_CHUNK, text="第二段"))
+    for index in range(80):
+        state.observe(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_UPDATE,
+                tool_call=ToolCallInfo(
+                    id=f"tool-{index}",
+                    title=f"操作 {index}",
+                    kind="read",
+                    status="in_progress",
+                    content="x" * 500,
+                ),
+            )
+        )
+
+    snapshot = state.snapshot()
+
+    assert snapshot.startswith("主任务: 必须保留的主任务")
+    assert len(snapshot) <= 12_000
+    assert sum("Agent 分析:" in event for event in state.events) <= 1
+
+
+def test_btw_during_handle_message_does_not_reacquire_repository_lock():
+    handler = _make_handler()
+    handler.settings.acp_startup_timeout = 20
+    handler.get_working_dir = MagicMock(return_value="/tmp/project")
+    handler._get_session_manager().get_session.return_value = MagicMock(
+        session_id="main-session"
+    )
+    handler._acquire_repo_lock = MagicMock(return_value=(None, None, False))
+    sidecar = MagicMock()
+    sidecar.send_prompt.return_value = PromptResult(
+        stop_reason="end_turn", text="这是旁路回答"
+    )
+
+    def run_main(*_args, **_kwargs):
+        handler.handle_btw(
+            "btw-message", "chat", "主任务为什么在读图？", None
+        )
+
+    handler.handle_response = MagicMock(side_effect=run_main)
+    with (
+        patch(
+            "src.agent_session.create_auxiliary_session",
+            return_value=sidecar,
+        ),
+        patch("src.agent_session.close_session_safely"),
+    ):
+        handler.handle_message("main-message", "chat", "修复截图问题", None)
+
+    handler._acquire_repo_lock.assert_called_once_with(None, "chat")
+    assert "这是旁路回答" in handler.reply_text.call_args.args[1]
 
 
 def test_prompt_execution_log_identifies_child_only_incompleteness(

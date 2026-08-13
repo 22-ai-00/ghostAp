@@ -106,5 +106,31 @@ class TestRefactorRobustness(unittest.TestCase):
         )
         self.assertEqual(employee_mock.list_employees_roster.call_count, 2)
 
+    def test_btw_routes_question_to_programming_side_channel(self):
+        mock_ctx = MagicMock()
+        handler = SystemHandler(mock_ctx)
+        programming = MagicMock()
+        handler._resolve_active_programming_mode_key = MagicMock(
+            return_value="codex"
+        )
+        handler.get_handler = MagicMock(return_value=programming)
+
+        handler.handle_intercepted_command(
+            "mid",
+            "cid",
+            "/btw 为什么重复读取截图？",
+            command_match=SlashCommandParser.parse(
+                "/btw 为什么重复读取截图？"
+            ),
+        )
+
+        programming.handle_btw.assert_called_once_with(
+            "mid",
+            "cid",
+            "为什么重复读取截图？",
+            None,
+        )
+        programming.handle_message.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

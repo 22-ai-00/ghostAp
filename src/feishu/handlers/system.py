@@ -803,7 +803,14 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             self.reply_text(message_id, UI_TEXT["system_btw_no_active_session"])
             return
 
-        handler.handle_message(message_id, chat_id, command_match.normalized_text, project)
+        handle_btw = getattr(handler, "handle_btw", None)
+        if callable(handle_btw):
+            handle_btw(message_id, chat_id, command_match.args, project)
+            return
+
+        # Compatibility for custom programming handlers: /btw belongs to the
+        # GhostAP control plane, so only the question reaches the provider.
+        handler.handle_message(message_id, chat_id, command_match.args, project)
 
     def _resolve_active_programming_mode_key(
         self,

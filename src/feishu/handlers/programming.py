@@ -10,7 +10,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
 from ...acp import (
@@ -42,6 +44,121 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _MODEL_OVERRIDE_UNSET = object()
+_BTW_EVENT_LIMIT = 48
+_BTW_EVENT_TEXT_LIMIT = 600
+_BTW_SNAPSHOT_LIMIT = 12_000
+_BTW_STARTUP_TIMEOUT_S = 30.0
+_BTW_PROMPT_TIMEOUT_S = 90
+
+
+def _bounded_btw_text(value: object, limit: int = _BTW_EVENT_TEXT_LIMIT) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _format_btw_event(event: object) -> str:
+    """Project one ACP event into a bounded, user-visible observation."""
+    event_type = getattr(getattr(event, "event_type", None), "value", "")
+    if event_type in {"text_chunk", "thought_chunk"}:
+        label = "Agent 输出" if event_type == "text_chunk" else "Agent 分析"
+        text = _bounded_btw_text(getattr(event, "text", ""))
+        return f"{label}: {text}" if text else ""
+    if event_type == "image_chunk":
+        image = getattr(event, "image", None)
+        name = _bounded_btw_text(getattr(image, "name", "") or "任务图片")
+        source = _bounded_btw_text(getattr(image, "source_uri", ""), 300)
+        return f"图片: {name}" + (f" ({source})" if source else "")
+    if event_type in {"tool_call_start", "tool_call_update", "tool_call_done"}:
+        tool_call = getattr(event, "tool_call", None)
+        if tool_call is None:
+            return ""
+        status = _bounded_btw_text(getattr(tool_call, "status", "") or event_type)
+        title = _bounded_btw_text(getattr(tool_call, "title", "") or "未命名操作", 300)
+        content = _bounded_btw_text(getattr(tool_call, "content", ""), 300)
+        line = f"工具[{status}]: {title}"
+        return f"{line} — {content}" if content else line
+    if event_type == "plan_update":
+        plan = getattr(event, "plan", None)
+        entries = getattr(plan, "entries", ()) or ()
+        parts = []
+        for entry in entries:
+            content = _bounded_btw_text(getattr(entry, "content", ""), 240)
+            if content:
+                parts.append(f"[{getattr(entry, 'status', 'pending')}] {content}")
+        return "计划: " + "; ".join(parts) if parts else ""
+    return ""
+
+
+@dataclass
+class _ActiveProgrammingRun:
+    task_text: str
+    cwd: str
+    agent_type: str
+    model_name: str | None
+    started_at: float = field(default_factory=time.monotonic)
+    events: deque[str] = field(
+        default_factory=lambda: deque(maxlen=_BTW_EVENT_LIMIT)
+    )
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _btw_inflight: bool = field(default=False, repr=False)
+
+    def observe(self, event: object) -> None:
+        line = _format_btw_event(event)
+        if not line:
+            return
+        with self._lock:
+            if (
+                self.events
+                and line.startswith(("Agent 输出:", "Agent 分析:"))
+                and self.events[-1].partition(":")[0]
+                == line.partition(":")[0]
+            ):
+                label, _, previous = self.events[-1].partition(":")
+                _, _, addition = line.partition(":")
+                combined = _bounded_btw_text(
+                    f"{previous} {addition}",
+                    _BTW_EVENT_TEXT_LIMIT,
+                )
+                self.events[-1] = f"{label}: {combined}"
+                return
+            self.events.append(line)
+
+    def claim_btw(self) -> bool:
+        with self._lock:
+            if self._btw_inflight:
+                return False
+            self._btw_inflight = True
+            return True
+
+    def release_btw(self) -> None:
+        with self._lock:
+            self._btw_inflight = False
+
+    def snapshot(self) -> str:
+        with self._lock:
+            events = tuple(self.events)
+        elapsed = max(0, int(time.monotonic() - self.started_at))
+        header = "\n".join(
+            (
+                f"主任务: {_bounded_btw_text(self.task_text, 2000)}",
+                f"已运行: {elapsed} 秒",
+                "最近执行事件:",
+            )
+        )
+        event_text = "\n".join(f"- {line}" for line in events)
+        if not events:
+            event_text = "- 暂无可见执行事件"
+        remaining = max(0, _BTW_SNAPSHOT_LIMIT - len(header) - 1)
+        return f"{header}\n{event_text[-remaining:]}"
+
+    def progress_fallback(self) -> str:
+        with self._lock:
+            events = tuple(self.events)[-4:]
+        if not events:
+            return "主任务仍在运行，但暂时还没有可用于回答的执行事件。"
+        return "当前可见进展：\n" + "\n".join(f"- {line}" for line in events)
 
 
 def _append_execution_notice(text: str, notice: str) -> str:
@@ -235,6 +352,138 @@ class ProgrammingModeHandler(BaseHandler):
     def __init__(self, ctx):
         super().__init__(ctx)
         self._current_model: Optional[str] = None
+        self._active_programming_runs: dict[
+            tuple[str, str, str], _ActiveProgrammingRun
+        ] = {}
+        self._active_programming_runs_lock = threading.Lock()
+
+    @staticmethod
+    def _active_run_key(
+        chat_id: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> tuple[str, str, str]:
+        from ...thread import get_current_thread_id
+
+        project_id = str(getattr(project, "project_id", "") or "")
+        thread_id = str(get_current_thread_id() or "")
+        return str(chat_id or ""), project_id, thread_id
+
+    def _register_active_programming_run(
+        self,
+        chat_id: str,
+        project: Optional["ProjectContext"],
+        *,
+        task_text: str,
+        cwd: str,
+    ) -> tuple[tuple[str, str, str], _ActiveProgrammingRun]:
+        agent_type = self._get_agent_type_override(project) or self.mode_key
+        state = _ActiveProgrammingRun(
+            task_text=task_text,
+            cwd=cwd,
+            agent_type=agent_type,
+            model_name=self._get_model_name_override(project),
+        )
+        key = self._active_run_key(chat_id, project)
+        with self._active_programming_runs_lock:
+            self._active_programming_runs[key] = state
+        return key, state
+
+    def _unregister_active_programming_run(
+        self,
+        key: tuple[str, str, str],
+        state: _ActiveProgrammingRun,
+    ) -> None:
+        with self._active_programming_runs_lock:
+            if self._active_programming_runs.get(key) is state:
+                self._active_programming_runs.pop(key, None)
+
+    def _get_active_programming_run(
+        self,
+        chat_id: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> _ActiveProgrammingRun | None:
+        key = self._active_run_key(chat_id, project)
+        with self._active_programming_runs_lock:
+            return self._active_programming_runs.get(key)
+
+    def handle_btw(
+        self,
+        message_id: str,
+        chat_id: str,
+        question: str,
+        project: Optional["ProjectContext"] = None,
+    ) -> None:
+        """Answer a side question without contending for the main task lock."""
+        active_run = self._get_active_programming_run(chat_id, project)
+        if active_run is None:
+            # /btw is a GhostAP control command, not a portable provider slash
+            # command. An idle programming session can answer the question normally.
+            self.handle_message(message_id, chat_id, question, project)
+            return
+
+        if not active_run.claim_btw():
+            self.reply_text(message_id, UI_TEXT["system_btw_already_running"])
+            return
+
+        self.reply_text(message_id, UI_TEXT["system_btw_observing"])
+        auxiliary_session = None
+        try:
+            from ...agent_session import (
+                close_session_safely,
+                create_auxiliary_session,
+            )
+
+            startup_timeout = min(
+                _BTW_STARTUP_TIMEOUT_S,
+                max(
+                    1.0,
+                    float(getattr(self.settings, "acp_startup_timeout", 30) or 30),
+                ),
+            )
+            auxiliary_session = create_auxiliary_session(
+                agent_type=active_run.agent_type,
+                cwd=active_run.cwd,
+                model_name=active_run.model_name,
+                thread_id="btw-observer",
+                startup_timeout=startup_timeout,
+                startup_retries=1,
+                startup_log_failures=False,
+            )
+            prompt = (
+                "你是一个正在执行的编程任务的只读旁路观察员。"
+                "请只根据下面的实时快照回答用户的临时问题，不参与或改变主任务。\n"
+                "要求：不要调用工具；不要声称看到了快照之外的信息；证据不足时明确说明；"
+                "用中文简洁回答，并区分事实与推断。\n\n"
+                f"{active_run.snapshot()}\n\n"
+                f"用户旁路问题: {_bounded_btw_text(question, 4000)}"
+            )
+            result = auxiliary_session.send_prompt(
+                prompt,
+                timeout=_BTW_PROMPT_TIMEOUT_S,
+            )
+            answer = str(getattr(result, "text", "") or "").strip()
+            if not answer:
+                answer = active_run.progress_fallback()
+            self.reply_text(
+                message_id,
+                UI_TEXT["system_btw_answer"].format(answer=answer),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] /btw auxiliary observation failed: %s",
+                self.mode_name,
+                get_error_detail(exc),
+            )
+            self.reply_text(
+                message_id,
+                UI_TEXT["system_btw_fallback"].format(
+                    progress=active_run.progress_fallback(),
+                ),
+            )
+        finally:
+            if auxiliary_session is not None:
+                close_session_safely(auxiliary_session)
+            active_run.release_btw()
 
     # ------------------------------------------------------------------
     # Config-driven default implementations (subclass may override)
@@ -924,6 +1173,8 @@ class ProgrammingModeHandler(BaseHandler):
 
         repo_lock_mgr = None
         needs_release = False
+        active_run_key = None
+        active_run = None
         try:
             _, repo_lock_mgr, needs_release = self._acquire_repo_lock(root_path, chat_id)
         except LockConflictError:
@@ -936,6 +1187,12 @@ class ProgrammingModeHandler(BaseHandler):
             return
 
         try:
+            active_run_key, active_run = self._register_active_programming_run(
+                chat_id,
+                project,
+                task_text=raw_task_text,
+                cwd=cwd,
+            )
             self.handle_response(
                 message_id,
                 chat_id,
@@ -949,6 +1206,11 @@ class ProgrammingModeHandler(BaseHandler):
                 _finalization_task_text=raw_task_text,
             )
         finally:
+            if active_run_key is not None and active_run is not None:
+                self._unregister_active_programming_run(
+                    active_run_key,
+                    active_run,
+                )
             if needs_release:
                 self._release_repo_lock(root_path, chat_id, repo_lock_mgr)
 
@@ -1220,10 +1482,13 @@ class ProgrammingModeHandler(BaseHandler):
         seen_image_ids: set[str] = set()
         image_failures = [0]
         child_lifecycle_proof = AuthoritativeChildLifecycleProof()
+        active_run = self._get_active_programming_run(chat_id, project)
 
         def on_event(event) -> None:
             update_count[0] += 1
             child_lifecycle_proof.observe_event(event)
+            if active_run is not None:
+                active_run.observe(event)
             if prog_session is not None:
                 try:
                     prog_session.on_event(event)
