@@ -3849,6 +3849,10 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         require_tool_filter=True,
                         model_name=binding.model_name,
                         cancel_event=attempt_cancel_event,
+                        # Member timeout/startup failure is an expected input
+                        # to frozen-pool fallback, not an unhandled service
+                        # failure. This handler reports the bounded fallback.
+                        startup_log_failures=False,
                     )
                     if session is None:
                         last_error = f"{binding.agent_id}: unable to create generation session"

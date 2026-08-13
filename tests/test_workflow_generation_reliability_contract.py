@@ -381,6 +381,8 @@ def test_fair_member_slice_preserves_later_binding_budget_and_bounds_repairs(
     assert first_kwargs["idle_timeout"] == 120
     assert second_kwargs["timeout"] <= 50
     assert second_kwargs["idle_timeout"] <= 50
+    assert factory.call_args_list[0].kwargs["startup_log_failures"] is False
+    assert factory.call_args_list[1].kwargs["startup_log_failures"] is False
     assert any("A-2" in item and "working" in item for item in progress)
     assert not any("heartbeat" in item.lower() for item in progress)
 
