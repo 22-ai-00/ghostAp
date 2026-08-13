@@ -1,6 +1,8 @@
 # GhostAP 项目记忆索引
 
 > **维护性 Backlog**: 后续 Review/Audit 发现的非紧急维护项按分级规则录入 [Backlog.md](Backlog.md) 并在维护窗口集中处理；本轮 Refactoring Analysis 1–28 的问题矩阵入口是 [.Memory/2026-05-11.md](2026-05-11.md) 顶部最终矩阵，2026-05-12 是执行验证日志。
+## 2026-08-13
+- **Superpowers空目录清理** - 移除归档噪音路径并恢复文档守卫 → [2026-08-13.md](2026-08-13.md)
 ## 2026-08-12
 - **启动readiness身份修复** - 兼容官方Bot info缺省app_id，保留异常绑定拒绝 → [2026-08-12.md](2026-08-12.md)
 - **Team有界关闭闭环** - admission冻结、排队取消、运行与provider共享deadline → [2026-08-12.md](2026-08-12.md)
