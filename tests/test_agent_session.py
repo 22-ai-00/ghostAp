@@ -165,6 +165,35 @@ class TestSyncClaudeCLISession:
         assert all(e.event_type == ACPEventType.TEXT_CHUNK for e in events)
         assert sess.message_count == 1
 
+    def test_send_prompt_accepts_workflow_activity_timeout_contract(self):
+        """Claude CLI must implement the common Workflow prompt signature."""
+        sess = SyncClaudeCLISession(cwd="/tmp")
+        sess.session_id = "test-id"
+
+        mock_proc = MagicMock()
+        mock_proc.stdout = iter(["working\n", "done\n"])
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.read.return_value = ""
+        mock_proc.returncode = 0
+        mock_proc.poll.return_value = 0
+        mock_proc.wait = MagicMock()
+        observed: list[str] = []
+
+        with (
+            patch("subprocess.Popen", return_value=mock_proc),
+            patch("src.utils.env.build_clean_env", return_value={}),
+        ):
+            result = sess.send_prompt(
+                "test",
+                on_event=lambda event: observed.append(event.text),
+                timeout=30,
+                idle_timeout=5.0,
+                activity_predicate=lambda event: bool(event.text.strip()),
+            )
+
+        assert result.stop_reason == "end_turn"
+        assert observed == ["working\n", "done\n"]
+
     def test_send_prompt_emits_new_local_image_before_return(self, tmp_path):
         sess = SyncClaudeCLISession(cwd=str(tmp_path))
         sess.session_id = "test-id"

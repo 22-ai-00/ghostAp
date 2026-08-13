@@ -166,7 +166,9 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
         self,
         text: str,
         on_event: Optional[Callable[[ACPEvent], None]] = None,
-        timeout: Optional[int] = None,
+        timeout: Optional[float] = None,
+        idle_timeout: Optional[float] = None,
+        activity_predicate: Optional[Callable[[ACPEvent], bool]] = None,
     ) -> PromptResult:
         self._cancel_event.clear()
         prompt_generation = self._begin_prompt_generation()
@@ -176,6 +178,8 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
                 text,
                 on_event=on_event,
                 timeout=timeout,
+                idle_timeout=idle_timeout,
+                activity_predicate=activity_predicate,
             )
             user_cancelled = self._consume_prompt_generation(prompt_generation)
             generation_consumed = True
@@ -196,7 +200,9 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
         self,
         text: str,
         on_event: Optional[Callable[[ACPEvent], None]] = None,
-        timeout: Optional[int] = None,
+        timeout: Optional[float] = None,
+        idle_timeout: Optional[float] = None,
+        activity_predicate: Optional[Callable[[ACPEvent], bool]] = None,
     ) -> PromptResult:
         if not self.session_id:
             self.start()
@@ -266,7 +272,14 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
                     else None
                 )
 
-                deadline = (time.monotonic() + timeout) if timeout else None
+                started_at = time.monotonic()
+                deadline = (started_at + timeout) if timeout else None
+                effective_idle_timeout = (
+                    float(idle_timeout)
+                    if idle_timeout is not None and float(idle_timeout) > 0
+                    else 0.0
+                )
+                last_activity_at = [started_at]
                 assert self._proc.stdout is not None
 
                 # Watchdog thread: terminates the process on timeout or cancel
@@ -314,11 +327,28 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
                             terminated_reason.append("timeout")
                             _ensure_process_stopped()
                             return
+                        if (
+                            effective_idle_timeout > 0
+                            and time.monotonic() - last_activity_at[0]
+                            >= effective_idle_timeout
+                        ):
+                            terminated_reason.append("idle_timeout")
+                            _ensure_process_stopped()
+                            return
                         wait_timeout = 0.1
                         if deadline is not None:
                             wait_timeout = min(
                                 wait_timeout,
                                 max(0.0, deadline - time.monotonic()),
+                            )
+                        if effective_idle_timeout > 0:
+                            wait_timeout = min(
+                                wait_timeout,
+                                max(
+                                    0.0,
+                                    effective_idle_timeout
+                                    - (time.monotonic() - last_activity_at[0]),
+                                ),
                             )
                         self._cancel_event.wait(timeout=wait_timeout)
 
@@ -340,8 +370,21 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
                             _ensure_process_stopped()
                             return (1, "".join(chunks), "", "timeout")
                     chunks.append(line)
+                    event = ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=line)
+                    counts_as_activity = True
+                    if activity_predicate is not None:
+                        try:
+                            counts_as_activity = bool(activity_predicate(event))
+                        except Exception:
+                            counts_as_activity = False
+                            logger.warning(
+                                "Claude CLI activity predicate failed closed",
+                                exc_info=True,
+                            )
+                    if counts_as_activity:
+                        last_activity_at[0] = time.monotonic()
                     if on_event:
-                        on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text=line))
+                        on_event(event)
 
                 if terminated_reason:
                     _ensure_process_stopped()
@@ -387,9 +430,10 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
             if state == "cancelled":
                 self.is_resumed = True
                 return PromptResult(stop_reason="cancelled", text=out)
-            if state == "timeout":
+            if state in {"timeout", "idle_timeout"}:
                 self.is_resumed = True
-                timeout_text = (out + "\n❌ Claude 执行超时").strip()
+                reason = "空闲超时" if state == "idle_timeout" else "执行超时"
+                timeout_text = (out + f"\n❌ Claude {reason}").strip()
                 return PromptResult(stop_reason="timeout", text=timeout_text)
 
             output = out
