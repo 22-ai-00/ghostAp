@@ -16,6 +16,7 @@ from .codec import (
     NormalizedA2AObservation,
     normalize_a2a_observation,
 )
+from .journal import RemoteDispatchLedger, RemoteDispatchLedgerError
 
 __all__ = [
     "A2ACodecError",
@@ -26,6 +27,8 @@ __all__ = [
     "MAX_OBSERVATION_BYTES",
     "NormalizedA2AObservation",
     "PilotAgentRegistration",
+    "RemoteDispatchLedger",
+    "RemoteDispatchLedgerError",
     "TrustedAgentCard",
     "canonical_card_digest",
     "load_trusted_agent_card",
