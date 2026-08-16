@@ -12,6 +12,7 @@ RESIDUAL_GRACE_DELAY="${GHOSTAP_RESIDUAL_GRACE_DELAY:-10}"
 READINESS_TIMEOUT="${GHOSTAP_READINESS_TIMEOUT:-60}"
 READINESS_POLL_INTERVAL="${GHOSTAP_READINESS_POLL_INTERVAL:-1}"
 START_FAILURE_GRACE_DELAY="${GHOSTAP_START_FAILURE_GRACE_DELAY:-5}"
+START_PROCESS_PID_TIMEOUT="${GHOSTAP_START_PROCESS_PID_TIMEOUT:-10}"
 LOG_MODE="${GHOSTAP_LOG_MODE:-truncate}"
 STARTED_PID=""
 RESTART_REQUEST_SEQUENCE=0
@@ -60,7 +61,6 @@ pid_is_ghostap_service() {
     if [ -z "$process_command" ]; then
         process_command=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
     fi
-    pid_belongs_to_project "$pid" || return 1
     case "$process_command" in
         "$PYTHON_BIN -m src.main"|".venv/bin/python -m src.main")
             command_kind="python"
@@ -70,6 +70,7 @@ pid_is_ghostap_service() {
             ;;
         *) return 1 ;;
     esac
+    pid_belongs_to_project "$pid" || return 1
     if [ "$(uname -s)" = "Linux" ]; then
         local process_exe expected_exe
         process_exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || return 1
@@ -116,25 +117,56 @@ snapshot_restart_generation() {
         --project-dir "$PROJECT_DIR"
 }
 
+get_launchctl_service_pid() {
+    command -v launchctl >/dev/null 2>&1 || return 1
+    launchctl print "gui/$(id -u)/$LAUNCHCTL_LABEL" 2>/dev/null |
+        awk '$1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ { print $3; exit }'
+}
+
+wait_for_launchctl_service_pid() {
+    local deadline=$((SECONDS + START_PROCESS_PID_TIMEOUT))
+    local launchctl_pid=""
+    while :; do
+        launchctl_pid=$(get_launchctl_service_pid) || true
+        if [[ "$launchctl_pid" =~ ^[0-9]+$ ]]; then
+            echo "$launchctl_pid"
+            return 0
+        fi
+        if (( SECONDS >= deadline )); then
+            return 1
+        fi
+        sleep "$READINESS_POLL_INTERVAL"
+    done
+}
+
+remove_launchctl_service() {
+    local launchctl_pid=""
+    launchctl_pid=$(get_launchctl_service_pid) || true
+    launchctl remove "$LAUNCHCTL_LABEL" >/dev/null 2>&1 || true
+    if [ -n "$launchctl_pid" ]; then
+        wait_for_pid_exit "$launchctl_pid" "$RESIDUAL_GRACE_DELAY"
+    fi
+}
+
 start_service_process() {
     local mode="${1:-truncate}"
     local detach_cmd=()
     if command -v setsid >/dev/null 2>&1; then
         detach_cmd=(setsid)
     elif command -v launchctl >/dev/null 2>&1; then
-        launchctl remove "$LAUNCHCTL_LABEL" >/dev/null 2>&1 || true
+        remove_launchctl_service || return 1
         unset VIRTUAL_ENV
         if [ -x "$PYTHON_BIN" ]; then
             launchctl submit -l "$LAUNCHCTL_LABEL" -- /bin/bash -lc \
                 'cd "$1" && exec "$2" -m src.main >>"$3" 2>&1' \
-                bash "$PROJECT_DIR" "$PYTHON_BIN" "$LOG_FILE"
+                bash "$PROJECT_DIR" "$PYTHON_BIN" "$LOG_FILE" || return 1
         else
             launchctl submit -l "$LAUNCHCTL_LABEL" -- /bin/bash -lc \
                 'cd "$1" && exec uv run python -m src.main >>"$2" 2>&1' \
-                bash "$PROJECT_DIR" "$LOG_FILE"
+                bash "$PROJECT_DIR" "$LOG_FILE" || return 1
         fi
-        STARTED_PID=""
-        return
+        STARTED_PID=$(wait_for_launchctl_service_pid) || return 1
+        return 0
     fi
 
     unset VIRTUAL_ENV
@@ -397,11 +429,13 @@ cleanup_failed_start() {
 stop_service() {
     local forced=0
     local target_pid=""
+    local discovered_pids=""
     local residual_pids=""
     local p=""
 
     echo "正在停止 GhostAP 服务..."
     log_restart "stop begin"
+    discovered_pids=$(get_running_pids)
 
     if [ -f "$PID_FILE" ]; then
         target_pid=$(cat "$PID_FILE")
@@ -418,8 +452,20 @@ stop_service() {
         rm -f "$PID_FILE"
     fi
     if command -v launchctl >/dev/null 2>&1; then
-        launchctl remove "$LAUNCHCTL_LABEL" >/dev/null 2>&1 || true
+        if ! remove_launchctl_service; then
+            forced=1
+        fi
     fi
+
+    for p in $discovered_pids; do
+        if kill -0 "$p" 2>/dev/null &&
+            ! wait_for_pid_exit "$p" "$RESIDUAL_GRACE_DELAY"; then
+            if pid_is_ghostap_service "$p" &&
+                ! terminate_service_pid "$p" "$RESIDUAL_GRACE_DELAY"; then
+                forced=1
+            fi
+        fi
+    done
 
     residual_pids=$(get_running_pids)
     if [ -n "$residual_pids" ]; then
@@ -456,7 +502,11 @@ start_service() {
     prepare_codex_acp_dependency
     log_restart "start begin cmd=$(service_command_label)"
     previous_running_pids=$(get_running_pids)
-    start_service_process "$start_log_mode"
+    if ! start_service_process "$start_log_mode"; then
+        echo "❌ 启动失败：无法创建 GhostAP 服务进程"
+        log_restart "start failed process launch"
+        return 1
+    fi
     PID="$STARTED_PID"
     if [ -n "$PID" ]; then
         echo "$PID" > "$PID_FILE"

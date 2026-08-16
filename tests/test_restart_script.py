@@ -220,6 +220,32 @@ pid_is_ghostap_service 4343
     assert result.returncode == 0, result.stderr
 
 
+def test_non_service_command_is_rejected_before_project_cwd_lookup(tmp_path):
+    capture = tmp_path / "cwd-lookups"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+pid_belongs_to_project() {
+    printf '%s\n' "$1" >> "$CAPTURE"
+    return 0
+}
+if pid_is_ghostap_service 4242 '/usr/bin/python unrelated.py'; then
+    exit 9
+fi
+[ ! -e "$CAPTURE" ]
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_default_launchctl_labels_are_isolated_per_checkout(tmp_path):
     labels: list[str] = []
     for name in ("checkout-a", "checkout-b"):
@@ -388,6 +414,7 @@ def test_macos_service_launch_uses_positional_argv_for_quoted_paths(tmp_path):
 export GHOSTAP_RESTART_LIBRARY_ONLY=1
 export CAPTURE="$2"
 source "$1"
+submitted=0
 command() {
     if [ "$1" = "-v" ] && [ "$2" = "setsid" ]; then
         return 1
@@ -395,9 +422,13 @@ command() {
     builtin command "$@"
 }
 launchctl() {
-    if [ "$1" = "submit" ]; then
-        printf '%s\n' "$@" > "$CAPTURE"
-    fi
+    case "$1" in
+        print) [ "$submitted" = "1" ] && printf '%s\n' 'pid = 4242' ;;
+        submit)
+            printf '%s\n' "$@" > "$CAPTURE"
+            submitted=1
+            ;;
+    esac
 }
 start_service_process append
 '''
@@ -417,6 +448,161 @@ start_service_process append
     assert 'cd "$1"' in command_text
     assert str(checkout) in argv
     assert str(checkout / "logs.log") in argv
+
+
+def test_macos_service_launch_failure_is_propagated(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+source "$1"
+command() {
+    if [ "$1" = "-v" ] && [ "$2" = "setsid" ]; then
+        return 1
+    fi
+    builtin command "$@"
+}
+launchctl() {
+    [ "$1" != "submit" ]
+}
+if start_service_process append; then
+    exit 9
+fi
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_macos_service_launch_waits_for_previous_launchctl_pid(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    capture = tmp_path / "events"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+command() {
+    if [ "$1" = "-v" ] && [ "$2" = "setsid" ]; then
+        return 1
+    fi
+    builtin command "$@"
+}
+launchctl() {
+    case "$1" in
+        print) printf '%s\n' 'pid = 4242' ;;
+        remove) printf '%s\n' remove >> "$CAPTURE" ;;
+        submit) printf '%s\n' submit >> "$CAPTURE" ;;
+    esac
+}
+wait_for_pid_exit() {
+    printf 'wait:%s:%s\n' "$1" "$2" >> "$CAPTURE"
+}
+start_service_process append
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "remove",
+        "wait:4242:10",
+        "submit",
+    ]
+
+
+def test_macos_service_launch_records_new_launchctl_pid(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+source "$1"
+submitted=0
+command() {
+    if [ "$1" = "-v" ] && [ "$2" = "setsid" ]; then
+        return 1
+    fi
+    builtin command "$@"
+}
+launchctl() {
+    case "$1" in
+        print)
+            if [ "$submitted" = "1" ]; then
+                printf '%s\n' 'pid = 4242'
+            else
+                return 1
+            fi
+            ;;
+        submit) submitted=1 ;;
+    esac
+}
+sleep() { :; }
+start_service_process append
+printf '%s\n' "$STARTED_PID"
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "4242"
+
+
+def test_start_service_stops_when_process_launch_fails(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    capture = tmp_path / "events"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+prepare_python_dependencies() { :; }
+prepare_employee_sandbox_dependency() { :; }
+prepare_codex_acp_dependency() { :; }
+log_restart() { :; }
+get_running_pids() { :; }
+start_service_process() {
+    printf '%s\n' launch-failed >> "$CAPTURE"
+    return 1
+}
+wait_for_service_readiness() {
+    printf '%s\n' unexpected-readiness-poll >> "$CAPTURE"
+}
+start_service
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert capture.read_text(encoding="utf-8").splitlines() == ["launch-failed"]
 
 
 def test_start_service_publishes_generation_only_after_readiness(tmp_path):
@@ -600,6 +786,52 @@ stop_service
     assert "kill:-9 -- -4242" in events
     assert "强制" in result.stdout
     assert "✅ 服务已停止" not in result.stdout
+
+
+def test_stop_waits_for_service_discovered_before_launchctl_remove(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    capture = tmp_path / "events"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+removed=0
+log_restart() { :; }
+get_running_pids() {
+    if [ "$removed" = "0" ]; then
+        printf '%s\n' 4242
+    fi
+}
+launchctl() {
+    if [ "$1" = "remove" ]; then
+        printf 'launchctl:%s\n' "$*" >> "$CAPTURE"
+        removed=1
+    fi
+}
+kill() {
+    [ "$1" = "-0" ]
+}
+wait_for_pid_exit() {
+    printf 'wait:%s:%s\n' "$1" "$2" >> "$CAPTURE"
+}
+stop_service
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = capture.read_text(encoding="utf-8").splitlines()
+    assert len(events) == 2
+    assert events[0].startswith("launchctl:remove com.ghostap.local.")
+    assert events[1] == "wait:4242:10"
 
 
 def test_restart_script_has_no_generated_shared_worker_or_heredoc():
