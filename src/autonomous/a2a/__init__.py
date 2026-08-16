@@ -8,6 +8,12 @@ from .card import (
     canonical_card_digest,
     load_trusted_agent_card,
 )
+from .client import (
+    A2AClientLimits,
+    BearerCredentialResolver,
+    RemoteA2AClientError,
+    RemoteA2ADispatchAdapter,
+)
 from .codec import (
     MAX_OBSERVATION_BYTES,
     A2ACodecError,
@@ -20,13 +26,17 @@ from .journal import RemoteDispatchLedger, RemoteDispatchLedgerError
 
 __all__ = [
     "A2ACodecError",
+    "A2AClientLimits",
     "A2ANormalizedStatus",
     "A2AObservationKind",
     "AgentCardValidationError",
+    "BearerCredentialResolver",
     "MAX_AGENT_CARD_BYTES",
     "MAX_OBSERVATION_BYTES",
     "NormalizedA2AObservation",
     "PilotAgentRegistration",
+    "RemoteA2AClientError",
+    "RemoteA2ADispatchAdapter",
     "RemoteDispatchLedger",
     "RemoteDispatchLedgerError",
     "TrustedAgentCard",
