@@ -281,6 +281,10 @@ A2A 规范规定 Get 类操作天然幂等，Cancel 和删除 push config 是幂
 
 Python SDK `v1.1.2` 支持 JSON-RPC、HTTP+JSON/REST、gRPC 的客户端/服务端实现，提供 Card resolver/client factory、`AgentExecutor`、request handler、TaskStore、流式 EventQueue，以及可选 Starlette/FastAPI/gRPC/数据库/OTel 依赖。它要求 Python 3.10+，与 GhostAP 当前 Python 3.11+ 基线兼容。[a2a-python README](https://github.com/a2aproject/a2a-python/blob/v1.1.2/README.md)、[AgentExecutor interface](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/server/agent_execution/agent_executor.py)
 
+对当前 outbound 试点，SDK `v1.1.2` 的公共客户端接口需要按源码精确使用：`ClientFactory.create(card)` 从已取得的 Card 创建客户端，`create_from_url()` 则先解析 well-known Card；`ClientConfig.supported_protocol_bindings` 为空时只注册 JSON-RPC，HTTP+JSON 或 gRPC 必须显式启用。`Client.send_message()` 统一返回 `AsyncIterator[StreamResponse]`，并依据 `ClientConfig.streaming` 与 Card 的 streaming capability 选择流式或非流式传输，恢复和取消分别使用 `subscribe()`、`get_task()`、`cancel_task()`。`subscribe()` 只有在客户端和服务端都声明 streaming 时可用；每次调用可通过 `ClientCallContext.timeout` 传入超时。[ClientFactory](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/client_factory.py)、[Client API](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/client.py)、[BaseClient implementation](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/base_client.py)
+
+GhostAP 不能把 SDK 的默认 Card 解析和接口选择当成准入校验。`ClientFactory` 会优先 `1.0`，但没有 `1.0` 时还会回退到大于 `1.0`、版本号 `>=0.3` 或缺失版本的接口；`A2ACardResolver` 也会转换旧版字段、忽略未知字段，并在 INFO 日志记录取得的完整 Card。首期要求 wire `1.0` 时，应先用受控 HTTP client 获取 Card，执行严格 schema、来源、endpoint、版本和 digest 校验并脱敏，再把已验证 Card 交给 `ClientFactory.create()`；不能直接依赖 `create_from_url()` 自动准入或静默兼容。[ClientFactory interface selection](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/client_factory.py)、[A2ACardResolver](https://github.com/a2aproject/a2a-python/blob/v1.1.2/src/a2a/client/card_resolver.py)
+
 但 SDK 只是协议 plumbing，不应成为第二个领域事实源：
 
 - 若 GhostAP 将来提供 inbound A2A Server，SDK TaskStore 应做成 Journal projection/adapter，或只缓存可从 Journal 重建的数据；
