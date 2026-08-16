@@ -107,8 +107,8 @@ class Settings(BaseSettings):
     # 4-12s). A tight 6s window times out often, and falling back to the static
     # DEFAULT_MODELS hides the real model list (GPT-5.x, GLM-5, Kimi, openrouter
     # pools, Gemini previews, …), so we give the probe a generous window before
-    # degrading. The startup preheat keeps the 5min cache warm so /coco normally
-    # never pays this cost interactively.
+    # degrading. With lazy startup, the first explicit model-catalog request may
+    # pay this bounded cost; successful results keep later interactions cached.
     acp_model_probe_timeout: float = 15.0
 
     # ACP backends are lazy by default: Bot readiness must not depend on model
