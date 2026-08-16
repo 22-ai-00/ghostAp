@@ -11,16 +11,99 @@ ROOT = Path(__file__).resolve().parents[1]
 RESTART_SCRIPT = ROOT / "restart.sh"
 
 
-def test_restart_script_preheats_codex_acp_fallback_dependency():
+def test_restart_script_defers_codex_acp_fallback_dependency_by_default():
     text = RESTART_SCRIPT.read_text(encoding="utf-8")
 
     assert "CODEX_ACP_NPM_PACKAGE=" in text
     assert "@agentclientprotocol/codex-acp@1.2.0" in text
-    assert "PREPARE_CODEX_ACP=" in text
+    assert 'PREPARE_CODEX_ACP="${GHOSTAP_PREPARE_CODEX_ACP:-0}"' in text
     assert "prepare_codex_acp_dependency()" in text
     assert 'npx --yes "$CODEX_ACP_NPM_PACKAGE" --version' in text
     assert 'npx --yes "$CODEX_ACP_NPM_PACKAGE" --help' not in text
     assert "prepare_codex_acp_dependency" in text.split("start_service() {", 1)[1]
+
+
+def test_restart_default_codex_preparation_performs_no_external_probe(tmp_path):
+    capture = tmp_path / "events"
+    shell = r'''
+unset GHOSTAP_PREPARE_CODEX_ACP
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+log_restart() { printf '%s\n' "$*" >> "$CAPTURE"; }
+codex_native_acp_available() { exit 9; }
+npx() { exit 9; }
+prepare_codex_acp_dependency
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "codex acp fallback preheat skipped"
+    ]
+
+
+def test_application_startup_defers_acp_connections_by_default(monkeypatch):
+    import src.acp.helper as acp_helper
+    import src.coco_model as coco_model
+    import src.main as main_module
+    from src.config.settings import Settings
+
+    events = []
+    preheat_calls = []
+
+    class FakeCocoModelManager:
+        def kickoff_preheat(self):
+            preheat_calls.append("coco")
+
+    class FakeFeishuClient:
+        def __init__(self, *, message_callback):
+            self.message_callback = message_callback
+
+        def start(self):
+            events.append("feishu-start")
+
+        def close(self):
+            events.append("feishu-close")
+            return True
+
+    def fake_acp_preheat(*_args, **_kwargs):
+        preheat_calls.append("acp")
+
+    monkeypatch.setattr(acp_helper, "kickoff_acp_model_preheat", fake_acp_preheat)
+    monkeypatch.setattr(
+        coco_model,
+        "get_coco_model_manager",
+        lambda: FakeCocoModelManager(),
+    )
+    monkeypatch.setattr(main_module, "_load_feishu_runtime", lambda: (None, None, FakeFeishuClient))
+    monkeypatch.setattr(main_module.Application, "_install_signal_handlers", lambda _self: None)
+    monkeypatch.setattr(
+        main_module.Application,
+        "_shutdown_lock_managers",
+        staticmethod(lambda: events.append("locks-close")),
+    )
+
+    app = object.__new__(main_module.Application)
+    app.settings = SimpleNamespace(
+        validate_feishu_config=lambda: True,
+        app_id="test-app-id",
+        sandbox_timeout=30,
+        default_acp_tool=None,
+    )
+    app.feishu_client = None
+
+    app.run()
+
+    assert Settings.model_fields["acp_model_preheat_on_startup"].default is False
+    assert preheat_calls == []
+    assert events == ["feishu-start", "feishu-close", "locks-close"]
 
 
 @pytest.mark.parametrize(
@@ -30,7 +113,7 @@ def test_restart_script_preheats_codex_acp_fallback_dependency():
         (False, ["feishu-close"]),
     ],
 )
-def test_application_startup_preheats_codex_model_capabilities_without_join(
+def test_application_startup_can_preheat_model_capabilities_when_explicitly_enabled(
     monkeypatch,
     close_result,
     expected_shutdown_events,

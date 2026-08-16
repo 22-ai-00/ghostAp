@@ -2,6 +2,7 @@
 
 > **维护性 Backlog**: 后续 Review/Audit 发现的非紧急维护项按分级规则录入 [Backlog.md](Backlog.md) 并在维护窗口集中处理；本轮 Refactoring Analysis 1–28 的问题矩阵入口是 [.Memory/2026-05-11.md](2026-05-11.md) 顶部最终矩阵，2026-05-12 是执行验证日志。
 ## 2026-08-16
+- **ACP懒启动解耦readiness** - restart与主进程默认不预热，交互时按需建连可重试 → [2026-08-16.md](2026-08-16.md)
 - **本机Shell完全放开** - trusted_local确认、任意目录与空命令过滤现场验收 → [2026-08-16.md](2026-08-16.md)
 - **启动readiness误超时修复** - launchd PID权威化并等待旧进程退出后复用label → [2026-08-16.md](2026-08-16.md)
 ## 2026-08-14

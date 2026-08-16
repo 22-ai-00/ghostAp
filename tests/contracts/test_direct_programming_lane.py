@@ -197,6 +197,33 @@ def test_backend_start_failure_keeps_the_previous_project_configuration():
     assert manager.get_session("chat-direct", project_id=project.project_id) is None
 
 
+def test_backend_start_failure_can_retry_on_the_next_feishu_activation():
+    attempts: list[str] = []
+    recorder = SessionCallRecorder()
+
+    def flaky_factory(*, agent_type: str, **kwargs):
+        attempts.append(agent_type)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary codex network failure")
+        return recorder.session_factory(agent_type=agent_type, **kwargs)
+
+    manager = ACPSessionManager("codex", session_starter=flaky_factory)
+    ctx = _context("codex", manager)
+    handler = CodexModeHandler(ctx)
+    handler.reply_text = MagicMock()
+    handler.reply_card = MagicMock()
+    handler.add_reaction = MagicMock()
+    handler.record_mode_transition = MagicMock()
+    project = _project("codex", "codex-model")
+
+    assert handler.enter_mode("first", "chat-direct", project=project, silent=True) is False
+    assert manager.get_session("chat-direct", project_id=project.project_id) is None
+
+    assert handler.enter_mode("second", "chat-direct", project=project, silent=True) is True
+    assert manager.get_session("chat-direct", project_id=project.project_id) is not None
+    assert attempts == ["codex", "codex"]
+
+
 def _configuration_lane(tmp_path):
     storage = tmp_path / "projects.json"
     projects = ProjectManager(str(storage))

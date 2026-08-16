@@ -111,10 +111,10 @@ class Settings(BaseSettings):
     # never pays this cost interactively.
     acp_model_probe_timeout: float = 15.0
 
-    # Warm up the coco ACP model list in the background at startup so the
-    # interactive /coco model picker reads a fresh 5min-cached list instead of
-    # paying the cold-spawn probe cost (and risking a timeout → stale defaults).
-    acp_model_preheat_on_startup: bool = True
+    # ACP backends are lazy by default: Bot readiness must not depend on model
+    # provider or package-registry network availability.  Operators can opt in
+    # to eager model-catalog warming when startup isolation is not required.
+    acp_model_preheat_on_startup: bool = False
 
     # ACP permission auto-approve (True = agent actions auto-approved, False = denied by default)
     acp_permission_auto_approve: bool = True

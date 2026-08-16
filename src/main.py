@@ -226,9 +226,12 @@ class Application:
         else:
             logger.info("默认模式: 纯 Shell")
 
-        # ACP model list preheat (background best-effort).
+        # Optional ACP model-list preheat.  The default is deliberately lazy so
+        # Feishu readiness never starts Codex/TraeX processes or waits on their
+        # network dependencies.  A real programming interaction creates the
+        # backend session and can be retried independently if that startup fails.
         try:
-            if getattr(self.settings, "acp_model_preheat_on_startup", True):
+            if getattr(self.settings, "acp_model_preheat_on_startup", False):
                 from .acp.helper import kickoff_acp_model_preheat
                 from .coco_model import get_coco_model_manager
 

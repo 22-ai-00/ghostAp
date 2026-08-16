@@ -19,7 +19,9 @@ RESTART_REQUEST_SEQUENCE=0
 PROJECT_LAUNCHCTL_ID=$(printf '%s' "$PROJECT_DIR" | cksum | awk '{print $1}')
 LAUNCHCTL_LABEL="${GHOSTAP_LAUNCHCTL_LABEL:-com.ghostap.local.${PROJECT_LAUNCHCTL_ID}}"
 CODEX_ACP_NPM_PACKAGE="${GHOSTAP_CODEX_ACP_NPM_PACKAGE:-@agentclientprotocol/codex-acp@1.2.0}"
-PREPARE_CODEX_ACP="${GHOSTAP_PREPARE_CODEX_ACP:-1}"
+# Keep service readiness independent from npm/Codex network availability.
+# Operators may explicitly opt in when they prefer eager adapter installation.
+PREPARE_CODEX_ACP="${GHOSTAP_PREPARE_CODEX_ACP:-0}"
 SYNC_PYTHON_DEPENDENCIES="${GHOSTAP_SYNC_PYTHON_DEPENDENCIES:-1}"
 PREPARE_EMPLOYEE_SANDBOX="${GHOSTAP_PREPARE_EMPLOYEE_SANDBOX:-1}"
 
