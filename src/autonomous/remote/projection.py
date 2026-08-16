@@ -311,6 +311,11 @@ def _apply_event(
             if duplicate != observation:
                 raise RemoteProjectionError("remote observation ID collision")
             return
+        if observation.artifact_id and any(
+            item.artifact_id == observation.artifact_id and item.last_chunk
+            for item in snapshot.observations
+        ):
+            raise RemoteProjectionError("remote artifact continued after final chunk")
         _assert_state_transition(snapshot.state, observation.state)
         phase = (
             RemoteAttemptPhase.TERMINAL
@@ -380,6 +385,7 @@ def _assert_state_transition(
         raise RemoteProjectionError("remote terminal observation cannot be replaced")
     allowed = {
         RemoteTaskState.EXECUTING: {
+            RemoteTaskState.EXECUTING,
             RemoteTaskState.SUBMITTED,
             RemoteTaskState.WORKING,
             RemoteTaskState.INPUT_REQUIRED,

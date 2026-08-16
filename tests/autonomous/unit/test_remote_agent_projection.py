@@ -34,9 +34,7 @@ def _ref(payload: bytes, *, marker: str) -> BlobRef:
         ciphertext_hash=hashlib.sha256(marker.encode()).hexdigest(),
         payload_hash=payload_hash,
         content_hash=payload_hash,
-        labels_hash=hashlib.sha256(
-            json.dumps(labels, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest(),
+        labels_hash=hashlib.sha256(json.dumps(labels, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         size=len(payload),
         labels=labels,
         key_ref="k1",
@@ -106,9 +104,7 @@ def test_claimed_completion_is_persisted_but_never_locally_completed() -> None:
         artifact_id="artifact-review",
         last_chunk=True,
     )
-    projection = rebuild_remote_projection(
-        (synthetic_frame(*events, observation_event(handle, completed)),)
-    )
+    projection = rebuild_remote_projection((synthetic_frame(*events, observation_event(handle, completed)),))
     result = projection.by_key[handle.key]
     assert result.phase is RemoteAttemptPhase.TERMINAL
     assert result.claimed_completed is True
@@ -225,6 +221,53 @@ def test_unknown_send_and_cancel_are_anchored_in_distinct_safe_states() -> None:
     ).by_key[handle.key]
     assert canceled.phase is RemoteAttemptPhase.CANCEL_REQUESTED
     assert canceled.cancel_requested is True
+
+
+def test_identical_artifact_chunks_are_preserved_until_final_chunk() -> None:
+    _request_value, prepared, snapshot = _prepared()
+    prefix = [
+        prepared,
+        executing_event(snapshot.handle),
+        task_bound_event(snapshot.handle, "task-1"),
+    ]
+    projection = rebuild_remote_projection((synthetic_frame(*prefix),))
+    handle = projection.by_key[snapshot.handle.key].handle
+    digest = hashlib.sha256(b'{"text":"same"}').hexdigest()
+
+    first = RemoteObservation(
+        observation_id="obs-artifact_0",
+        state=RemoteTaskState.EXECUTING,
+        context_id=handle.context_id,
+        task_id=handle.task_id,
+        payload_digest=digest,
+        artifact_id="artifact-review",
+        append=True,
+    )
+    second = RemoteObservation(
+        observation_id="obs-artifact_1",
+        state=RemoteTaskState.EXECUTING,
+        context_id=handle.context_id,
+        task_id=handle.task_id,
+        payload_digest=digest,
+        artifact_id="artifact-review",
+        append=True,
+        last_chunk=True,
+    )
+    events = [*prefix, observation_event(handle, first), observation_event(handle, second)]
+    observed = rebuild_remote_projection((synthetic_frame(*events),)).by_key[handle.key]
+    assert observed.observations == (first, second)
+
+    after_final = RemoteObservation(
+        observation_id="obs-artifact_2",
+        state=RemoteTaskState.EXECUTING,
+        context_id=handle.context_id,
+        task_id=handle.task_id,
+        payload_digest=digest,
+        artifact_id="artifact-review",
+        append=True,
+    )
+    with pytest.raises(RemoteProjectionError, match="after final chunk"):
+        rebuild_remote_projection((synthetic_frame(*events, observation_event(handle, after_final)),))
 
 
 def test_external_effect_cannot_start_without_preparation() -> None:
