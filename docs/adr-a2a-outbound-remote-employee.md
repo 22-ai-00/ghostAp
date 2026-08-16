@@ -32,7 +32,8 @@ before a Team assignment or run may complete.
 ## Pilot boundary
 
 - One fixed, locally trusted Card and endpoint; no open discovery.
-- Outbound JSON-RPC 1.0 with streaming, GetTask, Subscribe, and Cancel.
+- Outbound A2A protocol 1.0 over JSON-RPC 2.0, with streaming, GetTask,
+  Subscribe, and Cancel.
 - Text and bounded structured data only. Raw bytes and URL Parts are rejected.
 - Credentials are resolved by the adapter after Card validation and are never
   placed in prompts, messages, artifacts, Card caches, or Journal payloads.

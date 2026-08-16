@@ -1,4 +1,4 @@
-"""Durable outbound-only A2A JSON-RPC 1.0 client adapter.
+"""Durable outbound-only A2A protocol 1.0 client over JSON-RPC 2.0.
 
 This module is the only production boundary that lets the A2A SDK touch the
 autonomous domain.  The public Agent Card is fetched without credentials,
