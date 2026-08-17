@@ -25,6 +25,7 @@ from src.feishu.handlers.programming import (
     ClaudeModeHandler,
     CocoModeHandler,
     CodexModeHandler,
+    DSHModeHandler,
     GeminiModeHandler,
     GrokModeHandler,
     TraexModeHandler,
@@ -45,6 +46,7 @@ BACKENDS = (
     ("gemini", GeminiModeHandler, "gemini-model"),
     ("traex", TraexModeHandler, "traex-model"),
     ("grok", GrokModeHandler, "grok-build"),
+    ("dsh", DSHModeHandler, '["deepseek-official","deepseek-v4-flash","high"]'),
 )
 
 
@@ -77,6 +79,7 @@ def _context(backend: str, manager) -> HandlerContext:
         gemini_manager=managers["gemini"],
         traex_manager=managers["traex"],
         grok_manager=managers["grok"],
+        dsh_manager=managers["dsh"],
         intent_recognizer=MagicMock(),
         scheduler=MagicMock(),
         project_manager=project_manager,
@@ -613,6 +616,7 @@ def test_tools_list_uses_programming_availability_without_acp_probe(
         "gemini",
         "traex",
         "grok",
+        "dsh",
     ]
     assert all(
         call.kwargs
@@ -634,7 +638,7 @@ def test_tools_status_uses_programming_availability_without_acp_probe(
         "src.feishu.handlers.system.is_programming_tool_available",
         availability,
     )
-    for name in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok"):
+    for name in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"):
         getattr(ctx, f"{name}_manager").list_active_sessions.return_value = []
     system.reply_interactive_card = MagicMock()
 
@@ -648,6 +652,7 @@ def test_tools_status_uses_programming_availability_without_acp_probe(
         "gemini",
         "traex",
         "grok",
+        "dsh",
     ]
     assert all(
         call.kwargs

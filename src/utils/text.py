@@ -238,4 +238,5 @@ def get_acp_result_header_text() -> dict[str, str]:
         "tool_desc_gemini": "Google Gemini CLI",
         "tool_desc_traex": "TRAE CLI",
         "tool_desc_grok": "xAI Grok Build",
+        "tool_desc_dsh": "DeepSeek Harness 原生 ACP 编程",
     }

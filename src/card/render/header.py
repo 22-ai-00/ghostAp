@@ -16,6 +16,7 @@ _TOOL_DISPLAY = {
     "gemini": "Gemini",
     "traex": "Traex",
     "grok": "Grok",
+    "dsh": "DSH",
 }
 
 _SUBTASK_STATUS_LABELS = {

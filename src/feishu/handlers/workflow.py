@@ -781,7 +781,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             ),
         )
         project_id = getattr(project, "project_id", "") or ""
-        recommendation_order = ("traex", "claude", "codex", "grok", "aiden", "gemini", "coco")
+        recommendation_order = ("traex", "claude", "codex", "grok", "dsh", "aiden", "gemini", "coco")
         recommendation_names = [
             name for name in recommendation_order if name in available_tools
         ] or list(available_tools)[:3]
@@ -1290,7 +1290,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             return
 
         available = list(all_tools)
-        recommended_order = ["traex", "claude", "codex", "grok", "aiden", "gemini", "coco"]
+        recommended_order = ["traex", "claude", "codex", "grok", "dsh", "aiden", "gemini", "coco"]
         recommended = [tool for tool in recommended_order if tool in all_tools]
         default_tools = recommended[:3] or available[:1]
         orchestrator_tool = DEFAULT_ORCHESTRATOR_AGENT
@@ -3150,7 +3150,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             ),
             (
                 "✨ 核心能力",
-                "• 多工具并行调度（coco / claude / aiden / codex / gemini / traex / grok）\n"
+                "• 多工具并行调度（coco / claude / aiden / codex / gemini / traex / grok / dsh）\n"
                 "• 工具 Agent 可继续拆分 subagent 并行工作\n"
                 "• Agent 按任务动态规划角色分工\n"
                 "• Journal 缓存避免重复执行\n"

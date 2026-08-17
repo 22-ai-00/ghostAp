@@ -53,6 +53,10 @@ def resolve_engine_identity(
         model = acp_model_name if (acp_tool_name or "").strip().lower() == "grok" else None
         return EngineIdentity(engine_name="Grok", agent_type="grok", model_name=model, transport="acp")
 
+    if mode == InteractionMode.DSH:
+        model = acp_model_name if (acp_tool_name or "").strip().lower() == "dsh" else None
+        return EngineIdentity(engine_name="DSH", agent_type="dsh", model_name=model, transport="acp")
+
     # SMART / COCO / SHELL default to Coco engine for orchestrators
     model = acp_model_name if (acp_tool_name or "").strip().lower() == "coco" else None
     return EngineIdentity(engine_name="Coco", agent_type="coco", model_name=model, transport="acp")

@@ -95,6 +95,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/enter_traex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "traex", p),
             "/grok": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "grok", p),
             "/enter_grok": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "grok", p),
+            "/dsh": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "dsh", p),
+            "/enter_dsh": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "dsh", p),
             "/exit": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/quit": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_coco": lambda m, c, t, p: self.exit_current_mode(m, c, p),
@@ -111,6 +113,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_traex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_grok": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/exit_grok": lambda m, c, t, p: self.exit_current_mode(m, c, p),
+            "/end_dsh": lambda m, c, t, p: self.exit_current_mode(m, c, p),
+            "/exit_dsh": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/coco_status": lambda m, c, t, p: self.show_coco_status(m, c),
             "/coco_info": lambda m, c, t, p: self.get_handler("coco").show_info(m, c, p),
             "/claude_info": lambda m, c, t, p: self.get_handler("claude").show_info(m, c, p),
@@ -119,6 +123,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/gemini_info": lambda m, c, t, p: self.get_handler("gemini").show_info(m, c, p),
             "/traex_info": lambda m, c, t, p: self.get_handler("traex").show_info(m, c, p),
             "/grok_info": lambda m, c, t, p: self.get_handler("grok").show_info(m, c, p),
+            "/dsh_info": lambda m, c, t, p: self.get_handler("dsh").show_info(m, c, p),
             "/projects": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/project": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/switch": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
@@ -283,6 +288,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_traex",
             "/end_grok",
             "/exit_grok",
+            "/end_dsh",
+            "/exit_dsh",
         }
         exit_keywords = {
             "退出模式",
@@ -293,6 +300,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "退出coco",
             "退出aiden",
             "退出grok",
+            "退出dsh",
             "退出codex",
             "退出gemini",
             "退出traex",
@@ -368,6 +376,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/enter_traex",
             "/grok",
             "/enter_grok",
+            "/dsh",
+            "/enter_dsh",
             "/exit",
             "/quit",
             "/end_coco",
@@ -384,6 +394,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_traex",
             "/end_grok",
             "/exit_grok",
+            "/end_dsh",
+            "/exit_dsh",
             "/coco_status",
             "/coco_info",
             "/claude_info",
@@ -392,6 +404,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/gemini_info",
             "/traex_info",
             "/grok_info",
+            "/dsh_info",
             "/projects",
             "/status",
             "/project",
@@ -828,6 +841,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             InteractionMode.GEMINI,
             InteractionMode.TRAEX,
             InteractionMode.GROK,
+            InteractionMode.DSH,
         }
         thread_id = get_current_thread_id()
         if thread_id:
@@ -924,6 +938,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             ("gemini", "is_gemini_mode"),
             ("traex", "is_traex_mode"),
             ("grok", "is_grok_mode"),
+            ("dsh", "is_dsh_mode"),
         ]
         for _tool, _mode_check in _TOOL_HANDLER_MAP:
             if tool_name != _tool:
@@ -1594,6 +1609,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "claude": "claude",
             "traex": "traex",
             "grok": "grok",
+            "dsh": "dsh",
         }
         for mode_check, tool in mode_to_tool.items():
             checker = getattr(self.mode_manager, f"is_{mode_check}_mode", None)
@@ -1712,6 +1728,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             InteractionMode.GEMINI: "gemini",
             InteractionMode.TRAEX: "traex",
             InteractionMode.GROK: "grok",
+            InteractionMode.DSH: "dsh",
         }.get(current_mode)
         if programming_handler:
             self.get_handler(programming_handler).exit_mode(
@@ -1874,7 +1891,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
     def show_tools_list(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         """Show a list of all available ACP tools with quick access buttons."""
         # Define tool names
-        names = ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok"]
+        names = ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"]
         emojis = {
             "coco": "🤖",
             "claude": "🔮",
@@ -1883,6 +1900,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "gemini": "✨",
             "traex": "🚀",
             "grok": "🌌",
+            "dsh": "🧭",
         }
 
         # Cached-first availability check: avoid blocking user-path on external probe.
@@ -1917,6 +1935,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             {"name": "gemini", "emoji": "✨", "manager": self.ctx.gemini_manager},
             {"name": "traex", "emoji": "🚀", "manager": self.ctx.traex_manager},
             {"name": "grok", "emoji": "🌌", "manager": self.ctx.grok_manager},
+            {"name": "dsh", "emoji": "🧭", "manager": self.ctx.dsh_manager},
         ]
 
         def _format_last_used(ts: float) -> str:

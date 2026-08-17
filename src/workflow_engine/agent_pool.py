@@ -123,6 +123,7 @@ def select_auto_orchestrator(
         "claude",
         "codex",
         "grok",
+        "dsh",
         "aiden",
         "gemini",
         "coco",

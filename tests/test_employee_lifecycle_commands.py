@@ -126,6 +126,7 @@ def test_system_routes_every_employee_command(
         (InteractionMode.GEMINI, False),
         (InteractionMode.TRAEX, False),
         (InteractionMode.GROK, False),
+        (InteractionMode.DSH, False),
         (InteractionMode.SMART, True),
     ],
 )

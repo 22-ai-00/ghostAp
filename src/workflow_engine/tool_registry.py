@@ -42,6 +42,7 @@ _FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "traex": "高并发推理·轻量任务",
     "gemini": "Google 多模态推理",
     "grok": "xAI 原生 ACP 编程",
+    "dsh": "DeepSeek Harness 原生 ACP 编程",
 }
 
 
@@ -129,7 +130,7 @@ def _discover_tools(*, require_available: bool = False) -> dict[str, str]:
     except Exception as e:
         logger.debug("ACP tool discovery failed, using fallback: %s", repr(e))
         if not require_available:
-            for name in ("traex", "claude", "codex", "grok", "aiden", "gemini", "coco"):
+            for name in ("traex", "claude", "codex", "grok", "dsh", "aiden", "gemini", "coco"):
                 if name not in result:
                     result[name] = _FALLBACK_DESCRIPTIONS.get(name, name)
 

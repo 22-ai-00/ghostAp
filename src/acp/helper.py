@@ -16,6 +16,13 @@ from ..config import get_settings
 from ..utils.async_helpers import safe_wait_for
 from ..utils.text import get_acp_result_header_text
 from .client import GhostAPClient
+from .dsh_selection import (
+    DSH_MODEL_CONFIG_ID,
+    DSH_REASONING_CONFIG_ID,
+    compose_dsh_model_selection,
+    decode_dsh_model_value,
+    decode_dsh_reasoning_value,
+)
 from .model_selection import CODEX_REASONING_EFFORTS, compose_codex_model_selection
 from .options import ACPModelOption, ACPModelSelectionVariant, ACPToolOption
 from .providers import get_providers, tool_registry
@@ -28,7 +35,7 @@ from .transport import LateFrameTolerantMessageQueue
 
 logger = logging.getLogger(__name__)
 
-_TOOLS = ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok")
+_TOOLS = ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh")
 _PROBE_TTL = 1800.0
 _CODEX_PROBE_TTL = 1800.0
 _NEGATIVE_TTL = 300.0
@@ -448,6 +455,98 @@ def _response_models(
     return models or _config_models(response, selected)
 
 
+def _dsh_reasoning_capability(response: object) -> tuple[tuple[str, ...], str | None]:
+    root = _config_option(response, DSH_REASONING_CONFIG_ID, "thought_level")
+    if root is None:
+        return (), None
+    efforts: list[str] = []
+    for option in getattr(root, "options", None) or ():
+        effort = decode_dsh_reasoning_value(
+            str(getattr(option, "value", "") or "")
+        )
+        if effort and effort not in efforts:
+            efforts.append(effort)
+    current = decode_dsh_reasoning_value(
+        str(getattr(root, "current_value", "") or "")
+    )
+    return tuple(efforts), current if current in efforts else None
+
+
+async def discover_dsh_model_options(
+    connection: object,
+    response: object,
+) -> list[ACPModelOption]:
+    """Build exact DSH provider/model/Effort variants from ACP config options."""
+    model_root = _config_option(response, DSH_MODEL_CONFIG_ID, "model")
+    if model_root is None:
+        return []
+    current_value = str(getattr(model_root, "current_value", "") or "").strip()
+    session_id = str(getattr(response, "session_id", "") or "").strip()
+    raw_options: list[object] = []
+    for option in getattr(model_root, "options", None) or ():
+        nested = getattr(option, "options", None)
+        raw_options.extend(list(nested) if nested is not None else [option])
+
+    discovered: list[ACPModelOption] = []
+    for option in raw_options:
+        raw_value = str(getattr(option, "value", "") or "").strip()
+        if not raw_value:
+            continue
+        try:
+            provider, model = decode_dsh_model_value(raw_value)
+        except ValueError:
+            continue
+        authority = response if raw_value == current_value else None
+        if authority is None and session_id:
+            try:
+                authority = await connection.set_config_option(
+                    config_id=DSH_MODEL_CONFIG_ID,
+                    session_id=session_id,
+                    value=raw_value,
+                )
+            except Exception as exc:
+                from ..utils.errors import get_error_detail
+
+                logger.warning(
+                    "[ACP] DSH model capability probe failed model=%s err=%s",
+                    raw_value,
+                    get_error_detail(exc),
+                )
+        efforts, default_effort = _dsh_reasoning_capability(authority)
+        variants = tuple(
+            ACPModelSelectionVariant(
+                name=compose_dsh_model_selection(raw_value, effort),
+                model=f"{provider}/{model}",
+                effort=effort,
+                is_default=effort == default_effort,
+            )
+            for effort in efforts
+        )
+        if not variants:
+            variants = (
+                ACPModelSelectionVariant(
+                    name=compose_dsh_model_selection(raw_value),
+                    model=f"{provider}/{model}",
+                    is_default=True,
+                ),
+            )
+        discovered.append(
+            ACPModelOption(
+                name=f"{provider}/{model}",
+                description=str(
+                    getattr(option, "description", "")
+                    or getattr(option, "name", "")
+                    or f"{provider}/{model}"
+                ).strip(),
+                is_default=raw_value == current_value,
+                selection_variants=variants,
+                reasoning_efforts=efforts,
+                default_reasoning_effort=default_effort,
+            )
+        )
+    return discovered
+
+
 async def _probe_acp_models(
     tool_name: str, cwd: str | None, current_model: str | None = None
 ) -> list[ACPModelOption]:
@@ -472,6 +571,8 @@ async def _probe_acp_models(
         response = await connection.new_session(cwd=cwd or str(Path.cwd()))
         if tool_name == "codex":
             return await discover_codex_model_options(connection, response)
+        if tool_name == "dsh":
+            return await discover_dsh_model_options(connection, response)
         models = _response_models(response, None)
         if tool_name == "traex":
             return build_traex_model_options(

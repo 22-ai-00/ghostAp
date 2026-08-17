@@ -123,6 +123,8 @@ class CoreBuilder:
                 effective_mode = InteractionMode.TRAEX
             elif getattr(project, "grok_mode", False):
                 effective_mode = InteractionMode.GROK
+            elif getattr(project, "dsh_mode", False):
+                effective_mode = InteractionMode.DSH
             elif getattr(project, "coco_mode", False):
                 effective_mode = InteractionMode.COCO
 
@@ -135,6 +137,8 @@ class CoreBuilder:
                 return UI_TEXT["system_mode_traex"]
             elif effective_mode == InteractionMode.GROK:
                 return UI_TEXT["system_mode_grok"]
+            elif effective_mode == InteractionMode.DSH:
+                return UI_TEXT["system_mode_dsh"]
             mode_icon = "🤖" if effective_mode == InteractionMode.COCO else "🧠"
             mode_name = UI_TEXT["coco_mode_title"] if effective_mode == InteractionMode.COCO else UI_TEXT["smart_mode_title"]
             return f"{mode_icon} {mode_name}"
@@ -147,6 +151,8 @@ class CoreBuilder:
             return f"🚀 {project.project_name} · Traex"
         elif effective_mode == InteractionMode.GROK:
             return f"🌌 {project.project_name} · Grok"
+        elif effective_mode == InteractionMode.DSH:
+            return f"🧭 {project.project_name} · DSH"
         elif effective_mode == InteractionMode.COCO:
             return f"🤖 {project.project_name} · Coco"
         else:
@@ -191,6 +197,8 @@ class CoreBuilder:
                 effective_mode = InteractionMode.TRAEX
             elif getattr(project, "grok_mode", False):
                 effective_mode = InteractionMode.GROK
+            elif getattr(project, "dsh_mode", False):
+                effective_mode = InteractionMode.DSH
             elif getattr(project, "coco_mode", False):
                 effective_mode = InteractionMode.COCO
 

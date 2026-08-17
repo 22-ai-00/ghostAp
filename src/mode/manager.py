@@ -15,6 +15,7 @@ class InteractionMode(Enum):
     GEMINI = "gemini"
     TRAEX = "traex"
     GROK = "grok"
+    DSH = "dsh"
     SHELL = "shell"
 
 
@@ -51,6 +52,7 @@ class ModeManager:
             InteractionMode.GEMINI,
             InteractionMode.TRAEX,
             InteractionMode.GROK,
+            InteractionMode.DSH,
         )
 
     @staticmethod
@@ -206,6 +208,10 @@ class ModeManager:
         """进入 Grok 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.GROK, auto=auto, project_id=project_id)
 
+    def enter_dsh_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
+        """进入 DSH 编程模式。"""
+        return self.enter_programming_mode(chat_id, InteractionMode.DSH, auto=auto, project_id=project_id)
+
     def enter_shell_mode(self, chat_id: str, project_id: Optional[str] = None) -> InteractionMode:
         """进入 Shell 模式。"""
         return self.set_mode(chat_id, InteractionMode.SHELL, auto_entered=False, project_id=project_id)
@@ -242,6 +248,10 @@ class ModeManager:
         """判断当前是否为 Grok 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.GROK
 
+    def is_dsh_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
+        """判断当前是否为 DSH 模式。"""
+        return self.get_mode(chat_id, project_id) == InteractionMode.DSH
+
     def is_smart_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断当前是否为 SMART 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.SMART
@@ -267,5 +277,6 @@ class ModeManager:
             InteractionMode.GEMINI: "✨ Gemini 编程模式",
             InteractionMode.TRAEX: "🚀 Traex 编程模式",
             InteractionMode.GROK: "🌌 Grok 编程模式",
+            InteractionMode.DSH: "🧭 DSH 编程模式",
             InteractionMode.SHELL: "💻 Shell 模式",
         }.get(mode, "未知模式")

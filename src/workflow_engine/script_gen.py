@@ -73,6 +73,7 @@ _CAPABILITY_NOTES = {
     "gemini": "Gemini 擅长多模态推理和图像理解。",
     "traex": "Traex 擅长高并发轻量任务。",
     "grok": "Grok Build 擅长原生 ACP 编程与代码库任务。",
+    "dsh": "DeepSeek Harness 擅长 DeepSeek 模型驱动的原生 ACP 编程任务。",
 }
 
 

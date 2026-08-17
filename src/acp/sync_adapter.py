@@ -767,6 +767,9 @@ class SyncACPSession(PromptGenerationTracker):
     def _uses_traex_acp(self) -> bool:
         return (self._agent_type or "").strip().lower() == "traex"
 
+    def _uses_dsh_acp(self) -> bool:
+        return (self._agent_type or "").strip().lower() == "dsh"
+
     async def _apply_official_codex_selection(self, selection: str) -> bool:
         """Apply a persisted Codex model/Effort selection over ACP config options."""
         if not self._acp_session:
@@ -811,6 +814,37 @@ class SyncACPSession(PromptGenerationTracker):
             await self._acp_session.set_config_option(
                 "reasoning_effort",
                 resolved.effort,
+            )
+        )
+
+    async def _apply_dsh_selection(self, selection: str) -> bool:
+        if not self._acp_session:
+            return False
+        from .dsh_selection import (
+            DSH_MODEL_CONFIG_ID,
+            DSH_REASONING_CONFIG_ID,
+            split_dsh_model_selection,
+        )
+
+        try:
+            model_value, reasoning_value = split_dsh_model_selection(selection)
+        except ValueError as exc:
+            logger.warning(
+                "[ACP:DSH] invalid model selection: %s",
+                get_error_detail(exc),
+            )
+            return False
+        if not await self._acp_session.set_config_option(
+            DSH_MODEL_CONFIG_ID,
+            model_value,
+        ):
+            return False
+        if reasoning_value is None:
+            return True
+        return bool(
+            await self._acp_session.set_config_option(
+                DSH_REASONING_CONFIG_ID,
+                reasoning_value,
             )
         )
 
@@ -870,6 +904,14 @@ class SyncACPSession(PromptGenerationTracker):
                     await self._acp_session.close()
                 raise RuntimeError(
                     f"Traex ACP rejected selected model: {self._model_name}"
+                )
+        if self._uses_dsh_acp() and self._model_name:
+            applied = await self._apply_dsh_selection(self._model_name)
+            if not applied:
+                with contextlib.suppress(Exception):
+                    await self._acp_session.close()
+                raise RuntimeError(
+                    f"DSH ACP rejected selected model: {self._model_name}"
                 )
         return session_id
 
@@ -1275,6 +1317,8 @@ class SyncACPSession(PromptGenerationTracker):
         try:
             if self._uses_traex_acp():
                 operation = self._apply_traex_selection(model_id)
+            elif self._uses_dsh_acp():
+                operation = self._apply_dsh_selection(model_id)
             elif self._uses_official_codex_acp():
                 operation = self._apply_official_codex_selection(model_id)
             else:

@@ -888,6 +888,7 @@ class BaseHandler:
             InteractionMode.GEMINI: ContextSourceMode.GEMINI,
             InteractionMode.TRAEX: ContextSourceMode.TRAEX,
             InteractionMode.GROK: ContextSourceMode.GROK,
+            InteractionMode.DSH: ContextSourceMode.DSH,
         }
         return mapping.get(mode, ContextSourceMode.SMART)
 

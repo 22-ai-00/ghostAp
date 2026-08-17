@@ -158,7 +158,7 @@
   <main>
     <h1>编程卡片 footer 收敛</h1>
     <p class="lede">
-      模型选择仍是显式配置入口；进入或完成普通编程模式后，不再用 Coco、Claude、Gemini、Traex
+      模型选择仍是显式配置入口；进入或完成普通编程模式后，不再用 Coco、Claude、Gemini、Traex、DSH
       的跨工具按钮占据卡片底部，也不暗示用户需要再次选择模式。
     </p>
 
@@ -173,6 +173,23 @@
             <p class="meta">项目 ghostAp · 模型配置可通过 /model 再次打开</p>
             <div class="footer">
               <button type="button">刷新模型</button>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <article class="sample">
+        <div class="label">DSH native ACP ready</div>
+        <div class="card">
+          <div class="header">🧭 DSH 编程模式已就绪</div>
+          <div class="body">
+            <span class="path">/data00/home/jiataorui/work/github/ghostAp</span>
+            <div class="status">DeepSeek / DeepSeek-V4-Flash · high</div>
+            <p>DSH 的 provider、model 与 reasoning effort 来自 ACP 实时目录。</p>
+            <p class="meta">普通任务仍使用统一主卡流；权限请求保持一次性、默认拒绝。</p>
+            <div class="footer">
+              <button type="button">退出 DSH 模式</button>
+              <button type="button">切换项目</button>
             </div>
           </div>
         </div>
@@ -195,7 +212,7 @@
     <aside class="decision">
       保留：显式模型选择、刷新模型、活动模式自身的退出与项目切换。<br>
       移除：默认、SMART、Codex、Aiden 卡片中的 enter_coco / enter_claude /
-      enter_gemini / enter_traex 引导。
+      enter_gemini / enter_traex / enter_dsh 引导。
     </aside>
   </main>
 </body>

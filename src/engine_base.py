@@ -369,6 +369,8 @@ class BaseEngineManager(Generic[T]):
             mode = InteractionMode.TRAEX
         elif normalized.startswith("grok"):
             mode = InteractionMode.GROK
+        elif normalized.startswith("dsh"):
+            mode = InteractionMode.DSH
         else:
             mode = InteractionMode.COCO
 

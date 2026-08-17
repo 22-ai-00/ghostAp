@@ -63,9 +63,9 @@ class TestGetProvidersThreadSafety:
                 futures = [pool.submit(_worker) for _ in range(8)]
                 results = [f.result(timeout=10) for f in as_completed(futures)]
 
-        # _make_custom_help_checker_with_cache_handle is called four times
-        # (aiden + gemini + traex + grok) but only in ONE init path.
-        assert build_count == 4, f"Expected 4 checker builds (aiden+gemini+traex+grok), got {build_count}"
+        # _make_custom_help_checker_with_cache_handle is called five times
+        # (aiden + gemini + traex + grok + dsh) but only in ONE init path.
+        assert build_count == 5, f"Expected 5 checker builds (aiden+gemini+traex+grok+dsh), got {build_count}"
 
         # All threads must have received the same dict object (identity check)
         first = results[0]
@@ -136,7 +136,7 @@ class TestProvidersCacheInvalidation:
              patch.object(providers_mod, "_make_resolve_checker", return_value=lambda: True):
             providers = get_providers()
 
-        expected_names = {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok"}
+        expected_names = {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"}
         assert set(providers.keys()) == expected_names
 
     def test_single_lock_no_intermediate_caches(self) -> None:

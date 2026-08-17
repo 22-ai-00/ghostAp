@@ -182,6 +182,8 @@ class ProjectBuilder:
                 effective_mode = InteractionMode.TRAEX
             elif getattr(project, "grok_mode", False):
                 effective_mode = InteractionMode.GROK
+            elif getattr(project, "dsh_mode", False):
+                effective_mode = InteractionMode.DSH
             elif getattr(project, "coco_mode", False):
                 effective_mode = InteractionMode.COCO
 

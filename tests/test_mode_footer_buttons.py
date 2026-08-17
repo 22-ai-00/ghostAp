@@ -39,6 +39,7 @@ def test_inactive_or_unhandled_mode_footer_has_no_cross_tool_entry_guidance(
         (InteractionMode.GEMINI, "exit_gemini"),
         (InteractionMode.TRAEX, "exit_traex"),
         (InteractionMode.GROK, "exit_grok"),
+        (InteractionMode.DSH, "exit_dsh"),
     ],
 )
 def test_active_mode_footer_keeps_exit_and_project_switch(
