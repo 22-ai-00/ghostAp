@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-GhostAP 是一个飞书/Lark 机器人服务，用于通过出站 WebSocket 连接进行安全的远程 shell 执行和 AI 辅助开发。用户可以通过聊天运行 shell 命令、管理项目，并驱动 Coco、Claude、Aiden、Codex、Gemini、Traex 和 Grok 等编程工具。
+GhostAP 是一个飞书/Lark 机器人服务，用于通过出站 WebSocket 连接进行安全的远程 shell 执行和 AI 辅助开发。用户可以通过聊天运行 shell 命令、管理项目，并驱动 Coco、Claude、Aiden、Codex、Gemini、Traex、Grok 和 DSH 等编程工具。
 
 ## 命令
 
@@ -29,6 +29,7 @@ uv run python scripts/test_inventory.py tests/
 - 调用 Codex `spawn_agent` 时，显式传 `agent_type` 必须同时使用 `fork_turns="none"` 或正整数；全历史 fork 必须省略 `agent_type`，否则子代理会在启动前被拒绝。
 - 保持修改范围明确。修复局部问题时不要重构无关代码。
 - 所有功能和 bug 修复都需要测试。对于涉及的合约，优先使用针对性回归测试。
+- GhostAP 至少支持 Linux 与 macOS。涉及进程、sandbox、文件锁、路径/临时目录、权限位、环境变量或平台工具时，必须用平台分支或能力探测保持两端契约并补回归；不得把 Linux-only 假设带到 macOS，也不得以放宽 fail-closed 安全边界换取兼容性。
 - 所有测试失败、异常退出或缺失最终摘要都必须查明原因并修复；禁止跳过、掩盖或当作通过。若根因是测试本身错误，需谨慎修正测试及其契约并保留回归证据。
 - 完成判定必须回读用户原始验收范围；若最终总结仍列出未实现的用户要求、未验证的核心路径或相关失败测试，不得标记完成，应继续执行或明确报告阻塞/失败。
 - 每个独立 bug 修复或需求完成并验证后，立即创建一个聚焦 commit 作为回滚点；不同问题分开提交。每次修改提交后必须立即 push 到当前所在分支；push 失败必须查明原因并明确报告，未成功 push 不得视为完成。
@@ -46,7 +47,7 @@ uv run python scripts/test_inventory.py tests/
 - 优先选择特定的失败衍生规则而非通用建议。
 - 如果规则可以通过测试、钩子或类型化 API 强制执行，就在那里强制执行，并在此处只保留简短指针。
 - 当代码库或工具不再需要时，删除过时规则。
-- 将 Coco/Claude/Aiden/Codex/Gemini/Traex/Grok 视为 GhostAP 编程抽象背后的工具后端。除非传输或功能确实不同，否则避免添加后端特定分支。
+- 将 Coco/Claude/Aiden/Codex/Gemini/Traex/Grok/DSH 视为 GhostAP 编程抽象背后的工具后端。除非传输或功能确实不同，否则避免添加后端特定分支。
 - 机器人管理员引导是单向的：仅当 `ADMIN_USER_IDS` 为空时，才接受任意用户在主 Bot 私聊中发送 `/setadmin`；群聊中的首次设置一律拒绝。之后只有配置的管理员可以替换 `.env` 中的单个管理员。
 
 ## 架构指针

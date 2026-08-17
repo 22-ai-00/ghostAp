@@ -172,6 +172,14 @@ def test_readme_discovers_all_programming_session_info_commands() -> None:
         assert f"`{command}`" in modes_section
 
 
+def test_agents_declares_linux_macos_compatibility_contract() -> None:
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+
+    assert "至少支持 Linux 与 macOS" in agents
+    assert "Linux-only 假设" in agents
+    assert "不得以放宽 fail-closed 安全边界换取兼容性" in agents
+
+
 def test_workflow_node_minimum_is_consistent_across_runtime_and_readme() -> None:
     runtime_package = json.loads(
         (ROOT / "src" / "workflow_engine" / "runtime" / "package.json").read_text(
