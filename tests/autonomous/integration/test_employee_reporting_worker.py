@@ -11,6 +11,7 @@ import pytest
 from src.autonomous.acceptance.main_bot_warning_outbox import (
     MainBotWarningRetryableDeliveryError,
 )
+from src.autonomous.gateway.coordinator import EmployeeDispatchReportingRecoveryResult
 from src.autonomous.ingress.service import IngressBlobRetryableError
 from src.autonomous.outbox.delivery import (
     EmployeeOutboxDrainResult,
@@ -571,6 +572,52 @@ def test_reporting_repair_failure_does_not_block_healthy_outbox_delivery() -> No
     assert runtime._drain_employee_reporting_once() is True  # noqa: SLF001
     assert events == ["repair", "snapshot", "terminal", "healthy_outbox"]
     assert runtime._dispatch_recovery_pending is True  # noqa: SLF001
+
+
+def test_reporting_repair_is_single_flight_across_concurrent_callers() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    class _Dispatch:
+        @staticmethod
+        def repair_reporting() -> EmployeeDispatchReportingRecoveryResult:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            assert release.wait(2.0)
+            return EmployeeDispatchReportingRecoveryResult(
+                recovered_count=1,
+                deferred_attempt_ids=(),
+            )
+
+    runtime = EmployeeDepartmentRuntime()
+    runtime._dispatch = _Dispatch()  # type: ignore[assignment]  # noqa: SLF001
+    runtime._dispatch_recovery_pending = True  # noqa: SLF001
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def repair() -> None:
+        try:
+            results.append(runtime._repair_employee_dispatch_reporting())  # noqa: SLF001
+        except BaseException as exc:  # pragma: no cover - assertion reports worker faults
+            errors.append(exc)
+
+    first = threading.Thread(target=repair)
+    second = threading.Thread(target=repair)
+    first.start()
+    assert entered.wait(2.0)
+    second.start()
+    time.sleep(0.05)
+    release.set()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert not errors
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert calls == 1
+    assert sorted(results) == [False, True]
 
 
 def test_reporting_repair_backoff_keeps_gc_fenced_but_runs_independent_work() -> None:
