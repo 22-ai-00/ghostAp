@@ -106,3 +106,4 @@ class HandlerContext:
     managed_group_owner_id: str = ""
     managed_group_receiving_bot_ref: str = ""
     managed_group_bot_rotation: Optional[Callable[[str], tuple[int, int]]] = None
+    slash_permission_provider: Optional[Callable[[], Any]] = None

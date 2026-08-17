@@ -62,6 +62,33 @@ def test_empty_allowlists_reject_normal_messages() -> None:
     assert decision.prospective_allowed is False
 
 
+def test_unconfigured_enforced_bot_allows_safe_private_bootstrap_help() -> None:
+    decision = _policy().decide(_request(text="/help", chat_type="p2p"))
+
+    assert decision.allowed is True
+    assert decision.operation is AccessOperation.BOOTSTRAP_HELP
+    assert decision.reason_code == "bootstrap_help"
+    assert decision.prospective_allowed is False
+
+
+@pytest.mark.parametrize(
+    ("text", "chat_type"),
+    [
+        ("/help", "group"),
+        ("/help extra", "p2p"),
+        ("/codex", "p2p"),
+    ],
+)
+def test_bootstrap_help_does_not_widen_unconfigured_access(
+    text: str,
+    chat_type: str,
+) -> None:
+    decision = _policy().decide(_request(text=text, chat_type=chat_type))
+
+    assert decision.allowed is False
+    assert decision.operation is AccessOperation.NORMAL_MESSAGE
+
+
 def test_normal_message_requires_both_user_and_chat_dimensions() -> None:
     user_only = _policy(users=frozenset({"ou_user"})).decide(
         _request(sender="ou_user")

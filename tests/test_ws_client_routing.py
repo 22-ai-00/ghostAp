@@ -27,7 +27,7 @@ from src.mode import InteractionMode
 from src.project import ProjectContext
 from src.tasking import TaskPriority, TaskQueueFullError, TaskScheduler, TaskSpec, TaskStatus
 from src.thread import get_current_thread_id, set_current_thread_id
-from src.trust.models import ActorKind, TrustZone
+from src.trust.models import ActorKind, EffectiveTrust, TrustZone
 
 
 @pytest.fixture
@@ -2689,6 +2689,48 @@ def test_handle_message_system_command_routing(mock_ws_client: FeishuWSClient):
     assert spec.is_system_command is True
     assert spec.tenant_key == "tenant_test"
     # System commands should not block behind regular project tasks (often goes to control queue or no strict project queue)
+
+
+def test_unconfigured_enforced_private_help_uses_narrow_bootstrap_route(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    mock_ws_client._ingress_access_policy_provider.swap(
+        IngressAccessPolicy(
+            admin_ids=frozenset(),
+            allowed_user_ids=frozenset(),
+            allowed_chat_ids=frozenset(),
+            mode=IngressAccessMode.ENFORCED,
+            admin_bootstrap_scope="p2p_only",
+        )
+    )
+    event = create_mock_message(
+        "/help",
+        message_id="om_bootstrap_help",
+        chat_id="oc_bootstrap_private",
+    )
+    event.event.message.chat_type = "p2p"
+    unknown_private_trust = EffectiveTrust(
+        zone=TrustZone.EXTERNAL_OR_UNKNOWN_GROUP,
+        actor=ActorKind.UNKNOWN,
+        managed_group=None,
+        group_revision=None,
+        grant_revision=None,
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(
+        return_value=unknown_private_trust
+    )
+    system = mock_ws_client._handler_ctx.handlers["system"]
+    system.show_bootstrap_help = MagicMock(return_value="om_help_reply")
+
+    mock_ws_client._handle_message(event)
+
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "system_help"
+    callback(SimpleNamespace(run_id="run_bootstrap_help"))
+    system.show_bootstrap_help.assert_called_once_with(
+        "om_bootstrap_help",
+        "oc_bootstrap_private",
+    )
 
 
 def test_handle_message_records_trusted_chat_origin(mock_ws_client: FeishuWSClient):

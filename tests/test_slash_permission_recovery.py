@@ -16,6 +16,7 @@ from src.autonomous.provisioning.slash_commands import (
     SlashPermissionRequired,
 )
 from src.autonomous.provisioning.slash_lark import LarkSlashCommandAPI
+from src.feishu.handlers.system import SystemHandler
 from src.feishu.ws_client import FeishuWSClient
 
 _APP_ID = "cli_a9224f1c7ca25bd2"
@@ -190,3 +191,41 @@ def test_first_admitted_private_user_is_notified_when_admin_is_unset() -> None:
     send = client._handler_ctx.handlers["coco"].im_client.send_message
     send.assert_called_once()
     assert send.call_args.args[0:2] == ("open_id", "ou_private_user")
+
+
+def test_bootstrap_help_always_replies_with_admin_and_permission_guidance() -> None:
+    required = SlashPermissionRequired(
+        operation="GET",
+        scopes=(_READ_SCOPE,),
+        authorization_url=_GRANT_URL,
+    )
+    ctx = MagicMock()
+    ctx.slash_permission_provider = MagicMock(return_value=required)
+    handler = SystemHandler(ctx)
+    handler.reply_text = MagicMock(return_value="om_bootstrap_help")
+
+    handler.show_bootstrap_help("om_help", "oc_private")
+
+    handler.reply_text.assert_called_once()
+    text = handler.reply_text.call_args.args[1]
+    assert "/setadmin" in text
+    assert "点击此链接" in text
+    assert _GRANT_URL in text
+
+
+def test_normal_help_permission_hint_is_optional_and_clickable() -> None:
+    required = SlashPermissionRequired(
+        operation="GET",
+        scopes=(_READ_SCOPE,),
+        authorization_url=_GRANT_URL,
+    )
+    ctx = MagicMock()
+    ctx.slash_permission_provider = MagicMock(return_value=required)
+    handler = SystemHandler(ctx)
+    handler.reply_text = MagicMock(return_value="om_permission_hint")
+
+    handler._reply_slash_permission_hint("om_help")
+
+    hint = handler.reply_text.call_args.args[1]
+    assert "不开通不影响" in hint
+    assert _GRANT_URL in hint

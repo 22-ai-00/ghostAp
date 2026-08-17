@@ -845,6 +845,7 @@ class FeishuWSClient:
                 self._managed_group_receiving_bot_ref
             ),
             managed_group_bot_rotation=self.rotate_main_managed_group_bot,
+            slash_permission_provider=self._current_main_slash_permission,
         )
 
         handler_types = {
@@ -1592,6 +1593,12 @@ class FeishuWSClient:
             if self._closed:
                 return
 
+    def _current_main_slash_permission(
+        self,
+    ) -> SlashPermissionRequired | None:
+        with self._slash_permission_notice_lock:
+            return self._pending_slash_permission
+
     @staticmethod
     def _slash_notice_admin_ids(settings: object) -> tuple[str, ...]:
         raw_admin_ids = getattr(settings, "admin_user_ids", ()) or ()
@@ -1891,10 +1898,14 @@ class FeishuWSClient:
                 prospective_allowed=False,
             )
 
-        if not decision.allowed or policy.mode.value in {
-            "shadow",
-            "legacy_allow_all",
-        }:
+        if (
+            not decision.allowed
+            or decision.operation is AccessOperation.BOOTSTRAP_HELP
+            or policy.mode.value in {
+                "shadow",
+                "legacy_allow_all",
+            }
+        ):
             audit_logger.warning(
                 "INGRESS_ACCESS_DECISION mode=%s operation=%s reason=%s "
                 "sender_hash=%s chat_hash=%s prospective_allowed=%s",
@@ -2030,6 +2041,21 @@ class FeishuWSClient:
             prospective_allowed=allowed,
             effective_trust=trust,
         )
+
+    def _message_trust_access_decision(
+        self,
+        trust: EffectiveTrust | None,
+        *,
+        chat_type: str,
+    ) -> AccessDecision | None:
+        """Let the access policy own first-run P2P bootstrap admission."""
+
+        if (
+            chat_type == "p2p"
+            and not self._current_ingress_access_policy().admin_ids
+        ):
+            return None
+        return self._managed_trust_access_decision(trust)
 
     def _managed_ingress_action_allowed(
         self,
@@ -2701,7 +2727,10 @@ class FeishuWSClient:
                 message_id=causal_message_id,
             )
         )
-        trust_decision = self._managed_trust_access_decision(effective_trust)
+        trust_decision = self._message_trust_access_decision(
+            effective_trust,
+            chat_type=chat_type,
+        )
         if trust_decision is not None and not trust_decision.allowed:
             return
 
@@ -2741,14 +2770,19 @@ class FeishuWSClient:
         )
         if not ingress_decision.allowed:
             return
-        self._register_slash_permission_notice_recipient(
-            sender_id=_sender_id,
-            chat_type=chat_type,
-        )
-        if employee_candidate is None and not self._managed_ingress_action_allowed(
-            effective_trust,
-            text=text,
-            command_match=command_match,
+        if ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP:
+            self._register_slash_permission_notice_recipient(
+                sender_id=_sender_id,
+                chat_type=chat_type,
+            )
+        if (
+            ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP
+            and employee_candidate is None
+            and not self._managed_ingress_action_allowed(
+                effective_trust,
+                text=text,
+                command_match=command_match,
+            )
         ):
             return
 
@@ -2760,7 +2794,10 @@ class FeishuWSClient:
         )
         project_id = managed_group.project_id if managed_group is not None else None
         thread_root_id = None
-        if employee_candidate is None:
+        if (
+            employee_candidate is None
+            and ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP
+        ):
             try:
                 parent_id = getattr(data.event.message, "parent_id", None)
                 root_id = getattr(data.event.message, "root_id", None)
@@ -2790,7 +2827,12 @@ class FeishuWSClient:
             except (AttributeError, KeyError, TypeError):
                 project_id = None
 
-        if employee_candidate is None and managed_group is None and not project_id:
+        if (
+            employee_candidate is None
+            and ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP
+            and managed_group is None
+            and not project_id
+        ):
             try:
                 active = self._project_manager.get_active_project(chat_id)
                 project_id = active.project_id if active else None
@@ -3053,7 +3095,10 @@ class FeishuWSClient:
                 chat_type=chat_type,
                 message_id=causal_message_id,
             )
-            trust_decision = self._managed_trust_access_decision(current_trust)
+            trust_decision = self._message_trust_access_decision(
+                current_trust,
+                chat_type=chat_type,
+            )
             if trust_decision is not None and not trust_decision.allowed:
                 return
             if effective_trust is not None and current_trust != effective_trust:
@@ -3157,10 +3202,14 @@ class FeishuWSClient:
                             release_message_reservation()
                         return
 
-            if employee_target is None and not self._managed_ingress_action_allowed(
-                current_trust,
-                text=text,
-                command_match=command_match,
+            if (
+                ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP
+                and employee_target is None
+                and not self._managed_ingress_action_allowed(
+                    current_trust,
+                    text=text,
+                    command_match=command_match,
+                )
             ):
                 return
 
@@ -3185,6 +3234,22 @@ class FeishuWSClient:
                 if not must_remain_fenced:
                     # Only a durable handoff denial reaches this branch.
                     release_message_reservation()
+                return
+
+            if ingress_decision.operation is AccessOperation.BOOTSTRAP_HELP:
+                if command_match is None:
+                    logger.critical(
+                        "INGRESS_BOOTSTRAP_HELP_MATCH_MISSING"
+                    )
+                    return
+                set_current_sender_id(_sender_id)
+                set_current_sender_union_id(_sender_union_id or None)
+                set_current_is_p2p(_is_p2p)
+                set_current_tenant_key(_tenant_key or None)
+                self._handler_ctx.handlers["system"].show_bootstrap_help(
+                    message_id,
+                    chat_id,
+                )
                 return
 
             if ingress_decision.operation in {

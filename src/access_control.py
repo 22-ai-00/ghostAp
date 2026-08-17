@@ -30,6 +30,7 @@ class AccessOperation(str, Enum):
     """The only ingress operations that can cross the authorization boundary."""
 
     NORMAL_MESSAGE = "normal_message"
+    BOOTSTRAP_HELP = "bootstrap_help"
     BOOTSTRAP_ADMIN = "bootstrap_admin"
     ENROL_CURRENT_CHAT = "enrol_current_chat"
 
@@ -102,6 +103,19 @@ class IngressAccessPolicy:
             self.admin_bootstrap_scope == "any_chat"
             or request.chat_type == "p2p"
         )
+        if (
+            self.mode is IngressAccessMode.ENFORCED
+            and not self.admin_ids
+            and command == "/help"
+            and not arguments
+            and request.chat_type == "p2p"
+        ):
+            return AccessDecision(
+                allowed=True,
+                operation=AccessOperation.BOOTSTRAP_HELP,
+                reason_code="bootstrap_help",
+                prospective_allowed=False,
+            )
         if (
             not self.admin_ids
             and command == "/setadmin"

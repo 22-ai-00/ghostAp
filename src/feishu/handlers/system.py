@@ -891,9 +891,54 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
 
         if origin_message_id:
             if self.update_card(origin_message_id, card_content):
+                self._reply_slash_permission_hint(message_id)
                 return
 
         self.reply_card(message_id, card_content)
+        self._reply_slash_permission_hint(message_id)
+
+    def _slash_permission_hint_text(self) -> str:
+        """Return a user-safe optional discovery hint without exposing errors."""
+
+        provider = getattr(self.ctx, "slash_permission_provider", None)
+        if not callable(provider):
+            return ""
+        try:
+            required = provider()
+        except Exception:
+            logger.warning("Slash permission hint provider failed", exc_info=True)
+            return ""
+        url = getattr(required, "authorization_url", "")
+        if not isinstance(url, str) or not url.startswith(
+            "https://open.feishu.cn/app/"
+        ):
+            return ""
+        return (
+            "⚠️ `/` 命令发现面板尚未开通可选权限，"
+            "但不开通不影响消息、Shell 和编程工具使用。\n"
+            "点击此链接进行权限申请并发布，GhostAP 会自动恢复：\n"
+            f"{url}"
+        )
+
+    def _reply_slash_permission_hint(self, message_id: str) -> Optional[str]:
+        hint = self._slash_permission_hint_text()
+        if not hint:
+            return None
+        return self.reply_text(message_id, hint)
+
+    def show_bootstrap_help(self, message_id: str, chat_id: str) -> Optional[str]:
+        """Reply to unauthenticated P2P help without leaking project context."""
+
+        del chat_id
+        text = (
+            "GhostAP 已启动，但当前尚未配置管理员，因此普通命令仍按安全策略拒绝。\n"
+            "请在当前私聊发送 `/setadmin` 完成首次管理员设置；设置成功后可使用"
+            " `/help`、`/codex`、`/dsh` 等命令。"
+        )
+        hint = self._slash_permission_hint_text()
+        if hint:
+            text = f"{text}\n\n{hint}"
+        return self.reply_text(message_id, text)
 
     def handle_deep_prompt(self, message_id: str, chat_id: str):
         self.reply_text(
