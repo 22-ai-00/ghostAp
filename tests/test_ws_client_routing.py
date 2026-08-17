@@ -2733,6 +2733,50 @@ def test_unconfigured_enforced_private_help_uses_narrow_bootstrap_route(
     )
 
 
+def test_unconfigured_enforced_private_setadmin_uses_narrow_bootstrap_route(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    mock_ws_client._ingress_access_policy_provider.swap(
+        IngressAccessPolicy(
+            admin_ids=frozenset(),
+            allowed_user_ids=frozenset(),
+            allowed_chat_ids=frozenset(),
+            mode=IngressAccessMode.ENFORCED,
+            admin_bootstrap_scope="p2p_only",
+        )
+    )
+    event = create_mock_message(
+        "/setadmin",
+        message_id="om_bootstrap_admin",
+        chat_id="oc_bootstrap_private",
+    )
+    event.event.message.chat_type = "p2p"
+    unknown_private_trust = EffectiveTrust(
+        zone=TrustZone.EXTERNAL_OR_UNKNOWN_GROUP,
+        actor=ActorKind.UNKNOWN,
+        managed_group=None,
+        group_revision=None,
+        grant_revision=None,
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(
+        return_value=unknown_private_trust
+    )
+    system = mock_ws_client._handler_ctx.handlers["system"]
+    system.handle_intercepted_command = MagicMock()
+
+    mock_ws_client._handle_message(event)
+
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "feishu_message"
+    callback(SimpleNamespace(run_id="run_bootstrap_admin"))
+    system.handle_intercepted_command.assert_called_once()
+    assert system.handle_intercepted_command.call_args.args[:3] == (
+        "om_bootstrap_admin",
+        "oc_bootstrap_private",
+        "/setadmin",
+    )
+
+
 def test_handle_message_records_trusted_chat_origin(mock_ws_client: FeishuWSClient):
     """Message events are the authoritative source for DM provenance."""
     msg = create_mock_message("/hire 柳七月", message_id="om_hire", chat_id="oc_dm")

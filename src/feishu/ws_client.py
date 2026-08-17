@@ -171,6 +171,12 @@ _EMPLOYEE_HANDOFF_MAX_SECONDS = 3.0
 _EMPLOYEE_WARNING_RETRY_DELAYS = (0.0, 0.05, 0.2)
 _MAIN_BOT_IDENTITY_RETRY_SECONDS = 1.0
 _MAIN_SLASH_SYNC_RETRY_SECONDS = 60.0
+_BOOTSTRAP_ACCESS_OPERATIONS = frozenset(
+    {
+        AccessOperation.BOOTSTRAP_HELP,
+        AccessOperation.BOOTSTRAP_ADMIN,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2776,7 +2782,7 @@ class FeishuWSClient:
                 chat_type=chat_type,
             )
         if (
-            ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP
+            ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
             and employee_candidate is None
             and not self._managed_ingress_action_allowed(
                 effective_trust,
@@ -2796,7 +2802,7 @@ class FeishuWSClient:
         thread_root_id = None
         if (
             employee_candidate is None
-            and ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP
+            and ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
         ):
             try:
                 parent_id = getattr(data.event.message, "parent_id", None)
@@ -2829,7 +2835,7 @@ class FeishuWSClient:
 
         if (
             employee_candidate is None
-            and ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP
+            and ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
             and managed_group is None
             and not project_id
         ):
@@ -3203,7 +3209,7 @@ class FeishuWSClient:
                         return
 
             if (
-                ingress_decision.operation is not AccessOperation.BOOTSTRAP_HELP
+                ingress_decision.operation not in _BOOTSTRAP_ACCESS_OPERATIONS
                 and employee_target is None
                 and not self._managed_ingress_action_allowed(
                     current_trust,
