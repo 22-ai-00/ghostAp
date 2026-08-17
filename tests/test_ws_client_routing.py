@@ -945,8 +945,11 @@ def test_employee_target_lookup_never_blocks_ws_callback(
     mock_ws_client: FeishuWSClient,
 ) -> None:
     runtime = mock_ws_client._employee_department_runtime
+    lookup_calls = 0
 
     def slow_lookup(**_kwargs):
+        nonlocal lookup_calls
+        lookup_calls += 1
         time.sleep(0.2)
         return _ready_employee_target()
 
@@ -961,13 +964,12 @@ def test_employee_target_lookup_never_blocks_ws_callback(
         message_id="om_nonblocking_employee_lookup",
     )
 
-    started = time.monotonic()
     mock_ws_client._handle_message(event)
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 0.1
+    assert lookup_calls == 0
     _spec, callback = mock_ws_client._scheduler.submit.call_args.args
     callback(MagicMock())
+    assert lookup_calls == 1
     assert runtime.resolve_ready_employee_bot_target is slow_lookup
 
 
@@ -993,11 +995,8 @@ def test_employee_target_trust_snapshot_never_blocks_ws_callback(
         message_id="om_nonblocking_employee_trust",
     )
 
-    started = time.monotonic()
     mock_ws_client._handle_message(event)
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 0.1
     assert trust_calls == 0
     _spec, callback = mock_ws_client._scheduler.submit.call_args.args
     callback(MagicMock())
