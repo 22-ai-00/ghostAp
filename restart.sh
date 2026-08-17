@@ -215,12 +215,14 @@ wait_for_service_readiness() {
         fi
         for candidate in $candidates; do
             previous=0
-            for prior_pid in $previous_pids; do
-                if [ "$candidate" = "$prior_pid" ]; then
-                    previous=1
-                    break
-                fi
-            done
+            if [ -z "$preferred_pid" ]; then
+                for prior_pid in $previous_pids; do
+                    if [ "$candidate" = "$prior_pid" ]; then
+                        previous=1
+                        break
+                    fi
+                done
+            fi
             [ "$previous" = "0" ] || continue
             if generation=$(verify_service_readiness "$candidate" 2>/dev/null) &&
                 [[ "$generation" =~ ^[A-Za-z0-9_-]{20,64}$ ]]; then
@@ -443,6 +445,9 @@ terminate_service_pid() {
 cleanup_failed_start() {
     local target_pid="${1:-}"
 
+    if command -v launchctl >/dev/null 2>&1; then
+        remove_launchctl_service || true
+    fi
     [ -n "$target_pid" ] || return 0
     if kill -0 "$target_pid" 2>/dev/null && pid_is_ghostap_service "$target_pid"; then
         terminate_service_pid "$target_pid" "$START_FAILURE_GRACE_DELAY" || true

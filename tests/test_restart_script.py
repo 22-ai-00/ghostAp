@@ -725,6 +725,40 @@ printf '%s\n' "$STARTED_PID"
     assert result.stdout.strip() == "4242"
 
 
+def test_readiness_checks_preferred_pid_even_when_it_was_previously_seen(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    capture = tmp_path / "probes"
+    capture.touch()
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+READINESS_TIMEOUT=0
+get_running_pids() { printf '%s\n' 4242; }
+verify_service_readiness() {
+    printf '%s\n' "$1" >> "$CAPTURE"
+    printf '%s\n' AAAAAAAAAAAAAAAAAAAAAAAA
+}
+kill() { [ "$1" = "-0" ]; }
+wait_for_service_readiness 4242 4242
+printf '%s:%s\n' "$PID" "$READY_GENERATION"
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == ["4242"]
+    assert result.stdout.strip() == "4242:AAAAAAAAAAAAAAAAAAAAAAAA"
+
+
 def test_start_service_stops_when_process_launch_fails(tmp_path):
     checkout = tmp_path / "checkout"
     checkout.mkdir()
@@ -893,6 +927,43 @@ start_service
     assert capture.read_text(encoding="utf-8").splitlines() == [
         "publish-failed",
         "cleanup:4242",
+    ]
+
+
+def test_failed_start_removes_launchctl_job_before_terminating_pid(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    capture = tmp_path / "events"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+command() {
+    if [ "$1" = "-v" ] && [ "$2" = "launchctl" ]; then
+        return 0
+    fi
+    builtin command "$@"
+}
+remove_launchctl_service() { printf '%s\n' remove-launchctl >> "$CAPTURE"; }
+kill() { [ "$1" = "-0" ]; }
+pid_is_ghostap_service() { return 0; }
+terminate_service_pid() { printf 'terminate:%s:%s\n' "$1" "$2" >> "$CAPTURE"; }
+cleanup_failed_start 4242
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "remove-launchctl",
+        "terminate:4242:5",
     ]
 
 
