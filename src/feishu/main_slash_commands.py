@@ -36,10 +36,12 @@ MAIN_AGENT_COMMANDS: tuple[SlashCommand, ...] = tuple(
 
 async def reconcile_main_agent_slash_commands(
     client: _AsyncLarkClient,
+    *,
+    app_id: str,
 ) -> VerifiedSlashState:
     """Converge the main Bot's server-side Slash Command panel."""
 
     return await SlashCommandReconciler(
-        LarkSlashCommandAPI(client),
+        LarkSlashCommandAPI(client, expected_app_id=app_id),
         desired=MAIN_AGENT_COMMANDS,
     ).reconcile()

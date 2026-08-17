@@ -5468,7 +5468,9 @@ class EmployeeDepartmentRuntime:
     @staticmethod
     def _default_slash_factory(app_id: str, app_secret: str) -> _SlashReconciler:
         client = lark.Client.builder().app_id(app_id).app_secret(app_secret).build()
-        return SlashCommandReconciler(LarkSlashCommandAPI(client))
+        return SlashCommandReconciler(
+            LarkSlashCommandAPI(client, expected_app_id=app_id)
+        )
 
     def _start_loop(self) -> None:
         def run() -> None:

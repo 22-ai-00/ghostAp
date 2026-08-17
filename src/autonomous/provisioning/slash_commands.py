@@ -116,6 +116,31 @@ class SlashCommandAPIError(RuntimeError):
     """Feishu Slash Command API call failed."""
 
 
+class SlashPermissionRequired(SlashCommandAPIError):
+    """A validated Feishu one-click grant link can restore Slash discovery."""
+
+    def __init__(
+        self,
+        *,
+        operation: str,
+        scopes: tuple[str, ...],
+        authorization_url: str,
+    ) -> None:
+        self.operation = _non_empty_text(operation, "operation")
+        self.scopes = tuple(
+            _non_empty_text(scope, "permission scope") for scope in scopes
+        )
+        if not self.scopes:
+            raise ValueError("permission scopes must not be empty")
+        self.authorization_url = _non_empty_text(
+            authorization_url,
+            "authorization_url",
+        )
+        super().__init__(
+            f"Slash {self.operation} requires {', '.join(self.scopes)}"
+        )
+
+
 class SlashReconciliationError(RuntimeError):
     """Exact Slash desired state could not be verified."""
 
@@ -274,6 +299,8 @@ class SlashCommandReconciler:
     async def _safe_list(self) -> tuple[ObservedSlashCommand, ...]:
         try:
             return await self._api.list_commands()
+        except SlashPermissionRequired:
+            raise
         except Exception as exc:
             raise SlashReconciliationError(f"Slash GET failed ({type(exc).__name__})") from None
 
@@ -291,6 +318,8 @@ class SlashCommandReconciler:
             else:
                 await self._api.delete_command(command_id)
             return
+        except SlashPermissionRequired:
+            raise
         except Exception:
             observed = _indexed_observed(await self._safe_list())
             current = observed.get(command.command)

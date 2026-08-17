@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Protocol
+from urllib.parse import parse_qs, urlsplit
 
 from lark_oapi.api.application.v7 import (
     AppSlashCommand,
@@ -19,11 +20,21 @@ from .slash_commands import (
     CanonicalSlashCommand,
     ObservedSlashCommand,
     SlashCommandAPIError,
+    SlashPermissionRequired,
 )
 
 _COLLECTION_URI = "/open-apis/application/v7/app_slash_commands"
 _ITEM_URI = f"{_COLLECTION_URI}/:command_id"
 _SAFE_ID = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
+_SAFE_APP_ID = re.compile(r"cli_[A-Za-z0-9_-]{1,256}\Z")
+_AUTH_URL = re.compile(r"https://open\.feishu\.cn/[^\s，。；]+")
+_PERMISSION_DENIED_CODE = 99991672
+_SLASH_PERMISSION_SCOPES = frozenset(
+    {
+        "application:app_slash_command:read",
+        "application:app_slash_command:write",
+    }
+)
 _RESPONSE_ITEM_FIELDS = frozenset(AppSlashCommand._types) | {"icon"}
 _RESPONSE_ICON_FIELDS = frozenset({"icon_key"})
 
@@ -35,8 +46,19 @@ class _AsyncLarkClient(Protocol):
 class LarkSlashCommandAPI:
     """Call Slash v7 through ``Client.arequest(BaseRequest)`` with tenant auth."""
 
-    def __init__(self, client: _AsyncLarkClient) -> None:
+    def __init__(
+        self,
+        client: _AsyncLarkClient,
+        *,
+        expected_app_id: str | None = None,
+    ) -> None:
         self._client = client
+        if expected_app_id is not None and (
+            not isinstance(expected_app_id, str)
+            or _SAFE_APP_ID.fullmatch(expected_app_id) is None
+        ):
+            raise ValueError("expected Slash app ID is invalid")
+        self._expected_app_id = expected_app_id
 
     async def list_commands(self) -> tuple[ObservedSlashCommand, ...]:
         """Return a strictly decoded full server command set."""
@@ -169,14 +191,12 @@ class LarkSlashCommandAPI:
             response = await self._client.arequest(request)
         except Exception as exc:
             raise SlashCommandAPIError(f"Slash {operation} request failed ({type(exc).__name__})") from None
-        if not isinstance(response, BaseResponse) or not response.success():
-            code = response.code if isinstance(response, BaseResponse) else "invalid"
-            raise SlashCommandAPIError(f"Slash {operation} failed (code={code})")
+        if not isinstance(response, BaseResponse):
+            raise SlashCommandAPIError(f"Slash {operation} failed (code=invalid)")
         raw = response.raw
         if (
             raw is None
             or not isinstance(raw.status_code, int)
-            or not 200 <= raw.status_code < 300
             or not isinstance(raw.content, bytes)
         ):
             raise SlashCommandAPIError(f"Slash {operation} response schema is invalid")
@@ -187,8 +207,85 @@ class LarkSlashCommandAPI:
         code = payload.get("code") if isinstance(payload, dict) else None
         if isinstance(code, bool) or not isinstance(code, int):
             raise SlashCommandAPIError(f"Slash {operation} response schema is invalid")
-        if code != 0:
+        if not response.success() or not 200 <= raw.status_code < 300 or code != 0:
+            permission = self._permission_required(payload, operation=operation)
+            if permission is not None:
+                raise permission
             raise SlashCommandAPIError(f"Slash {operation} failed (code={code})")
         if not isinstance(payload.get("data"), dict):
             raise SlashCommandAPIError(f"Slash {operation} response schema is invalid")
         return payload
+
+    def _permission_required(
+        self,
+        payload: dict[str, Any],
+        *,
+        operation: str,
+    ) -> SlashPermissionRequired | None:
+        """Decode only app-bound official grant links from permission errors."""
+
+        if (
+            payload.get("code") != _PERMISSION_DENIED_CODE
+            or self._expected_app_id is None
+        ):
+            return None
+        error = payload.get("error")
+        violations = (
+            error.get("permission_violations")
+            if isinstance(error, dict)
+            else None
+        )
+        if not isinstance(violations, list):
+            return None
+        scopes = tuple(
+            sorted(
+                {
+                    item.get("subject")
+                    for item in violations
+                    if isinstance(item, dict)
+                    and item.get("type") == "action_scope_required"
+                    and item.get("subject") in _SLASH_PERMISSION_SCOPES
+                }
+            )
+        )
+        if not scopes:
+            return None
+        message = payload.get("msg")
+        if not isinstance(message, str):
+            return None
+        for candidate in _AUTH_URL.findall(message):
+            try:
+                parsed = urlsplit(candidate)
+                query = parse_qs(parsed.query, strict_parsing=True)
+            except ValueError:
+                continue
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname != "open.feishu.cn"
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.port is not None
+                or parsed.path != f"/app/{self._expected_app_id}/auth"
+                or set(query) != {"q", "op_from", "token_type"}
+                or query.get("op_from") != ["openapi"]
+                or query.get("token_type") != ["tenant"]
+            ):
+                continue
+            linked_scopes = tuple(
+                scope
+                for value in query.get("q", ())
+                for scope in value.split(",")
+                if scope
+            )
+            if (
+                not linked_scopes
+                or not set(linked_scopes) <= _SLASH_PERMISSION_SCOPES
+                or not set(scopes) <= set(linked_scopes)
+            ):
+                continue
+            return SlashPermissionRequired(
+                operation=operation,
+                scopes=scopes,
+                authorization_url=candidate,
+            )
+        return None

@@ -57,6 +57,7 @@ from ..agent.intent_recognizer import IntentRecognizer
 from ..autonomous.provisioning.notification_state import (
     hire_notification_message_uuid,
 )
+from ..autonomous.provisioning.slash_commands import SlashPermissionRequired
 from ..card.actions.dispatch import WORKFLOW_AGENT_SELECTION_ACTIONS
 from ..card.ui_text import UI_TEXT
 from ..config import IngressAccessMode, get_settings
@@ -169,6 +170,7 @@ _EMPLOYEE_HANDOFF_GRACE_SECONDS = 0.25
 _EMPLOYEE_HANDOFF_MAX_SECONDS = 3.0
 _EMPLOYEE_WARNING_RETRY_DELAYS = (0.0, 0.05, 0.2)
 _MAIN_BOT_IDENTITY_RETRY_SECONDS = 1.0
+_MAIN_SLASH_SYNC_RETRY_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,6 +575,12 @@ class FeishuWSClient:
         self._main_bot_identity_next_retry_at = 0.0
         self._channel_client: Optional[FeishuChannel] = None
         self._slash_command_sync_thread: Optional[threading.Thread] = None
+        self._slash_command_sync_wakeup = threading.Event()
+        self._slash_permission_notice_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._slash_permission_notice_recipients: set[str] = set()
+        self._slash_permission_notifications: set[tuple[str, str]] = set()
+        self._slash_permission_unroutable_logs: set[str] = set()
+        self._pending_slash_permission: SlashPermissionRequired | None = None
         self._employee_runtime_recovery_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._employee_runtime_recovery_thread: Optional[threading.Thread] = None
         self._employee_runtime_recovery_started = False
@@ -1195,6 +1203,9 @@ class FeishuWSClient:
         not tear down lock managers underneath it.
         """
         self._closed = True
+        slash_wakeup = getattr(self, "_slash_command_sync_wakeup", None)
+        if slash_wakeup is not None:
+            slash_wakeup.set()
         self._fence_message_ingress_bindings()
         dispatcher = getattr(self, "_card_advisory_dispatcher", None)
         if dispatcher is not None:
@@ -1529,30 +1540,177 @@ class FeishuWSClient:
             return self._channel_client
 
     def _sync_main_slash_commands(self) -> None:
-        """Best-effort convergence of the main Bot's Slash discovery panel."""
+        """Retry optional Slash discovery convergence without gating service."""
 
-        self._sync_main_bot_identity()
-        try:
-            verified = asyncio.run(
-                reconcile_main_agent_slash_commands(self._get_api_client())
+        while not self._closed:
+            self._sync_main_bot_identity()
+            try:
+                verified = asyncio.run(
+                    reconcile_main_agent_slash_commands(
+                        self._get_api_client(),
+                        app_id=self.settings.app_id,
+                    )
+                )
+            except SlashPermissionRequired as exc:
+                with self._slash_permission_notice_lock:
+                    previous_permission = self._pending_slash_permission
+                    self._pending_slash_permission = exc
+                if (
+                    previous_permission is None
+                    or previous_permission.authorization_url
+                    != exc.authorization_url
+                ):
+                    logger.warning(
+                        "Optional Main Agent Slash discovery is unavailable; "
+                        "messaging, Shell, and programming tools remain available. "
+                        "Grant and publish permission, then background recovery will "
+                        "retry automatically: %s",
+                        exc.authorization_url,
+                    )
+                self._notify_main_slash_permission_required(exc)
+            except Exception as exc:
+                logger.warning(
+                    "Optional Main Agent Slash discovery sync failed (%s); "
+                    "messaging remains available and background recovery will retry",
+                    type(exc).__name__,
+                )
+            else:
+                with self._slash_permission_notice_lock:
+                    self._pending_slash_permission = None
+                logger.info(
+                    "Main Agent Slash Commands ready: total=%d created=%d "
+                    "updated=%d deleted=%d",
+                    len(verified.observed),
+                    len(verified.created),
+                    len(verified.updated),
+                    len(verified.deleted),
+                )
+                return
+
+            self._slash_command_sync_wakeup.wait(_MAIN_SLASH_SYNC_RETRY_SECONDS)
+            self._slash_command_sync_wakeup.clear()
+            if self._closed:
+                return
+
+    @staticmethod
+    def _slash_notice_admin_ids(settings: object) -> tuple[str, ...]:
+        raw_admin_ids = getattr(settings, "admin_user_ids", ()) or ()
+        if isinstance(raw_admin_ids, str):
+            return tuple(
+                item.strip()
+                for item in raw_admin_ids.split(",")
+                if item.strip().startswith("ou_")
             )
-        except Exception as exc:
+        return tuple(
+            sorted(
+                item
+                for item in raw_admin_ids
+                if isinstance(item, str) and item.startswith("ou_")
+            )
+        )
+
+    def _register_slash_permission_notice_recipient(
+        self,
+        *,
+        sender_id: str,
+        chat_type: str,
+    ) -> None:
+        """Wake the worker for the first admitted private user when no admin exists."""
+
+        if (
+            chat_type != "p2p"
+            or not isinstance(sender_id, str)
+            or not sender_id.startswith("ou_")
+        ):
+            return
+        if self._slash_notice_admin_ids(self.settings):
+            return
+        lock = getattr(self, "_slash_permission_notice_lock", None)
+        recipients = getattr(self, "_slash_permission_notice_recipients", None)
+        if lock is None or recipients is None:
+            return
+        with lock:
+            if recipients:
+                return
+            recipients.add(sender_id)
+            should_wake = self._pending_slash_permission is not None
+        if should_wake:
+            self._slash_command_sync_wakeup.set()
+
+    def _notify_main_slash_permission_required(
+        self,
+        required: SlashPermissionRequired,
+    ) -> None:
+        """Send an audited, deduplicated grant notice to an eligible recipient."""
+
+        admin_ids = self._slash_notice_admin_ids(self.settings)
+        with self._slash_permission_notice_lock:
+            recipient_ids = admin_ids or tuple(
+                sorted(self._slash_permission_notice_recipients)
+            )
+        if not recipient_ids:
+            with self._slash_permission_notice_lock:
+                should_log = (
+                    required.authorization_url
+                    not in self._slash_permission_unroutable_logs
+                )
+                self._slash_permission_unroutable_logs.add(
+                    required.authorization_url
+                )
+            if should_log:
+                logger.warning(
+                    "Slash permission grant link could not be sent in Feishu because "
+                    "ADMIN_USER_IDS is empty; use /setadmin, then automatic retry will "
+                    "notify the administrator: %s",
+                    required.authorization_url,
+                )
+            return
+
+        handler = self._handler_ctx.handlers.get("coco")
+        im_client = getattr(handler, "im_client", None)
+        send_message = getattr(im_client, "send_message", None)
+        if not callable(send_message):
             logger.warning(
-                "Main Agent Slash Command sync skipped (%s); grant and publish "
-                "application:app_slash_command:read and "
-                "application:app_slash_command:write",
-                type(exc).__name__,
+                "Slash permission notice transport is unavailable; background "
+                "recovery remains active"
             )
             return
 
-        logger.info(
-            "Main Agent Slash Commands ready: total=%d created=%d updated=%d "
-            "deleted=%d",
-            len(verified.observed),
-            len(verified.created),
-            len(verified.updated),
-            len(verified.deleted),
+        notice = (
+            "⚠️ GhostAP 的“/ 命令发现面板”缺少可选权限，"
+            "消息、Shell 和编程工具仍可正常使用。\n"
+            "请应用管理员点击下方链接申请并发布权限；GhostAP 会在后台"
+            "自动重试，无需重启：\n"
+            f"{required.authorization_url}\n"
+            f"缺失权限：{', '.join(required.scopes)}"
         )
+        content = json.dumps({"text": notice}, ensure_ascii=False)
+        for recipient_id in recipient_ids:
+            notification_key = (recipient_id, required.authorization_url)
+            with self._slash_permission_notice_lock:
+                if notification_key in self._slash_permission_notifications:
+                    continue
+            try:
+                response = send_message(
+                    "open_id",
+                    recipient_id,
+                    content,
+                    msg_type="text",
+                )
+                if response is not None and response.success():
+                    with self._slash_permission_notice_lock:
+                        self._slash_permission_notifications.add(notification_key)
+                else:
+                    logger.warning(
+                        "Slash permission notice delivery failed for recipient=%s",
+                        recipient_id[:12],
+                    )
+            except Exception:
+                logger.warning(
+                    "Slash permission notice delivery raised for recipient=%s",
+                    recipient_id[:12],
+                    exc_info=True,
+                )
 
     def _sync_main_bot_identity(self) -> str:
         """Resolve the main app's bot Open ID outside the WS ACK path."""
@@ -2583,6 +2741,10 @@ class FeishuWSClient:
         )
         if not ingress_decision.allowed:
             return
+        self._register_slash_permission_notice_recipient(
+            sender_id=_sender_id,
+            chat_type=chat_type,
+        )
         if employee_candidate is None and not self._managed_ingress_action_allowed(
             effective_trust,
             text=text,
