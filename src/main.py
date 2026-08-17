@@ -243,8 +243,6 @@ class Application:
         except Exception:
             logger.debug("Application.run: ACP model preheat failed", exc_info=True)
 
-        self._install_signal_handlers()
-
         _fmt, _EmojiReaction, FeishuWSClient = _load_feishu_runtime()
         try:
             from feishu.sdk_logging import configure_lark_sdk_logging
@@ -252,6 +250,11 @@ class Application:
             from .feishu.sdk_logging import configure_lark_sdk_logging
         configure_lark_sdk_logging()
         self.feishu_client = FeishuWSClient(message_callback=self.handle_message)
+        # No application resources need graceful cleanup until the client has
+        # been constructed.  Keep the OS-default SIGTERM behavior during slow
+        # third-party imports so a transient launchd replacement exits quietly
+        # instead of surfacing a misleading KeyboardInterrupt traceback.
+        self._install_signal_handlers()
 
         logger.info("启动飞书长连接服务...")
         logger.info("支持的功能: Shell模式 | Coco模式 | 目录切换")

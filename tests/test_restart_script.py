@@ -106,6 +106,60 @@ def test_application_startup_defers_acp_connections_by_default(monkeypatch):
     assert events == ["feishu-start", "feishu-close", "locks-close"]
 
 
+def test_application_installs_sigterm_handler_after_runtime_import(monkeypatch):
+    import src.main as main_module
+
+    events = []
+
+    class FakeFeishuClient:
+        def __init__(self, *, message_callback):
+            del message_callback
+            events.append("client-created")
+
+        def start(self):
+            events.append("feishu-start")
+
+        def close(self):
+            events.append("feishu-close")
+            return True
+
+    def load_runtime():
+        events.append("runtime-loaded")
+        return None, None, FakeFeishuClient
+
+    monkeypatch.setattr(main_module, "_load_feishu_runtime", load_runtime)
+    monkeypatch.setattr(
+        main_module.Application,
+        "_install_signal_handlers",
+        lambda _self: events.append("signals-installed"),
+    )
+    monkeypatch.setattr(
+        main_module.Application,
+        "_shutdown_lock_managers",
+        staticmethod(lambda: events.append("locks-close")),
+    )
+
+    app = object.__new__(main_module.Application)
+    app.settings = SimpleNamespace(
+        validate_feishu_config=lambda: True,
+        app_id="test-app-id",
+        sandbox_timeout=30,
+        default_acp_tool=None,
+    )
+    app.feishu_client = None
+
+    app.run()
+
+    assert events == [
+        "runtime-loaded",
+        "client-created",
+        "signals-installed",
+        "feishu-start",
+        "feishu-close",
+        "locks-close",
+    ]
+
+
 @pytest.mark.parametrize(
     ("close_result", "expected_shutdown_events"),
     [
@@ -1059,6 +1113,48 @@ stop_service
     assert len(events) == 2
     assert events[0].startswith("launchctl:remove com.ghostap.local.")
     assert events[1] == "wait:4242:10"
+
+
+def test_stop_removes_launchctl_job_before_terminating_pid_file_process(
+    tmp_path,
+):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    capture = tmp_path / "events"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+printf '%s\n' 4242 > "$PID_FILE"
+log_restart() { :; }
+get_running_pids() { :; }
+command() {
+    if [ "$1" = "-v" ] && [ "$2" = "launchctl" ]; then
+        return 0
+    fi
+    builtin command "$@"
+}
+remove_launchctl_service() { printf '%s\n' remove-launchctl >> "$CAPTURE"; }
+kill() { [ "$1" = "-0" ]; }
+pid_is_ghostap_service() { return 0; }
+terminate_service_pid() { printf 'terminate:%s:%s\n' "$1" "$2" >> "$CAPTURE"; }
+stop_service
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "remove-launchctl",
+        "terminate:4242:30",
+    ]
 
 
 def test_restart_script_has_no_generated_shared_worker_or_heredoc():

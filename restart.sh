@@ -469,6 +469,15 @@ stop_service() {
     log_restart "stop begin"
     discovered_pids=$(get_running_pids)
 
+    # launchctl submit creates a keepalive job on macOS.  Unload it before
+    # signalling the PID-file process so launchd cannot respawn a replacement
+    # while the original service is still completing graceful shutdown.
+    if command -v launchctl >/dev/null 2>&1; then
+        if ! remove_launchctl_service; then
+            forced=1
+        fi
+    fi
+
     if [ -f "$PID_FILE" ]; then
         target_pid=$(cat "$PID_FILE")
         if kill -0 "$target_pid" 2>/dev/null &&
@@ -482,11 +491,6 @@ stop_service() {
             log_restart "stale pid file ignored pid=$target_pid"
         fi
         rm -f "$PID_FILE"
-    fi
-    if command -v launchctl >/dev/null 2>&1; then
-        if ! remove_launchctl_service; then
-            forced=1
-        fi
     fi
 
     for p in $discovered_pids; do
