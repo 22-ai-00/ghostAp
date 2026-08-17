@@ -20,6 +20,7 @@ from ..workforce.credential_vault import CredentialKeyring
 
 _SECRET_FILENAME = "employee-runtime-secrets.json"
 _LOCK_FILENAME = ".employee-runtime-secrets.lock"
+_LOCK_OPEN_ATTEMPTS = 8
 _MAX_ENVELOPE_BYTES = 16 * 1024
 _ENVELOPE_FIELDS = frozenset(
     {
@@ -186,6 +187,23 @@ def _read_existing(directory_fd: int) -> bytes | None:
         os.close(descriptor)
 
 
+def _open_lock_file(directory_fd: int) -> int:
+    """Open the bootstrap lock despite Darwin's concurrent openat create race."""
+
+    for attempt in range(_LOCK_OPEN_ATTEMPTS):
+        try:
+            return os.open(
+                _LOCK_FILENAME,
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            if exc.errno != errno.ENOENT or attempt + 1 == _LOCK_OPEN_ATTEMPTS:
+                raise
+    raise AssertionError("unreachable")
+
+
 def _write_new(directory_fd: int, raw: bytes) -> None:
     temporary = f".{_SECRET_FILENAME}.{uuid.uuid4().hex}.tmp"
     descriptor = -1
@@ -237,12 +255,7 @@ def load_or_create_local_employee_material(
     lock_fd = -1
     try:
         try:
-            lock_fd = os.open(
-                _LOCK_FILENAME,
-                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=directory_fd,
-            )
+            lock_fd = _open_lock_file(directory_fd)
             lock_metadata = os.fstat(lock_fd)
             if (
                 not stat.S_ISREG(lock_metadata.st_mode)

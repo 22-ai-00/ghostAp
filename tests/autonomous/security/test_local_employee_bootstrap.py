@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr
 
+from src.autonomous.provisioning import local_bootstrap as local_bootstrap_module
 from src.autonomous.provisioning.local_bootstrap import (
     LocalEmployeeBootstrapError,
     load_or_create_local_employee_material,
@@ -42,6 +44,29 @@ def test_bootstrap_concurrent_callers_converge(tmp_path: Path) -> None:
         )
 
     assert all(material == materials[0] for material in materials)
+
+
+def test_bootstrap_retries_transient_lock_creation_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_open = os.open
+    lock_attempts = 0
+
+    def flaky_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal lock_attempts
+        if path == local_bootstrap_module._LOCK_FILENAME:
+            lock_attempts += 1
+            if lock_attempts == 1:
+                raise FileNotFoundError(errno.ENOENT, "transient openat race", path)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(local_bootstrap_module.os, "open", flaky_open)
+
+    material = load_or_create_local_employee_material(tmp_path)
+
+    assert material.journal_hmac_key
+    assert lock_attempts == 2
 
 
 @pytest.mark.parametrize(
