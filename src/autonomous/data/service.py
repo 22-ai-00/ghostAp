@@ -195,6 +195,13 @@ class EmployeeDataService:
             self._replace_state_unlocked(fresh)
             return fresh
 
+    def projection_snapshot(self) -> DataProjectionState:
+        """Return a detached current projection without forcing a disk replay."""
+
+        with self._mutex:
+            self._synchronize_projection_unlocked()
+            return self._state.clone()
+
     def get_history_payload(self, record_id: str) -> ExecutionHistoryPayloadV1:
         """Read and authenticate one canonical terminal history payload."""
 

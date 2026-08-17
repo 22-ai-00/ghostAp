@@ -13,7 +13,7 @@ from pathlib import Path
 from ..data.models import DataKind
 from ..data.ports import AuthenticatedExecutionTerminal, PublishEmployeeDocumentCommand
 from ..journal.blob_store import BlobRef
-from ..journal.frame import JournalEvent
+from ..journal.frame import GENESIS_HASH, JournalEvent
 from ..journal.writer import CommitState, JournalWriter
 from ..workspace.layout import atomic_write_relative, open_child_directory, open_directory_tree
 from .compiler import (
@@ -61,6 +61,8 @@ class EmployeeKnowledgeService:
         self._sources: dict[str, dict[str, str]] = {}
         self._terminal: set[str] = set()
         self._review_required: set[str] = set()
+        self._projection_sequence = 0
+        self._projection_hash = ""
         self._closed = False
         self._thread: threading.Thread | None = None
 
@@ -69,7 +71,7 @@ class EmployeeKnowledgeService:
             raise TypeError("terminal must be AuthenticatedExecutionTerminal")
         if terminal.status != "completed":
             raise ValueError("only completed terminals produce knowledge")
-        state = self._data.service.rebuild_projection()
+        state = self._data.service.projection_snapshot()
         metadata = next(
             (
                 item
@@ -169,7 +171,7 @@ class EmployeeKnowledgeService:
 
         if self._agents_root is None:
             return 0
-        state = self._data.service.rebuild_projection()
+        state = self._data.service.projection_snapshot()
         agent_keys = sorted(
             {
                 (item.tenant_key, item.agent_id)
@@ -284,7 +286,7 @@ class EmployeeKnowledgeService:
         try:
             self._commit_effect(ingest_id, "prepared")
             self._commit_effect(ingest_id, "executing")
-            state = self._data.service.rebuild_projection()
+            state = self._data.service.projection_snapshot()
             history = state.history_records.get(source_meta["source_id"])
             if history is None or history.tombstoned:
                 raise KnowledgeServiceError("knowledge source is unavailable")
@@ -374,7 +376,7 @@ class EmployeeKnowledgeService:
         source: KnowledgeSource,
         compilation: KnowledgeCompilation,
     ) -> int:
-        state = self._data.service.rebuild_projection()
+        state = self._data.service.projection_snapshot()
         generations = [
             item.version
             for item in state.employee_documents.values()
@@ -431,7 +433,7 @@ class EmployeeKnowledgeService:
         source: KnowledgeSource,
         generation: int,
     ) -> None:
-        state = self._data.service.rebuild_projection()
+        state = self._data.service.projection_snapshot()
         page_ids = sorted(
             item.source_id
             for item in state.employee_documents.values()
@@ -464,11 +466,25 @@ class EmployeeKnowledgeService:
         )
 
     def _refresh_projection(self) -> None:
-        known: set[str] = set()
-        terminal: set[str] = set()
-        review_required: set[str] = set()
-        sources: dict[str, dict[str, str]] = {}
-        for frame in self._writer.replay():
+        anchor, frames = self._writer.committed_tail(self._projection_sequence + 1)
+        anchor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
+        if anchor.sequence == self._projection_sequence:
+            if anchor_hash != self._projection_hash:
+                raise KnowledgeServiceError("knowledge projection anchor changed")
+            return
+
+        known = set(self._known)
+        terminal = set(self._terminal)
+        review_required = set(self._review_required)
+        sources = {key: dict(value) for key, value in self._sources.items()}
+        expected_sequence = self._projection_sequence + 1
+        expected_previous_hash = self._projection_hash or GENESIS_HASH
+        for frame in frames:
+            if (
+                frame.sequence != expected_sequence
+                or frame.previous_hash != expected_previous_hash
+            ):
+                raise KnowledgeServiceError("knowledge projection tail is discontinuous")
             for event in frame.events:
                 if not event.aggregate_id.startswith("knowledge-ingest:"):
                     continue
@@ -485,10 +501,16 @@ class EmployeeKnowledgeService:
                 elif event.event_type == "knowledge.ingest.retry_requested":
                     terminal.discard(ingest_id)
                     review_required.discard(ingest_id)
+            expected_sequence = frame.sequence + 1
+            expected_previous_hash = frame.frame_hash
+        if expected_sequence - 1 != anchor.sequence or expected_previous_hash != anchor_hash:
+            raise KnowledgeServiceError("knowledge projection tail does not reach anchor")
         self._known = known
         self._terminal = terminal
         self._review_required = review_required
         self._sources = sources
+        self._projection_sequence = anchor.sequence
+        self._projection_hash = anchor_hash
 
     def _commit_effect(self, ingest_id: str, state: str) -> None:
         self._commit(
