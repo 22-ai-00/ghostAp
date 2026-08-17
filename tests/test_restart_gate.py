@@ -101,6 +101,35 @@ def test_generation_requires_a_live_ready_service(tmp_path: Path) -> None:
         gate.snapshot()
 
 
+def test_darwin_process_identity_forces_locale_independent_ps_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from src.utils import restart_gate
+
+    captured_env: dict[str, str] = {}
+
+    def fake_run(*_args, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        started_at = (
+            "Mon Aug 17 19:16:50 2026"
+            if captured_env.get("LC_ALL") == "C"
+            else "一  8月/17 19:16:50 2026"
+        )
+        return SimpleNamespace(returncode=0, stdout=started_at)
+
+    monkeypatch.setattr(restart_gate.sys, "platform", "darwin")
+    monkeypatch.setattr(restart_gate.os, "kill", lambda *_args: None)
+    monkeypatch.setattr(restart_gate.subprocess, "run", fake_run)
+
+    identity = restart_gate._process_instance_identity(4242)
+
+    assert identity == "darwin:Mon Aug 17 19:16:50 2026"
+    assert captured_env["LC_ALL"] == "C"
+    assert captured_env["LANG"] == "C"
+
+
 def test_gate_keeps_lock_inodes_and_checkout_binding(tmp_path: Path) -> None:
     project, gate, _generation = _ready_gate(tmp_path)
     identities = (

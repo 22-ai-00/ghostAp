@@ -127,6 +127,7 @@ def _process_instance_identity(pid: int) -> str:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            env={"LC_ALL": "C", "LANG": "C"},
             shell=False,
             close_fds=True,
             timeout=2,

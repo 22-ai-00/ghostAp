@@ -2,7 +2,8 @@
 
 > **维护性 Backlog**: 后续 Review/Audit 发现的非紧急维护项按分级规则录入 [Backlog.md](Backlog.md) 并在维护窗口集中处理；本轮 Refactoring Analysis 1–28 的问题矩阵入口是 [.Memory/2026-05-11.md](2026-05-11.md) 顶部最终矩阵，2026-05-12 是执行验证日志。
 ## 2026-08-17
-- **macOS重启PID竞态修复** - 权威PID不再被旧快照过滤，失败时卸载launchd keepalive → [2026-08-17.md](2026-08-17.md)
+- **macOS重启locale根因闭环** - Darwin进程身份固定C locale，中文终端重启实测通过 → [2026-08-17.md](2026-08-17.md)
+- **macOS重启失败清理加固** - 权威PID防御性校验，失败时卸载launchd keepalive → [2026-08-17.md](2026-08-17.md)
 - **编程模型与退出入口统一** - 八后端共享/model与/exit并由模式SSOT自适应 → [2026-08-17.md](2026-08-17.md)
 - **DSH原生ACP一等接入** - 真实模型/Effort目录、持久模式与Workflow全链路打通 → [2026-08-17.md](2026-08-17.md)
 - **Linux/macOS兼容规则固化** - 平台能力探测与安全边界写入AGENTS并设文档守卫 → [2026-08-17.md](2026-08-17.md)
