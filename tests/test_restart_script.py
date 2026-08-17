@@ -202,8 +202,12 @@ def test_restart_script_syncs_python_and_prepares_platform_sandbox():
     assert "GHOSTAP_SYNC_PYTHON_DEPENDENCIES" in text
     assert "uv sync --check --group dev" in text
     assert "uv sync --group dev" in text
+    assert "uv sync --group dev --compile-bytecode" in text
     assert "venv_has_stale_entrypoint_shebang" in text
-    assert "uv sync --group dev --reinstall" in text
+    assert "uv sync --group dev --reinstall --compile-bytecode" in text
+    assert "正在初始化 GhostAP Python 服务并等待 readiness" in start_body
+    assert "dependency_seconds=" in start_body
+    assert "readiness_seconds=" in start_body
     assert "prepare_python_dependencies || return 1" in start_body
     assert "GHOSTAP_PREPARE_EMPLOYEE_SANDBOX" in text
     assert "prepare_employee_sandbox_dependency" in start_body
@@ -213,6 +217,75 @@ def test_restart_script_syncs_python_and_prepares_platform_sandbox():
     assert "pacman -Sy" not in text
     assert "/usr/bin/sandbox-exec" in text
     assert "mechanism=seatbelt" in text
+
+
+def test_python_dependency_check_does_not_reinstall_up_to_date_environment(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "uv-calls"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+log_restart() { :; }
+venv_has_stale_entrypoint_shebang() { return 1; }
+uv() {
+    printf '%s\n' "$*" >> "$CAPTURE"
+    return 0
+}
+prepare_python_dependencies
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "sync --check --group dev"
+    ]
+    assert "正在检查 GhostAP Python 依赖" in result.stdout
+    assert "Python 依赖已是最新" in result.stdout
+    assert "依赖变更" not in result.stdout
+
+
+def test_python_dependency_change_syncs_and_precompiles_bytecode(
+    tmp_path: Path,
+) -> None:
+    capture = tmp_path / "uv-calls"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+log_restart() { :; }
+venv_has_stale_entrypoint_shebang() { return 1; }
+uv() {
+    printf '%s\n' "$*" >> "$CAPTURE"
+    if [ "$*" = "sync --check --group dev" ]; then
+        return 1
+    fi
+    return 0
+}
+prepare_python_dependencies
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "sync --check --group dev",
+        "sync --group dev --compile-bytecode",
+    ]
+    assert "正在解析、安装并预编译 Python 字节码" in result.stdout
+    assert "Python 依赖同步完成" in result.stdout
 
 
 def test_restart_script_syntax_is_valid():

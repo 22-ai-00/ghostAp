@@ -16,6 +16,7 @@ START_PROCESS_PID_TIMEOUT="${GHOSTAP_START_PROCESS_PID_TIMEOUT:-10}"
 LOG_MODE="${GHOSTAP_LOG_MODE:-truncate}"
 STARTED_PID=""
 RESTART_REQUEST_SEQUENCE=0
+PYTHON_DEPENDENCY_SECONDS=0
 PROJECT_LAUNCHCTL_ID=$(printf '%s' "$PROJECT_DIR" | cksum | awk '{print $1}')
 LAUNCHCTL_LABEL="${GHOSTAP_LAUNCHCTL_LABEL:-com.ghostap.local.${PROJECT_LAUNCHCTL_ID}}"
 CODEX_ACP_NPM_PACKAGE="${GHOSTAP_CODEX_ACP_NPM_PACKAGE:-@agentclientprotocol/codex-acp@1.2.0}"
@@ -89,6 +90,17 @@ pid_is_ghostap_service() {
 
 log_restart() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') [RESTART] $*" >> "$LOG_FILE"
+}
+
+format_elapsed() {
+    local total_seconds="${1:-0}"
+    if (( total_seconds < 1 )); then
+        echo "<1 秒"
+    elif (( total_seconds < 60 )); then
+        echo "${total_seconds} 秒"
+    else
+        echo "$((total_seconds / 60)) 分 $((total_seconds % 60)) 秒"
+    fi
 }
 
 build_restart_python_command() {
@@ -257,7 +269,10 @@ venv_has_stale_entrypoint_shebang() {
 }
 
 prepare_python_dependencies() {
+    local phase_started_at=$SECONDS
     if [ "$SYNC_PYTHON_DEPENDENCIES" = "0" ]; then
+        PYTHON_DEPENDENCY_SECONDS=0
+        echo "已跳过 GhostAP Python 依赖检查"
         log_restart "python dependency sync skipped"
         return
     fi
@@ -267,25 +282,34 @@ prepare_python_dependencies() {
         return 1
     fi
 
-    echo "同步 GhostAP Python 依赖..."
+    echo "正在检查 GhostAP Python 依赖..."
     if venv_has_stale_entrypoint_shebang; then
-        echo "检测到项目目录迁移，正在重建虚拟环境入口脚本..."
-        if uv sync --group dev --reinstall >/dev/null 2>&1; then
-            log_restart "python dependencies reinstalled stale entrypoint shebang"
+        echo "检测到项目目录迁移，正在重新安装依赖并预编译字节码..."
+        if uv sync --group dev --reinstall --compile-bytecode; then
+            PYTHON_DEPENDENCY_SECONDS=$((SECONDS - phase_started_at))
+            echo "✅ Python 环境已重建（耗时 $(format_elapsed "$PYTHON_DEPENDENCY_SECONDS")）"
+            log_restart "python dependencies reinstalled stale entrypoint shebang seconds=$PYTHON_DEPENDENCY_SECONDS"
             return
         fi
+        PYTHON_DEPENDENCY_SECONDS=$((SECONDS - phase_started_at))
         echo "❌ Python 虚拟环境入口脚本修复失败"
-        log_restart "python dependency reinstall failed stale entrypoint shebang"
+        log_restart "python dependency reinstall failed stale entrypoint shebang seconds=$PYTHON_DEPENDENCY_SECONDS"
         return 1
     elif uv sync --check --group dev >/dev/null 2>&1; then
-        log_restart "python dependencies already synchronized"
+        PYTHON_DEPENDENCY_SECONDS=$((SECONDS - phase_started_at))
+        echo "✅ Python 依赖已是最新（检查耗时 $(format_elapsed "$PYTHON_DEPENDENCY_SECONDS")）"
+        log_restart "python dependencies already synchronized seconds=$PYTHON_DEPENDENCY_SECONDS"
         return
     fi
-    if uv sync --group dev >/dev/null 2>&1; then
-        log_restart "python dependencies synced"
+    echo "检测到依赖变更，正在解析、安装并预编译 Python 字节码..."
+    if uv sync --group dev --compile-bytecode; then
+        PYTHON_DEPENDENCY_SECONDS=$((SECONDS - phase_started_at))
+        echo "✅ Python 依赖同步完成（耗时 $(format_elapsed "$PYTHON_DEPENDENCY_SECONDS")）"
+        log_restart "python dependencies synced seconds=$PYTHON_DEPENDENCY_SECONDS"
     else
+        PYTHON_DEPENDENCY_SECONDS=$((SECONDS - phase_started_at))
         echo "❌ Python 依赖同步失败"
-        log_restart "python dependency sync failed"
+        log_restart "python dependency sync failed seconds=$PYTHON_DEPENDENCY_SECONDS"
         return 1
     fi
 }
@@ -429,6 +453,7 @@ cleanup_failed_start() {
 }
 
 stop_service() {
+    local stop_started_at=$SECONDS
     local forced=0
     local target_pid=""
     local discovered_pids=""
@@ -481,17 +506,23 @@ stop_service() {
     fi
 
     if [ "$forced" = "1" ]; then
-        echo "⚠️  服务已强制停止；本次停止为降级完成"
-        log_restart "stop degraded forced termination"
+        local stop_elapsed=$((SECONDS - stop_started_at))
+        echo "⚠️  服务已强制停止；本次停止为降级完成（耗时 $(format_elapsed "$stop_elapsed")）"
+        log_restart "stop degraded forced termination seconds=$stop_elapsed"
         return 2
     fi
 
-    echo "✅ 服务已停止"
-    log_restart "stop done graceful"
+    local stop_elapsed=$((SECONDS - stop_started_at))
+    echo "✅ 服务已停止（耗时 $(format_elapsed "$stop_elapsed")）"
+    log_restart "stop done graceful seconds=$stop_elapsed"
     return 0
 }
 
 start_service() {
+    local start_started_at=$SECONDS
+    local readiness_started_at=0
+    local readiness_elapsed=0
+    local start_elapsed=0
     local previous_running_pids=""
     echo "正在启动 GhostAP 服务..."
     local start_log_mode="$LOG_MODE"
@@ -514,9 +545,12 @@ start_service() {
         echo "$PID" > "$PID_FILE"
     fi
 
+    readiness_started_at=$SECONDS
+    echo "正在初始化 GhostAP Python 服务并等待 readiness（上限 ${READINESS_TIMEOUT}s）..."
     if ! wait_for_service_readiness "$PID" "$previous_running_pids"; then
+        readiness_elapsed=$((SECONDS - readiness_started_at))
         echo "❌ 启动失败：服务未在 ${READINESS_TIMEOUT}s 内通过 readiness 检查"
-        log_restart "start failed readiness pid=$PID"
+        log_restart "start failed readiness pid=$PID seconds=$readiness_elapsed"
         cleanup_failed_start "$PID"
         return 1
     fi
@@ -530,11 +564,13 @@ start_service() {
         cleanup_failed_start "$PID"
         return 1
     fi
-    echo "✅ GhostAP 服务已启动且 readiness 已通过"
+    readiness_elapsed=$((SECONDS - readiness_started_at))
+    start_elapsed=$((SECONDS - start_started_at))
+    echo "✅ GhostAP 服务已启动且 readiness 已通过（初始化 $(format_elapsed "$readiness_elapsed")，总计 $(format_elapsed "$start_elapsed")）"
     echo "   进程: $RUNNING_PIDS"
     echo "   启动命令: $(service_command_label)"
     echo "   日志: $LOG_FILE"
-    log_restart "start ready pid=$PID running=$RUNNING_PIDS generation=${READY_GENERATION:-verified}"
+    log_restart "start ready pid=$PID running=$RUNNING_PIDS generation=${READY_GENERATION:-verified} dependency_seconds=$PYTHON_DEPENDENCY_SECONDS readiness_seconds=$readiness_elapsed total_seconds=$start_elapsed"
     return 0
 }
 
