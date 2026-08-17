@@ -25,7 +25,11 @@ from websockets.sync.server import Server, serve
 
 pytestmark = pytest.mark.slow
 
-_PROCESS_WAIT_SECONDS = 5.0
+# A spawned Darwin worker must import cryptography, the pinned Channel SDK, and
+# the controlled bytecode cache before it can reach the wire harness. Full-suite
+# CPU pressure can exceed five seconds without violating any wire-level timing
+# contract; ACK timing remains governed separately by _ACK_BUDGET_SECONDS.
+_PROCESS_WAIT_SECONDS = 30.0
 _ACK_BUDGET_SECONDS = 1.5
 _NO_EARLY_RESPONSE_SECONDS = _ACK_BUDGET_SECONDS
 
