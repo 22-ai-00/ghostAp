@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 _SANDBOX_METADATA_MAX_BYTES = 4096
 _SANDBOX_METADATA_TIMEOUT_SECONDS = 10.0
+_EVENT_PIPE_EXIT_GRACE_SECONDS = 0.1
 _MACOS_SEATBELT_PROFILE = """
 (version 1)
 (deny default)
@@ -1100,6 +1101,13 @@ class EmployeeChannelSupervisor:
                     self._accept_frame(runtime, frame)
         finally:
             exit_code = runtime.process.poll()
+            if exit_code is None:
+                try:
+                    exit_code = runtime.process.wait(
+                        timeout=min(self._stop_timeout, _EVENT_PIPE_EXIT_GRACE_SECONDS)
+                    )
+                except subprocess.TimeoutExpired:
+                    pass
             should_reap = False
             with self._lock:
                 active = runtime.status.state in {
