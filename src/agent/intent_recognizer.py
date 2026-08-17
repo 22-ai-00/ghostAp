@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Callable, Optional
 
 from ..config import get_settings
+from ..mode import PROGRAMMING_MODE_VALUES
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,6 @@ class IntentType(Enum):
     ENTER_GROK = "enter_grok"
     EXIT_GROK = "exit_grok"
     ENTER_DSH = "enter_dsh"
-    EXIT_DSH = "exit_dsh"
     EXIT_MODE = "exit_mode"
     CHANGE_DIR = "change_dir"
     SHELL_COMMAND = "shell"
@@ -145,7 +145,6 @@ class IntentRecognizer:
         "enter_grok": IntentType.ENTER_GROK,
         "exit_grok": IntentType.EXIT_GROK,
         "enter_dsh": IntentType.ENTER_DSH,
-        "exit_dsh": IntentType.EXIT_DSH,
         "exit_mode": IntentType.EXIT_MODE,
         "coco_message": IntentType.COCO_MESSAGE,
         "claude_message": IntentType.CLAUDE_MESSAGE,
@@ -209,8 +208,6 @@ class IntentRecognizer:
         "/exit_grok": (IntentType.EXIT_GROK, "退出 Grok 编程模式"),
         "/dsh": (IntentType.ENTER_DSH, "进入 DSH 编程模式"),
         "/enter_dsh": (IntentType.ENTER_DSH, "进入 DSH 编程模式"),
-        "/end_dsh": (IntentType.EXIT_DSH, "退出 DSH 编程模式"),
-        "/exit_dsh": (IntentType.EXIT_DSH, "退出 DSH 编程模式"),
         "/exit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/quit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/projects": (IntentType.LIST_PROJECTS, "查看项目列表"),
@@ -819,7 +816,7 @@ class IntentRecognizer:
 
     def _match_programming_exit_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
         text_lower = self._lower(text)
-        is_programming = current_mode in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh")
+        is_programming = current_mode in PROGRAMMING_MODE_VALUES
         if is_programming and len(text) < 20:
             if any(kw in text_lower for kw in self.EXIT_KEYWORDS):
                 return IntentResult.single(

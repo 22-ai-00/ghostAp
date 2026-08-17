@@ -24,6 +24,7 @@ from ...card.builders.system import SystemBuilder
 from ...card.render.model_cascade import compose_model_selection, parse_model_selection
 from ...card.ui_text import UI_TEXT
 from ...coco_model import get_coco_model_manager
+from ...mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES, InteractionMode
 from ...tasking import TaskPriority, TaskSpec
 from ...utils.errors import safe_error_message
 from ..emoji import EmojiReaction
@@ -113,8 +114,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_traex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_grok": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/exit_grok": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/end_dsh": lambda m, c, t, p: self.exit_current_mode(m, c, p),
-            "/exit_dsh": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/coco_status": lambda m, c, t, p: self.show_coco_status(m, c),
             "/coco_info": lambda m, c, t, p: self.get_handler("coco").show_info(m, c, p),
             "/claude_info": lambda m, c, t, p: self.get_handler("claude").show_info(m, c, p),
@@ -288,8 +287,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_traex",
             "/end_grok",
             "/exit_grok",
-            "/end_dsh",
-            "/exit_dsh",
         }
         exit_keywords = {
             "退出模式",
@@ -300,14 +297,15 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "退出coco",
             "退出aiden",
             "退出grok",
-            "退出dsh",
             "退出codex",
             "退出gemini",
             "退出traex",
         }
         if text_lower in exit_commands:
             return True
-        return any(kw in text_lower for kw in exit_keywords)
+        return any(kw in text_lower for kw in exit_keywords) or any(
+            f"退出{mode}" in text_lower for mode in PROGRAMMING_MODE_VALUES
+        )
 
     @staticmethod
     def is_deep_command(text: str) -> bool:
@@ -394,8 +392,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_traex",
             "/end_grok",
             "/exit_grok",
-            "/end_dsh",
-            "/exit_dsh",
             "/coco_status",
             "/coco_info",
             "/claude_info",
@@ -830,19 +826,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         chat_id: str,
         project: Optional["ProjectContext"] = None,
     ) -> Optional[str]:
-        from ...mode import InteractionMode
         from ...thread import get_current_thread_id
 
-        programming_modes = {
-            InteractionMode.COCO,
-            InteractionMode.CLAUDE,
-            InteractionMode.AIDEN,
-            InteractionMode.CODEX,
-            InteractionMode.GEMINI,
-            InteractionMode.TRAEX,
-            InteractionMode.GROK,
-            InteractionMode.DSH,
-        }
         thread_id = get_current_thread_id()
         if thread_id:
             thread_ctx = self.ctx.thread_manager.get(thread_id)
@@ -851,12 +836,12 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                     mode = InteractionMode(thread_ctx.mode)
                 except ValueError:
                     mode = None
-                if mode in programming_modes:
+                if mode in PROGRAMMING_MODES:
                     return mode.value
 
         project_id = self._project_id(project)
         mode = self.mode_manager.get_mode(chat_id, project_id=project_id)
-        if mode in programming_modes and self.mode_manager.is_programming_mode(
+        if mode in PROGRAMMING_MODES and self.mode_manager.is_programming_mode(
             chat_id,
             project_id=project_id,
         ):
@@ -1586,7 +1571,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
 
         Priority:
         1. project.acp_tool_name (explicit tool set on active project)
-        2. Current interaction mode (coco/aiden/codex/gemini/claude)
+        2. Current programming interaction mode
         3. Default: "coco"
         """
         if project and getattr(project, "acp_tool_name", ""):
@@ -1601,21 +1586,10 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             project.acp_tool_name = None
             project.acp_model_name = None
 
-        mode_to_tool = {
-            "coco": "coco",
-            "aiden": "aiden",
-            "codex": "codex",
-            "gemini": "gemini",
-            "claude": "claude",
-            "traex": "traex",
-            "grok": "grok",
-            "dsh": "dsh",
-        }
-        for mode_check, tool in mode_to_tool.items():
-            checker = getattr(self.mode_manager, f"is_{mode_check}_mode", None)
-            project_id = project.project_id if project else None
-            if callable(checker) and checker(chat_id, project_id=project_id):
-                return tool
+        project_id = project.project_id if project else None
+        mode = self.mode_manager.get_mode(chat_id, project_id=project_id)
+        if mode in PROGRAMMING_MODES:
+            return mode.value
 
         return "coco"
 
@@ -1689,7 +1663,6 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
     # Exit current mode
     # ------------------------------------------------------------------
     def exit_current_mode(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
-        from ...mode import InteractionMode
         from ...thread import get_current_thread_id, get_thread_manager, set_current_thread_id
 
         _pid = project.project_id if project else None
@@ -1720,18 +1693,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                 except ValueError:
                     logger.debug("invalid InteractionMode value: %s", thread_ctx.mode, exc_info=True)
 
-        programming_handler = {
-            InteractionMode.COCO: "coco",
-            InteractionMode.CLAUDE: "claude",
-            InteractionMode.AIDEN: "aiden",
-            InteractionMode.CODEX: "codex",
-            InteractionMode.GEMINI: "gemini",
-            InteractionMode.TRAEX: "traex",
-            InteractionMode.GROK: "grok",
-            InteractionMode.DSH: "dsh",
-        }.get(current_mode)
-        if programming_handler:
-            self.get_handler(programming_handler).exit_mode(
+        if current_mode in PROGRAMMING_MODES:
+            self.get_handler(current_mode.value).exit_mode(
                 message_id,
                 chat_id,
                 project,
@@ -1890,8 +1853,9 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
 
     def show_tools_list(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         """Show a list of all available ACP tools with quick access buttons."""
-        # Define tool names
-        names = ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"]
+        names = [
+            mode.value for mode in InteractionMode if mode in PROGRAMMING_MODES
+        ]
         emojis = {
             "coco": "🤖",
             "claude": "🔮",

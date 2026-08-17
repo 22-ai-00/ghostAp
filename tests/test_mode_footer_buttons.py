@@ -13,11 +13,10 @@ def _actions(buttons: list[dict]) -> list[str]:
     [
         None,
         InteractionMode.SMART,
-        InteractionMode.CODEX,
-        InteractionMode.AIDEN,
+        InteractionMode.SHELL,
     ],
 )
-def test_inactive_or_unhandled_mode_footer_has_no_cross_tool_entry_guidance(
+def test_non_programming_mode_footer_has_no_cross_tool_entry_guidance(
     mode: InteractionMode | None,
 ) -> None:
     actions = _actions(
@@ -32,19 +31,15 @@ def test_inactive_or_unhandled_mode_footer_has_no_cross_tool_entry_guidance(
 
 
 @pytest.mark.parametrize(
-    ("mode", "exit_action"),
+    "mode",
     [
-        (InteractionMode.COCO, "exit_coco"),
-        (InteractionMode.CLAUDE, "exit_claude"),
-        (InteractionMode.GEMINI, "exit_gemini"),
-        (InteractionMode.TRAEX, "exit_traex"),
-        (InteractionMode.GROK, "exit_grok"),
-        (InteractionMode.DSH, "exit_dsh"),
+        mode
+        for mode in InteractionMode
+        if mode not in {InteractionMode.SMART, InteractionMode.SHELL}
     ],
 )
-def test_active_mode_footer_keeps_exit_and_project_switch(
+def test_every_programming_mode_footer_reuses_generic_exit_and_project_switch(
     mode: InteractionMode,
-    exit_action: str,
 ) -> None:
     buttons = build_mode_buttons(
         mode,
@@ -52,7 +47,7 @@ def test_active_mode_footer_keeps_exit_and_project_switch(
         thread_root_id="thread-1",
     )
 
-    assert _actions(buttons) == [exit_action, "switch_project"]
+    assert _actions(buttons) == ["exit", "switch_project"]
     exit_value = buttons[0]["behaviors"][0]["value"]
     assert exit_value["project_id"] == "project-1"
     assert exit_value["thread_root_id"] == "thread-1"

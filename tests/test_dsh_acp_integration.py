@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -251,7 +252,20 @@ def test_dsh_handler_dispatch_identity_and_card_metadata_are_wired() -> None:
         button["behaviors"][0]["value"]["action"]
         for button in build_mode_buttons(InteractionMode.DSH, "project")
     ]
-    assert actions == ["exit_dsh", "switch_project"]
+    assert actions == ["exit", "switch_project"]
+
+
+def test_dsh_reuses_shared_model_and_exit_commands() -> None:
+    exit_action = next(action for action in PUBLIC_ACTIONS if action.command == "/exit")
+    integration_doc = (
+        Path(__file__).resolve().parents[1] / "docs" / "dsh_acp_integration.md"
+    ).read_text(encoding="utf-8")
+
+    assert not hasattr(IntentType, "EXIT_DSH")
+    assert "/exit_dsh" not in exit_action.aliases
+    assert "/exit_dsh" not in integration_doc
+    for tool_name in ("Codex", "Traex", "DSH"):
+        assert tool_name in integration_doc
 
 
 def test_dsh_is_available_to_workflow_agent_pools() -> None:

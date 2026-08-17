@@ -158,8 +158,8 @@
   <main>
     <h1>编程卡片 footer 收敛</h1>
     <p class="lede">
-      模型选择仍是显式配置入口；进入或完成普通编程模式后，不再用 Coco、Claude、Gemini、Traex、DSH
-      的跨工具按钮占据卡片底部，也不暗示用户需要再次选择模式。
+      /model 是所有 ACP 编程工具共享的模型入口，会自动适配当前 Codex、Traex、DSH 等后端；
+      所有编程卡片也复用同一个退出动作，避免为每个工具维护专用命令和按钮。
     </p>
 
     <section class="grid" aria-label="card previews">
@@ -186,9 +186,9 @@
             <span class="path">/data00/home/jiataorui/work/github/ghostAp</span>
             <div class="status">DeepSeek / DeepSeek-V4-Flash · high</div>
             <p>DSH 的 provider、model 与 reasoning effort 来自 ACP 实时目录。</p>
-            <p class="meta">普通任务仍使用统一主卡流；权限请求保持一次性、默认拒绝。</p>
+            <p class="meta">/model 自动定位 DSH；权限请求保持一次性、默认拒绝。</p>
             <div class="footer">
-              <button type="button">退出 DSH 模式</button>
+              <button type="button">退出编程模式</button>
               <button type="button">切换项目</button>
             </div>
           </div>
@@ -202,17 +202,21 @@
           <div class="body">
             <span class="path">/data00/home/jiataorui/work/github/ghostAp</span>
             <div class="status">会话已经初始化，可以直接发送需求</div>
-            <p>模式卡仅说明当前状态与项目范围；退出仍使用 /exit。</p>
-            <p class="meta">此卡片底部不显示任何跨工具“进入模式”按钮。</p>
+            <p>模式卡仅说明当前状态与项目范围；按钮与命令都复用统一 /exit。</p>
+            <p class="meta">此卡片底部不显示跨工具“进入模式”或后端专用退出按钮。</p>
+            <div class="footer">
+              <button type="button">退出编程模式</button>
+              <button type="button">切换项目</button>
+            </div>
           </div>
         </div>
       </article>
     </section>
 
     <aside class="decision">
-      保留：显式模型选择、刷新模型、活动模式自身的退出与项目切换。<br>
+      保留：共享 /model、刷新模型、统一 /exit 与项目切换。<br>
       移除：默认、SMART、Codex、Aiden 卡片中的 enter_coco / enter_claude /
-      enter_gemini / enter_traex / enter_dsh 引导。
+      enter_gemini / enter_traex / enter_dsh 引导，以及所有新卡片中的 exit_&lt;tool&gt; 动作。
     </aside>
   </main>
 </body>

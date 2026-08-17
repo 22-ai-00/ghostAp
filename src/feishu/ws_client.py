@@ -62,6 +62,7 @@ from ..card.ui_text import UI_TEXT
 from ..config import IngressAccessMode, get_settings
 from ..config.env_file_store import AtomicEnvFileStore
 from ..deep_engine import DeepEngineManager, ProgressReporter
+from ..mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES
 from ..project import (
     MessageLinker,
     MessageProjectMapper,
@@ -1662,7 +1663,7 @@ class FeishuWSClient:
 
                     # Resolve mode from ModeManager (single source of truth).
                     _proj_mode = self._mode_manager.get_mode(chat_id, project_id=project_id)
-                    if _proj_mode.value in {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"}:
+                    if _proj_mode in PROGRAMMING_MODES:
                         auto_enter_mode = _proj_mode.value
 
                     if auto_enter_mode:
@@ -3448,23 +3449,13 @@ class FeishuWSClient:
 
     def _dispatch_empty_text(self, message_id, chat_id, project, task_ctx, *, root_id=None):
         """处理"文本为空"的情况：在编程模式下仍转发（保持会话），否则展示帮助。"""
-        from ..mode import InteractionMode
 
         _pid = project.project_id if project else None
         if not _pid and task_ctx and task_ctx.spec.project_id:
             _pid = task_ctx.spec.project_id
 
         current_mode, _is_prog = self._get_effective_mode(chat_id, project_id=_pid)
-        if current_mode in {
-            InteractionMode.COCO,
-            InteractionMode.CLAUDE,
-            InteractionMode.AIDEN,
-            InteractionMode.CODEX,
-            InteractionMode.GEMINI,
-            InteractionMode.TRAEX,
-            InteractionMode.GROK,
-            InteractionMode.DSH,
-        }:
+        if current_mode in PROGRAMMING_MODES:
             if project is None:
                 project = self._project_manager.get_active_project(chat_id)
 
@@ -3595,8 +3586,9 @@ class FeishuWSClient:
                     or getattr(self.settings, "default_acp_tool", None)
                     or "coco"
                 ).strip().lower()
-                supported = {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"}
-                handler = handlers[tool if tool in supported else "coco"]
+                handler = handlers[
+                    tool if tool in PROGRAMMING_MODE_VALUES else "coco"
+                ]
                 if not self._current_trust_can_dispatch(
                     effective_trust, project=bound_project
                 ):

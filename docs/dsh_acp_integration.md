@@ -26,8 +26,9 @@ GhostAP 的可用性探测要求 `acp` profile 的依赖列表中存在
 
 - `/dsh` 或 `/enter_dsh`：进入持久 DSH 编程模式。
 - `/dsh_info`：查看当前会话与模型。
-- `/model`：从 DSH 实时 provider/model/reasoning effort 目录选择模型。
-- `/exit`、`/exit_dsh`：退出 DSH 编程模式。
+- `/model`：共享模型命令，自动适配当前 Codex、Traex、DSH 等 ACP 编程后端；
+  在 DSH 模式中从实时 provider/model/reasoning effort 目录选择模型。
+- `/exit`：共享退出命令，退出当前 DSH 或其他编程模式。
 - Workflow Agent Pool、Deep 与 Spec 均可使用 `dsh`。
 
 ## 协议差异

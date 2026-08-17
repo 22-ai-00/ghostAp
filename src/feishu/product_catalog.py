@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 
+from ..mode import PROGRAMMING_MODES, InteractionMode
+
 
 class CompletionLabel(str, Enum):
     MATURE = "mature"
@@ -122,8 +124,8 @@ PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/grok", "进入 Grok 编程模式", aliases=("/enter_grok",), enters_programming_mode=True, programming_mode_id="grok", protects_from_auto_activation=True),
     _action("/dsh", "进入 DSH 编程模式", aliases=("/enter_dsh",), enters_programming_mode=True, programming_mode_id="dsh", protects_from_auto_activation=True),
     _action("/acp", "查看或设置项目 ACP 工具", "/acp [工具]", protects_from_auto_activation=True),
-    _action("/model", "查看或设置项目模型", "/model [模型名|default]"),
-    _action("/exit", "退出当前编程模式", aliases=("/quit", "/end_coco", "/exit_coco", "/end_claude", "/exit_claude", "/end_aiden", "/exit_aiden", "/end_codex", "/exit_codex", "/end_gemini", "/exit_gemini", "/end_traex", "/exit_traex", "/end_grok", "/exit_grok", "/end_dsh", "/exit_dsh")),
+    _action("/model", "自适应查看或设置当前编程工具模型", "/model [模型名|default]"),
+    _action("/exit", "退出当前编程模式", aliases=("/quit", "/end_coco", "/exit_coco", "/end_claude", "/exit_claude", "/end_aiden", "/exit_aiden", "/end_codex", "/exit_codex", "/end_gemini", "/exit_gemini", "/end_traex", "/exit_traex", "/end_grok", "/exit_grok")),
     _action("/btw", "在当前编程会话中提出旁路问题", "/btw <问题>"),
     _action("/coco_status", "查看 Coco 会话状态"),
     _action("/coco_info", "查看 Coco 会话与模型信息"),
@@ -232,7 +234,9 @@ _EXECUTION_LANE_DESCRIPTORS: tuple[ExecutionLaneDescriptor, ...] = (
         "Direct 编程",
         CompletionLabel.MATURE,
         RuntimeHealth.AVAILABLE,
-        ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"),
+        tuple(
+            mode.value for mode in InteractionMode if mode in PROGRAMMING_MODES
+        ),
     ),
     ExecutionLaneDescriptor(ExecutionLane.DEEP, "deep", "Deep", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),
     ExecutionLaneDescriptor(ExecutionLane.SPEC, "spec", "Spec", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),

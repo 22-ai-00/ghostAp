@@ -67,6 +67,7 @@ SELECT_ACP_MODEL_EFFORT = "select_acp_model_effort"
 # ---------------------------------------------------------------------------
 # Global / status actions
 # ---------------------------------------------------------------------------
+EXIT_PROGRAMMING_MODE = "exit"  # Exit whichever programming backend is active
 SHOW_STATUS = "show_status"  # Show current session status card
 SHOW_BOARD = "show_board"  # Show project dashboard
 REFRESH_BOARD = "refresh_board"  # Refresh dashboard data

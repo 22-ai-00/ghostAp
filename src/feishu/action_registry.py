@@ -7,6 +7,7 @@ if TYPE_CHECKING:
 
 from ..card.actions import dispatch as action_ids
 from ..card.ui_text import UI_TEXT
+from ..mode import PROGRAMMING_MODES, InteractionMode
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,11 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
     spec = handlers["spec"]
     workflow = handlers["workflow"]
 
-    for mode in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"):
+    for interaction_mode in (
+        mode for mode in InteractionMode if mode in PROGRAMMING_MODES
+    ):
+        mode = interaction_mode.value
+
         def _show_model_selector(mid, cid, pid, val, *, _mode=mode):
             system.show_explicit_acp_model_selection(
                 mid,
@@ -48,6 +53,7 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
             )
 
         actions[f"enter_{mode}"] = _show_model_selector
+        # Compatibility for cards rendered before the shared exit action.
         actions[f"exit_{mode}"] = handlers[mode].handle_card_exit
 
     # Project
@@ -105,6 +111,11 @@ def init_action_registry(client: "FeishuWSClient") -> dict[str, Callable[[str, s
         actions[action] = workflow.handle_workflow_agent_action
 
     # System
+    actions[action_ids.EXIT_PROGRAMMING_MODE] = (
+        lambda mid, cid, pid, val: system.exit_current_mode(
+            mid, cid, _resolve_project(client, pid, cid)
+        )
+    )
     actions[action_ids.SHOW_HELP_MENU] = (
         lambda mid, cid, pid, val: system.show_full_help(
             mid, cid, _resolve_project(client, pid, cid)

@@ -19,6 +19,23 @@ class InteractionMode(Enum):
     SHELL = "shell"
 
 
+PROGRAMMING_MODES: frozenset[InteractionMode] = frozenset(
+    {
+        InteractionMode.COCO,
+        InteractionMode.CLAUDE,
+        InteractionMode.AIDEN,
+        InteractionMode.CODEX,
+        InteractionMode.GEMINI,
+        InteractionMode.TRAEX,
+        InteractionMode.GROK,
+        InteractionMode.DSH,
+    }
+)
+PROGRAMMING_MODE_VALUES: frozenset[str] = frozenset(
+    mode.value for mode in PROGRAMMING_MODES
+)
+
+
 @dataclass
 class ModeState:
     """某个 chat 或 project 的模式状态。"""
@@ -44,16 +61,6 @@ class ModeManager:
         # Key format: "{chat_id}:{project_id}" — ensures cross-chat isolation.
         self._project_modes: dict[str, ModeState] = {}
         self._lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-        self._programming_modes = (
-            InteractionMode.COCO,
-            InteractionMode.CLAUDE,
-            InteractionMode.AIDEN,
-            InteractionMode.CODEX,
-            InteractionMode.GEMINI,
-            InteractionMode.TRAEX,
-            InteractionMode.GROK,
-            InteractionMode.DSH,
-        )
 
     @staticmethod
     def _project_key(chat_id: str, project_id: str) -> str:
@@ -169,7 +176,7 @@ class ModeManager:
         project_id: Optional[str] = None,
     ) -> InteractionMode:
         """统一进入编程模式入口。"""
-        if mode not in self._programming_modes:
+        if mode not in PROGRAMMING_MODES:
             raise ValueError(f"mode must be a programming mode, got: {mode}")
         return self.set_mode(chat_id, mode, auto_entered=auto, project_id=project_id)
 
@@ -263,7 +270,7 @@ class ModeManager:
     def is_programming_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断是否处于编程模式。"""
         mode = self.get_mode(chat_id, project_id)
-        return mode in self._programming_modes
+        return mode in PROGRAMMING_MODES
 
     def get_mode_display_name(self, chat_id: str, project_id: Optional[str] = None) -> str:
         """返回当前模式的 UI 展示名。"""

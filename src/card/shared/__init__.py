@@ -2,8 +2,9 @@
 
 from typing import Optional
 
-from src.mode.manager import InteractionMode
+from src.mode.manager import PROGRAMMING_MODES, InteractionMode
 
+from ..actions import dispatch as action_ids
 from ..buttons_config import BUTTON_CONFIG
 from ..themes import THEMES, ProjectTheme
 from ..ui_text import UI_TEXT
@@ -67,23 +68,16 @@ def build_mode_buttons(
     """Build mode-specific footer buttons (exit/enter mode + switch project)."""
     buttons = []
 
-    if mode == InteractionMode.CLAUDE:
-        buttons.append(_create_mode_button("exit_claude", "exit_claude", project_id, thread_root_id, button_size=button_size))
-        buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
-    elif mode == InteractionMode.COCO:
-        buttons.append(_create_mode_button("exit_coco", "exit_coco", project_id, thread_root_id, button_size=button_size))
-        buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
-    elif mode == InteractionMode.GEMINI:
-        buttons.append(_create_mode_button("exit_gemini", "exit_gemini", project_id, thread_root_id, button_size=button_size))
-        buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
-    elif mode == InteractionMode.TRAEX:
-        buttons.append(_create_mode_button("exit_traex", "exit_traex", project_id, thread_root_id, button_size=button_size))
-        buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
-    elif mode == InteractionMode.GROK:
-        buttons.append(_create_mode_button("exit_grok", "exit_grok", project_id, thread_root_id, button_size=button_size))
-        buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
-    elif mode == InteractionMode.DSH:
-        buttons.append(_create_mode_button("exit_dsh", "exit_dsh", project_id, thread_root_id, button_size=button_size))
+    if mode in PROGRAMMING_MODES:
+        buttons.append(
+            _create_mode_button(
+                "exit",
+                action_ids.EXIT_PROGRAMMING_MODE,
+                project_id,
+                thread_root_id,
+                button_size=button_size,
+            )
+        )
         buttons.append(_create_mode_button("switch_project", "switch_project", button_size=button_size))
 
     return [b for b in buttons if b]

@@ -446,6 +446,31 @@ def test_model_command_without_arguments_opens_the_shared_selector(
     system.reply_text.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "mode"),
+    [(name, InteractionMode(name)) for name, _handler, _model in BACKENDS],
+)
+def test_model_command_adapts_to_every_active_programming_backend(
+    tmp_path,
+    tool_name: str,
+    mode: InteractionMode,
+):
+    _storage, _projects, first, _second, ctx, system = _configuration_lane(tmp_path)
+    first.acp_tool_name = None
+    first.acp_model_name = None
+    ctx.mode_manager.get_mode.return_value = mode
+    system.show_explicit_acp_model_selection = MagicMock()
+
+    system.handle_model_command("model", "chat-first", "/model", first)
+
+    system.show_explicit_acp_model_selection.assert_called_once_with(
+        "model",
+        "chat-first",
+        tool_name,
+        first,
+    )
+
+
 def _install_single_tool_registration(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -869,6 +894,16 @@ def test_model_actions_are_registered_to_the_system_controller(tmp_path):
     system.handle_refresh_acp_models.assert_called_once_with(
         "m", "c", first.project_id, value
     )
+
+
+def test_generic_exit_card_action_delegates_to_current_mode_controller(tmp_path):
+    _storage, _projects, first, _second, _ctx, system = _configuration_lane(tmp_path)
+    system.exit_current_mode = MagicMock()
+    actions = init_action_registry(_action_registry_client(first, system))
+
+    actions["exit"]("m", "chat-first", first.project_id, {})
+
+    system.exit_current_mode.assert_called_once_with("m", "chat-first", first)
 
 
 def test_cascade_redraw_uses_the_server_visible_option_and_resets_downstream(

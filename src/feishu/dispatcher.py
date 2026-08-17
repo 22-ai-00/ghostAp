@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 from ..agent.intent_recognizer import IntentType
 from ..card.ui_text import UI_TEXT
+from ..mode import PROGRAMMING_MODE_VALUES
 from ..utils.errors import get_error_detail
 from .emoji import EmojiReaction
 from .message_formatter import FeishuMessageFormatter as fmt
@@ -262,7 +263,7 @@ class MessageDispatcher:
             )
         ) is ActionDecision.ALLOW
 
-    _PROGRAMMING_MODES = frozenset({"coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"})
+    _PROGRAMMING_MODES = PROGRAMMING_MODE_VALUES
 
     _ENGINE_ENTER_MAP: dict = {
         IntentType.ENTER_DEEP: ("deep", "start_deep_engine"),

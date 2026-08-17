@@ -170,7 +170,7 @@ PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就�
 | `/help` | 查看完整帮助 |
 | `/coco`、`/claude`、`/aiden`、`/codex`、`/gemini`、`/traex`、`/grok`、`/dsh` | 进入对应编程模式 |
 | `/coco_info`、`/claude_info`、`/aiden_info`、`/codex_info`、`/gemini_info`、`/traex_info`、`/grok_info`、`/dsh_info` | 查看对应编程会话与模型信息 |
-| `/model`、`/model list`、`/model <name>` | 查看或切换当前 ACP 工具模型 |
+| `/model`、`/model list`、`/model <name>` | 自动适配并查看或切换当前 ACP 工具（Codex、Traex、DSH 等）的模型 |
 | `/acp` | 查看 ACP 工具选择入口 |
 | `/exit` | 退出当前模式，回到 Smart |
 

@@ -32,7 +32,7 @@ from ...card.builders.system import SystemBuilder
 from ...card.hooks import EmojiHook
 from ...card.session.config import SessionCallbacks
 from ...card.ui_text import UI_TEXT
-from ...mode import InteractionMode
+from ...mode import PROGRAMMING_MODE_VALUES, InteractionMode
 from ...project import ContextSourceMode
 from ...utils.errors import get_error_detail, log_exception
 from ..emoji import EmojiReaction
@@ -660,7 +660,7 @@ class ProgrammingModeHandler(BaseHandler):
     def _set_mode_on_project(self, project: "ProjectContext", active: bool, session_id: str = "", count: int = 0):
         if active:
             project.set_programming_mode(self.mode_key, True, session_id, count)
-            if self.mode_key in {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"}:
+            if self.mode_key in PROGRAMMING_MODE_VALUES:
                 project.acp_tool_name = self.mode_key
         else:
             project.set_programming_mode(self.mode_key, False)

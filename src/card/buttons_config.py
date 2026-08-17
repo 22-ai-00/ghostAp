@@ -21,12 +21,7 @@ BUTTON_CONFIG = {
     "mode_compact": {"text": UI_TEXT["card_btn_mode_compact"], "type": "default"},
     "history": {"text": "📜 历史", "type": "default"},
     # Mode Switch & Project Buttons
-    "exit_claude": {"text": "🚪 退出 Claude 模式", "type": "default"},
-    "exit_coco": {"text": "🚪 退出 Coco 模式", "type": "default"},
-    "exit_gemini": {"text": "🚪 退出 Gemini 模式", "type": "default"},
-    "exit_traex": {"text": "🚪 退出 Traex 模式", "type": "default"},
-    "exit_grok": {"text": "🚪 退出 Grok 模式", "type": "default"},
-    "exit_dsh": {"text": "🚪 退出 DSH 模式", "type": "default"},
+    "exit": {"text": "🚪 退出编程模式", "type": "default"},
     "enter_coco": {"text": "🤖 进入 Coco 模式", "type": "default"},
     "enter_claude": {"text": "🔮 进入 Claude 模式", "type": "default"},
     "enter_gemini": {"text": "✨ 进入 Gemini 模式", "type": "default"},
