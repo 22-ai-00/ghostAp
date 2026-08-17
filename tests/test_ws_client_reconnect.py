@@ -20,7 +20,10 @@ def test_ws_health_logs_recovery_duration_after_disconnect(
     from src.feishu.ws_health import WSHealthMonitor
 
     now = iter((100.0, 110.0, 112.5))
-    monkeypatch.setattr("src.feishu.ws_health.time.time", lambda: next(now))
+    monkeypatch.setattr(
+        "src.feishu.ws_health.time",
+        SimpleNamespace(time=lambda: next(now)),
+    )
     monitor = WSHealthMonitor(SimpleNamespace(), SimpleNamespace())
 
     with caplog.at_level("INFO", logger="src.feishu.ws_health"):
