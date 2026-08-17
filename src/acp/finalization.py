@@ -30,6 +30,7 @@ class _PromptSession(Protocol):
         text: str,
         on_event: Callable[[ACPEvent], None] | None = None,
         timeout: float | int | None = None,
+        idle_timeout: float | int | None = None,
     ) -> PromptResult: ...
 
 
@@ -190,20 +191,16 @@ def _send_runtime_finalization_prompt(
     *,
     on_event: Callable[[ACPEvent], None] | None,
     timeout: float | int,
+    idle_timeout: float | int | None,
 ) -> PromptResult:
     """Use a single-turn collector when the concrete session supports it."""
     method = getattr(session, "send_finalization_prompt", None)
+    kwargs = {"on_event": on_event, "timeout": timeout}
+    if idle_timeout is not None:
+        kwargs["idle_timeout"] = idle_timeout
     if callable(method):
-        return method(
-            text,
-            on_event=on_event,
-            timeout=timeout,
-        )
-    return session.send_prompt(
-        text,
-        on_event=on_event,
-        timeout=timeout,
-    )
+        return method(text, **kwargs)
+    return session.send_prompt(text, **kwargs)
 
 
 def _send_primary_prompt(
@@ -212,21 +209,17 @@ def _send_primary_prompt(
     *,
     on_event: Callable[[ACPEvent], None] | None,
     timeout: float | int,
+    idle_timeout: float | int | None,
     replay_deferred_child_events: bool,
 ) -> PromptResult:
+    kwargs = {"on_event": on_event, "timeout": timeout}
+    if idle_timeout is not None:
+        kwargs["idle_timeout"] = idle_timeout
     if replay_deferred_child_events:
         method = getattr(session, "send_continuation_prompt", None)
         if callable(method):
-            return method(
-                text,
-                on_event=on_event,
-                timeout=timeout,
-            )
-    return session.send_prompt(
-        text,
-        on_event=on_event,
-        timeout=timeout,
-    )
+            return method(text, **kwargs)
+    return session.send_prompt(text, **kwargs)
 
 
 def run_prompt_with_finalization(
@@ -236,6 +229,7 @@ def run_prompt_with_finalization(
     on_event: Callable[[ACPEvent], None] | None = None,
     timeout_s: float | int,
     finalization_reserve_s: float | int,
+    idle_timeout_s: float | int | None = None,
     finalization_task_text: str | None = None,
     on_finalization_start: Callable[[], None] | None = None,
     replace_dead_session: Callable[[float], SessionT] | None = None,
@@ -254,6 +248,7 @@ def run_prompt_with_finalization(
                 text,
                 on_event=on_event,
                 timeout=primary_timeout,
+                idle_timeout=idle_timeout_s,
                 replay_deferred_child_events=replay_deferred_child_events,
             )
         except TimeoutError as exc:
@@ -283,6 +278,7 @@ def run_prompt_with_finalization(
             text,
             on_event=on_event,
             timeout=primary_timeout,
+            idle_timeout=idle_timeout_s,
             replay_deferred_child_events=replay_deferred_child_events,
         )
     except TimeoutError as exc:
@@ -349,6 +345,7 @@ def run_prompt_with_finalization(
             ),
             on_event=on_event,
             timeout=final_timeout_arg,
+            idle_timeout=idle_timeout_s,
         )
     except Exception as finalization_error:
         try:

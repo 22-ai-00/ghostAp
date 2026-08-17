@@ -8,6 +8,7 @@ attributes; the base class provides default implementations for all hooks.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -49,6 +50,7 @@ _BTW_EVENT_TEXT_LIMIT = 600
 _BTW_SNAPSHOT_LIMIT = 12_000
 _BTW_STARTUP_TIMEOUT_S = 30.0
 _BTW_PROMPT_TIMEOUT_S = 90
+_SAFE_FEISHU_APP_ID = re.compile(r"cli_[A-Za-z0-9_-]{1,256}\Z")
 
 
 def _bounded_btw_text(value: object, limit: int = _BTW_EVENT_TEXT_LIMIT) -> str:
@@ -182,6 +184,16 @@ def _configured_execution_windows(settings: object) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int):
         return 1
     return min(24, max(1, raw))
+
+
+def _configured_programming_idle_timeout(
+    settings: object,
+) -> int | None:
+    raw = getattr(settings, "programming_agent_idle_timeout_s", 0)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    value = max(0, int(raw))
+    return value or None
 
 
 def _finalization_incomplete_reason(
@@ -1218,6 +1230,23 @@ class ProgrammingModeHandler(BaseHandler):
     # ------------------------------------------------------------------
     # handle_response (streaming / non-streaming)
     # ------------------------------------------------------------------
+    def _notify_programming_text_fallback(self, message_id: str) -> None:
+        """Make a transport downgrade visible before the blocking ACP turn."""
+
+        notice = UI_TEXT["mode_stream_fallback_running"]
+        app_id = str(getattr(self.settings, "app_id", "") or "").strip()
+        if _SAFE_FEISHU_APP_ID.fullmatch(app_id) is not None:
+            permission_url = (
+                f"https://open.feishu.cn/app/{app_id}/auth"
+                "?q=cardkit:card:write&op_from=openapi&token_type=tenant"
+            )
+            notice = (
+                f"{notice}\n"
+                f"{UI_TEXT['mode_stream_fallback_permission_hint']}\n"
+                f"{permission_url}"
+            )
+        self.reply_text(message_id, notice)
+
     def handle_response(
         self, message_id: str, chat_id: str, text: str, session: SyncSession, project, cwd: str, global_working_dir: str,
         *, _repo_lock_mgr=None, _root_path: str | None = None,
@@ -1244,6 +1273,7 @@ class ProgrammingModeHandler(BaseHandler):
         channel_client_factory = self.ctx.channel_client_factory
         if not callable(channel_client_factory):
             logger.warning("lark-channel 客户端不可用，回退到非流式文本输出")
+            self._notify_programming_text_fallback(message_id)
             self._handle_response_non_streaming(
                 message_id, chat_id, text, session, project, global_working_dir,
                 _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
@@ -1268,6 +1298,7 @@ class ProgrammingModeHandler(BaseHandler):
                 "初始化 lark-channel 卡片客户端失败，回退到非流式文本输出: %s",
                 str(exc),
             )
+            self._notify_programming_text_fallback(message_id)
             self._handle_response_non_streaming(
                 message_id, chat_id, text, session, project, global_working_dir,
                 _repo_lock_mgr=_repo_lock_mgr, _root_path=_root_path,
@@ -1317,6 +1348,7 @@ class ProgrammingModeHandler(BaseHandler):
                 timeout=delivery_timeout,
             )
         if fallback_to_text:
+            self._notify_programming_text_fallback(message_id)
             self._handle_response_non_streaming(
                 message_id,
                 chat_id,
@@ -1575,6 +1607,9 @@ class ProgrammingModeHandler(BaseHandler):
                 on_event=on_event,
                 timeout_s=timeout,
                 finalization_reserve_s=_configured_finalization_reserve(
+                    self.settings
+                ),
+                idle_timeout_s=_configured_programming_idle_timeout(
                     self.settings
                 ),
                 finalization_task_text=_finalization_task_text,

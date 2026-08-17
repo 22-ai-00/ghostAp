@@ -555,6 +555,14 @@ UI_TEXT = {
     "mode_exec_exception_title": "执行异常",
     "mode_exec_timeout_msg": "⏳ 执行超时: {error}",
     "mode_exec_exception_msg": "❌ 执行异常: {error}",
+    "mode_stream_fallback_running": (
+        "⚠️ 流式编程卡片当前不可用，已切换为普通文本；任务仍在执行，"
+        "完成或失败后会在这里明确回复。"
+    ),
+    "mode_stream_fallback_permission_hint": (
+        "如尚未开通卡片权限，可点击下方链接申请并发布；"
+        "不开通也不影响本次任务继续使用普通文本："
+    ),
     "mode_working_dir_label": "📁 工作目录: `{path}`",
     # --- Card lifecycle strings ---
     "card_lifecycle_thinking": "💭 正在思考…",

@@ -1030,44 +1030,53 @@ class SyncACPSession(PromptGenerationTracker):
         text: str,
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         timeout: Optional[int] = None,
+        idle_timeout: Optional[float] = None,
     ) -> PromptResult:
         """Run the terminal cleanup turn without following new Goal turns."""
-        return self.send_prompt(
-            text,
-            on_event=on_event,
-            timeout=timeout,
-            await_goal_quiescence=False,
-            replay_deferred_child_events=True,
-        )
+        kwargs = {
+            "on_event": on_event,
+            "timeout": timeout,
+            "await_goal_quiescence": False,
+            "replay_deferred_child_events": True,
+        }
+        if idle_timeout is not None:
+            kwargs["idle_timeout"] = idle_timeout
+        return self.send_prompt(text, **kwargs)
 
     def send_continuation_prompt(
         self,
         text: str,
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         timeout: Optional[int] = None,
+        idle_timeout: Optional[float] = None,
     ) -> PromptResult:
         """Continue the same logical task with deferred child evidence."""
-        return self.send_prompt(
-            text,
-            on_event=on_event,
-            timeout=timeout,
-            replay_deferred_child_events=True,
-        )
+        kwargs = {
+            "on_event": on_event,
+            "timeout": timeout,
+            "replay_deferred_child_events": True,
+        }
+        if idle_timeout is not None:
+            kwargs["idle_timeout"] = idle_timeout
+        return self.send_prompt(text, **kwargs)
 
     def send_reconciliation_prompt(
         self,
         text: str,
         on_event: Optional[Callable[[ACPEvent], None]] = None,
         timeout: Optional[int] = None,
+        idle_timeout: Optional[float] = None,
     ) -> PromptResult:
         """Keep collecting until every observed transient child is terminal."""
-        return self.send_prompt(
-            text,
-            on_event=on_event,
-            timeout=timeout,
-            await_child_quiescence=not self._uses_official_codex_acp(),
-            replay_deferred_child_events=True,
-        )
+        kwargs = {
+            "on_event": on_event,
+            "timeout": timeout,
+            "await_child_quiescence": not self._uses_official_codex_acp(),
+            "replay_deferred_child_events": True,
+        }
+        if idle_timeout is not None:
+            kwargs["idle_timeout"] = idle_timeout
+        return self.send_prompt(text, **kwargs)
 
     def enrich_child_reconciliation_result(
         self,

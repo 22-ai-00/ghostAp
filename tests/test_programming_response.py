@@ -93,12 +93,14 @@ class _QueuedPromptSession:
         self._results = list(results)
         self._first_event = first_event
         self.calls: list[tuple[str, object, float | int | None]] = []
+        self.idle_timeouts: list[float | int | None] = []
         self._force_dead = False
         self.session_id = "queued-session"
         self.message_count = 1
 
-    def send_prompt(self, text, on_event=None, timeout=None):
+    def send_prompt(self, text, on_event=None, timeout=None, idle_timeout=None):
         self.calls.append((text, on_event, timeout))
+        self.idle_timeouts.append(idle_timeout)
         if len(self.calls) == 1 and self._first_event is not None:
             on_event(self._first_event)
         result = self._results.pop(0)
@@ -187,6 +189,8 @@ def _make_handler():
     ctx.settings = MagicMock()
     ctx.settings.claude_execution_timeout = 600
     ctx.settings.coco_execution_timeout = 600
+    ctx.settings.programming_agent_idle_timeout_s = 420
+    ctx.settings.app_id = "cli_test"
     ctx.settings.repo_lock_hard_timeout = 3600
     ctx.api_client_factory = MagicMock()
     ctx.pending_image_lock = nullcontext()
@@ -573,6 +577,9 @@ def test_programming_owned_delivery_shuts_down_after_initial_card_fallback():
     handler = _make_handler()
     handler.ctx.channel_client_factory = MagicMock(return_value=object())
     call_order: list[str] = []
+    handler.reply_text.side_effect = lambda *_args, **_kwargs: (
+        call_order.append("notice") or "notice-message"
+    )
     handler._handle_response_non_streaming = MagicMock(
         side_effect=lambda *_args, **_kwargs: call_order.append("fallback")
     )
@@ -601,7 +608,15 @@ def test_programming_owned_delivery_shuts_down_after_initial_card_fallback():
 
     delivery.shutdown.assert_called_once()
     handler._handle_response_non_streaming.assert_called_once()
-    assert call_order == ["shutdown", "fallback"]
+    assert call_order == ["shutdown", "notice", "fallback"]
+    notice = handler.reply_text.call_args.args[1]
+    assert "已切换为普通文本" in notice
+    assert "任务仍在执行" in notice
+    assert "cardkit:card:write" in notice
+    assert (
+        "https://open.feishu.cn/app/cli_test/auth"
+        "?q=cardkit:card:write&op_from=openapi&token_type=tenant"
+    ) in notice
 
 
 def test_programming_owned_delivery_shuts_down_when_execution_raises():
@@ -648,6 +663,7 @@ def test_streaming_pending_plan_continues_on_same_session_and_finishes():
 
     adapter = _FakeProgrammingCardSession.last
     assert len(session.calls) == 2
+    assert session.idle_timeouts == [420, 420]
     assert session.calls[0][0] == "finish the task"
     assert "自动续做指令" in session.calls[1][0]
     assert adapter.continuation_boundaries == 1
@@ -1113,6 +1129,8 @@ def test_programming_handle_response_falls_back_when_channel_is_unavailable():
         _root_path=None,
         _finalization_task_text=None,
     )
+    handler.reply_text.assert_called_once()
+    assert "任务仍在执行" in handler.reply_text.call_args.args[1]
     session.send_prompt.assert_not_called()
 
 

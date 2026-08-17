@@ -147,6 +147,17 @@
       line-height: 1.6;
     }
 
+    .message {
+      padding: 18px 20px;
+      border: 1px solid #b9c9e8;
+      border-radius: 14px;
+      background: #eef4ff;
+      box-shadow: var(--shadow);
+      line-height: 1.65;
+    }
+
+    .message a { color: var(--blue); }
+
     @media (max-width: 760px) {
       main { padding-top: 32px; }
       .grid { grid-template-columns: 1fr; }
@@ -211,12 +222,22 @@
           </div>
         </div>
       </article>
+
+      <article class="sample">
+        <div class="label">CardKit permission fallback</div>
+        <div class="message">
+          ⚠️ 流式编程卡片当前不可用，已切换为普通文本；任务仍在执行，完成或失败后会在这里明确回复。<br><br>
+          如尚未开通卡片权限，可点击下方链接申请并发布；不开通也不影响本次任务继续使用普通文本：<br>
+          <a href="#">申请 cardkit:card:write 权限</a>
+        </div>
+      </article>
     </section>
 
     <aside class="decision">
       保留：共享 /model、刷新模型、统一 /exit 与项目切换。<br>
       移除：默认、SMART、Codex、Aiden 卡片中的 enter_coco / enter_claude /
-      enter_gemini / enter_traex / enter_dsh 引导，以及所有新卡片中的 exit_&lt;tool&gt; 动作。
+      enter_gemini / enter_traex / enter_dsh 引导，以及所有新卡片中的 exit_&lt;tool&gt; 动作。<br>
+      CardKit 缺权只降级输出传输；纯文本先回执运行状态，并提供应用绑定的一键申请链接。
     </aside>
   </main>
 </body>

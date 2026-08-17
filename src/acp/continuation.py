@@ -106,6 +106,7 @@ class _PromptSession(Protocol):
         text: str,
         on_event: Callable[[ACPEvent], None] | None = None,
         timeout: float | int | None = None,
+        idle_timeout: float | int | None = None,
     ) -> PromptResult: ...
 
 
@@ -270,11 +271,15 @@ def _send_child_reconciliation_prompt(
     *,
     on_event: Callable[[ACPEvent], None] | None,
     timeout: float | int,
+    idle_timeout: float | int | None,
 ) -> PromptResult:
+    kwargs = {"on_event": on_event, "timeout": timeout}
+    if idle_timeout is not None:
+        kwargs["idle_timeout"] = idle_timeout
     method = getattr(session, "send_reconciliation_prompt", None)
     if callable(method):
-        return method(text, on_event=on_event, timeout=timeout)
-    return session.send_prompt(text, on_event=on_event, timeout=timeout)
+        return method(text, **kwargs)
+    return session.send_prompt(text, **kwargs)
 
 
 def _retire_reconciliation_timeout(
@@ -383,6 +388,7 @@ def run_prompt_with_continuation(
     on_event: Callable[[ACPEvent], None] | None = None,
     timeout_s: float | int,
     finalization_reserve_s: float | int,
+    idle_timeout_s: float | int | None = None,
     finalization_task_text: str | None = None,
     on_finalization_start: Callable[[], None] | None = None,
     on_continuation_start: Callable[[], None] | None = None,
@@ -424,6 +430,7 @@ def run_prompt_with_continuation(
             on_event=on_event,
             timeout_s=turn_timeout_s,
             finalization_reserve_s=finalization_reserve_s,
+            idle_timeout_s=idle_timeout_s,
             finalization_task_text=finalization_scope,
             on_finalization_start=mark_finalization_start,
             replace_dead_session=replace_dead_session,
@@ -556,6 +563,7 @@ def run_prompt_with_continuation(
                     continuation_prompt,
                     on_event=on_event,
                     timeout=reconciliation_timeout,
+                    idle_timeout=idle_timeout_s,
                 )
                 reconciliation_finished_at = time.time()
             except TimeoutError as timeout_error:

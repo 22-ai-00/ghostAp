@@ -38,6 +38,22 @@ class _TimeoutThenCompleteSession:
         return PromptResult(stop_reason="end_turn", text="finalized")
 
 
+class _IdleAwareCompleteSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, float | int | None, float | int | None]] = []
+        self._force_dead = False
+
+    def send_prompt(
+        self,
+        text: str,
+        on_event: Callable[[object], None] | None = None,
+        timeout: float | int | None = None,
+        idle_timeout: float | int | None = None,
+    ) -> PromptResult:
+        self.calls.append((text, timeout, idle_timeout))
+        return PromptResult(stop_reason="end_turn", text="done")
+
+
 class _ActiveGoalTimeoutThenCompleteSession(_TimeoutThenCompleteSession):
     def __init__(self) -> None:
         super().__init__()
@@ -107,6 +123,21 @@ def test_timeout_reserves_a_second_prompt_for_safe_finalization() -> None:
     assert "最终答复" in finalization_prompt
 
 
+def test_primary_prompt_receives_activity_idle_timeout() -> None:
+    session = _IdleAwareCompleteSession()
+
+    result = _runner()(
+        session,
+        "slow provider task",
+        timeout_s=600,
+        finalization_reserve_s=0,
+        idle_timeout_s=300,
+    )
+
+    assert result.text == "done"
+    assert session.calls == [("slow provider task", 573, 300)]
+
+
 def test_timeout_finalization_uses_single_turn_entrypoint_when_supported() -> None:
     session = _SingleTurnTimeoutThenCompleteSession()
 
@@ -146,6 +177,35 @@ def test_sync_finalization_prompt_does_not_follow_new_goal_turns() -> None:
         "finalize",
         on_event=None,
         timeout=30,
+        await_goal_quiescence=False,
+        replay_deferred_child_events=True,
+    )
+
+
+def test_sync_finalization_prompt_preserves_activity_idle_timeout() -> None:
+    session = object.__new__(SyncACPSession)
+    expected = PromptResult(stop_reason="end_turn", text="finalized")
+
+    with patch.object(
+        SyncACPSession,
+        "send_prompt",
+        autospec=True,
+        return_value=expected,
+    ) as send_prompt:
+        result = SyncACPSession.send_finalization_prompt(
+            session,
+            "finalize",
+            timeout=600,
+            idle_timeout=420,
+        )
+
+    assert result is expected
+    send_prompt.assert_called_once_with(
+        session,
+        "finalize",
+        on_event=None,
+        timeout=600,
+        idle_timeout=420,
         await_goal_quiescence=False,
         replay_deferred_child_events=True,
     )

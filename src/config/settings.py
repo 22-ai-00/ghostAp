@@ -88,6 +88,15 @@ class Settings(BaseSettings):
             "a fresh transport between windows."
         ),
     )
+    programming_agent_idle_timeout_s: int = Field(
+        default=420,
+        ge=0,
+        description=(
+            "Activity-based idle timeout for ordinary programming ACP turns. "
+            "ACP text, thought, plan, and tool events refresh the timer while "
+            "the execution timeout remains the hard cap. Set 0 to disable."
+        ),
+    )
 
     # ACP session history directory (empty = default ~/.ghostap/acp_history)
     acp_history_dir: str = ""
