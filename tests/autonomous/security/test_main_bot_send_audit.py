@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
+import src.autonomous.journal.writer as writer_module
 from src.autonomous.acceptance.main_bot_audit import MainBotSendAuditLog
 from src.autonomous.journal.anchor import FileAnchor
+from src.autonomous.journal.frame import JournalIntegrityError
 from src.autonomous.journal.writer import JournalWriter
 
 
@@ -46,6 +49,97 @@ def test_main_bot_target_audit_ignores_unrelated_messages(tmp_path: Path) -> Non
 
     assert audit.count_target_attempts("tenant-a", target_hash, 99.0, 102.0) == 1
     audit.close()
+
+
+def test_main_bot_audit_reopens_from_anchored_tail_without_history_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = tmp_path / "audit"
+    anchor_path = tmp_path / "audit.anchor"
+    audit = MainBotSendAuditLog.open(
+        directory,
+        anchor_path=anchor_path,
+        hmac_key=b"a" * 32,
+        writer_epoch=1,
+    )
+    audit.record_attempt("tenant-a", "reply", "om_1", attempted_at=100.0)
+    audit.record_attempt("tenant-a", "patch", "om_1", attempted_at=101.0)
+    audit.close()
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            writer_module.JournalWriter,
+            "_load_and_recover",
+            lambda *_args, **_kwargs: pytest.fail("audit startup replayed history"),
+        )
+        reopened = MainBotSendAuditLog.open(
+            directory,
+            anchor_path=anchor_path,
+            hmac_key=b"a" * 32,
+            writer_epoch=2,
+        )
+        try:
+            assert reopened.activation_fence_ready is True
+            reopened.record_attempt(
+                "tenant-a",
+                "reply",
+                "om_2",
+                attempted_at=102.0,
+            )
+        finally:
+            reopened.close()
+
+    verified = MainBotSendAuditLog.open(
+        directory,
+        anchor_path=anchor_path,
+        hmac_key=b"a" * 32,
+        writer_epoch=3,
+    )
+    try:
+        assert verified.count_attempts("tenant-a", 99.0, 103.0) == 3
+    finally:
+        verified.close()
+
+
+def test_history_replay_failure_marks_fast_opened_audit_incomplete(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "audit"
+    anchor_path = tmp_path / "audit.anchor"
+    audit = MainBotSendAuditLog.open(
+        directory,
+        anchor_path=anchor_path,
+        hmac_key=b"a" * 32,
+        writer_epoch=1,
+    )
+    audit.record_attempt("tenant-a", "reply", "om_1", attempted_at=100.0)
+    audit.record_attempt("tenant-a", "reply", "om_2", attempted_at=101.0)
+    audit.close()
+
+    reopened = MainBotSendAuditLog.open(
+        directory,
+        anchor_path=anchor_path,
+        hmac_key=b"a" * 32,
+        writer_epoch=2,
+    )
+    records = (directory / "journal.jsonl").read_bytes().splitlines(keepends=True)
+    first = json.loads(records[0])
+    digest = first["hmac_digest"]
+    first["hmac_digest"] = ("0" if digest[0] != "0" else "1") + digest[1:]
+    records[0] = json.dumps(
+        first,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode() + b"\n"
+    (directory / "journal.jsonl").write_bytes(b"".join(records))
+
+    try:
+        with pytest.raises(JournalIntegrityError, match="hmac"):
+            reopened.count_attempts("tenant-a", 99.0, 102.0)
+        assert reopened.activation_fence_ready is False
+    finally:
+        reopened.close()
 
 
 def test_activation_fence_serializes_outbound_record_until_commit_window_closes(

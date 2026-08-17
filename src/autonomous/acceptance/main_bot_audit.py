@@ -44,11 +44,12 @@ class MainBotSendAuditLog:
         external_audit: Any = None,
     ) -> MainBotSendAuditLog:
         return cls(
-            JournalWriter.open(
+            JournalWriter.open_at_verified_tail(
                 Path(directory).expanduser(),
                 anchor=anchor if anchor is not None else FileAnchor(anchor_path),
                 hmac_key=hmac_key,
                 writer_epoch=writer_epoch if writer_epoch is not None else time.time_ns(),
+                aggregate_id=_AGGREGATE_ID,
             ),
             external_audit=external_audit,
         )
@@ -261,22 +262,26 @@ class MainBotSendAuditLog:
                 raise RuntimeError("main Bot send audit is incomplete")
             local_count = 0
             tenant_hash = hashlib.sha256(tenant_key.encode("utf-8")).hexdigest()
-            for frame in self.writer.replay():
-                for event in frame.events:
-                    if event.event_type != _EVENT_TYPE:
-                        continue
-                    payload = event.payload
-                    attempted_at = payload.get("attempted_at")
-                    event_tenant = payload.get("tenant_hash")
-                    event_target = payload.get("target_hash")
-                    if (
-                        isinstance(attempted_at, (int, float))
-                        and not isinstance(attempted_at, bool)
-                        and float(start) <= float(attempted_at) <= float(end)
-                        and event_tenant in {"", tenant_hash}
-                        and (target_hash is None or event_target == target_hash)
-                    ):
-                        local_count += 1
+            try:
+                for frame in self.writer.replay():
+                    for event in frame.events:
+                        if event.event_type != _EVENT_TYPE:
+                            continue
+                        payload = event.payload
+                        attempted_at = payload.get("attempted_at")
+                        event_tenant = payload.get("tenant_hash")
+                        event_target = payload.get("target_hash")
+                        if (
+                            isinstance(attempted_at, (int, float))
+                            and not isinstance(attempted_at, bool)
+                            and float(start) <= float(attempted_at) <= float(end)
+                            and event_tenant in {"", tenant_hash}
+                            and (target_hash is None or event_target == target_hash)
+                        ):
+                            local_count += 1
+            except BaseException:
+                self._complete = False
+                raise
             if self.external_audit is None:
                 return local_count
             if target_hash is None:

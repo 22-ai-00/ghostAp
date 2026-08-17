@@ -225,6 +225,119 @@ def test_second_writer_fails_nonblocking_and_close_releases_lock(
         assert list(reopened.replay(from_sequence=1)) == []
 
 
+def test_verified_tail_open_skips_full_replay_and_preserves_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_dir = tmp_path / "journal"
+    anchor = MemoryAnchor()
+    writer = open_writer(base_dir, anchor)
+    for version in range(3):
+        result = writer.commit(
+            [event(event_type="audit.recorded", value=str(version))],
+            {"goal_1": version},
+        )
+        assert commit_state(result) is CommitState.ANCHORED
+    writer.close()
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            JournalWriter,
+            "_load_and_recover",
+            lambda *_args, **_kwargs: pytest.fail("verified-tail open replayed history"),
+        )
+        reopened = JournalWriter.open_at_verified_tail(
+            base_dir,
+            anchor=anchor,
+            hmac_key=HMAC_KEY,
+            writer_epoch=8,
+            aggregate_id="goal_1",
+        )
+        try:
+            assert reopened.get_aggregate_versions(("goal_1",)) == {"goal_1": 3}
+            assert len(reopened._frames) == 1  # noqa: SLF001
+            fourth = reopened.commit(
+                [event(event_type="audit.recorded", value="3")],
+                {"goal_1": 3},
+            )
+            assert commit_state(fourth) is CommitState.ANCHORED
+            assert len(reopened._frames) == 1  # noqa: SLF001
+            with pytest.raises(JournalIntegrityError, match="does not contain"):
+                reopened.committed_tail(1)
+            tail_anchor, tail = reopened.committed_tail(4)
+            assert tail_anchor.sequence == 4
+            assert [frame.sequence for frame in tail] == [4]
+        finally:
+            reopened.close()
+
+    with open_writer(base_dir, anchor, writer_epoch=9) as verified:
+        frames = tuple(verified.replay())
+    assert [frame.sequence for frame in frames] == [1, 2, 3, 4]
+
+
+def test_verified_tail_open_rejects_wrong_dedicated_aggregate(
+    tmp_path: Path,
+) -> None:
+    base_dir = tmp_path / "journal"
+    anchor = MemoryAnchor()
+    writer = open_writer(base_dir, anchor)
+    writer.commit([event()], {"goal_1": 0})
+    writer.close()
+
+    with pytest.raises(JournalIntegrityError, match="single-aggregate"):
+        JournalWriter.open_at_verified_tail(
+            base_dir,
+            anchor=anchor,
+            hmac_key=HMAC_KEY,
+            aggregate_id="other",
+        )
+
+    with open_writer(base_dir, anchor, writer_epoch=9):
+        pass
+
+
+def test_verified_tail_open_authenticates_the_anchored_frame(
+    tmp_path: Path,
+) -> None:
+    base_dir = tmp_path / "journal"
+    anchor = MemoryAnchor()
+    writer = open_writer(base_dir, anchor)
+    writer.commit([event()], {"goal_1": 0})
+    writer.close()
+    rewrite_record(journal_path(base_dir), 0, corrupt_hmac)
+
+    with pytest.raises(JournalIntegrityError, match="hmac"):
+        JournalWriter.open_at_verified_tail(
+            base_dir,
+            anchor=anchor,
+            hmac_key=HMAC_KEY,
+            aggregate_id="goal_1",
+        )
+
+
+def test_verified_tail_open_checks_the_complete_raw_hash_chain(
+    tmp_path: Path,
+) -> None:
+    base_dir = tmp_path / "journal"
+    anchor = MemoryAnchor()
+    writer = open_writer(base_dir, anchor)
+    for version in range(3):
+        writer.commit(
+            [event(event_type="audit.recorded", value=str(version))],
+            {"goal_1": version},
+        )
+    writer.close()
+    rewrite_record(journal_path(base_dir), 0, corrupt_hmac)
+
+    with pytest.raises(JournalIntegrityError, match="previous hash chain"):
+        JournalWriter.open_at_verified_tail(
+            base_dir,
+            anchor=anchor,
+            hmac_key=HMAC_KEY,
+            aggregate_id="goal_1",
+        )
+
+
 def test_second_process_cannot_acquire_writer_lock(tmp_path: Path) -> None:
     base_dir = tmp_path / "journal"
     writer = open_writer(base_dir, MemoryAnchor())
