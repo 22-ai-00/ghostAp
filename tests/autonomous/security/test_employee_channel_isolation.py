@@ -190,6 +190,29 @@ def test_default_launcher_prefers_bwrap_and_falls_back_to_process_isolation(
         supervisor.close()
 
 
+def test_default_linux_bwrap_binds_python_runtime_and_external_worker(
+    tmp_path: Path,
+) -> None:
+    worker_path = _worker(tmp_path).resolve()
+    supervisor = EmployeeChannelSupervisor(
+        secret_resolver=lambda *_: "employee-secret",
+        worker_path=worker_path,
+        platform_name="linux",
+    )
+    try:
+        rendered = "\0".join(supervisor._sandbox_prefix)
+        for runtime_root in {
+            Path(sys.prefix).resolve(),
+            Path(sys.base_prefix).resolve(),
+        }:
+            assert (
+                f"--ro-bind\0{runtime_root}\0{runtime_root}" in rendered
+            )
+        assert f"--ro-bind\0{worker_path}\0{worker_path}" in rendered
+    finally:
+        supervisor.close()
+
+
 def test_secret_and_parent_environment_never_enter_argv_or_child_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -269,8 +269,45 @@ class EmployeeChannelSupervisor:
         repository_root = Path(__file__).resolve().parents[3]
         source_root = repository_root / "src"
         runtime_prefix = Path(sys.prefix).resolve()
+        base_runtime_prefix = Path(sys.base_prefix).resolve()
         directory_targets = {Path("/etc"), repository_root}
-        for target in (repository_root, runtime_prefix):
+        worker_is_external = not self._worker_path.is_relative_to(source_root)
+        runtime_bindings = {
+            (runtime_prefix, runtime_prefix),
+            (base_runtime_prefix, base_runtime_prefix),
+        }
+        python_link = Path(sys.executable)
+        while python_link.is_symlink():
+            link_target = Path(os.readlink(python_link))
+            python_link = (
+                link_target
+                if link_target.is_absolute()
+                else python_link.parent / link_target
+            )
+        python_real = Path(sys.executable).resolve()
+        try:
+            python_relative = python_real.relative_to(base_runtime_prefix)
+        except ValueError:
+            python_relative = None
+        if python_relative is not None and python_link.resolve() == python_real:
+            runtime_alias = python_link
+            for _ in python_relative.parts:
+                runtime_alias = runtime_alias.parent
+            # Some uv environments keep an absolute interpreter symlink under
+            # a logical home path (for example /home) while sys.base_prefix is
+            # reported through that path's physical mount (for example
+            # /data00/home).  Preserve the lexical target inside the sandbox.
+            runtime_bindings.add((base_runtime_prefix, runtime_alias))
+        directory_roots = [
+            repository_root,
+            *(destination for _, destination in runtime_bindings),
+        ]
+        if worker_is_external:
+            # /tmp is replaced by an empty tmpfs below.  Recreate only the
+            # destination skeleton for an injected worker before binding the
+            # file itself; never expose the host parent directory contents.
+            directory_roots.append(self._worker_path.parent)
+        for target in directory_roots:
             parent = target
             while parent != parent.parent:
                 directory_targets.add(parent)
@@ -297,13 +334,17 @@ class EmployeeChannelSupervisor:
         for path in (Path("/usr"), Path("/lib"), Path("/lib64")):
             if path.exists():
                 args.extend(("--ro-bind", str(path), str(path)))
-        args.extend(("--ro-bind", str(runtime_prefix), str(runtime_prefix)))
+        for source, destination in sorted(
+            runtime_bindings,
+            key=lambda binding: (str(binding[1]), str(binding[0])),
+        ):
+            args.extend(("--ro-bind", str(source), str(destination)))
         if source_root.is_dir():
             args.extend(("--ro-bind", str(source_root), str(source_root)))
         for path in (repository_root / "pyproject.toml", repository_root / "uv.lock"):
             if path.is_file():
                 args.extend(("--ro-bind", str(path), str(path)))
-        if not self._worker_path.is_relative_to(source_root):
+        if worker_is_external:
             args.extend(("--ro-bind", str(self._worker_path), str(self._worker_path)))
         for path in (
             Path("/etc/hosts"),
