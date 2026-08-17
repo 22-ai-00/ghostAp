@@ -154,6 +154,7 @@ def test_default_sandbox_attestation_fails_closed_before_secret_resolution(tmp_p
         supervisor.close()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux bwrap fallback contract")
 def test_default_launcher_prefers_bwrap_and_falls_back_to_process_isolation(
     tmp_path: Path,
 ) -> None:
@@ -251,7 +252,10 @@ def test_secret_and_parent_environment_never_enter_argv_or_child_environment(
         child_env = events[0]["data"]["environment"]
         assert child_env["PYTHONUTF8"] == "1"
         assert "AUTONOMOUS_VAULT_MASTER_KEY" not in child_env
-        assert set(child_env) <= {"PYTHONUTF8", "LC_CTYPE"}
+        allowed_child_env = {"PYTHONUTF8", "LC_CTYPE"}
+        if sys.platform == "darwin":
+            allowed_child_env.add("__CF_USER_TEXT_ENCODING")
+        assert set(child_env) <= allowed_child_env
     finally:
         supervisor.close()
 

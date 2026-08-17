@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -55,6 +57,10 @@ def test_employee_session_host_limits_tools_to_employee_workspace(
     host.close()
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bwrap") is None,
+    reason="Linux bubblewrap filesystem contract",
+)
 def test_employee_cli_namespace_hides_sensitive_and_peer_employee_paths(
     tmp_path: Path,
 ) -> None:
