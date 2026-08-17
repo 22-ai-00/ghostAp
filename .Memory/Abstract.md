@@ -1,6 +1,8 @@
 # GhostAP 项目记忆索引
 
 > **维护性 Backlog**: 后续 Review/Audit 发现的非紧急维护项按分级规则录入 [Backlog.md](Backlog.md) 并在维护窗口集中处理；本轮 Refactoring Analysis 1–28 的问题矩阵入口是 [.Memory/2026-05-11.md](2026-05-11.md) 顶部最终矩阵，2026-05-12 是执行验证日志。
+## 2026-08-17
+- **Employee报告热循环修复** - Fire改读已验committed tail，空闲CPU降至0.5% → [2026-08-17.md](2026-08-17.md)
 ## 2026-08-16
 - **A2A出站协议内核落地** - 固定Card、Journal恢复与安全SDK客户端 → [2026-08-16.md](2026-08-16.md)
 - **ACP懒启动解耦readiness** - restart与主进程默认不预热，交互时按需建连可重试 → [2026-08-16.md](2026-08-16.md)

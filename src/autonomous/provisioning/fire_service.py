@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from threading import RLock
 from typing import Callable, Protocol
 
-from ..journal.frame import JournalEvent
+from ..journal.frame import JournalEvent, TransactionFrame
 from ..journal.writer import CommitState, JournalWriter
 from .external_mutation_gate import EmployeeExternalMutationGate
 from .fire_state import (
@@ -749,7 +749,7 @@ class EmployeeFireService:
         expected_effect_state: FireEffectState | None | object = _UNSET,
     ) -> bool:
         with self._writer.transaction_guard():
-            frames = tuple(self._writer.replay())
+            frames = self._committed_frames(self._writer)
             current = rebuild_fire_projection(frames).get(event.aggregate_id)
             if event.event_type == "fire.effect.reconciled":
                 effect_type = event.payload.get("effect_type")
@@ -834,7 +834,7 @@ class EmployeeFireService:
             payload=payload,
         )
         with self._writer.transaction_guard():
-            frames = tuple(self._writer.replay())
+            frames = self._committed_frames(self._writer)
             existing = tuple(
                 parsed
                 for frame in frames
@@ -899,7 +899,7 @@ class EmployeeFireService:
             (state.tenant_key, state.agent_id) for state in self._states().values()
         }
         pending: dict[tuple[str, str], _PendingExternalMutationFence] = {}
-        for frame in self._writer.replay():
+        for frame in self._committed_frames(self._writer):
             for event in frame.events:
                 if event.event_type != _EXTERNAL_MUTATION_FENCE_EVENT:
                     continue
@@ -971,7 +971,7 @@ class EmployeeFireService:
         """Restore permanent fences before any mutator recovery can run."""
 
         identities: set[tuple[str, str]] = set()
-        frames = tuple(writer.replay())
+        frames = cls._committed_frames(writer)
         for frame in frames:
             for event in frame.events:
                 if event.event_type != _EXTERNAL_MUTATION_FENCE_EVENT:
@@ -1108,8 +1108,17 @@ class EmployeeFireService:
             f"{hashlib.sha256(raw.encode()).hexdigest()}"
         )
 
+    @staticmethod
+    def _committed_frames(
+        writer: JournalWriter,
+    ) -> tuple[TransactionFrame, ...]:
+        """Read the writer's already-verified frames through its durable anchor."""
+
+        _anchor, frames = writer.committed_tail(1)
+        return frames
+
     def _states(self):
-        return rebuild_fire_projection(tuple(self._writer.replay()))
+        return rebuild_fire_projection(self._committed_frames(self._writer))
 
     def _require(self, intent_id: str) -> DurableFireState:
         state = self._states().get(intent_id)

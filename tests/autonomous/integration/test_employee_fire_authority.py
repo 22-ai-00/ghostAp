@@ -127,8 +127,8 @@ def _active_bound_fire_authority(tmp_path):
 
 def test_reconcile_draining_is_constant_time_without_pending_drains() -> None:
     class _Writer:
-        def replay(self):
-            pytest.fail("idle drain reconciliation replayed the Journal")
+        def committed_tail(self, _from_sequence):
+            return SimpleNamespace(sequence=0, frame_hash=""), ()
 
     service = EmployeeFireService(
         writer=_Writer(),  # type: ignore[arg-type]
@@ -1177,10 +1177,15 @@ def test_drain_action_required_after_quiesce_is_not_polled_again(tmp_path):
         def __init__(self, wrapped):
             self.wrapped = wrapped
             self.replay_count = 0
+            self.committed_tail_count = 0
 
         def replay(self, *args, **kwargs):
             self.replay_count += 1
             return self.wrapped.replay(*args, **kwargs)
+
+        def committed_tail(self, *args, **kwargs):
+            self.committed_tail_count += 1
+            return self.wrapped.committed_tail(*args, **kwargs)
 
         def __getattr__(self, name):
             return getattr(self.wrapped, name)
@@ -1210,7 +1215,9 @@ def test_drain_action_required_after_quiesce_is_not_polled_again(tmp_path):
             drain=True,
         )
     )
-    counting_writer.replay_count = 0
+    assert counting_writer.replay_count == 0
+    assert counting_writer.committed_tail_count > 0
+    counting_writer.committed_tail_count = 0
 
     assert waiting.phase is FirePhase.ACTION_REQUIRED
     assert waiting.effect_state("execution_quiesce") is FireEffectState.COMMITTED
@@ -1218,6 +1225,7 @@ def test_drain_action_required_after_quiesce_is_not_polled_again(tmp_path):
     assert service.reconcile_draining() == ()
     assert service.reconcile_draining() == ()
     assert counting_writer.replay_count == 0
+    assert counting_writer.committed_tail_count == 0
     ingress.close()
     writer.close()
 
@@ -1231,10 +1239,15 @@ def test_reconcile_draining_evicts_cursor_advanced_by_another_service(tmp_path):
         def __init__(self, wrapped):
             self.wrapped = wrapped
             self.replay_count = 0
+            self.committed_tail_count = 0
 
         def replay(self, *args, **kwargs):
             self.replay_count += 1
             return self.wrapped.replay(*args, **kwargs)
+
+        def committed_tail(self, *args, **kwargs):
+            self.committed_tail_count += 1
+            return self.wrapped.committed_tail(*args, **kwargs)
 
         def __getattr__(self, name):
             return getattr(self.wrapped, name)
@@ -1290,13 +1303,17 @@ def test_reconcile_draining_evicts_cursor_advanced_by_another_service(tmp_path):
     assert advanced.effect_state("execution_quiesce") is FireEffectState.COMMITTED
     assert advanced.effect_state("slash_cleanup") is FireEffectState.ACTION_REQUIRED
 
-    counting_writer.replay_count = 0
+    assert counting_writer.replay_count == 0
+    assert counting_writer.committed_tail_count > 0
+    counting_writer.committed_tail_count = 0
     assert initial.reconcile_draining() == ()
-    assert counting_writer.replay_count == 1
+    assert counting_writer.replay_count == 0
+    assert counting_writer.committed_tail_count == 1
 
     now += 0.5
     assert initial.reconcile_draining() == ()
-    assert counting_writer.replay_count == 1
+    assert counting_writer.replay_count == 0
+    assert counting_writer.committed_tail_count == 1
     ingress.close()
     writer.close()
 
