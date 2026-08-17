@@ -647,7 +647,7 @@ class EmployeeDepartmentRuntime:
         self._reporting_stop = threading.Event()
         self._reporting_wakeup = threading.Event()
         self._reporting_lifecycle_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
-        self._reporting_repair_lock = threading.Lock()  # leaf lock: serializes recovery and reporting repair
+        self._reporting_repair_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._reporting_repair_failures = 0
         self._reporting_repair_not_before = 0.0
         self._warning_reporting_failures = 0
