@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import multiprocessing
 import os
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -620,11 +621,28 @@ def test_allow_chat_processes_merge_inside_flock_without_lost_updates(
         for chat in chats
     ]
 
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=15)
-        assert process.exitcode == 0
+    try:
+        for process in processes:
+            process.start()
+
+        # Darwin's spawn start method must import the full test module in each
+        # child. Under a full-suite CPU load this can legitimately exceed the
+        # former per-process 15-second window even though every child is making
+        # progress. Use one bounded group deadline because the children start
+        # concurrently and the contract under test is the flock merge.
+        deadline = time.monotonic() + 60
+        for process in processes:
+            process.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        assert not [process.pid for process in processes if process.is_alive()]
+        assert [process.exitcode for process in processes] == [0] * len(processes)
+    finally:
+        for process in processes:
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+        for process in processes:
+            if process.pid is not None:
+                process.join(timeout=5)
 
     line = next(
         item
