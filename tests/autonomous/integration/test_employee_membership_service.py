@@ -792,6 +792,44 @@ def test_restart_rebuilds_membership_projection(tmp_path) -> None:
     assert restarted.get("tenant_1", "oc_team", "agt_1").state is outcome.state
 
 
+def test_membership_full_rebuild_avoids_per_frame_defensive_clones(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from src.autonomous.membership.projection import (
+        MembershipProjectionState,
+        is_membership_event,
+        rebuild_membership_projection,
+        reduce_membership_frame,
+    )
+
+    fx = _fixture(tmp_path)
+    fx.service.mutate(_request())
+    frames = tuple(fx.writer.replay())
+    clone_calls = 0
+    original_clone = MembershipProjectionState.clone
+
+    def tracked_clone(state):
+        nonlocal clone_calls
+        clone_calls += 1
+        return original_clone(state)
+
+    monkeypatch.setattr(MembershipProjectionState, "clone", tracked_clone)
+    live = MembershipProjectionState()
+    for frame in frames:
+        reduce_membership_frame(live, frame)
+    relevant_frames = sum(
+        any(is_membership_event(event.event_type) for event in frame.events)
+        for frame in frames
+    )
+    assert clone_calls == relevant_frames
+
+    before_rebuild = clone_calls
+    rebuilt = rebuild_membership_projection(frames)
+    assert clone_calls == before_rebuild
+    assert rebuilt == live
+
+
 def test_startup_audit_removes_stale_projected_membership_without_remote_mutation(
     tmp_path,
 ) -> None:

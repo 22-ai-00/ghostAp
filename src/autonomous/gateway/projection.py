@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from ..authorization import EmployeeAuthorizationScope
@@ -180,6 +181,28 @@ def reduce_gateway_frame(
 ) -> None:
     """Apply one authenticated frame with dispatch and terminal atomicity."""
 
+    _reduce_gateway_frame(state, frame, atomic=True)
+
+
+def rebuild_gateway_projection(
+    frames: Iterable[TransactionFrame],
+) -> GatewayProjectionState:
+    """Build a detached projection without cloning it for every frame."""
+
+    state = GatewayProjectionState()
+    for frame in frames:
+        _reduce_gateway_frame(state, frame, atomic=False)
+    return state
+
+
+def _reduce_gateway_frame(
+    state: GatewayProjectionState,
+    frame: TransactionFrame,
+    *,
+    atomic: bool,
+) -> None:
+    """Apply a frame, optionally using a defensive copy for live state."""
+
     if not isinstance(frame, TransactionFrame) or not frame.committed:
         raise GatewayProjectionError("gateway projection requires committed frame")
     known_hash = state.frame_hashes.get(frame.sequence)
@@ -213,18 +236,21 @@ def reduce_gateway_frame(
             "new attempt binding and dispatch commit require the same frame"
         )
     _validate_cross_domain_atomicity(state, event_values, bound)
-    isolated = state.clone()
-    for event in event_values:
-        if is_gateway_event(event.event_type):
-            _reduce_gateway_event(
-                isolated,
-                event,
-                frame_sequence=frame.sequence,
-            )
-    state.attempts = isolated.attempts
-    state.attempt_by_acceptance_id = isolated.attempt_by_acceptance_id
-    state.attempt_by_permit_id = isolated.attempt_by_permit_id
-    state.attempt_by_ingress_identity = isolated.attempt_by_ingress_identity
+    gateway_events = tuple(
+        event for event in event_values if is_gateway_event(event.event_type)
+    )
+    isolated = state.clone() if atomic and gateway_events else state
+    for event in gateway_events:
+        _reduce_gateway_event(
+            isolated,
+            event,
+            frame_sequence=frame.sequence,
+        )
+    if isolated is not state:
+        state.attempts = isolated.attempts
+        state.attempt_by_acceptance_id = isolated.attempt_by_acceptance_id
+        state.attempt_by_permit_id = isolated.attempt_by_permit_id
+        state.attempt_by_ingress_identity = isolated.attempt_by_ingress_identity
     state.cursor_sequence = frame.sequence
     state.cursor_hash = frame.frame_hash
     state.frame_hashes[frame.sequence] = frame.frame_hash
@@ -501,5 +527,6 @@ __all__ = [
     "GatewayProjectionError",
     "GatewayProjectionState",
     "is_gateway_event",
+    "rebuild_gateway_projection",
     "reduce_gateway_frame",
 ]

@@ -16,6 +16,7 @@ from .projection import (
     MembershipProjectionError,
     MembershipProjectionState,
     MembershipRecord,
+    rebuild_membership_projection,
     reduce_membership_frame,
 )
 from .service import (
@@ -43,5 +44,6 @@ __all__ = [
     "MembershipRemoteRejected",
     "MembershipRemoteUnknown",
     "membership_effect_id",
+    "rebuild_membership_projection",
     "reduce_membership_frame",
 ]

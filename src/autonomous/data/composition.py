@@ -324,7 +324,7 @@ def build_employee_data_composition(
         context_factory=context_factory,
         audit_port=service,
     )
-    from ..gateway.projection import GatewayProjectionState, reduce_gateway_frame
+    from ..gateway.projection import rebuild_gateway_projection
     from ..journal.projections import ProjectionRepository
     from ..team.models import TeamAssignmentStatus, TeamRunPhase
     from ..team.projection import rebuild_team_projection
@@ -403,9 +403,7 @@ def build_employee_data_composition(
                 TeamRunPhase.CANCELED,
             }
         )
-        gateway = GatewayProjectionState()
-        for frame in frames:
-            reduce_gateway_frame(gateway, frame)
+        gateway = rebuild_gateway_projection(frames)
         active_attempts = tuple(
             attempt
             for attempt in gateway.attempts.values()

@@ -32,6 +32,7 @@ from .projection import (
     EFFECT_PREPARED,
     MembershipProjectionState,
     MembershipRecord,
+    rebuild_membership_projection,
     reduce_membership_frame,
 )
 
@@ -802,10 +803,9 @@ class EmployeeMembershipService:
 
     def rebuild_projection(self) -> MembershipProjectionState:
         with self._mutex:
-            fresh = MembershipProjectionState()
-            for frame in self._writer.replay():
-                reduce_membership_frame(fresh, frame)
-            self._state = fresh
+            self._state = rebuild_membership_projection(
+                self._writer.replay()
+            )
             return self._state
 
     def recover_pending(self) -> int:
@@ -1274,10 +1274,9 @@ class EmployeeMembershipService:
         last = self._writer.get_last_frame()
         head = (0, "") if last is None else (last.sequence, last.frame_hash)
         if (self._state.cursor_sequence, self._state.cursor_hash) != head:
-            fresh = MembershipProjectionState()
-            for frame in self._writer.replay():
-                reduce_membership_frame(fresh, frame)
-            self._state = fresh
+            self._state = rebuild_membership_projection(
+                self._writer.replay()
+            )
 
     def _commit_unlocked(self, *events: JournalEvent) -> None:
         result = commit_workforce_events_unlocked(

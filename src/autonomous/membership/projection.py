@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 
 from ..journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
@@ -67,6 +68,28 @@ def reduce_membership_frame(
     state: MembershipProjectionState,
     frame: TransactionFrame,
 ) -> None:
+    """Atomically apply one committed frame to a live projection."""
+
+    _reduce_membership_frame(state, frame, atomic=True)
+
+
+def rebuild_membership_projection(
+    frames: Iterable[TransactionFrame],
+) -> MembershipProjectionState:
+    """Build a detached projection without cloning it for every frame."""
+
+    state = MembershipProjectionState()
+    for frame in frames:
+        _reduce_membership_frame(state, frame, atomic=False)
+    return state
+
+
+def _reduce_membership_frame(
+    state: MembershipProjectionState,
+    frame: TransactionFrame,
+    *,
+    atomic: bool,
+) -> None:
     if not isinstance(frame, TransactionFrame) or not frame.committed:
         raise MembershipProjectionError("membership projection requires committed frame")
     known = state.frame_hashes.get(frame.sequence)
@@ -79,8 +102,11 @@ def reduce_membership_frame(
     if frame.previous_hash != (state.cursor_hash or GENESIS_HASH):
         raise MembershipProjectionError("membership frame hash chain mismatch")
 
-    isolated = state.clone()
-    for event in frame.events:
+    membership_events = tuple(
+        event for event in frame.events if is_membership_event(event.event_type)
+    )
+    isolated = state.clone() if atomic and membership_events else state
+    for event in membership_events:
         if event.event_type == EFFECT_PREPARED:
             _prepared(isolated, event)
         elif event.event_type == EFFECT_EXECUTING:
@@ -90,9 +116,10 @@ def reduce_membership_frame(
         elif event.event_type == EFFECT_ACTION_REQUIRED:
             _action_required(isolated, event)
 
-    state.records = isolated.records
-    state.effects = isolated.effects
-    state.effect_keys = isolated.effect_keys
+    if isolated is not state:
+        state.records = isolated.records
+        state.effects = isolated.effects
+        state.effect_keys = isolated.effect_keys
     state.cursor_sequence = frame.sequence
     state.cursor_hash = frame.frame_hash
     state.frame_hashes[frame.sequence] = frame.frame_hash
@@ -268,5 +295,6 @@ __all__ = [
     "MembershipProjectionState",
     "MembershipRecord",
     "is_membership_event",
+    "rebuild_membership_projection",
     "reduce_membership_frame",
 ]

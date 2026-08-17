@@ -705,6 +705,45 @@ def test_gateway_replay_normalizes_exact_pre_scope_slock_binding(tmp_path) -> No
         binding.to_dict()
 
 
+def test_gateway_full_rebuild_avoids_per_frame_defensive_clones(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from src.autonomous.gateway.projection import (
+        GatewayProjectionState,
+        is_gateway_event,
+        rebuild_gateway_projection,
+        reduce_gateway_frame,
+    )
+
+    frames = _replay_gateway_binding_frame(
+        tmp_path,
+        _legacy_slock_binding_payload(),
+    )
+    clone_calls = 0
+    original_clone = GatewayProjectionState.clone
+
+    def tracked_clone(state):
+        nonlocal clone_calls
+        clone_calls += 1
+        return original_clone(state)
+
+    monkeypatch.setattr(GatewayProjectionState, "clone", tracked_clone)
+    live = GatewayProjectionState()
+    for frame in frames:
+        reduce_gateway_frame(live, frame)
+    relevant_frames = sum(
+        any(is_gateway_event(event.event_type) for event in frame.events)
+        for frame in frames
+    )
+    assert clone_calls == relevant_frames
+
+    before_rebuild = clone_calls
+    rebuilt = rebuild_gateway_projection(frames)
+    assert clone_calls == before_rebuild
+    assert rebuilt == live
+
+
 def test_gateway_replay_defaults_pre_scope_binding_to_managed_group(
     tmp_path,
 ) -> None:

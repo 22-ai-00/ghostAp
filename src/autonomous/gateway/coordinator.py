@@ -58,6 +58,7 @@ from .projection import (
     ATTEMPT_DISPATCH_COMMITTED,
     ATTEMPT_TERMINAL,
     GatewayProjectionState,
+    rebuild_gateway_projection,
     reduce_gateway_frame,
 )
 from .team import EmployeeTeamGateway
@@ -1625,10 +1626,9 @@ class EmployeeDispatchCoordinator:
             and self._gateway_state.cursor_hash == expected_hash
         ):
             return
-        fresh = GatewayProjectionState()
-        for frame in self._writer.replay():
-            reduce_gateway_frame(fresh, frame)
-        self._gateway_state = fresh
+        self._gateway_state = rebuild_gateway_projection(
+            self._writer.replay()
+        )
 
     def _build_binding(
         self,
