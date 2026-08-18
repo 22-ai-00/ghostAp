@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ class ImageDownloadResult:
 class FeishuImageHandler:
     """处理飞书消息中的图片：解析、下载、存储"""
 
+    CACHE_ROOT = "~/.cache/ghostAp"
     IMAGE_DIR_NAME = "picturechat"
 
     def __init__(self, api_client_factory: Callable[[], Any], settings: "Settings"):
@@ -205,7 +207,8 @@ class FeishuImageHandler:
         """批量下载图片并保存到按消息隔离的子目录
 
         图片以序号命名（1.png, 2.png, ...），保存在
-        ``{save_dir}/{msg_short_id}/`` 子目录下，避免不同消息的图片冲突。
+        ``{save_dir}/msg_{message_sha256}/`` 子目录下，避免不同项目、聊天和
+        消息的图片冲突，也不把飞书消息 ID 暴露在本地目录名中。
 
         Args:
             message_id: 飞书消息 ID（下载 API 需要，同时用于子目录命名）
@@ -220,9 +223,10 @@ class FeishuImageHandler:
         if not image_keys:
             return result
 
-        msg_short_id = message_id[-8:] if len(message_id) > 8 else message_id
-        msg_dir = os.path.join(save_dir, f"msg_{msg_short_id}")
-        os.makedirs(msg_dir, exist_ok=True)
+        message_digest = hashlib.sha256(message_id.encode("utf-8")).hexdigest()
+        msg_dir = os.path.join(save_dir, f"msg_{message_digest}")
+        os.makedirs(save_dir, mode=0o700, exist_ok=True)
+        os.makedirs(msg_dir, mode=0o700, exist_ok=True)
 
         for index, image_key in enumerate(image_keys, 1):
             saved_path = self._download_single_image(
@@ -254,9 +258,18 @@ class FeishuImageHandler:
 
             filename = f"{index}.png"
             filepath = os.path.join(save_dir, filename)
-
-            with open(filepath, "wb") as f:
-                f.write(response.file.read())
+            payload = response.file.read()
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(filepath, flags, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb") as image_file:
+                    descriptor = -1
+                    image_file.write(payload)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
 
             logger.info("图片已保存: %s", filepath)
             return filepath
@@ -287,10 +300,7 @@ class FeishuImageHandler:
         return "\n".join(lines)
 
     @staticmethod
-    def get_image_save_dir(project_root: Optional[str], fallback_dir: str) -> str:
-        """确定图片保存目录
-
-        优先使用 project_root/picturechat/，否则 fallback_dir/picturechat/
-        """
-        base_dir = project_root if project_root else fallback_dir
-        return os.path.join(base_dir, FeishuImageHandler.IMAGE_DIR_NAME)
+    def get_image_save_dir() -> str:
+        """返回所有聊天与编程模式共享的用户级图片缓存目录。"""
+        cache_root = os.path.abspath(os.path.expanduser(FeishuImageHandler.CACHE_ROOT))
+        return os.path.join(cache_root, FeishuImageHandler.IMAGE_DIR_NAME)

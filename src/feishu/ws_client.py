@@ -3581,10 +3581,7 @@ class FeishuWSClient:
         if task_ctx and project:
             self._update_task_project(task_ctx, project.project_id)
 
-        save_dir = FeishuImageHandler.get_image_save_dir(
-            project.root_path if project else None,
-            self._handler_ctx.handlers["coco"].get_working_dir(chat_id),
-        )
+        save_dir = FeishuImageHandler.get_image_save_dir()
 
         image_handler = self._get_image_handler()
         download_result = image_handler.download_images(message_id, image_keys, save_dir)

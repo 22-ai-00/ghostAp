@@ -3145,8 +3145,12 @@ def test_process_message_async_auto_enter_mode(mock_ws_client: FeishuWSClient):
 
 def test_flat_post_engine_command_reaches_dispatch_with_command_and_image(
     mock_ws_client: FeishuWSClient,
+    monkeypatch,
+    tmp_path: Path,
 ):
     """The production flat post shape must preserve slash routing at ingress."""
+    user_home = tmp_path / "user-home"
+    monkeypatch.setenv("HOME", str(user_home))
     content_rows = [
         [{"tag": "text", "text": "/deep 恢复自主执行逻辑", "style": []}],
         [{"tag": "img", "image_key": "img_v3_evidence"}],
@@ -3176,6 +3180,11 @@ def test_flat_post_engine_command_reaches_dispatch_with_command_and_image(
     assert "/tmp/evidence.png" in args[2]
     assert args[4] == "traex"
     assert kwargs["command_match"].command == "/deep"
+    image_handler.download_images.assert_called_once_with(
+        "om_123",
+        ["img_v3_evidence"],
+        str(user_home / ".cache" / "ghostAp" / "picturechat"),
+    )
 
 
 def test_topic_bound_deep_blocks_spec_switch_command(mock_ws_client: FeishuWSClient):
