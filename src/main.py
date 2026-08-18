@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from typing import Optional
 
 try:
@@ -26,14 +27,43 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _activate_lark_import_cache():
+    """Activate the uv-environment cache before importing the generated SDK."""
+
+    if any(name == "lark_oapi" or name.startswith("lark_oapi.") for name in sys.modules):
+        logger.warning("Lark SDK import cache bypassed because the SDK was imported early")
+        return None
+
+    started_at = time.perf_counter()
+    try:
+        from .utils.lark_import_cache import activate_lark_oapi_import_cache
+
+        result = activate_lark_oapi_import_cache()
+    except Exception as exc:
+        logger.warning(
+            "Lark SDK import cache unavailable; falling back to installed files: %s",
+            type(exc).__name__,
+        )
+        return None
+    logger.info(
+        "Lark SDK import cache %s in %.2fs",
+        "built" if result.created else "reused",
+        time.perf_counter() - started_at,
+    )
+    return result
+
+
 def _load_feishu_runtime():
     """Load Feishu runtime dependencies only when the service actually starts."""
+    _activate_lark_import_cache()
+    started_at = time.perf_counter()
     try:
         from feishu.message_formatter import FeishuMessageFormatter as fmt
         from feishu.ws_client import EmojiReaction, FeishuWSClient
     except ImportError:
         from .feishu.message_formatter import FeishuMessageFormatter as fmt
         from .feishu.ws_client import EmojiReaction, FeishuWSClient
+    logger.info("Feishu runtime imports loaded in %.2fs", time.perf_counter() - started_at)
     return fmt, EmojiReaction, FeishuWSClient
 
 
