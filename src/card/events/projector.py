@@ -18,6 +18,8 @@ from src.card.tool_display import (
 AGENT_TOOL_TITLES = frozenset({"agent", "subagent", "task"})
 GENERIC_TASK_LABELS = frozenset({"", "agent", "subagent", "task", "子任务"})
 TERMINAL_AGENT_STATUSES = frozenset({"completed", "failed", "cancelled"})
+UNRESOLVED_AGENT_STATUS = "unresolved"
+UNRESOLVED_AGENT_PROGRESS = "未收到最终状态，主任务已结束"
 GENERIC_AGENT_FAILURE_DETAIL = "子任务执行失败"
 
 _PROVIDER_STATUS = {
@@ -436,11 +438,15 @@ def finalize_summaries(
     summaries: Mapping[str, Mapping],
     terminal_status: str,
 ) -> dict[str, dict]:
+    """Settle child summaries without fabricating a provider terminal state.
+
+    ``terminal_status`` describes why the parent card is closing; it is not
+    evidence that a still-live child failed or was cancelled.  Only provider
+    terminal frames may assign those statuses.  Unreconciled children receive
+    a distinct, non-running display status so the parent can close truthfully.
+    """
     result = {key: dict(value) for key, value in summaries.items()}
-    terminal_progress = {
-        "cancelled": "未收到最终结果，已随主任务停止",
-        "failed": "未收到最终结果，主任务已结束",
-    }.get(terminal_status)
+    parent_is_terminal = terminal_status in TERMINAL_AGENT_STATUSES
     for source_id, existing in result.items():
         status = str(existing.get("status") or "").strip().lower()
         if status in TERMINAL_AGENT_STATUSES:
@@ -448,9 +454,13 @@ def finalize_summaries(
             if fallback and existing.get("progress") in _TRANSIENT_PROGRESS:
                 existing["progress"] = fallback
             continue
-        existing["status"] = terminal_status
-        if terminal_progress:
-            existing["progress"] = terminal_progress
+        existing["status"] = UNRESOLVED_AGENT_STATUS
+        existing["progress"] = (
+            UNRESOLVED_AGENT_PROGRESS
+            if parent_is_terminal
+            else "未收到最终状态"
+        )
+        existing.pop("error", None)
     return result
 
 

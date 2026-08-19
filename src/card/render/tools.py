@@ -53,6 +53,7 @@ _SUBAGENT_STATUS_ICONS = {
     "completed": "✅",
     "failed": "❌",
     "cancelled": "⚪",
+    "unresolved": "❔",
 }
 _SUBAGENT_STATUS_LABELS = {
     "running": "执行中",
@@ -60,6 +61,7 @@ _SUBAGENT_STATUS_LABELS = {
     "completed": "已完成",
     "failed": "失败",
     "cancelled": "已取消",
+    "unresolved": "未收到最终状态",
 }
 _GENERIC_SUBAGENT_LABELS = {"agent", "subagent", "task", "子任务"}
 _SUBAGENT_SLUG_RE = re.compile(
@@ -234,11 +236,12 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
                 max_chars=180,
             )
             if progress:
-                detail_label = (
-                    "进展"
-                    if status in {"running", "active"}
-                    else "结果"
-                )
+                if status in {"running", "active"}:
+                    detail_label = "进展"
+                elif status == "unresolved":
+                    detail_label = "状态"
+                else:
+                    detail_label = "结果"
                 lines.append(f"  - {detail_label}：{progress}")
         if status == "failed" and item.get("error"):
             error_detail = sanitize_tool_failure_detail(
@@ -252,11 +255,13 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
     completed_count = status_counts.get("completed", 0)
     failed_count = status_counts.get("failed", 0)
     cancelled_count = status_counts.get("cancelled", 0)
+    unresolved_count = status_counts.get("unresolved", 0)
     known_count = (
         running_count
         + completed_count
         + failed_count
         + cancelled_count
+        + unresolved_count
     )
     unknown_count = max(0, len(subagents) - known_count)
     summary_parts: list[str] = []
@@ -268,22 +273,27 @@ def render_subagent_dispatch_panel(subagents: list[dict]) -> dict | None:
         summary_parts.append(f"失败 {failed_count}")
     if cancelled_count:
         summary_parts.append(f"取消 {cancelled_count}")
+    if unresolved_count:
+        summary_parts.append(f"未收到最终状态 {unresolved_count}")
     if unknown_count:
         summary_parts.append(f"未知 {unknown_count}")
     summary = " / ".join(summary_parts) if summary_parts else "暂无状态"
-    header_icon = (
-        "❌"
-        if failed_count
-        else (
-            "🟠"
-            if running_count or unknown_count
-            else ("⚪" if cancelled_count else "✅")
-        )
-    )
+    if failed_count:
+        header_icon = "❌"
+    elif running_count or unknown_count:
+        header_icon = "🟠"
+    elif unresolved_count:
+        header_icon = "❔"
+    elif cancelled_count:
+        header_icon = "⚪"
+    else:
+        header_icon = "✅"
 
     return {
         "tag": "collapsible_panel",
-        "expanded": bool(running_count or failed_count or unknown_count),
+        "expanded": bool(
+            running_count or failed_count or unresolved_count or unknown_count
+        ),
         "header": {
             "title": {"tag": "markdown", "content": f"{header_icon} **并行子任务** · {len(subagents)} 个 · {summary}"},
             "vertical_align": "center",

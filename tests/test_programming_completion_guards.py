@@ -21,6 +21,7 @@ from src.acp.models import (
 )
 from src.acp.outcome import PromptOutcome, classify_prompt_result
 from src.card.delivery.engine import CardDelivery
+from src.card.events.projector import finalize_summaries
 from src.card.programming_adapter import (
     ProgrammingCardSession,
     build_programming_metadata,
@@ -121,6 +122,50 @@ def test_agent_completion_updates_main_summary_without_completing_parent() -> No
         assert "父任务继续输出" in programming.get_final_text()
     finally:
         programming.abort()
+
+
+def test_parent_failure_closes_with_unresolved_child_without_fake_failure() -> None:
+    """A parent terminal is not evidence for a child's terminal outcome."""
+    delivery = CardDelivery(_CardClient())
+    parent = _card_session(delivery, session_id="parent-unresolved-child")
+    programming = ProgrammingCardSession(parent)
+    try:
+        programming.start()
+        programming.on_event(
+            _agent_event(ACPEventType.TOOL_CALL_START, status="in_progress")
+        )
+
+        programming.fail("主任务未完整收口")
+
+        assert parent.state is not None
+        assert parent.state.terminal == "failed"
+        summary = parent.state.metadata.subagents[0]
+        assert summary["status"] == "unresolved"
+        assert summary["progress"] == "未收到最终状态，主任务已结束"
+    finally:
+        programming.abort()
+
+
+def test_child_finalization_preserves_only_observed_terminal_states() -> None:
+    summaries = {
+        "running": {"status": "running", "error": "stale"},
+        "completed": {"status": "completed", "progress": "执行中"},
+        "failed": {"status": "failed", "progress": "正在启动"},
+        "cancelled": {"status": "cancelled", "progress": "正在中断"},
+    }
+
+    finalized = finalize_summaries(summaries, "failed")
+
+    assert finalized["running"] == {
+        "status": "unresolved",
+        "progress": "未收到最终状态，主任务已结束",
+    }
+    assert finalized["completed"]["status"] == "completed"
+    assert finalized["completed"]["progress"] == "已完成"
+    assert finalized["failed"]["status"] == "failed"
+    assert finalized["failed"]["progress"] == "执行失败"
+    assert finalized["cancelled"]["status"] == "cancelled"
+    assert finalized["cancelled"]["progress"] == "已取消"
 
 
 def test_authoritative_terminal_snapshot_is_invalidated_by_new_generation() -> None:

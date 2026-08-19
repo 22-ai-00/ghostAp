@@ -72,6 +72,31 @@ def test_render_subagent_dispatch_panel_does_not_present_cancel_only_as_success(
     assert "**已取消** · 用户取消的子任务" in panel["elements"][0]["content"]
 
 
+def test_render_subagent_dispatch_panel_names_unreconciled_terminal_truthfully():
+    panel = render_subagent_dispatch_panel(
+        [
+            {
+                "label": "等待权威终态的子任务",
+                "tool": "Codex",
+                "status": "unresolved",
+                "progress": "未收到最终状态，主任务已结束",
+            }
+        ]
+    )
+
+    assert panel is not None
+    title = panel["header"]["title"]["content"]
+    content = panel["elements"][0]["content"]
+    assert panel["expanded"] is True
+    assert title.startswith("❔")
+    assert "未收到最终状态 1" in title
+    assert "运行中" not in title
+    assert "失败" not in title
+    assert "取消" not in title
+    assert "**未收到最终状态**" in content
+    assert "状态：未收到最终状态，主任务已结束" in content
+
+
 def test_render_subagent_dispatch_panel_explains_missing_result_and_humanizes_slug():
     panel = render_subagent_dispatch_panel(
         [
