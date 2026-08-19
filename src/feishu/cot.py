@@ -38,15 +38,17 @@ _JSON_HEADERS = {"Content-Type": "application/json; charset=utf-8"}
 _MAX_IDENTIFIER_CHARS = 512
 _MAX_BATCH_EVENTS = 100
 _MAX_BATCH_ITEMS = 32
+_MAX_UPDATE_EVENT_BYTES = 14 * 1024
 _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 10_000
-_MAX_TOOL_CONTENT_CHARS = 8_000
+_MAX_STREAM_CHUNK_BYTES = 4_000
+_MAX_TOOL_CONTENT_BYTES = 4_000
 _DEFAULT_FLUSH_INTERVAL = 0.3
 _DEFAULT_QUEUE_CAPACITY = 256
 _DEFAULT_API_TIMEOUT_SECONDS = 35.0
-_DEFAULT_SESSION_REQUEST_TIMEOUT_SECONDS = 2.0
-_DEFAULT_SESSION_CLOSE_TIMEOUT_SECONDS = 1.2
-_MAX_SESSION_CLOSE_TIMEOUT_SECONDS = 1.5
+_DEFAULT_SESSION_REQUEST_TIMEOUT_SECONDS = 5.0
+_DEFAULT_SESSION_CLOSE_TIMEOUT_SECONDS = 4.5
+_MAX_SESSION_CLOSE_TIMEOUT_SECONDS = 6.0
 _LATE_CLEANUP_WORKERS = 4
 _LATE_CLEANUP_QUEUE_CAPACITY = 64
 _STOP = object()
@@ -778,7 +780,7 @@ class FeishuCOTSession:
             or close_timeout > _MAX_SESSION_CLOSE_TIMEOUT_SECONDS
         ):
             raise ValueError(
-                "close_timeout must be positive and no greater than 1.5 seconds"
+                "close_timeout must be positive and no greater than 6.0 seconds"
             )
         else:
             resolved_close_timeout = float(close_timeout)
@@ -1314,39 +1316,47 @@ class FeishuCOTSession:
                                 append_failed=True,
                             )
                         continue
-                    try:
-                        self._api.append(
-                            binding,
-                            events,
-                            timeout_seconds=request_timeout,
-                        )
-                    except Exception as exc:
-                        error = self._as_transport_error(
-                            exc,
-                            "COT asynchronous update failed",
-                        )
-                        with self._lock:
-                            self._record_failure_locked(
-                                error,
-                                append_failed=True,
+                    for event_batch in _partition_update_events(events):
+                        try:
+                            self._api.append(
+                                binding,
+                                event_batch,
+                                timeout_seconds=request_timeout,
                             )
-                        if error.request_may_be_in_flight:
-                            self._schedule_late_cleanup(
-                                error,
-                                stage="update",
-                                binding=binding,
+                        except Exception as exc:
+                            error = self._as_transport_error(
+                                exc,
+                                "COT asynchronous update failed",
                             )
-                        truncated = self._discard_queued_process_items()
-                        if truncated:
+                            logger.warning(
+                                "COT request failed; stage=update failure=%s "
+                                "batch_events=%d",
+                                _safe_transport_failure(error),
+                                len(event_batch),
+                            )
                             with self._lock:
                                 self._record_failure_locked(
-                                    COTTransportError(
-                                        "COT worker discarded queued events "
-                                        "after append failure"
-                                    ),
+                                    error,
                                     append_failed=True,
                                 )
-                        stop_after_batch = True
+                            if error.request_may_be_in_flight:
+                                self._schedule_late_cleanup(
+                                    error,
+                                    stage="update",
+                                    binding=binding,
+                                )
+                            truncated = self._discard_queued_process_items()
+                            if truncated:
+                                with self._lock:
+                                    self._record_failure_locked(
+                                        COTTransportError(
+                                            "COT worker discarded queued events "
+                                            "after append failure"
+                                        ),
+                                        append_failed=True,
+                                    )
+                            stop_after_batch = True
+                            break
                 if force_worker_stop:
                     truncated = self._discard_queued_process_items()
                     if truncated:
@@ -1586,11 +1596,15 @@ class FeishuCOTSession:
             text = _sanitize_unicode(text)
             if not text:
                 return ()
-            return (
+            return tuple(
                 self._cot_event(
                     "TEXT_MESSAGE_CONTENT",
-                    {"messageId": self._hash_id("text", block_id), "delta": text},
-                ),
+                    {
+                        "messageId": self._hash_id("text", block_id),
+                        "delta": chunk,
+                    },
+                )
+                for chunk in _split_utf8_chunks(text, _MAX_STREAM_CHUNK_BYTES)
             )
         if event.type is CardEventType.TEXT_DONE:
             if block_id not in self._open_text:
@@ -1624,14 +1638,15 @@ class FeishuCOTSession:
             text = _sanitize_unicode(text)
             if not text:
                 return ()
-            return (
+            return tuple(
                 self._cot_event(
                     "REASONING_MESSAGE_CONTENT",
                     {
                         "messageId": self._hash_id("reasoning", block_id),
-                        "delta": text,
+                        "delta": chunk,
                     },
-                ),
+                )
+                for chunk in _split_utf8_chunks(text, _MAX_STREAM_CHUNK_BYTES)
             )
         if event.type is CardEventType.REASONING_DONE:
             if block_id not in self._open_reasoning:
@@ -1696,13 +1711,9 @@ class FeishuCOTSession:
             if event.type is CardEventType.TOOL_FAILED:
                 candidate = payload.get("error", "")
                 fallback = "Tool failed"
-                result_status = "error"
-                is_error = True
             else:
                 candidate = payload.get("tool_output", "")
                 fallback = "Tool completed"
-                result_status = "completed"
-                is_error = False
             content = _safe_tool_content(candidate, opaque_id=block_id)
             if not content:
                 latest = state.get("latest", "")
@@ -1721,8 +1732,6 @@ class FeishuCOTSession:
                         "toolCallId": tool_call_id,
                         "content": content,
                         "role": "tool",
-                        "status": result_status,
-                        "isError": is_error,
                     },
                 ),
             )
@@ -2168,9 +2177,74 @@ def _sanitize_unicode(value: str) -> str:
 def _safe_tool_content(value: object, *, opaque_id: str) -> str:
     safe = sanitize_full_tool_event_content(value, opaque_ids=(opaque_id,))
     safe = _sanitize_unicode(safe)
-    if len(safe) <= _MAX_TOOL_CONTENT_CHARS:
-        return safe
-    return safe[: _MAX_TOOL_CONTENT_CHARS - 1] + "…"
+    return _truncate_utf8(safe, _MAX_TOOL_CONTENT_BYTES)
+
+
+def _split_utf8_chunks(value: str, maximum_bytes: int) -> tuple[str, ...]:
+    """Split text without corrupting UTF-8 or losing process content."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return (value,)
+    chunks: list[str] = []
+    start = 0
+    while start < len(encoded):
+        end = min(start + maximum_bytes, len(encoded))
+        while end < len(encoded) and end > start and encoded[end] & 0xC0 == 0x80:
+            end -= 1
+        if end == start:
+            end = min(start + maximum_bytes, len(encoded))
+            while end < len(encoded) and encoded[end] & 0xC0 == 0x80:
+                end += 1
+        chunks.append(encoded[start:end].decode("utf-8"))
+        start = end
+    return tuple(chunks)
+
+
+def _truncate_utf8(value: str, maximum_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= maximum_bytes:
+        return value
+    ellipsis = "…"
+    prefix_limit = maximum_bytes - len(ellipsis.encode("utf-8"))
+    prefix = _split_utf8_chunks(value, prefix_limit)[0]
+    return prefix + ellipsis
+
+
+def _partition_update_events(
+    events: Sequence[Mapping[str, object]],
+) -> tuple[tuple[Mapping[str, object], ...], ...]:
+    """Bound each Update body while preserving strict FIFO event order."""
+    batches: list[tuple[Mapping[str, object], ...]] = []
+    current: list[Mapping[str, object]] = []
+    current_bytes = 2
+    for event in events:
+        encoded = _encode_events((event,))[0]
+        event_bytes = len(
+            json.dumps(
+                encoded,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ) + (1 if current else 0)
+        if current and current_bytes + event_bytes > _MAX_UPDATE_EVENT_BYTES:
+            batches.append(tuple(current))
+            current = []
+            current_bytes = 2
+            event_bytes -= 1
+        current.append(event)
+        current_bytes += event_bytes
+    if current:
+        batches.append(tuple(current))
+    return tuple(batches)
+
+
+def _safe_transport_failure(error: COTTransportError) -> str:
+    return sanitize_single_line_label(
+        str(error),
+        fallback=type(error).__name__,
+        max_chars=240,
+    )
 
 
 def _safe_error_message(value: object) -> str:

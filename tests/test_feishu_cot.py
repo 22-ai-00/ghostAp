@@ -464,9 +464,8 @@ def test_session_maps_ordered_text_reasoning_and_latest_safe_tool_result_in_one_
     assert tool_args["toolCallId"] == tool_end["toolCallId"]
     assert tool_end["toolCallId"] == tool_result["toolCallId"]
     assert tool_start["toolCallName"] == "shell"
+    assert set(tool_result) == {"messageId", "toolCallId", "content", "role"}
     assert tool_result["role"] == "tool"
-    assert tool_result["status"] == "completed"
-    assert tool_result["isError"] is False
     assert "second result" in tool_result["content"]
     assert "first result" not in tool_result["content"]
     assert tool_id not in json.dumps(batch, ensure_ascii=False)
@@ -598,10 +597,86 @@ def test_tool_failure_emits_one_error_result() -> None:
         "TOOL_CALL_RESULT",
     ]
     result = _event_content(batch[-1])
-    assert result["status"] == "error"
-    assert result["isError"] is True
+    assert set(result) == {"messageId", "toolCallId", "content", "role"}
     assert result["role"] == "tool"
     assert "secret" not in result["content"]
+
+
+def test_large_text_delta_is_losslessly_chunked_into_bounded_update_requests() -> None:
+    client = _RecordingClient(
+        _create_response(),
+        *(_empty_response() for _ in range(20)),
+    )
+    session = FeishuCOTSession(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    session.start()
+    text = ("中文-and-ascii-" * 2_000) + "终"
+    assert session.emit(CardEvent.text_started("large-text")) is True
+    assert session.emit(CardEvent.text_delta("large-text", text)) is True
+    assert session.emit(CardEvent.text_done("large-text")) is True
+    assert session.complete(CardEvent.completed()) is True
+
+    update_requests = client.requests[2:-2]
+    assert len(update_requests) > 1
+    assert all(
+        len(
+            json.dumps(
+                request.body,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        <= 16 * 1024
+        for request in update_requests
+    )
+    deltas = [
+        _event_content(event)["delta"]
+        for request in update_requests
+        for event in _request_events(request)
+        if event["event_type"] == "TEXT_MESSAGE_CONTENT"
+    ]
+    assert "".join(deltas) == text
+    assert all(len(delta.encode("utf-8")) <= 4_000 for delta in deltas)
+
+
+def test_large_tool_result_uses_exact_agui_schema_and_utf8_byte_cap() -> None:
+    client = _RecordingClient(
+        _create_response(),
+        *(_empty_response() for _ in range(10)),
+    )
+    session = FeishuCOTSession(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    session.start()
+    assert session.emit(CardEvent.tool_started("large-tool", "shell", "{}"))
+    assert session.emit(
+        CardEvent(
+            type=CardEventType.TOOL_DONE,
+            payload={
+                "block_id": "large-tool",
+                "tool_output": "结果" * 10_000,
+            },
+        )
+    )
+    assert session.complete(CardEvent.completed()) is True
+
+    result = next(
+        _event_content(event)
+        for request in client.requests[2:-2]
+        for event in _request_events(request)
+        if event["event_type"] == "TOOL_CALL_RESULT"
+    )
+    assert set(result) == {"messageId", "toolCallId", "content", "role"}
+    assert result["role"] == "tool"
+    assert len(str(result["content"]).encode("utf-8")) <= 4_000
+    assert str(result["content"]).endswith("…")
 
 
 def test_abort_neutrally_closes_process_sidecar_exactly_once() -> None:
@@ -666,6 +741,31 @@ def test_async_update_failure_is_detectable_without_retry_or_emit_exception() ->
     assert content["status"] == "paused"
     assert client.requests[4].queries[-1] == ("reason", "done")
     assert session._worker_done.wait(1.0)
+
+
+def test_async_update_business_failure_logs_the_sanitized_error_code(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _RecordingClient(
+        _create_response(),
+        _empty_response(),
+        _response({}, code=230099),
+        _empty_response(),
+        _empty_response(),
+    )
+    session = FeishuCOTSession(
+        _api(client, timeout_seconds=0.05),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    session.start()
+    with caplog.at_level("WARNING", logger="src.feishu.cot"):
+        assert session.emit(CardEvent.text_started("text-one")) is True
+        _wait_until(lambda: not session.healthy)
+
+    assert "stage=update" in caplog.text
+    assert "code=230099" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -1079,14 +1179,14 @@ def test_session_close_budget_is_independent_and_capped() -> None:
         chat_id=_CHAT_ID,
         origin_message_id=_ORIGIN_ID,
     )
-    assert session._request_timeout == 2.0
-    assert session._close_timeout == 1.2
-    with pytest.raises(ValueError, match="1.5"):
+    assert session._request_timeout == 5.0
+    assert session._close_timeout == 4.5
+    with pytest.raises(ValueError, match="6.0"):
         FeishuCOTSession(
             api,
             chat_id=_CHAT_ID,
             origin_message_id=_ORIGIN_ID,
-            close_timeout=1.51,
+            close_timeout=6.01,
         )
 
 
