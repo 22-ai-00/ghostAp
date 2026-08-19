@@ -90,6 +90,10 @@ _PROGRAMMING_MAX_TOTAL_BLOCKS = (
 _PROGRAMMING_MAX_COMPLETED_TOOL_BLOCKS = _PROGRAMMING_MAX_TOTAL_BLOCKS
 _PROCESS_REPLAY_MAX_EVENTS = 2048
 _PROCESS_REPLAY_MAX_BYTES = 2 * 1024 * 1024
+_COT_DEGRADED_BANNER = (
+    "COT 过程通道暂不可用；完整过程已切换到主卡，"
+    "任务继续执行，无需重试。"
+)
 _SYSTEM_TEXT_BLOCK_IDS = frozenset({
     "_error",
     "_cancelled",
@@ -163,6 +167,7 @@ class ProgrammingCardSession:
         self._native_process_started = False
         self._buffered_process_events: list[CardEvent] = []
         self._buffered_process_bytes = 0
+        self._process_cutover_announced = False
         self._event_gate = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._terminal_fenced = False
         self._continuation_visibility_timeout = max(
@@ -241,9 +246,13 @@ class ProgrammingCardSession:
             self._native_process_started = started
         if not started:
             try:
-                sink.abort()
-            except Exception:
-                logger.warning("Failed to abort inactive Feishu COT", exc_info=True)
+                with self._dispatch_lock:
+                    self._cut_over_to_card_locked(reason="activation_failed")
+            finally:
+                try:
+                    sink.abort()
+                except Exception:
+                    logger.warning("Failed to abort inactive Feishu COT", exc_info=True)
             self._ensure_card_process_stream()
         return started
 
@@ -472,7 +481,7 @@ class ProgrammingCardSession:
                     "Feishu COT terminal delivery failed; replaying process into the card"
                 )
                 with self._dispatch_lock:
-                    self._cut_over_to_card_locked()
+                    self._cut_over_to_card_locked(reason="terminal_delivery_failed")
                 if self._process_sink is not None:
                     try:
                         self._process_sink.abort()
@@ -625,21 +634,23 @@ class ProgrammingCardSession:
                     > _PROCESS_REPLAY_MAX_BYTES
                 )
                 if replay_limit_reached:
-                    logger.warning(
-                        "Feishu COT replay buffer reached its safety limit; "
-                        "cutting over to the card"
-                    )
                     handled = False
-                    replayed = self._cut_over_to_card_locked()
+                    replayed = self._cut_over_to_card_locked(
+                        reason="replay_buffer_limit",
+                    )
                     sink_to_abort = sink
                     result = replayed and self._dispatch_to_card_locked(event)
                 else:
+                    cutover_reason = "emit_rejected"
                     try:
+                        sink_healthy = bool(getattr(sink, "healthy", True))
                         handled = bool(
                             sink is not None
-                            and bool(getattr(sink, "healthy", True))
+                            and sink_healthy
                             and sink.emit(event)
                         )
+                        if not sink_healthy:
+                            cutover_reason = "sink_unhealthy"
                     except Exception:
                         logger.warning(
                             "Feishu COT process event delivery raised; "
@@ -647,12 +658,16 @@ class ProgrammingCardSession:
                             exc_info=True,
                         )
                         handled = False
+                        cutover_reason = "emit_exception"
                     if handled:
                         self._buffered_process_events.append(event)
                         self._buffered_process_bytes += event_bytes
                         if bool(getattr(sink, "healthy", True)):
                             return True
-                    replayed = self._cut_over_to_card_locked()
+                        cutover_reason = "async_unhealthy"
+                    replayed = self._cut_over_to_card_locked(
+                        reason=cutover_reason,
+                    )
                     sink_to_abort = sink
                     result = (
                         replayed
@@ -687,15 +702,34 @@ class ProgrammingCardSession:
         self._rotator.dispatch(event)
         return True
 
-    def _cut_over_to_card_locked(self) -> bool:
+    def _cut_over_to_card_locked(self, *, reason: str) -> bool:
         """Atomically replay accepted COT atoms and resume card projection."""
         self._native_process_started = False
         buffered = tuple(self._buffered_process_events)
+        buffered_bytes = self._buffered_process_bytes
         self._buffered_process_events.clear()
         self._buffered_process_bytes = 0
+        logger.warning(
+            "Feishu COT process sidecar degraded; reason=%s buffered_events=%d "
+            "buffered_bytes=%d",
+            reason,
+            len(buffered),
+            buffered_bytes,
+        )
         for buffered_event in buffered:
             if not self._dispatch_to_card_locked(buffered_event):
                 return False
+        if not self._process_cutover_announced:
+            banner_event = CardEvent(
+                type=CardEventType.WARNING_UPDATED,
+                payload={
+                    "warning": _COT_DEGRADED_BANNER,
+                    "warning_type": "info",
+                },
+            )
+            if not self._dispatch_to_card_locked(banner_event):
+                return False
+            self._process_cutover_announced = True
         return True
 
     @staticmethod

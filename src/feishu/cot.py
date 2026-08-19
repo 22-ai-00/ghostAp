@@ -87,12 +87,15 @@ _PROCESS_EVENT_TYPES = frozenset(
 )
 
 _STATUS_TEXT = {
-    "running": {"zh_cn": "任务进行中", "en_us": "Working on it"},
-    "thinking": {"zh_cn": "正在思考", "en_us": "Thinking"},
-    "done": {"zh_cn": "任务已完成", "en_us": "Done"},
-    "error": {"zh_cn": "任务失败", "en_us": "Failed"},
-    "paused": {"zh_cn": "任务已暂停", "en_us": "Paused"},
-    "interrupted": {"zh_cn": "任务已中断", "en_us": "Interrupted"},
+    "running": {"zh_cn": "过程记录中", "en_us": "Recording process"},
+    "thinking": {"zh_cn": "正在记录过程", "en_us": "Recording process"},
+    "done": {"zh_cn": "过程记录完成", "en_us": "Process recorded"},
+    "error": {
+        "zh_cn": "过程记录异常结束，请查看主卡",
+        "en_us": "Process ended unexpectedly; see the main card",
+    },
+    "paused": {"zh_cn": "过程展示已切换到主卡", "en_us": "Process moved to the main card"},
+    "interrupted": {"zh_cn": "过程记录已中断", "en_us": "Process interrupted"},
 }
 
 
@@ -113,6 +116,15 @@ class COTTransportError(RuntimeError):
         super().__init__(message)
         self.request_may_be_in_flight = request_may_be_in_flight
         self._pending_call = pending_call
+
+
+class _COTResponseRejected(COTTransportError):
+    """The server returned an explicit non-success response.
+
+    Unlike a transport exception or malformed response, this outcome proves
+    that RUN_STARTED was rejected and can therefore be retried once during
+    late cleanup without risking a duplicate remote start.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -633,7 +645,9 @@ class FeishuCOTAPIClient:
             or not 200 <= raw.status_code < 300
             or code != 0
         ):
-            raise COTTransportError(f"COT {operation} failed (code={code})")
+            raise _COTResponseRejected(
+                f"COT {operation} failed (code={code})"
+            )
         if not isinstance(payload.get("data"), dict):
             raise COTTransportError(
                 f"COT {operation} response schema is invalid"
@@ -890,7 +904,7 @@ class FeishuCOTSession:
                     self._starting = False
                     self._closed = True
                 self._enqueue_cleanup_action(
-                    lambda: self._late_append_error(binding)
+                    lambda: self._late_close_degraded(binding)
                 )
                 close_cleanup_scheduled = True
                 raise error
@@ -1019,7 +1033,7 @@ class FeishuCOTSession:
             return False
 
     def abort(self) -> None:
-        """Fence immediately and schedule non-authoritative error cleanup."""
+        """Fence immediately and close the non-authoritative process sidecar."""
         with self._lock:
             if self._starting and not self._started:
                 self._close_requested = (None, True)
@@ -1159,6 +1173,7 @@ class FeishuCOTSession:
                         terminal_error,
                         stage="terminal",
                         binding=binding,
+                        complete_reason=complete_reason,
                     )
         else:
             with self._lock:
@@ -1185,7 +1200,9 @@ class FeishuCOTSession:
                 try:
                     self._api.complete(
                         binding,
-                        reason=complete_reason if terminal_ok else "error",
+                        # Complete describes the authoritative parent outcome,
+                        # never the health of this optional process transport.
+                        reason=complete_reason,
                         timeout_seconds=complete_timeout,
                     )
                     complete_ok = True
@@ -1397,7 +1414,6 @@ class FeishuCOTSession:
         event: CardEvent | None,
         aborting: bool,
     ) -> None:
-        del event, aborting
         with self._lock:
             if self._terminal_owner_claimed:
                 return
@@ -1405,12 +1421,22 @@ class FeishuCOTSession:
             self._deferred_close = None
             self._deferred_cleanup_needed = False
             ambiguous_request_seen = self._ambiguous_request_seen
+            prior_failure = self._failure
             self._terminal_result = False
             self._closed = True
             self._closing = False
         if ambiguous_request_seen:
             return
-        self._late_append_error(binding)
+        terminal_event, complete_reason, _ = self._terminal_event(
+            event,
+            aborting=aborting,
+            prior_failure=prior_failure,
+        )
+        self._late_append_and_complete(
+            binding,
+            (terminal_event,),
+            reason=complete_reason,
+        )
 
     def _run_started_event(self) -> dict[str, object]:
         return self._cot_event(
@@ -1436,21 +1462,69 @@ class FeishuCOTSession:
     ) -> tuple[dict[str, object], Literal["done", "error"], bool]:
         if aborting:
             return (
-                self._run_error_event("COT session aborted", "ABORTED"),
-                "error",
+                self._degraded_terminal_event(),
+                "done",
                 True,
             )
+        if isinstance(event, CardEvent):
+            # The parent card is the task-status authority.  If its real
+            # terminal is already known, never replace it with a sidecar
+            # transport failure that happened earlier in the same close race.
+            if event.type is CardEventType.COMPLETED:
+                return (
+                    self._cot_event(
+                        "RUN_FINISHED",
+                        {
+                            "threadId": self._thread_id,
+                            "runId": self._run_id,
+                            "status": "done",
+                        },
+                    ),
+                    "done",
+                    True,
+                )
+            if event.type is CardEventType.CANCELLED:
+                reason = event.payload.get("reason", "")
+                text_reason = reason if isinstance(reason, str) else ""
+                if _is_timeout_reason(text_reason):
+                    return (
+                        self._run_error_event("Task timed out", "TIMEOUT"),
+                        "error",
+                        True,
+                    )
+                return (
+                    self._cot_event(
+                        "RUN_FINISHED",
+                        {
+                            "threadId": self._thread_id,
+                            "runId": self._run_id,
+                            "status": "interrupted",
+                        },
+                    ),
+                    "error",
+                    True,
+                )
+            if event.type is CardEventType.FAILED:
+                raw_error = event.payload.get("error", "")
+                message = (
+                    _safe_error_message(raw_error)
+                    if isinstance(raw_error, str) and raw_error
+                    else "Task failed"
+                )
+                return (
+                    self._run_error_event(message[:1_000], "TASK_FAILED"),
+                    "error",
+                    True,
+                )
+
         if prior_failure is not None:
-            code = (
-                "BACKPRESSURE"
-                if "queue" in str(prior_failure).lower()
-                else "TRANSPORT_ERROR"
+            logger.warning(
+                "COT process transport degraded before parent terminal; "
+                "failure_type=%s",
+                type(prior_failure).__name__,
             )
-            return (
-                self._run_error_event("COT process delivery failed", code),
-                "error",
-                True,
-            )
+            return self._degraded_terminal_event(), "done", True
+
         if not isinstance(event, CardEvent):
             with self._lock:
                 self._record_failure_locked(
@@ -1458,58 +1532,9 @@ class FeishuCOTSession:
                     append_failed=False,
                 )
             return (
-                self._run_error_event(
-                    "COT terminal event is invalid",
-                    "INVALID_TERMINAL",
-                ),
-                "error",
-                False,
-            )
-        if event.type is CardEventType.COMPLETED:
-            return (
-                self._cot_event(
-                    "RUN_FINISHED",
-                    {
-                        "threadId": self._thread_id,
-                        "runId": self._run_id,
-                        "status": "done",
-                    },
-                ),
+                self._degraded_terminal_event(),
                 "done",
-                True,
-            )
-        if event.type is CardEventType.CANCELLED:
-            reason = event.payload.get("reason", "")
-            text_reason = reason if isinstance(reason, str) else ""
-            if _is_timeout_reason(text_reason):
-                return (
-                    self._run_error_event("Task timed out", "TIMEOUT"),
-                    "error",
-                    True,
-                )
-            return (
-                self._cot_event(
-                    "RUN_FINISHED",
-                    {
-                        "threadId": self._thread_id,
-                        "runId": self._run_id,
-                        "status": "interrupted",
-                    },
-                ),
-                "error",
-                True,
-            )
-        if event.type is CardEventType.FAILED:
-            raw_error = event.payload.get("error", "")
-            message = (
-                _safe_error_message(raw_error)
-                if isinstance(raw_error, str) and raw_error
-                else "Task failed"
-            )
-            return (
-                self._run_error_event(message[:1_000], "TASK_FAILED"),
-                "error",
-                True,
+                False,
             )
         with self._lock:
             self._record_failure_locked(
@@ -1517,12 +1542,20 @@ class FeishuCOTSession:
                 append_failed=False,
             )
         return (
-            self._run_error_event(
-                "COT terminal event is invalid",
-                "INVALID_TERMINAL",
-            ),
-            "error",
+            self._degraded_terminal_event(),
+            "done",
             False,
+        )
+
+    def _degraded_terminal_event(self) -> dict[str, object]:
+        """Close only the process display without asserting a task terminal."""
+        return self._cot_event(
+            "RUN_FINISHED",
+            {
+                "threadId": self._thread_id,
+                "runId": self._run_id,
+                "status": "paused",
+            },
         )
 
     def _map_process_event_locked(
@@ -1772,6 +1805,7 @@ class FeishuCOTSession:
         *,
         stage: str,
         binding: COTBinding | None,
+        complete_reason: Literal["done", "error"] = "done",
     ) -> None:
         pending_call = error._pending_call
         if pending_call is None:
@@ -1783,6 +1817,7 @@ class FeishuCOTSession:
                     stage=stage,
                     binding=binding,
                     outcome=outcome,
+                    complete_reason=complete_reason,
                 )
             )
         )
@@ -1839,8 +1874,14 @@ class FeishuCOTSession:
         stage: str,
         binding: COTBinding | None,
         outcome: _LateOutcome,
+        complete_reason: Literal["done", "error"],
     ) -> None:
         with self._late_cleanup_lock:
+            logger.warning(
+                "COT late request resolved; stage=%s succeeded=%s",
+                stage,
+                outcome.succeeded,
+            )
             if stage == "create":
                 if not outcome.succeeded:
                     logger.warning("COT Create failed after timeout")
@@ -1854,24 +1895,30 @@ class FeishuCOTSession:
                 with self._lock:
                     if self._binding is None:
                         self._binding = binding
-                self._late_complete(binding)
+                self._late_start_and_close_degraded(binding)
                 return
             if binding is None:
                 logger.warning("COT late %s result lacks binding", stage)
                 self._finalize_late_cleanup()
                 return
-            if stage in {"run_started", "update"}:
-                self._late_append_error(
-                    binding,
-                    code=(
-                        "TRANSPORT_TIMEOUT"
-                        if outcome.succeeded
-                        else "TRANSPORT_ERROR"
-                    ),
-                )
+            if stage == "run_started":
+                # A non-zero server response proves that the original start
+                # did not take effect, so repair it with a paired lifecycle.
+                # Connection loss and malformed responses remain ambiguous:
+                # never blind-retry RUN_STARTED in those cases.
+                if not outcome.succeeded and isinstance(
+                    outcome.value,
+                    _COTResponseRejected,
+                ):
+                    self._late_start_and_close_degraded(binding)
+                else:
+                    self._late_close_degraded(binding)
                 return
-            if stage in {"terminal", "cleanup_terminal"}:
-                self._late_complete(binding)
+            if stage == "update":
+                self._late_close_degraded(binding)
+                return
+            if stage == "terminal":
+                self._late_complete(binding, reason=complete_reason)
                 return
             if stage == "complete":
                 self._finalize_late_cleanup()
@@ -1879,21 +1926,34 @@ class FeishuCOTSession:
             logger.warning("COT late result stage is invalid: %s", stage)
             self._finalize_late_cleanup()
 
-    def _late_append_error(
+    def _late_start_and_close_degraded(self, binding: COTBinding) -> None:
+        """Repair a late Create with a valid, neutral lifecycle then close it."""
+        self._late_close_degraded(binding, include_run_started=True)
+
+    def _late_close_degraded(
         self,
         binding: COTBinding,
         *,
-        code: str = "TRANSPORT_TIMEOUT",
+        include_run_started: bool = False,
+    ) -> None:
+        terminal_events = (
+            (self._run_started_event(), self._degraded_terminal_event())
+            if include_run_started
+            else (self._degraded_terminal_event(),)
+        )
+        self._late_append_and_complete(binding, terminal_events, reason="done")
+
+    def _late_append_and_complete(
+        self,
+        binding: COTBinding,
+        terminal_events: tuple[dict[str, object], ...],
+        *,
+        reason: Literal["done", "error"],
     ) -> None:
         try:
             self._api.append(
                 binding,
-                (
-                    self._run_error_event(
-                        "COT process delivery timed out",
-                        code,
-                    ),
-                ),
+                terminal_events,
                 timeout_seconds=self._request_timeout,
             )
         except Exception as exc:
@@ -1906,15 +1966,21 @@ class FeishuCOTSession:
             if error.request_may_be_in_flight:
                 self._schedule_late_cleanup(
                     error,
-                    stage="cleanup_terminal",
+                    stage="terminal",
                     binding=binding,
+                    complete_reason=reason,
                 )
                 return
-            self._late_complete(binding)
+            self._late_complete(binding, reason=reason)
             return
-        self._late_complete(binding)
+        self._late_complete(binding, reason=reason)
 
-    def _late_complete(self, binding: COTBinding) -> None:
+    def _late_complete(
+        self,
+        binding: COTBinding,
+        *,
+        reason: Literal["done", "error"],
+    ) -> None:
         with self._lock:
             if self._complete_attempted:
                 return
@@ -1922,7 +1988,7 @@ class FeishuCOTSession:
         try:
             self._api.complete(
                 binding,
-                reason="error",
+                reason=reason,
                 timeout_seconds=self._request_timeout,
             )
         except Exception as exc:
@@ -1934,32 +2000,13 @@ class FeishuCOTSession:
                     error,
                     stage="complete",
                     binding=binding,
+                    complete_reason=reason,
                 )
                 return
         self._finalize_late_cleanup()
 
     def _best_effort_start_cleanup(self, binding: COTBinding) -> None:
-        with self._lock:
-            if self._complete_attempted:
-                return
-            self._complete_attempted = True
-        try:
-            self._api.complete(
-                binding,
-                reason="error",
-                timeout_seconds=self._request_timeout,
-            )
-        except Exception as exc:
-            logger.warning("COT failed-start cleanup was rejected")
-            error = self._as_transport_error(exc, "COT failed-start cleanup failed")
-            with self._lock:
-                self._record_failure_locked(error, append_failed=True)
-            if error.request_may_be_in_flight:
-                self._schedule_late_cleanup(
-                    error,
-                    stage="complete",
-                    binding=binding,
-                )
+        self._late_start_and_close_degraded(binding)
 
     def _cleanup_created_before_start(self, binding: COTBinding) -> None:
         self._best_effort_start_cleanup(binding)
@@ -1969,33 +2016,7 @@ class FeishuCOTSession:
             self._finalize_late_cleanup()
 
     def _best_effort_started_cleanup(self, binding: COTBinding) -> None:
-        try:
-            self._api.append(
-                binding,
-                (
-                    self._run_error_event(
-                        "COT worker failed to start",
-                        "WORKER_START",
-                    ),
-                ),
-                timeout_seconds=self._request_timeout,
-            )
-        except Exception as exc:
-            logger.warning("COT worker-start terminal event was rejected")
-            error = self._as_transport_error(
-                exc,
-                "COT worker-start terminal append failed",
-            )
-            with self._lock:
-                self._record_failure_locked(error, append_failed=True)
-            if error.request_may_be_in_flight:
-                self._schedule_late_cleanup(
-                    error,
-                    stage="terminal",
-                    binding=binding,
-                )
-                return
-        self._best_effort_start_cleanup(binding)
+        self._late_close_degraded(binding)
 
 
 def _valid_identifier(value: object) -> bool:

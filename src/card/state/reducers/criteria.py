@@ -14,6 +14,48 @@ logger = logging.getLogger(__name__)
 
 def reduce_criteria(state: CardState, event: CardEvent) -> CardState:
     """Handle CRITERIA_UPDATED / WARNING_UPDATED / REVIEW_RETRY events."""
+    # Warnings are shared card chrome, not Spec-only state.  Handle them before
+    # the engine extension guard so ordinary programming cards can surface
+    # transport degradation without manufacturing an EngineExtState.
+    if event.type is CardEventType.WARNING_UPDATED:
+        warning = event.payload.get("warning", "")
+        explicit_type = event.payload.get("warning_type")
+        if explicit_type in {"success", "warning", "error", "info"}:
+            warning_type = explicit_type
+        elif not warning:
+            warning_type = None
+        elif warning.startswith("✅"):
+            warning_type = "success"
+        elif warning.startswith("❌"):
+            warning_type = "error"
+        elif warning.startswith("ℹ️"):
+            warning_type = "info"
+        else:
+            warning_type = "warning"
+        footer = replace(
+            state.footer,
+            warning_banner=warning or None,
+            warning_type=warning_type,
+        )
+        # Keep-alive is a singleton derived from the current warning.  Strip
+        # any prior instance first so repeated TTL warnings update in place,
+        # and clearing/replacing the warning cannot leave a stale action.
+        buttons_without_keep_alive = tuple(
+            button
+            for button in state.buttons
+            if button.action_id != "ttl_keep_alive"
+        )
+        buttons = buttons_without_keep_alive
+        if warning and event.payload.get("show_keep_alive_btn"):
+            minutes = event.payload.get("keep_alive_minutes", 7)
+            keep_alive_btn = ButtonSpec(
+                text=UI_TEXT["ttl_keep_alive_btn"].format(minutes=minutes),
+                action_id="ttl_keep_alive",
+                type="primary",
+            )
+            buttons = (keep_alive_btn,) + buttons_without_keep_alive
+        return replace(state, footer=footer, buttons=buttons)
+
     if state.engine_ext is None:
         logger.warning("reduce_criteria called with engine_ext=None, event=%s", event.type)
         return state
@@ -40,33 +82,6 @@ def reduce_criteria(state: CardState, event: CardEvent) -> CardState:
             else:
                 blocks = state.blocks + (criteria_block,)
             return replace(state, engine_ext=ext, blocks=blocks)
-
-        case CardEventType.WARNING_UPDATED:
-            warning = event.payload.get("warning", "")
-            # Infer semantic type from content prefix
-            if not warning:
-                warning_type = None
-            elif warning.startswith("✅"):
-                warning_type = "success"
-            elif warning.startswith("❌"):
-                warning_type = "error"
-            elif warning.startswith("ℹ️"):
-                warning_type = "info"
-            else:
-                warning_type = "warning"
-            footer = replace(state.footer, warning_banner=warning or None, warning_type=warning_type)
-            # Add keep-alive button when TTL prewarning is active
-            buttons = state.buttons
-            if event.payload.get("show_keep_alive_btn"):
-                minutes = event.payload.get("keep_alive_minutes", 7)
-                keep_alive_btn = ButtonSpec(
-                    text=UI_TEXT["ttl_keep_alive_btn"].format(minutes=minutes),
-                    action_id="ttl_keep_alive",
-                    type="primary",
-                )
-                # Prepend as primary CTA, preserve any existing buttons
-                buttons = (keep_alive_btn,) + buttons
-            return replace(state, footer=footer, buttons=buttons)
 
         case CardEventType.REVIEW_RETRY:
             attempt = event.payload.get("attempt", 1)

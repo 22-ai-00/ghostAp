@@ -35,6 +35,7 @@ from src.card.state.runtime_stats import RuntimeStats
 class _CardClient:
     def __init__(self) -> None:
         self.created = 0
+        self.updated_cards: list[dict] = []
 
     def create_card(
         self,
@@ -49,7 +50,7 @@ class _CardClient:
         return f"msg-{self.created}", f"card-{self.created}"
 
     def update_card(self, card_id, card_json, *, sequence=0) -> None:
-        return None
+        self.updated_cards.append(card_json)
 
     def update_element(self, card_id, element_id, content, *, sequence=0) -> None:
         return None
@@ -63,6 +64,7 @@ class _ProcessSink:
         self.events: list[CardEvent] = []
         self.completed: list[CardEvent] = []
         self.aborted = False
+        self.abort_calls = 0
         self.visible_check = visible_check
         self.start_error = start_error
         self.fail_mode: str | None = None
@@ -92,6 +94,7 @@ class _ProcessSink:
         return self.healthy
 
     def abort(self) -> None:
+        self.abort_calls += 1
         self.aborted = True
         self.started = False
 
@@ -260,7 +263,7 @@ def test_cot_keeps_plan_on_card_and_publishes_only_terminal_conclusion() -> None
 
 def test_cot_start_failure_restores_complete_legacy_card_projection() -> None:
     sink = _ProcessSink(start_error=RuntimeError("COT unavailable"))
-    _, card_session, programming = _programming_session(process_sink=sink)
+    client, card_session, programming = _programming_session(process_sink=sink)
 
     try:
         programming.start()
@@ -294,6 +297,13 @@ def test_cot_start_failure_restores_complete_legacy_card_projection() -> None:
         assert sink.completed == []
         assert card_session.state is not None
         assert card_session.state.terminal == "completed"
+        assert card_session.state.engine_ext is None
+        assert sink.abort_calls == 1
+        assert any(
+            "COT 过程通道暂不可用；完整过程已切换到主卡，"
+            "任务继续执行，无需重试。" in str(card)
+            for card in client.updated_cards
+        )
         assert any(
             isinstance(block, TextBlock) and block.content == "卡片正文"
             for block in card_session.state.blocks
@@ -309,6 +319,33 @@ def test_cot_start_failure_restores_complete_legacy_card_projection() -> None:
             and block.status == "completed"
             for block in card_session.state.blocks
         )
+    finally:
+        programming.abort()
+
+
+def test_cot_activation_always_aborts_sink_if_cutover_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = _ProcessSink(start_error=RuntimeError("COT unavailable"))
+    _, _, programming = _programming_session(process_sink=sink)
+
+    def fail_cutover(*, reason: str) -> bool:
+        assert reason == "activation_failed"
+        raise RuntimeError("card cutover failed")
+
+    try:
+        programming.start()
+        monkeypatch.setattr(
+            programming,
+            "_cut_over_to_card_locked",
+            fail_cutover,
+        )
+
+        with pytest.raises(RuntimeError, match="card cutover failed"):
+            programming.activate_process_sink()
+
+        assert sink.abort_calls == 1
+        assert sink.aborted is True
     finally:
         programming.abort()
 
@@ -526,7 +563,19 @@ def test_cot_delivery_loss_atomically_replays_without_losing_event_shape(
         programming.dispatch(CardEvent.text_delta("child-text", "exactly once"))
 
         assert sink.aborted is True
+        assert sink.abort_calls == 1
         assert card_session.state is not None
+        assert card_session.state.terminal == "running"
+        assert card_session.state.engine_ext is None
+        assert card_session.state.footer.warning_banner == (
+            "COT 过程通道暂不可用；完整过程已切换到主卡，"
+            "任务继续执行，无需重试。"
+        )
+        assert card_session.state.footer.warning_type == "info"
+        rendered = render_card(card_session.state, RenderBudget())
+        rendered_payload = str(rendered[0]._card_json)
+        assert rendered_payload.count(card_session.state.footer.warning_banner) == 1
+        assert "ℹ️" in rendered_payload
         child = next(
             block
             for block in card_session.state.blocks
@@ -548,6 +597,38 @@ def test_cot_delivery_loss_atomically_replays_without_losing_event_shape(
         assert tool.tool_output == "complete output"
         assert tool.tool_summary == "Read contract"
         assert tool.status == "completed"
+
+        programming.dispatch(CardEvent.text_done("child-text"))
+        assert sink.abort_calls == 1
+        assert programming._process_cutover_announced is True
+    finally:
+        programming.abort()
+
+
+def test_cot_degraded_banner_is_cleared_when_parent_is_cancelled() -> None:
+    sink = _ProcessSink()
+    _, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+        programming.dispatch(CardEvent.text_started("cancel-after-cutover"))
+        sink.fail_mode = "return_false"
+        programming.dispatch(
+            CardEvent.text_delta("cancel-after-cutover", "过程仍在主卡")
+        )
+
+        assert card_session.state is not None
+        assert "任务继续执行" in str(card_session.state.footer.warning_banner)
+
+        programming.cancel()
+
+        assert card_session.state is not None
+        assert card_session.state.terminal == "cancelled"
+        assert card_session.state.footer.warning_banner is None
+        assert card_session.state.footer.warning_type is None
+        rendered = render_card(card_session.state, RenderBudget())
+        assert "任务继续执行" not in str(rendered[0]._card_json)
     finally:
         programming.abort()
 
@@ -571,11 +652,14 @@ def test_cot_replay_buffer_hard_limit_cuts_over_before_accepting_more(
         programming.dispatch(CardEvent.text_delta("bounded-text", "c"))
 
         assert sink.aborted is True
+        assert sink.abort_calls == 1
         assert [event.type for event in sink.events] == [
             CardEventType.TEXT_STARTED,
             CardEventType.TEXT_DELTA,
         ]
         assert card_session.state is not None
+        assert card_session.state.terminal == "running"
+        assert card_session.state.footer.warning_type == "info"
         block = next(
             block
             for block in card_session.state.blocks
@@ -606,8 +690,11 @@ def test_cot_replay_buffer_byte_limit_cuts_over_without_truncation(
         )
 
         assert sink.aborted is True
+        assert sink.abort_calls == 1
         assert sink.events == [start]
         assert card_session.state is not None
+        assert card_session.state.terminal == "running"
+        assert card_session.state.footer.warning_type == "info"
         block = next(
             block
             for block in card_session.state.blocks

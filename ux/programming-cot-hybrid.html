@@ -74,6 +74,7 @@
     }
 
     .cot-trigger.done { color: var(--green); background: var(--green-soft); }
+    .cot-trigger.degraded { color: var(--amber); background: var(--amber-soft); }
     .cot-meta { color: var(--quiet); font-size: 12px; font-weight: 500; }
     .cot-body { padding: 13px 14px 14px; }
 
@@ -132,6 +133,15 @@
     .card-header small { display: block; margin-top: 2px; opacity: .78; font-weight: 500; }
     .card-body { padding: 14px 15px; }
 
+    .info-banner {
+      margin-bottom: 12px;
+      padding: 9px 11px;
+      border: 1px solid #cbd8ef;
+      border-radius: 9px;
+      background: var(--blue-soft);
+      color: #31559a;
+    }
+
     .task-summary {
       padding: 10px 12px;
       border: 1px solid #e6bd72;
@@ -160,10 +170,14 @@
     .legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: var(--blue); }
     .legend span:nth-child(2)::before { background: var(--amber); }
     .legend span:nth-child(3)::before { background: var(--green); }
+    .state-degraded { grid-column: 1 / -1; }
+    .state-degraded .chat { grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); }
+    .state-degraded .user-message { grid-column: 1 / -1; }
 
     @media (max-width: 780px) {
       main { width: min(460px, calc(100% - 24px)); padding-top: 22px; }
       .states { grid-template-columns: 1fr; }
+      .state-degraded .chat { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -180,7 +194,7 @@
 
           <section class="cot" aria-label="Feishu COT 运行中预览">
             <div class="cot-trigger">
-              <span>● 任务进行中</span>
+              <span>● 过程记录中</span>
               <span class="cot-meta">展开过程⌃</span>
             </div>
             <div class="cot-body">
@@ -224,7 +238,7 @@
 
           <section class="cot" aria-label="Feishu COT 已完成预览">
             <div class="cot-trigger done">
-              <span>✓ 任务已完成</span>
+              <span>✓ 过程记录完成</span>
               <span class="cot-meta">查看 6 条过程⌄</span>
             </div>
           </section>
@@ -253,10 +267,41 @@
           </section>
         </div>
       </article>
+
+      <article class="state-degraded">
+        <h2 class="state-title">过程通道降级 · COT 中性收口，主卡继续执行</h2>
+        <div class="chat">
+          <div class="user-message">把登录模块拆成并行任务并修好测试。</div>
+
+          <section class="cot" aria-label="Feishu COT 过程通道降级预览">
+            <div class="cot-trigger degraded">
+              <span>○ 过程展示已切换</span>
+              <span class="cot-meta">完整过程见主卡</span>
+            </div>
+          </section>
+
+          <section class="result-card" aria-label="COT 降级后的权威主卡预览">
+            <div class="card-header">进行中 · GhostAP · Codex<small>任务未中断，过程已回放到本卡</small></div>
+            <div class="card-body">
+              <div class="info-banner">ℹ️ COT 过程通道暂不可用；完整过程已切换到主卡，任务继续执行，无需重试。</div>
+              <div class="reasoning">正在确认认证入口、现有测试和并发可拆分边界。</div>
+              <p class="process-copy">已定位两个可独立处理的模块，开始并行修改。</p>
+              <div class="task-summary">
+                <strong>并行子任务 · 2 个</strong>
+                <div class="tasks">
+                  <span>✓ #1 修复会话校验</span>
+                  <span class="active">● #2 补认证路由回归</span>
+                </div>
+              </div>
+              <div class="footer">Codex · gpt-5.6-sol/high · 00:49</div>
+            </div>
+          </section>
+        </div>
+      </article>
     </section>
 
     <aside class="rule">
-      <strong>运输规则</strong>：COT 创建成功后，正文/推理/工具事件不再重复写进卡片；任务清单、子 Agent 摘要、图片和终态正文继续进入结果卡。COT 不可用时，自动恢复现有完整流式卡。
+      <strong>运输规则</strong>：主卡是任务状态的唯一事实源，COT 只是非权威的过程旁路。COT 创建成功后，正文/推理/工具事件不再重复写进卡片；通道不可用时只以中性状态收口 COT，原子回放完整过程到主卡，不重跑 ACP，也不改变主任务终态。
       <div class="legend"><span>COT 过程</span><span>卡片任务总览</span><span>卡片最终结论</span></div>
     </aside>
   </main>

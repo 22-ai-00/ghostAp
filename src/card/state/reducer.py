@@ -128,7 +128,6 @@ _ENGINE_EXT_EVENTS = frozenset({
     CardEventType.SPEC_TASKS_UPDATED,
     CardEventType.REVIEW_RESULT_UPDATED,
     CardEventType.CRITERIA_UPDATED,
-    CardEventType.WARNING_UPDATED,
     CardEventType.REVIEW_RETRY,
 })
 
@@ -227,6 +226,9 @@ _STRUCTURAL_EVENTS = frozenset({
     CardEventType.TASK_LIST_UPDATED,
     # Section separator (adds new block)
     CardEventType.SECTION_SEPARATOR,
+    # A banner is inserted above the page body, so adding/removing one changes
+    # the wire structure and must not be treated as an element-only text patch.
+    CardEventType.WARNING_UPDATED,
 })
 
 

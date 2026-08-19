@@ -418,12 +418,21 @@ def test_session_maps_ordered_text_reasoning_and_latest_safe_tool_result_in_one_
     started_content = _event_content(run_started[0])
     assert started_content["input"]["query"] == "修复登录�"
     assert started_content["input"]["statusText"] == {
-        "running": {"zh_cn": "任务进行中", "en_us": "Working on it"},
-        "thinking": {"zh_cn": "正在思考", "en_us": "Thinking"},
-        "done": {"zh_cn": "任务已完成", "en_us": "Done"},
-        "error": {"zh_cn": "任务失败", "en_us": "Failed"},
-        "paused": {"zh_cn": "任务已暂停", "en_us": "Paused"},
-        "interrupted": {"zh_cn": "任务已中断", "en_us": "Interrupted"},
+        "running": {"zh_cn": "过程记录中", "en_us": "Recording process"},
+        "thinking": {"zh_cn": "正在记录过程", "en_us": "Recording process"},
+        "done": {"zh_cn": "过程记录完成", "en_us": "Process recorded"},
+        "error": {
+            "zh_cn": "过程记录异常结束，请查看主卡",
+            "en_us": "Process ended unexpectedly; see the main card",
+        },
+        "paused": {
+            "zh_cn": "过程展示已切换到主卡",
+            "en_us": "Process moved to the main card",
+        },
+        "interrupted": {
+            "zh_cn": "过程记录已中断",
+            "en_us": "Process interrupted",
+        },
     }
     assert set(started_content) == {"threadId", "runId", "input"}
 
@@ -595,7 +604,7 @@ def test_tool_failure_emits_one_error_result() -> None:
     assert "secret" not in result["content"]
 
 
-def test_abort_is_error_and_exactly_once() -> None:
+def test_abort_neutrally_closes_process_sidecar_exactly_once() -> None:
     client = _RecordingClient(
         _create_response(),
         _empty_response(),
@@ -617,14 +626,13 @@ def test_abort_is_error_and_exactly_once() -> None:
     terminal = _request_events(client.requests[2])[0]
     content = _event_content(terminal)
     started_content = _event_content(_request_events(client.requests[1])[0])
-    assert terminal["event_type"] == "RUN_ERROR"
+    assert terminal["event_type"] == "RUN_FINISHED"
     assert content == {
         "threadId": started_content["threadId"],
         "runId": started_content["runId"],
-        "message": "COT session aborted",
-        "code": "ABORTED",
+        "status": "paused",
     }
-    assert client.requests[3].queries[-1] == ("reason", "error")
+    assert client.requests[3].queries[-1] == ("reason", "done")
     assert session.healthy is False
 
 
@@ -652,15 +660,27 @@ def test_async_update_failure_is_detectable_without_retry_or_emit_exception() ->
     terminal = _request_events(client.requests[3])[0]
     content = _event_content(terminal)
     started_content = _event_content(_request_events(client.requests[1])[0])
-    assert terminal["event_type"] == "RUN_ERROR"
+    assert terminal["event_type"] == "RUN_FINISHED"
     assert content["threadId"] == started_content["threadId"]
     assert content["runId"] == started_content["runId"]
-    assert content["code"] == "TRANSPORT_ERROR"
-    assert client.requests[4].queries[-1] == ("reason", "error")
+    assert content["status"] == "paused"
+    assert client.requests[4].queries[-1] == ("reason", "done")
     assert session._worker_done.wait(1.0)
 
 
-def test_queue_backpressure_returns_false_then_closes_as_error() -> None:
+@pytest.mark.parametrize(
+    ("parent_terminal", "event_type", "status_or_code", "complete_reason"),
+    [
+        (CardEvent.completed(), "RUN_FINISHED", "done", "done"),
+        (CardEvent.failed("parent failed"), "RUN_ERROR", "TASK_FAILED", "error"),
+    ],
+)
+def test_queue_backpressure_does_not_override_real_parent_terminal(
+    parent_terminal: CardEvent,
+    event_type: str,
+    status_or_code: str,
+    complete_reason: str,
+) -> None:
     entered = threading.Event()
     release = threading.Event()
 
@@ -691,13 +711,14 @@ def test_queue_backpressure_returns_false_then_closes_as_error() -> None:
     assert session.emit(CardEvent.text_delta("text-one", "overflow")) is False
     assert session.healthy is False
     release.set()
-    assert session.complete(CardEvent.completed()) is False
+    assert session.complete(parent_terminal) is False
 
     assert len(client.requests) == 6
     terminal = _request_events(client.requests[4])[0]
-    assert terminal["event_type"] == "RUN_ERROR"
-    assert _event_content(terminal)["code"] == "BACKPRESSURE"
-    assert client.requests[5].queries[-1] == ("reason", "error")
+    assert terminal["event_type"] == event_type
+    content = _event_content(terminal)
+    assert (content.get("status") or content.get("code")) == status_or_code
+    assert client.requests[5].queries[-1] == ("reason", complete_reason)
 
 
 def test_drain_timeout_never_sends_concurrent_terminal_or_complete() -> None:
@@ -777,8 +798,9 @@ def test_sdk_update_timeout_never_sends_concurrent_terminal_or_complete() -> Non
     assert exited.wait(1.0)
     _wait_until(lambda: len(client.requests) == 5)
     terminal = _request_events(client.requests[3])[0]
-    assert terminal["event_type"] == "RUN_ERROR"
-    assert client.requests[4].queries[-1] == ("reason", "error")
+    assert terminal["event_type"] == "RUN_FINISHED"
+    assert _event_content(terminal)["status"] == "paused"
+    assert client.requests[4].queries[-1] == ("reason", "done")
     assert session._worker_done.wait(1.0)
 
 
@@ -830,7 +852,11 @@ def test_late_create_success_completes_without_unpaired_run_error() -> None:
         release.wait(1.0)
         return _create_response()
 
-    client = _RecordingClient(late_create, _empty_response())
+    client = _RecordingClient(
+        late_create,
+        _empty_response(),
+        _empty_response(),
+    )
     session = FeishuCOTSession(
         _api(client, timeout_seconds=0.2),
         chat_id=_CHAT_ID,
@@ -844,9 +870,15 @@ def test_late_create_success_completes_without_unpaired_run_error() -> None:
     assert len(client.requests) == 1
 
     release.set()
-    _wait_until(lambda: len(client.requests) == 2)
-    assert client.requests[1].uri.endswith("/complete/:cot_id")
-    assert client.requests[1].queries[-1] == ("reason", "error")
+    _wait_until(lambda: len(client.requests) == 3)
+    repaired_lifecycle = _request_events(client.requests[1])
+    assert [event["event_type"] for event in repaired_lifecycle] == [
+        "RUN_STARTED",
+        "RUN_FINISHED",
+    ]
+    assert _event_content(repaired_lifecycle[1])["status"] == "paused"
+    assert client.requests[2].uri.endswith("/complete/:cot_id")
+    assert client.requests[2].queries[-1] == ("reason", "done")
 
 
 def test_late_create_sdk_failure_never_guesses_a_cleanup_binding() -> None:
@@ -906,11 +938,23 @@ def test_late_run_started_success_closes_in_fifo_order() -> None:
 
     release.set()
     _wait_until(lambda: len(client.requests) == 4)
-    assert _request_events(client.requests[2])[0]["event_type"] == "RUN_ERROR"
-    assert client.requests[3].queries[-1] == ("reason", "error")
+    terminal = _request_events(client.requests[2])[0]
+    assert terminal["event_type"] == "RUN_FINISHED"
+    assert _event_content(terminal)["status"] == "paused"
+    assert client.requests[3].queries[-1] == ("reason", "done")
 
 
-def test_late_terminal_success_only_completes_after_the_barrier() -> None:
+@pytest.mark.parametrize(
+    ("parent_terminal", "complete_reason"),
+    [
+        (CardEvent.completed(), "done"),
+        (CardEvent.failed("parent failed"), "error"),
+    ],
+)
+def test_late_terminal_success_preserves_parent_reason_after_the_barrier(
+    parent_terminal: CardEvent,
+    complete_reason: str,
+) -> None:
     entered = threading.Event()
     release = threading.Event()
 
@@ -933,14 +977,14 @@ def test_late_terminal_success_only_completes_after_the_barrier() -> None:
         flush_interval=0.005,
     )
     session.start()
-    assert session.complete(CardEvent.completed()) is False
+    assert session.complete(parent_terminal) is False
     assert entered.is_set()
     assert len(client.requests) == 3
 
     release.set()
     _wait_until(lambda: len(client.requests) == 4)
     assert client.requests[3].uri.endswith("/complete/:cot_id")
-    assert client.requests[3].queries[-1] == ("reason", "error")
+    assert client.requests[3].queries[-1] == ("reason", complete_reason)
 
 
 def test_late_complete_success_is_not_retried() -> None:
@@ -988,7 +1032,11 @@ def test_abort_during_start_never_enters_accepting_state() -> None:
         release.wait(1.0)
         return _create_response()
 
-    client = _RecordingClient(blocking_create, _empty_response())
+    client = _RecordingClient(
+        blocking_create,
+        _empty_response(),
+        _empty_response(),
+    )
     session = FeishuCOTSession(
         _api(client, timeout_seconds=0.2),
         chat_id=_CHAT_ID,
@@ -1009,12 +1057,18 @@ def test_abort_during_start_never_enters_accepting_state() -> None:
     session.abort()
     release.set()
     thread.join(1.0)
-    _wait_until(lambda: len(client.requests) == 2)
+    _wait_until(lambda: len(client.requests) == 3)
 
     assert errors and isinstance(errors[0], COTTransportError)
     assert session.started is False
     assert session.emit(CardEvent.text_started("never")) is False
-    assert client.requests[1].queries[-1] == ("reason", "error")
+    repaired_lifecycle = _request_events(client.requests[1])
+    assert [event["event_type"] for event in repaired_lifecycle] == [
+        "RUN_STARTED",
+        "RUN_FINISHED",
+    ]
+    assert _event_content(repaired_lifecycle[1])["status"] == "paused"
+    assert client.requests[2].queries[-1] == ("reason", "done")
 
 
 def test_session_close_budget_is_independent_and_capped() -> None:
@@ -1116,8 +1170,10 @@ def test_abort_returns_before_an_inflight_update_finishes() -> None:
     assert len(client.requests) == 3
     release.set()
     _wait_until(lambda: len(client.requests) == 5)
-    assert _request_events(client.requests[3])[0]["event_type"] == "RUN_ERROR"
-    assert client.requests[4].queries[-1] == ("reason", "error")
+    terminal = _request_events(client.requests[3])[0]
+    assert terminal["event_type"] == "RUN_FINISHED"
+    assert _event_content(terminal)["status"] == "paused"
+    assert client.requests[4].queries[-1] == ("reason", "done")
 
 
 def test_authoritative_close_returns_within_independent_total_budget() -> None:
@@ -1153,10 +1209,10 @@ def test_authoritative_close_returns_within_independent_total_budget() -> None:
 
     release.set()
     _wait_until(lambda: len(client.requests) == 4)
-    assert client.requests[3].queries[-1] == ("reason", "error")
+    assert client.requests[3].queries[-1] == ("reason", "done")
 
 
-def test_late_explicit_run_started_failure_still_gets_ordered_error_cleanup() -> None:
+def test_late_explicit_run_started_failure_gets_neutral_ordered_cleanup() -> None:
     entered = threading.Event()
     release = threading.Event()
 
@@ -1183,8 +1239,13 @@ def test_late_explicit_run_started_failure_still_gets_ordered_error_cleanup() ->
     assert entered.is_set()
     release.set()
     _wait_until(lambda: len(client.requests) == 4)
-    assert _request_events(client.requests[2])[0]["event_type"] == "RUN_ERROR"
-    assert client.requests[3].queries[-1] == ("reason", "error")
+    repair = _request_events(client.requests[2])
+    assert [event["event_type"] for event in repair] == [
+        "RUN_STARTED",
+        "RUN_FINISHED",
+    ]
+    assert _event_content(repair[1])["status"] == "paused"
+    assert client.requests[3].queries[-1] == ("reason", "done")
 
 
 @pytest.mark.parametrize("operation", ["append", "complete"])
@@ -1249,11 +1310,13 @@ def test_worker_thread_construction_failure_closes_started_remote(
         session.start()
 
     assert len(client.requests) == 4
-    assert _request_events(client.requests[2])[0]["event_type"] == "RUN_ERROR"
-    assert client.requests[3].queries[-1] == ("reason", "error")
+    terminal = _request_events(client.requests[2])[0]
+    assert terminal["event_type"] == "RUN_FINISHED"
+    assert _event_content(terminal)["status"] == "paused"
+    assert client.requests[3].queries[-1] == ("reason", "done")
 
 
-def test_run_started_sdk_exception_gets_ordered_error_cleanup() -> None:
+def test_run_started_sdk_exception_gets_neutral_ordered_cleanup() -> None:
     client = _RecordingClient(
         _create_response(),
         ConnectionResetError("response lost"),
@@ -1270,10 +1333,14 @@ def test_run_started_sdk_exception_gets_ordered_error_cleanup() -> None:
         session.start()
 
     _wait_until(lambda: len(client.requests) == 4)
-    terminal = _request_events(client.requests[2])[0]
-    assert terminal["event_type"] == "RUN_ERROR"
-    assert _event_content(terminal)["code"] == "TRANSPORT_ERROR"
-    assert client.requests[3].queries[-1] == ("reason", "error")
+    cleanup = _request_events(client.requests[2])
+    # The server may have accepted RUN_STARTED before the connection failed,
+    # so cleanup must not blindly send a second RUN_STARTED.
+    assert [event["event_type"] for event in cleanup] == ["RUN_FINISHED"]
+    terminal = cleanup[0]
+    assert terminal["event_type"] == "RUN_FINISHED"
+    assert _event_content(terminal)["status"] == "paused"
+    assert client.requests[3].queries[-1] == ("reason", "done")
 
 
 def test_terminal_sdk_exception_completes_only_after_call_returns() -> None:
@@ -1294,7 +1361,7 @@ def test_terminal_sdk_exception_completes_only_after_call_returns() -> None:
 
     _wait_until(lambda: len(client.requests) == 4)
     assert client.requests[3].uri.endswith("/complete/:cot_id")
-    assert client.requests[3].queries[-1] == ("reason", "error")
+    assert client.requests[3].queries[-1] == ("reason", "done")
 
 
 def test_complete_sdk_exception_is_never_retried() -> None:
@@ -1350,5 +1417,7 @@ def test_worker_append_failure_exits_after_late_cleanup_without_caller_close() -
     _wait_until(lambda: session._closed)
     assert session._worker_done.wait(1.0)
     assert session._queue.empty()
-    assert _request_events(client.requests[3])[0]["event_type"] == "RUN_ERROR"
-    assert client.requests[4].queries[-1] == ("reason", "error")
+    terminal = _request_events(client.requests[3])[0]
+    assert terminal["event_type"] == "RUN_FINISHED"
+    assert _event_content(terminal)["status"] == "paused"
+    assert client.requests[4].queries[-1] == ("reason", "done")

@@ -301,12 +301,21 @@ def reduce_lifecycle(state: CardState, event: CardEvent) -> CardState:
             ),)
             # Determine terminal reason: ttl_expired if specified in payload, else cancelled
             reason = payload.get("reason", "cancelled") if payload else "cancelled"
-            # Preserve warning_banner from prior state (e.g. TTL expired text)
+            # A normal cancellation supersedes transient running-state
+            # warnings (including COT cutover's "task continues" banner).
+            # TTL closure and explicitly persistent warnings remain visible.
+            preserve_warning = reason == "ttl_expired" or (
+                payload.get("persistent_warning") is True
+            )
+            warning_banner = (
+                state.footer.warning_banner if preserve_warning else None
+            )
+            warning_type = state.footer.warning_type if warning_banner else None
             footer = FooterState(
                 status_text=UI_TEXT["card_lifecycle_cancelled_status"],
-                warning_banner=state.footer.warning_banner,
-                warning_type=state.footer.warning_type,
-                persistent_warning=bool(state.footer.warning_banner),
+                warning_banner=warning_banner,
+                warning_type=warning_type,
+                persistent_warning=bool(warning_banner),
                 duration_seconds=_compute_duration(state, now),
             )
             cancel_buttons_list: list[ButtonSpec] = []
