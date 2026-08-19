@@ -179,6 +179,37 @@ def evaluate_security_posture(
                 "trusted_local requires explicit risk acknowledgement",
             )
         )
+    trusted_personal = (
+        getattr(settings, "acp_trusted_personal_mode", False) is True
+    )
+    if trusted_personal and getattr(
+        settings,
+        "acp_trusted_personal_ack",
+        False,
+    ) is not True:
+        findings.append(
+            SecurityFinding(
+                "acp_trusted_personal_unacknowledged",
+                SecuritySeverity.BLOCKING,
+                "ACP trusted-personal mode requires explicit risk acknowledgement",
+            )
+        )
+    elif trusted_personal and not _has_ids(settings, "admin_user_ids"):
+        findings.append(
+            SecurityFinding(
+                "acp_trusted_personal_admin_missing",
+                SecuritySeverity.BLOCKING,
+                "ACP trusted-personal mode requires a configured administrator",
+            )
+        )
+    elif trusted_personal:
+        findings.append(
+            SecurityFinding(
+                "acp_trusted_personal_active",
+                SecuritySeverity.WARNING,
+                "administrator project tasks may run ACP backends with full host and network access",
+            )
+        )
     if shell_mode is ShellAccessMode.ISOLATED and not isolation_ready:
         findings.append(
             SecurityFinding(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from collections.abc import Mapping
@@ -400,6 +401,19 @@ class ACPSession:
         self._env_override = dict(env) if isinstance(env, dict) else None
         self._auto_approve = auto_approve
         self._capture_full_tool_content = bool(capture_full_tool_content)
+        initial_mode_source = (
+            self._env_override
+            if self._env_override is not None
+            else os.environ
+        )
+        configured_initial_mode = str(
+            initial_mode_source.get("INITIAL_AGENT_MODE") or "agent"
+        ).strip()
+        self._trusted_personal_restore_mode = (
+            configured_initial_mode
+            if configured_initial_mode in {"read-only", "agent"}
+            else "agent"
+        )
         self._conn = None  # ClientSideConnection
         self._proc = None  # subprocess
         self._ctx_manager = None  # async context manager
@@ -1326,6 +1340,35 @@ class ACPSession:
                 get_error_detail(e),
             )
             return False
+
+    async def set_trusted_personal_permissions(self, enabled: bool) -> bool:
+        """Apply or revoke one task's broad ACP permission lease.
+
+        The official Codex adapter owns its sandbox policy as a session mode,
+        so permission callbacks alone cannot enable network access. Switch it
+        to ``agent-full-access`` for the lease and restore the normal ``agent``
+        preset afterwards. Other ACP providers use the callback bridge only.
+        """
+
+        client = self._client
+        if client is None or not self._session_id:
+            return False
+        requested = enabled is True
+        if not requested:
+            client.set_trusted_personal_permissions(False)
+        if self._uses_official_codex_acp():
+            target_mode = (
+                "agent-full-access"
+                if requested
+                else self._trusted_personal_restore_mode
+            )
+            if not await self.set_config_option("mode", target_mode):
+                if requested:
+                    client.set_trusted_personal_permissions(False)
+                return False
+        if requested:
+            client.set_trusted_personal_permissions(True)
+        return True
 
     async def set_model(self, model_id: str) -> bool:
         """Switch the model for this session via ACP protocol.

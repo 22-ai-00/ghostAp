@@ -1421,6 +1421,7 @@ class GhostAPClient(Client):
         self._on_event = on_event
         self._on_session_info = on_session_info
         self._auto_approve = auto_approve
+        self._trusted_personal_permissions = False
         self._root_dir = os.path.abspath(os.path.expanduser(root_dir or "."))
         self._capture_full_tool_content = bool(capture_full_tool_content)
         self._sandbox = SandboxExecutor()
@@ -1434,6 +1435,10 @@ class GhostAPClient(Client):
     def set_tool_filter(self, filter_fn: Optional[Callable[[str, dict | None], bool]]) -> None:
         """Install or clear a per-session tool filter."""
         self._tool_filter = filter_fn
+
+    def set_trusted_personal_permissions(self, enabled: bool) -> None:
+        """Toggle the task-scoped single-user permission escape hatch."""
+        self._trusted_personal_permissions = enabled is True
 
     def snapshot_local_images(self) -> LocalImageArtifactSnapshot:
         """Capture bounded image file metadata before a prompt starts."""
@@ -1621,66 +1626,68 @@ class GhostAPClient(Client):
         self, session_id: str, tool_call, options, **kwargs: Any
     ) -> RequestPermissionResponse:
         """Handle permission requests from agent."""
-        if not self._auto_approve:
+        trusted_personal = self._trusted_personal_permissions is True
+        if not self._auto_approve and not trusted_personal:
             return self._deny_permission(session_id, "auto_approve_disabled")
 
         if not options:
             return self._deny_permission(session_id, "empty_options")
 
-        # Permission filters apply to every ACP kind before auto-approval.
-        safety_stage = "tool_request"
-        permission_kind, command_shape = _permission_request_diagnostics(tool_call)
-        try:
-            permission_tool, tool_args, command = _permission_tool_request(
-                tool_call,
-                root_dir=self._root_dir,
-            )
-            safety_stage = "tool_filter"
-            if not self._is_tool_allowed(permission_tool, tool_args):
-                denied_data = {"tool": permission_tool}
-                if command is not None:
-                    denied_data["command"] = command
-                return self._deny_permission(
-                    session_id, "tool_filter_denied", **denied_data
+        if not trusted_personal:
+            # Permission filters apply to every ACP kind before auto-approval.
+            safety_stage = "tool_request"
+            permission_kind, command_shape = _permission_request_diagnostics(tool_call)
+            try:
+                permission_tool, tool_args, command = _permission_tool_request(
+                    tool_call,
+                    root_dir=self._root_dir,
                 )
+                safety_stage = "tool_filter"
+                if not self._is_tool_allowed(permission_tool, tool_args):
+                    denied_data = {"tool": permission_tool}
+                    if command is not None:
+                        denied_data["command"] = command
+                    return self._deny_permission(
+                        session_id, "tool_filter_denied", **denied_data
+                    )
 
-            # Keep the existing hard and sandbox checks for executable commands.
-            if command is not None:
-                safety_stage = "dangerous_command"
-                hard_ok, hard_reason = _ACP_PERMISSION_DANGEROUS_CHECK.check(command, None)
-                if not hard_ok:
-                    logger.info("[ACP] Reject dangerous auto-approved command: %s (%s)", command, hard_reason)
-                    return self._deny_permission(
-                        session_id,
-                        "dangerous_execute",
-                        command=command,
-                        detail=hard_reason,
-                    )
-                safety_stage = "sandbox"
-                ok, reason = self._sandbox.is_command_safe(command)
-                if not ok:
-                    logger.info("[ACP] Reject unsafe command: %s (%s)", command, reason)
-                    return self._deny_permission(
-                        session_id,
-                        "unsafe_execute",
-                        command=command,
-                        detail=reason,
-                    )
-        except Exception as e:
-            logger.warning(
-                "[ACP] Permission safety check failed closed: error=%s stage=%s kind=%s command_shape=%s",
-                type(e).__name__,
-                safety_stage,
-                permission_kind,
-                command_shape,
-            )
-            return self._deny_permission(
-                session_id,
-                "permission_safety_check_failed",
-                stage=safety_stage,
-                kind=permission_kind,
-                command_shape=command_shape,
-            )
+                # Keep the existing hard and sandbox checks for executable commands.
+                if command is not None:
+                    safety_stage = "dangerous_command"
+                    hard_ok, hard_reason = _ACP_PERMISSION_DANGEROUS_CHECK.check(command, None)
+                    if not hard_ok:
+                        logger.info("[ACP] Reject dangerous auto-approved command: %s (%s)", command, hard_reason)
+                        return self._deny_permission(
+                            session_id,
+                            "dangerous_execute",
+                            command=command,
+                            detail=hard_reason,
+                        )
+                    safety_stage = "sandbox"
+                    ok, reason = self._sandbox.is_command_safe(command)
+                    if not ok:
+                        logger.info("[ACP] Reject unsafe command: %s (%s)", command, reason)
+                        return self._deny_permission(
+                            session_id,
+                            "unsafe_execute",
+                            command=command,
+                            detail=reason,
+                        )
+            except Exception as e:
+                logger.warning(
+                    "[ACP] Permission safety check failed closed: error=%s stage=%s kind=%s command_shape=%s",
+                    type(e).__name__,
+                    safety_stage,
+                    permission_kind,
+                    command_shape,
+                )
+                return self._deny_permission(
+                    session_id,
+                    "permission_safety_check_failed",
+                    stage=safety_stage,
+                    kind=permission_kind,
+                    command_shape=command_shape,
+                )
 
         # Only an explicit one-shot grant is eligible for automatic selection.
         # Provider-specific or future option kinds are denied by default.
@@ -1692,8 +1699,34 @@ class GhostAPClient(Client):
             ):
                 allow_option_id = str(opt.option_id)
                 break
+        if trusted_personal and not allow_option_id:
+            for opt in options:
+                if (
+                    getattr(opt, "kind", None) == "allow_always"
+                    and getattr(opt, "option_id", None)
+                ):
+                    allow_option_id = str(opt.option_id)
+                    break
         if not allow_option_id:
             return self._deny_permission(session_id, "missing_allow_once")
+
+        self._record(
+            session_id,
+            "permission",
+            {
+                "outcome": "selected",
+                "policy": "trusted_personal" if trusted_personal else "auto_approve",
+                "option_kind": next(
+                    (
+                        str(getattr(option, "kind", "") or "")
+                        for option in options
+                        if str(getattr(option, "option_id", "") or "")
+                        == allow_option_id
+                    ),
+                    "",
+                ),
+            },
+        )
 
         return RequestPermissionResponse(outcome=AllowedOutcome(option_id=allow_option_id, outcome="selected"))
 

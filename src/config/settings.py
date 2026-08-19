@@ -136,6 +136,11 @@ class Settings(BaseSettings):
     # ACP permission auto-approve (True = agent actions auto-approved, False = denied by default)
     acp_permission_auto_approve: bool = True
 
+    # Task-scoped escape hatch for a single-user deployment. Runtime activation
+    # additionally requires a configured admin sender and a concrete project.
+    acp_trusted_personal_mode: bool = False
+    acp_trusted_personal_ack: bool = False
+
     # Auto-update agent CLI when ACP server mode is not supported
     acp_auto_update: bool = True
     # Timeout for agent CLI auto-update subprocess (seconds)

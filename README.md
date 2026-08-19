@@ -108,6 +108,8 @@ SANDBOX_MAX_OUTPUT_LENGTH=4000
 SANDBOX_COMMAND_BLACKLIST=
 
 ACP_PERMISSION_AUTO_APPROVE=true
+ACP_TRUSTED_PERSONAL_MODE=false
+ACP_TRUSTED_PERSONAL_ACK=false
 ACP_MODEL_PROBE_TIMEOUT=15
 
 WORKFLOW_TOTAL_TIMEOUT_S=3600
@@ -120,6 +122,12 @@ WORKFLOW_SCRIPT_GEN_TIMEOUT_S=180
 Employee Department 必须单独启用，并为群上下文设置有界保留期。`shadow`、
 `legacy_allow_all` 和 `trusted_local` 只用于显式诊断或紧急回退，校验输出会用稳定
 finding code 标出未强制执行或未确认的风险。
+
+单人部署若需要让管理员在当前项目的普通 ACP 编程任务中执行远程 `git push`
+等主机/网络操作，可同时启用 `ACP_TRUSTED_PERSONAL_MODE=true` 与
+`ACP_TRUSTED_PERSONAL_ACK=true`。该权限按任务租约启用：Codex 会临时切换到
+`agent-full-access`，任务结束后恢复普通 `agent` 模式；Workflow、Employee 和
+非管理员任务不会继承此权限。撤销失败的会话会被强制退休，避免权限残留。
 
 更多参数见 `.env.example` 和 `src/config/settings.py`。各 AI 后端所需的密钥、登录态或 CLI 配置应按对应工具自己的方式准备，GhostAP 只读取必要的环境变量和本地命令。
 

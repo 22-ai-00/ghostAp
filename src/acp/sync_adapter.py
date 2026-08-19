@@ -1358,6 +1358,36 @@ class SyncACPSession(PromptGenerationTracker):
         """Return the currently installed tool filter, or None."""
         return getattr(self, "_tool_filter", None)
 
+    def set_trusted_personal_permissions(
+        self,
+        enabled: bool,
+        timeout: float = 10.0,
+    ) -> bool:
+        """Synchronously apply or revoke a task-scoped ACP trust lease."""
+
+        if not self._acp_session or not self._loop:
+            return False
+        try:
+            applied = bool(
+                self._run_async(
+                    self._acp_session.set_trusted_personal_permissions(enabled),
+                    timeout=max(0.1, float(timeout or 10.0)),
+                )
+            )
+        except (TimeoutError, OSError, RuntimeError) as exc:
+            logger.error(
+                "[ACP:%s] trusted-personal lease transition failed: enabled=%s error=%s",
+                self._agent_type,
+                enabled,
+                get_error_detail(exc),
+            )
+            applied = False
+        if not applied:
+            # A timed-out mode transition has an unknown remote state. Never
+            # reuse that transport for another user/task.
+            self._force_dead = True
+        return applied
+
     def has_active_goal(self, timeout: float = 1.0) -> bool:
         """Inspect provider-owned goal state on the session event loop."""
         if not self._acp_session:

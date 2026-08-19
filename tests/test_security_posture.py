@@ -62,6 +62,7 @@ def test_shell_access_posture_is_fail_closed(
     expected_code: str | None,
 ) -> None:
     settings = Settings(
+        _env_file=None,
         shell_access_mode=mode,
         shell_trusted_local_ack=ack,
         admin_user_ids=admins,
@@ -95,6 +96,7 @@ def test_non_enforcing_ingress_modes_are_visibly_reported(
 ) -> None:
     posture = evaluate_security_posture(
         Settings(
+            _env_file=None,
             ingress_access_mode=mode,
             admin_bootstrap_scope="p2p_only",
         )
@@ -143,7 +145,7 @@ def test_employee_department_posture_tracks_real_composition_gate(
 
 def test_any_chat_bootstrap_is_distinguishable_from_secure_posture() -> None:
     posture = evaluate_security_posture(
-        Settings(admin_bootstrap_scope="any_chat")
+        Settings(_env_file=None, admin_bootstrap_scope="any_chat")
     )
 
     finding = next(
@@ -192,6 +194,7 @@ def test_validate_prints_posture_and_exits_nonzero_for_blocker(
     from src.main import main
 
     settings = Settings(
+        _env_file=None,
         app_id="cli_test",
         app_secret="cli_test_secret",
         shell_access_mode="admin_dm",
