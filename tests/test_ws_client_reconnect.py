@@ -911,6 +911,7 @@ def test_employee_runtime_recovery_failure_closes_runtime_once() -> None:
 
 def test_ws_client_init_failure_after_employee_runtime_composition_closes_once(
     monkeypatch,
+    tmp_path,
 ) -> None:
     from unittest.mock import MagicMock
 
@@ -919,6 +920,10 @@ def test_ws_client_init_failure_after_employee_runtime_composition_closes_once(
     )
     from src.feishu import ws_client as ws
 
+    settings = ws.get_settings().model_copy(update={"restart_gate_dir": ""})
+    monkeypatch.setattr(ws, "get_settings", lambda: settings)
+    monkeypatch.setattr(ws, "_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setattr(ws, "ProjectManager", MagicMock())
     runtime = SimpleNamespace(close=MagicMock())
     initialization_error = RuntimeError("handler construction failed")
     monkeypatch.setattr(
@@ -941,6 +946,7 @@ def test_ws_client_init_failure_after_employee_runtime_composition_closes_once(
 
 def test_ws_client_init_failure_does_not_leave_scheduler_holding_client(
     monkeypatch,
+    tmp_path,
 ) -> None:
     from unittest.mock import MagicMock
 
@@ -949,6 +955,10 @@ def test_ws_client_init_failure_does_not_leave_scheduler_holding_client(
     )
     from src.feishu import ws_client as ws
 
+    settings = ws.get_settings().model_copy(update={"restart_gate_dir": ""})
+    monkeypatch.setattr(ws, "get_settings", lambda: settings)
+    monkeypatch.setattr(ws, "_CHECKOUT_ROOT", tmp_path)
+    monkeypatch.setattr(ws, "ProjectManager", MagicMock())
     runtime = SimpleNamespace(close=MagicMock())
     initialization_error = RuntimeError("handler construction failed")
     schedulers = []

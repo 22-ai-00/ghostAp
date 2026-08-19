@@ -5,12 +5,22 @@ from src.feishu.ws_client import FeishuWSClient
 from src.utils.rate_limit import RateLimitExceededException
 
 
+@patch("src.feishu.ws_client.ProjectManager")
 @patch("src.feishu.ws_client.TaskScheduler")
-def test_spec_backpressure(mock_scheduler_cls):
+def test_spec_backpressure(
+    mock_scheduler_cls,
+    _project_manager_cls,
+    monkeypatch,
+    tmp_path,
+):
     from src.access_control import IngressAccessPolicy, IngressAccessPolicyProvider
     from src.config import IngressAccessMode
+    from src.feishu import ws_client as ws
 
     mock_scheduler = mock_scheduler_cls.return_value
+    settings = ws.get_settings().model_copy(update={"restart_gate_dir": ""})
+    monkeypatch.setattr(ws, "get_settings", lambda: settings)
+    monkeypatch.setattr(ws, "_CHECKOUT_ROOT", tmp_path)
 
     # Simulate backpressure by raising the exception on submit for spec tasks
     def mock_submit(spec, fn):

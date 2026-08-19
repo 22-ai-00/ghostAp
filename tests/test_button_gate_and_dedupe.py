@@ -36,9 +36,10 @@ def _make_card_action_data(
     )
 
 
-def test_button_is_blocked_while_system_command_inflight():
+def test_button_is_blocked_while_system_command_inflight(tmp_path):
     with (
         patch("src.feishu.ws_client.get_settings") as mock_get_settings,
+        patch("src.feishu.ws_client._CHECKOUT_ROOT", tmp_path),
         patch("src.feishu.ws_client.ACPSessionManager"),
         patch("src.feishu.ws_client.IntentRecognizer"),
         patch("src.feishu.ws_client.ProjectManager"),
@@ -124,9 +125,10 @@ def test_button_is_blocked_while_system_command_inflight():
             client.close()
 
 
-def test_system_gate_lookup_failure_acks_and_never_schedules_business_action():
+def test_system_gate_lookup_failure_acks_and_never_schedules_business_action(tmp_path):
     with (
         patch("src.feishu.ws_client.get_settings") as mock_get_settings,
+        patch("src.feishu.ws_client._CHECKOUT_ROOT", tmp_path),
         patch("src.feishu.ws_client.ACPSessionManager"),
         patch("src.feishu.ws_client.IntentRecognizer"),
         patch("src.feishu.ws_client.ProjectManager"),
@@ -173,9 +175,10 @@ def test_system_gate_lookup_failure_acks_and_never_schedules_business_action():
 
 
 
-def test_button_rapid_clicks_dedupe_same_state_and_accept_changed_state():
+def test_button_rapid_clicks_dedupe_same_state_and_accept_changed_state(tmp_path):
     with (
         patch("src.feishu.ws_client.get_settings") as mock_get_settings,
+        patch("src.feishu.ws_client._CHECKOUT_ROOT", tmp_path),
         patch("src.feishu.ws_client.ACPSessionManager"),
         patch("src.feishu.ws_client.IntentRecognizer"),
         patch("src.feishu.ws_client.ProjectManager"),

@@ -54,9 +54,10 @@ def test_exit_current_mode_delegates_for_every_programming_backend(
     handler.reply_text.assert_not_called()
 
 
-def test_exit_is_deferred_until_running_task_finishes():
+def test_exit_is_deferred_until_running_task_finishes(tmp_path):
     with (
         patch("src.feishu.ws_client.get_settings") as mock_get_settings,
+        patch("src.feishu.ws_client._CHECKOUT_ROOT", tmp_path),
         patch("src.feishu.ws_client.ACPSessionManager"),
         patch("src.feishu.ws_client.IntentRecognizer"),
         patch("src.feishu.ws_client.ProjectManager"),
@@ -137,9 +138,10 @@ def test_exit_is_deferred_until_running_task_finishes():
         client.close()
 
 
-def test_exit_is_immediate_when_no_running_task():
+def test_exit_is_immediate_when_no_running_task(tmp_path):
     with (
         patch("src.feishu.ws_client.get_settings") as mock_get_settings,
+        patch("src.feishu.ws_client._CHECKOUT_ROOT", tmp_path),
         patch("src.feishu.ws_client.ACPSessionManager"),
         patch("src.feishu.ws_client.IntentRecognizer"),
         patch("src.feishu.ws_client.ProjectManager"),
