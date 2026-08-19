@@ -347,6 +347,42 @@ class StreamBridge(Protocol):
         ...
 
 
+class ProcessEventSink(Protocol):
+    """Optional ordered transport for programming process events.
+
+    The result card remains the authoritative task/conclusion projection.  A
+    sink may mirror text, reasoning, and tool events into a native process UI
+    such as Feishu COT without making the card layer depend on that transport.
+    """
+
+    @property
+    def started(self) -> bool: ...
+
+    @property
+    def message_id(self) -> str | None: ...
+
+    @property
+    def healthy(self) -> bool:
+        """Whether queued process events can still reach the remote UI."""
+        ...
+
+    def start(self) -> None:
+        """Create the remote process message and open its run lifecycle."""
+        ...
+
+    def emit(self, event: "CardEvent") -> bool:
+        """Queue one supported process event; return whether it was handled."""
+        ...
+
+    def complete(self, event: "CardEvent") -> bool:
+        """Close the run and its remote lifecycle for one terminal event."""
+        ...
+
+    def abort(self) -> None:
+        """Best-effort close after local setup or delivery aborts."""
+        ...
+
+
 __all__ = [
     "Session",
     "TTLState",
@@ -359,4 +395,5 @@ __all__ = [
     "ManagedDispatchable",
     "CardAPIClient",
     "StreamBridge",
+    "ProcessEventSink",
 ]

@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>普通编程 · Feishu COT 混合消息预览</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f3f5f8;
+      --card: #fff;
+      --text: #1f2329;
+      --muted: #646a73;
+      --quiet: #8f959e;
+      --line: #dfe3e8;
+      --soft-line: #edf0f3;
+      --blue: #245bdb;
+      --blue-soft: #eef4ff;
+      --green: #18864b;
+      --green-soft: #eef9f2;
+      --amber: #a65d05;
+      --amber-soft: #fff8eb;
+      --shadow: 0 8px 28px rgb(31 35 41 / 7%);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: linear-gradient(180deg, #edf2fa 0, var(--page) 260px);
+      color: var(--text);
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    main {
+      width: min(1120px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 36px 0 64px;
+    }
+
+    h1 { margin: 0 0 8px; font-size: clamp(24px, 4vw, 34px); }
+    .lead { max-width: 780px; margin: 0 0 26px; color: var(--muted); }
+    .states { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; align-items: start; }
+    .state-title { margin: 0 0 10px; color: var(--muted); font-size: 13px; font-weight: 700; }
+    .chat { display: grid; gap: 12px; }
+
+    .user-message {
+      justify-self: end;
+      max-width: 84%;
+      padding: 10px 13px;
+      border-radius: 12px 4px 12px 12px;
+      background: #dfeaff;
+    }
+
+    .cot {
+      overflow: hidden;
+      border: 1px solid #cbd8ef;
+      border-radius: 12px;
+      background: var(--card);
+      box-shadow: var(--shadow);
+    }
+
+    .cot-trigger {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-weight: 700;
+    }
+
+    .cot-trigger.done { color: var(--green); background: var(--green-soft); }
+    .cot-meta { color: var(--quiet); font-size: 12px; font-weight: 500; }
+    .cot-body { padding: 13px 14px 14px; }
+
+    .reasoning {
+      margin-bottom: 10px;
+      padding: 9px 11px;
+      border-left: 3px solid #8eabdf;
+      background: #f7f9fc;
+      color: var(--muted);
+    }
+
+    .process-copy { margin: 0 0 10px; }
+    .tool-list { display: grid; gap: 7px; }
+
+    .tool {
+      display: grid;
+      grid-template-columns: 24px minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 10px;
+      border: 1px solid var(--soft-line);
+      border-radius: 8px;
+      background: #fafbfc;
+    }
+
+    .tool-icon {
+      display: grid;
+      width: 24px;
+      height: 24px;
+      place-items: center;
+      border-radius: 6px;
+      background: #e8eef9;
+    }
+
+    .tool strong { display: block; font-size: 13px; }
+    .tool small { display: block; overflow: hidden; color: var(--quiet); text-overflow: ellipsis; white-space: nowrap; }
+    .tool-status { color: var(--green); font-size: 12px; }
+    .tool-status.running { color: var(--amber); }
+
+    .result-card {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      box-shadow: var(--shadow);
+    }
+
+    .card-header {
+      padding: 12px 15px;
+      color: #fff;
+      background: #31559a;
+      font-weight: 700;
+    }
+
+    .card-header.done { background: #17683d; }
+    .card-header small { display: block; margin-top: 2px; opacity: .78; font-weight: 500; }
+    .card-body { padding: 14px 15px; }
+
+    .task-summary {
+      padding: 10px 12px;
+      border: 1px solid #e6bd72;
+      border-radius: 9px;
+      background: var(--amber-soft);
+    }
+
+    .task-summary strong { display: block; margin-bottom: 5px; }
+    .tasks { display: grid; gap: 4px; color: var(--muted); }
+    .tasks .active { color: var(--blue); font-weight: 650; }
+    .answer h3 { margin: 0 0 7px; font-size: 15px; }
+    .answer p { margin: 0; }
+    .deliverables { margin: 10px 0 0; padding-left: 20px; }
+    .footer { margin-top: 13px; padding-top: 10px; border-top: 1px solid var(--soft-line); color: var(--quiet); font-size: 12px; }
+
+    .rule {
+      margin-top: 24px;
+      padding: 14px 16px;
+      border-left: 3px solid var(--blue);
+      border-radius: 8px;
+      background: #eaf1ff;
+      color: #354052;
+    }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 9px; color: var(--muted); font-size: 12px; }
+    .legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 6px; border-radius: 50%; background: var(--blue); }
+    .legend span:nth-child(2)::before { background: var(--amber); }
+    .legend span:nth-child(3)::before { background: var(--green); }
+
+    @media (max-width: 780px) {
+      main { width: min(460px, calc(100% - 24px)); padding-top: 22px; }
+      .states { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>普通编程：COT 过程 + 原生结果卡</h1>
+    <p class="lead">推理、过程文案和工具调用交给 Feishu COT/AG-UI 原生消息；Card 2.0 只保留它更擅长的任务总览、并行 Agent、图片产物和最终结论。</p>
+
+    <section class="states">
+      <article>
+        <h2 class="state-title">运行中 · COT 展开，任务卡保持紧凑</h2>
+        <div class="chat">
+          <div class="user-message">把登录模块拆成并行任务并修好测试。</div>
+
+          <section class="cot" aria-label="Feishu COT 运行中预览">
+            <div class="cot-trigger">
+              <span>● 任务进行中</span>
+              <span class="cot-meta">展开过程⌃</span>
+            </div>
+            <div class="cot-body">
+              <div class="reasoning">正在确认认证入口、现有测试和并发可拆分边界。</div>
+              <p class="process-copy">已定位两个可独立处理的模块，开始并行修改。</p>
+              <div class="tool-list">
+                <div class="tool">
+                  <span class="tool-icon">⌕</span>
+                  <span><strong>搜索代码</strong><small>认证路由与会话测试</small></span>
+                  <span class="tool-status">完成</span>
+                </div>
+                <div class="tool">
+                  <span class="tool-icon">⌘</span>
+                  <span><strong>运行测试</strong><small>tests/test_auth.py -q</small></span>
+                  <span class="tool-status running">执行中</span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="result-card" aria-label="任务总览卡预览">
+            <div class="card-header">进行中 · GhostAP · Codex<small>任务与并行 Agent 总览</small></div>
+            <div class="card-body">
+              <div class="task-summary">
+                <strong>并行子任务 · 2 个</strong>
+                <div class="tasks">
+                  <span>✓ #1 修复会话校验</span>
+                  <span class="active">● #2 补认证路由回归</span>
+                </div>
+              </div>
+              <div class="footer">Codex · gpt-5.6-sol/high · 00:42</div>
+            </div>
+          </section>
+        </div>
+      </article>
+
+      <article>
+        <h2 class="state-title">已完成 · COT 收起，结论卡成为主交付</h2>
+        <div class="chat">
+          <div class="user-message">把登录模块拆成并行任务并修好测试。</div>
+
+          <section class="cot" aria-label="Feishu COT 已完成预览">
+            <div class="cot-trigger done">
+              <span>✓ 任务已完成</span>
+              <span class="cot-meta">查看 6 条过程⌄</span>
+            </div>
+          </section>
+
+          <section class="result-card" aria-label="最终结论卡预览">
+            <div class="card-header done">完成 · GhostAP · Codex<small>任务、结论与交付物</small></div>
+            <div class="card-body">
+              <div class="answer">
+                <h3>最终结论</h3>
+                <p>登录态校验与认证路由已修复，两个并行子任务均完成，原有安全边界保持不变。</p>
+                <ul class="deliverables">
+                  <li>新增过期会话拒绝回归</li>
+                  <li>修复路由在空凭据下的错误分支</li>
+                  <li>相关测试 18 项全部通过</li>
+                </ul>
+              </div>
+              <div class="task-summary">
+                <strong>并行子任务 · 2/2 完成</strong>
+                <div class="tasks">
+                  <span>✓ #1 修复会话校验</span>
+                  <span>✓ #2 补认证路由回归</span>
+                </div>
+              </div>
+              <div class="footer">Codex · gpt-5.6-sol/high · 完成于 01:18</div>
+            </div>
+          </section>
+        </div>
+      </article>
+    </section>
+
+    <aside class="rule">
+      <strong>运输规则</strong>：COT 创建成功后，正文/推理/工具事件不再重复写进卡片；任务清单、子 Agent 摘要、图片和终态正文继续进入结果卡。COT 不可用时，自动恢复现有完整流式卡。
+      <div class="legend"><span>COT 过程</span><span>卡片任务总览</span><span>卡片最终结论</span></div>
+    </aside>
+  </main>
+</body>
+</html>

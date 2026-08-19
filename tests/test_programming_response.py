@@ -41,6 +41,8 @@ class _FakeProgrammingCardSession:
         self.cancelled_reason = None
         self.continuation_boundaries = 0
         self.kwargs = kwargs
+        self.process_sink = kwargs.get("process_sink")
+        self.process_sink_activation_calls = 0
         type(self).last = self
 
     def start(self):
@@ -48,6 +50,24 @@ class _FakeProgrammingCardSession:
 
     def get_message_id(self):
         return None
+
+    def activate_process_sink(self):
+        self.process_sink_activation_calls += 1
+        sink = self.process_sink
+        if sink is None:
+            return False
+        try:
+            if not sink.started:
+                sink.start()
+            return sink.started and bool(getattr(sink, "healthy", True))
+        except Exception:
+            sink.abort()
+            return False
+
+    def get_process_message_id(self):
+        if self.process_sink is None:
+            return None
+        return self.process_sink.message_id
 
     def wait_until_visible(self, _timeout):
         return True
@@ -83,6 +103,36 @@ class _FakeProgrammingCardSession:
 
     def begin_continuation_turn(self):
         self.continuation_boundaries += 1
+
+
+class _FakeProcessSink:
+    def __init__(
+        self,
+        *,
+        message_id: str | None = "om-cot-process",
+        start_error: Exception | None = None,
+        call_order: list[str] | None = None,
+    ) -> None:
+        self.message_id = message_id
+        self.started = False
+        self.healthy = True
+        self.start_error = start_error
+        self.call_order = call_order
+        self.start_calls = 0
+        self.abort_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+        if self.call_order is not None:
+            self.call_order.append("cot_start")
+        if self.start_error is not None:
+            raise self.start_error
+        self.started = True
+
+    def abort(self) -> None:
+        self.abort_calls += 1
+        self.started = False
+
 
 class _QueuedPromptSession:
     def __init__(
@@ -192,6 +242,7 @@ def _make_handler():
     ctx.settings.programming_agent_idle_timeout_s = 420
     ctx.settings.app_id = "cli_test"
     ctx.settings.repo_lock_hard_timeout = 3600
+    ctx.settings.feishu_cot_enabled = False
     ctx.api_client_factory = MagicMock()
     ctx.pending_image_lock = nullcontext()
     ctx.pending_image_keys = {}
@@ -1057,6 +1108,7 @@ def test_provider_goal_after_finalization_fails_with_timeout_truth(
 
 def test_programming_handle_response_builds_channel_card_client():
     handler = _make_handler()
+    handler.settings.feishu_cot_enabled = False
     channel = object()
     handler.ctx.channel_client_factory = MagicMock(return_value=channel)
     session = MagicMock()
@@ -1079,6 +1131,8 @@ def test_programming_handle_response_builds_channel_card_client():
             "src.card.delivery.feishu_client.FeishuCardAPIClient",
             return_value=MagicMock(name="legacy_card_adapter"),
         ),
+        patch("src.feishu.cot.FeishuCOTAPIClient") as cot_api_cls,
+        patch("src.feishu.cot.FeishuCOTSession") as cot_session_cls,
         patch("src.card.session.CardSession", return_value=MagicMock()),
         patch("src.card.session.factory.CardSessionFactory", return_value=MagicMock()),
         patch("src.card.programming_adapter.ProgrammingCardSession", _FakeProgrammingCardSession),
@@ -1100,6 +1154,185 @@ def test_programming_handle_response_builds_channel_card_client():
     assert delivery_factory.call_args.args == (channel_adapter,)
     assert callable(delivery_factory.call_args.kwargs["payload_transform"])
     assert callable(delivery_factory.call_args.kwargs["trust_revision_provider"])
+    cot_api_cls.assert_not_called()
+    cot_session_cls.assert_not_called()
+
+
+def test_programming_starts_cot_only_after_card_is_visible_and_links_both_messages():
+    handler = _make_handler()
+    handler.settings.feishu_cot_enabled = True
+    handler.settings.default_reply_mode = "thread"
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    session = _QueuedPromptSession(_completed_result())
+    call_order: list[str] = []
+    process_sink = _FakeProcessSink(call_order=call_order)
+
+    class _LinkedProgrammingCardSession(_FakeProgrammingCardSession):
+        last = None
+
+        def wait_until_visible(self, _timeout):
+            call_order.append("card_visible")
+            return True
+
+        def get_message_id(self):
+            return "om-card-summary"
+
+    cot_api = MagicMock(name="cot_api")
+    with (
+        _streaming_environment(_LinkedProgrammingCardSession),
+        patch(
+            "src.feishu.cot.FeishuCOTAPIClient",
+            return_value=cot_api,
+        ) as cot_api_cls,
+        patch(
+            "src.feishu.cot.FeishuCOTSession",
+            return_value=process_sink,
+        ) as cot_session_cls,
+    ):
+        handler.handle_response(
+            "msg-cot-success",
+            "chat-1",
+            "injected task text",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+            _finalization_task_text="raw user task",
+        )
+
+    adapter = _LinkedProgrammingCardSession.last
+    assert call_order[:2] == ["card_visible", "cot_start"]
+    assert adapter.process_sink is process_sink
+    assert adapter.process_sink_activation_calls == 1
+    assert process_sink.start_calls == 1
+    assert adapter.finished is True
+    assert len(session.calls) == 1
+    cot_api_cls.assert_called_once()
+    assert cot_api_cls.call_args.args == (handler.ctx.api_client_factory.return_value,)
+    cot_session_cls.assert_called_once_with(
+        cot_api,
+        chat_id="chat-1",
+        origin_message_id="msg-cot-success",
+        reply_in_thread=True,
+        input_text="raw user task",
+        request_timeout=2.0,
+    )
+    handler.ctx.message_linker.link_reply.assert_any_call(
+        "msg-cot-success",
+        "om-card-summary",
+    )
+    handler.ctx.message_linker.link_reply.assert_any_call(
+        "msg-cot-success",
+        "om-cot-process",
+    )
+
+
+def test_programming_cot_activation_failure_keeps_streaming_card_execution():
+    handler = _make_handler()
+    handler.settings.feishu_cot_enabled = True
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler._handle_response_non_streaming = MagicMock()
+    session = _QueuedPromptSession(_completed_result())
+    call_order: list[str] = []
+    process_sink = _FakeProcessSink(
+        message_id=None,
+        start_error=RuntimeError("COT unavailable"),
+        call_order=call_order,
+    )
+
+    class _LinkedProgrammingCardSession(_FakeProgrammingCardSession):
+        last = None
+
+        def wait_until_visible(self, _timeout):
+            call_order.append("card_visible")
+            return True
+
+        def get_message_id(self):
+            return "om-card-fallback"
+
+    with (
+        _streaming_environment(_LinkedProgrammingCardSession),
+        patch("src.feishu.cot.FeishuCOTAPIClient", return_value=MagicMock()),
+        patch("src.feishu.cot.FeishuCOTSession", return_value=process_sink),
+    ):
+        handler.handle_response(
+            "msg-cot-failure",
+            "chat-1",
+            "finish",
+            session,
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    adapter = _LinkedProgrammingCardSession.last
+    assert call_order == ["card_visible", "cot_start"]
+    assert adapter.process_sink_activation_calls == 1
+    assert process_sink.start_calls == 1
+    assert process_sink.abort_calls == 1
+    assert adapter.finished is True
+    assert len(session.calls) == 1
+    handler._handle_response_non_streaming.assert_not_called()
+    handler.ctx.message_linker.link_reply.assert_called_once_with(
+        "msg-cot-failure",
+        "om-card-fallback",
+    )
+
+
+def test_programming_aborts_active_cot_card_session_when_execution_entry_raises():
+    handler = _make_handler()
+    handler.settings.feishu_cot_enabled = True
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler._handle_response_non_streaming = MagicMock()
+    failure = RuntimeError("execution entry failed")
+    handler._execute_programming_response = MagicMock(side_effect=failure)
+    process_sink = _FakeProcessSink()
+    delivery = MagicMock()
+    delivery.shutdown.return_value = True
+
+    class _AbortTrackingProgrammingCardSession(_FakeProgrammingCardSession):
+        last = None
+
+        def __init__(self, *_args, **kwargs):
+            super().__init__(*_args, **kwargs)
+            self.aborted = False
+            type(self).last = self
+
+        def get_message_id(self):
+            return "om-card-before-execution"
+
+        def abort(self):
+            self.aborted = True
+            if self.process_sink is not None and self.process_sink.started:
+                self.process_sink.abort()
+
+    with (
+        _streaming_environment(
+            _AbortTrackingProgrammingCardSession,
+            delivery=delivery,
+        ),
+        patch("src.feishu.cot.FeishuCOTAPIClient", return_value=MagicMock()),
+        patch("src.feishu.cot.FeishuCOTSession", return_value=process_sink),
+        pytest.raises(RuntimeError, match="execution entry failed") as exc_info,
+    ):
+        handler.handle_response(
+            "msg-cot-execution-failure",
+            "chat-1",
+            "finish",
+            MagicMock(),
+            None,
+            "/tmp",
+            "/tmp",
+        )
+
+    adapter = _AbortTrackingProgrammingCardSession.last
+    assert exc_info.value is failure
+    assert adapter.process_sink_activation_calls == 1
+    assert process_sink.start_calls == 1
+    assert adapter.aborted is True
+    assert process_sink.abort_calls == 1
+    handler._handle_response_non_streaming.assert_not_called()
+    delivery.shutdown.assert_called_once()
 
 
 def test_programming_handle_response_falls_back_when_channel_is_unavailable():
@@ -1136,15 +1369,17 @@ def test_programming_handle_response_falls_back_when_channel_is_unavailable():
 
 def test_programming_falls_back_when_initial_async_channel_card_is_not_visible():
     handler = _make_handler()
+    handler.settings.feishu_cot_enabled = True
     handler.ctx.channel_client_factory = MagicMock(return_value=object())
     handler._handle_response_non_streaming = MagicMock()
     session = MagicMock()
+    process_sink = _FakeProcessSink()
 
     class _InvisibleProgrammingCardSession(_FakeProgrammingCardSession):
         last = None
 
         def __init__(self, *_args, **_kwargs):
-            super().__init__()
+            super().__init__(*_args, **_kwargs)
             self.aborted = False
             type(self).last = self
 
@@ -1160,6 +1395,11 @@ def test_programming_falls_back_when_initial_async_channel_card_is_not_visible()
             "src.card.delivery.channel_client.LarkChannelCardAPIClient",
             return_value=MagicMock(),
         ),
+        patch("src.feishu.cot.FeishuCOTAPIClient", return_value=MagicMock()),
+        patch(
+            "src.feishu.cot.FeishuCOTSession",
+            return_value=process_sink,
+        ) as cot_session_cls,
         patch("src.card.session.CardSession", return_value=MagicMock()),
         patch("src.card.session.factory.CardSessionFactory", return_value=MagicMock()),
         patch(
@@ -1178,6 +1418,10 @@ def test_programming_falls_back_when_initial_async_channel_card_is_not_visible()
         )
 
     assert _InvisibleProgrammingCardSession.last.aborted is True
+    assert _InvisibleProgrammingCardSession.last.process_sink is process_sink
+    assert _InvisibleProgrammingCardSession.last.process_sink_activation_calls == 0
+    assert process_sink.start_calls == 0
+    cot_session_cls.assert_called_once()
     handler._handle_response_non_streaming.assert_called_once()
     session.send_prompt.assert_not_called()
 

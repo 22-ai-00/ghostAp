@@ -97,6 +97,14 @@ class Settings(BaseSettings):
             "the execution timeout remains the hard cap. Set 0 to disable."
         ),
     )
+    feishu_cot_enabled: bool = Field(
+        default=True,
+        description=(
+            "Use Feishu IM COT/AG-UI for ordinary programming process events. "
+            "Task summaries and terminal conclusions remain Card 2.0 messages; "
+            "unsupported tenants fall back to the existing streaming card."
+        ),
+    )
 
     # ACP session history directory (empty = default ~/.ghostap/acp_history)
     acp_history_dir: str = ""

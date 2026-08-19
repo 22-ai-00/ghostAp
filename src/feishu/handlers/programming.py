@@ -50,6 +50,7 @@ _BTW_EVENT_TEXT_LIMIT = 600
 _BTW_SNAPSHOT_LIMIT = 12_000
 _BTW_STARTUP_TIMEOUT_S = 30.0
 _BTW_PROMPT_TIMEOUT_S = 90
+_PROGRAMMING_COT_REQUEST_TIMEOUT_S = 2.0
 _SAFE_FEISHU_APP_ID = re.compile(r"cli_[A-Za-z0-9_-]{1,256}\Z")
 
 
@@ -1247,6 +1248,44 @@ class ProgrammingModeHandler(BaseHandler):
             )
         self.reply_text(message_id, notice)
 
+    def _create_programming_process_sink(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        input_text: str,
+    ):
+        """Build the optional Feishu COT sink without starting network I/O."""
+        if getattr(self.settings, "feishu_cot_enabled", None) is not True:
+            return None
+        try:
+            from ..cot import FeishuCOTAPIClient, FeishuCOTSession
+
+            api = FeishuCOTAPIClient(
+                self.ctx.api_client_factory(),
+                outbound_audit=self.ctx.main_bot_outbound_audit,
+                outbound_audit_failure=self.ctx.main_bot_outbound_audit_failure,
+                tenant_key_resolver=self.ctx.tenant_key_resolver,
+                outbound_target_aliases=lambda target: self._reply_audit_aliases(
+                    self._resolve_origin(target)
+                ),
+                trust_revision_provider=self._managed_card_trust_revisions,
+            )
+            return FeishuCOTSession(
+                api,
+                chat_id=chat_id,
+                origin_message_id=message_id,
+                reply_in_thread=self.settings.default_reply_mode == "thread",
+                input_text=input_text,
+                request_timeout=_PROGRAMMING_COT_REQUEST_TIMEOUT_S,
+            )
+        except Exception:
+            logger.warning(
+                "初始化飞书 COT 过程消息失败，继续使用流式卡片",
+                exc_info=True,
+            )
+            return None
+
     def handle_response(
         self, message_id: str, chat_id: str, text: str, session: SyncSession, project, cwd: str, global_working_dir: str,
         *, _repo_lock_mgr=None, _root_path: str | None = None,
@@ -1316,6 +1355,11 @@ class ProgrammingModeHandler(BaseHandler):
             ),
             trust_revision_provider=self._managed_card_trust_revisions,
         )
+        process_sink = self._create_programming_process_sink(
+            message_id=message_id,
+            chat_id=chat_id,
+            input_text=_finalization_task_text or text,
+        )
         try:
             delivery_timeout = max(
                 2.0,
@@ -1338,6 +1382,7 @@ class ProgrammingModeHandler(BaseHandler):
                 delivery=delivery,
                 delivery_timeout=delivery_timeout,
                 project_id=project_id,
+                process_sink=process_sink,
                 _repo_lock_mgr=_repo_lock_mgr,
                 _root_path=_root_path,
                 _finalization_task_text=_finalization_task_text,
@@ -1375,6 +1420,7 @@ class ProgrammingModeHandler(BaseHandler):
         delivery,
         delivery_timeout: float,
         project_id: str | None,
+        process_sink=None,
         _repo_lock_mgr=None,
         _root_path: str | None = None,
         _finalization_task_text: str | None = None,
@@ -1412,6 +1458,7 @@ class ProgrammingModeHandler(BaseHandler):
             image_uploader=self.upload_acp_image,
             session_factory=_create_programming_card_session,
             continuation_visibility_timeout=delivery_timeout,
+            process_sink=process_sink,
         )
 
         try:
@@ -1427,31 +1474,69 @@ class ProgrammingModeHandler(BaseHandler):
             return True
 
         card_message_id = prog_session.get_message_id()
+        origin_registered = False
         if card_message_id:
             try:
                 rid = self.ensure_request_id(message_id, chat_id=chat_id, project_id=project_id)
                 self.ctx.message_linker.register_origin(
                     message_id, request_id=rid, chat_id=chat_id, project_id=project_id
                 )
+                origin_registered = True
                 self.ctx.message_linker.link_reply(message_id, card_message_id)
             except Exception as e:
                 logger.debug("link消息失败(programming): %s", e)
 
-        self._execute_programming_response(
-            message_id,
-            chat_id,
-            text,
-            session,
-            project,
-            cwd,
-            global_working_dir,
-            prog_session=prog_session,
-            card_message_id=card_message_id,
-            delivery_timeout=delivery_timeout,
-            _repo_lock_mgr=_repo_lock_mgr,
-            _root_path=_root_path,
-            _finalization_task_text=_finalization_task_text,
-        )
+        process_message_id = None
+        if process_sink is not None and prog_session.activate_process_sink():
+            process_message_id = prog_session.get_process_message_id()
+            if process_message_id:
+                try:
+                    if not origin_registered:
+                        rid = self.ensure_request_id(
+                            message_id,
+                            chat_id=chat_id,
+                            project_id=project_id,
+                        )
+                        self.ctx.message_linker.register_origin(
+                            message_id,
+                            request_id=rid,
+                            chat_id=chat_id,
+                            project_id=project_id,
+                        )
+                    self.ctx.message_linker.link_reply(
+                        message_id,
+                        process_message_id,
+                    )
+                except Exception as e:
+                    logger.debug("link消息失败(programming COT): %s", e)
+                if project:
+                    try:
+                        self.register_message_project(process_message_id, project)
+                    except Exception as e:
+                        logger.debug("项目消息映射失败(programming COT): %s", e)
+
+        try:
+            self._execute_programming_response(
+                message_id,
+                chat_id,
+                text,
+                session,
+                project,
+                cwd,
+                global_working_dir,
+                prog_session=prog_session,
+                card_message_id=card_message_id,
+                delivery_timeout=delivery_timeout,
+                _repo_lock_mgr=_repo_lock_mgr,
+                _root_path=_root_path,
+                _finalization_task_text=_finalization_task_text,
+            )
+        except BaseException:
+            # COT is activated before the ACP execution helper initializes its
+            # own terminal guards.  Fence both transports if that setup raises
+            # so an already-created native run cannot remain live indefinitely.
+            prog_session.abort()
+            raise
         return False
 
     @staticmethod

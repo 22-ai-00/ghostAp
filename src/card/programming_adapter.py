@@ -43,6 +43,7 @@ from src.card.text_stream import append_stream_text
 
 if TYPE_CHECKING:
     from src.acp.models import ACPEvent, ACPImageInfo
+    from src.card.protocols import ProcessEventSink
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,19 @@ _TOOL_CARD_EVENT_TYPES = frozenset({
     CardEventType.TOOL_FAILED,
 })
 
+_PROCESS_STREAM_EVENT_TYPES = frozenset({
+    CardEventType.TEXT_STARTED,
+    CardEventType.TEXT_DELTA,
+    CardEventType.TEXT_DONE,
+    CardEventType.REASONING_STARTED,
+    CardEventType.REASONING_DELTA,
+    CardEventType.REASONING_DONE,
+    CardEventType.TOOL_STARTED,
+    CardEventType.TOOL_DELTA,
+    CardEventType.TOOL_DONE,
+    CardEventType.TOOL_FAILED,
+})
+
 # One ordinary programming card should normally carry a useful span of the
 # conversation instead of rotating because many raw tool events were folded
 # into one visible execution-history panel. Platform byte/node pagination is
@@ -74,6 +88,8 @@ _PROGRAMMING_MAX_TOTAL_BLOCKS = (
     MAX_TOTAL_BLOCKS * PROGRAMMING_PROGRESS_BLOCKS_PER_CARD
 )
 _PROGRAMMING_MAX_COMPLETED_TOOL_BLOCKS = _PROGRAMMING_MAX_TOTAL_BLOCKS
+_PROCESS_REPLAY_MAX_EVENTS = 2048
+_PROCESS_REPLAY_MAX_BYTES = 2 * 1024 * 1024
 _SYSTEM_TEXT_BLOCK_IDS = frozenset({
     "_error",
     "_cancelled",
@@ -134,6 +150,7 @@ class ProgrammingCardSession:
         image_uploader: Callable[["ACPImageInfo"], str | None] | None = None,
         session_factory: Callable[[CardMetadata], CardSession] | None = None,
         continuation_visibility_timeout: float = 12.0,
+        process_sink: "ProcessEventSink | None" = None,
     ) -> None:
         self._rotator = SessionRotator(session)
         self._base_metadata = (
@@ -142,6 +159,12 @@ class ProgrammingCardSession:
             or CardMetadata()
         )
         self._session_factory = session_factory
+        self._process_sink = process_sink
+        self._native_process_started = False
+        self._buffered_process_events: list[CardEvent] = []
+        self._buffered_process_bytes = 0
+        self._event_gate = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._terminal_fenced = False
         self._continuation_visibility_timeout = max(
             0.01,
             float(continuation_visibility_timeout),
@@ -187,13 +210,51 @@ class ProgrammingCardSession:
     def start(self) -> None:
         """Start the card (creates initial card in Feishu)."""
         self._dispatch_card_event(CardEvent.started())
-        self._dispatch_card_event(CardEvent.text_started("_active_text"))
-        self._text_turn_seq = max(self._text_turn_seq, 1)
-        self._text_blocks_by_source["main"] = "_active_text"
-        self._active_text_sources.add("main")
+        if self._process_sink is None:
+            self._dispatch_card_event(CardEvent.text_started("_active_text"))
+            self._text_turn_seq = max(self._text_turn_seq, 1)
+            self._text_blocks_by_source["main"] = "_active_text"
+            self._active_text_sources.add("main")
         self._start_ticker()
 
+    def activate_process_sink(self) -> bool:
+        """Start native process delivery after the fallback card is visible.
+
+        A COT create is deliberately never allowed to delay or orphan the
+        authoritative task/result card.  If activation fails, the already
+        visible card resumes the complete legacy process projection.
+        """
+        sink = self._process_sink
+        if sink is None:
+            return False
+        try:
+            if not sink.started:
+                sink.start()
+            started = sink.started and bool(getattr(sink, "healthy", True))
+        except Exception:
+            logger.warning(
+                "Feishu COT activation failed; continuing with the streaming card",
+                exc_info=True,
+            )
+            started = False
+        with self._dispatch_lock:
+            self._native_process_started = started
+        if not started:
+            try:
+                sink.abort()
+            except Exception:
+                logger.warning("Failed to abort inactive Feishu COT", exc_info=True)
+            self._ensure_card_process_stream()
+        return started
+
     def on_event(self, acp_event: "ACPEvent") -> None:
+        """Process one ACP event before the terminal lifecycle fence."""
+        with self._event_gate:
+            if self._terminal_fenced:
+                return
+            self._on_event_unfenced(acp_event)
+
+    def _on_event_unfenced(self, acp_event: "ACPEvent") -> None:
         """Process an ACP event (converts to CardEvent internally).
 
         Text deltas are batched for efficiency. Structural events flush immediately.
@@ -294,7 +355,9 @@ class ProgrammingCardSession:
 
     def on_text(self, text: str) -> None:
         """Append text directly (for simple text-only streams)."""
-        if text:
+        with self._event_gate:
+            if self._terminal_fenced or not text:
+                return
             with self._flush_lock:
                 self._flush_lock_holder.held = True
                 try:
@@ -309,15 +372,18 @@ class ProgrammingCardSession:
 
     def begin_continuation_turn(self) -> None:
         """Close active stream blocks before a same-card continuation turn."""
-        self._flush_now()
-        if self._reasoning_blocks_by_source:
-            self._close_reasoning_blocks(retire=True)
-        if self._active_text_sources:
-            self._close_text_blocks()
-        self._last_tool_boundary_seq = max(
-            self._last_tool_boundary_seq,
-            self._text_turn_seq,
-        )
+        with self._event_gate:
+            if self._terminal_fenced:
+                return
+            self._flush_now()
+            if self._reasoning_blocks_by_source:
+                self._close_reasoning_blocks(retire=True)
+            if self._active_text_sources:
+                self._close_text_blocks()
+            self._last_tool_boundary_seq = max(
+                self._last_tool_boundary_seq,
+                self._text_turn_seq,
+            )
 
     def finish(
         self,
@@ -367,6 +433,17 @@ class ProgrammingCardSession:
         )
 
     def _terminate(self, event: CardEvent, *, subagent_status: str) -> None:
+        with self._event_gate:
+            if self._terminal_fenced:
+                return
+            self._terminate_unfenced(event, subagent_status=subagent_status)
+
+    def _terminate_unfenced(
+        self,
+        event: CardEvent,
+        *,
+        subagent_status: str,
+    ) -> None:
         self._cancel_timer()
         self._flush_now()
         if self._active_text_sources:
@@ -374,7 +451,37 @@ class ProgrammingCardSession:
         if self._active_reasoning_sources:
             self._close_reasoning_blocks()
         self._finish_agent_summaries(terminal_status=subagent_status)
-        self._dispatch_card_event(event)
+        self._terminal_fenced = True
+        if self._native_process_started:
+            completed = False
+            try:
+                sink = self._process_sink
+                if sink is not None and bool(getattr(sink, "healthy", True)):
+                    completed = sink.complete(event)
+            except Exception:
+                logger.warning(
+                    "Feishu COT terminal delivery raised; replaying process into the card",
+                    exc_info=True,
+                )
+            if completed:
+                self._buffered_process_events.clear()
+                self._buffered_process_bytes = 0
+                self._publish_conclusion_to_card()
+            else:
+                logger.warning(
+                    "Feishu COT terminal delivery failed; replaying process into the card"
+                )
+                with self._dispatch_lock:
+                    self._cut_over_to_card_locked()
+                if self._process_sink is not None:
+                    try:
+                        self._process_sink.abort()
+                    except Exception:
+                        logger.warning(
+                            "Failed to abort degraded Feishu COT",
+                            exc_info=True,
+                        )
+        self._dispatch_event(event, route_process=False)
         self._stop_ticker()
 
     def get_message_id(self) -> str | None:
@@ -386,6 +493,12 @@ class ProgrammingCardSession:
             if first_page:
                 return first_page.message_id
         return None
+
+    def get_process_message_id(self) -> str | None:
+        """Return the native process-message id when this run uses one."""
+        if self._process_sink is None:
+            return None
+        return self._process_sink.message_id
 
     def wait_until_visible(self, timeout: float) -> bool:
         """Wait for the initial async delivery and confirm a visible message."""
@@ -419,15 +532,23 @@ class ProgrammingCardSession:
 
     def abort(self) -> None:
         """Stop local activity and close the card session without more delivery."""
-        self._cancel_timer()
-        self._stop_ticker()
-        with self._dispatch_lock:
-            retired = tuple(self._failed_retired_sessions)
-            self._rotator.close()
-            for session in retired:
-                session.close()
-            self._failed_retired_sessions.clear()
-            self._active_tool_snapshots.clear()
+        with self._event_gate:
+            self._terminal_fenced = True
+            self._cancel_timer()
+            self._stop_ticker()
+            if self._native_process_started and self._process_sink is not None:
+                try:
+                    self._process_sink.abort()
+                except Exception:
+                    logger.warning("Failed to abort Feishu COT process message", exc_info=True)
+                self._native_process_started = False
+            with self._dispatch_lock:
+                retired = tuple(self._failed_retired_sessions)
+                self._rotator.close()
+                for session in retired:
+                    session.close()
+                self._failed_retired_sessions.clear()
+                self._active_tool_snapshots.clear()
 
     def get_final_text(self) -> str:
         """Return the complete ordered main-Agent transcript."""
@@ -439,33 +560,190 @@ class ProgrammingCardSession:
                 if content
             )
 
+    def get_conclusion_text(self) -> str:
+        """Return the last non-empty main-Agent block used as the conclusion."""
+        self._flush_now()
+        with self._flush_lock:
+            return next(
+                (
+                    content
+                    for _, content in reversed(self._main_text_transcript)
+                    if content.strip()
+                ),
+                "",
+            )
+
+    def _publish_conclusion_to_card(self) -> None:
+        """Project only the terminal main-Agent block into the result card."""
+        conclusion = self.get_conclusion_text()
+        if not conclusion:
+            return
+        block_id = "_final_answer"
+        self._dispatch_event(
+            CardEvent.text_started(block_id),
+            route_process=False,
+        )
+        self._dispatch_event(
+            CardEvent.text_delta(block_id, conclusion),
+            route_process=False,
+        )
+        self._dispatch_event(
+            CardEvent.text_done(block_id),
+            route_process=False,
+        )
+
     def dispatch(self, event: CardEvent) -> None:
         """Route media-bridge events through the same capacity handoff gate."""
         self._dispatch_card_event(event)
 
     def _dispatch_card_event(self, event: CardEvent) -> bool:
         """Serialize projection, visible-first rotation, and event dispatch."""
+        return self._dispatch_event(event, route_process=True)
+
+    def _dispatch_event(
+        self,
+        event: CardEvent,
+        *,
+        route_process: bool,
+    ) -> bool:
+        """Route native process atoms or reduce one authoritative card event."""
+        sink_to_abort = None
         with self._dispatch_lock:
-            if self._capacity_delivery_failed:
+            if route_process and self._terminal_fenced:
                 return False
-            current = self._rotator.current
-            if current.closed:
-                return False
-            state = current.state
-            if state is not None and self._requires_capacity_rotation(state, event):
-                if not self._rotate_for_capacity(current, event):
-                    self._capacity_delivery_failed = True
-                    if self._capacity_failure_reason is None:
-                        self._capacity_failure_reason = (
-                            "continuation card could not be made visible and archived"
+            if (
+                route_process
+                and self._native_process_started
+                and event.type in _PROCESS_STREAM_EVENT_TYPES
+            ):
+                sink = self._process_sink
+                event_bytes = self._process_event_size(event)
+                replay_limit_reached = (
+                    len(self._buffered_process_events) + 1
+                    > _PROCESS_REPLAY_MAX_EVENTS
+                    or self._buffered_process_bytes + event_bytes
+                    > _PROCESS_REPLAY_MAX_BYTES
+                )
+                if replay_limit_reached:
+                    logger.warning(
+                        "Feishu COT replay buffer reached its safety limit; "
+                        "cutting over to the card"
+                    )
+                    handled = False
+                    replayed = self._cut_over_to_card_locked()
+                    sink_to_abort = sink
+                    result = replayed and self._dispatch_to_card_locked(event)
+                else:
+                    try:
+                        handled = bool(
+                            sink is not None
+                            and bool(getattr(sink, "healthy", True))
+                            and sink.emit(event)
                         )
-                    return False
-            self._rotator.dispatch(event)
-            return True
+                    except Exception:
+                        logger.warning(
+                            "Feishu COT process event delivery raised; "
+                            "cutting over to the card",
+                            exc_info=True,
+                        )
+                        handled = False
+                    if handled:
+                        self._buffered_process_events.append(event)
+                        self._buffered_process_bytes += event_bytes
+                        if bool(getattr(sink, "healthy", True)):
+                            return True
+                    replayed = self._cut_over_to_card_locked()
+                    sink_to_abort = sink
+                    result = (
+                        replayed
+                        if handled
+                        else replayed and self._dispatch_to_card_locked(event)
+                    )
+            else:
+                result = self._dispatch_to_card_locked(event)
+        if sink_to_abort is not None:
+            try:
+                sink_to_abort.abort()
+            except Exception:
+                logger.warning("Failed to abort degraded Feishu COT", exc_info=True)
+        return result
+
+    def _dispatch_to_card_locked(self, event: CardEvent) -> bool:
+        """Reduce one event into the card while ``_dispatch_lock`` is held."""
+        if self._capacity_delivery_failed:
+            return False
+        current = self._rotator.current
+        if current.closed:
+            return False
+        state = current.state
+        if state is not None and self._requires_capacity_rotation(state, event):
+            if not self._rotate_for_capacity(current, event):
+                self._capacity_delivery_failed = True
+                if self._capacity_failure_reason is None:
+                    self._capacity_failure_reason = (
+                        "continuation card could not be made visible and archived"
+                    )
+                return False
+        self._rotator.dispatch(event)
+        return True
+
+    def _cut_over_to_card_locked(self) -> bool:
+        """Atomically replay accepted COT atoms and resume card projection."""
+        self._native_process_started = False
+        buffered = tuple(self._buffered_process_events)
+        self._buffered_process_events.clear()
+        self._buffered_process_bytes = 0
+        for buffered_event in buffered:
+            if not self._dispatch_to_card_locked(buffered_event):
+                return False
+        return True
+
+    @staticmethod
+    def _process_event_size(event: CardEvent) -> int:
+        """Return a bounded-allocation estimate for the replay buffer."""
+        total = len(str(event.type.value).encode("utf-8", errors="replace"))
+        pending: list[object] = [event.payload]
+        seen: set[int] = set()
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                total += len(value.encode("utf-8", errors="replace"))
+            elif isinstance(value, bytes):
+                total += len(value)
+            elif isinstance(value, Mapping):
+                identity = id(value)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                pending.extend(value.keys())
+                pending.extend(value.values())
+            elif isinstance(value, (list, tuple, set, frozenset)):
+                identity = id(value)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                pending.extend(value)
+            else:
+                total += len(str(value).encode("utf-8", errors="replace"))
+            if total > _PROCESS_REPLAY_MAX_BYTES:
+                return total
+        return total
+
+    def _ensure_card_process_stream(self) -> None:
+        """Restore the legacy initial text stream after COT activation fails."""
+        with self._dispatch_lock:
+            if "main" in self._active_text_sources:
+                return
+            if self._dispatch_to_card_locked(CardEvent.text_started("_active_text")):
+                self._text_turn_seq = max(self._text_turn_seq, 1)
+                self._text_blocks_by_source["main"] = "_active_text"
+                self._active_text_sources.add("main")
 
     def _dispatch_tool_event(self, event: CardEvent) -> bool:
         """Dispatch one tool event and retain active state across card pages."""
         with self._dispatch_lock:
+            if self._native_process_started:
+                return self._dispatch_card_event(event)
             block_id = str((event.payload or {}).get("block_id") or "")
             if (
                 event.type in {
@@ -767,6 +1045,13 @@ class ProgrammingCardSession:
 
     def _flush_now(self) -> None:
         """Flush pending text immediately."""
+        with self._event_gate:
+            if self._terminal_fenced:
+                return
+            self._flush_now_unfenced()
+
+    def _flush_now_unfenced(self) -> None:
+        """Flush pending text while the event lifecycle gate is held."""
         self._cancel_timer()
         pending_by_block: dict[str, str] = {}
         with self._flush_lock:

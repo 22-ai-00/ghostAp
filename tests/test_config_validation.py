@@ -413,3 +413,11 @@ class TestTaskSchedulerBoundedSettings:
             assert scheduler._max_terminal_history == 23
         finally:
             scheduler.stop(wait=True, shutdown_executor=True)
+
+
+class TestFeishuCOTSettings:
+    def test_cot_is_enabled_by_default(self):
+        assert Settings(_env_file=None).feishu_cot_enabled is True
+
+    def test_cot_emergency_switch_can_disable_transport(self):
+        assert Settings(_env_file=None, feishu_cot_enabled=False).feishu_cot_enabled is False
