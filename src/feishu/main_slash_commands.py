@@ -18,7 +18,7 @@ from ..autonomous.provisioning.slash_commands import (
     VerifiedSlashState,
 )
 from ..autonomous.provisioning.slash_lark import LarkSlashCommandAPI
-from .product_catalog import get_public_actions
+from .product_catalog import get_slash_discoverable_actions
 
 
 class _AsyncLarkClient(Protocol):
@@ -30,7 +30,7 @@ class _AsyncLarkClient(Protocol):
 # discovery-panel projection.
 MAIN_AGENT_COMMANDS: tuple[SlashCommand, ...] = tuple(
     SlashCommand(action.command, action.description, action.usage)
-    for action in get_public_actions()
+    for action in get_slash_discoverable_actions()
 )
 
 

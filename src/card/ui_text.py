@@ -57,7 +57,6 @@ UI_TEXT = {
         "- `/spec_history`：查看 spec 文件与循环历史\n"
         "- `/spec_metrics`：查看目标达成度与指标变化\n"
         "- `/spec_config`：查看 Spec 长程配置（阈值/保留策略）\n"
-        "- `/spec_export`：导出当前 Spec/Plan 报告\n"
         "- `/spec_save`：立即落盘保存状态（用于断点续传）\n"
         "- `/stop_spec`：停止\n"
     ),
@@ -254,7 +253,6 @@ UI_TEXT = {
         "`/spec_guide <引导>` · 补充约束/偏好\n"
         "`/spec_history` · 历史  ·  `/spec_metrics` · 目标达成度\n"
         "`/spec_config` · 配置  ·  `/spec_save` · 立即保存\n"
-        "`/spec_export` · 导出报告  ·  `/stop_spec` · 停止任务\n"
         "`/stop_spec` · 停止"
     ),
     "system_help_section_project": "📂 项目管理",

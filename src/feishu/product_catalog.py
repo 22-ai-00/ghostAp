@@ -62,6 +62,7 @@ class ProductAction:
     owner_accessible: bool = True
     compatibility: CompatibilityBehavior = CompatibilityBehavior.PASSTHROUGH
     public: bool = True
+    slash_discoverable: bool = True
     enters_programming_mode: bool = False
     programming_mode_id: str | None = None
     protects_from_auto_activation: bool = False
@@ -92,6 +93,7 @@ def _action(
     enters_programming_mode: bool = False,
     programming_mode_id: str | None = None,
     protects_from_auto_activation: bool = False,
+    slash_discoverable: bool = True,
 ) -> ProductAction:
     return ProductAction(
         action_id=command.removeprefix("/").replace("_", "-"),
@@ -102,6 +104,7 @@ def _action(
         aliases=aliases,
         scopes=_OWNER_SCOPES,
         compatibility=compatibility,
+        slash_discoverable=slash_discoverable,
         enters_programming_mode=enters_programming_mode,
         programming_mode_id=programming_mode_id,
         protects_from_auto_activation=protects_from_auto_activation,
@@ -156,8 +159,13 @@ PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/spec_status", "查看 Spec Engine 任务进度", protects_from_auto_activation=True),
     _action("/spec_history", "查看 Spec Engine 历史", protects_from_auto_activation=True),
     _action("/spec_metrics", "查看 Spec Engine 目标达成度", protects_from_auto_activation=True),
-    _action("/spec_config", "查看或调整 Spec Engine 配置", protects_from_auto_activation=True),
-    _action("/spec_export", "导出 Spec Engine 报告", protects_from_auto_activation=True),
+    _action("/spec_config", "查看 Spec Engine 配置", protects_from_auto_activation=True),
+    _action(
+        "/spec_export",
+        "导出 Spec Engine 报告",
+        protects_from_auto_activation=True,
+        slash_discoverable=False,
+    ),
     _action("/spec_save", "立即保存 Spec Engine 状态", protects_from_auto_activation=True),
     _action("/spec_guide", "补充 Spec Engine 引导", "/spec_guide <引导>", protects_from_auto_activation=True),
     _action("/stop_spec", "停止 Spec Engine 任务", protects_from_auto_activation=True),
@@ -277,6 +285,12 @@ def get_public_actions() -> tuple[ProductAction, ...]:
     """All currently implemented Owner-visible commands, never a rollout filter."""
 
     return PUBLIC_ACTIONS
+
+
+def get_slash_discoverable_actions() -> tuple[ProductAction, ...]:
+    """Public commands whose user journey is complete in Feishu chat."""
+
+    return tuple(action for action in PUBLIC_ACTIONS if action.slash_discoverable)
 
 
 def get_compatibility_actions() -> tuple[ProductAction, ...]:
