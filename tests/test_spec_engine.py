@@ -857,6 +857,7 @@ class TestSpecEngineExecution:
         s.spec_backlog_stuck_window = 3
         s.spec_success_ignore_backlog = True
         s.spec_convergence_window = 0
+        s.spec_cache_root = str(tmp_path / "spec-cache")
         # Keep artifacts tiny for test
         s.spec_cycle_artifact_retention = 1
         mock_settings.return_value = s
