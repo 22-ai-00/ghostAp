@@ -33,9 +33,10 @@ def _response(
     status_code: int = 200,
     code: object = 0,
     sdk_code: object = 0,
+    msg: object = "success",
     raw_content: bytes | None = None,
 ) -> BaseResponse:
-    payload: dict[str, object] = {"code": code, "msg": "success"}
+    payload: dict[str, object] = {"code": code, "msg": msg}
     if data is not _EMPTY:
         payload["data"] = data
     response = BaseResponse()
@@ -101,6 +102,19 @@ def _request_events(request: BaseRequest) -> list[dict[str, object]]:
     events = request.body["events"]
     assert isinstance(events, list)
     return events
+
+
+def _assert_wire_event_bounds(requests: list[BaseRequest]) -> None:
+    for request in requests:
+        if not isinstance(request.body, dict) or "events" not in request.body:
+            continue
+        for event in _request_events(request):
+            assert isinstance(event["timestamp"], str)
+            assert str(event["timestamp"]).isascii()
+            assert str(event["timestamp"]).isdecimal()
+            content = event["content"]
+            assert isinstance(content, str)
+            assert len(content) <= 4_096
 
 
 def _wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
@@ -169,7 +183,7 @@ def test_api_request_shapes_double_serialization_audit_and_revision_fence() -> N
     assert update.body["cot_id"] == _COT_ID
     wire_event = _request_events(update)[0]
     assert wire_event["event_type"] == "TEXT_MESSAGE_CONTENT"
-    assert wire_event["timestamp"] == 1234
+    assert wire_event["timestamp"] == "1234"
     assert isinstance(wire_event["content"], str)
     assert _event_content(wire_event) == {
         "messageId": "text_1",
@@ -241,6 +255,21 @@ def test_create_response_accepts_forward_compatible_data_fields() -> None:
     binding = _api(client).create(_CHAT_ID)
     assert binding.cot_id == _COT_ID
     assert binding.message_id == _MESSAGE_ID
+    assert len(client.requests) == 1
+
+
+def test_api_rejects_oversized_final_event_content_before_network() -> None:
+    client = _RecordingClient(_create_response())
+    api = _api(client)
+    binding = api.create(_CHAT_ID)
+    event = {
+        "event_type": "TEXT_MESSAGE_CONTENT",
+        "content": {"messageId": "text_1", "delta": "\\" * 4_096},
+        "timestamp": "1",
+    }
+
+    with pytest.raises(COTTransportError, match="exceeds 4096 characters"):
+        api.append(binding, (event,))
     assert len(client.requests) == 1
 
 
@@ -481,8 +510,15 @@ def test_session_maps_ordered_text_reasoning_and_latest_safe_tool_result_in_one_
     }
     all_events = [*run_started, *batch, terminal]
     timestamps = [event["timestamp"] for event in all_events]
-    assert all(isinstance(timestamp, int) for timestamp in timestamps)
-    assert all(left < right for left, right in zip(timestamps, timestamps[1:]))
+    assert all(
+        isinstance(timestamp, str) and timestamp.isdecimal()
+        for timestamp in timestamps
+    )
+    numeric_timestamps = [int(timestamp) for timestamp in timestamps]
+    assert all(
+        left < right
+        for left, right in zip(numeric_timestamps, numeric_timestamps[1:])
+    )
 
 
 @pytest.mark.parametrize(
@@ -641,6 +677,35 @@ def test_large_text_delta_is_losslessly_chunked_into_bounded_update_requests() -
     ]
     assert "".join(deltas) == text
     assert all(len(delta.encode("utf-8")) <= 4_000 for delta in deltas)
+    _assert_wire_event_bounds(client.requests)
+
+
+def test_escaped_text_delta_is_lossless_with_final_content_character_limit() -> None:
+    client = _RecordingClient(
+        _create_response(),
+        *(_empty_response() for _ in range(20)),
+    )
+    session = FeishuCOTSession(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    session.start()
+    text = ('\\"line\n' * 1_200) + "done"
+    assert session.emit(CardEvent.text_started("escaped-text")) is True
+    assert session.emit(CardEvent.text_delta("escaped-text", text)) is True
+    assert session.emit(CardEvent.text_done("escaped-text")) is True
+    assert session.complete(CardEvent.completed()) is True
+
+    deltas = [
+        _event_content(event)["delta"]
+        for request in client.requests[2:-2]
+        for event in _request_events(request)
+        if event["event_type"] == "TEXT_MESSAGE_CONTENT"
+    ]
+    assert "".join(str(delta) for delta in deltas) == text
+    _assert_wire_event_bounds(client.requests)
 
 
 def test_large_tool_result_uses_exact_agui_schema_and_utf8_byte_cap() -> None:
@@ -661,7 +726,10 @@ def test_large_tool_result_uses_exact_agui_schema_and_utf8_byte_cap() -> None:
             type=CardEventType.TOOL_DONE,
             payload={
                 "block_id": "large-tool",
-                "tool_output": "结果" * 10_000,
+                # Reproduces the live failure: the old 4000-byte inner cap
+                # still exceeded the 4096-character content limit after the
+                # message/tool IDs and role were serialized around it.
+                "tool_output": "x" * 10_000,
             },
         )
     )
@@ -677,6 +745,86 @@ def test_large_tool_result_uses_exact_agui_schema_and_utf8_byte_cap() -> None:
     assert result["role"] == "tool"
     assert len(str(result["content"]).encode("utf-8")) <= 4_000
     assert str(result["content"]).endswith("…")
+    _assert_wire_event_bounds(client.requests)
+
+
+def test_large_escaped_tool_args_and_result_fit_complete_content_envelope() -> None:
+    client = _RecordingClient(
+        _create_response(),
+        *(_empty_response() for _ in range(12)),
+    )
+    session = FeishuCOTSession(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    session.start()
+    tool_input = json.dumps(
+        {"command": "\\" * 6_000, "path": "src/cot.py"},
+        ensure_ascii=False,
+    )
+    assert session.emit(
+        CardEvent.tool_started("escaped-tool", "shell", tool_input)
+    )
+    assert session.emit(
+        CardEvent(
+            type=CardEventType.TOOL_DONE,
+            payload={
+                "block_id": "escaped-tool",
+                "tool_output": "\\" * 8_000,
+            },
+        )
+    )
+    assert session.complete(CardEvent.completed()) is True
+
+    tool_events = [
+        event
+        for request in client.requests[2:-2]
+        for event in _request_events(request)
+        if str(event["event_type"]).startswith("TOOL_CALL_")
+    ]
+    args_event = next(
+        event for event in tool_events if event["event_type"] == "TOOL_CALL_ARGS"
+    )
+    args = _event_content(args_event)["delta"]
+    assert isinstance(args, str)
+    parsed_args = json.loads(args)
+    assert parsed_args["truncated"] is True
+    assert str(parsed_args["summary"]).endswith("…")
+    result = _event_content(
+        next(
+            event
+            for event in tool_events
+            if event["event_type"] == "TOOL_CALL_RESULT"
+        )
+    )
+    assert str(result["content"]).endswith("…")
+    _assert_wire_event_bounds(client.requests)
+
+
+def test_long_run_input_is_bounded_in_the_final_content_envelope() -> None:
+    client = _RecordingClient(
+        _create_response(),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+    )
+    session = FeishuCOTSession(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        input_text='\\"需求\n' * 2_000,
+        flush_interval=0.005,
+    )
+    session.start()
+    assert session.complete(CardEvent.completed()) is True
+
+    started = _request_events(client.requests[1])[0]
+    query = _event_content(started)["input"]["query"]
+    assert isinstance(query, str)
+    assert query.endswith("…")
+    _assert_wire_event_bounds(client.requests)
 
 
 def test_abort_neutrally_closes_process_sidecar_exactly_once() -> None:
@@ -749,7 +897,11 @@ def test_async_update_business_failure_logs_the_sanitized_error_code(
     client = _RecordingClient(
         _create_response(),
         _empty_response(),
-        _response({}, code=230099),
+        _response(
+            {},
+            code=230099,
+            msg="invalid event API_TOKEN=supersecret\nrequest rejected",
+        ),
         _empty_response(),
         _empty_response(),
     )
@@ -766,6 +918,8 @@ def test_async_update_business_failure_logs_the_sanitized_error_code(
 
     assert "stage=update" in caplog.text
     assert "code=230099" in caplog.text
+    assert "invalid event" in caplog.text
+    assert "supersecret" not in caplog.text
 
 
 @pytest.mark.parametrize(

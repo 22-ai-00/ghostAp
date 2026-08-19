@@ -39,6 +39,11 @@ _MAX_IDENTIFIER_CHARS = 512
 _MAX_BATCH_EVENTS = 100
 _MAX_BATCH_ITEMS = 32
 _MAX_UPDATE_EVENT_BYTES = 14 * 1024
+# Generated Lark SDKs define MessageCot.content as a JSON string of at most
+# 4096 characters and MessageCot.timestamp as a string.  This limit applies to
+# the complete encoded content object, not only to a delta/tool payload inside
+# that object.
+_MAX_EVENT_CONTENT_CHARS = 4_096
 _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 10_000
 _MAX_STREAM_CHUNK_BYTES = 4_000
@@ -647,8 +652,10 @@ class FeishuCOTAPIClient:
             or not 200 <= raw.status_code < 300
             or code != 0
         ):
+            response_message = _safe_response_message(payload.get("msg"))
+            detail = f", msg={response_message}" if response_message else ""
             raise _COTResponseRejected(
-                f"COT {operation} failed (code={code})"
+                f"COT {operation} failed (code={code}{detail})"
             )
         if not isinstance(payload.get("data"), dict):
             raise COTTransportError(
@@ -1449,16 +1456,27 @@ class FeishuCOTSession:
         )
 
     def _run_started_event(self) -> dict[str, object]:
+        status_text = {key: dict(value) for key, value in _STATUS_TEXT.items()}
+        query = _fit_string_to_event_content(
+            self._input_text,
+            lambda candidate: {
+                "threadId": self._thread_id,
+                "runId": self._run_id,
+                "input": {
+                    "query": candidate,
+                    "statusText": status_text,
+                },
+            },
+            maximum_bytes=_MAX_STREAM_CHUNK_BYTES,
+        )
         return self._cot_event(
             "RUN_STARTED",
             {
                 "threadId": self._thread_id,
                 "runId": self._run_id,
                 "input": {
-                    "query": self._input_text,
-                    "statusText": {
-                        key: dict(value) for key, value in _STATUS_TEXT.items()
-                    },
+                    "query": query,
+                    "statusText": status_text,
                 },
             },
         )
@@ -1596,15 +1614,16 @@ class FeishuCOTSession:
             text = _sanitize_unicode(text)
             if not text:
                 return ()
+            message_id = self._hash_id("text", block_id)
             return tuple(
                 self._cot_event(
                     "TEXT_MESSAGE_CONTENT",
                     {
-                        "messageId": self._hash_id("text", block_id),
+                        "messageId": message_id,
                         "delta": chunk,
                     },
                 )
-                for chunk in _split_utf8_chunks(text, _MAX_STREAM_CHUNK_BYTES)
+                for chunk in _split_stream_delta(message_id, text)
             )
         if event.type is CardEventType.TEXT_DONE:
             if block_id not in self._open_text:
@@ -1638,15 +1657,16 @@ class FeishuCOTSession:
             text = _sanitize_unicode(text)
             if not text:
                 return ()
+            message_id = self._hash_id("reasoning", block_id)
             return tuple(
                 self._cot_event(
                     "REASONING_MESSAGE_CONTENT",
                     {
-                        "messageId": self._hash_id("reasoning", block_id),
+                        "messageId": message_id,
                         "delta": chunk,
                     },
                 )
-                for chunk in _split_utf8_chunks(text, _MAX_STREAM_CHUNK_BYTES)
+                for chunk in _split_stream_delta(message_id, text)
             )
         if event.type is CardEventType.REASONING_DONE:
             if block_id not in self._open_reasoning:
@@ -1676,7 +1696,11 @@ class FeishuCOTSession:
                 max_chars=120,
             )
             raw_input = payload.get("tool_input", "")
-            safe_input = _safe_tool_content(raw_input, opaque_id=block_id)
+            safe_input = _safe_tool_arguments(
+                raw_input,
+                opaque_id=block_id,
+                tool_call_id=tool_call_id,
+            )
             self._tools[block_id] = {
                 "tool_call_id": tool_call_id,
                 "latest": "",
@@ -1689,7 +1713,7 @@ class FeishuCOTSession:
                 ),
                 self._cot_event(
                     "TOOL_CALL_ARGS",
-                    {"toolCallId": tool_call_id, "delta": safe_input or "{}"},
+                    {"toolCallId": tool_call_id, "delta": safe_input},
                 ),
                 self._cot_event("TOOL_CALL_END", {"toolCallId": tool_call_id}),
             )
@@ -1724,11 +1748,22 @@ class FeishuCOTSession:
             tool_call_id = state.get("tool_call_id")
             if not isinstance(tool_call_id, str):
                 return None
+            message_id = self._hash_id("tool-result", block_id)
+            content = _fit_string_to_event_content(
+                content,
+                lambda candidate: {
+                    "messageId": message_id,
+                    "toolCallId": tool_call_id,
+                    "content": candidate,
+                    "role": "tool",
+                },
+                maximum_bytes=_MAX_TOOL_CONTENT_BYTES,
+            )
             return (
                 self._cot_event(
                     "TOOL_CALL_RESULT",
                     {
-                        "messageId": self._hash_id("tool-result", block_id),
+                        "messageId": message_id,
                         "toolCallId": tool_call_id,
                         "content": content,
                         "role": "tool",
@@ -1761,21 +1796,31 @@ class FeishuCOTSession:
         }
 
     def _run_error_event(self, message: str, code: str) -> dict[str, object]:
+        safe_message = _fit_string_to_event_content(
+            message,
+            lambda candidate: {
+                "threadId": self._thread_id,
+                "runId": self._run_id,
+                "message": candidate,
+                "code": code,
+            },
+            maximum_bytes=_MAX_TOOL_CONTENT_BYTES,
+        )
         return self._cot_event(
             "RUN_ERROR",
             {
                 "threadId": self._thread_id,
                 "runId": self._run_id,
-                "message": message,
+                "message": safe_message,
                 "code": code,
             },
         )
 
-    def _next_timestamp_ms(self) -> int:
+    def _next_timestamp_ms(self) -> str:
         with self._lock:
             now_ms = int(time.time() * 1_000)
             self._last_timestamp_ms = max(now_ms, self._last_timestamp_ms + 1)
-            return self._last_timestamp_ms
+            return str(self._last_timestamp_ms)
 
     def _hash_id(self, kind: str, opaque_id: str) -> str:
         digest = hashlib.sha256(
@@ -2077,31 +2122,46 @@ def _encode_events(
         timestamp = event.get("timestamp")
         if event_type not in _COT_EVENT_TYPES or not isinstance(content, Mapping):
             raise COTTransportError("COT event schema is invalid")
-        if (
-            isinstance(timestamp, bool)
-            or not isinstance(timestamp, int)
-            or timestamp < 0
+        if isinstance(timestamp, bool):
+            raise COTTransportError("COT event timestamp is invalid")
+        if isinstance(timestamp, int):
+            if timestamp < 0:
+                raise COTTransportError("COT event timestamp is invalid")
+            timestamp_text = str(timestamp)
+        elif (
+            isinstance(timestamp, str)
+            and timestamp
+            and timestamp.isascii()
+            and timestamp.isdecimal()
         ):
+            timestamp_text = timestamp
+        else:
             raise COTTransportError("COT event timestamp is invalid")
         try:
-            safe_content = _sanitize_json_value(content, budget=[0])
-            content_json = json.dumps(
-                safe_content,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
+            content_json = _encode_event_content(content)
             content_json.encode("utf-8")
         except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
             raise COTTransportError("COT event content is invalid") from None
+        if len(content_json) > _MAX_EVENT_CONTENT_CHARS:
+            raise COTTransportError("COT event content exceeds 4096 characters")
         encoded.append(
             {
                 "event_type": event_type,
                 "content": content_json,
-                "timestamp": timestamp,
+                "timestamp": timestamp_text,
             }
         )
     return encoded
+
+
+def _encode_event_content(content: Mapping[str, object]) -> str:
+    safe_content = _sanitize_json_value(content, budget=[0])
+    return json.dumps(
+        safe_content,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
 
 
 def _sanitize_json_value(
@@ -2180,6 +2240,125 @@ def _safe_tool_content(value: object, *, opaque_id: str) -> str:
     return _truncate_utf8(safe, _MAX_TOOL_CONTENT_BYTES)
 
 
+def _safe_tool_arguments(
+    value: object,
+    *,
+    opaque_id: str,
+    tool_call_id: str,
+) -> str:
+    """Return one valid JSON argument delta within the final content limit."""
+    safe = sanitize_full_tool_event_content(value, opaque_ids=(opaque_id,))
+    safe = _sanitize_unicode(safe).strip()
+    if not safe:
+        return "{}"
+    try:
+        parsed = json.loads(safe)
+    except (json.JSONDecodeError, RecursionError):
+        parsed = {"input": safe}
+    if not isinstance(parsed, Mapping):
+        parsed = {"input": parsed}
+    try:
+        compact = json.dumps(
+            parsed,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, RecursionError):
+        compact = json.dumps(
+            {"input": safe},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    if (
+        len(compact.encode("utf-8")) <= _MAX_TOOL_CONTENT_BYTES
+        and _event_content_fits(
+            {"toolCallId": tool_call_id, "delta": compact}
+        )
+    ):
+        return compact
+
+    def _summary_delta(candidate: str) -> str:
+        return json.dumps(
+            {"truncated": True, "summary": candidate},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    summary = _fit_string_to_event_content(
+        safe,
+        lambda candidate: {
+            "toolCallId": tool_call_id,
+            "delta": _summary_delta(candidate),
+        },
+        maximum_bytes=_MAX_TOOL_CONTENT_BYTES,
+    )
+    return _summary_delta(summary)
+
+
+def _split_stream_delta(message_id: str, value: str) -> tuple[str, ...]:
+    """Split a delta losslessly across byte and encoded-content boundaries."""
+    chunks: list[str] = []
+    for byte_chunk in _split_utf8_chunks(value, _MAX_STREAM_CHUNK_BYTES):
+        remaining = byte_chunk
+        while remaining:
+            prefix_length = _largest_fitting_prefix(
+                remaining,
+                lambda candidate: {"messageId": message_id, "delta": candidate},
+            )
+            if prefix_length <= 0:
+                raise COTTransportError("COT stream content envelope is invalid")
+            chunks.append(remaining[:prefix_length])
+            remaining = remaining[prefix_length:]
+    return tuple(chunks)
+
+
+def _fit_string_to_event_content(
+    value: str,
+    content_builder: Callable[[str], Mapping[str, object]],
+    *,
+    maximum_bytes: int | None = None,
+) -> str:
+    """Fit one display string inside the final MessageCot.content JSON."""
+    candidate = _sanitize_unicode(value)
+    if maximum_bytes is not None:
+        candidate = _truncate_utf8(candidate, maximum_bytes)
+    if _event_content_fits(content_builder(candidate)):
+        return candidate
+    ellipsis = "…"
+    prefix_length = _largest_fitting_prefix(
+        candidate,
+        lambda prefix: content_builder(prefix + ellipsis),
+    )
+    if prefix_length <= 0:
+        if _event_content_fits(content_builder(ellipsis)):
+            return ellipsis
+        raise COTTransportError("COT event content envelope exceeds 4096 characters")
+    return candidate[:prefix_length] + ellipsis
+
+
+def _largest_fitting_prefix(
+    value: str,
+    content_builder: Callable[[str], Mapping[str, object]],
+) -> int:
+    low = 0
+    high = len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if _event_content_fits(content_builder(value[:middle])):
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
+def _event_content_fits(content: Mapping[str, object]) -> bool:
+    try:
+        return len(_encode_event_content(content)) <= _MAX_EVENT_CONTENT_CHARS
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
+        return False
+
+
 def _split_utf8_chunks(value: str, maximum_bytes: int) -> tuple[str, ...]:
     """Split text without corrupting UTF-8 or losing process content."""
     encoded = value.encode("utf-8")
@@ -2244,6 +2423,16 @@ def _safe_transport_failure(error: COTTransportError) -> str:
         str(error),
         fallback=type(error).__name__,
         max_chars=240,
+    )
+
+
+def _safe_response_message(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    return sanitize_single_line_label(
+        sanitize_full_tool_event_content(value),
+        fallback="",
+        max_chars=160,
     )
 
 
