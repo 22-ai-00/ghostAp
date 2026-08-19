@@ -135,6 +135,27 @@ def _complete_result(text: str = "done") -> PromptResult:
     )
 
 
+def _with_child_state(
+    result: PromptResult,
+    status: str,
+    *,
+    tool_id: str,
+) -> PromptResult:
+    result.tool_calls.append(
+        ToolCallInfo(
+            id=tool_id,
+            title="list_agents",
+            kind="other",
+            status="completed",
+            collaboration_tool="list_agents",
+            subagent_states=(
+                {"source_id": "reviewer", "status": status},
+            ),
+        )
+    )
+    return result
+
+
 def _runner():
     runner = getattr(acp, "run_prompt_with_continuation", None)
     assert callable(runner), "bounded ACP prompt continuation is not implemented"
@@ -311,6 +332,9 @@ def test_unresolved_child_gets_a_bounded_reconciliation_turn() -> None:
     assert "子代理状态对账指令" in session.calls[1].text
     assert "MESSAGE 不代表子代理已进入终态" in session.calls[1].text
     assert "wait_agent -> list_agents" in session.calls[1].text
+    assert "list_agents -> wait_agent -> list_agents" in session.calls[1].text
+    assert "不得继续、重做或替代原任务实现" in session.calls[1].text
+    assert "不得调用 interrupt_agent" in session.calls[1].text
     assert continuation_starts == ["reconciling"]
     assert execution.automatic_continuations == 1
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
@@ -319,25 +343,15 @@ def test_unresolved_child_gets_a_bounded_reconciliation_turn() -> None:
 
 def test_child_reconciliation_applies_session_terminal_evidence_once() -> None:
     runner = _runner()
-    running = PromptResult(
-        stop_reason="end_turn",
-        tool_calls=[
-            ToolCallInfo(
-                id="list-running",
-                title="list_agents",
-                kind="other",
-                status="completed",
-                collaboration_tool="list_agents",
-                subagent_states=(
-                    {"source_id": "reviewer", "status": "running"},
-                ),
-            )
-        ],
+    running = _with_child_state(
+        _pending_result(pending_count=2),
+        "running",
+        tool_id="list-running",
     )
 
     class EnrichingSession(_FakeSession):
         def __init__(self) -> None:
-            super().__init__(running, running)
+            super().__init__(running, running, _complete_result())
             self.enrichment_calls = 0
 
         def enrich_child_reconciliation_result(
@@ -383,9 +397,10 @@ def test_child_reconciliation_applies_session_terminal_evidence_once() -> None:
         finalization_reserve_s=30,
     )
 
-    assert len(session.calls) == 2
+    assert len(session.calls) == 3
     assert session.enrichment_calls == 1
-    assert execution.automatic_continuations == 1
+    assert "结构化计划仍有 2 项未完成" in session.calls[2].text
+    assert execution.automatic_continuations == 2
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
     assert execution.assessment.unresolved_child_tool_calls == 0
 
@@ -476,6 +491,193 @@ def test_completed_goal_allows_child_state_reconciliation() -> None:
     assert execution.automatic_continuations == 1
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
     assert execution.assessment.incomplete_tool_calls == 0
+
+
+def test_mixed_child_reconciliation_preserves_plan_before_continuing() -> None:
+    runner = _runner()
+    reconciliation_plan = PlanInfo(
+        entries=[PlanEntryInfo(content="state audit", status="completed")]
+    )
+    session = _FakeSession(
+        _with_child_state(
+            _pending_result(pending_count=2),
+            "running",
+            tool_id="list-before-reconciliation",
+        ),
+        _with_child_state(
+            PromptResult(
+                stop_reason="end_turn",
+                text="reviewer is terminal",
+                plan=reconciliation_plan,
+            ),
+            "completed",
+            tool_id="list-after-reconciliation",
+        ),
+        _complete_result(),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 3
+    assert "子代理状态对账指令" in session.calls[1].text
+    assert "自动续做指令" in session.calls[2].text
+    assert "结构化计划仍有 2 项未完成" in session.calls[2].text
+    assert execution.automatic_continuations == 2
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+
+
+def test_mixed_pending_plan_stops_when_child_remains_running() -> None:
+    runner = _runner()
+    temporary_completed_plan = PlanInfo(
+        entries=[PlanEntryInfo(content="reconciliation", status="completed")]
+    )
+    session = _FakeSession(
+        _with_child_state(
+            _pending_result(),
+            "running",
+            tool_id="list-before-reconciliation",
+        ),
+        _with_child_state(
+            PromptResult(
+                stop_reason="end_turn",
+                text="reviewer is still running",
+                plan=temporary_completed_plan,
+            ),
+            "running",
+            tool_id="list-after-reconciliation",
+        ),
+        AssertionError("a second child or plan turn must not run"),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.assessment.pending_plan_entries == 1
+    assert execution.assessment.unresolved_child_tool_calls == 1
+
+
+@pytest.mark.parametrize(
+    "original_plan",
+    [
+        pytest.param(None, id="missing-plan"),
+        pytest.param(
+            PlanInfo(
+                entries=[
+                    PlanEntryInfo(content="implementation", status="completed")
+                ]
+            ),
+            id="completed-plan",
+        ),
+    ],
+)
+def test_child_reconciliation_cannot_manufacture_pending_plan(
+    original_plan: PlanInfo | None,
+) -> None:
+    runner = _runner()
+    session = _FakeSession(
+        _with_child_state(
+            PromptResult(stop_reason="end_turn", plan=original_plan),
+            "running",
+            tool_id="list-before-reconciliation",
+        ),
+        _with_child_state(
+            _pending_result(),
+            "completed",
+            tool_id="list-after-reconciliation",
+        ),
+        AssertionError("reconciliation must not manufacture a plan turn"),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 2
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.assessment.pending_plan_entries == 0
+    assert execution.result.plan is original_plan
+
+
+def test_mixed_state_with_running_outer_tool_does_not_auto_continue() -> None:
+    runner = _runner()
+    first_result = _with_child_state(
+        _pending_result(),
+        "running",
+        tool_id="list-before-reconciliation",
+    )
+    first_result.tool_calls.append(
+        ToolCallInfo(
+            id="outer-command",
+            title="pytest",
+            kind="execute",
+            status="in_progress",
+        )
+    )
+    session = _FakeSession(first_result)
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 1
+    assert execution.automatic_continuations == 0
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.assessment.incomplete_outer_tool_calls == 1
+    assert execution.assessment.unresolved_child_tool_calls == 1
+
+
+def test_mixed_state_keeps_one_child_and_three_plan_turn_bounds() -> None:
+    runner = _runner()
+    session = _FakeSession(
+        _with_child_state(
+            _pending_result(),
+            "running",
+            tool_id="list-before-reconciliation",
+        ),
+        _with_child_state(
+            PromptResult(stop_reason="end_turn"),
+            "completed",
+            tool_id="list-after-reconciliation",
+        ),
+        _pending_result(),
+        _pending_result(),
+        _pending_result(),
+        AssertionError("continuation bounds were exceeded"),
+    )
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    followups = [call.text for call in session.calls[1:]]
+    assert len(session.calls) == 5
+    assert sum("子代理状态对账指令" in text for text in followups) == 1
+    assert sum("自动续做指令" in text for text in followups) == 3
+    assert execution.automatic_continuations == 4
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.assessment.pending_plan_entries == 1
 
 
 def test_plan_then_child_reconciliation_each_get_one_bounded_turn() -> None:

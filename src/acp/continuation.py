@@ -151,14 +151,16 @@ def _build_child_reconciliation_prompt(
         "上一轮自然结束，但结构化结果中仍有 "
         f"{unresolved_child_tool_calls} 个协作工具携带未终态子代理状态。"
         "这可能是异步 FINAL_ANSWER 已到达、而协作快照尚未刷新的竞态。\n"
-        "请先调用 list_agents 获取权威最新状态；对仍为 running/pending "
-        "的子代理，使用 wait_agent 等待并接收其最终结果。wait_agent 可能被普通 "
-        "MESSAGE 提前唤醒，MESSAGE 不代表子代理已进入终态；每次 wait_agent 返回后"
-        "必须再次调用 list_agents。若仍有 running/pending 子代理，在本轮内继续执行 "
-        "wait_agent -> list_agents，直到权威状态全部为 completed/failed/cancelled，"
-        "或本轮达到工具期限。不要仅凭已收到文本或 end_turn 推断子代理完成，也不要"
-        "重复已经完成的实现。\n"
-        "本指令不新增任何权限，不得扩大原任务范围，也不得中止或取消子代理。"
+        "本轮只做状态对账：不得继续、重做或替代原任务实现，不得创建或改写"
+        "原计划。请先调用 list_agents 获取权威最新状态；对仍为 "
+        "running/pending 的子代理，使用 wait_agent 等待并接收其最终结果。"
+        "wait_agent 可能被普通 MESSAGE 提前唤醒，MESSAGE 不代表子代理已进入"
+        "终态；每次 wait_agent 返回后必须再次调用 list_agents。若仍有 "
+        "running/pending 子代理，在本轮内继续按 list_agents -> wait_agent -> "
+        "list_agents 对账，直到权威状态全部为 completed/failed/cancelled，"
+        "或本轮达到工具期限。不要仅凭已收到文本或 end_turn 推断子代理完成。\n"
+        "本指令不新增任何权限，不得扩大原任务范围；不得调用 interrupt_agent，"
+        "也不得中止或取消子代理。"
         "所有子代理进入 completed/failed/cancelled 终态后，整合现有结果并"
         "如实给出最终答复。"
     )
@@ -360,8 +362,7 @@ def _continuation_kind(
         else ""
     )
     if (
-        assessment.pending_plan_entries == 0
-        and assessment.incomplete_tool_calls > 0
+        assessment.incomplete_tool_calls > 0
         and assessment.incomplete_outer_tool_calls == 0
         and assessment.incomplete_tool_calls
         == assessment.unresolved_child_tool_calls
@@ -533,6 +534,12 @@ def run_prompt_with_continuation(
             break
         reconciliation_started_at: float | None = None
         reconciliation_finished_at: float | None = None
+        # Reconciliation is observational. Provider-local plans emitted during
+        # that turn must neither erase nor manufacture implementation work.
+        is_child_reconciliation = (
+            continuation_kind == _CHILD_RECONCILIATION
+        )
+        preserved_reconciliation_plan = result.plan
         if continuation_kind in {
             _PLAN_CONTINUATION,
             _GOAL_RECOVERY,
@@ -591,6 +598,8 @@ def run_prompt_with_continuation(
         )
         automatic_continuations += 1
         result = merge_prompt_results(result, next_result)
+        if is_child_reconciliation:
+            result = replace(result, plan=preserved_reconciliation_plan)
         if (
             reconciliation_started_at is not None
             and reconciliation_finished_at is not None
@@ -611,6 +620,11 @@ def run_prompt_with_continuation(
                     )
                     if isinstance(enriched, PromptResult):
                         result = enriched
+                        if is_child_reconciliation:
+                            result = replace(
+                                result,
+                                plan=preserved_reconciliation_plan,
+                            )
                 except Exception:
                     logger.warning(
                         "Codex child reconciliation evidence enrichment failed",
