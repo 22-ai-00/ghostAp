@@ -12,10 +12,8 @@ from typing import Callable, Optional
 from ..acp.providers import normalize_acp_model_name
 from ..config import get_settings
 from ..utils.errors import get_error_detail
-from .backend_resolver import is_cli_backend
 from .claude_cli import SyncClaudeCLISession
 from .protocol import SyncSession
-from .tool_permissions import apply_auxiliary_tool_profile
 from .wrappers import ModelFailureAwareSession, RateLimitAwareSession
 
 logger = logging.getLogger(__name__)
@@ -93,8 +91,6 @@ def _start_base_session(
     cwd: str,
     model_name: str | None,
     *,
-    allow_cli: bool,
-    auto_approve: bool | None = None,
     capture_full_tool_content: bool = False,
     employee_env: dict[str, str] | None = None,
     startup_timeout: float | None = None,
@@ -102,7 +98,7 @@ def _start_base_session(
     startup_log_failures: bool | None = None,
 ) -> SyncSession:
     """Start exactly one CLI or ACP transport with shared startup arguments."""
-    if agent_type == "claude" and allow_cli:
+    if agent_type == "claude":
         session: SyncSession = SyncClaudeCLISession(
             cwd=cwd,
             model_name=model_name,
@@ -131,7 +127,6 @@ def _start_base_session(
             else startup_timeout
         ),
         model_name=model_name,
-        auto_approve=auto_approve,
         **kwargs,
     )
 
@@ -153,9 +148,7 @@ def create_engine_session(
     model_name: Optional[str] = None,
     *,
     thread_id: Optional[str] = None,
-    auto_approve: bool | None = None,
     capture_full_tool_content: bool = False,
-    require_tool_filter: bool = False,
     startup_timeout: Optional[float] = None,
     startup_retries: Optional[int] = None,
     startup_log_failures: Optional[bool] = None,
@@ -164,19 +157,16 @@ def create_engine_session(
     agent, normalized_cwd, model = _resolve_inputs(agent_type, cwd, model_name)
     employee_env = current_employee_session_environment()
     logger.info(
-        "[SessionFactory] engine agent=%s cwd=%s model=%s thread=%s auto=%s",
+        "[SessionFactory] engine agent=%s cwd=%s model=%s thread=%s",
         agent,
         normalized_cwd,
         model,
         thread_id or "",
-        auto_approve,
     )
     session = _start_base_session(
         agent,
         normalized_cwd,
         model,
-        allow_cli=not require_tool_filter or employee_env is not None,
-        auto_approve=auto_approve,
         capture_full_tool_content=capture_full_tool_content,
         employee_env=employee_env,
         startup_timeout=startup_timeout,
@@ -208,14 +198,10 @@ def create_auxiliary_session(
     startup_retries: Optional[int] = None,
     startup_log_failures: Optional[bool] = None,
 ) -> SyncSession:
-    """Create a coordination session with a mandatory deny-all tool filter."""
-    if is_cli_backend(agent_type):
-        raise RuntimeError(
-            "Claude CLI backend does not support auxiliary ACP transport"
-        )
+    """Create an unprivileged-by-convention coordination session."""
     agent, normalized_cwd, model = _resolve_inputs(agent_type, cwd, model_name)
     logger.info(
-        "[SessionFactory] auxiliary agent=%s cwd=%s model=%s thread=%s profile=deny_all",
+        "[SessionFactory] auxiliary agent=%s cwd=%s model=%s thread=%s",
         agent,
         normalized_cwd,
         model,
@@ -225,18 +211,12 @@ def create_auxiliary_session(
         agent,
         normalized_cwd,
         model,
-        allow_cli=False,
         startup_timeout=startup_timeout,
         startup_retries=startup_retries,
         startup_log_failures=startup_log_failures,
     )
     if get_settings().rate_limit_retry_enabled:
         session = RateLimitAwareSession(session, cancel_event=cancel_event)
-    try:
-        apply_auxiliary_tool_profile(session)
-    except Exception:
-        close_session_safely(session)
-        raise
     return session
 
 
@@ -270,7 +250,6 @@ class EphemeralReviewSession:
                 agent,
                 cwd,
                 model,
-                allow_cli=True,
                 startup_timeout=self._startup_timeout,
             )
             self.session_started = True

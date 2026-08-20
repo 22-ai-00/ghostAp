@@ -931,7 +931,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
 
         del chat_id
         text = (
-            "GhostAP 已启动，但当前尚未配置管理员，因此普通命令仍按安全策略拒绝。\n"
+            "GhostAP 已启动，但当前尚未配置管理员，因此普通命令仍按入口访问规则拒绝。\n"
             "请在当前私聊发送 `/setadmin` 完成首次管理员设置；设置成功后可使用"
             " `/help`、`/codex`、`/dsh` 等命令。"
         )
@@ -1758,9 +1758,9 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         working_dir: Optional[str],
         project: Optional["ProjectContext"] = None,
     ):
-        """Execute a shell command via SandboxExecutor and reply with the result."""
+        """Execute a host shell command directly and reply with the result."""
+        from ...command_executor import CommandExecutor
         from ...repo_lock import LockConflictError
-        from ...sandbox import SandboxExecutor
 
         if project is not None:
             lock_root_path = getattr(project, "root_path", None) or working_dir
@@ -1768,7 +1768,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             lock_root_path = self.lock_helper.resolve_git_lock_root(working_dir)
 
         def _run_shell():
-            executor = SandboxExecutor()
+            executor = CommandExecutor()
             # Smart mode shell execution: disable interactive mode to avoid .bashrc noise and job control errors
             result = executor.execute(cmd, cwd=working_dir, interactive=False, chat_id=chat_id)
             msg_type, card_content = SystemBuilder.build_shell_result_card(

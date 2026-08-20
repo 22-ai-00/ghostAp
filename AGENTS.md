@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-GhostAP 是一个飞书/Lark 机器人服务，用于通过出站 WebSocket 连接进行安全的远程 shell 执行和 AI 辅助开发。用户可以通过聊天运行 shell 命令、管理项目，并驱动 Coco、Claude、Aiden、Codex、Gemini、Traex、Grok 和 DSH 等编程工具。
+GhostAP 是一个飞书/Lark 机器人服务，用于通过出站 WebSocket 连接进行远程 shell 执行和 AI 辅助开发。用户可以通过聊天运行 shell 命令、管理项目，并驱动 Coco、Claude、Aiden、Codex、Gemini、Traex、Grok 和 DSH 等编程工具。
 
 ## 命令
 
@@ -29,7 +29,7 @@ uv run python scripts/test_inventory.py tests/
 - 调用 Codex `spawn_agent` 时，显式传 `agent_type` 必须同时使用 `fork_turns="none"` 或正整数；全历史 fork 必须省略 `agent_type`，否则子代理会在启动前被拒绝。
 - 保持修改范围明确。修复局部问题时不要重构无关代码。
 - 所有功能和 bug 修复都需要测试。对于涉及的合约，优先使用针对性回归测试。
-- GhostAP 至少支持 Linux 与 macOS。涉及进程、sandbox、文件锁、路径/临时目录、权限位、环境变量或平台工具时，必须用平台分支或能力探测保持两端契约并补回归；不得把 Linux-only 假设带到 macOS，也不得以放宽 fail-closed 安全边界换取兼容性。
+- GhostAP 至少支持 Linux 与 macOS。涉及进程、文件锁、路径/临时目录、权限位、环境变量或平台工具时，必须用平台分支或能力探测保持两端契约并补回归；不得把 Linux-only 假设带到 macOS。
 - 所有测试失败、异常退出或缺失最终摘要都必须查明原因并修复；禁止跳过、掩盖或当作通过。若根因是测试本身错误，需谨慎修正测试及其契约并保留回归证据。
 - 完成判定必须回读用户原始验收范围；若最终总结仍列出未实现的用户要求、未验证的核心路径或相关失败测试，不得标记完成，应继续执行或明确报告阻塞/失败。
 - 每个独立 bug 修复或需求完成并验证后，立即创建一个聚焦 commit 作为回滚点；不同问题分开提交。每次修改提交后必须立即 push 到当前所在分支；push 失败必须查明原因并明确报告，未成功 push 不得视为完成。
@@ -73,8 +73,6 @@ uv run python scripts/test_inventory.py tests/
 - **域对象冻结**。`domain/` 下的 dataclass 都是 `frozen=True`，状态变更使用 `dataclasses.replace()` 而非赋值。
 - **Effect 在派发前必须锚定**。PREPARED 和 EXECUTING 帧必须 fsync 并锚定后才能发起外部调用。
 - **终态需要 finalization**。Run 在有未解决 Effect 或未处置已提交 Effect 时不能进入终态。
-- **默认拒绝**。`src/trust/action_matrix.py` 对所有操作默认拒绝，需显式授权。
-- **Assist 不写入**。`assist` 模式下系统只读，R4 风险始终拒绝。
 - **飞书 SDK 使用官方包**。消息/卡片投递使用 `lark-oapi`，WebSocket 事件订阅使用 `lark-channel-sdk`。不要手写 HTTP 调用。
 
 关键模块入口：
@@ -84,7 +82,6 @@ uv run python scripts/test_inventory.py tests/
 - `src/autonomous/gateway/coordinator.py`：现役 Effect 派发与恢复协调。
 - `src/autonomous/domain/state_machine.py`：纯状态转换函数（`transition_run/plan/step/effect`）。
 - `src/autonomous/journal/writer.py`：单写入者，fsync + flock。
-- `src/trust/action_matrix.py`：权威动作授权矩阵。
 - `src/autonomous/runtime/employee_actor.py`：现役员工 actor 执行循环。
 - `src/autonomous/supervisor/employee_channels.py`：员工 Channel SDK 进程生命周期。
 - `src/autonomous/provisioning/channel_worker.py`：由 supervisor 通过文件路径启动的 Channel 子进程入口。
@@ -146,126 +143,6 @@ handler -> session -> render
 
 ## Workflow 模式 (`/wf`)
 
-`WorkflowHandler` 负责 `/wf` 命令，允许用户用自然语言描述多步骤任务，由编排 Agent 生成并执行 Node.js 工作流脚本。**三步流程**如下：
-
-1. **① 选择主编排Agent** — 选择一个工具+模型组合来驱动脚本生成。组合卡片允许展开工具查看其模型面板，或直接点击 "+ 添加 <工具>" 使用默认模型。此处不需要多选：编排器是单个选择的 Agent。
-2. **② 选择评审Agent** — 使用相同的组合卡片界面。可以选择一个或多个工具+模型组合作为独立评审者，或点击 **Auto** 快捷按钮跳过独立评审，由编排器进行自我评审。跳过评审适用于低风险变更，可避免额外的 Agent 调用成本。
-3. **③ 确认并执行** — 当两步都非空（或步骤2启用了Auto）后，引擎通过 `src/workflow_engine/script_gen.py` 构建 JS 工作流，验证输出（元数据导出、括号平衡、至少一个 `agent()`/`workflow()`/模式原语调用、无禁止的 `require('fs'|child_process|net|...)` 逃逸），显示确认卡片列出阶段、工具和简短预览，用户确认后执行脚本。进度通过 `WorkflowProgressRenderer` 流式传输。
-
-### Dynamic Workflow 编排模式
-
-Workflow 引擎提供 6+2 个高阶编排原语，作为 JS 运行时全局函数（`src/workflow_engine/runtime/runtime.js`）：
-
-| 原语 | 模式 | 用途 |
-| --- | --- | --- |
-| `classify(input, categories, opts)` | Classify-and-Act | 先分类后路由到不同处理逻辑 |
-| `fanout(input, workers, opts)` | Fan-out-and-Synthesize | 拆分并行执行后合成 |
-| `verify(output, opts)` | Adversarial Verification | 对抗性验证+循环修订 |
-| `generate(count, generatorFn, filterFn, opts)` | Generate-and-Filter | 生成多方案后过滤排序 |
-| `tournament(contestants, judgeFn, opts)` | Tournament | 淘汰赛决出最佳方案 |
-| `loop(taskFn, opts)` | Loop-Until-Done | 循环执行直到收敛/停止条件 |
-| `sequence(steps)` | Sequential | 严格顺序执行（每步传递结果） |
-| `race(contestants, opts)` | First-to-Finish | 竞速取第一个有效结果 |
-
-**比例原则**：简单任务用 1 个 agent() 调用；中等任务用 fanout/sequence（3-5 calls）；复杂任务才组合多个模式。
-
-**安全约束**：`generate()` 上限 50；`loop()` 硬上限 50；`MAX_TOTAL_AGENTS`（200）由 Python 侧强制。所有原语通过 `sandboxWrapHostFn` 包装。
-
-
-错误处理：
-- 任一步骤为空选择时，卡片中会显示内联错误；用户需要选择至少一个工具/模型并重试。
-- 验证失败的脚本会被拒绝，并返回结构化错误列表（缺少元数据、不安全模式等）—— 用户从确认卡片重新生成。
-- 运行中的工作流会阻止新的 `/wf` 调用，必须使用 `/stop_wf` 或进度卡片上的取消按钮停止。
-
-### 快速开始
-
-#### 命令速查
-
-| 命令 | 用途 |
-| --- | --- |
-| `/wf <需求描述>` | 从需求描述启动新工作流 |
-| `/stop_wf` | 中止当前运行的工作流 |
-| `/wf_status` | 显示活动工作流进度和已选工具 |
-| `/wf_help` | 聊天内帮助文本 |
-
-#### 交互流程
-
-1. **输入命令**：在飞书聊天中输入 `/wf <您的需求>`，例如 `/wf 帮我创建一个用户登录页面`
-2. **选择主编排Agent**：在弹出的卡片中选择一个工具+模型组合作为编排器
-3. **选择评审Agent**：选择一个或多个评审工具+模型组合，或点击 **Auto** 按钮跳过评审
-4. **确认执行**：查看生成的脚本预览后点击确认按钮开始执行
-5. **查看进度**：实时查看工作流执行进度
-
-#### 取消/回退操作
-
-- 在确认阶段点击 **取消** 按钮取消工作流
-- 在执行阶段使用 `/stop_wf` 命令或点击进度卡片上的取消按钮停止工作流
-- 如果遇到错误，卡片会显示错误提示和处理建议
-
-#### 三步工作流流程
-
-工作流使用组合卡片界面完成完整的三步流程：
-
-1. **① 编排器步骤（步骤1）**：选择恰好一个工具+模型组合来生成工作流脚本。使用顶部的步骤指示器跟踪进度（当前=1/3）。
-
-2. **② 评审步骤（步骤2）**：选择一个或多个工具+模型组合来评审生成的脚本，或使用 **Auto** 按钮跳过独立评审。步骤指示器显示当前=2/3。
-
-3. **③ 确认步骤（步骤3）**：查看生成的工作流脚本并确认执行。步骤指示器显示当前=3/3。
-
-#### 组合卡片功能
-- **工具+模型内联展开**：点击任意工具可内联展开并查看其可用模型，无需导航到单独卡片。
-- **步骤指示器**：显示当前步骤（1/3、2/3 或 3/3）和整体进度。
-- **Auto 选项**：在评审步骤中，跳过独立评审并使用编排器 Agent 进行自我评审。
-- **移除/清除按钮**：单击即可移除单个选择或清除所有选择。
-- **空选择验证**：通过显示内联错误消息防止空选择继续。
-
-#### 跳过评审
-
-在评审步骤中使用 **Auto** 按钮跳过独立评审的场景：
-- 进行低风险变更（例如，小的 bug 修复、文档更新）
-- 处于快速原型开发模式
-- 信任编排器 Agent 的自我评审能力
-
-**风险提示**：
-- 跳过独立评审可能会遗漏潜在问题
-- 建议在生产环境或高风险变更时启用独立评审
-- Auto 模式下，角色由 LLM 动态分配
-
-**重新启用评审**：
-- 如果在步骤2选择了 Auto，可以返回到步骤2重新选择评审工具
-- 在确认卡片上可以看到评审状态（Auto 或具体评审工具）
-- 如果需要，可以点击"重新选择"按钮返回工具选择界面
-
-#### 脚本生成与确认
-- **动态角色分配**：角色（编排器/评审者）由 LLM 从任务描述中动态推断，而非由用户静态选择。
-- **脚本预览**：确认卡片显示生成的工作流脚本预览，包含关键细节：
-  - 编排器工具/模型
-  - 评审工具/模型（如果跳过评审则显示 "Auto"）
-  - 阶段分解
-- **执行控制**：确认执行脚本，或在需要更改时重新生成。
-
-#### Agent() 调用执行
-
-当工作流运行 `agent()` 调用时：
-- 每个 Agent 调用使用选定的工具/模型组合
-- 评审 Agent 对编排器的工作提供反馈
-- 最终输出将所有 Agent 结果合并为一个连贯的交付物
-- 进度通过工作流进度卡片实时流式传输
-## 全自动执行契约
-
-普通编程、Deep、Spec、Workflow 在收到任务后均应自动推进到成功或明确失败终态：
-
-- 使用项目已保存配置；缺失时采用可用的推荐工具和后端默认模型。
-- 普通、安全、可逆的选择自动采用推荐项；高风险且未经原始请求精确授权的操作自动拒绝或跳过，并继续安全部分。
-- Agent 提问、Review 不确定、格式修复和暂时性失败使用有界自动恢复；耗尽后明确失败，不进入等待用户状态。
-- 只保留用户主动的停止/取消和显式配置入口；任务主路径不得要求选择 Agent、确认脚本、批准继续或手动恢复。
-- ACP 权限保持 fail-closed，只允许明确的一次性安全授权；禁止以跳过权限检查换取自动化。
-
-Workflow 使用 `src/workflow_engine/runtime/runtime.js` 提供的 `classify`、`fanout`、`verify`、`generate`、`tournament`、`loop`、`sequence`、`race` 原语动态生成任务专用 JS。运行时负责确定性控制流，Agent 负责语义工作；简单任务保持单 Agent，复杂度增长时再组合原语。
-
-Workflow 飞书卡片显示任务摘要、阶段统计和所有直接 `agent()` 调用的调度状态；每个 Agent 只显示一条最新操作，终态通过分页或附件完整交付结果。ACP 内部嵌套 Agent 在协议缺少权威列表时只能标记为观测信息，不得从陈旧快照推断终态。
-## Workflow 模式 (`/wf`)
-
 `WorkflowHandler` 负责自然语言 Workflow。当前交互和执行契约如下：
 
 1. `/wf <需求>` 先显示 owner-bound Agent Pool 选择卡；只有发起者可在同一 chat/project/session 中修改。
@@ -280,6 +157,7 @@ Workflow 飞书卡片显示任务摘要、阶段统计和所有直接 `agent()` 
 - `meta.agentPlan` 用 `agentId` 表示静态节点，用 `runtime: true` 与 `candidateAgentIds` 表示运行时候选。
 - 进度卡展示编排器、完整池、静态计划、动态候选和实际 `A-id/tool/model/current operation/result`；实际运行绑定是权威事实。
 - 运行时原语为 `classify`、`fanout`、`verify`、`generate`、`tournament`、`loop`、`sequence`、`race`。简单任务保持少量调用；`generate`、`loop` 上限 50，`MAX_TOTAL_AGENTS` 上限 200。
+- Workflow 脚本在普通 Node.js 宿主上下文运行，可直接使用 Node 模块、进程环境和网络；GhostAP 只校验工作流元数据、Agent Pool 绑定和运行预算。
 
 生成和终态规则：
 
@@ -301,7 +179,7 @@ Workflow 飞书卡片显示任务摘要、阶段统计和所有直接 `agent()` 
 普通编程、Deep、Spec 在收到任务后自动推进；Workflow 在 Agent Pool 单次确认后自动推进。所有模式都必须到达成功或明确失败终态：
 
 - 使用项目已保存配置；缺失时采用可用的推荐工具和后端默认模型。
-- 普通、安全、可逆的选择采用推荐项；高风险且未经原始请求精确授权的操作拒绝或跳过，并继续安全部分。
+- 普通选择采用推荐项；执行权限和工具授权交给 Codex、Claude 等后端自身处理，GhostAP 不叠加命令风险策略、工具过滤或操作系统沙箱。
 - Agent 提问、Review 不确定、格式修复和暂时性失败使用有界自动恢复；耗尽后明确失败。
 - 除 Workflow 的单次池确认外，不增加 Agent 选择、脚本确认、继续批准或手动恢复门。
-- ACP 权限保持 fail-closed，只允许明确的一次性安全授权。
+- ACP 权限请求直接采用后端提供的授权选项，不再由 GhostAP 维护二次安全策略。

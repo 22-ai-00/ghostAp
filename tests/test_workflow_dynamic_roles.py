@@ -25,7 +25,7 @@ class TestDynamicRolesGuidance(unittest.TestCase):
         self.assertIn("根据任务需求自行规划角色分工", prompt)
         self.assertIn("角色不是固定列表", prompt)
         self.assertIn(
-            "建议考虑：架构设计、代码实现、安全审计、正确性验证、测试覆盖等维度",
+            "建议考虑：架构设计、代码实现、正确性验证、测试覆盖等维度",
             prompt,
         )
 
@@ -100,7 +100,7 @@ class TestRolesSectionStructure(unittest.TestCase):
             "Dynamic guidance should be under the Roles heading",
         )
         self.assertIn(
-            "建议考虑：架构设计、代码实现、安全审计、正确性验证、测试覆盖等维度",
+            "建议考虑：架构设计、代码实现、正确性验证、测试覆盖等维度",
             roles_content,
             "Dynamic guidance should be under the Roles heading",
         )
@@ -216,7 +216,7 @@ class TestDifferentOrchestratorAgents(unittest.TestCase):
             with self.subTest(orchestrator_agent=agent):
                 prompt = self._build_prompt(agent)
                 self.assertIn(
-                    "建议考虑：架构设计、代码实现、安全审计、正确性验证、测试覆盖等维度",
+                    "建议考虑：架构设计、代码实现、正确性验证、测试覆盖等维度",
                     prompt,
                     f"Agent '{agent}' should get recommended dimensions",
                 )

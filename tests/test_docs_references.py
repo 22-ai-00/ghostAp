@@ -114,7 +114,7 @@ def test_public_positioning_matches_agent_department_contract() -> None:
     for boundary in (
         "Main Bot: control plane",
         "Employee Bot: execution identity",
-        "Host Shell: privileged host execution",
+            "Host Shell: direct host execution",
         "single-host and file-backed",
         "Direct programming keeps the selected Agent",
     ):
@@ -178,7 +178,7 @@ def test_agents_declares_linux_macos_compatibility_contract() -> None:
 
     assert "至少支持 Linux 与 macOS" in agents
     assert "Linux-only 假设" in agents
-    assert "不得以放宽 fail-closed 安全边界换取兼容性" in agents
+    assert "平台分支或能力探测" in agents
 
 
 def test_workflow_node_minimum_is_consistent_across_runtime_and_readme() -> None:

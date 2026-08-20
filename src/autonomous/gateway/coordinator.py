@@ -1678,7 +1678,6 @@ class EmployeeDispatchCoordinator:
             model=employee.model,
             profile=employee.profile,
             effort=employee.effort,
-            security_profile="employee_v1",
             capabilities=employee.capabilities,
             permissions=employee.permissions,
             constraints_digest=grant.request.constraints_digest,

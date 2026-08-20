@@ -141,7 +141,6 @@ class ProjectedAgentRegistry:
             created_at=employee.created_at,
             personality_traits=list(employee.personality_traits),
             capabilities=list(employee.capabilities),
-            security_profile="employee_v1",
         )
 
     def context_binding(

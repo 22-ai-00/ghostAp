@@ -253,7 +253,6 @@ def _supervisor_nack(
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=lambda *_args: "unused",
         worker_path=__file__,
-        sandbox_prefix=(),
     )
     runtime = SimpleNamespace(
         status=ChannelProcessStatus(
@@ -354,7 +353,6 @@ def test_malformed_worker_nack_wakes_pending_send_as_integrity_failure() -> None
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=lambda *_args: "unused",
         worker_path=__file__,
-        sandbox_prefix=(),
         send_timeout=0.1,
     )
     event_r, event_w = os.pipe()

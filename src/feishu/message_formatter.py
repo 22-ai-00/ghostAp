@@ -78,20 +78,6 @@ class FeishuMessageFormatter:
         return "post", json.dumps(post_content)
 
     @staticmethod
-    def format_safety_block(command: str, reason: str) -> tuple[str, str]:
-        md_text = f"""> 🖥️ `{command}`
-
-**❌ 拦截原因**: {reason}
-
-*如需执行此命令，请联系管理员*"""
-
-        content = [[{"tag": "md", "text": md_text}]]
-
-        post_content = {"zh_cn": {"title": "🚫 命令被安全检查拦截", "content": content}}
-
-        return "post", json.dumps(post_content)
-
-    @staticmethod
     def format_help(current_dir: str, is_coco_mode: bool = False) -> tuple[str, str]:
         if is_coco_mode:
             md_text = """直接发送消息与 Coco 对话进行远程开发

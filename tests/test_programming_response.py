@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import ExitStack, contextmanager, nullcontext
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -840,53 +840,6 @@ def test_non_streaming_pending_plan_continues_and_replies_with_success():
     handler.reply_text.assert_called_once()
     assert "done" in handler.reply_text.call_args.args[1]
     handler.add_reaction.assert_called_once()
-
-
-def test_admin_project_task_wraps_acp_execution_in_trusted_personal_lease():
-    handler = _make_handler()
-    handler.reply_card = MagicMock()
-    handler.upload_acp_image = MagicMock()
-    handler.settings.acp_trusted_personal_mode = True
-    handler.settings.acp_trusted_personal_ack = True
-    handler.settings.admin_user_ids = frozenset({"ou_owner"})
-    project = MagicMock()
-    project.project_id = "project-1"
-    project.root_path = "/tmp/project-1"
-    session = MagicMock()
-    session.session_id = "trusted-session"
-    session.message_count = 1
-    session._force_dead = False
-    session.set_trusted_personal_permissions.return_value = True
-
-    def execute_first_window(initial_session, initial_prompt, **kwargs):
-        return kwargs["execute_window"](initial_session, initial_prompt)
-
-    with (
-        patch("src.thread.get_current_sender_id", return_value="ou_owner"),
-        patch(
-            "src.feishu.handlers.programming.run_prompt_across_execution_windows",
-            side_effect=execute_first_window,
-        ),
-        patch(
-            "src.feishu.handlers.programming.run_prompt_with_continuation",
-            return_value=_completed_execution("pushed"),
-        ),
-    ):
-        handler._handle_response_non_streaming(
-            "msg-trusted",
-            "chat-1",
-            "push current branch",
-            session,
-            project,
-            "/tmp/project-1",
-        )
-
-    assert session.set_trusted_personal_permissions.call_args_list == [
-        call(True),
-        call(False),
-    ]
-    assert session._force_dead is False
-    assert "pushed" in handler.reply_text.call_args.args[1]
 
 
 def test_non_streaming_retries_pending_plan_then_renders_incomplete():

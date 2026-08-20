@@ -807,18 +807,6 @@ class BaseHandler:
             current_dir = self.get_working_dir(chat_id)
             expanded_path = os.path.normpath(os.path.join(current_dir, expanded_path))
 
-        # 路径范围校验 — 使用 realpath 解析 symlink，避免 /home/x 与 /data00/home/x 不匹配
-        allowed_roots = self.settings.project_allowed_roots
-        if allowed_roots:
-            real_path = os.path.realpath(expanded_path)
-            norm_path = os.path.normpath(expanded_path)
-            if not any(
-                real_path.startswith(os.path.realpath(root))
-                or norm_path.startswith(os.path.normpath(root))
-                for root in allowed_roots
-            ):
-                return False, f"目录不在允许范围内: {expanded_path}"
-
         if os.path.isdir(expanded_path):
             with self.ctx.working_dir_lock:
                 self.ctx.working_dirs[chat_id] = expanded_path

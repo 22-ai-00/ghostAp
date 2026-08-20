@@ -42,7 +42,7 @@ def test_claude_1m_selection_reaches_real_cli_environment():
     session = SyncClaudeCLISession(
         cwd="/tmp",
         model_name="claude-opus-4-8[1m]",
-        config=ClaudeCLIConfig(add_dir=False, bypass_permissions=False),
+        config=ClaudeCLIConfig(add_dir=False),
     )
     session.session_id = "session-1"
 

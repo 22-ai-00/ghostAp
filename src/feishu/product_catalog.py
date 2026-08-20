@@ -1,7 +1,6 @@
 """The single typed product and command catalog for GhostAP.
 
-Completion labels describe support expectations.  They never introduce an
-Owner access, rollout, allowlist, approval, sandbox, or release-state gate.
+Completion labels describe support expectations; they do not gate execution.
 """
 
 from __future__ import annotations

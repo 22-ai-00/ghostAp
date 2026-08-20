@@ -38,31 +38,18 @@ class Settings(BaseSettings):
     # When empty, all unmatched messages are treated as shell commands.
     default_acp_tool: str = ""
 
-    sandbox_timeout: int = 30
-    sandbox_max_output_length: int = 4000
-    sandbox_command_blacklist: str = ""
-    sandbox_use_whitelist: bool = False
-    sandbox_command_whitelist: str = ""
+    # Reliability limits for direct host command execution.
+    command_timeout: int = 30
+    command_max_output_length: int = 4000
     ingress_access_mode: Literal[
         "enforced", "shadow", "legacy_allow_all"
     ] = "enforced"
     admin_bootstrap_scope: Literal["any_chat", "p2p_only"] = "p2p_only"
-    shell_access_mode: Literal[
-        "disabled", "admin_dm", "allowlisted", "isolated", "trusted_local"
-    ] = "disabled"
-    shell_trusted_local_ack: bool = False
     employee_group_context_retention_days: int = Field(
         default=30,
         ge=1,
         le=3650,
     )
-
-    # 允许 set_working_dir 切换到的根目录列表
-    # 校验时会通过 realpath 解析 symlink，所以 ~/work 能匹配 /data00/home/x/work
-    project_allowed_roots: list[str] = [
-        os.path.expanduser("~/workspaces"),
-        os.path.expanduser("~/work"),
-    ]
 
     coco_execution_timeout: int = Field(default=7200, gt=0)
     coco_session_timeout: int = 86400
@@ -129,17 +116,9 @@ class Settings(BaseSettings):
     acp_model_probe_timeout: float = 15.0
 
     # ACP backends are lazy by default: Bot readiness must not depend on model
-    # provider or package-registry network availability.  Operators can opt in
-    # to eager model-catalog warming when startup isolation is not required.
+    # provider or package-registry network availability. Operators can opt in
+    # to eager model-catalog warming when desired.
     acp_model_preheat_on_startup: bool = False
-
-    # ACP permission auto-approve (True = agent actions auto-approved, False = denied by default)
-    acp_permission_auto_approve: bool = True
-
-    # Task-scoped escape hatch for a single-user deployment. Runtime activation
-    # additionally requires a configured admin sender and a concrete project.
-    acp_trusted_personal_mode: bool = False
-    acp_trusted_personal_ack: bool = False
 
     # Auto-update agent CLI when ACP server mode is not supported
     acp_auto_update: bool = True
@@ -185,10 +164,6 @@ class Settings(BaseSettings):
     acp_diagnostics_args_limit: int = 600
     acp_diagnostics_snippet_limit: int = 240
     acp_diagnostics_total_limit: int = 2000
-
-    # Claude CLI permission bypass is opt-in and only valid in the managed
-    # employee sandbox. Ordinary programming keeps Claude's permission checks.
-    claude_cli_skip_permissions: bool = False
 
     # ACP agent command overrides (optional)
     # Example:
@@ -475,9 +450,6 @@ class Settings(BaseSettings):
 
     # /lock 确认卡片有效期（秒），超时后确认按钮失效
     lock_confirm_timeout: int = 120
-
-    # SandboxExecutor 严格锁模式 — True 时检测到锁冲突 raise LockConflictError，False 仅 warning
-    sandbox_strict_lock_mode: bool = False
 
     # ------------------------------------------------------------------
     # 管理员用户列表（用于群级锁权限判定）
@@ -913,14 +885,6 @@ class Settings(BaseSettings):
             )
         return self
 
-
-    @property
-    def command_blacklist(self) -> list[str]:
-        return [cmd.strip() for cmd in self.sandbox_command_blacklist.split(",") if cmd.strip()]
-
-    @property
-    def command_whitelist(self) -> list[str]:
-        return [cmd.strip() for cmd in self.sandbox_command_whitelist.split(",") if cmd.strip()]
 
     def validate_feishu_config(self) -> bool:
         return bool(self.app_id and self.app_secret)

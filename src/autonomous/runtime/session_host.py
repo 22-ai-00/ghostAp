@@ -65,50 +65,9 @@ class EmployeeSessionHost:
             raise EmployeeSessionUnavailableError("employee workspace is unavailable")
         return workspace
 
-    @staticmethod
-    def _under(path: str, roots: tuple[str, ...]) -> bool:
-        candidate = os.path.realpath(path)
-        return any(candidate == root or candidate.startswith(root + os.sep) for root in roots)
-
-    def _install_policy(self, session: object, agent: AgentIdentity, workspace: str) -> None:
-        set_filter = getattr(session, "set_tool_filter", None)
-        if not callable(set_filter):
-            raise EmployeeSessionUnavailableError("employee backend lacks tool filtering")
-        permissions = set(agent.permissions)
-        capabilities = set(agent.capabilities)
-        roots = (workspace,)
-        configure = getattr(session, "configure_employee_sandbox", None)
-        writable = roots if "file_write" in permissions and "file_write" in capabilities else ()
-        if callable(configure):
-            configure(read_only_roots=roots, writable_roots=writable)
-
-        def tool_filter(tool_name: str, args: dict | None = None) -> bool:
-            args = args or {}
-            name = (tool_name or "").lower()
-            if name == "shell":
-                return "shell" in permissions and "shell" in capabilities
-            if name == "git":
-                return "git" in permissions and "git" in capabilities
-            if name in {"file_read", "file_list", "grep", "search"}:
-                path = str(args.get("path") or args.get("file_path") or workspace)
-                path = path if os.path.isabs(path) else os.path.join(workspace, path)
-                return bool({"file_read", "shell", "git"} & permissions) and self._under(path, roots)
-            if name == "file_write":
-                path = str(args.get("path") or args.get("file_path") or "")
-                path = path if os.path.isabs(path) else os.path.join(workspace, path)
-                return (
-                    bool(path)
-                    and "file_write" in permissions
-                    and "file_write" in capabilities
-                    and self._under(path, writable)
-                )
-            return False
-
-        set_filter(tool_filter)
-
     def open_employee_session(self, agent: AgentIdentity, *, env: dict[str, str]) -> _EmployeeSessionLease:
-        if agent.security_profile != "employee_v1" or not isinstance(env, dict):
-            raise EmployeeSessionUnavailableError("employee session authority is invalid")
+        if not isinstance(env, dict):
+            raise EmployeeSessionUnavailableError("employee session environment is invalid")
         workspace = self._workspace(agent)
         with employee_session_environment(env):
             session = create_engine_session(
@@ -116,18 +75,9 @@ class EmployeeSessionHost:
                 cwd=workspace,
                 model_name=agent.model_name or None,
                 thread_id=f"employee_actor_{agent.agent_id}",
-                auto_approve=True,
-                require_tool_filter=True,
             )
         if session is None:
             raise EmployeeSessionUnavailableError("employee backend session creation failed")
-        try:
-            self._install_policy(session, agent, workspace)
-        except Exception:
-            close = getattr(session, "close", None)
-            if callable(close):
-                close()
-            raise
         with self._lock:
             previous = self._sessions.get(agent.agent_id)
             if previous is not None and previous is not session:

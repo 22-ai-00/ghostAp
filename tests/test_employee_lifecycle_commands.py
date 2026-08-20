@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -17,7 +17,7 @@ from src.feishu.dispatcher import MessageDispatcher
 from src.feishu.handlers.employee import EmployeeHandler
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
-from src.feishu.ws_client import FeishuWSClient, TrustActionDecision
+from src.feishu.ws_client import FeishuWSClient
 from src.mode import InteractionMode
 from src.thread import (
     set_current_is_p2p,
@@ -559,7 +559,7 @@ def test_data_audit_failure_returns_no_read_content(
 
 
 @pytest.mark.parametrize("command", ["/history Atlas", "/employee-memory Atlas"])
-def test_dispatcher_applies_system_admin_gate_before_sensitive_employee_read(
+def test_dispatcher_routes_sensitive_employee_read_without_action_policy(
     command: str,
 ) -> None:
     client = MagicMock()
@@ -574,7 +574,6 @@ def test_dispatcher_applies_system_admin_gate_before_sensitive_employee_read(
         "system"
     ].is_interceptable_command_match.return_value = True
     dispatcher = MessageDispatcher(client)
-    dispatcher._action_matrix_allows = MagicMock(return_value=False)
 
     dispatcher.process_with_intent(
         "om_read",
@@ -584,15 +583,11 @@ def test_dispatcher_applies_system_admin_gate_before_sensitive_employee_read(
         effective_trust=MagicMock(),
     )
 
-    dispatcher._action_matrix_allows.assert_called_once_with(
-        ANY,
-        action_name="system_admin",
-    )
-    dispatcher.system.handle_intercepted_command.assert_not_called()
+    dispatcher.system.handle_intercepted_command.assert_called_once()
 
 
 @pytest.mark.parametrize("command", ["/employees", "/roster"])
-def test_dispatcher_applies_system_admin_gate_before_employee_roster(
+def test_dispatcher_routes_employee_roster_without_action_policy(
     command: str,
 ) -> None:
     client = MagicMock()
@@ -607,7 +602,6 @@ def test_dispatcher_applies_system_admin_gate_before_employee_roster(
         "system"
     ].is_interceptable_command_match.return_value = True
     dispatcher = MessageDispatcher(client)
-    dispatcher._action_matrix_allows = MagicMock(return_value=False)
     command_match = SlashCommandParser.parse(command)
 
     assert command_match is not None
@@ -620,15 +614,11 @@ def test_dispatcher_applies_system_admin_gate_before_employee_roster(
         effective_trust=MagicMock(),
     )
 
-    dispatcher._action_matrix_allows.assert_called_once_with(
-        ANY,
-        action_name="system_admin",
-    )
-    dispatcher.system.handle_intercepted_command.assert_not_called()
+    dispatcher.system.handle_intercepted_command.assert_called_once()
 
 
 @pytest.mark.parametrize("command", ["/history Atlas", "/employee-memory Atlas"])
-def test_ws_ingress_classifies_sensitive_employee_read_as_system_admin(
+def test_ws_ingress_allows_sensitive_employee_read_without_action_policy(
     command: str,
 ) -> None:
     client = object.__new__(FeishuWSClient)
@@ -639,22 +629,17 @@ def test_ws_ingress_classifies_sensitive_employee_read_as_system_admin(
         group_revision=1,
         grant_revision=1,
     )
-    with patch("src.feishu.ws_client.ActionMatrix") as matrix:
-        matrix.return_value.decide.return_value = TrustActionDecision.DENY
+    allowed = client._managed_ingress_action_allowed(
+        trust,
+        text=command,
+        command_match=SlashCommandParser.parse(command),
+    )
 
-        allowed = client._managed_ingress_action_allowed(
-            trust,
-            text=command,
-            command_match=SlashCommandParser.parse(command),
-        )
-
-    assert allowed is False
-    request = matrix.return_value.decide.call_args.args[0]
-    assert request.action.value == "system_admin"
+    assert allowed is True
 
 
 @pytest.mark.parametrize("command", ["/employees", "/roster"])
-def test_ws_ingress_classifies_employee_roster_as_system_admin(
+def test_ws_ingress_allows_employee_roster_without_action_policy(
     command: str,
 ) -> None:
     client = object.__new__(FeishuWSClient)
@@ -668,15 +653,10 @@ def test_ws_ingress_classifies_employee_roster_as_system_admin(
     command_match = SlashCommandParser.parse(command)
     assert command_match is not None
     assert command_match.command == "/employees"
-    with patch("src.feishu.ws_client.ActionMatrix") as matrix:
-        matrix.return_value.decide.return_value = TrustActionDecision.DENY
+    allowed = client._managed_ingress_action_allowed(
+        trust,
+        text=command,
+        command_match=command_match,
+    )
 
-        allowed = client._managed_ingress_action_allowed(
-            trust,
-            text=command,
-            command_match=command_match,
-        )
-
-    assert allowed is False
-    request = matrix.return_value.decide.call_args.args[0]
-    assert request.action.value == "system_admin"
+    assert allowed is True

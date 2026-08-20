@@ -52,7 +52,7 @@ from acp.schema import (
     WriteTextFileResponse,
 )
 
-from ..sandbox.executor import DangerousPatternCheckStrategy, SandboxExecutor
+from ..command_executor import CommandExecutor
 from ..utils.errors import get_error_detail
 from ..utils.text import sanitize_single_line_label
 from .models import (
@@ -71,20 +71,7 @@ logger = logging.getLogger(__name__)
 
 # Default fallback; prefer Settings.acp_max_file_chars at runtime.
 _MAX_FILE_CHARS = 200_000
-_ACP_PERMISSION_DANGEROUS_CHECK = DangerousPatternCheckStrategy()
 _ENVIRONMENT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_SHELL_CONTROL_TOKENS = frozenset({";", "&", "&&", "|", "||", "<", ">", "(", ")", "`"})
-_PERMISSION_KIND_TOOL_NAMES = {
-    "read": "file_read",
-    "edit": "file_write",
-    "delete": "file_write",
-    "move": "file_write",
-    "search": "search",
-    "fetch": "fetch",
-    "think": "think",
-    "switch_mode": "switch_mode",
-    "other": "other",
-}
 MAX_ACP_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_BASE64_IMAGE_CHARS = ((MAX_ACP_IMAGE_BYTES + 2) // 3) * 4
 SUPPORTED_ACP_IMAGE_MIME_TYPES = frozenset({
@@ -167,109 +154,6 @@ def _image_roots_overlap(first: str, second: str) -> bool:
         return True
     except ValueError:
         return False
-
-
-def _permission_execute_tool_name(command: str) -> str:
-    """Classify a plain Git invocation without treating shell wrappers as Git."""
-    if "\n" in command or "\r" in command:
-        return "shell"
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()`")
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except (TypeError, ValueError):
-        return "shell"
-    if not tokens or os.path.basename(tokens[0]).casefold() != "git":
-        return "shell"
-    if any(token in _SHELL_CONTROL_TOKENS for token in tokens[1:]):
-        return "shell"
-    return "git"
-
-
-def _normalize_permission_execute_command(
-    command_value: Any,
-) -> tuple[Optional[str], Optional[list[str]]]:
-    """Normalize an ACP execute command without weakening command checks.
-
-    ACP providers may send either a shell command string or a canonical argv
-    array.  ``shlex.join`` preserves argv boundaries in the string consumed by
-    the existing tool, dangerous-command, and sandbox policies.  Other shapes
-    remain fail-closed rather than being coerced with ``str()``.
-    """
-    if command_value is None or command_value == "":
-        return None, None
-    if isinstance(command_value, str):
-        if "\x00" in command_value:
-            raise ValueError("execute command contains NUL")
-        return command_value, None
-    if isinstance(command_value, (list, tuple)):
-        if not command_value:
-            raise ValueError("execute argv must not be empty")
-        if not all(isinstance(arg, str) for arg in command_value):
-            raise ValueError("execute argv must contain only strings")
-        argv = list(command_value)
-        if any("\x00" in arg for arg in argv):
-            raise ValueError("execute argv contains NUL")
-        return shlex.join(argv), argv
-    raise ValueError("execute command must be a string or argv array")
-
-
-def _permission_request_diagnostics(tool_call: Any) -> tuple[str, str]:
-    """Return non-sensitive permission payload shape diagnostics."""
-    raw_kind = getattr(tool_call, "kind", None)
-    kind = raw_kind.strip().casefold() if isinstance(raw_kind, str) else "unknown"
-    raw_input = getattr(tool_call, "raw_input", None)
-    command_value: Any = None
-    if isinstance(raw_input, Mapping):
-        for key in ("command", "cmd", "shell_command"):
-            if key in raw_input:
-                command_value = raw_input.get(key)
-                break
-    elif kind == "execute":
-        command_value = raw_input
-    shape = "missing" if command_value is None else type(command_value).__name__
-    return kind or "unknown", shape
-
-
-def _permission_tool_request(
-    tool_call: Any,
-    *,
-    root_dir: str,
-) -> tuple[str, dict, Optional[str]]:
-    """Map every ACP permission kind to a stable tool-filter request."""
-
-    raw_input = getattr(tool_call, "raw_input", None)
-    if isinstance(raw_input, Mapping):
-        tool_args = dict(raw_input)
-    elif raw_input is None:
-        tool_args = {}
-    else:
-        tool_args = {"raw_input": raw_input}
-
-    raw_kind = getattr(tool_call, "kind", None)
-    kind = raw_kind.strip().casefold() if isinstance(raw_kind, str) else ""
-    if kind != "execute":
-        return _PERMISSION_KIND_TOOL_NAMES.get(kind, "other"), tool_args, None
-
-    command_value: Any = None
-    if isinstance(raw_input, Mapping):
-        for key in ("command", "cmd", "shell_command"):
-            candidate = raw_input.get(key)
-            if candidate is None or candidate == "":
-                continue
-            command_value = candidate
-            break
-    elif isinstance(raw_input, str):
-        command_value = raw_input
-    command, argv = _normalize_permission_execute_command(command_value)
-    if command is None:
-        raise ValueError("execute permission request is missing command")
-
-    tool_args["command"] = command
-    if argv is not None:
-        tool_args["argv"] = argv
-    tool_args.setdefault("cwd", root_dir)
-    return _permission_execute_tool_name(command), tool_args, command
 
 
 def _get_max_file_chars() -> int:
@@ -361,6 +245,15 @@ def _safe_resolve_path(root_dir: str, user_path: str) -> Path:
     except Exception as e:
         raise PermissionError(f"path escapes root_dir: {user_path}") from e
     return resolved
+
+
+def _resolve_host_path(root_dir: str, user_path: str) -> Path:
+    """Resolve an ACP callback path without imposing a GhostAP root policy."""
+
+    path = Path(user_path).expanduser()
+    if not path.is_absolute():
+        path = Path(root_dir).expanduser() / path
+    return path.resolve()
 
 
 def _image_name(uri: str | None) -> str:
@@ -1414,31 +1307,19 @@ class GhostAPClient(Client):
         self,
         on_event: Callable[[ACPEvent], None],
         on_session_info: Callable[[str, ACPSessionInfo], None] | None = None,
-        auto_approve: bool = True,
         root_dir: str = ".",
         capture_full_tool_content: bool = False,
     ):
         self._on_event = on_event
         self._on_session_info = on_session_info
-        self._auto_approve = auto_approve
-        self._trusted_personal_permissions = False
         self._root_dir = os.path.abspath(os.path.expanduser(root_dir or "."))
         self._capture_full_tool_content = bool(capture_full_tool_content)
-        self._sandbox = SandboxExecutor()
+        self._command_executor = CommandExecutor()
         self._terminals: dict[str, _TerminalRecord] = {}
         self._terminals_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._history = ACPHistoryStore()
-        self._tool_filter: Optional[Callable[[str, dict | None], bool]] = None
         self._image_snapshot_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         self._active_image_snapshot: LocalImageArtifactSnapshot | None = None
-
-    def set_tool_filter(self, filter_fn: Optional[Callable[[str, dict | None], bool]]) -> None:
-        """Install or clear a per-session tool filter."""
-        self._tool_filter = filter_fn
-
-    def set_trusted_personal_permissions(self, enabled: bool) -> None:
-        """Toggle the task-scoped single-user permission escape hatch."""
-        self._trusted_personal_permissions = enabled is True
 
     def snapshot_local_images(self) -> LocalImageArtifactSnapshot:
         """Capture bounded image file metadata before a prompt starts."""
@@ -1468,16 +1349,6 @@ class GhostAPClient(Client):
             self._active_image_snapshot = None
         if snapshot is not None:
             release_local_image_artifact_snapshot(snapshot)
-
-    def _is_tool_allowed(self, tool_name: str, args: dict | None = None) -> bool:
-        filter_fn = self._tool_filter
-        if not callable(filter_fn):
-            return True
-        try:
-            return bool(filter_fn(tool_name, args or {}))
-        except Exception as exc:
-            logger.warning("[ACP] tool filter failed closed: tool=%s err=%s", tool_name, get_error_detail(exc))
-            return False
 
     def _record(self, session_id: str, kind: str, data: dict) -> None:
         try:
@@ -1625,106 +1496,41 @@ class GhostAPClient(Client):
     async def request_permission(
         self, session_id: str, tool_call, options, **kwargs: Any
     ) -> RequestPermissionResponse:
-        """Handle permission requests from agent."""
-        trusted_personal = self._trusted_personal_permissions is True
-        if not self._auto_approve and not trusted_personal:
-            return self._deny_permission(session_id, "auto_approve_disabled")
-
+        """Select an allowance offered by the backend without local policy."""
+        del tool_call, kwargs
         if not options:
             return self._deny_permission(session_id, "empty_options")
-
-        if not trusted_personal:
-            # Permission filters apply to every ACP kind before auto-approval.
-            safety_stage = "tool_request"
-            permission_kind, command_shape = _permission_request_diagnostics(tool_call)
-            try:
-                permission_tool, tool_args, command = _permission_tool_request(
-                    tool_call,
-                    root_dir=self._root_dir,
+        ordered = sorted(
+            options,
+            key=lambda option: (
+                {"allow_once": 0, "allow_always": 1}.get(
+                    str(getattr(option, "kind", "") or ""),
+                    2,
                 )
-                safety_stage = "tool_filter"
-                if not self._is_tool_allowed(permission_tool, tool_args):
-                    denied_data = {"tool": permission_tool}
-                    if command is not None:
-                        denied_data["command"] = command
-                    return self._deny_permission(
-                        session_id, "tool_filter_denied", **denied_data
-                    )
-
-                # Keep the existing hard and sandbox checks for executable commands.
-                if command is not None:
-                    safety_stage = "dangerous_command"
-                    hard_ok, hard_reason = _ACP_PERMISSION_DANGEROUS_CHECK.check(command, None)
-                    if not hard_ok:
-                        logger.info("[ACP] Reject dangerous auto-approved command: %s (%s)", command, hard_reason)
-                        return self._deny_permission(
-                            session_id,
-                            "dangerous_execute",
-                            command=command,
-                            detail=hard_reason,
-                        )
-                    safety_stage = "sandbox"
-                    ok, reason = self._sandbox.is_command_safe(command)
-                    if not ok:
-                        logger.info("[ACP] Reject unsafe command: %s (%s)", command, reason)
-                        return self._deny_permission(
-                            session_id,
-                            "unsafe_execute",
-                            command=command,
-                            detail=reason,
-                        )
-            except Exception as e:
-                logger.warning(
-                    "[ACP] Permission safety check failed closed: error=%s stage=%s kind=%s command_shape=%s",
-                    type(e).__name__,
-                    safety_stage,
-                    permission_kind,
-                    command_shape,
-                )
-                return self._deny_permission(
-                    session_id,
-                    "permission_safety_check_failed",
-                    stage=safety_stage,
-                    kind=permission_kind,
-                    command_shape=command_shape,
-                )
-
-        # Only an explicit one-shot grant is eligible for automatic selection.
-        # Provider-specific or future option kinds are denied by default.
-        allow_option_id = ""
-        for opt in options:
-            if (
-                getattr(opt, "kind", None) == "allow_once"
-                and getattr(opt, "option_id", None)
-            ):
-                allow_option_id = str(opt.option_id)
-                break
-        if trusted_personal and not allow_option_id:
-            for opt in options:
-                if (
-                    getattr(opt, "kind", None) == "allow_always"
-                    and getattr(opt, "option_id", None)
-                ):
-                    allow_option_id = str(opt.option_id)
-                    break
+            ),
+        )
+        selected = next(
+            (
+                option
+                for option in ordered
+                if getattr(option, "option_id", None)
+                and str(getattr(option, "kind", "") or "").startswith("allow")
+            ),
+            None,
+        )
+        allow_option_id = (
+            str(getattr(selected, "option_id", "") or "") if selected else ""
+        )
         if not allow_option_id:
-            return self._deny_permission(session_id, "missing_allow_once")
+            return self._deny_permission(session_id, "backend_offered_no_allowance")
 
         self._record(
             session_id,
             "permission",
             {
                 "outcome": "selected",
-                "policy": "trusted_personal" if trusted_personal else "auto_approve",
-                "option_kind": next(
-                    (
-                        str(getattr(option, "kind", "") or "")
-                        for option in options
-                        if str(getattr(option, "option_id", "") or "")
-                        == allow_option_id
-                    ),
-                    "",
-                ),
+                "authority": "backend",
+                "option_kind": str(getattr(selected, "kind", "") or ""),
             },
         )
 
@@ -1741,12 +1547,9 @@ class GhostAPClient(Client):
         limit: Optional[int] = None,
         **kwargs: Any,
     ) -> ReadTextFileResponse:
-        tool_args = {"path": path, "line": line, "limit": limit, **kwargs}
-        if not self._is_tool_allowed("file_read", tool_args):
-            self._record(session_id, "read_file", {"path": path, "blocked": True, "reason": "tool_filter_denied"})
-            return ReadTextFileResponse(content="", field_meta={"blocked": True, "reason": "tool_filter_denied"})
+        del kwargs
         try:
-            resolved = _safe_resolve_path(self._root_dir, path)
+            resolved = _resolve_host_path(self._root_dir, path)
             content = resolved.read_text(encoding="utf-8")
             if line is not None or limit is not None:
                 start = max(0, int(line or 1) - 1)
@@ -1772,11 +1575,9 @@ class GhostAPClient(Client):
     async def write_text_file(
         self, session_id: str, path: str, content: str, **kwargs: Any
     ) -> Optional[WriteTextFileResponse]:
-        if not self._is_tool_allowed("file_write", {"path": path, **kwargs}):
-            self._record(session_id, "write_file", {"path": path, "blocked": True, "reason": "tool_filter_denied"})
-            return WriteTextFileResponse(field_meta={"blocked": True, "reason": "tool_filter_denied", "path": path})
+        del kwargs
         try:
-            resolved = _safe_resolve_path(self._root_dir, path)
+            resolved = _resolve_host_path(self._root_dir, path)
             resolved.parent.mkdir(parents=True, exist_ok=True)
             resolved.write_text(content or "", encoding="utf-8")
             self._record(session_id, "write_file", {"path": str(resolved), "chars": len(content or "")})
@@ -1802,15 +1603,9 @@ class GhostAPClient(Client):
         self._cleanup_expired_terminals()
 
         shell_command = shlex.join([command, *(args or [])]) if args else command
-        try:
-            execution_cwd = str(_safe_resolve_path(self._root_dir, cwd)) if cwd else self._root_dir
-        except Exception:
-            return self._create_failed_terminal(
-                session_id=session_id,
-                command=shell_command,
-                message="❌ 工作目录超出项目范围",
-                reason="cwd_outside_project_root",
-            )
+        execution_cwd = (
+            str(_resolve_host_path(self._root_dir, cwd)) if cwd else self._root_dir
+        )
         try:
             env_overrides = _validated_env_overrides(env)
         except ValueError as e:
@@ -1821,31 +1616,8 @@ class GhostAPClient(Client):
                 reason="invalid_environment_variable",
             )
 
-        tool_args = {
-            "command": shell_command,
-            "args": list(args or []),
-            "cwd": execution_cwd,
-            "output_byte_limit": output_byte_limit,
-            **kwargs,
-        }
-        if not self._is_tool_allowed("shell", tool_args):
-            return self._create_failed_terminal(
-                session_id=session_id,
-                command=shell_command,
-                message="❌ 工具权限检查未通过: tool_filter_denied",
-                reason="tool_filter_denied",
-            )
-
-        ok, reason = self._sandbox.is_command_safe(shell_command)
-        if not ok:
-            return self._create_failed_terminal(
-                session_id=session_id,
-                command=shell_command,
-                message=f"❌ 安全检查未通过: {reason}",
-                reason=reason or "sandbox_rejected",
-            )
-
-        result = self._sandbox.execute(
+        del kwargs
+        result = self._command_executor.execute(
             shell_command,
             cwd=execution_cwd,
             interactive=False,

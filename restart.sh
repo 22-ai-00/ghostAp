@@ -24,7 +24,6 @@ CODEX_ACP_NPM_PACKAGE="${GHOSTAP_CODEX_ACP_NPM_PACKAGE:-@agentclientprotocol/cod
 # Operators may explicitly opt in when they prefer eager adapter installation.
 PREPARE_CODEX_ACP="${GHOSTAP_PREPARE_CODEX_ACP:-0}"
 SYNC_PYTHON_DEPENDENCIES="${GHOSTAP_SYNC_PYTHON_DEPENDENCIES:-1}"
-PREPARE_EMPLOYEE_SANDBOX="${GHOSTAP_PREPARE_EMPLOYEE_SANDBOX:-1}"
 
 cd "$PROJECT_DIR"
 
@@ -316,74 +315,6 @@ prepare_python_dependencies() {
     fi
 }
 
-run_privileged() {
-    if [ "$(id -u)" = "0" ]; then
-        "$@"
-        return
-    fi
-    if ! command -v sudo >/dev/null 2>&1; then
-        return 1
-    fi
-    if [ -t 0 ]; then
-        sudo "$@"
-    else
-        sudo -n "$@"
-    fi
-}
-
-install_linux_bubblewrap() {
-    if command -v apt-get >/dev/null 2>&1; then
-        run_privileged apt-get update >/dev/null 2>&1 && \
-            run_privileged apt-get install -y bubblewrap >/dev/null 2>&1
-    elif command -v dnf >/dev/null 2>&1; then
-        run_privileged dnf install -y bubblewrap >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        run_privileged yum install -y bubblewrap >/dev/null 2>&1
-    elif command -v zypper >/dev/null 2>&1; then
-        run_privileged zypper --non-interactive install bubblewrap >/dev/null 2>&1
-    elif command -v pacman >/dev/null 2>&1; then
-        run_privileged pacman -S --needed --noconfirm bubblewrap >/dev/null 2>&1
-    elif command -v apk >/dev/null 2>&1; then
-        run_privileged apk add bubblewrap >/dev/null 2>&1
-    else
-        return 1
-    fi
-}
-
-prepare_employee_sandbox_dependency() {
-    if [ "$PREPARE_EMPLOYEE_SANDBOX" = "0" ]; then
-        log_restart "employee sandbox preparation skipped"
-        return
-    fi
-
-    case "$(uname -s)" in
-        Linux)
-            if [ ! -x /usr/bin/bwrap ]; then
-                echo "安装员工 Channel 隔离依赖 bubblewrap..."
-                install_linux_bubblewrap || true
-            fi
-            if [ -x /usr/bin/bwrap ]; then
-                log_restart "employee sandbox ready mechanism=bubblewrap"
-            else
-                echo "⚠️  bubblewrap 自动安装失败，员工 Channel 将记录未验证降级"
-                log_restart "employee sandbox unavailable mechanism=bubblewrap"
-            fi
-            ;;
-        Darwin)
-            if [ -x /usr/bin/sandbox-exec ]; then
-                log_restart "employee sandbox ready mechanism=seatbelt"
-            else
-                echo "⚠️  macOS 系统 sandbox-exec 不可用，员工 Channel 将 fail-closed"
-                log_restart "employee sandbox unavailable mechanism=seatbelt"
-            fi
-            ;;
-        *)
-            echo "⚠️  当前平台没有受支持的员工 Channel 文件系统沙箱"
-            log_restart "employee sandbox unavailable mechanism=unsupported"
-            ;;
-    esac
-}
-
 codex_native_acp_available() {
     command -v codex >/dev/null 2>&1 || return 1
     codex acp serve --help 2>&1 | grep -Eiq "(acp serve|acp.*server)"
@@ -540,7 +471,6 @@ start_service() {
         start_log_mode="append"
     fi
     prepare_python_dependencies || return 1
-    prepare_employee_sandbox_dependency
     prepare_codex_acp_dependency
     log_restart "start begin cmd=$(service_command_label)"
     previous_running_pids=$(get_running_pids)

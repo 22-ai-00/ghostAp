@@ -266,16 +266,16 @@ class TestSpecEngineE2E:
 
 
 # ---------------------------------------------------------------------------
-# 4. Sandbox executor: bare exception → error_message non-empty
+# 4. Command executor: bare exception → error_message non-empty
 # ---------------------------------------------------------------------------
 
-class TestSandboxExecutorE2E:
-    """SandboxExecutor exception paths → error_message always non-empty."""
+class TestCommandExecutorE2E:
+    """CommandExecutor exception paths → error_message always non-empty."""
 
     def test_bare_exception_in_execute_has_nonempty_error(self):
-        from src.sandbox.executor import SandboxExecutor
+        from src.command_executor import CommandExecutor
 
-        executor = SandboxExecutor()
+        executor = CommandExecutor()
         # Force a bare Exception by providing a command that triggers an internal error
         with patch.object(executor, "_sanitize_command_for_noninteractive", side_effect=Exception()):
             result = executor.execute("echo test")
@@ -284,9 +284,9 @@ class TestSandboxExecutorE2E:
         assert "执行异常" in result.error_message
 
     def test_bare_timeout_in_execute_has_nonempty_error(self):
-        from src.sandbox.executor import SandboxExecutor
+        from src.command_executor import CommandExecutor
 
-        executor = SandboxExecutor()
+        executor = CommandExecutor()
         with patch.object(executor, "_sanitize_command_for_noninteractive", side_effect=TimeoutError()):
             result = executor.execute("echo test")
         assert result.error_message is not None
@@ -311,7 +311,6 @@ class TestInternalDiagnosticsGuard:
         client._root_dir = "/nonexistent"
         client._ops_log = []
         client._record = lambda *a: None
-        client._tool_filter = None
 
         import asyncio
         loop = asyncio.new_event_loop()

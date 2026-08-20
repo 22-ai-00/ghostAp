@@ -95,7 +95,7 @@ def test_timeout_finalized_incomplete_result_opens_fresh_window() -> None:
     assert calls[1][0] == "provider-session-1"
     assert "第 2/4 个执行窗口" in calls[1][1]
     assert "original task" in calls[1][1]
-    assert "不新增任何权限" in calls[1][1]
+    assert "GhostAP 不增加二次权限或风险判断" in calls[1][1]
 
 
 def test_natural_incomplete_result_does_not_open_new_window() -> None:

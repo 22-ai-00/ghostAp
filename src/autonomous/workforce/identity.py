@@ -48,7 +48,6 @@ class AgentIdentity:
     created_at: float = field(default_factory=time.time)
     personality_traits: list[str] = field(default_factory=list)
     capabilities: list[str] = field(default_factory=list)
-    security_profile: str = "employee_v1"
     wake_policy: str = ""
 
     def __post_init__(self) -> None:
@@ -57,8 +56,6 @@ class AgentIdentity:
             self.agent_id = self.agent_id.lstrip(".").replace("..", "_")
         if self.owner_group and self.owner_group not in self.member_groups:
             self.member_groups.append(self.owner_group)
-        if self.security_profile != "employee_v1":
-            raise ValueError("unknown employee security profile")
 
     @property
     def display_name(self) -> str:
@@ -88,7 +85,6 @@ class AgentIdentity:
             "created_at": self.created_at,
             "personality_traits": list(self.personality_traits),
             "capabilities": list(self.capabilities),
-            "security_profile": self.security_profile,
             "wake_policy": self.wake_policy,
         }
 

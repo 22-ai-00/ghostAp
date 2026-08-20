@@ -127,7 +127,6 @@ def _claude_session() -> SyncClaudeCLISession:
         config=ClaudeCLIConfig(
             command="claude",
             add_dir=False,
-            bypass_permissions=False,
         ),
     )
     session.session_id = "session-1"

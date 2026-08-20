@@ -1,4 +1,4 @@
-"""GhostAP — Feishu chatbot shell sandbox service."""
+"""GhostAP — Feishu chatbot remote development service."""
 
 from importlib.metadata import PackageNotFoundError, version
 

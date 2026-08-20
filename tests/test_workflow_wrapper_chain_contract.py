@@ -35,7 +35,6 @@ def _sync_acp_base(
     session = object.__new__(SyncACPSession)
     session._prompt_lock = threading.Lock()
     session._acp_session = None
-    session._tool_filter = None
     pending = iter(outcomes)
 
     def _send_prompt_once(
@@ -87,11 +86,7 @@ def _factory_chain(tmp_path, base: SyncACPSession) -> ModelFailureAwareSession:
         patch("src.agent_session.factory.get_settings", return_value=settings),
         patch("src.agent_session.wrappers.get_settings", return_value=settings),
     ):
-        session = create_engine_session(
-            "codex",
-            str(tmp_path),
-            require_tool_filter=True,
-        )
+        session = create_engine_session("codex", str(tmp_path))
     assert isinstance(session, ModelFailureAwareSession)
     assert isinstance(session._inner, RateLimitAwareSession)
     assert session._inner._inner is base
@@ -117,10 +112,9 @@ def test_start_retry_forwards_explicit_capture_policy(tmp_path) -> None:
             *,
             agent_type,
             cwd,
-            auto_approve=None,
             capture_full_tool_content=False,
         ):
-            del agent_type, cwd, auto_approve
+            del agent_type, cwd
             captured.append(capture_full_tool_content)
 
         def start(self, startup_timeout=20):
@@ -174,7 +168,6 @@ def test_engine_factory_forwards_explicit_capture_policy(tmp_path) -> None:
         create_engine_session(
             "codex",
             str(tmp_path),
-            require_tool_filter=True,
             capture_full_tool_content=True,
         )
 
@@ -312,68 +305,6 @@ def test_compaction_retry_preserves_workflow_activity_contract(tmp_path) -> None
     assert retry_calls[0]["activity_predicate"] is predicate
 
 
-def _deny_mutation(tool_name: str, _params: dict | None) -> bool:
-    normalized = tool_name.lower()
-    return not any(
-        token in normalized
-        for token in ("shell", "write", "network")
-    )
-
-
-def _assert_mutation_filter_preserved(session: SyncACPSession) -> None:
-    tool_filter = session.get_tool_filter()
-    assert tool_filter is _deny_mutation
-    assert tool_filter("shell", {}) is False
-    assert tool_filter("write_file", {}) is False
-    assert tool_filter("network_request", {}) is False
-
-
-def test_compaction_replacement_inherits_deny_mutation_filter(tmp_path) -> None:
-    first = _sync_acp_base([RuntimeError("compaction required")], [])
-    replacement = _sync_acp_base(
-        [PromptResult(stop_reason="end_turn", text="recovered")],
-        [],
-    )
-    session = _factory_chain(tmp_path, first)
-    session.set_tool_filter(_deny_mutation)
-    session._compaction_action = lambda _session: replacement
-
-    with patch(
-        "src.agent_session.wrappers.classify_model_failure",
-        return_value={"reason": "need_compaction"},
-    ):
-        assert session.send_prompt("build").text == "recovered"
-
-    _assert_mutation_filter_preserved(replacement)
-
-
-def test_failover_replacement_inherits_deny_mutation_filter(tmp_path) -> None:
-    first = _sync_acp_base([], [])
-    first._agent_cmd = "codex"
-    first._agent_args = ["--model", "old"]
-    first._agent_type = "codex"
-    first._cwd = str(tmp_path)
-    first.close = MethodType(lambda _self: None, first)
-    replacement = _sync_acp_base([], [])
-    replacement.start = MethodType(
-        lambda _self, startup_timeout=20: "replacement",
-        replacement,
-    )
-    session = _factory_chain(tmp_path, first)
-    session.set_tool_filter(_deny_mutation)
-
-    with (
-        patch("src.agent_session.wrappers.SyncACPSession", return_value=replacement),
-        patch(
-            "src.agent_session.wrappers._replace_model_in_agent_args",
-            return_value=(["--model", "new"], True),
-        ),
-    ):
-        assert session._do_failover(from_model="old", to_model="new") is True
-
-    _assert_mutation_filter_preserved(replacement)
-
-
 def test_model_failure_wrapper_checks_cancel_before_replacement_send(tmp_path) -> None:
     first = _sync_acp_base([RuntimeError("compaction required")], [])
     replacement_calls: list[dict[str, object]] = []
@@ -398,6 +329,8 @@ def test_model_failure_wrapper_checks_cancel_before_replacement_send(tmp_path) -
         session.send_prompt("build")
 
     assert replacement_calls == []
+
+
 def test_compaction_and_failover_do_not_create_before_old_close_is_confirmed(
     monkeypatch,
 ) -> None:
@@ -413,24 +346,12 @@ def test_compaction_and_failover_do_not_create_before_old_close_is_confirmed(
         def close(self):
             raise RuntimeError("old close is uncertain")
 
-        def set_tool_filter(self, tool_filter):
-            self.tool_filter = tool_filter
-
-        def get_tool_filter(self):
-            return getattr(self, "tool_filter", None)
-
     class CandidateSession:
         def start(self, startup_timeout=60):
             return "candidate"
 
         def close(self):
             return None
-
-        def set_tool_filter(self, tool_filter):
-            self.tool_filter = tool_filter
-
-        def get_tool_filter(self):
-            return getattr(self, "tool_filter", None)
 
     for mode in ("compaction", "failover"):
         old = OldSession()
@@ -461,59 +382,6 @@ def test_compaction_and_failover_do_not_create_before_old_close_is_confirmed(
         assert replaced is False
         assert created["count"] == 0
         assert wrapper._inner is old
-
-
-def test_failed_candidate_install_keeps_every_uncertain_reference_for_close_retry() -> None:
-    import pytest
-
-    from src.agent_session.wrappers import ModelFailureAwareSession
-
-    class OldSession:
-        def close(self):
-            return None
-
-        def set_tool_filter(self, tool_filter):
-            self.tool_filter = tool_filter
-
-        def get_tool_filter(self):
-            return getattr(self, "tool_filter", None)
-
-    class CandidateSession:
-        def __init__(self):
-            self.allow_close = False
-            self.close_calls = 0
-
-        def set_tool_filter(self, _tool_filter):
-            raise RuntimeError("filter install failed")
-
-        def close(self):
-            self.close_calls += 1
-            if not self.allow_close:
-                raise RuntimeError("candidate close is uncertain")
-
-    candidates = [CandidateSession(), CandidateSession()]
-    wrapper = ModelFailureAwareSession(
-        OldSession(),
-        compaction_action=lambda _session: candidates.pop(0),
-    )
-    wrapper.set_tool_filter(lambda _tool: True)
-
-    assert wrapper._do_compaction() is False
-    first = wrapper.uncertain_sessions[0]
-    assert wrapper._do_compaction() is False
-    second = wrapper.uncertain_sessions[1]
-    assert wrapper.uncertain_sessions == (first, second)
-
-    second.allow_close = True
-    with pytest.raises(RuntimeError):
-        wrapper.close()
-    assert first.close_calls == 2
-    assert second.close_calls == 2
-    assert wrapper.uncertain_sessions == (first,)
-
-    first.allow_close = True
-    wrapper.close()
-    assert wrapper.uncertain_sessions == ()
 
 
 def test_cancel_after_candidate_creation_closes_candidate_without_swap() -> None:

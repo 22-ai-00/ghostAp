@@ -7,11 +7,10 @@
  */
 
 import { createInterface } from 'node:readline';
-import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import vm from 'node:vm';
 
 // ---------------------------------------------------------------------------
 // Path sanitization (strip absolute paths and stack traces from messages)
@@ -1597,7 +1596,15 @@ function log(msg) {
 // Expose globals
 // ---------------------------------------------------------------------------
 
-function installGlobals() {
+function installGlobals(workflowArgs) {
+  // stdout is reserved for JSON-RPC frames. Generated scripts still receive
+  // the ordinary Node console API, with stdout-oriented methods routed to the
+  // runtime diagnostic stream so free-form logs cannot corrupt transport.
+  const hostConsole = globalThis.console;
+  globalThis.console = Object.assign(Object.create(hostConsole), hostConsole, {
+    log: (...args) => hostConsole.error(...args),
+    info: (...args) => hostConsole.error(...args),
+  });
   globalThis.agent = agent;
   globalThis.parallel = parallel;
   globalThis.pipeline = pipeline;
@@ -1611,19 +1618,8 @@ function installGlobals() {
   globalThis.loop = loop;
   globalThis.sequence = sequence;
   globalThis.race = race;
-}
-
-// Wrap every function we hand into the vm sandbox so that attacker code
-// cannot walk through ``fn.constructor.constructor(...)`` to reach the host
-// Function constructor. Each wrapper is a plain closure with ``null``
-// prototype; we additionally freeze the wrapper so its properties are
-// immutable from within the sandbox.
-function sandboxWrapHostFn(fn) {
-  // eslint-disable-next-line func-names
-  const wrapper = function (...args) { return fn(...args); };
-  Object.setPrototypeOf(wrapper, null);
-  Object.freeze(wrapper);
-  return wrapper;
+  globalThis.CancelledError = CancelledError;
+  globalThis.workflowArgs = workflowArgs;
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,105 +1677,19 @@ async function main() {
     return;
   }
 
-  // Create sandboxed context with only orchestration primitives.
-  // Every host-side function is wrapped in a sandboxed closure before being
-  // handed to the vm context so script code cannot reach
-  // ``agent.constructor.constructor("return process")()`` or similar
-  // prototype-chain escapes.
-  const sandboxGlobals = {
-    // Core primitives
-    agent: sandboxWrapHostFn(agent),
-    parallel: sandboxWrapHostFn(parallel),
-    pipeline: sandboxWrapHostFn(pipeline),
-    phase: sandboxWrapHostFn(phase),
-    log: sandboxWrapHostFn(log),
-    // Dynamic Workflow pattern primitives
-    classify: sandboxWrapHostFn(classify),
-    fanout: sandboxWrapHostFn(fanout),
-    verify: sandboxWrapHostFn(verify),
-    generate: sandboxWrapHostFn(generate),
-    tournament: sandboxWrapHostFn(tournament),
-    loop: sandboxWrapHostFn(loop),
-    sequence: sandboxWrapHostFn(sequence),
-    race: sandboxWrapHostFn(race),
-    CancelledError: sandboxWrapHostFn(() => { throw new CancelledError(); }),
-    workflowArgs,
-    // Safe standard built-ins
-    console: { log: sandboxWrapHostFn((...a) => debugLog(a.join(' '))),
-                error: sandboxWrapHostFn((...a) => debugLog(a.join(' '))) },
-    setTimeout: sandboxWrapHostFn((fn, ms) => setTimeout(fn, ms)),
-    clearTimeout: sandboxWrapHostFn((id) => clearTimeout(id)),
-    Promise,
-    JSON,
-    Array,
-    Object,
-    String,
-    Number,
-    Boolean,
-    Map,
-    Set,
-    Date,
-    Math,
-    Error,
-    TypeError,
-    RangeError,
-    RegExp,
-    Symbol,
-    parseInt,
-    parseFloat,
-    isNaN,
-    isFinite,
-    encodeURIComponent,
-    decodeURIComponent,
-    encodeURI,
-    decodeURI,
-    undefined,
-    NaN,
-    Infinity,
-  };
-
-  const context = vm.createContext(sandboxGlobals, {
-    name: 'workflow-sandbox',
-    codeGeneration: { strings: false, wasm: false },
-  });
-
-  // Harden the prototypes inside the sandbox so attacker code cannot patch
-  // ``Object.prototype`` / ``Function.prototype`` with getters/setters that
-  // leak back into the host. These calls only affect objects inside the
-  // vm context; the host side is untouched.
+  // Execute the generated module in the ordinary Node.js host context. The
+  // generator historically writes `.js` even inside CommonJS projects, so use
+  // a short-lived sibling `.mjs` copy. Keeping the same directory preserves
+  // relative and package import resolution without a VM or custom loader.
+  installGlobals(workflowArgs);
+  let ns;
+  let modulePath = absolutePath;
   try {
-    vm.runInContext('Object.freeze(Object.prototype);' +
-                    'Object.freeze(Function.prototype);' +
-                    'Object.freeze(Array.prototype);' +
-                    'Object.freeze(String.prototype);' +
-                    'Object.freeze(Number.prototype);' +
-                    'Object.freeze(Boolean.prototype);' +
-                    'Object.freeze(Promise.prototype);', context, {
-      filename: 'sandbox-harden.js',
-    });
-  } catch (err) {
-    sendNotification('error', {
-      message: sanitizePath(`Sandbox hardening failed — aborting: ${err.message}`),
-      stack: '',
-    });
-    flushAndExit(1);
-    return;
-  }
-
-  // Load and execute using vm.SourceTextModule (sandboxed ESM)
-  let mod;
-  try {
-    mod = new vm.SourceTextModule(source, {
-      context,
-      identifier: `file://${absolutePath}`,
-    });
-
-    // Link: deny all imports (sandbox enforcement)
-    await mod.link((specifier) => {
-      throw new Error(`Imports are not allowed in workflow scripts: "${specifier}"`);
-    });
-
-    await mod.evaluate();
+    if (!absolutePath.endsWith('.mjs')) {
+      modulePath = `${absolutePath}.ghostap-${process.pid}-${Date.now()}.mjs`;
+      writeFileSync(modulePath, source, { flag: 'wx' });
+    }
+    ns = await import(pathToFileURL(modulePath).href);
   } catch (err) {
     sendNotification('error', {
       message: sanitizePath(`Failed to load script: ${err.message}`),
@@ -1787,10 +1697,11 @@ async function main() {
     });
     flushAndExit(1);
     return;
+  } finally {
+    if (modulePath !== absolutePath) {
+      try { unlinkSync(modulePath); } catch { /* best-effort temporary cleanup */ }
+    }
   }
-
-  // Extract exports from the module namespace
-  const ns = mod.namespace;
 
   // Validate meta
   const meta = ns.meta;

@@ -114,10 +114,6 @@ class _WorkflowGenerationCancelled(RuntimeError):
     """Internal control flow: a superseded generator must not write fallback."""
 
 
-class _WorkflowGenerationCloseUncertain(RuntimeError):
-    """The prior binding may still be live, so fallback is unsafe."""
-
-
 class _WorkflowGenerationExhausted(RuntimeError):
     """All model paths and the deterministic pool fallback were exhausted."""
 
@@ -2760,7 +2756,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 with open(script_path, "rb") as f:
                     script_bytes = f.read()
             except OSError:
-                # Note: script_path is not exposed to user for security reasons
+                # script_path is an internal implementation detail.
                 _reply_start_error(
                     "internal_error",
                     detail="脚本文件读取失败，请重新发送 `/wf` 生成",
@@ -2777,7 +2773,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 )
                 return
 
-            # Structural + security validation (mirrors the generation path).
+            # Structural and frozen-pool validation mirrors generation.
             from ...workflow_engine.script_gen import extract_meta_from_script, validate_generated_script
 
             is_valid, validation_errors = validate_generated_script(
@@ -3451,27 +3447,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             auto_reviewer=True,
         )
 
-        mutating_tools = frozenset(
-            {
-                "execute_command", "create_terminal", "run_terminal", "run_shell", "shell", "bash",
-                "write_file", "write_text_file", "delete_file", "remove_file", "mkdir", "patch_file",
-                "apply_diff", "edit_file", "write_to_file", "http_request", "http_get", "http_post",
-                "fetch", "download", "upload", "network_request", "url_open", "send_message",
-                "send_email", "create_issue",
-            }
-        )
-
-        def script_gen_tool_filter(tool_name: str, _params: dict | None) -> bool:
-            if not isinstance(tool_name, str):
-                return False
-            normalized = tool_name.lower().strip()
-            if normalized in mutating_tools:
-                return False
-            return not any(
-                token in normalized
-                for token in ("write", "delete", "remove", "exec", "run", "patch", "post", "upload", "send", "create")
-            )
-
         last_error = "模型未返回有效脚本"
         for attempt in range(1, _SCRIPT_GENERATION_MAX_ATTEMPTS + 1):
             ensure_not_cancelled()
@@ -3483,15 +3458,12 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     agent_type=agent_type,
                     cwd=root_path,
                     thread_id="workflow_script_gen",
-                    auto_approve=False,
-                    require_tool_filter=True,
                     model_name=selected_model_name,
                     cancel_event=cancel_event,
                 )
                 if session is None:
                     last_error = "无法创建脚本生成会话"
                     continue
-                session.set_tool_filter(script_gen_tool_filter)
                 retry_note = "" if attempt == 1 else (
                     "\n\n上一次输出未通过验证。请重新生成完整脚本，"
                     "并严格使用提示中列出的工具。"
@@ -3616,30 +3588,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             orchestrator,
             *(item for item in pool if item.agent_id != orchestrator.agent_id),
         )
-        mutating_tools = frozenset(
-            {
-                "execute_command", "create_terminal", "run_terminal", "run_shell", "shell",
-                "bash", "write_file", "write_text_file", "delete_file", "remove_file",
-                "mkdir", "patch_file", "apply_diff", "edit_file", "write_to_file",
-                "http_request", "http_get", "http_post", "fetch", "download", "upload",
-                "network_request", "url_open", "send_message", "send_email", "create_issue",
-            }
-        )
-
-        def tool_filter(tool_name: str, _params: dict | None) -> bool:
-            if not isinstance(tool_name, str):
-                return False
-            normalized = tool_name.lower().strip()
-            if normalized in mutating_tools:
-                return False
-            return not any(
-                token in normalized
-                for token in (
-                    "write", "delete", "remove", "exec", "run", "patch", "post",
-                    "upload", "send", "create",
-                )
-            )
-
         def ensure_current() -> None:
             if cancel_event is not None and cancel_event.is_set():
                 raise _WorkflowGenerationCancelled("Workflow generation cancelled")
@@ -3725,7 +3673,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             session: Any,
             *,
             cancel: bool,
-            read_only_fenced: bool,
             quarantine_event: threading.Event,
             provider_cancel_event: threading.Event,
         ) -> None:
@@ -3748,22 +3695,17 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             except Exception as exc:
                 close_confirmed = False
                 details.append(f"generation session close uncertain: {exc}")
-            if cancel_confirmed and close_confirmed:
-                if session_owner is not None:
-                    unbind_active_session(session_owner, session)
-                    release_owner = getattr(engine, "release_lifecycle_owner", None)
-                    if callable(release_owner):
-                        release_owner(session_owner)
-                return
-            if read_only_fenced:
-                if session_owner is not None:
-                    unbind_active_session(session_owner, session)
+            if not (cancel_confirmed and close_confirmed):
                 logger.warning(
-                    "Workflow read-only generation session cleanup was not confirmed; "
-                    "quarantining it and continuing within the frozen pool"
+                    "Workflow generation session cleanup was not confirmed; "
+                    "continuing with the next frozen-pool member: %s",
+                    "; ".join(details),
                 )
-                return
-            raise _WorkflowGenerationCloseUncertain("; ".join(details))
+            if session_owner is not None:
+                unbind_active_session(session_owner, session)
+                release_owner = getattr(engine, "release_lifecycle_owner", None)
+                if callable(release_owner):
+                    release_owner(session_owner)
 
         def transport_failure(exc: BaseException) -> bool:
             text = f"{type(exc).__name__}: {exc}".lower()
@@ -3775,11 +3717,11 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 )
             )
 
-        def permission_or_unsafe(exc: BaseException | str) -> bool:
+        def provider_rejection(exc: BaseException | str) -> bool:
             text = str(exc).lower()
             return any(
                 token in text
-                for token in ("permission", "forbidden", "unauthorized", "unsafe", "policy")
+                for token in ("permission", "forbidden", "unauthorized")
             )
 
         def validate_and_write(script_content: str) -> tuple[str, dict[str, Any]]:
@@ -3849,7 +3791,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                 activity_buffer = _WorkflowGenerationActivityBuffer()
                 attempt_cancel_event = threading.Event()
                 attempt_quarantined = threading.Event()
-                read_only_fenced = False
                 try:
                     session_owner = current_generation_owner()
                     if session_owner is None:
@@ -3863,8 +3804,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             f"workflow_script_gen_{captured_session_key}_{binding.agent_id}_"
                             f"{repair_attempt}"
                         ),
-                        auto_approve=False,
-                        require_tool_filter=True,
                         model_name=binding.model_name,
                         cancel_event=attempt_cancel_event,
                         # Member timeout/startup failure is an expected input
@@ -3881,7 +3820,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=True,
-                            read_only_fenced=False,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -3889,13 +3827,10 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         raise RuntimeError(
                             "stale Workflow generation owner before session bind"
                         )
-                    session.set_tool_filter(tool_filter)
-                    read_only_fenced = True
                     if not active_session_is_current(session_owner, session):
                         close_strict(
                             session,
                             cancel=True,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -3967,7 +3902,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=True,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -3982,7 +3916,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=True,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -3994,7 +3927,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=True,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -4008,7 +3940,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=True,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -4021,7 +3952,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=False,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -4038,7 +3968,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=False,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -4053,7 +3982,6 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=False,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -4063,20 +3991,16 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     close_strict(
                         session,
                         cancel=False,
-                        read_only_fenced=read_only_fenced,
                         quarantine_event=attempt_quarantined,
                         provider_cancel_event=attempt_cancel_event,
                     )
                     session = None
                     return validate_and_write(script_content)
-                except _WorkflowGenerationCloseUncertain:
-                    raise
                 except _WorkflowGenerationCancelled:
                     if session is not None:
                         close_strict(
                             session,
                             cancel=True,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
@@ -4086,12 +4010,11 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                         close_strict(
                             session,
                             cancel=True,
-                            read_only_fenced=read_only_fenced,
                             quarantine_event=attempt_quarantined,
                             provider_cancel_event=attempt_cancel_event,
                         )
                         session = None
-                        if transport_failure(exc) or permission_or_unsafe(exc):
+                        if transport_failure(exc) or provider_rejection(exc):
                             session = None
                             last_error = f"{type(exc).__name__}: {exc}"
                             should_fallback = True

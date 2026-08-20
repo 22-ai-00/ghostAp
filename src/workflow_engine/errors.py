@@ -69,7 +69,7 @@ _USER_MESSAGES: dict[ErrorCategory, str] = {
         "工作流等待响应超时，请重试或增加超时限制。"
     ),
     ErrorCategory.REVIEW_FAILED: (
-        "一个或多个独立评审 Agent 未正常完成，Workflow 已按安全策略停止。"
+        "一个或多个独立评审 Agent 未正常完成，Workflow 未发布不完整结果。"
     ),
     ErrorCategory.INTERNAL_ERROR: (
         "发生内部错误，请重试。如问题持续，请联系管理员。"

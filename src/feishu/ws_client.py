@@ -84,14 +84,7 @@ from ..thread import (
     get_thread_manager,
     set_current_tenant_key,
 )
-from ..trust.action_matrix import ActionMatrix, can_dispatch
 from ..trust.models import (
-    ActionDecision as TrustActionDecision,
-)
-from ..trust.models import (
-    ActionKind,
-    ActionRequest,
-    ActionTargetKind,
     ActorKind,
     EffectiveTrust,
     TrustZone,
@@ -2072,55 +2065,8 @@ class FeishuWSClient:
     ) -> bool:
         if trust is None:
             return True
-        action: ActionKind | None = None
-        if self._is_known_host_shell_invocation(text):
-            action = ActionKind.HOST_SHELL
-        elif command_match is not None and command_match.command in {
-            "/access",
-            "/setadmin",
-            "/hire",
-            "/fire",
-            "/employee-role",
-        }:
-            action = ActionKind.GRANT_ADMIN
-        elif command_match is not None and command_match.command in {
-            "/employees",
-            "/history",
-            "/employee-memory",
-        }:
-            action = ActionKind.SYSTEM_ADMIN
-        if action is None:
-            return trust.zone is not TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
-        return ActionMatrix().decide(
-            ActionRequest(
-                trust=trust,
-                action=action,
-                target=ActionTargetKind.HOST_GLOBAL,
-            )
-        ) is TrustActionDecision.ALLOW
-
-    @staticmethod
-    def _is_known_host_shell_invocation(text: str) -> bool:
-        """Recognize only deterministic shell forms at the intake fence.
-
-        The broader SMART heuristic intentionally treats unknown English verbs
-        as possible executables.  It is useful for routing but is not an
-        authorization fact, so managed ingress only rejects the explicit
-        command whitelist and local executable paths here.  The Dispatcher
-        applies the ActionMatrix again when intent recognition confirms Shell.
-        """
-
-        from ..agent.intent_recognizer import IntentRecognizer
-
-        normalized = (text or "").strip().lower()
-        if not normalized:
-            return False
-        first_word = normalized.split()[0]
-        return (
-            first_word == "cd"
-            or first_word in IntentRecognizer.SHELL_COMMANDS
-            or IntentRecognizer._looks_like_local_executable_path(first_word)
-        )
+        del text, command_match
+        return trust.zone is not TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
 
     def _current_trust_can_dispatch(
         self,
@@ -2155,13 +2101,22 @@ class FeishuWSClient:
                 )
             ):
                 return False
-        return can_dispatch(
-            trust,
-            current_group_revision=current_group_revision,
-            current_grant_revision=current_grant_revision,
-            killed=False,
-            paused=False,
-        ) is TrustActionDecision.ALLOW
+        if trust.zone is TrustZone.OWNER_P2P:
+            return (
+                trust.actor is ActorKind.OWNER
+                and trust.managed_group is None
+                and trust.group_revision is None
+                and trust.grant_revision is None
+                and current_group_revision is None
+                and current_grant_revision is None
+            )
+        return (
+            trust.zone is TrustZone.MANAGED_AGENT_GROUP
+            and trust.actor in {ActorKind.OWNER, ActorKind.EMPLOYEE}
+            and trust.managed_group is not None
+            and current_group_revision == trust.group_revision
+            and current_grant_revision == trust.grant_revision
+        )
 
     @staticmethod
     def _extract_canonical_ingress_facts(

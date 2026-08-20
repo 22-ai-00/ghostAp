@@ -129,8 +129,6 @@ def make_employee_bootstrap(tmp_path: Path) -> EmployeeSessionBootstrap:
         codex_home=codex_home,
         instruction_text=instruction_text,
         instruction_digest=instruction_digest,
-        read_only_roots=(workspace_root,),
-        writable_roots=(project_root,),
     )
 
 

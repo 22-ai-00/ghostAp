@@ -38,35 +38,6 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MIME = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*\Z")
 _STORAGE_NAME = re.compile(r"[a-z0-9]{1,128}\Z")
 _RESOURCE_TYPES = frozenset({"file", "image"})
-_DANGEROUS_SUFFIXES = frozenset(
-    {
-        ".app",
-        ".bat",
-        ".cmd",
-        ".com",
-        ".cpl",
-        ".dll",
-        ".dmg",
-        ".exe",
-        ".gadget",
-        ".hta",
-        ".jar",
-        ".js",
-        ".jse",
-        ".lnk",
-        ".msi",
-        ".msp",
-        ".pif",
-        ".ps1",
-        ".reg",
-        ".scr",
-        ".sh",
-        ".vb",
-        ".vbe",
-        ".vbs",
-        ".wsf",
-    }
-)
 _ZIP_MIMES = frozenset(
     {
         "application/epub+zip",
@@ -650,8 +621,6 @@ class AttachmentStagingService:
             raise AttachmentValidationError("attachment size does not match descriptor")
         if hashlib.sha256(content).hexdigest() != descriptor.declared_sha256:
             raise AttachmentValidationError("attachment hash does not match descriptor")
-        if _is_executable(content, descriptor.user_filename) or _is_executable(content, downloaded.file_name):
-            raise AttachmentValidationError("attachment executable content is forbidden")
         detected = _detect_mime(content)
         declared = descriptor.declared_mime_type
         if not _mime_matches(declared, detected):
@@ -1457,23 +1426,6 @@ def _read_at_most(fd: int, maximum: int) -> bytes:
         chunks.append(chunk)
         remaining -= len(chunk)
     return b"".join(chunks)
-
-
-def _is_executable(content: bytes, filename: str) -> bool:
-    lower_name = filename.casefold()
-    if any(lower_name.endswith(suffix) for suffix in _DANGEROUS_SUFFIXES):
-        return True
-    executable_magic = (
-        b"\x7fELF",
-        b"MZ",
-        b"#!",
-        b"\xfe\xed\xfa\xce",
-        b"\xfe\xed\xfa\xcf",
-        b"\xce\xfa\xed\xfe",
-        b"\xcf\xfa\xed\xfe",
-        b"\xca\xfe\xba\xbe",
-    )
-    return content.startswith(executable_magic)
 
 
 def _detect_mime(content: bytes) -> str:

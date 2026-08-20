@@ -372,7 +372,6 @@ def start_session_with_retry(
     log_failures: bool = True,
     env: Optional[dict[str, str]] = None,
     retries: Optional[int] = None,
-    auto_approve: bool | None = None,
     capture_full_tool_content: bool = False,
 ) -> SyncACPSession:
     """Start an ACP session with retry and progressive timeout.
@@ -399,7 +398,6 @@ def start_session_with_retry(
 
     def construct_session(**kwargs: object) -> SyncACPSession:
         optional_kwargs: dict[str, object] = {
-            "auto_approve": auto_approve,
             "capture_full_tool_content": bool(capture_full_tool_content),
         }
         while True:
@@ -626,7 +624,6 @@ class SyncACPSession(PromptGenerationTracker):
         agent_cmd: Optional[str] = None,
         model_name: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
-        auto_approve: bool | None = None,
         capture_full_tool_content: bool = False,
     ):
         self._agent_type = agent_type
@@ -640,7 +637,6 @@ class SyncACPSession(PromptGenerationTracker):
             self._agent_args = agent_args or args
         self._model_name = (model_name or "").strip() or None
         self._explicit_env = dict(env) if env is not None else None
-        self._auto_approve = auto_approve
         self._capture_full_tool_content = bool(capture_full_tool_content)
         self._log_failures = True
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -880,7 +876,6 @@ class SyncACPSession(PromptGenerationTracker):
             agent_args=self._agent_args,
             cwd=self._cwd,
             env=env_override,
-            auto_approve=self._auto_approve,
             capture_full_tool_content=self._capture_full_tool_content,
         )
         session_id = await self._acp_session.start()
@@ -1343,50 +1338,6 @@ class SyncACPSession(PromptGenerationTracker):
         except (TimeoutError, OSError, RuntimeError) as e:
             logger.warning("[ACP] set_model failed: %s", get_error_detail(e), exc_info=True)
             return False
-
-    def set_tool_filter(self, filter_fn: "Callable[[str, dict | None], bool]") -> None:
-        """Install a per-session tool filter for least-privilege execution.
-
-        The filter_fn receives (tool_name, args) and returns True to allow.
-        This is stored locally and checked by the engine before tool execution.
-        """
-        self._tool_filter = filter_fn
-        if self._acp_session is not None:
-            self._acp_session.set_tool_filter(filter_fn)
-
-    def get_tool_filter(self) -> "Optional[Callable[[str, dict | None], bool]]":
-        """Return the currently installed tool filter, or None."""
-        return getattr(self, "_tool_filter", None)
-
-    def set_trusted_personal_permissions(
-        self,
-        enabled: bool,
-        timeout: float = 10.0,
-    ) -> bool:
-        """Synchronously apply or revoke a task-scoped ACP trust lease."""
-
-        if not self._acp_session or not self._loop:
-            return False
-        try:
-            applied = bool(
-                self._run_async(
-                    self._acp_session.set_trusted_personal_permissions(enabled),
-                    timeout=max(0.1, float(timeout or 10.0)),
-                )
-            )
-        except (TimeoutError, OSError, RuntimeError) as exc:
-            logger.error(
-                "[ACP:%s] trusted-personal lease transition failed: enabled=%s error=%s",
-                self._agent_type,
-                enabled,
-                get_error_detail(exc),
-            )
-            applied = False
-        if not applied:
-            # A timed-out mode transition has an unknown remote state. Never
-            # reuse that transport for another user/task.
-            self._force_dead = True
-        return applied
 
     def has_active_goal(self, timeout: float = 1.0) -> bool:
         """Inspect provider-owned goal state on the session event loop."""

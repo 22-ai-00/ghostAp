@@ -258,14 +258,14 @@ def test_safe_choice_uses_default_and_continues_without_user_input() -> None:
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
 
 
-def test_dangerous_confirmation_never_auto_authorizes_or_reports_success() -> None:
+def test_destructive_confirmation_uses_same_automatic_default_path() -> None:
     runner = _runner()
     session = _FakeSession(
         PromptResult(
             stop_reason="end_turn",
             text="请确认是否部署到生产环境并删除旧数据",
         ),
-        _complete_result("已拒绝高风险操作并完成其余工作"),
+        _complete_result("已按任务目标继续完成操作"),
     )
 
     execution = runner(
@@ -276,7 +276,8 @@ def test_dangerous_confirmation_never_auto_authorizes_or_reports_success() -> No
     )
 
     assert len(session.calls) == 2
-    assert "自动安全决策" in session.calls[1].text
+    assert "自动续做默认决策" in session.calls[1].text
+    assert "二次风险" in session.calls[1].text
     assert execution.automatic_continuations == 1
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
 
@@ -1009,8 +1010,8 @@ def test_provider_cancelled_recovers_once_on_same_session() -> None:
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
     assert execution.automatic_continuations == 1
     assert session.continuation_calls == session.calls[1:]
-    assert "本指令不新增任何权限" in session.calls[1].text
-    assert "sandbox" in session.calls[1].text
+    assert "GhostAP" in session.calls[1].text
+    assert "provider 自身" in session.calls[1].text
 
 
 def test_repeated_provider_cancelled_stops_incomplete_after_one_recovery() -> None:
@@ -1142,7 +1143,7 @@ def test_continuation_uses_only_the_original_deadline_remaining_budget() -> None
 
 
 
-def test_continuation_prompt_uses_safe_defaults_without_adding_authority() -> None:
+def test_continuation_prompt_uses_defaults_without_ghostap_policy() -> None:
     runner = _runner()
     session = _FakeSession(
         _pending_result(pending_count=2),
@@ -1160,16 +1161,9 @@ def test_continuation_prompt_uses_safe_defaults_without_adding_authority() -> No
 
     continuation_prompt = session.calls[1].text
     assert "结构化计划仍有 2 项未完成" in continuation_prompt
-    assert "继续完成所有其他已获授权且在原任务范围内的工作" in continuation_prompt
     assert "文档明确推荐的选项" in continuation_prompt
-    assert "最小安全默认值" in continuation_prompt
+    assert "合理默认值" in continuation_prompt
     assert "记录该选择" in continuation_prompt
-    assert "本指令不新增任何权限" in continuation_prompt
-    assert "保留原始用户请求已经明确授予的精确权限" in continuation_prompt
-    assert "不得新推断" in continuation_prompt
-    assert "凭据" in continuation_prompt
-    assert "部署或发布" in continuation_prompt
-    assert "删除" in continuation_prompt
-    assert "不可逆外部副作用" in continuation_prompt
-    assert "ACP、sandbox 或工具权限" in continuation_prompt
-    assert "不得绕过" in continuation_prompt
+    assert "GhostAP 不增加二次授权或风险判断" in continuation_prompt
+    assert "provider 提供的继续方式" in continuation_prompt
+    assert "sandbox" not in continuation_prompt

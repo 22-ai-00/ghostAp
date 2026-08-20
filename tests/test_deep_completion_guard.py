@@ -84,7 +84,7 @@ def test_deep_automatically_recovers_blocked_goal() -> None:
     assert "GhostAP 自动恢复指令" in session.prompts[1]
 
 
-def test_deep_automatically_chooses_safe_default_instead_of_waiting() -> None:
+def test_deep_delegates_permissions_while_choosing_default() -> None:
     session = _Session(
         PromptResult(stop_reason="end_turn", text="请选择推荐方案还是最小方案？"),
         PromptResult(stop_reason="end_turn", text="已采用推荐的安全可逆方案并完成。"),
@@ -94,7 +94,8 @@ def test_deep_automatically_chooses_safe_default_instead_of_waiting() -> None:
 
     assert project.status is DeepProjectStatus.COMPLETED
     assert "GhostAP 自动续做默认决策" in session.prompts[1]
-    assert "不得发布、部署、付费、删除数据" in session.prompts[1]
+    assert "GhostAP 不做二次风险分类或权限拦截" in session.prompts[1]
+    assert "provider 自身的权限机制" in session.prompts[1]
 
 
 def test_deep_fails_after_bounded_automatic_continuations() -> None:

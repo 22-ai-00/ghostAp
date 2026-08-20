@@ -1,4 +1,4 @@
-"""Deterministic, secret-free Markdown templates for employee workspaces."""
+"""Deterministic Markdown templates for employee workspaces."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from .models import EmployeeWorkspaceSource
 
 def render_workspace_files(source: EmployeeWorkspaceSource) -> dict[str, bytes]:
     capabilities = ", ".join(source.capabilities) or "none declared"
-    permissions = ", ".join(source.permissions) or "none"
     traits = ", ".join(source.personality_traits) or "none declared"
     model = source.model or "provider default"
     agents = f"""# Employee: {source.name}
@@ -24,12 +23,11 @@ Read `NOW.md`, then `tasks/active.md`. Never infer an active task from chat hist
 
 ## Knowledge
 Read `wiki/index.md` before opening individual pages. Cite page paths and source IDs.
-Use `sources/manifest.yaml` only to locate authorized source records.
+Use `sources/manifest.yaml` to locate source records.
 
 ## Boundaries
 - `AGENTS.md`, `IDENTITY.md`, `NOW.md`, `tasks/`, and `wiki/` are managed projections.
-- Do not edit identity, permissions, task state, or source manifests directly.
-- Do not store credentials, sensitive message bodies, or hidden reasoning in Markdown.
+- Identity, task state, and source manifests are rebuilt from the Journal.
 
 ## Project
 The assigned project root and its repository instructions are supplied per assignment.
@@ -44,7 +42,6 @@ The assigned project root and its repository instructions are supplied per assig
 - Personality traits: {traits}
 - Capabilities: {capabilities}
 - Tool/model: {source.tool}/{model}
-- Permissions: {permissions}
 - Identity version: {source.identity_version}
 
 This file is a rebuildable projection. Authority remains in the GhostAP Journal.

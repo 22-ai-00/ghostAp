@@ -48,11 +48,6 @@ class _SessionWrapper(_PromptRetryMixin):
     def __init__(self, inner: "SyncSession", cancel_event: threading.Event | None = None):
         self._inner = inner
         self._cancel_event = cancel_event or threading.Event()
-        get_tool_filter = getattr(inner, "get_tool_filter", None)
-        try:
-            self._tool_filter = get_tool_filter() if callable(get_tool_filter) else None
-        except Exception:
-            self._tool_filter = None
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
@@ -79,19 +74,6 @@ class _SessionWrapper(_PromptRetryMixin):
             return self._inner.cancel(wait=wait, timeout=timeout)
         except TypeError:
             return self._inner.cancel()
-
-    def set_tool_filter(
-        self,
-        tool_filter: Callable[[str, dict | None], bool] | None,
-    ) -> None:
-        setter = getattr(self._inner, "set_tool_filter", None)
-        if not callable(setter):
-            raise RuntimeError("session replacement does not support tool filters")
-        setter(tool_filter)
-        self._tool_filter = tool_filter
-
-    def get_tool_filter(self) -> Callable[[str, dict | None], bool] | None:
-        return self._tool_filter
 
 
 class SyncSession(Protocol):
@@ -130,16 +112,6 @@ class SyncSession(Protocol):
     def active_prompt_generation(self) -> int | None: ...
     def mark_user_cancel(self, generation: int) -> None: ...
     def cancel(self, wait: bool = False, timeout: float = 2.0) -> bool | None: ...
-    def set_tool_filter(
-        self,
-        tool_filter: Callable[[str, dict | None], bool] | None,
-    ) -> None: ...
-    def get_tool_filter(self) -> Callable[[str, dict | None], bool] | None: ...
-    def set_trusted_personal_permissions(
-        self,
-        enabled: bool,
-        timeout: float = 10.0,
-    ) -> bool: ...
     def close(self) -> None: ...
     def to_snapshot(self) -> dict: ...
     def get_session_info(self) -> str: ...

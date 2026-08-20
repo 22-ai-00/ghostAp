@@ -132,7 +132,6 @@ class DispatchBinding:
     model: str
     profile: str
     effort: str
-    security_profile: str
     capabilities: tuple[str, ...]
     permissions: tuple[str, ...]
     constraints_digest: str
@@ -183,7 +182,6 @@ class DispatchBinding:
             "tool",
             "profile",
             "effort",
-            "security_profile",
         ):
             object.__setattr__(self, name, _required_text(getattr(self, name), name))
         object.__setattr__(self, "thread_id", _optional_text(self.thread_id, "thread_id"))
@@ -193,8 +191,6 @@ class DispatchBinding:
             _optional_text(self.thread_root_id, "thread_root_id"),
         )
         object.__setattr__(self, "model", _optional_text(self.model, "model"))
-        if self.security_profile != "employee_v1":
-            raise ValueError("dispatch binding requires employee_v1 security profile")
         for name, prefix in (
             ("permit_id", "prm_"),
             ("attempt_id", "att_"),
@@ -310,15 +306,18 @@ class DispatchBinding:
     def from_dict(cls, value: object) -> DispatchBinding:
         if not isinstance(value, dict):
             raise ValueError("dispatch binding must be an object")
+        normalized = dict(value)
+        # Older journal frames carried an execution-policy label. It no longer
+        # has runtime meaning, but replay must remain compatible after removal.
+        normalized.pop("security_profile", None)
         expected = set(cls.__dataclass_fields__)
-        if set(value) != expected:
+        if set(normalized) != expected:
             raise ValueError("dispatch binding must use exact schema")
-        if not isinstance(value.get("permissions"), list) or not isinstance(
-            value.get("capabilities"),
+        if not isinstance(normalized.get("permissions"), list) or not isinstance(
+            normalized.get("capabilities"),
             list,
         ):
             raise ValueError("dispatch authority collections must be JSON arrays")
-        normalized = dict(value)
         if normalized.get("schema_version") != 2:
             raise ValueError("current dispatch binding requires schema version 2")
         try:
@@ -406,7 +405,6 @@ class AgentExecutionSpec:
     created_at: float
     personality_traits: tuple[str, ...]
     capabilities: tuple[str, ...]
-    security_profile: str
     wake_policy: str
 
     @classmethod
@@ -434,7 +432,6 @@ class AgentExecutionSpec:
             created_at=agent.created_at,
             personality_traits=tuple(agent.personality_traits),
             capabilities=tuple(agent.capabilities),
-            security_profile=agent.security_profile,
             wake_policy=agent.wake_policy,
         )
 
@@ -460,7 +457,6 @@ class AgentExecutionSpec:
             created_at=self.created_at,
             personality_traits=list(self.personality_traits),
             capabilities=list(self.capabilities),
-            security_profile=self.security_profile,
             wake_policy=self.wake_policy,
         )
 

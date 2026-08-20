@@ -1,5 +1,7 @@
 # GhostAP Dynamic Multi-Agent Orchestration V3 Implementation Plan
 
+> 历史说明（2026-08-20）：本文中的 deny-all、风险分级和工具过滤方案不再是当前执行契约；GhostAP 已将执行权限交给后端自身处理。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 将 GhostAP 建设成后端中立、角色动态、拓扑动态、证据驱动且可耐久恢复的多 Agent 协作控制面，使用户选定的本机 Agent 能按任务需要自动分工、执行、验证、重规划和交付，而不把 Codex、Grok、TraeX、Hermes、OpenClaw 等品牌写死为固定角色。

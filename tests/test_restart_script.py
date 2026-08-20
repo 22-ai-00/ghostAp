@@ -94,7 +94,7 @@ def test_application_startup_defers_acp_connections_by_default(monkeypatch):
     app.settings = SimpleNamespace(
         validate_feishu_config=lambda: True,
         app_id="test-app-id",
-        sandbox_timeout=30,
+        command_timeout=30,
         default_acp_tool=None,
     )
     app.feishu_client = None
@@ -143,7 +143,7 @@ def test_application_installs_sigterm_handler_after_runtime_import(monkeypatch):
     app.settings = SimpleNamespace(
         validate_feishu_config=lambda: True,
         app_id="test-app-id",
-        sandbox_timeout=30,
+        command_timeout=30,
         default_acp_tool=None,
     )
     app.feishu_client = None
@@ -230,7 +230,7 @@ def test_application_startup_can_preheat_model_capabilities_when_explicitly_enab
     app.settings = SimpleNamespace(
         validate_feishu_config=lambda: True,
         app_id="test-app-id",
-        sandbox_timeout=30,
+        command_timeout=30,
         default_acp_tool=None,
         acp_model_preheat_on_startup=True,
     )
@@ -249,7 +249,7 @@ def test_application_startup_can_preheat_model_capabilities_when_explicitly_enab
     ]
 
 
-def test_restart_script_syncs_python_and_prepares_platform_sandbox():
+def test_restart_script_syncs_python_without_installing_execution_sandbox():
     text = RESTART_SCRIPT.read_text(encoding="utf-8")
     start_body = text.split("start_service() {", 1)[1]
 
@@ -263,14 +263,9 @@ def test_restart_script_syncs_python_and_prepares_platform_sandbox():
     assert "dependency_seconds=" in start_body
     assert "readiness_seconds=" in start_body
     assert "prepare_python_dependencies || return 1" in start_body
-    assert "GHOSTAP_PREPARE_EMPLOYEE_SANDBOX" in text
-    assert "prepare_employee_sandbox_dependency" in start_body
-    assert "apt-get install -y bubblewrap" in text
-    assert "dnf install -y bubblewrap" in text
-    assert "pacman -S --needed --noconfirm bubblewrap" in text
-    assert "pacman -Sy" not in text
-    assert "/usr/bin/sandbox-exec" in text
-    assert "mechanism=seatbelt" in text
+    assert "GHOSTAP_PREPARE_EMPLOYEE_SANDBOX" not in text
+    assert "bubblewrap" not in text
+    assert "sandbox-exec" not in text
 
 
 def test_python_dependency_check_does_not_reinstall_up_to_date_environment(
@@ -907,7 +902,6 @@ export GHOSTAP_RESTART_LIBRARY_ONLY=1
 export CAPTURE="$2"
 source "$1"
 prepare_python_dependencies() { :; }
-prepare_employee_sandbox_dependency() { :; }
 prepare_codex_acp_dependency() { :; }
 log_restart() { :; }
 get_running_pids() { :; }
@@ -943,7 +937,6 @@ export GHOSTAP_RESTART_LIBRARY_ONLY=1
 export CAPTURE="$2"
 source "$1"
 prepare_python_dependencies() { printf '%s\n' dependencies >> "$CAPTURE"; }
-prepare_employee_sandbox_dependency() { :; }
 prepare_codex_acp_dependency() { :; }
 log_restart() { :; }
 start_service_process() {
@@ -991,7 +984,6 @@ export GHOSTAP_RESTART_LIBRARY_ONLY=1
 export CAPTURE="$2"
 source "$1"
 prepare_python_dependencies() { :; }
-prepare_employee_sandbox_dependency() { :; }
 prepare_codex_acp_dependency() { :; }
 log_restart() { :; }
 start_service_process() {
@@ -1038,7 +1030,6 @@ export GHOSTAP_RESTART_LIBRARY_ONLY=1
 export CAPTURE="$2"
 source "$1"
 prepare_python_dependencies() { :; }
-prepare_employee_sandbox_dependency() { :; }
 prepare_codex_acp_dependency() { :; }
 log_restart() { :; }
 start_service_process() { STARTED_PID=4242; }

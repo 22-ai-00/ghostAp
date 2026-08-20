@@ -241,7 +241,6 @@ class EmployeeTeamGateway:
             agent.reasoning_effort == binding.effort,
             tuple(sorted(agent.permissions)) == binding.permissions,
             tuple(sorted(agent.capabilities)) == binding.capabilities,
-            agent.security_profile == binding.security_profile == "employee_v1",
         )
         if not all(coordinates):
             raise DispatchPermitAuthorityError("permit agent binding mismatch")

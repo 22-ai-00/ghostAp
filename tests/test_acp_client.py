@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from acp.schema import KillTerminalResponse, PermissionOption, SessionInfoUpdate
+from acp.schema import SessionInfoUpdate
 
 from src.acp.client import GhostAPClient, _parse_plan, _parse_tool_call
 from src.acp.helper import SessionKeyCodec
@@ -345,7 +345,6 @@ def test_untrustworthy_goal_session_info_cannot_clear_stored_state(
 def test_prompt_preserves_empty_stop_reason_for_fail_closed_classification(
     tmp_path: Path,
 ):
-    from types import SimpleNamespace
 
     from src.acp.outcome import PromptOutcome, classify_prompt_result
     from src.acp.session import ACPSession
@@ -367,7 +366,6 @@ def test_prompt_preserves_empty_stop_reason_for_fail_closed_classification(
 
 
 def test_acp_manager_retries_start_failure(monkeypatch, caplog):
-    from types import SimpleNamespace
 
     from src.acp import manager as mgr
     from tests.helpers import FakeSessionBase
@@ -408,7 +406,6 @@ def test_acp_manager_retries_start_failure(monkeypatch, caplog):
 
 def test_supports_acp_serve_unsets_claudecode(monkeypatch):
     """ACP serve 探测不应继承 nested-session guard 环境变量。"""
-    from types import SimpleNamespace
 
     from src.acp import sync_adapter as sa
 
@@ -434,7 +431,6 @@ def test_supports_acp_serve_unsets_claudecode(monkeypatch):
 
 def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
     """ACPSession 启动时应主动剔除 CLAUDECODE，避免 Claude nested-session 检测。"""
-    from types import SimpleNamespace
 
     import src.acp.session as session_mod
     from src.acp.session import ACPSession
@@ -475,7 +471,7 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
     monkeypatch.setattr(
         session_mod,
         "get_settings",
-        lambda: SimpleNamespace(acp_permission_auto_approve=True, acp_stream_buffer_limit=0),
+        lambda: SimpleNamespace(acp_stream_buffer_limit=0),
     )
 
     with monkeypatch.context() as m:
@@ -503,7 +499,6 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
 
 def test_acp_session_start_failure_has_fail_phase(monkeypatch):
     """ACPSession.start 失败时应抛 ACPStartupError 且携带 fail_phase（spawn/initialize/new_session）。"""
-    from types import SimpleNamespace
 
     import src.acp.session as session_mod
     from src.acp.session import ACPSession, ACPStartupError
@@ -531,7 +526,7 @@ def test_acp_session_start_failure_has_fail_phase(monkeypatch):
     monkeypatch.setattr(
         session_mod,
         "get_settings",
-        lambda: SimpleNamespace(acp_permission_auto_approve=True, acp_stream_buffer_limit=0),
+        lambda: SimpleNamespace(acp_stream_buffer_limit=0),
     )
 
     s = ACPSession(agent_cmd="claude", agent_args=["acp", "serve"], cwd="/tmp")
@@ -544,7 +539,6 @@ def test_acp_session_start_failure_has_fail_phase(monkeypatch):
 
 def test_acp_health_check_uses_non_mutating_session_list_probe():
     """Health checks must not reload or otherwise mutate the active session."""
-    from types import SimpleNamespace
 
     from src.acp.session import ACPSession
 
@@ -571,7 +565,6 @@ def test_acp_health_check_uses_non_mutating_session_list_probe():
 
 def test_acp_manager_unhealthy_session_is_cleaned(monkeypatch):
     import time as _time
-    from types import SimpleNamespace
 
     from src.acp import manager as mgr
 
@@ -692,7 +685,6 @@ def test_sync_adapter_legacy_factory_lazily_initializes_generation_state(
 
 def test_acp_manager_session_starter_success_is_not_overwritten(monkeypatch):
     """回归：session_starter 成功返回后不应被默认路径覆盖。"""
-    from types import SimpleNamespace
 
     from src.acp import manager as mgr
 
@@ -1175,7 +1167,7 @@ class TestGhostAPClient:
         return loop.run_until_complete(coro)
 
 
-    def test_request_permission_without_allow_once_is_denied(self):
+    def test_request_permission_uses_backend_allow_always_when_needed(self):
         option = MagicMock()
         option.kind = "allow_always"
         option.option_id = "unsafe-fallback"
@@ -1188,7 +1180,8 @@ class TestGhostAPClient:
             )
         )
 
-        assert result.outcome.outcome == "cancelled"
+        assert result.outcome.outcome == "selected"
+        assert result.outcome.option_id == "unsafe-fallback"
 
 
     def test_tool_call_copies_codex_subagent_source_to_event(self):
@@ -1226,413 +1219,19 @@ class TestGhostAPClient:
         assert self.events[0].tool_call.subagent_activity == "started"
 
 
-def test_tool_filter_blocks_acp_file_and_terminal_tools(tmp_path: Path):
+
+def test_read_text_file_can_resolve_outside_session_root(tmp_path: Path):
     root = str(tmp_path)
-    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
-    client = GhostAPClient(on_event=lambda e: None, root_dir=root)
-    client.set_tool_filter(lambda tool, args: False)
-
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        read_resp = loop.run_until_complete(client.read_text_file("s1", "a.txt"))
-        write_resp = loop.run_until_complete(client.write_text_file("s1", "a.txt", "changed"))
-        term_resp = loop.run_until_complete(client.create_terminal(command="echo hi", session_id="s1"))
-        term_out = loop.run_until_complete(client.terminal_output(session_id="s1", terminal_id=term_resp.terminal_id))
-
-        assert read_resp.content == ""
-        assert read_resp.field_meta and read_resp.field_meta.get("blocked") is True
-        assert write_resp and write_resp.field_meta and write_resp.field_meta.get("blocked") is True
-        assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "hello"
-        assert term_resp.field_meta and term_resp.field_meta.get("blocked") is True
-        assert "工具权限" in term_out.output
-    finally:
-        loop.close()
-
-
-def test_kill_terminal_returns_current_official_response_and_releases_record():
-    client = GhostAPClient(on_event=lambda _event: None)
-    client.set_tool_filter(lambda _tool, _args: False)
-
-    terminal = asyncio.run(client.create_terminal(command="echo blocked", session_id="s1"))
-    response = asyncio.run(
-        client.kill_terminal(session_id="s1", terminal_id=terminal.terminal_id)
-    )
-
-    assert isinstance(response, KillTerminalResponse)
-    assert terminal.terminal_id not in client._terminals
-
-
-def test_tool_filter_blocks_auto_approved_permission_request():
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-    client.set_tool_filter(lambda tool, args: False)
-
-    opt = MagicMock()
-    opt.kind = "allow_once"
-    opt.option_id = "opt1"
-    tool_call = MagicMock()
-    tool_call.kind = "execute"
-    tool_call.raw_input = {"command": "echo hi"}
-
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        resp = loop.run_until_complete(client.request_permission(options=[opt], session_id="s1", tool_call=tool_call))
-        assert resp.outcome.outcome == "cancelled"
-    finally:
-        loop.close()
-
-
-@pytest.mark.parametrize(
-    ("kind", "raw_input", "expected_tool", "expected_args"),
-    [
-        ("read", {"path": "/project/secret.txt"}, "file_read", {"path": "/project/secret.txt"}),
-        ("edit", {"path": "/project/app.py"}, "file_write", {"path": "/project/app.py"}),
-        ("delete", {"path": "/project/app.py"}, "file_write", {"path": "/project/app.py"}),
-        (
-            "move",
-            {"source": "/project/a.py", "destination": "/project/b.py"},
-            "file_write",
-            {"source": "/project/a.py", "destination": "/project/b.py"},
-        ),
-        ("search", {"query": "password"}, "search", {"query": "password"}),
-        ("fetch", {"url": "https://example.invalid"}, "fetch", {"url": "https://example.invalid"}),
-        ("other", {"operation": "custom"}, "other", {"operation": "custom"}),
-        ("think", {"topic": "plan"}, "think", {"topic": "plan"}),
-        ("switch_mode", {"mode": "code"}, "switch_mode", {"mode": "code"}),
-        ("future_kind", {"operation": "future"}, "other", {"operation": "future"}),
-        (None, {"operation": "unspecified"}, "other", {"operation": "unspecified"}),
-    ],
-)
-def test_permission_bridge_checks_every_kind_before_auto_approve(
-    kind,
-    raw_input,
-    expected_tool,
-    expected_args,
-):
-    seen: list[tuple[str, dict]] = []
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-    client.set_tool_filter(
-        lambda tool, args: seen.append((tool, args or {})) or False
-    )
-    option = PermissionOption(
-        optionId="allow-once",
-        name="Allow once",
-        kind="allow_once",
-    )
-    tool_call = SimpleNamespace(kind=kind, raw_input=raw_input)
-
-    response = asyncio.run(
-        client.request_permission(
-            options=[option],
-            session_id="s1",
-            tool_call=tool_call,
-        )
-    )
-
-    assert response.outcome.outcome == "cancelled"
-    assert seen == [(expected_tool, expected_args)]
-
-
-def test_permission_bridge_filter_exception_fails_closed_before_auto_approve():
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-
-    def broken_filter(_tool, _args):
-        raise RuntimeError("filter unavailable")
-
-    client.set_tool_filter(broken_filter)
-    option = PermissionOption(
-        optionId="allow-once",
-        name="Allow once",
-        kind="allow_once",
-    )
-
-    response = asyncio.run(
-        client.request_permission(
-            options=[option],
-            session_id="s1",
-            tool_call=SimpleNamespace(
-                kind="read",
-                raw_input={"path": "/project/secret.txt"},
-            ),
-        )
-    )
-
-    assert response.outcome.outcome == "cancelled"
-
-
-def test_permission_bridge_dangerous_argv_remains_fail_closed():
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-    option = PermissionOption(
-        optionId="allow-once",
-        name="Allow once",
-        kind="allow_once",
-    )
-
-    response = asyncio.run(
-        client.request_permission(
-            options=[option],
-            session_id="s1",
-            tool_call=SimpleNamespace(
-                kind="execute",
-                raw_input={"command": ["rm", "-rf", "/"]},
-            ),
-        )
-    )
-
-    assert response.outcome.outcome == "cancelled"
-
-
-@pytest.mark.parametrize(
-    "command",
-    (
-        "rm -rf /",
-        ["zsh", "-c", "rm -rf /"],
-        "rm --no-preserve-root -rf /",
-        "rm -rf -- /",
-        'rm -rf "/"',
-        ["zsh", "-c", 'cd /tmp && rm --no-preserve-root -rf "/"'],
-    ),
-)
-def test_permission_bridge_rejects_root_removal_in_plain_and_wrapped_forms(
-    command,
-):
-    client = GhostAPClient(on_event=lambda _event: None, auto_approve=True)
-    option = PermissionOption(
-        optionId="allow-once",
-        name="Allow once",
-        kind="allow_once",
-    )
-
-    response = asyncio.run(
-        client.request_permission(
-            options=[option],
-            session_id="s1",
-            tool_call=SimpleNamespace(
-                kind="execute",
-                raw_input={"command": command},
-            ),
-        )
-    )
-
-    assert response.outcome.outcome == "cancelled"
-
-
-def test_permission_bridge_accepts_safe_production_shaped_zsh_command():
-    seen: list[tuple[str, dict]] = []
-    client = GhostAPClient(on_event=lambda _event: None, auto_approve=True)
-    client.set_tool_filter(
-        lambda tool, args: seen.append((tool, args or {})) or tool == "shell"
-    )
-    option = PermissionOption(
-        optionId="allow-once",
-        name="Allow once",
-        kind="allow_once",
-    )
-    script = (
-        "cd /workspace && python - <<'PY' > /tmp/result\n"
-        "print('ok')\nPY\ncat /tmp/result | sed -n '1p'"
-    )
-
-    response = asyncio.run(
-        client.request_permission(
-            options=[option],
-            session_id="s1",
-            tool_call=SimpleNamespace(
-                kind="execute",
-                raw_input={"command": ["zsh", "-c", script]},
-            ),
-        )
-    )
-
-    assert response.outcome.outcome == "selected"
-    assert seen and seen[0][0] == "shell"
-
-
-def test_permission_bridge_missing_execute_command_fails_closed():
-    seen: list[tuple[str, dict]] = []
-    client = GhostAPClient(on_event=lambda _event: None, auto_approve=True)
-    client.set_tool_filter(
-        lambda tool, args: seen.append((tool, args or {})) or True
-    )
-    option = PermissionOption(
-        optionId="allow-once",
-        name="Allow once",
-        kind="allow_once",
-    )
-
-    response = asyncio.run(
-        client.request_permission(
-            options=[option],
-            session_id="s1",
-            tool_call=SimpleNamespace(kind="execute", raw_input={"opaque": "x"}),
-        )
-    )
-
-    assert response.outcome.outcome == "cancelled"
-    assert seen == []
-
-
-def test_permission_bridge_accepts_safe_canonical_argv():
-    seen: list[tuple[str, dict]] = []
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-    client.set_tool_filter(
-        lambda tool, args: seen.append((tool, args or {})) or tool == "git"
-    )
-    option = PermissionOption(
-        optionId="allow-once",
-        name="Allow once",
-        kind="allow_once",
-    )
-    argv = ["git", "status", "--short"]
-
-    response = asyncio.run(
-        client.request_permission(
-            options=[option],
-            session_id="s1",
-            tool_call=SimpleNamespace(
-                kind="execute",
-                raw_input={"command": argv},
-            ),
-        )
-    )
-
-    assert response.outcome.outcome == "selected"
-    assert seen == [
-        (
-            "git",
-            {
-                "command": "git status --short",
-                "argv": argv,
-                "cwd": client._root_dir,  # noqa: SLF001
-            },
-        )
-    ]
-
-
-@pytest.mark.parametrize(
-    "command",
-    (
-        [],
-        ["echo", 1],
-        [["echo"], "hello"],
-        {"program": "echo"},
-    ),
-)
-def test_permission_bridge_malformed_argv_remains_fail_closed(command):
-    seen: list[tuple[str, dict]] = []
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-    client.set_tool_filter(lambda tool, args: seen.append((tool, args or {})) or True)
-    option = PermissionOption(
-        optionId="allow-once",
-        name="Allow once",
-        kind="allow_once",
-    )
-
-    response = asyncio.run(
-        client.request_permission(
-            options=[option],
-            session_id="s1",
-            tool_call=SimpleNamespace(
-                kind="execute",
-                raw_input={"command": command},
-            ),
-        )
-    )
-
-    assert response.outcome.outcome == "cancelled"
-    assert seen == []
-
-
-def test_permission_bridge_classifies_canonical_git_execute_as_git():
-    seen: list[tuple[str, dict]] = []
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-    client.set_tool_filter(lambda tool, args: seen.append((tool, args or {})) or tool == "git")
-
-    opt = MagicMock()
-    opt.kind = "allow_once"
-    opt.option_id = "opt1"
-    tool_call = MagicMock()
-    tool_call.kind = "execute"
-    tool_call.raw_input = {"command": "/usr/bin/git status --short"}
-
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        resp = loop.run_until_complete(client.request_permission(options=[opt], session_id="s1", tool_call=tool_call))
-        assert resp.outcome.outcome == "selected"
-        assert seen == [
-            ("git", {"command": "/usr/bin/git status --short", "cwd": client._root_dir})  # noqa: SLF001
-        ]
-    finally:
-        loop.close()
-
-
-def test_permission_bridge_keeps_wrapped_git_execute_on_shell_policy():
-    seen: list[str] = []
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-    client.set_tool_filter(lambda tool, args: seen.append(tool) or tool == "git")
-
-    opt = MagicMock()
-    opt.kind = "allow_once"
-    opt.option_id = "opt1"
-    tool_call = MagicMock()
-    tool_call.kind = "execute"
-    tool_call.raw_input = {"command": "sh -c 'git status'"}
-
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        resp = loop.run_until_complete(client.request_permission(options=[opt], session_id="s1", tool_call=tool_call))
-        assert resp.outcome.outcome == "cancelled"
-        assert seen == ["shell"]
-    finally:
-        loop.close()
-
-
-def test_permission_bridge_fails_closed_when_safety_check_raises():
-    client = GhostAPClient(on_event=lambda e: None, auto_approve=True)
-    client._sandbox.is_command_safe = MagicMock(  # noqa: SLF001
-        side_effect=RuntimeError("safety backend unavailable")
-    )
-    client._record = MagicMock()  # noqa: SLF001
-
-    opt = MagicMock()
-    opt.kind = "allow_once"
-    opt.option_id = "opt1"
-    tool_call = MagicMock()
-    tool_call.kind = "execute"
-    tool_call.raw_input = {"command": "echo hi"}
-
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        resp = loop.run_until_complete(client.request_permission(options=[opt], session_id="s1", tool_call=tool_call))
-        assert resp.outcome.outcome == "cancelled"
-        client._record.assert_called_once_with(  # noqa: SLF001
-            "s1",
-            "permission",
-            {
-                "outcome": "cancelled",
-                "reason": "permission_safety_check_failed",
-                "stage": "sandbox",
-                "kind": "execute",
-                "command_shape": "str",
-            },
-        )
-    finally:
-        loop.close()
-
-
-def test_read_text_file_path_escape_denied(tmp_path: Path):
-    root = str(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    outside.write_text("outside", encoding="utf-8")
     client = GhostAPClient(on_event=lambda e: None, root_dir=root)
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
-        resp = loop.run_until_complete(client.read_text_file("s1", "../etc/passwd"))
-        assert resp.content == ""
-        assert resp.field_meta and "error" in resp.field_meta
+        resp = loop.run_until_complete(
+            client.read_text_file("s1", f"../{outside.name}")
+        )
+        assert resp.content == "outside"
     finally:
         loop.close()
 
@@ -1646,7 +1245,7 @@ def test_resolve_agent_spec_coco_has_command():
 
 
 def test_acp_011_permission_arguments_keep_allow_once_selection():
-    client = GhostAPClient(on_event=lambda _event: None, auto_approve=True)
+    client = GhostAPClient(on_event=lambda _event: None)
     option = MagicMock()
     option.kind = "allow_once"
     option.option_id = "allow-once"

@@ -11,7 +11,7 @@ from src.feishu.handlers.employee import EmployeeHandler
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.product_catalog import resolve_command
 from src.feishu.slash_command_parser import SlashCommandParser
-from src.feishu.ws_client import FeishuWSClient, TrustActionDecision
+from src.feishu.ws_client import FeishuWSClient
 from src.thread import set_current_sender_id
 from src.trust.models import ActorKind, EffectiveTrust, TrustZone
 
@@ -166,7 +166,7 @@ def test_employee_role_service_error_is_replied_without_internal_detail() -> Non
     assert any(word in reply for word in ("失败", "未找到", "暂不可用"))
 
 
-def test_dispatcher_treats_employee_role_as_admin_mutation() -> None:
+def test_dispatcher_routes_employee_role_without_action_policy_gate() -> None:
     client = MagicMock()
     client._handler_ctx.handlers = {
         "coco": MagicMock(),
@@ -174,7 +174,9 @@ def test_dispatcher_treats_employee_role_as_admin_mutation() -> None:
         "project": MagicMock(),
     }
     dispatcher = MessageDispatcher(client)
-    dispatcher._action_matrix_allows = MagicMock(return_value=False)
+    client._get_effective_mode.return_value = (SimpleNamespace(value="smart"), False)
+    client._current_trust_can_dispatch.return_value = True
+    dispatcher.system.is_interceptable_command_match.return_value = True
     text = f"{COMMAND} 柳神 负责核心开发"
 
     dispatcher.process_with_intent(
@@ -185,14 +187,10 @@ def test_dispatcher_treats_employee_role_as_admin_mutation() -> None:
         effective_trust=MagicMock(),
     )
 
-    assert dispatcher._action_matrix_allows.call_count == 1
-    assert dispatcher._action_matrix_allows.call_args.kwargs == {
-        "action_name": "grant_admin"
-    }
-    dispatcher.system.handle_intercepted_command.assert_not_called()
+    dispatcher.system.handle_intercepted_command.assert_called_once()
 
 
-def test_ws_managed_ingress_classifies_employee_role_as_grant_admin() -> None:
+def test_ws_managed_ingress_does_not_apply_action_policy() -> None:
     client = object.__new__(FeishuWSClient)
     trust = EffectiveTrust(
         zone=TrustZone.MANAGED_AGENT_GROUP,
@@ -202,15 +200,10 @@ def test_ws_managed_ingress_classifies_employee_role_as_grant_admin() -> None:
         grant_revision=None,
     )
     text = f"{COMMAND} 柳神 负责核心开发"
-    with patch("src.feishu.ws_client.ActionMatrix") as matrix:
-        matrix.return_value.decide.return_value = TrustActionDecision.DENY
+    allowed = client._managed_ingress_action_allowed(
+        trust,
+        text=text,
+        command_match=SlashCommandParser.parse(text),
+    )
 
-        allowed = client._managed_ingress_action_allowed(
-            trust,
-            text=text,
-            command_match=SlashCommandParser.parse(text),
-        )
-
-    assert allowed is False
-    request = matrix.return_value.decide.call_args.args[0]
-    assert request.action.value == "grant_admin"
+    assert allowed is True

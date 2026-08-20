@@ -59,7 +59,6 @@ class _Session:
         events: list[str] | None = None,
         close_error: BaseException | None = None,
         cancel_result: bool = True,
-        filter_error: BaseException | None = None,
         on_send: Any = None,
         streamed_events: list[ACPEvent] | None = None,
     ) -> None:
@@ -68,17 +67,10 @@ class _Session:
         self.events = events if events is not None else []
         self.close_error = close_error
         self.cancel_result = cancel_result
-        self.filter_error = filter_error
         self.on_send = on_send
         self.streamed_events = streamed_events or []
         self.calls: list[tuple[str, dict[str, Any]]] = []
-        self.filter = None
         self.event_callback = None
-
-    def set_tool_filter(self, callback) -> None:
-        if self.filter_error:
-            raise self.filter_error
-        self.filter = callback
 
     def send_prompt(self, prompt: str, **kwargs: Any) -> PromptResult:
         self.calls.append((prompt, kwargs))
@@ -259,7 +251,7 @@ def test_attempt_timeout_cancellation_does_not_set_workflow_stop_event(tmp_path)
     assert all(event is not workflow_stop for event in created_cancel_events)
 
 
-def test_read_only_close_failure_is_quarantined_and_binding_fallback_continues(
+def test_close_failure_is_quarantined_and_binding_fallback_continues(
     tmp_path,
 ) -> None:
     progress: list[str] = []
@@ -296,7 +288,7 @@ def test_read_only_close_failure_is_quarantined_and_binding_fallback_continues(
     assert not any("late stale activity" in item for item in progress)
 
 
-def test_read_only_cancel_uncertainty_is_quarantined_and_does_not_fence(
+def test_cancel_uncertainty_is_quarantined_and_does_not_fence(
     tmp_path,
 ) -> None:
     engine = _engine(tmp_path)
@@ -323,21 +315,23 @@ def test_read_only_cancel_uncertainty_is_quarantined_and_does_not_fence(
     assert engine.has_uncertain_lifecycle_session() is False
 
 
-def test_unfenced_session_cleanup_uncertainty_still_blocks_fallback(tmp_path) -> None:
+def test_cleanup_uncertainty_does_not_block_success(tmp_path) -> None:
     engine = _engine(tmp_path)
     owner = engine._script_generation_owner
     session = _Session(
         PromptResult(stop_reason="end_turn", text=_script("A-2", "gemini")),
         name="A-2",
-        filter_error=RuntimeError("filter installation failed"),
         close_error=RuntimeError("close uncertain"),
     )
 
-    with pytest.raises(RuntimeError, match="close|uncertain"):
-        _generate(_handler(), engine, tmp_path, MagicMock(return_value=session))
+    path, meta = _generate(
+        _handler(), engine, tmp_path, MagicMock(return_value=session)
+    )
 
-    assert owner.active_generation_session is session
-    assert engine.has_uncertain_lifecycle_session() is True
+    assert path.endswith("generated.js")
+    assert meta["agentPlan"][0]["agentId"] == "A-2"
+    assert owner.active_generation_session is None
+    assert engine.has_uncertain_lifecycle_session() is False
 
 
 def test_fair_member_slice_preserves_later_binding_budget_and_bounds_repairs(

@@ -1059,9 +1059,6 @@ def test_cancelled_generator_does_not_recreate_owned_script(tmp_path):
     engine._script_generation_owner = owner
 
     class FakeSession:
-        def set_tool_filter(self, _tool_filter):
-            return None
-
         def send_prompt(self, _prompt, **kwargs):
             timeout = kwargs["timeout"]
             assert timeout > 0

@@ -30,7 +30,6 @@ from src.autonomous.supervisor.employee_channels import (
     EmployeeChannelSupervisor,
 )
 from tests.autonomous.integration.test_employee_channel_process import (
-    _accepted_attestation,
     _worker,
 )
 from tests.autonomous.integration.test_employee_fire_queued_handoff import (
@@ -272,7 +271,6 @@ def test_real_status_control_retires_only_after_delivery_only_send(
         restarted_channels = EmployeeChannelSupervisor(
             secret_resolver=lambda *_: "employee-secret",
             worker_path=_worker(tmp_path),
-            sandbox_attestor=_accepted_attestation,
             ready_timeout=1.0,
             stop_timeout=1.0,
             ingress_service=subject.harness.ingress,

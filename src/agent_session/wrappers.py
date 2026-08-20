@@ -260,7 +260,7 @@ class ModelFailureAwareSession(_SessionWrapper):
         operation: str,
         prepare_candidate: Optional[Callable[[SyncSession], None]] = None,
     ) -> bool:
-        """Close old, prepare candidate, install filter, then atomically swap."""
+        """Close old, prepare the candidate, then atomically swap."""
         with self._replacement_lock:
             if self._cancel_event.is_set():
                 return False
@@ -278,9 +278,6 @@ class ModelFailureAwareSession(_SessionWrapper):
                 replacement = rewrap(new_base)
                 if prepare_candidate is not None:
                     prepare_candidate(replacement)
-                tool_filter = self.get_tool_filter()
-                if tool_filter is not None:
-                    replacement.set_tool_filter(tool_filter)
                 if self._cancel_event.is_set():
                     self._close_rejected_candidate(
                         replacement,

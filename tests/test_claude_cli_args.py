@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from src.agent_session.claude_cli import ClaudeCLIConfig, SyncClaudeCLISession
 from src.agent_session.factory import create_engine_session
 
@@ -26,7 +24,7 @@ def test_selected_claude_model_reaches_real_cli_argv() -> None:
     session = SyncClaudeCLISession(
         cwd="/tmp",
         model_name="claude-sonnet-4-5",
-        config=ClaudeCLIConfig(add_dir=False, bypass_permissions=False),
+        config=ClaudeCLIConfig(add_dir=False),
     )
     session.session_id = "session-1"
 
@@ -67,7 +65,7 @@ def test_engine_factory_passes_selected_model_to_claude_cli() -> None:
     )
 
 
-def test_sandboxed_claude_1m_uses_wrapped_base_model_and_copied_env() -> None:
+def test_employee_claude_1m_uses_direct_argv_and_copied_env() -> None:
     original_env = {
         "PATH": "/usr/bin",
         "HOME": "/tmp/employee",
@@ -77,25 +75,20 @@ def test_sandboxed_claude_1m_uses_wrapped_base_model_and_copied_env() -> None:
     session = SyncClaudeCLISession(
         cwd="/tmp",
         model_name="claude-opus-4-8[1m]",
-        config=ClaudeCLIConfig(add_dir=False, bypass_permissions=False),
+        config=ClaudeCLIConfig(add_dir=False),
         employee_process_env=original_env,
     )
     session.session_id = "session-1"
-    assert session._employee_sandbox is not None
-    session._employee_sandbox.wrap_argv = MagicMock(
-        side_effect=lambda argv: ["bwrap", "--", *argv]
-    )
-
     with patch(
         "src.agent_session.claude_cli.subprocess.Popen",
         return_value=_completed_process(),
     ) as popen:
-        result = session.send_prompt("review in sandbox")
+        result = session.send_prompt("review directly")
 
     assert result.stop_reason == "end_turn"
     argv = popen.call_args.args[0]
     env = popen.call_args.kwargs["env"]
-    assert argv[:4] == ["bwrap", "--", "claude", "-p"]
+    assert argv[:2] == ["claude", "-p"]
     assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
     assert env["ANTHROPIC_BETAS"] == (
         "existing-beta,context-1m-2025-08-07"
@@ -103,17 +96,17 @@ def test_sandboxed_claude_1m_uses_wrapped_base_model_and_copied_env() -> None:
     assert original_env == original_snapshot
 
 
-def test_unsandboxed_claude_permission_bypass_fails_closed() -> None:
+def test_claude_cli_never_injects_permission_bypass() -> None:
     session = SyncClaudeCLISession(
         cwd="/tmp",
-        config=ClaudeCLIConfig(add_dir=False, bypass_permissions=True),
+        config=ClaudeCLIConfig(add_dir=False),
     )
     session.session_id = "session-1"
 
-    with (
-        patch("src.agent_session.claude_cli.subprocess.Popen") as popen,
-        pytest.raises(RuntimeError, match="受控员工沙箱"),
-    ):
+    with patch(
+        "src.agent_session.claude_cli.subprocess.Popen",
+        return_value=_completed_process(),
+    ) as popen:
         session.send_prompt("inspect the project")
 
-    popen.assert_not_called()
+    assert "--dangerously-skip-permissions" not in popen.call_args.args[0]

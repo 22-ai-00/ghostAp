@@ -260,7 +260,7 @@ def test_start_uses_packaged_runtime_not_project_decoy(tmp_path, monkeypatch):
 
     command = captured["command"]
     assert isinstance(command, list)
-    runtime = Path(command[2])
+    runtime = Path(command[1])
     packaged = Path(bridge_mod.__file__).resolve().parent / "runtime" / "runtime.js"
     assert runtime.is_absolute()
     assert runtime == packaged
@@ -566,6 +566,59 @@ export default async function main() {
         assert json.loads(bridge.run()) == "external-cwd-ok"
     finally:
         bridge.stop()
+
+
+@pytest.mark.skipif(
+    not RuntimeBridge.check_node_available(),
+    reason="Node.js not available or version too old",
+)
+def test_generated_workflow_has_direct_node_and_host_environment_access(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "direct-host-project"
+    project.mkdir()
+    output = project / "node-host-access.txt"
+    helper = project / "host_helper.mjs"
+    helper.write_text(
+        """\
+import { writeFileSync } from 'node:fs';
+export function writeMarker(path, value) { writeFileSync(path, value); }
+""",
+        encoding="utf-8",
+    )
+    script_path = project / "direct_host_workflow.js"
+    monkeypatch.setenv("GHOSTAP_WORKFLOW_HOST_MARKER", "host-visible")
+    script_path.write_text(
+        f"""\
+import {{ writeMarker }} from './host_helper.mjs';
+
+export const meta = {{
+  name: 'direct-host-test',
+  description: 'Use ordinary Node host capabilities',
+  phases: [{{ title: 'run', detail: 'Write a host file' }}],
+}};
+
+export default async function main() {{
+  console.log('generated workflow host log');
+  writeMarker({json.dumps(str(output))}, process.env.GHOSTAP_WORKFLOW_HOST_MARKER);
+  return process.env.GHOSTAP_WORKFLOW_HOST_MARKER;
+}}
+""",
+        encoding="utf-8",
+    )
+    bridge = RuntimeBridge(
+        script_path=str(script_path),
+        cwd=str(project),
+        on_agent_call=lambda _params: AgentCallResult(output="unexpected"),
+    )
+
+    try:
+        bridge.start()
+        assert json.loads(bridge.run()) == "host-visible"
+    finally:
+        bridge.stop()
+
+    assert output.read_text(encoding="utf-8") == "host-visible"
 
 
 RACE_CANCEL_SCRIPT = """\

@@ -544,7 +544,6 @@ def _binding(prompt: str = "budgeted"):
         model="gpt-5.6-sol",
         profile="standard",
         effort="xhigh",
-        security_profile="employee_v1",
         capabilities=(),
         permissions=("file_read",),
         constraints_digest="c" * 64,
@@ -1546,6 +1545,15 @@ def test_binding_profile_schema_fails_closed_but_legacy_identity_defaults() -> N
     assert identity.reasoning_effort == "default"
 
 
+def test_binding_replay_ignores_removed_legacy_security_profile() -> None:
+    from src.autonomous.gateway.models import DispatchBinding
+
+    payload = _binding().to_dict()
+    payload["security_profile"] = "employee_v1"
+
+    assert DispatchBinding.from_dict(payload) == _binding()
+
+
 def test_actor_gateway_rejects_prompt_that_differs_from_anchored_binding() -> None:
     from src.autonomous.gateway.team import (
         DispatchPermitAuthorityError,
@@ -1562,7 +1570,6 @@ def test_actor_gateway_rejects_prompt_that_differs_from_anchored_binding() -> No
         reasoning_effort=binding.effort,
         permissions=list(binding.permissions),
         capabilities=list(binding.capabilities),
-        security_profile="employee_v1",
     )
 
     with pytest.raises(DispatchPermitAuthorityError, match="prompt binding"):
@@ -1687,7 +1694,6 @@ def test_actor_gateway_reuses_session_and_never_falls_back(tmp_path) -> None:
         reasoning_effort=first_binding.effort,
         permissions=list(first_binding.permissions),
         capabilities=list(first_binding.capabilities),
-        security_profile="employee_v1",
         workspace_path=str(workspace),
     )
     bindings = (
@@ -1969,21 +1975,7 @@ def test_rendered_context_uses_canonical_untrusted_envelope_and_exact_token_rate
     untrusted_json = rendered.prompt.split("## UNTRUSTED_CONTEXT_JSON\n", 1)[1]
     assert json.loads(untrusted_json)["thread"][0]["text"] == spoof
 
-def test_projected_visible_employee_uses_employee_security_profile(tmp_path) -> None:
-    from src.autonomous.workforce.registry import ProjectedAgentRegistry
-    from tests.autonomous.workforce_helpers import seed_workforce_state
-
-    _, state = seed_workforce_state(tmp_path)
-    identity = ProjectedAgentRegistry(
-        state,
-        storage_base_path=str(tmp_path / "employee-store"),
-    ).as_execution_identity("tenant_1", "agt_1")
-
-    assert identity is not None
-    assert identity.security_profile == "employee_v1"
-
-
-def test_employee_process_env_excludes_manager_vault_and_peer_secrets() -> None:
+def test_employee_process_env_inherits_host_and_applies_backend_overrides() -> None:
     from src.autonomous.gateway.env_scope import build_employee_process_env
 
     env = build_employee_process_env(
@@ -2001,14 +1993,17 @@ def test_employee_process_env_excludes_manager_vault_and_peer_secrets() -> None:
     )
 
     assert env == {
+        "AUTONOMOUS_VAULT_MASTER_KEY": "vault-secret",
         "HOME": "/srv/ghostap/employees/agt_env",
         "LANG": "C.UTF-8",
+        "LARK_APP_SECRET": "manager-bot-secret",
         "OPENAI_API_KEY": "employee-provider-secret",
+        "OTHER_EMPLOYEE_TOKEN": "peer-secret",
         "PATH": "/usr/bin",
     }
 
 
-def test_runtime_only_employee_environment_never_inherits_provider_secrets() -> None:
+def test_runtime_only_employee_environment_inherits_full_host_environment() -> None:
     from unittest.mock import patch
 
     from src.autonomous.gateway.env_scope import (
@@ -2029,12 +2024,16 @@ def test_runtime_only_employee_environment_never_inherits_provider_secrets() -> 
     ):
         material = runtime_only_employee_environment(authority)
 
-    assert dict(material.runtime_env) == {"LANG": "C.UTF-8", "PATH": "/usr/bin"}
+    assert dict(material.runtime_env) == {
+        "LANG": "C.UTF-8",
+        "OPENAI_API_KEY": "shared",
+        "PATH": "/usr/bin",
+    }
     assert dict(material.credential_env) == {}
     assert material.authority == authority
 
 
-def test_local_employee_environment_delegates_only_traex_auth_source(
+def test_local_employee_environment_inherits_host_and_delegates_traex_auth_source(
     tmp_path,
 ) -> None:
     from unittest.mock import patch
@@ -2071,7 +2070,12 @@ def test_local_employee_environment_delegates_only_traex_auth_source(
     ):
         material = provider(authority, traex_auth_home=str(traex_home))
 
-    assert dict(material.runtime_env) == {"LANG": "C.UTF-8", "PATH": "/usr/bin"}
+    assert dict(material.runtime_env) == {
+        "LANG": "C.UTF-8",
+        "LARK_APP_SECRET": "manager-bot-secret",
+        "OPENAI_API_KEY": "manager-provider-key",
+        "PATH": "/usr/bin",
+    }
     assert dict(material.credential_env) == {}
     assert dict(material.provider_files) == {"traex_auth_json": str(auth_file)}
     assert material.authority == authority
@@ -2810,7 +2814,6 @@ def test_gateway_rejects_capability_binding_mismatch() -> None:
         model_name=binding.model,
         permissions=list(binding.permissions),
         capabilities=[],
-        security_profile="employee_v1",
     )
     with pytest.raises(DispatchPermitAuthorityError, match="mismatch"):
         EmployeeTeamGateway(runtime_supervisor=object()).issue_permit(

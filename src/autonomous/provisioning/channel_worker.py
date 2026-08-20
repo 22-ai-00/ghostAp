@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import ctypes
 import dataclasses
 import json
 import os
 import queue
-import resource
 import select
 import sys
 import threading
@@ -20,8 +18,7 @@ from typing import Any, Callable
 
 _LARK_DOMAIN = "https://open.feishu.cn"
 
-# ``python -I /absolute/worker.py`` intentionally excludes the repository from
-# sys.path. Add only the immutable repository root derived from this file.
+# Make direct file execution independent of the service's current directory.
 _REPOSITORY_ROOT = str(Path(__file__).resolve().parents[3])
 if _REPOSITORY_ROOT not in sys.path:
     sys.path.insert(0, _REPOSITORY_ROOT)
@@ -41,8 +38,8 @@ from src.autonomous.provisioning.channel_protocol import (  # noqa: E402
 )
 
 
-class WorkerSecurityError(RuntimeError):
-    """Mandatory process hardening could not be applied."""
+class EmployeeIdentityError(RuntimeError):
+    """The employee bot identity could not be established."""
 
 
 @dataclass(slots=True)
@@ -255,24 +252,17 @@ def run_low_level_employee_channel(
     bootstrap_fd: int,
     control_fd: int,
     event_fd: int,
-    *,
-    sandbox_proof_fd: int | None = None,
-    sandbox_proof_nonce: str = "",
 ) -> None:
     """Run the pinned synchronous SDK dispatcher with parent-durable ACKs."""
 
-    apply_process_hardening()
     from src.autonomous.ingress.sdk_capability import (
         collect_sdk_distribution_identity,
         prepare_controlled_sdk_import_cache,
     )
 
-    channel_tmp = Path(os.environ.get("GHOSTAP_CHANNEL_TMP", "/tmp"))
+    channel_tmp = Path(os.environ.get("TMPDIR", "/tmp"))
     prepare_controlled_sdk_import_cache(channel_tmp / f"ghostap-employee-channel-sdk-{os.getpid()}")
     collect_sdk_distribution_identity(require_controlled_import_cache=True)
-    if sandbox_proof_fd is not None:
-        emit_macos_sandbox_proof(sandbox_proof_fd, sandbox_proof_nonce)
-
     with os.fdopen(bootstrap_fd, "rb", buffering=0) as bootstrap_stream:
         bootstrap = decode_bootstrap(bootstrap_stream.readline(MAX_FRAME_BYTES + 1))
     tenant_key = bootstrap.tenant_key
@@ -515,7 +505,7 @@ def _fetch_employee_bot_open_id(
     try:
         response = client.request(request)
     except Exception as exc:
-        raise WorkerSecurityError(f"employee bot identity lookup failed ({type(exc).__name__})") from None
+        raise EmployeeIdentityError(f"employee bot identity lookup failed ({type(exc).__name__})") from None
     raw = response.raw if isinstance(response, BaseResponse) else None
     if (
         not isinstance(response, BaseResponse)
@@ -525,13 +515,13 @@ def _fetch_employee_bot_open_id(
         or not 200 <= raw.status_code < 300
         or not isinstance(raw.content, bytes)
     ):
-        raise WorkerSecurityError("employee bot identity lookup was rejected")
+        raise EmployeeIdentityError("employee bot identity lookup was rejected")
     try:
         payload = json.loads(raw.content)
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
-        raise WorkerSecurityError("employee bot identity response is invalid") from None
+        raise EmployeeIdentityError("employee bot identity response is invalid") from None
     if not isinstance(payload, dict):
-        raise WorkerSecurityError("employee bot identity response is invalid")
+        raise EmployeeIdentityError("employee bot identity response is invalid")
     bot = payload.get("bot")
     open_id = bot.get("open_id") if isinstance(bot, dict) else None
     observed_app_id = bot.get("app_id") if isinstance(bot, dict) else None
@@ -543,7 +533,7 @@ def _fetch_employee_bot_open_id(
         or len(open_id) > 256
         or (observed_app_id is not None and observed_app_id != expected_app_id)
     ):
-        raise WorkerSecurityError("employee bot identity response is invalid")
+        raise EmployeeIdentityError("employee bot identity response is invalid")
     return open_id
 
 
@@ -603,8 +593,7 @@ def _handle_low_level_outbound(
 ) -> None:
     """Execute one parent-authorized send with current Channel authority."""
 
-    # Keep every SDK/HTTP import below ``apply_process_hardening()`` in the
-    # fresh worker.  This handler is reachable only from the hardened runtime.
+    # Keep every SDK/HTTP import inside the fresh worker.
     from lark_oapi.core.exception import (
         AccessTokenException,
         ObtainAccessTokenException,
@@ -963,78 +952,6 @@ def _canonical_ingress_id(value: Any, prefix: str) -> str:
     return prefix + hashlib.sha256(value.encode()).hexdigest()
 
 
-def apply_process_hardening() -> None:
-    """Disable core dumps, dumpability, and privilege acquisition."""
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    libc = ctypes.CDLL(None, use_errno=True)
-    if sys.platform == "linux":
-        prctl = libc.prctl
-        prctl.argtypes = [
-            ctypes.c_int,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-            ctypes.c_ulong,
-        ]
-        prctl.restype = ctypes.c_int
-        if prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
-            raise WorkerSecurityError("dumpability hardening failed")
-        if prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
-            raise WorkerSecurityError("privilege hardening failed")
-        return
-    if sys.platform == "darwin":
-        ptrace = libc.ptrace
-        ptrace.argtypes = [
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_int,
-        ]
-        ptrace.restype = ctypes.c_int
-        result = ptrace(31, 0, None, 0)  # PT_DENY_ATTACH
-        if result != 0:
-            raise WorkerSecurityError("debug attachment hardening failed")
-        return
-    raise WorkerSecurityError("unsupported worker platform")
-
-
-def emit_macos_sandbox_proof(fd: int, nonce: str) -> None:
-    """Prove the deny-default Seatbelt profile before reading credentials."""
-    if sys.platform != "darwin" or len(nonce) != 32 or any(character not in "0123456789abcdef" for character in nonce):
-        raise WorkerSecurityError("invalid macOS sandbox proof request")
-    repository_root = Path(__file__).resolve().parents[3]
-    canary = repository_root / "AGENTS.md"
-
-    def readable(path: Path) -> bool:
-        try:
-            descriptor = os.open(path, os.O_RDONLY)
-        except OSError:
-            return False
-        os.close(descriptor)
-        return True
-
-    try:
-        descriptor = os.open(canary, os.O_RDONLY)
-    except OSError as exc:
-        canary_errno = int(exc.errno or 0)
-    else:
-        os.close(descriptor)
-        canary_errno = 0
-    proof = {
-        "schema_version": 1,
-        "nonce": nonce,
-        "pid": os.getpid(),
-        "source_readable": readable(Path(__file__).resolve()),
-        "runtime_readable": readable(Path(sys.executable).resolve()),
-        "repository_canary_errno": canary_errno,
-    }
-    raw = json.dumps(proof, separators=(",", ":")).encode()
-    try:
-        os.write(fd, raw)
-    finally:
-        os.close(fd)
-
-
 @dataclass(slots=True)
 class _EmitRequest:
     frame_type: FrameType
@@ -1239,26 +1156,14 @@ def _json_safe(value: Any) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) not in {3, 5}:
+    if len(args) != 3:
         return 64
     try:
         fds = [int(value) for value in args[:3]]
     except ValueError:
         return 64
-    proof_fd: int | None = None
-    proof_nonce = ""
-    if len(args) == 5:
-        try:
-            proof_fd = int(args[3])
-        except ValueError:
-            return 64
-        proof_nonce = args[4]
     try:
-        run_low_level_employee_channel(
-            *fds,
-            sandbox_proof_fd=proof_fd,
-            sandbox_proof_nonce=proof_nonce,
-        )
+        run_low_level_employee_channel(*fds)
     except Exception:
         return 1
     return 0

@@ -131,7 +131,7 @@ class CocoModelManager:
                 from src.utils.env import build_clean_env
                 env = build_clean_env()
 
-                client = GhostAPClient(on_event=lambda _ev: None, auto_approve=True)
+                client = GhostAPClient(on_event=lambda _ev: None)
                 async with spawn_agent_process(
                     client,
                     "coco",

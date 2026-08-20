@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -20,9 +20,7 @@ from ..acp.client import (
 )
 from ..acp.models import ACPEvent, ACPEventType, PromptResult
 from ..acp.prompt_generation import PromptGenerationTracker
-from ..config import get_settings
 from ..utils.errors import get_error_detail
-from .employee_cli_sandbox import EmployeeCLISandbox
 from .process_cleanup import terminate_and_reap_process_tree
 from .protocol import _PromptRetryMixin
 
@@ -53,7 +51,6 @@ class ClaudeCLIConfig:
 
     command: str = "claude"
     add_dir: bool = True
-    bypass_permissions: Optional[bool] = None  # None → use config.claude_cli_skip_permissions
 
 
 class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
@@ -83,11 +80,8 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
         self._active_prompt_generation: int | None = None
         self._user_cancel_generation: int | None = None
         self._force_dead = False
-        self._tool_filter = None
-        self._employee_sandbox = (
-            EmployeeCLISandbox(cwd=cwd, process_env=employee_process_env)
-            if employee_process_env is not None
-            else None
+        self._employee_process_env = (
+            dict(employee_process_env) if employee_process_env is not None else None
         )
 
         self.session_id: str = ""
@@ -127,40 +121,8 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
 
     @property
     def employee_process_env(self) -> dict[str, str] | None:
-        sandbox = self._employee_sandbox
-        return None if sandbox is None else sandbox.process_env
-
-    def set_tool_filter(self, tool_filter) -> None:
-        self._tool_filter = tool_filter
-
-    def get_tool_filter(self):
-        return self._tool_filter
-
-    def configure_employee_sandbox(
-        self,
-        *,
-        read_only_roots: Sequence[str],
-        writable_roots: Sequence[str],
-    ) -> None:
-        if self._employee_sandbox is None:
-            raise RuntimeError("employee CLI environment is unavailable")
-        self._employee_sandbox.configure(
-            command=self._cfg.command,
-            read_only_roots=read_only_roots,
-            writable_roots=writable_roots,
-        )
-
-    def _resolve_bypass_permissions(self) -> bool:
-        """Allow permission bypass only inside the managed employee sandbox."""
-        if self._cfg.bypass_permissions is not None:
-            requested = self._cfg.bypass_permissions
-        else:
-            requested = get_settings().claude_cli_skip_permissions
-        if requested and self._employee_sandbox is None:
-            raise RuntimeError(
-                "Claude 权限绕过仅允许在受控员工沙箱中使用"
-            )
-        return requested
+        env = self._employee_process_env
+        return None if env is None else dict(env)
 
     def send_prompt(
         self,
@@ -219,12 +181,8 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
 
         def _build_args(resumed: bool) -> list[str]:
             args: list[str] = [self._cfg.command, "-p"]
-            if self._employee_sandbox is not None:
-                args.append("--bare")
             if self._cfg.add_dir:
                 args += ["--add-dir", self._cwd]
-            if self._resolve_bypass_permissions():
-                args.append("--dangerously-skip-permissions")
             if self._model_name:
                 args += ["--model", strip_1m_suffix(self._model_name)]
 
@@ -246,13 +204,13 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
                 # Claude Code CLI refuses to launch inside another Claude Code session.
                 # Our process may run under Claude Code / other wrappers, so we must
                 # explicitly unset the guard env to avoid nested-session crash.
-                if self._employee_sandbox is not None:
-                    env = self._employee_sandbox.process_env
-                    args = self._employee_sandbox.wrap_argv(args)
-                else:
-                    from ..utils.env import build_clean_env
+                from ..utils.env import build_clean_env
 
-                    env = build_clean_env()
+                env = build_clean_env(
+                    dict(self._employee_process_env)
+                    if self._employee_process_env is not None
+                    else None
+                )
                 from ..utils.env import apply_anthropic_betas
 
                 apply_anthropic_betas(env, self._model_name)

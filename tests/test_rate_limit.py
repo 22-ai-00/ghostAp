@@ -688,33 +688,6 @@ class TestCreateEngineSession:
         assert isinstance(result, ModelFailureAwareSession)
         assert not isinstance(getattr(result, "_inner", None), RateLimitAwareSession)
 
-    @patch("src.acp.sync_adapter.start_session_with_retry")
-    @patch("src.agent_session.factory.get_settings")
-    @patch("src.agent_session.factory.SyncClaudeCLISession")
-    def test_claude_uses_acp_when_tool_filter_required(self, MockCLI, mock_settings, mock_start):
-        settings = MagicMock()
-        settings.rate_limit_retry_enabled = False
-        settings.acp_startup_timeout = 20
-        mock_settings.return_value = settings
-        acp_session = MagicMock()
-        mock_start.return_value = acp_session
-
-        from src.agent_session import create_engine_session
-
-        result = create_engine_session("claude", "/tmp", require_tool_filter=True)
-
-        assert isinstance(result, ModelFailureAwareSession)
-        assert getattr(result, "_inner", None) is acp_session
-        MockCLI.assert_not_called()
-        mock_start.assert_called_once_with(
-            agent_type="claude",
-            cwd="/tmp",
-            startup_timeout=20,
-            model_name=None,
-            auto_approve=None,  # No lane override: preserve the Settings fallback.
-        )
-
-
 def test_model_failure_failover_map_default_in_settings(monkeypatch):
     """配置回归：Settings 应提供默认 failover 映射 gpt-5.2:gpt-5.1。"""
     from src.config import Settings

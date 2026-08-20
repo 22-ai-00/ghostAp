@@ -10,16 +10,12 @@ from typing import Optional
 try:
     from config import (
         ConfigurationError,
-        SecuritySeverity,
-        evaluate_security_posture,
         get_settings,
     )
     from utils.errors import get_error_detail
 except ImportError:
     from .config import (
         ConfigurationError,
-        SecuritySeverity,
-        evaluate_security_posture,
         get_settings,
     )
     from .utils.errors import get_error_detail
@@ -142,23 +138,6 @@ def _print_validate_summary(settings):
     print(f"  CARD_SESSION_LOCK_MAX          = {settings.card.session_lock_max}")
     print()
 
-    posture = evaluate_security_posture(settings)
-    print("[安全姿态]")
-    print(f"  INGRESS_ACCESS_MODE = {posture.ingress_mode.value}")
-    print(f"  SHELL_ACCESS_MODE   = {posture.shell_mode.value}")
-    print(
-        "  EMPLOYEE_DEPARTMENT = "
-        f"{'enabled' if posture.employee_department_enabled else 'disabled'}"
-    )
-    if posture.findings:
-        for finding in posture.findings:
-            print(
-                f"  [{finding.severity.value}] {finding.code}: "
-                f"{finding.message}"
-            )
-    else:
-        print("  [info] no_security_findings")
-    return posture
 
 
 class Application:
@@ -202,7 +181,7 @@ class Application:
             logger.debug("_install_signal_handlers: SIGHUP ignore failed", exc_info=True)
 
     def handle_message(self, message_id: str, chat_id: str, command: str, working_dir: Optional[str] = None):
-        """Legacy callback — executes shell command directly via SandboxExecutor."""
+        """Legacy callback that executes a host shell command directly."""
         try:
             self.feishu_client._handler_ctx.handlers["system"].execute_shell_and_reply(
                 message_id,
@@ -242,7 +221,7 @@ class Application:
         )
 
         logger.info("=" * 50)
-        logger.info("GhostAP - 飞书机器人Shell沙箱服务")
+        logger.info("GhostAP - 飞书机器人远程开发服务")
         logger.info("=" * 50)
 
         if not self.settings.validate_feishu_config():
@@ -250,7 +229,7 @@ class Application:
             sys.exit(1)
 
         logger.info("APP_ID: %s...", self.settings.app_id[:8])
-        logger.info("命令超时: %d秒", self.settings.sandbox_timeout)
+        logger.info("命令超时: %d秒", self.settings.command_timeout)
         if self.settings.default_acp_tool:
             logger.info("默认 ACP 工具: %s", self.settings.default_acp_tool)
         else:
@@ -345,19 +324,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     f"{'=' * 40}\n"
                 )
                 sys.exit(1)
-            posture = _print_validate_summary(settings)
-            if not posture.is_valid:
-                blocking_codes = ", ".join(
-                    finding.code
-                    for finding in posture.findings
-                    if finding.severity is SecuritySeverity.BLOCKING
-                )
-                sys.stderr.write(
-                    f"{'=' * 40}\n[配置校验失败]\n"
-                    "安全姿态存在阻断项: "
-                    f"{blocking_codes}\n{'=' * 40}\n"
-                )
-                sys.exit(1)
+            _print_validate_summary(settings)
             print()
             print("配置校验通过")
             sys.exit(0)

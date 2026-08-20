@@ -26,10 +26,9 @@ grok agent --model <model> stdio
 
 本机已安装 `/home/jiataorui/.local/bin/grok`，版本为 `1.0.0 (3cd0d0cbce)`；`grok agent --help` 提供 `stdio` 子命令以及 `--model`、`--reasoning-effort` 等选项。
 
-## 安全与兼容决策
+## 权限与兼容决策
 
-- 不传 `--always-approve`。GhostAP 继续通过 ACP 权限回调执行 fail-closed 授权，避免绕过现有安全边界。
+- GhostAP 不叠加 ACP 工具过滤或命令风险判断；权限回调选择后端提供的允许项，实际执行权限由 Grok 自身定义。
 - 认证交由官方 CLI 管理；GhostAP 不读取、不复制、不硬编码凭据。
 - 模型列表由 ACP `config_options` 动态发现；未显式选择时使用 Grok 后端默认模型。
 - Grok 作为第七个一等编程后端接入普通编程模式，同时进入 Workflow 可用工具池。
-

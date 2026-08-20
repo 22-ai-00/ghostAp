@@ -28,14 +28,6 @@ class _ProbeSession:
         self.closed = False
         self.cancelled = False
         self.prompts: list[tuple[str, float]] = []
-        self.configure_args: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
-        self.tool_filter = lambda *args, **kwargs: False  # type: ignore[assignment]
-
-    def configure_employee_sandbox(self, *, read_only_roots, writable_roots) -> None:
-        self.configure_args.append((tuple(read_only_roots), tuple(writable_roots)))
-
-    def set_tool_filter(self, tool_filter) -> None:
-        self.tool_filter = tool_filter
 
     def send_prompt(self, prompt: str, *, timeout: float):
         self.prompts.append((prompt, timeout))
@@ -58,7 +50,6 @@ def _agent(workspace: Path, *, permissions=None, capabilities=None) -> AgentIden
         agent_id="agt_session",
         name="Atlas",
         workspace_path=str(workspace),
-        security_profile="employee_v1",
         permissions=list(permissions or ["file_read", "file_write", "shell", "git"]),
         capabilities=list(capabilities or ["file_read", "file_write", "shell", "git"]),
     )
@@ -100,8 +91,8 @@ def test_session_host_projects_explicit_environment(monkeypatch, tmp_path) -> No
     assert created["agent_type"] == "coco"
     assert created["cwd"] == str(workspace)
     assert created["thread_id"] == f"employee_actor_{_agent(workspace).agent_id}"
-    assert created["auto_approve"] is True
-    assert created["require_tool_filter"] is True
+    assert "auto_approve" not in created
+    assert "require_tool_filter" not in created
 
 
 def test_run_agent_session_dispatches_one_prompt_with_timeout(monkeypatch, tmp_path) -> None:
@@ -150,7 +141,7 @@ def test_run_agent_session_defaults_timeout_and_releases_on_success(monkeypatch,
     assert host._sessions == {}
 
 
-def test_open_employee_session_tool_filter_blocks_unscoped_paths_and_ungranted_tools(
+def test_open_employee_session_does_not_install_ghostap_execution_policy(
     monkeypatch, tmp_path
 ) -> None:
     module = _load_session_host_module()
@@ -158,11 +149,13 @@ def test_open_employee_session_tool_filter_blocks_unscoped_paths_and_ungranted_t
     workspace.mkdir(parents=True)
     probe = _ProbeSession(result="ok")
 
-    monkeypatch.setattr(
-        module,
-        "create_engine_session",
-        lambda **_kwargs: probe,
-    )
+    created: list[dict[str, object]] = []
+
+    def create(**kwargs):
+        created.append(kwargs)
+        return probe
+
+    monkeypatch.setattr(module, "create_engine_session", create)
 
     agent = _agent(
         workspace,
@@ -175,19 +168,12 @@ def test_open_employee_session_tool_filter_blocks_unscoped_paths_and_ungranted_t
         env={"HOME": str(tmp_path / "employee-home"), "PATH": "/usr/bin"},
     )
     try:
-        tool_filter = probe.tool_filter
-        assert tool_filter("file_read", {"path": "notes/README.md"})
-        assert not tool_filter("file_read", {"path": str(tmp_path / "outside")})
-        assert tool_filter("file_read", {})
-        assert not tool_filter("file_write", {"path": "notes/UPD.md"})
-        assert not tool_filter("shell", {"command": "pwd"})
-        assert not tool_filter("unknown", {})
-        assert tool_filter("git", {"path": str(tmp_path / "outside")})
+        assert "auto_approve" not in created[0]
+        assert "require_tool_filter" not in created[0]
     finally:
         lease.close()
 
     assert not lease.is_server_healthy()
-    assert probe.configure_args == [((str(workspace),), ())]
     assert host._sessions == {}
 
 

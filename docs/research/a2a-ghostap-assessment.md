@@ -1,5 +1,7 @@
 # A2A 协议与 GhostAP 多 Agent 架构评估
 
+> 历史说明（2026-08-20）：本文对 GhostAP tool filter、ActionMatrix 和进程沙箱的描述基于调研时实现；这些 GhostAP 叠加执行策略现已删除。
+
 > 调研日期：2026-08-14
 >
 > 调研范围：A2A 官方协议、官方 SDK/样例，以及 GhostAP 当前 ACP、Workflow、Employee/Team/Gateway 实现。

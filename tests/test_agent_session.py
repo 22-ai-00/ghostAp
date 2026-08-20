@@ -50,33 +50,20 @@ def test_engine_factory_supports_every_programming_backend(
     assert session._inner is base
     args, kwargs = start.call_args
     assert args == (agent_type, str(tmp_path), "selected-model")
-    assert kwargs["allow_cli"] is True
+    assert "allow_cli" not in kwargs
 
 
-def test_auxiliary_factory_rejects_claude_before_acp_resolution(tmp_path) -> None:
-    resolver = MagicMock(
-        side_effect=AssertionError("auxiliary Claude must fail before input resolution")
-    )
-    provider_resolution = MagicMock(
-        side_effect=AssertionError("auxiliary Claude must not resolve ACP providers")
-    )
-    auto_update = MagicMock(
-        side_effect=AssertionError("auxiliary Claude must not trigger auto-update")
-    )
+def test_auxiliary_factory_uses_claude_cli_directly(tmp_path) -> None:
+    base = MagicMock()
     with (
-        patch("src.agent_session.factory._resolve_inputs", resolver),
-        patch("src.acp.providers.get_providers", provider_resolution),
-        patch("src.acp.sync_adapter._resolve_with_auto_update", auto_update),
+        patch("src.agent_session.factory._start_base_session", return_value=base) as start,
+        patch("src.agent_session.factory.get_settings") as settings,
     ):
-        with pytest.raises(
-            RuntimeError,
-            match="Claude CLI backend does not support auxiliary ACP transport",
-        ):
-            create_auxiliary_session("claude", str(tmp_path))
+        settings.return_value.rate_limit_retry_enabled = False
+        result = create_auxiliary_session("claude", str(tmp_path))
 
-    resolver.assert_not_called()
-    provider_resolution.assert_not_called()
-    auto_update.assert_not_called()
+    assert result is base
+    start.assert_called_once()
 
 
 # ── SyncClaudeCLISession ─────────────────────────────────────────────
@@ -268,7 +255,7 @@ class TestClaudeCLIArgInjectionGuard:
 
         sess = SyncClaudeCLISession(
             cwd="/tmp",
-            config=ClaudeCLIConfig(bypass_permissions=False),
+            config=ClaudeCLIConfig(),
         )
         sess.session_id = "test-session"
 

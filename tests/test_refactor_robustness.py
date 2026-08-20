@@ -10,11 +10,13 @@ from src.feishu.slash_command_parser import SlashCommandParser
 class TestRefactorRobustness(unittest.TestCase):
     def test_shell_output_truncation(self):
         """Test that long shell output is truncated in the card."""
-        from src.sandbox.executor import ExecutionResult
+        from src.command_executor import CommandExecutionResult
 
         # Create a long output string (> SHELL_STDOUT_MAX=16000 chars)
         long_output = "a" * 20000
-        result = ExecutionResult(return_code=0, stdout=long_output, stderr="", success=True)
+        result = CommandExecutionResult(
+            return_code=0, stdout=long_output, stderr="", success=True
+        )
 
         msg_type, content_json = SystemBuilder.build_shell_result_card("echo long", result)
         content = json.loads(content_json)

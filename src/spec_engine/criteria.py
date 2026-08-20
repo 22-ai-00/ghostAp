@@ -65,12 +65,12 @@ def run_objective_verify(
     timeout: int = 300,
     chat_id: str = "",
 ) -> tuple[bool, str]:
-    """Execute verify_command via SandboxExecutor, return (passed, output)."""
+    """Execute verify_command directly, returning ``(passed, output)``."""
     if not verify_command:
         return True, ""
     try:
-        from ..sandbox.executor import SandboxExecutor
-        executor = SandboxExecutor()
+        from ..command_executor import CommandExecutor
+        executor = CommandExecutor()
         result = executor.execute(verify_command, cwd=cwd, interactive=False, chat_id=chat_id)
         output = result.stdout
         if result.stderr:

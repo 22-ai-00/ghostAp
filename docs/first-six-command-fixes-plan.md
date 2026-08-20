@@ -3,6 +3,10 @@
 > Implementation Tasks 1–7 completed on 2026-08-12. Final whole-repository
 > suites, independent review, durable notes, and focused rollback commits are
 > recorded in `.Memory/2026-08-12.md`.
+>
+> Historical note (2026-08-20): references below to ActionMatrix and Workflow
+> execution isolation describe the implementation at that time. GhostAP's
+> execution policy and process sandbox were subsequently removed.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 

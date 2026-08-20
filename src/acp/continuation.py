@@ -49,55 +49,6 @@ _USER_INPUT_MARKERS = (
     "would you like me to",
     "are you sure",
 )
-_USER_INPUT_DANGEROUS_MARKERS = (
-    "凭据",
-    "凭证",
-    "api key",
-    "apikey",
-    "credential",
-    "secret",
-    "密码",
-    "password",
-    "token",
-    "权限",
-    "permission",
-    "授权",
-    "authorization",
-    "authenticate",
-    "其他进程",
-    "并发修改",
-    "接管",
-    "部署",
-    "deploy",
-    "production",
-    "发布",
-    "发布到",
-    "publish",
-    "release to",
-    "删除",
-    "delete",
-    "清空",
-    "wipe",
-    "purge",
-    "销毁",
-    "destroy",
-    "格式化",
-    "format disk",
-    "移除",
-    "remove data",
-    "清理",
-    "付费",
-    "billing",
-    "charge",
-    "pay",
-    "购买",
-    "purchase",
-    "rm -",
-    "drop ",
-    "truncate",
-)
-
-
 class _PromptSession(Protocol):
     _force_dead: bool
 
@@ -130,15 +81,11 @@ def _build_continuation_prompt(pending_plan_entries: int) -> str:
         "[GhostAP 自动续做指令]\n"
         f"上一轮自然结束，但结构化计划仍有 {pending_plan_entries} 项未完成。"
         "请保持原任务范围，在同一会话中继续执行。\n"
-        "对于原任务范围内普通、安全、可逆的设计或实现选择，优先采用"
-        "文档明确推荐的选项；如果没有明确推荐，采用最小安全默认值，"
+        "对于原任务范围内的设计或实现选择，优先采用"
+        "文档明确推荐的选项；如果没有明确推荐，采用合理默认值，"
         "记录该选择及理由后继续，不要仅因这类选择停下来询问。\n"
-        "本指令不新增任何权限；保留原始用户请求已经明确授予的精确权限，"
-        "但不得扩大。对于凭据、部署或发布、删除数据、不可逆外部副作用，"
-        "只有原始用户请求已明确、精确授权时才能执行；不得新推断、扩大或"
-        "替代授权。ACP、sandbox 或工具权限仍然有效，任何情况下都不得绕过。\n"
-        "只推迟确实需要新权限或新外部授权的项目，并清楚记录原因；"
-        "继续完成所有其他已获授权且在原任务范围内的工作。"
+        "GhostAP 不增加二次授权或风险判断；遇到 provider 自身的权限交互时"
+        "直接使用 provider 提供的继续方式，并完成原任务。"
         "本轮结束时如实说明已完成、验证和仍需用户决定的事项。"
     )
 
@@ -176,33 +123,13 @@ def _notify_continuation_start(callback: Callable[[], None] | None) -> None:
         logger.warning("prompt continuation callback failed", exc_info=True)
 
 
-def _confirmation_context(result: PromptResult) -> str:
-    """Collect visible and structured evidence relevant to authorization."""
-    parts = [str(result.text or "")]
-    if result.plan is not None:
-        parts.extend(str(entry.content or "") for entry in result.plan.entries)
-    for tool_call in result.tool_calls:
-        parts.extend((str(tool_call.title or ""), str(tool_call.kind or "")))
-    parts.extend(str(item) for item in result.tool_results)
-    return "\n".join(parts).strip().casefold()
-
-
 def _requests_explicit_user_input(result: PromptResult) -> bool:
     text = str(result.text or "").strip().casefold()
     if not text:
         return False
     if any(marker in text for marker in _USER_INPUT_MARKERS):
         return True
-    return text.endswith(("?", "？")) and _has_dangerous_confirmation_requirement(
-        _confirmation_context(result)
-    )
-
-
-def _has_dangerous_confirmation_requirement(text: str) -> bool:
-    normalized = (text or "").strip().casefold()
-    if not normalized:
-        return False
-    return any(marker in normalized for marker in _USER_INPUT_DANGEROUS_MARKERS)
+    return text.endswith(("?", "？"))
 
 
 def _normalize_user_input_assessment(
@@ -226,21 +153,9 @@ def _normalize_user_input_assessment(
 def _build_confirmation_default_prompt() -> str:
     return (
         "[GhostAP 自动续做默认决策]\n"
-        "上一步出现了“请选择/请确认”等提示，但未出现明确新增权限、发布部署、"
-        "删除数据、不可逆外部副作用的高风险诉求。\n"
-        "本次按“文档推荐选项 + 最小可逆本地默认值”自动继续，不要再次询问。"
-        "这不构成新增授权：不得猜测凭据或权限，不得发布、部署、付费、删除数据，"
-        "也不得执行不可逆外部操作；若确实需要这些授权，请只说明精确阻塞项。"
-    )
-
-
-def _build_risk_denial_prompt() -> str:
-    return (
-        "[GhostAP 自动安全决策]\n"
-        "上一步请求了新增凭据/权限，或部署、发布、删除数据等高风险操作。"
-        "该操作未获原始请求的明确精确授权，本次自动拒绝并跳过，不要再次询问，"
-        "也不得寻找绕过方式。请继续完成原任务中其余已授权、安全、可逆的工作；"
-        "若被拒绝的操作是完成任务的必要条件，请保留已有结果并明确报告失败原因。"
+        "上一步出现了“请选择/请确认”等提示。请直接采用文档推荐项；没有推荐项时"
+        "使用最符合原任务目标的默认值继续，不要再次询问。GhostAP 不做二次风险"
+        "分类或权限拦截，provider 自身的权限机制仍由 provider 处理。"
     )
 
 
@@ -248,8 +163,7 @@ def _build_goal_recovery_prompt(status: str) -> str:
     return (
         "[GhostAP 自动恢复指令]\n"
         f"结构化 Goal 当前为 {status}，但任务不能等待用户交互。请在同一会话中"
-        "采用推荐的安全可逆默认值继续；需要新增权限、凭据或不可逆副作用的步骤"
-        "一律拒绝并跳过。不要再次暂停、阻塞或询问用户。若无法安全完成，请完整"
+        "采用推荐默认值继续。不要再次暂停、阻塞或询问用户。若仍无法完成，请完整"
         "保留已有结果并明确报告失败原因。"
     )
 
@@ -257,12 +171,9 @@ def _build_goal_recovery_prompt(status: str) -> str:
 def _build_interruption_recovery_prompt() -> str:
     return (
         "[GhostAP ACP 中断恢复指令]\n"
-        "上一轮被 provider 或权限拒绝中断；这不是用户取消。请在同一会话中"
-        "仅继续原任务范围内其余已授权、安全、可逆的工作。若某一步权限被拒绝，"
-        "跳过该步并清楚记录原因，不要重复请求或寻找绕过方式。\n"
-        "本指令不新增任何权限，不得扩大原始授权；所有 ACP、sandbox 和工具权限"
-        "继续有效且不得绕过。不得猜测凭据，不得新增发布、部署、删除数据或"
-        "不可逆外部副作用。完成安全部分后如实给出结果；若仍无法完成，明确"
+        "上一轮被 provider 或权限交互中断；这不是用户取消。请在同一会话中"
+        "继续原任务，按 provider 自身提供的方式完成权限交互，不要等待 GhostAP"
+        "进行额外批准。完成后如实给出结果；若仍无法完成，明确"
         "报告剩余阻塞，不要再次自行恢复。"
     )
 
@@ -473,13 +384,7 @@ def run_prompt_with_continuation(
                 remaining_budget = deadline - _monotonic()
                 if remaining_budget <= 0:
                     break
-                decision_prompt = (
-                    _build_risk_denial_prompt()
-                    if _has_dangerous_confirmation_requirement(
-                        _confirmation_context(result)
-                    )
-                    else _build_confirmation_default_prompt()
-                )
+                decision_prompt = _build_confirmation_default_prompt()
                 next_result, entered_finalization = run_turn(
                     decision_prompt,
                     remaining_budget,

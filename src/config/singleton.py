@@ -8,7 +8,6 @@ from pydantic import ValidationError
 
 from .card import CardSessionConfig
 from .errors import ConfigurationError
-from .security_posture import SecuritySeverity, evaluate_security_posture
 from .settings import Settings
 
 _settings: Optional[Settings] = None
@@ -43,18 +42,6 @@ def _post_validate_warnings(settings: Settings) -> None:
         )
     except (TypeError, AttributeError):
         pass
-
-    try:
-        posture = evaluate_security_posture(settings)
-        for finding in posture.findings:
-            log = (
-                logger.error
-                if finding.severity is SecuritySeverity.BLOCKING
-                else logger.warning
-            )
-            log("security_posture code=%s message=%s", finding.code, finding.message)
-    except (TypeError, ValueError, AttributeError):
-        logger.exception("failed to evaluate configured security posture")
 
 
 def _build_spec_review_recommended_hint() -> str:

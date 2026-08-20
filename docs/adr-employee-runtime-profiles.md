@@ -1,6 +1,12 @@
 # ADR: Employee runtime deployment profiles
 
-Status: Accepted (2026-07-16)
+Status: Superseded (2026-08-20)
+
+The execution-isolation parts of this ADR are no longer active. Employee
+processes now run directly on the host with the inherited environment; GhostAP
+does not install Bubblewrap, Seatbelt, attestation, or an execution policy.
+Journal durability, credential integrity, and Feishu identity checks remain
+data/transport contracts rather than an execution sandbox.
 
 ## Context
 
@@ -27,8 +33,7 @@ than zero (default `8`). It uses:
 
 - locally generated runtime keys and an encrypted credential Vault;
 - a local `FileAnchor`, Journal, and main-Bot send audit;
-- `bwrap` or Seatbelt when available, with the documented Linux
-  `process-fallback` degradation;
+- direct host execution with permissions delegated to the selected backend;
 - local automated tests plus operator-owned real-tenant acceptance.
 
 This profile does not claim resistance to a privileged host administrator
@@ -39,18 +44,15 @@ those properties must not infer them from a green local test suite.
 
 ### Hardened multi-replica profile
 
-This is an architecture and deployment acceptance profile, not the current
-default composition. Enabling it requires all of the following to be supplied,
-wired into production, and tested fail-closed:
+This section records an older architecture proposal and is not an available
+GhostAP profile. Its former requirements included:
 
 - an independently administered monotonic witness/ledger or KMS/HSM-backed
   anchor shared by every main-Bot replica;
 - a shared activation fence and main-Bot audit provider;
 - immutable build/image digest and workload identity bound to tenant, release,
   instance, expiry, and recovery authority;
-- strict employee sandbox attestation and Feishu-only DNS/TLS/WebSocket egress
-  enforcement, with an isolated container backend where namespaces are
-  unavailable;
+- external employee isolation and egress enforcement;
 - independent QA execution and signed retention of the real-tenant release
   manifest, including Provisioning, employee send/receive, desktop/mobile
   Slash, main-Bot send-count, restart/reconnect, and 1/10/50 Bot soak evidence;

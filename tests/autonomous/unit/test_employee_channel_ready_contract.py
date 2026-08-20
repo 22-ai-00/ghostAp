@@ -68,7 +68,6 @@ def _supervisor() -> EmployeeChannelSupervisor:
     return EmployeeChannelSupervisor(
         secret_resolver=lambda *_args: "unused",
         worker_path=__file__,
-        sandbox_prefix=(),
     )
 
 

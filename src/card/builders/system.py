@@ -18,8 +18,8 @@ from .core import CoreBuilder
 from .lock import build_lock_help_body
 
 if TYPE_CHECKING:
+    from src.command_executor import CommandExecutionResult
     from src.project.context import ProjectContext
-    from src.sandbox.executor import ExecutionResult
 
 # Sentinel injected into the lru_cache'd help card; replaced post-cache
 # with live lock state so dynamic info is never frozen.
@@ -318,7 +318,7 @@ class SystemBuilder:
     @staticmethod
     def build_shell_result_card(
         cmd: str,
-        result: "ExecutionResult",
+        result: "CommandExecutionResult",
         working_dir: Optional[str] = None,
         project: Optional[ProjectContext] = None,
     ) -> tuple[str, str]:

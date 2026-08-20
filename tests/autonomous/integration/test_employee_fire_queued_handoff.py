@@ -55,7 +55,6 @@ from src.autonomous.supervisor.employee_channels import (
 )
 from src.autonomous.workforce.registry import ProjectedAgentRegistry
 from tests.autonomous.integration.test_employee_channel_process import (
-    _accepted_attestation,
     _worker,
 )
 from tests.autonomous.integration.test_employee_fire_authority import (
@@ -415,7 +414,6 @@ def test_process_restart_recovers_delivery_only_channel_before_fire_stops_it(
         restarted_channels = EmployeeChannelSupervisor(
             secret_resolver=lambda *_: "employee-secret",
             worker_path=_worker(tmp_path),
-            sandbox_attestor=_accepted_attestation,
             ready_timeout=1.0,
             stop_timeout=1.0,
             ingress_service=subject.harness.ingress,

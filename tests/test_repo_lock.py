@@ -646,34 +646,30 @@ class TestIsP2PThreadLocalPropagation:
         finally:
             set_current_is_p2p(False)
 
-    def test_sandbox_executor_no_independent_lock(self):
-        """SandboxExecutor.execute() should NOT acquire repo lock independently.
-
-        After the refactor, SandboxExecutor only logs a warning sentinel if the
-        lock is held by a different chat — it no longer calls hold().
-        """
+    def test_command_executor_has_no_independent_lock(self):
+        """CommandExecutor.execute() does not acquire the routing repo lock."""
         from unittest.mock import MagicMock
 
-        from src.sandbox.executor import SandboxExecutor
+        from src.command_executor import CommandExecutor
 
         mock_lock_mgr = MagicMock()
         mock_lock_mgr.get_lock_info.return_value = None  # no lock held
 
-        with patch("src.sandbox.executor.get_repo_lock_manager", return_value=mock_lock_mgr, create=True):
-            with patch("src.repo_lock.get_repo_lock_manager", return_value=mock_lock_mgr):
-                mock_subprocess = MagicMock()
-                mock_process = MagicMock()
-                mock_process.returncode = 0
-                mock_process.stdout = ""
-                mock_process.stderr = ""
-                mock_subprocess.run.return_value = mock_process
+        with patch("src.repo_lock.get_repo_lock_manager", return_value=mock_lock_mgr):
+            mock_subprocess = MagicMock()
+            mock_process = MagicMock()
+            mock_process.returncode = 0
+            mock_process.stdout = ""
+            mock_process.stderr = ""
+            mock_subprocess.run.return_value = mock_process
 
-                executor = SandboxExecutor(subprocess_executor=mock_subprocess)
-                result = executor.execute("echo test", cwd=f"{_TMP}/test", chat_id="chat-1")
+            executor = CommandExecutor(subprocess_executor=mock_subprocess)
+            result = executor.execute(
+                "echo test", cwd=f"{_TMP}/test", chat_id="chat-1"
+            )
 
-                # hold() should NOT be called — no independent lock acquisition
-                mock_lock_mgr.hold.assert_not_called()
-                assert result.success is True
+            mock_lock_mgr.hold.assert_not_called()
+            assert result.success is True
 
 
 # ---------------------------------------------------------------------------

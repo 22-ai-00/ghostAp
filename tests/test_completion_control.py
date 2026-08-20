@@ -17,7 +17,7 @@ def test_run_objective_verify_preserves_executor_outcome():
         result = MagicMock(success=success, stdout=stream if success else "", stderr="" if success else stream)
         executor = MagicMock()
         executor.return_value.execute.return_value = result
-        with patch("src.sandbox.executor.SandboxExecutor", executor):
+        with patch("src.command_executor.CommandExecutor", executor):
             passed, output = run_objective_verify("pytest tests/ -q", "/project")
         assert passed is success
         assert expected in output

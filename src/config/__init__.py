@@ -4,16 +4,13 @@ All public names are re-exported here so existing ``from src.config import …``
 statements continue to work without modification.
 """
 
+from .access import (
+    AccessFinding,
+    AccessFindingSeverity,
+    IngressAccessMode,
+)
 from .card import CardSessionConfig
 from .errors import ConfigurationError
-from .security_posture import (
-    IngressAccessMode,
-    SecurityFinding,
-    SecurityPosture,
-    SecuritySeverity,
-    ShellAccessMode,
-    evaluate_security_posture,
-)
 from .settings import Settings
 from .singleton import (
     _post_validate_warnings,
@@ -24,12 +21,9 @@ __all__ = [
     "CardSessionConfig",
     "ConfigurationError",
     "IngressAccessMode",
-    "SecurityFinding",
-    "SecurityPosture",
-    "SecuritySeverity",
+    "AccessFinding",
+    "AccessFindingSeverity",
     "Settings",
-    "ShellAccessMode",
-    "evaluate_security_posture",
     "get_settings",
     "_post_validate_warnings",
 ]

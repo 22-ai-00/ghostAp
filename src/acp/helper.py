@@ -558,7 +558,7 @@ async def _probe_acp_models(
 
     from ..utils.env import build_clean_env
 
-    client = GhostAPClient(on_event=lambda _event: None, auto_approve=False)
+    client = GhostAPClient(on_event=lambda _event: None)
     async with spawn_agent_process(
         client,
         command,

@@ -32,8 +32,8 @@ from src.autonomous.provisioning.channel_protocol import (
     encode_frame,
 )
 from src.autonomous.provisioning.channel_worker import (
+    EmployeeIdentityError,
     IngressAckMailbox,
-    WorkerSecurityError,
     _build_low_level_event_dispatcher,
     _fetch_employee_bot_open_id,
     _handle_low_level_outbound,
@@ -121,7 +121,7 @@ def test_worker_fails_closed_on_untrusted_bot_identity(payload: object) -> None:
     response.raw.content = json.dumps(payload).encode()
     client = type("Client", (), {"request": lambda _self, _request: response})()
 
-    with pytest.raises(WorkerSecurityError, match="identity response is invalid"):
+    with pytest.raises(EmployeeIdentityError, match="identity response is invalid"):
         _fetch_employee_bot_open_id(client, expected_app_id="cli_employee")
 
 
@@ -834,13 +834,12 @@ def test_production_worker_main_reaches_only_the_low_level_durable_bridge() -> N
     assert "create_employee_channel" not in source
 
 
-def test_low_level_entry_hardens_before_credentials_or_sdk_import() -> None:
+def test_low_level_entry_has_no_ghostap_process_sandbox() -> None:
     source = inspect.getsource(run_low_level_employee_channel)
 
-    assert source.index("apply_process_hardening()") < source.index("decode_bootstrap")
-    assert source.index("emit_macos_sandbox_proof") < source.index("decode_bootstrap")
-    assert source.index("collect_sdk_distribution_identity") < source.index("emit_macos_sandbox_proof")
-    assert source.index("apply_process_hardening()") < source.index("from lark_channel")
+    assert "apply_process_hardening" not in source
+    assert "sandbox_proof" not in source
+    assert source.index("collect_sdk_distribution_identity") < source.index("decode_bootstrap")
 
 
 def test_delivery_only_worker_registers_no_ingress_callbacks() -> None:

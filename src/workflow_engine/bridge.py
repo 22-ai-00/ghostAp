@@ -330,7 +330,7 @@ class RuntimeBridge:
         if not node_bin:
             raise RuntimeError("Node.js not found in PATH")
 
-        cmd = [node_bin, "--experimental-vm-modules", runtime_path, self._script_path]
+        cmd = [node_bin, runtime_path, self._script_path]
         logger.info("Starting Node.js runtime: %s", " ".join(cmd))
 
         with self._process_lock:
@@ -339,19 +339,6 @@ class RuntimeBridge:
             if self._shutdown_requested():
                 raise RuntimeError("RuntimeBridge cancelled before start")
             try:
-                # Minimal environment for Node.js runtime — excludes secrets
-                # and API keys from the parent process.
-                safe_env = {
-                    "PATH": os.environ.get("PATH", ""),
-                    "HOME": os.environ.get("HOME", ""),
-                    "NODE_PATH": os.environ.get("NODE_PATH", ""),
-                    "LANG": os.environ.get("LANG", "en_US.UTF-8"),
-                    "TERM": os.environ.get("TERM", "xterm"),
-                }
-                # Allow explicit NODE_OPTIONS if set (for debugging/flags)
-                if os.environ.get("NODE_OPTIONS"):
-                    safe_env["NODE_OPTIONS"] = os.environ["NODE_OPTIONS"]
-
                 self._process = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
@@ -360,7 +347,7 @@ class RuntimeBridge:
                     cwd=self._cwd,
                     text=True,
                     bufsize=1,  # Line-buffered
-                    env=safe_env,
+                    env=os.environ.copy(),
                 )
             except OSError as exc:
                 raise RuntimeError(

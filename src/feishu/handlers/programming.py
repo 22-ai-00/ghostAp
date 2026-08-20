@@ -1570,13 +1570,9 @@ class ProgrammingModeHandler(BaseHandler):
     ) -> None:
         """Run one automatic ACP task, independent of its output transport."""
         from ...acp.models import ACPEventType
-        from ...acp.personal_trust import (
-            TrustedPersonalPermissionLease,
-            trusted_personal_permissions_requested,
-        )
         from ...repo_lock import get_repo_lock_heartbeat_interval
         from ...tasking import get_current_task_run_id
-        from ...thread import get_current_sender_id, get_current_thread_id
+        from ...thread import get_current_thread_id
         from ...utils.heartbeat import RepoLockHeartbeat
 
         timeout = self.settings.coco_execution_timeout if self.is_coco else self.settings.claude_execution_timeout
@@ -1605,20 +1601,6 @@ class ProgrammingModeHandler(BaseHandler):
         image_failures = [0]
         child_lifecycle_proof = AuthoritativeChildLifecycleProof()
         active_run = self._get_active_programming_run(chat_id, project)
-        trusted_personal_requested = trusted_personal_permissions_requested(
-            self.settings,
-            project=project,
-            sender_id=get_current_sender_id() or "",
-        )
-        permission_lease = TrustedPersonalPermissionLease(
-            enabled=trusted_personal_requested
-        )
-        if trusted_personal_requested:
-            logger.warning(
-                "%s ACP个人可信权限租约已授权当前项目任务",
-                self.mode_name,
-            )
-
         def on_event(event) -> None:
             update_count[0] += 1
             child_lifecycle_proof.observe_event(event)
@@ -1676,7 +1658,6 @@ class ProgrammingModeHandler(BaseHandler):
                 startup_budget_s=startup_budget_s,
             )
             active_session[0] = replacement
-            permission_lease.acquire(replacement)
             return replacement
 
         def _retire_session(
@@ -1704,7 +1685,6 @@ class ProgrammingModeHandler(BaseHandler):
             window_prompt: str,
         ):
             active_session[0] = window_session
-            permission_lease.acquire(window_session)
             return run_prompt_with_continuation(
                 window_session,
                 window_prompt,
@@ -1747,7 +1727,6 @@ class ProgrammingModeHandler(BaseHandler):
                 thread_id=thread_id,
             )
             active_session[0] = resumed
-            permission_lease.acquire(resumed)
             if thread_id and project:
                 self._register_thread_context(
                     thread_id,
@@ -1923,24 +1902,6 @@ class ProgrammingModeHandler(BaseHandler):
             heartbeat_stop.set()
             if heartbeat is not None:
                 heartbeat.join(timeout=2)
-            lease_failures = permission_lease.release_all()
-            if lease_failures:
-                logger.error(
-                    "%s ACP个人可信权限租约撤销失败，会话将立即退休: count=%d",
-                    self.mode_name,
-                    len(lease_failures),
-                )
-                for failed_session in lease_failures:
-                    try:
-                        _retire_session(
-                            failed_session,
-                            retirement_budget_s=5.0,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "%s ACP个人可信权限异常会话退休失败",
-                            self.mode_name,
-                        )
             if prog_session is not None:
                 terminal_delivered = (
                     prog_session.wait_delivery_idle(delivery_timeout)

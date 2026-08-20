@@ -16,7 +16,7 @@ Agent。
 | 直接编程 | Coco、Claude、Aiden、Codex、Gemini、Traex、Grok、DSH 后端保持多轮直连 |
 | Agent Department | 持久员工拥有独立飞书 Bot、Channel、历史、记忆和停止语义 |
 | 飞书交互 | 卡片持续展示任务状态、工具调用、模型选择和错误诊断 |
-| Host Shell | 特权宿主机执行，只能关闭或显式授权；超时、截断和命令过滤不构成操作系统沙箱 |
+| Host Shell | 直接宿主机执行；GhostAP 不增加命令过滤或操作系统沙箱 |
 | 本地持久化 | Journal、Vault、Blob 和项目状态面向单机文件存储，不承诺多副本线性一致性或对特权宿主机的回滚抵抗 |
 
 ## 运行模型
@@ -27,7 +27,7 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 | --- | --- |
 | 产品身份 | 主 Bot 是控制面；Employee Bot 是独立执行身份 |
 | provider/transport | ACP 直接模式、Shell CLI 桥接 |
-| Host Shell | 独立的特权宿主执行能力，不是 Agent provider，也不是操作系统沙箱 |
+| Host Shell | 独立的直接宿主执行能力，不是 Agent provider |
 
 普通工具入口会设置聊天 + 项目的持续模式，直到 `/exit`。Deep、Spec 和 Workflow 是作用在话题/根线程上的任务引擎，不会替换普通编程模式。普通编程、Deep 和 Spec 收到任务后会自动推进到成功或明确失败；Workflow 仅保留一次由发起者完成的 Agent Pool 选择确认，确认后自动生成、验证和执行脚本，不再要求脚本确认、继续批准或手动恢复。Smart 是默认模式；当 `DEFAULT_ACP_TOOL` 留空时，未匹配的自由文本会按 Shell 命令处理。
 
@@ -41,9 +41,6 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 - 如需使用客户端 Slash Command 面板，飞书 PC 端需 7.70+，移动端需 7.71+
 - 如需使用 `/wf`，需要 Node.js 20+
 - 需要使用的 AI 工具或 ACP Provider 已在本机安装并完成各自认证
-- 可见员工 Channel 在 Linux 使用 `bubblewrap`，在 macOS 使用系统 Seatbelt；
-  `restart.sh` 会自动同步 Python 依赖、安装受支持 Linux 发行版的
-  `bubblewrap`，或探测 macOS 自带的 `/usr/bin/sandbox-exec`
 
 ### 安装依赖
 
@@ -51,10 +48,9 @@ GhostAP 把产品身份、执行策略和 provider/transport 拆开：
 uv sync --group dev
 ```
 
-也可以直接执行 `./restart.sh start`。该入口默认先运行 `uv sync --group dev`
-并准备当前平台的员工隔离依赖；`uv` 本身仍是启动前唯一需要预装的 Python
-包管理工具。可分别用 `GHOSTAP_SYNC_PYTHON_DEPENDENCIES=0` 和
-`GHOSTAP_PREPARE_EMPLOYEE_SANDBOX=0` 跳过这两步。
+也可以直接执行 `./restart.sh start`。该入口默认先运行 `uv sync --group dev`；
+`uv` 本身仍是启动前唯一需要预装的 Python 包管理工具。可用
+`GHOSTAP_SYNC_PYTHON_DEPENDENCIES=0` 跳过依赖同步。
 
 ### 配置飞书应用
 
@@ -95,21 +91,14 @@ DEFAULT_ACP_TOOL=coco
 ADMIN_USER_IDS=
 INGRESS_ACCESS_MODE=enforced
 ADMIN_BOOTSTRAP_SCOPE=p2p_only
-SHELL_ACCESS_MODE=disabled
-EMPLOYEE_DEPARTMENT_ENABLED=false
 EMPLOYEE_GROUP_CONTEXT_RETENTION_DAYS=30
 ```
 
 常用配置：
 
 ```env
-SANDBOX_TIMEOUT=30
-SANDBOX_MAX_OUTPUT_LENGTH=4000
-SANDBOX_COMMAND_BLACKLIST=
-
-ACP_PERMISSION_AUTO_APPROVE=true
-ACP_TRUSTED_PERSONAL_MODE=false
-ACP_TRUSTED_PERSONAL_ACK=false
+COMMAND_TIMEOUT=30
+COMMAND_MAX_OUTPUT_LENGTH=4000
 ACP_MODEL_PROBE_TIMEOUT=15
 
 WORKFLOW_TOTAL_TIMEOUT_S=3600
@@ -118,16 +107,9 @@ WORKFLOW_SCRIPT_GEN_TIMEOUT_S=180
 
 ```
 
-这些字段构成显式安全姿态：空授权列表不代表公开访问；Host Shell 默认关闭；
-Employee Department 必须单独启用，并为群上下文设置有界保留期。`shadow`、
-`legacy_allow_all` 和 `trusted_local` 只用于显式诊断或紧急回退，校验输出会用稳定
-finding code 标出未强制执行或未确认的风险。
-
-单人部署若需要让管理员在当前项目的普通 ACP 编程任务中执行远程 `git push`
-等主机/网络操作，可同时启用 `ACP_TRUSTED_PERSONAL_MODE=true` 与
-`ACP_TRUSTED_PERSONAL_ACK=true`。该权限按任务租约启用：Codex 会临时切换到
-`agent-full-access`，任务结束后恢复普通 `agent` 模式；Workflow、Employee 和
-非管理员任务不会继承此权限。撤销失败的会话会被强制退休，避免权限残留。
+`INGRESS_ACCESS_MODE` 和管理员列表只控制谁可以通过飞书入口操作服务；Shell、
+ACP、Workflow 和 Employee 执行不再叠加 GhostAP 自己的风险策略、工具过滤或
+进程沙箱。Codex、Claude 等后端按各自权限模型处理执行请求。
 
 更多参数见 `.env.example` 和 `src/config/settings.py`。各 AI 后端所需的密钥、登录态或 CLI 配置应按对应工具自己的方式准备，GhostAP 只读取必要的环境变量和本地命令。
 
@@ -138,8 +120,7 @@ uv run python -m src.main --validate
 uv run python -m src.main
 ```
 
-`--validate` 会输出 `[安全姿态]`；存在 blocking finding 时返回非零，必须先修正
-配置或准备隔离后端。
+`--validate` 检查必需配置和运行依赖，发现阻断项时返回非零。
 
 首次启动后，可在飞书私聊机器人发送 `/setadmin` 设置管理员。`ADMIN_USER_IDS` 为空时允许首次设置；设置后只有管理员可以替换管理员配置。
 
@@ -183,8 +164,8 @@ PID 与启动指纹均匹配后才发布 ready generation；仅存活但未就�
 | `/exit` | 退出当前模式，回到 Smart |
 
 Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文本会进入宿主机
-执行路径。它是特权能力而非操作系统沙箱，按产品合同必须关闭或由授权用户显式
-启用；黑白名单、超时和输出截断只是附加防护。
+执行路径。命令会直接交给宿主 shell；GhostAP 仅保留超时、输出截断和日志脱敏，
+不再做黑白名单、风险分级或操作系统隔离。
 
 ### 项目
 
@@ -252,9 +233,9 @@ Host Shell 不需要单独入口；在 Smart 模式中，匹配为 Shell 的文�
 
 普通编程、Deep 和 Spec 使用已保存配置，缺失时采用可用的推荐工具和默认模型，经过有界自动恢复后到达成功或明确失败终态。Workflow 发起后先显示仅发起者可修改的 Agent Pool：池中包含 1–8 个 `tool+model` Agent，并使用稳定的 `A1`、`A2` 等标识。用户点击 `使用此池开始编排` 完成单次确认后，池和主编排器冻结，脚本生成、验证与执行自动推进，不再出现脚本确认或继续批准门。
 
-普通、安全、可逆的选择自动采用推荐项；高风险且未经原始请求精确授权的操作拒绝或跳过，并继续可安全完成的部分。ACP 权限保持 fail-closed，不通过跳过权限检查换取自动化。
+普通选择自动采用推荐项。GhostAP 不再对命令或 ACP 工具做二次风险判定；执行权限由 Codex、Claude 等后端自身负责。
 
-Workflow 动态生成任务专用 JS，并按复杂度组合 `agent()`、`sequence()`、`fanout()`、`verify()`、`generate()`、`tournament()`、`loop()` 和 `race()`。脚本中的直接和动态调用只能引用已确认池内的 Agent，不能覆盖冻结的工具和模型绑定。运行时负责确定性控制流、总 Agent 数和危险能力限制，Agent 负责语义工作；简单任务保持少量调用。进度卡片展示任务、完整池、静态计划、动态候选和直接子 Agent 的实际调度状态，每个 Agent 只保留一条最新操作，完整结果通过分页或附件交付。
+Workflow 动态生成任务专用 JS，并按复杂度组合 `agent()`、`sequence()`、`fanout()`、`verify()`、`generate()`、`tournament()`、`loop()` 和 `race()`。脚本中的直接和动态调用只能引用已确认池内的 Agent，不能覆盖冻结的工具和模型绑定。脚本运行在普通 Node.js 宿主上下文，可使用 Node 模块、进程环境和网络；运行时只负责确定性控制流与调用预算。进度卡片展示任务、完整池、静态计划、动态候选和直接子 Agent 的实际调度状态，每个 Agent 只保留一条最新操作，完整结果通过分页或附件交付。
 
 ## 架构入口
 
@@ -299,21 +280,15 @@ uv run python -m pytest tests/autonomous/ -q
 uv run ruff check src/autonomous/         # 0 错误
 ```
 
-## 安全与运维
+## 访问与运维
 
-- Host Shell 是特权宿主机执行，不是操作系统沙箱；仅限受信工程主机，并且必须
-  保持关闭或由授权用户显式开启。命令过滤、超时和输出截断不提升隔离等级。
+- Host Shell、ACP、Workflow 和 Employee 都直接使用宿主机能力；GhostAP 不提供
+  命令风险策略、工具过滤、Bubblewrap、Seatbelt 或 Node VM 隔离。
 - 飞书消息有过期检查和去重缓存，避免重复执行。
-- ACP 工具调用通过权限钩子处理，可配置自动批准或默认拒绝。
+- ACP 权限请求采用后端提供的授权选项，由后端权限模型负责。
 - 仓库操作受 repo 锁保护，群聊访问可由管理员锁定。
 - 卡片按钮带签名校验，错误详情会脱敏和截断。
-- Workflow 脚本会做结构化验证，禁止危险模块和明显逃逸。
-- 可见员工 Channel 在 Linux 通过 Bubblewrap user/mount/PID namespace 验真；
-  macOS 通过 deny-default Seatbelt 与凭证下发前拒绝探针验真。macOS 缺少
-  系统 Seatbelt 时员工 Channel 默认拒绝启动，不会伪报隔离成功。
-- macOS 的 `sandbox-exec` 是系统兼容接口且已被 Apple 标记为 deprecated；
-  当前实现需要在目标 macOS 版本上完成 profile、DNS/TLS/WSS 真机验收。需要
-  Apple 长期支持的产品边界时，应迁移到签名 helper + App Sandbox entitlement。
+- Workflow 只验证模块结构、Agent Pool 绑定和调用预算，不限制 Node 模块。
 - 日志优先查看 `logs.log`；重启或启动问题同时检查 `[RESTART]` 标记和 `uv run python -m src.main --validate` 输出。
 
 ## 开发

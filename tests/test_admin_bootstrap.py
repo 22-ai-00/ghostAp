@@ -11,7 +11,7 @@ from src.access_control import (
     IngressAccessRequest,
 )
 from src.admin_bootstrap import AdminBootstrapService
-from src.config import IngressAccessMode, SecuritySeverity
+from src.config import AccessFindingSeverity, IngressAccessMode
 from src.config.env_file_store import EnvPreReplaceError
 from src.feishu.handlers.system import SystemHandler
 from src.feishu.slash_command_parser import SlashCommandParser
@@ -238,7 +238,7 @@ def test_policy_swap_failure_keeps_old_live_snapshot_after_disk_commit(
     assert len(provider.blocking_findings) == 1
     finding = provider.blocking_findings[0]
     assert finding.code == "ingress_policy_refresh_failed"
-    assert finding.severity is SecuritySeverity.BLOCKING
+    assert finding.severity is AccessFindingSeverity.BLOCKING
 
 
 def test_setadmin_non_admin_cannot_replace_existing_admin(tmp_path):

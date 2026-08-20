@@ -28,17 +28,7 @@ from src.autonomous.supervisor.channel_models import (
 from src.autonomous.supervisor.employee_channels import (
     ChannelProcessState,
     EmployeeChannelSupervisor,
-    SandboxAttestation,
 )
-
-
-def _accepted_attestation(pid: int) -> SandboxAttestation:
-    return SandboxAttestation(
-        pid=pid,
-        verified=True,
-        mechanism="test-fixture",
-        details=("fixture process contains no production credential source",),
-    )
 
 
 def _worker(tmp_path: Path, *, behavior: str = "normal") -> Path:
@@ -352,7 +342,6 @@ def _supervisor(tmp_path: Path, *, behavior: str = "normal", timeout: float = 2.
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=resolve,
         worker_path=_worker(tmp_path, behavior=behavior),
-        sandbox_attestor=_accepted_attestation,
         ready_timeout=timeout,
         stop_timeout=1.0,
     )
@@ -491,7 +480,6 @@ def test_delivery_only_channel_reuses_frozen_authority_and_rejects_ingress(
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=lambda *_: "employee-secret",
         worker_path=_ingress_worker(tmp_path),
-        sandbox_attestor=_accepted_attestation,
         ready_timeout=1.0,
         stop_timeout=1.0,
         ingress_service=service,
@@ -879,7 +867,6 @@ def test_parent_supervisor_anchors_runtime_bound_ingress_before_ack(
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=lambda *_: "employee-secret",
         worker_path=_ingress_worker(tmp_path),
-        sandbox_attestor=_accepted_attestation,
         ready_timeout=1.0,
         stop_timeout=1.0,
         ingress_service=service,
@@ -927,7 +914,6 @@ def test_ingress_request_alias_survives_a_new_worker_generation(
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=lambda *_: "employee-secret",
         worker_path=_ingress_worker(tmp_path),
-        sandbox_attestor=_accepted_attestation,
         ready_timeout=1.0,
         stop_timeout=1.0,
         ingress_service=service,
@@ -985,7 +971,6 @@ def test_partial_ingress_ipc_frame_crashes_without_acceptance_or_ack(
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=lambda *_: "employee-secret",
         worker_path=_partial_ingress_worker(tmp_path),
-        sandbox_attestor=_accepted_attestation,
         ready_timeout=1.0,
         stop_timeout=1.0,
         ingress_service=service,
@@ -1020,7 +1005,6 @@ def test_parent_control_ack_stop_send_share_one_noninterleaving_writer(
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=lambda *_: "employee-secret",
         worker_path=_ingress_worker(tmp_path),
-        sandbox_attestor=_accepted_attestation,
         ready_timeout=1.0,
         stop_timeout=1.0,
         ingress_service=service,

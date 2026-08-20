@@ -31,8 +31,6 @@ class EmployeeSessionBootstrap:
     codex_home: str
     instruction_text: str
     instruction_digest: str
-    read_only_roots: tuple[str, ...]
-    writable_roots: tuple[str, ...]
 
     @classmethod
     def from_agent(
@@ -61,7 +59,6 @@ class EmployeeSessionBootstrap:
         instruction_digest = hashlib.sha256(instruction_bytes).hexdigest()
         employee_root = Path(workspace).parent
         codex_home = os.path.realpath(employee_root / "runtime" / "codex-home")
-        writable = (project,) if "file_write" in set(agent.permissions) else ()
         return cls(
             session_key=EmployeeSessionKey(
                 tenant_key=tenant_key,
@@ -79,8 +76,6 @@ class EmployeeSessionBootstrap:
             codex_home=codex_home,
             instruction_text=instruction,
             instruction_digest=instruction_digest,
-            read_only_roots=(workspace,),
-            writable_roots=writable,
         )
 
     def wrap_prompt(self, prompt: str) -> str:

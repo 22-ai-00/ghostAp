@@ -1,4 +1,4 @@
-"""Generate and validate sandboxed Dynamic Workflow scripts."""
+"""Generate and validate Dynamic Workflow scripts."""
 
 from __future__ import annotations
 
@@ -31,40 +31,6 @@ def get_subagent_encouragement() -> str:
     return SUBAGENT_ENCOURAGEMENT if _subagent_hint_enabled() else ""
 
 
-# Source validation is the primary boundary; the Node sandbox is defense in depth.
-_DANGEROUS_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"""require\s*\(\s*['"]fs['"]\s*\)""", "filesystem access via require('fs')"),
-    (r"""require\s*\(\s*['"]child_process['"]\s*\)""", "shell access via require('child_process')"),
-    (r"""require\s*\(\s*['"]net['"]\s*\)""", "network access via require('net')"),
-    (r"""require\s*\(\s*['"]dgram['"]\s*\)""", "UDP access via require('dgram')"),
-    (r"""require\s*\(\s*['"]http['"]\s*\)""", "HTTP access via require('http')"),
-    (r"""require\s*\(\s*['"]https['"]\s*\)""", "HTTPS access via require('https')"),
-    (r"""process\.exit""", "process.exit() call"),
-    (r"""process\.env""", "process.env access"),
-    (r"""process\s*\[""", "process[...] bracket access (process.env alias)"),
-    (r"""import\s+.*from\s+['"]fs['"]""", "filesystem access via import 'fs'"),
-    (r"""import\s+.*from\s+['"]child_process['"]""", "shell access via import 'child_process'"),
-    (r"""import\s+.*from\s+['"]node:fs['"]""", "filesystem access via import 'node:fs'"),
-    (r"""import\s+.*from\s+['"]node:child_process['"]""", "shell access via import 'node:child_process'"),
-    (r"""import\s+.*from\s+['"]node:net['"]""", "network access via import 'node:net'"),
-    (r"""import\s+.*from\s+['"]node:dgram['"]""", "UDP access via import 'node:dgram'"),
-    (r"""import\s+.*from\s+['"]node:http['"]""", "HTTP access via import 'node:http'"),
-    (r"""import\s+.*from\s+['"]node:https['"]""", "HTTPS access via import 'node:https'"),
-    (r"""eval\s*\(""", "eval() usage"),
-    (r"""Function\s*\(""", "dynamic Function constructor"),
-    (
-        r"""\.constructor\s*\.\s*constructor\s*\(""",
-        "constructor.constructor escape (reaching the host Function constructor)",
-    ),
-    (r"""new\s+Worker\s*\(""", "Worker thread creation"),
-    (r"""globalThis\[""", "globalThis bracket access"),
-    (r"""Deno\.""", "Deno runtime API"),
-    (r"""Bun\.""", "Bun runtime API"),
-    (r"""\bimport\s*\(""", "dynamic import() expression"),
-    (r"""\bimport\.meta\b""", "import.meta access"),
-)
-
-
 _CAPABILITY_NOTES = {
     "coco": "Coco 擅长全栈编程、subagent 调度和复杂并行编排。",
     "claude": "Claude 擅长深度推理；强调逻辑严谨性和边界条件。",
@@ -94,7 +60,7 @@ _SCRIPT_GEN_PROMPT_TEMPLATE = """# Workflow Script Generation Task
 
 **Roles (specialized perspectives for agents):**
 根据任务需求自行规划角色分工。每个 agent() 调用可通过 `role` 参数指定适合的角色，例如 architect、reviewer、tester 等。
-角色不是固定列表。建议考虑：架构设计、代码实现、安全审计、正确性验证、测试覆盖等维度。
+角色不是固定列表。建议考虑：架构设计、代码实现、正确性验证、测试覆盖等维度。
 
 <<RUNTIME_BINDING>>
 
@@ -185,11 +151,9 @@ export default async function main() {
 
 每个摘要字段必须是完整语义条目；详细证据全部保留在 `result`，不得截断或返回 legacy 裸数组。
 
-## Safety and Completion Rules
+## Completion Rules
 
-- 禁止 `require`、`import`、filesystem、network、child process、`process`、`eval`、`Function`、Worker 或 sandbox escape。
-- 所有逻辑在单文件内；原语是全局变量，无需导入。
-- 普通、安全、可逆选择采用推荐项；高风险且未获原始请求精确授权的动作拒绝或跳过，并继续安全部分。
+- 原语是全局变量，无需导入；脚本可直接使用 Node.js 能力。
 - 用户主动 stop/cancel 才终止；其他提问、格式修复、Review 不确定和暂时失败均有界自动恢复。
 - 不得声称未实际执行的独立 Reviewer、测试或验证已完成。
 
@@ -346,7 +310,7 @@ def validate_generated_script(
     review_agents: Optional[list[dict]] = None,
     agent_pool: tuple[WorkflowAgentBinding, ...] | list[WorkflowAgentBinding] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Fail closed on malformed, inert, unbounded, or unsafe workflow source."""
+    """Reject malformed, inert, or unbounded workflow source."""
     del review_agents  # Review evidence is enforced by the engine, never inferred here.
     if not script_content or not script_content.strip():
         return False, ["Script content is empty"]
@@ -458,10 +422,6 @@ def validate_generated_script(
         balance = executable.count(opening) - executable.count(closing)
         if balance:
             errors.append(f"Unbalanced {name}: {balance:+d}")
-
-    for pattern, description in _DANGEROUS_PATTERNS:
-        if re.search(pattern, script_content):
-            errors.append(f"[capability] Forbidden pattern: {description}")
 
     if errors:
         logger.warning("Script validation failed with %d error(s): %s", len(errors), "; ".join(errors))

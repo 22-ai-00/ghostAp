@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import threading
 import time
 from collections.abc import Mapping
@@ -392,28 +391,13 @@ class ACPSession:
         agent_args: list[str],
         cwd: str,
         env: Optional[dict[str, str]] = None,
-        auto_approve: bool | None = None,
         capture_full_tool_content: bool = False,
     ):
         self._agent_cmd = agent_cmd
         self._agent_args = agent_args
         self._cwd = cwd
         self._env_override = dict(env) if isinstance(env, dict) else None
-        self._auto_approve = auto_approve
         self._capture_full_tool_content = bool(capture_full_tool_content)
-        initial_mode_source = (
-            self._env_override
-            if self._env_override is not None
-            else os.environ
-        )
-        configured_initial_mode = str(
-            initial_mode_source.get("INITIAL_AGENT_MODE") or "agent"
-        ).strip()
-        self._trusted_personal_restore_mode = (
-            configured_initial_mode
-            if configured_initial_mode in {"read-only", "agent"}
-            else "agent"
-        )
         self._conn = None  # ClientSideConnection
         self._proc = None  # subprocess
         self._ctx_manager = None  # async context manager
@@ -424,7 +408,6 @@ class ACPSession:
             cwd=cwd,
         )
         self._client: Optional[GhostAPClient] = None
-        self._tool_filter: Optional[Callable[[str, dict | None], bool]] = None
         self._event_handler: Optional[Callable[[ACPEvent], None]] = None
         self._event_generation = 0
         self._deferred_child_events: list[ACPEvent] = []
@@ -659,21 +642,13 @@ class ACPSession:
             self._transport_epoch += 1
             self._load_epoch += 1
         settings = get_settings()
-        auto_approve = (
-            settings.acp_permission_auto_approve
-            if self._auto_approve is None
-            else self._auto_approve
-        )
         client = GhostAPClient(
             on_event=self._dispatch_event,
-            auto_approve=auto_approve,
             root_dir=self._cwd,
             capture_full_tool_content=self._capture_full_tool_content,
         )
         self._client = client
         self._bind_session_info_callback()
-        if self._tool_filter is not None:
-            client.set_tool_filter(self._tool_filter)
         # Raise the stdio stream buffer limit to handle large agent responses.
         # Default asyncio limit (64KB) causes "Separator is found, but chunk is
         # longer than limit" on verbose JSON-RPC messages from long-running tasks.
@@ -719,6 +694,8 @@ class ACPSession:
             self._state.is_active = True
             if self._uses_official_codex_acp():
                 self._reset_lifecycle(goal_known=True)
+                if not await self.set_config_option("mode", "agent-full-access"):
+                    raise RuntimeError("Codex ACP rejected full-access mode")
 
             logger.info("[ACP:%s] Session started: %s", self._agent_cmd, self._session_id[:8])
             return self._session_id
@@ -756,12 +733,6 @@ class ACPSession:
                 fail_phase=phase or "unknown",
                 cause=e,
             ) from e
-
-    def set_tool_filter(self, filter_fn: Optional[Callable[[str, dict | None], bool]]) -> None:
-        """Install a per-session tool filter on the local ACP client callbacks."""
-        self._tool_filter = filter_fn
-        if self._client is not None:
-            self._client.set_tool_filter(filter_fn)
 
     async def load_session(self, session_id: str) -> None:
         """Load an existing session by ID (for resume)."""
@@ -1340,35 +1311,6 @@ class ACPSession:
                 get_error_detail(e),
             )
             return False
-
-    async def set_trusted_personal_permissions(self, enabled: bool) -> bool:
-        """Apply or revoke one task's broad ACP permission lease.
-
-        The official Codex adapter owns its sandbox policy as a session mode,
-        so permission callbacks alone cannot enable network access. Switch it
-        to ``agent-full-access`` for the lease and restore the normal ``agent``
-        preset afterwards. Other ACP providers use the callback bridge only.
-        """
-
-        client = self._client
-        if client is None or not self._session_id:
-            return False
-        requested = enabled is True
-        if not requested:
-            client.set_trusted_personal_permissions(False)
-        if self._uses_official_codex_acp():
-            target_mode = (
-                "agent-full-access"
-                if requested
-                else self._trusted_personal_restore_mode
-            )
-            if not await self.set_config_option("mode", target_mode):
-                if requested:
-                    client.set_trusted_personal_permissions(False)
-                return False
-        if requested:
-            client.set_trusted_personal_permissions(True)
-        return True
 
     async def set_model(self, model_id: str) -> bool:
         """Switch the model for this session via ACP protocol.

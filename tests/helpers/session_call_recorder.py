@@ -25,7 +25,6 @@ class FactoryCall:
     project_id: str | None
     thread_id: str | None
     session_key: str | None
-    tool_filter: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -37,7 +36,6 @@ class PromptCall:
     project_id: str | None
     thread_id: str | None
     session_key: str | None
-    tool_filter: tuple[str, ...] | None
     prompt: str
 
 
@@ -217,7 +215,6 @@ class SessionCallRecorder:
                 "project_id": kwargs.get("project_id"),
                 "thread_id": None,
                 "session_key": None,
-                "tool_filter": None,
             }
             self._factory_call_index[id(session)] = len(self.factory_calls)
             self.factory_calls.append(FactoryCall(**self._session_context[id(session)]))
@@ -232,7 +229,6 @@ class SessionCallRecorder:
         project_id: str | None,
         thread_id: str | None,
         session_key: str,
-        tool_filter: tuple[str, ...] | None = None,
     ) -> None:
         """Enrich a factory record from the manager's already-created key.
 
@@ -246,7 +242,6 @@ class SessionCallRecorder:
                 project_id=project_id,
                 thread_id=thread_id,
                 session_key=session_key,
-                tool_filter=tool_filter,
             )
             self.factory_calls[self._factory_call_index[id(session)]] = FactoryCall(**context)
 

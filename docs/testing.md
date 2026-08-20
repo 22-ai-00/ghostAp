@@ -62,7 +62,7 @@ uv run python scripts/validate_workflow_tenant.py \
 
 ## 执行通道纵向合同
 
-`tests/contracts/test_direct_programming_lane.py` 从显式 Slash 命令或当前 programming mode 一直覆盖到真实 session-manager/factory 请求。测试侧 recorder 只替换进程/远端传输边界，并记录 backend、实际 factory model、cwd、chat/project/thread session key、tool filter 与 prompt；它不以 mocks 重建路由。显式 Direct 请求的准入是一个目标 factory 加一个目标 prompt，且没有 classifier、planner、reviewer 或 coordinator 调用。
+`tests/contracts/test_direct_programming_lane.py` 从显式 Slash 命令或当前 programming mode 一直覆盖到真实 session-manager/factory 请求。测试侧 recorder 只替换进程/远端传输边界，并记录 backend、实际 factory model、cwd、chat/project/thread session key 与 prompt；它不以 mocks 重建路由。显式 Direct 请求的准入是一个目标 factory 加一个目标 prompt，且没有 classifier、planner、reviewer 或 coordinator 调用。
 
 `tests/contracts/test_protected_execution_lanes.py` 固定 Deep/Spec 的 provider/model、
 同 session 的真实首尝试超时后重试、factory 与 process-local pause/resume 路径。

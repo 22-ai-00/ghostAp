@@ -6,8 +6,8 @@ engineering environment.
 - Main Bot: control plane for projects, employees, teams, tasks, approvals, audit.
 - Employee Bot: execution identity with its own Channel, history, memory and stop.
 - Provider/model/engine: replaceable execution capability, shown under Advanced.
-- Host Shell: privileged host execution, disabled or explicitly authorized; it is
-  not an operating-system sandbox.
+- Host Shell: direct host execution without a GhostAP command policy or
+  operating-system sandbox.
 - Built-in employee profile: single-host and file-backed; it does not claim
   multi-replica linearizability or privileged-host rollback resistance.
 
@@ -23,9 +23,8 @@ engineering environment.
   1-8 `tool+model` Agents. After that single confirmation, the pool and
   orchestrator are frozen and script generation, validation and execution advance
   automatically without a later script-confirmation or continuation gate.
-- Users retain explicit stop and configuration controls. High-risk actions that
-  were not precisely authorized by the original request remain fail-closed; safe
-  work may continue without weakening ACP permission checks.
+- Users retain explicit stop and configuration controls. Tool permissions and
+  execution safety are delegated to the selected Agent backend.
 - `/hire <name>` creates a durable Employee Bot through the controlled
   tool/model/profile flow. Arbitrary `/hire --prompt` input is rejected.
 - The standalone Autonomous Manager command surface is retired. Employee and team
@@ -37,6 +36,6 @@ engineering environment.
   `race` primitives. Its runtime owns deterministic control flow while Agents own
   semantic work.
 
-This contract describes product boundaries. Security controls, process isolation
-and file-backed durability must not be presented as stronger guarantees than the
-running deployment can prove.
+This contract describes product boundaries. GhostAP does not add command-risk
+filtering, ACP tool filtering, Workflow isolation, or employee process isolation;
+identity access and file-backed durability remain control-plane concerns.

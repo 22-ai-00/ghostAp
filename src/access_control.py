@@ -9,9 +9,9 @@ from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
 from .config import (
+    AccessFinding,
+    AccessFindingSeverity,
     IngressAccessMode,
-    SecurityFinding,
-    SecuritySeverity,
 )
 
 if TYPE_CHECKING:
@@ -225,7 +225,7 @@ class IngressAccessPolicyProvider:
         if not isinstance(initial, IngressAccessPolicy):
             raise TypeError("initial must be an IngressAccessPolicy")
         self._current = initial
-        self._blocking_findings: tuple[SecurityFinding, ...] = ()
+        self._blocking_findings: tuple[AccessFinding, ...] = ()
         self._swap_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 
     @property
@@ -238,7 +238,7 @@ class IngressAccessPolicyProvider:
         return self._current
 
     @property
-    def blocking_findings(self) -> tuple[SecurityFinding, ...]:
+    def blocking_findings(self) -> tuple[AccessFinding, ...]:
         return self._blocking_findings
 
     def swap(self, replacement: IngressAccessPolicy) -> None:
@@ -248,9 +248,9 @@ class IngressAccessPolicyProvider:
             self._current = replacement
 
     def record_blocking_finding(self, code: str, message: str) -> None:
-        finding = SecurityFinding(
+        finding = AccessFinding(
             code=code,
-            severity=SecuritySeverity.BLOCKING,
+            severity=AccessFindingSeverity.BLOCKING,
             message=message,
         )
         with self._swap_lock:

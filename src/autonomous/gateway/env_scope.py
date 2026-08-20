@@ -1,4 +1,4 @@
-"""Explicit positive-list environment construction for employee ACP processes."""
+"""Employee backend environment construction and provider state projection."""
 
 from __future__ import annotations
 
@@ -12,28 +12,6 @@ from pathlib import Path
 from types import MappingProxyType
 
 from ..workspace.layout import open_child_directory, open_directory_tree
-
-_RUNTIME_KEYS = frozenset(
-    {
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "PATH",
-        "SSL_CERT_DIR",
-        "SSL_CERT_FILE",
-        "TERM",
-        "TMPDIR",
-    }
-)
-_PROVIDER_KEYS = frozenset(
-    {
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "GOOGLE_API_KEY",
-        "OPENAI_API_KEY",
-        "TRAE_HOME",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,10 +62,10 @@ class EmployeeProcessEnvironmentMaterial:
                 not isinstance(key, str)
                 or not key
                 or not isinstance(item, str)
-                or not item
+                or (name != "runtime_env" and not item)
                 for key, item in value.items()
             ):
-                raise ValueError(f"{name} must be a non-empty string mapping")
+                raise ValueError(f"{name} must be a string mapping")
             object.__setattr__(self, name, MappingProxyType(dict(value)))
 
     @property
@@ -107,14 +85,14 @@ def build_employee_process_env(
     credential_env: Mapping[str, str] | None = None,
     codex_home: str = "",
 ) -> dict[str, str]:
-    """Build one process env without inheriting shared application secrets."""
+    """Build one process env from the full host environment plus overrides."""
 
     if not isinstance(employee_home, str) or not employee_home.startswith("/"):
         raise ValueError("employee_home must be an absolute path")
     result = {
         key: value
         for key, value in runtime_env.items()
-        if key in _RUNTIME_KEYS and isinstance(value, str) and value
+        if isinstance(key, str) and key and isinstance(value, str)
     }
     result["HOME"] = employee_home
     if codex_home:
@@ -122,9 +100,7 @@ def build_employee_process_env(
             raise ValueError("codex_home must be an absolute path")
         result["CODEX_HOME"] = codex_home
     for key, value in dict(credential_env or {}).items():
-        if key not in _PROVIDER_KEYS:
-            raise ValueError("employee credential env key is not allowed")
-        if not isinstance(value, str) or not value:
+        if not isinstance(key, str) or not key or not isinstance(value, str) or not value:
             raise ValueError("employee credential env value is invalid")
         if key == "TRAE_HOME" and not value.startswith("/"):
             raise ValueError("employee TRAE_HOME must be an absolute path")
@@ -169,18 +145,9 @@ def build_employee_backend_env(
 def runtime_only_employee_environment(
     authority: EmployeeEnvironmentAuthority,
 ) -> EmployeeProcessEnvironmentMaterial:
-    """Provide only non-secret process runtime values for an employee.
+    """Provide the current host process environment to an employee backend."""
 
-    Provider credentials must come from a future employee-scoped authority;
-    the manager Bot process environment is never an acceptable credential
-    source.
-    """
-
-    runtime_env = {
-        key: value
-        for key, value in os.environ.items()
-        if key in _RUNTIME_KEYS and isinstance(value, str) and value
-    }
+    runtime_env = dict(os.environ)
     return EmployeeProcessEnvironmentMaterial(
         authority.tenant_key,
         authority.agent_id,

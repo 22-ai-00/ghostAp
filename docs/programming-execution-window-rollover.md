@@ -1,5 +1,8 @@
 # Programming Execution Window Rollover Implementation Plan
 
+> Historical note (2026-08-20): GhostAP no longer adds an ACP permission or
+> command-risk policy. Rollover preserves the provider's own permission model.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Treat the configured ACP timeout as one renewable execution window so an unfinished task automatically resumes in a clean transport instead of failing after its first window.

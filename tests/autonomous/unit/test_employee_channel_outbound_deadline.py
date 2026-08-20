@@ -25,7 +25,6 @@ def _ready_supervisor(
     supervisor = EmployeeChannelSupervisor(
         secret_resolver=lambda *_args: "unused",
         worker_path=__file__,
-        sandbox_prefix=(),
         send_timeout=send_timeout,
     )
     runtime = SimpleNamespace(
@@ -59,7 +58,6 @@ def test_supervisor_rejects_non_positive_or_non_finite_send_timeout(
         EmployeeChannelSupervisor(
             secret_resolver=lambda *_args: "unused",
             worker_path=__file__,
-            sandbox_prefix=(),
             send_timeout=send_timeout,  # type: ignore[arg-type]
         )
 
