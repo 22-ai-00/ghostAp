@@ -687,6 +687,7 @@ def test_gateway_replay_normalizes_exact_pre_scope_slock_binding(tmp_path) -> No
     )
 
     payload = _legacy_slock_binding_payload()
+    payload["security_profile"] = "employee_v1"
     with pytest.raises(ValueError, match="exact schema"):
         DispatchBinding.from_dict(payload)
 
@@ -792,6 +793,7 @@ def test_gateway_replay_normalizes_exact_pre_effective_scoped_team_binding(
         "prompt_digest",
     ):
         payload.pop(field_name)
+    payload["security_profile"] = "employee_v1"
 
     state = GatewayProjectionState()
     for frame in _replay_gateway_binding_frame(tmp_path, payload):

@@ -100,6 +100,13 @@ def _dispatch_binding_from_journal(value: object) -> DispatchBinding:
     """Normalize the one authenticated pre-team binding schema during replay."""
 
     legacy_shape = False
+    if isinstance(value, dict):
+        # Historical bindings retained this now-removed execution-policy
+        # label.  Strip it before exact legacy-shape matching just as
+        # ``DispatchBinding.from_dict`` does for the current shape.
+        normalized = dict(value)
+        normalized.pop("security_profile", None)
+        value = normalized
     if isinstance(value, dict) and set(value) in {
         _LEGACY_SLOCK_BINDING_FIELDS_EXACT,
     }:
