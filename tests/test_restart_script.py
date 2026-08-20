@@ -614,6 +614,89 @@ remote_restart
     assert "安全重启预检失败" in result.stdout
 
 
+def test_in_service_sync_restart_delegates_before_stopping_parent(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    capture = tmp_path / "events"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+restart_invoked_from_service_tree() { return 0; }
+log_restart() { printf 'log:%s\n' "$*" >> "$CAPTURE"; }
+remote_restart() { printf '%s\n' remote-worker >> "$CAPTURE"; }
+stop_service() { printf '%s\n' stopped-parent >> "$CAPTURE"; return 9; }
+start_service() { printf '%s\n' started-child >> "$CAPTURE"; return 9; }
+restart_service
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "log:in-service restart delegated to remote worker",
+        "remote-worker",
+    ]
+
+
+def test_restart_script_detects_a_real_parent_process_as_ancestor():
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+source "$1"
+process_is_descendant_of "$PPID"
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(RESTART_SCRIPT)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_external_sync_restart_still_waits_for_stop_and_start(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    script = checkout / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    capture = tmp_path / "events"
+    shell = r'''
+export GHOSTAP_RESTART_LIBRARY_ONLY=1
+export CAPTURE="$2"
+source "$1"
+restart_invoked_from_service_tree() { return 1; }
+remote_restart() { printf '%s\n' remote-worker >> "$CAPTURE"; return 9; }
+stop_service() { printf '%s\n' stopped >> "$CAPTURE"; return 2; }
+start_service() {
+    printf 'started:%s\n' "$LOG_MODE" >> "$CAPTURE"
+    return 0
+}
+restart_service
+'''
+
+    result = subprocess.run(
+        ["bash", "-c", shell, "bash", str(script), str(capture)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert capture.read_text(encoding="utf-8").splitlines() == [
+        "stopped",
+        "started:append",
+    ]
+
+
 def test_macos_service_launch_uses_positional_argv_for_quoted_paths(tmp_path):
     checkout = tmp_path / "checkout with ' quote"
     checkout.mkdir()

@@ -673,6 +673,51 @@ remote_restart() {
     echo "   查看日志: tail -f $LOG_FILE"
 }
 
+process_is_descendant_of() {
+    local ancestor_pid="$1"
+    local current_pid="$$"
+    local parent_pid=""
+
+    [[ "$ancestor_pid" =~ ^[0-9]+$ ]] || return 1
+    while [[ "$current_pid" =~ ^[0-9]+$ ]] && [ "$current_pid" -gt 1 ]; do
+        [ "$current_pid" = "$ancestor_pid" ] && return 0
+        parent_pid=$(ps -p "$current_pid" -o ppid= 2>/dev/null | tr -d '[:space:]')
+        [[ "$parent_pid" =~ ^[0-9]+$ ]] || return 1
+        [ "$parent_pid" != "$current_pid" ] || return 1
+        current_pid="$parent_pid"
+    done
+    return 1
+}
+
+restart_invoked_from_service_tree() {
+    local service_pid=""
+
+    for service_pid in $(get_running_pids); do
+        if process_is_descendant_of "$service_pid"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+restart_service() {
+    local stop_status=0
+
+    if restart_invoked_from_service_tree; then
+        echo "检测到 GhostAP 服务进程树内的同步重启请求，转交安全重启 worker..."
+        log_restart "in-service restart delegated to remote worker"
+        remote_restart
+        return
+    fi
+
+    stop_service || stop_status=$?
+    LOG_MODE="${GHOSTAP_LOG_MODE:-append}"
+    if ! start_service; then
+        return 1
+    fi
+    return "$stop_status"
+}
+
 if [ "${GHOSTAP_RESTART_LIBRARY_ONLY:-0}" = "1" ]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -685,13 +730,7 @@ case "${1:-restart}" in
         stop_service
         ;;
     restart)
-        stop_status=0
-        stop_service || stop_status=$?
-        LOG_MODE="${GHOSTAP_LOG_MODE:-append}"
-        if ! start_service; then
-            exit 1
-        fi
-        exit "$stop_status"
+        restart_service
         ;;
     remote-restart|rr)
         remote_restart
