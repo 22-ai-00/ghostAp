@@ -57,16 +57,15 @@ class SpecHandler(BaseEngineHandler):
         return self.renderer.create_spec_callbacks(message_id, chat_id, project, engine_name=engine_name, model_name=model_name)
 
     def _get_model_name(self, chat_id: str, project: Optional["ProjectContext"]) -> str:
-        """Resolve model name for subtitle display."""
-        from ...utils.engine_identity import resolve_engine_identity
-        project_id = project.project_id if project else None
-        current_mode = self.ctx.mode_manager.get_mode(chat_id, project_id=project_id)
-        identity = resolve_engine_identity(
-            mode=current_mode,
-            acp_tool_name=getattr(project, "acp_tool_name", None) if project else None,
-            acp_model_name=getattr(project, "acp_model_name", None) if project else None,
-        )
-        return identity.model_name or ""
+        """Resolve model name for subtitle display.
+
+        Spec is a topic engine, not a programming mode.  Read the model
+        directly from the project's ACP config so that ``/model`` in SMART
+        mode is respected.
+        """
+        if project and project.acp_tool_name and project.acp_model_name:
+            return project.acp_model_name
+        return ""
 
     def _get_spec_reporter(self):
         """Return the progress reporter used by _safe_execute_engine."""

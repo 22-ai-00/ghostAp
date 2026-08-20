@@ -54,17 +54,15 @@ class DeepHandler(BaseEngineHandler):
         return self.renderer.create_deep_callbacks(message_id, chat_id, project, engine_name, root_path)
 
     def _get_model_name(self, chat_id: str, project: Optional["ProjectContext"]) -> str:
-        """Resolve the selected model for Deep engine startup."""
-        from ...utils.engine_identity import resolve_engine_identity
+        """Resolve the selected model for Deep engine startup.
 
-        project_id = project.project_id if project else None
-        current_mode = self.ctx.mode_manager.get_mode(chat_id, project_id=project_id)
-        identity = resolve_engine_identity(
-            mode=current_mode,
-            acp_tool_name=getattr(project, "acp_tool_name", None) if project else None,
-            acp_model_name=getattr(project, "acp_model_name", None) if project else None,
-        )
-        return identity.model_name or ""
+        Deep is a topic engine (not a programming mode), so it runs in SMART
+        mode by default.  Read the model directly from the project's ACP config
+        so that a model selected via ``/model`` in SMART mode is picked up.
+        """
+        if project and project.acp_tool_name and project.acp_model_name:
+            return project.acp_model_name
+        return ""
 
     def _refresh_card_view(self, message_id: str, chat_id: str, project=None):
         self.show_deep_status(message_id, chat_id, project, origin_message_id=message_id)
