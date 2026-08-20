@@ -18,6 +18,7 @@ from src.feishu.cot import (
     COTTransportError,
     FeishuCOTAPIClient,
     FeishuCOTSession,
+    FeishuCOTStream,
 )
 
 _CHAT_ID = "oc_cot_chat"
@@ -53,6 +54,15 @@ def _response(
 
 def _create_response() -> BaseResponse:
     return _response({"cot_id": _COT_ID, "message_id": _MESSAGE_ID})
+
+
+def _create_response_for(index: int) -> BaseResponse:
+    return _response(
+        {
+            "cot_id": f"cot_task_{index}",
+            "message_id": f"om_cot_message_{index}",
+        }
+    )
 
 
 def _empty_response() -> BaseResponse:
@@ -115,6 +125,7 @@ def _assert_wire_event_bounds(requests: list[BaseRequest]) -> None:
             content = event["content"]
             assert isinstance(content, str)
             assert len(content) <= 4_096
+            assert len(content.encode("utf-8")) <= 4_096
 
 
 def _wait_until(predicate: Callable[[], bool], timeout: float = 1.0) -> None:
@@ -269,6 +280,23 @@ def test_api_rejects_oversized_final_event_content_before_network() -> None:
     }
 
     with pytest.raises(COTTransportError, match="exceeds 4096 characters"):
+        api.append(binding, (event,))
+    assert len(client.requests) == 1
+
+
+def test_api_rejects_utf8_oversized_final_event_content_before_network() -> None:
+    client = _RecordingClient(_create_response())
+    api = _api(client)
+    binding = api.create(_CHAT_ID)
+    event = {
+        "event_type": "TEXT_MESSAGE_CONTENT",
+        # The live service counts the UTF-8 wire size: this is fewer than
+        # 4096 Python characters but exceeds 4096 bytes with its JSON shell.
+        "content": {"messageId": "text_1", "delta": "中" * 1_400},
+        "timestamp": "1",
+    }
+
+    with pytest.raises(COTTransportError, match="exceeds 4096"):
         api.append(binding, (event,))
     assert len(client.requests) == 1
 
@@ -449,7 +477,10 @@ def test_session_maps_ordered_text_reasoning_and_latest_safe_tool_result_in_one_
     assert started_content["input"]["statusText"] == {
         "running": {"zh_cn": "过程记录中", "en_us": "Recording process"},
         "thinking": {"zh_cn": "正在记录过程", "en_us": "Recording process"},
-        "done": {"zh_cn": "过程记录完成", "en_us": "Process recorded"},
+        "done": {
+            "zh_cn": "本段过程记录完成",
+            "en_us": "Process segment recorded",
+        },
         "error": {
             "zh_cn": "过程记录异常结束，请查看主卡",
             "en_us": "Process ended unexpectedly; see the main card",
@@ -746,6 +777,165 @@ def test_large_tool_result_uses_exact_agui_schema_and_utf8_byte_cap() -> None:
     assert len(str(result["content"]).encode("utf-8")) <= 4_000
     assert str(result["content"]).endswith("…")
     _assert_wire_event_bounds(client.requests)
+
+
+def test_multibyte_tool_result_fits_the_complete_utf8_wire_envelope() -> None:
+    client = _RecordingClient(
+        _create_response(),
+        *(_empty_response() for _ in range(10)),
+    )
+    session = FeishuCOTSession(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    session.start()
+    assert session.emit(CardEvent.tool_started("multibyte-tool", "shell", "{}"))
+    assert session.emit(
+        CardEvent(
+            type=CardEventType.TOOL_DONE,
+            payload={
+                "block_id": "multibyte-tool",
+                "tool_output": "中文工具结果" * 2_000,
+            },
+        )
+    )
+    assert session.complete(CardEvent.completed()) is True
+
+    result_event = next(
+        event
+        for request in client.requests[2:-2]
+        for event in _request_events(request)
+        if event["event_type"] == "TOOL_CALL_RESULT"
+    )
+    content = result_event["content"]
+    assert isinstance(content, str)
+    assert len(content) < 4_096
+    assert len(content.encode("utf-8")) <= 4_096
+    assert str(_event_content(result_event)["content"]).endswith("…")
+    _assert_wire_event_bounds(client.requests)
+
+
+def test_long_process_rolls_over_to_a_new_cot_segment_without_replaying_parent() -> None:
+    client = _RecordingClient(
+        _create_response_for(1),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+        _create_response_for(2),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+    )
+    started_message_ids: list[str] = []
+    stream = FeishuCOTStream(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        input_text="执行长任务",
+        flush_interval=0.005,
+        on_segment_started=started_message_ids.append,
+    )
+    stream.start()
+    assert stream.emit(CardEvent.text_started("segment-one"))
+    assert stream.emit(CardEvent.text_delta("segment-one", "第一段过程"))
+
+    rollover = stream.rollover()
+    assert rollover.sealed is True
+    assert rollover.started is True
+    assert [event.type for event in rollover.replay_events] == [
+        CardEventType.TEXT_STARTED
+    ]
+    assert stream.started is True
+    assert stream.healthy is True
+    assert stream.message_id == "om_cot_message_2"
+
+    assert stream.emit(CardEvent.text_delta("segment-one", "第二段过程"))
+    assert stream.emit(CardEvent.text_done("segment-one"))
+    assert stream.complete(CardEvent.completed()) is True
+
+    assert started_message_ids == ["om_cot_message_1", "om_cot_message_2"]
+    create_requests = [
+        request
+        for request in client.requests
+        if request.http_method is HttpMethod.POST
+        and request.uri == "/open-apis/im/v1/message_cot"
+    ]
+    assert len(create_requests) == 2
+    first_terminal = _event_content(_request_events(client.requests[3])[0])
+    final_terminal = _event_content(_request_events(client.requests[8])[0])
+    assert first_terminal["status"] == "done"
+    assert final_terminal["status"] == "done"
+    assert [event["event_type"] for event in _request_events(client.requests[2])] == [
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+    ]
+    second_started = _event_content(_request_events(client.requests[6])[0])
+    assert second_started["input"]["query"] == "过程续接 · 第 2 段"
+    second_process_events = _request_events(client.requests[7])
+    assert [event["event_type"] for event in second_process_events] == [
+        "TEXT_MESSAGE_START",
+        "TEXT_MESSAGE_CONTENT",
+        "TEXT_MESSAGE_END",
+    ]
+    assert _event_content(second_process_events[1])["delta"] == "第二段过程"
+    _assert_wire_event_bounds(client.requests)
+
+
+def test_rollover_balances_an_active_tool_and_continues_its_real_result() -> None:
+    client = _RecordingClient(
+        _create_response_for(1),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+        _create_response_for(2),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+    )
+    stream = FeishuCOTStream(
+        _api(client, timeout_seconds=0.1),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        flush_interval=0.005,
+    )
+    stream.start()
+    assert stream.emit(CardEvent.tool_started("long-tool", "shell", "{}"))
+    rollover = stream.rollover()
+    assert rollover.sealed is True
+    assert [event.type for event in rollover.replay_events] == [
+        CardEventType.TOOL_STARTED
+    ]
+    assert stream.emit(
+        CardEvent(
+            type=CardEventType.TOOL_DONE,
+            payload={"block_id": "long-tool", "tool_output": "真实最终结果"},
+        )
+    )
+    assert stream.complete(CardEvent.completed()) is True
+
+    old_tool_events = _request_events(client.requests[2])
+    new_tool_events = _request_events(client.requests[7])
+    assert [event["event_type"] for event in old_tool_events] == [
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+    ]
+    assert "续接下一段" in str(_event_content(old_tool_events[-1])["content"])
+    assert [event["event_type"] for event in new_tool_events] == [
+        "TOOL_CALL_START",
+        "TOOL_CALL_ARGS",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+    ]
+    assert _event_content(new_tool_events[-1])["content"] == "真实最终结果"
 
 
 def test_large_escaped_tool_args_and_result_fit_complete_content_envelope() -> None:

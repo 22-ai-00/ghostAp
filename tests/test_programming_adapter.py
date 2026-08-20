@@ -16,6 +16,7 @@ from src.card.programming_adapter import (
     ProgrammingCardSession,
     build_programming_metadata,
 )
+from src.card.protocols import ProcessSegmentRollover
 from src.card.render.budget import RenderBudget
 from src.card.render.renderer import render_card
 from src.card.session import CardSession
@@ -69,6 +70,8 @@ class _ProcessSink:
         self.start_error = start_error
         self.fail_mode: str | None = None
         self.complete_mode: str | None = None
+        self.rollover_mode: str | None = None
+        self.rollover_calls = 0
 
     def start(self) -> None:
         if self.visible_check is not None:
@@ -92,6 +95,23 @@ class _ProcessSink:
         if self.complete_mode == "return_false":
             return False
         return self.healthy
+
+    def rollover(self) -> ProcessSegmentRollover:
+        self.rollover_calls += 1
+        if self.rollover_mode == "success":
+            return ProcessSegmentRollover(sealed=True, started=True)
+        if self.rollover_mode == "success_with_anchor":
+            anchor = next(
+                event
+                for event in reversed(self.events)
+                if event.type is CardEventType.TEXT_STARTED
+            )
+            return ProcessSegmentRollover(
+                sealed=True,
+                started=True,
+                replay_events=(anchor,),
+            )
+        return ProcessSegmentRollover(sealed=False, started=False)
 
     def abort(self) -> None:
         self.abort_calls += 1
@@ -666,6 +686,79 @@ def test_cot_replay_buffer_hard_limit_cuts_over_before_accepting_more(
             if isinstance(block, TextBlock) and block.block_id == "bounded-text"
         )
         assert block.content == "abc"
+    finally:
+        programming.abort()
+
+
+def test_cot_replay_budget_seals_and_continues_in_a_new_process_segment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.card.programming_adapter._PROCESS_REPLAY_MAX_EVENTS", 2)
+    sink = _ProcessSink()
+    sink.rollover_mode = "success"
+    _, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+        programming.dispatch(CardEvent.text_started("segmented-text"))
+        programming.dispatch(CardEvent.text_delta("segmented-text", "a"))
+
+        # The next atom starts a fresh COT segment instead of forcing the
+        # long-running task's whole process stream back into the main card.
+        programming.dispatch(CardEvent.text_delta("segmented-text", "b"))
+
+        assert sink.rollover_calls == 1
+        assert sink.abort_calls == 0
+        assert [event.type for event in sink.events] == [
+            CardEventType.TEXT_STARTED,
+            CardEventType.TEXT_DELTA,
+            CardEventType.TEXT_DELTA,
+        ]
+        assert card_session.state is not None
+        assert card_session.state.terminal == "running"
+        assert card_session.state.footer.warning_banner is None
+        assert not any(
+            isinstance(block, TextBlock) and block.block_id == "segmented-text"
+            for block in card_session.state.blocks
+        )
+    finally:
+        programming.abort()
+
+
+def test_degradation_after_rollover_replays_only_the_open_segment_with_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.card.programming_adapter._PROCESS_REPLAY_MAX_EVENTS", 3)
+    sink = _ProcessSink()
+    sink.rollover_mode = "success_with_anchor"
+    _, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+        programming.dispatch(CardEvent.text_started("segmented-text"))
+        programming.dispatch(CardEvent.text_delta("segmented-text", "old-a"))
+        programming.dispatch(CardEvent.text_delta("segmented-text", "old-b"))
+        programming.dispatch(CardEvent.text_delta("segmented-text", "new-c"))
+
+        sink.fail_mode = "async_unhealthy"
+        programming.dispatch(CardEvent.text_delta("segmented-text", "new-d"))
+
+        assert sink.rollover_calls == 1
+        assert sink.abort_calls == 1
+        assert card_session.state is not None
+        assert card_session.state.footer.warning_type == "info"
+        assert "已完成的过程分段仍保留" in str(
+            card_session.state.footer.warning_banner
+        )
+        block = next(
+            block
+            for block in card_session.state.blocks
+            if isinstance(block, TextBlock) and block.block_id == "segmented-text"
+        )
+        assert block.content == "new-cnew-d"
+        assert "old-a" not in block.content
     finally:
         programming.abort()
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import ExitStack, contextmanager, nullcontext
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -1132,7 +1132,7 @@ def test_programming_handle_response_builds_channel_card_client():
             return_value=MagicMock(name="legacy_card_adapter"),
         ),
         patch("src.feishu.cot.FeishuCOTAPIClient") as cot_api_cls,
-        patch("src.feishu.cot.FeishuCOTSession") as cot_session_cls,
+        patch("src.feishu.cot.FeishuCOTStream") as cot_session_cls,
         patch("src.card.session.CardSession", return_value=MagicMock()),
         patch("src.card.session.factory.CardSessionFactory", return_value=MagicMock()),
         patch("src.card.programming_adapter.ProgrammingCardSession", _FakeProgrammingCardSession),
@@ -1185,7 +1185,7 @@ def test_programming_starts_cot_only_after_card_is_visible_and_links_both_messag
             return_value=cot_api,
         ) as cot_api_cls,
         patch(
-            "src.feishu.cot.FeishuCOTSession",
+            "src.feishu.cot.FeishuCOTStream",
             return_value=process_sink,
         ) as cot_session_cls,
     ):
@@ -1215,7 +1215,8 @@ def test_programming_starts_cot_only_after_card_is_visible_and_links_both_messag
         origin_message_id="msg-cot-success",
         reply_in_thread=True,
         input_text="raw user task",
-        request_timeout=2.0,
+        request_timeout=5.0,
+        on_segment_started=ANY,
     )
     handler.ctx.message_linker.link_reply.assert_any_call(
         "msg-cot-success",
@@ -1224,6 +1225,12 @@ def test_programming_starts_cot_only_after_card_is_visible_and_links_both_messag
     handler.ctx.message_linker.link_reply.assert_any_call(
         "msg-cot-success",
         "om-cot-process",
+    )
+    segment_callback = cot_session_cls.call_args.kwargs["on_segment_started"]
+    segment_callback("om-cot-process-2")
+    handler.ctx.message_linker.link_reply.assert_any_call(
+        "msg-cot-success",
+        "om-cot-process-2",
     )
 
 
@@ -1253,7 +1260,7 @@ def test_programming_cot_activation_failure_keeps_streaming_card_execution():
     with (
         _streaming_environment(_LinkedProgrammingCardSession),
         patch("src.feishu.cot.FeishuCOTAPIClient", return_value=MagicMock()),
-        patch("src.feishu.cot.FeishuCOTSession", return_value=process_sink),
+        patch("src.feishu.cot.FeishuCOTStream", return_value=process_sink),
     ):
         handler.handle_response(
             "msg-cot-failure",
@@ -1312,7 +1319,7 @@ def test_programming_aborts_active_cot_card_session_when_execution_entry_raises(
             delivery=delivery,
         ),
         patch("src.feishu.cot.FeishuCOTAPIClient", return_value=MagicMock()),
-        patch("src.feishu.cot.FeishuCOTSession", return_value=process_sink),
+        patch("src.feishu.cot.FeishuCOTStream", return_value=process_sink),
         pytest.raises(RuntimeError, match="execution entry failed") as exc_info,
     ):
         handler.handle_response(
@@ -1397,7 +1404,7 @@ def test_programming_falls_back_when_initial_async_channel_card_is_not_visible()
         ),
         patch("src.feishu.cot.FeishuCOTAPIClient", return_value=MagicMock()),
         patch(
-            "src.feishu.cot.FeishuCOTSession",
+            "src.feishu.cot.FeishuCOTStream",
             return_value=process_sink,
         ) as cot_session_cls,
         patch("src.card.session.CardSession", return_value=MagicMock()),

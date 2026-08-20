@@ -173,11 +173,15 @@
     .state-degraded { grid-column: 1 / -1; }
     .state-degraded .chat { grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); }
     .state-degraded .user-message { grid-column: 1 / -1; }
+    .state-segmented { grid-column: 1 / -1; }
+    .state-segmented .chat { grid-template-columns: minmax(0, .72fr) minmax(0, .72fr) minmax(0, 1.1fr); }
+    .state-segmented .user-message { grid-column: 1 / -1; }
 
     @media (max-width: 780px) {
       main { width: min(460px, calc(100% - 24px)); padding-top: 22px; }
       .states { grid-template-columns: 1fr; }
       .state-degraded .chat { grid-template-columns: 1fr; }
+      .state-segmented .chat { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -238,7 +242,7 @@
 
           <section class="cot" aria-label="Feishu COT 已完成预览">
             <div class="cot-trigger done">
-              <span>✓ 过程记录完成</span>
+              <span>✓ 本段过程记录完成</span>
               <span class="cot-meta">查看 6 条过程⌄</span>
             </div>
           </section>
@@ -263,6 +267,48 @@
                 </div>
               </div>
               <div class="footer">Codex · gpt-5.6-sol/high · 完成于 01:18</div>
+            </div>
+          </section>
+        </div>
+      </article>
+
+      <article class="state-segmented">
+        <h2 class="state-title">长任务 · 过程按容量无缝续接，不按时长提前结束</h2>
+        <div class="chat">
+          <div class="user-message">完整审计并修复整个执行链，持续跑完相关测试。</div>
+
+          <section class="cot" aria-label="Feishu COT 第一段已封口预览">
+            <div class="cot-trigger done">
+              <span>✓ 本段过程记录完成</span>
+              <span class="cot-meta">第 1 段 · 查看过程⌄</span>
+            </div>
+          </section>
+
+          <section class="cot" aria-label="Feishu COT 第二段运行中预览">
+            <div class="cot-trigger">
+              <span>● 过程记录中</span>
+              <span class="cot-meta">续接第 2 段⌃</span>
+            </div>
+            <div class="cot-body">
+              <div class="reasoning">上一段已安全保存，继续验证共享路由与长时间执行边界。</div>
+              <p class="process-copy">正在运行扩大回归；主任务和任务卡保持同一生命周期。</p>
+            </div>
+          </section>
+
+          <section class="result-card" aria-label="长任务权威主卡预览">
+            <div class="card-header">进行中 · GhostAP · Codex<small>过程已续接 2 段，任务没有重跑</small></div>
+            <div class="card-body">
+              <div class="task-summary">
+                <strong>总体进度 · 3/5</strong>
+                <div class="tasks">
+                  <span>✓ 定位生命周期</span>
+                  <span>✓ 修复单事件边界</span>
+                  <span>✓ 完成分段续接</span>
+                  <span class="active">● 扩大回归验证</span>
+                  <span>○ 汇总结论</span>
+                </div>
+              </div>
+              <div class="footer">Codex · gpt-5.6-sol/high · 01:37:26</div>
             </div>
           </section>
         </div>
@@ -301,7 +347,7 @@
     </section>
 
     <aside class="rule">
-      <strong>运输规则</strong>：主卡是任务状态的唯一事实源，COT 只是非权威的过程旁路。COT 创建成功后，正文/推理/工具事件不再重复写进卡片；通道不可用时只以中性状态收口 COT，原子回放完整过程到主卡，不重跑 ACP，也不改变主任务终态。
+      <strong>运输规则</strong>：主卡是任务状态的唯一事实源，COT 只是非权威的过程旁路。任务时长不会结束 COT；当前段接近可回放容量时，先正常封口，再创建“过程续接”段，已确认段不重复回放。通道不可用时只以中性状态收口 COT，将尚未确认的当前段原子回放到主卡，不重跑 ACP，也不改变主任务终态。
       <div class="legend"><span>COT 过程</span><span>卡片任务总览</span><span>卡片最终结论</span></div>
     </aside>
   </main>

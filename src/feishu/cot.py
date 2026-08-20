@@ -27,6 +27,7 @@ from lark_oapi.core.model.base_request import BaseRequest
 from lark_oapi.core.model.base_response import BaseResponse
 
 from src.card.events import CardEvent, CardEventType
+from src.card.protocols import ProcessSegmentRollover
 from src.card.tool_display import sanitize_full_tool_event_content
 from src.utils.text import sanitize_single_line_label
 
@@ -39,11 +40,13 @@ _MAX_IDENTIFIER_CHARS = 512
 _MAX_BATCH_EVENTS = 100
 _MAX_BATCH_ITEMS = 32
 _MAX_UPDATE_EVENT_BYTES = 14 * 1024
-# Generated Lark SDKs define MessageCot.content as a JSON string of at most
-# 4096 characters and MessageCot.timestamp as a string.  This limit applies to
-# the complete encoded content object, not only to a delta/tool payload inside
-# that object.
+# Generated Lark SDKs describe MessageCot.content as a JSON string of at most
+# 4096 characters, while the live AppendCOTEvents service also rejects a
+# multibyte value when its UTF-8 representation exceeds 4096 bytes. Both limits
+# apply to the complete encoded content object, not only an inner delta/tool
+# payload.
 _MAX_EVENT_CONTENT_CHARS = 4_096
+_MAX_EVENT_CONTENT_BYTES = 4_096
 _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 10_000
 _MAX_STREAM_CHUNK_BYTES = 4_000
@@ -54,9 +57,11 @@ _DEFAULT_API_TIMEOUT_SECONDS = 35.0
 _DEFAULT_SESSION_REQUEST_TIMEOUT_SECONDS = 5.0
 _DEFAULT_SESSION_CLOSE_TIMEOUT_SECONDS = 4.5
 _MAX_SESSION_CLOSE_TIMEOUT_SECONDS = 6.0
+_DEFAULT_MAX_STREAM_SEGMENTS = 32
 _LATE_CLEANUP_WORKERS = 4
 _LATE_CLEANUP_QUEUE_CAPACITY = 64
 _STOP = object()
+_SEGMENT_END = object()
 
 _COT_EVENT_TYPES = frozenset(
     {
@@ -96,7 +101,7 @@ _PROCESS_EVENT_TYPES = frozenset(
 _STATUS_TEXT = {
     "running": {"zh_cn": "过程记录中", "en_us": "Recording process"},
     "thinking": {"zh_cn": "正在记录过程", "en_us": "Recording process"},
-    "done": {"zh_cn": "过程记录完成", "en_us": "Process recorded"},
+    "done": {"zh_cn": "本段过程记录完成", "en_us": "Process segment recorded"},
     "error": {
         "zh_cn": "过程记录异常结束，请查看主卡",
         "en_us": "Process ended unexpectedly; see the main card",
@@ -808,7 +813,7 @@ class FeishuCOTSession:
         self._binding: COTBinding | None = None
         self._starting = False
         self._started = False
-        self._close_requested: tuple[CardEvent | None, bool] | None = None
+        self._close_requested: tuple[object | None, bool] | None = None
         self._accepting = False
         self._closing = False
         self._closed = False
@@ -823,7 +828,7 @@ class FeishuCOTSession:
         self._cleanup_runner_active = False
         self._cleanup_actions: deque[Callable[[], None]] = deque(maxlen=8)
         self._close_deadline: float | None = None
-        self._deferred_close: tuple[COTBinding, CardEvent | None, bool] | None = None
+        self._deferred_close: tuple[COTBinding, object | None, bool] | None = None
         self._deferred_cleanup_needed = False
         self._terminal_owner_claimed = False
         self._last_timestamp_ms = 0
@@ -1041,6 +1046,21 @@ class FeishuCOTSession:
                 self._terminal_result = False
             return False
 
+    def seal_segment(self) -> bool:
+        """Finish one healthy process segment without ending the parent task."""
+        try:
+            return self._close(event=_SEGMENT_END, aborting=False)
+        except Exception as exc:
+            with self._lock:
+                self._record_failure_locked(
+                    self._as_transport_error(exc, "COT segment seal failed"),
+                    append_failed=True,
+                )
+                self._closed = True
+                self._closing = False
+                self._terminal_result = False
+            return False
+
     def abort(self) -> None:
         """Fence immediately and close the non-authoritative process sidecar."""
         with self._lock:
@@ -1081,7 +1101,7 @@ class FeishuCOTSession:
                 self._closed = True
                 self._closing = False
 
-    def _close(self, *, event: CardEvent | None, aborting: bool) -> bool:
+    def _close(self, *, event: object | None, aborting: bool) -> bool:
         with self._lock:
             if self._starting and not self._started:
                 self._close_requested = (event, aborting)
@@ -1109,7 +1129,7 @@ class FeishuCOTSession:
         self,
         *,
         binding: COTBinding,
-        event: CardEvent | None,
+        event: object | None,
         aborting: bool,
     ) -> bool:
         with self._lock:
@@ -1428,7 +1448,7 @@ class FeishuCOTSession:
         self,
         *,
         binding: COTBinding,
-        event: CardEvent | None,
+        event: object | None,
         aborting: bool,
     ) -> None:
         with self._lock:
@@ -1483,7 +1503,7 @@ class FeishuCOTSession:
 
     def _terminal_event(
         self,
-        event: CardEvent | None,
+        event: object | None,
         *,
         aborting: bool,
         prior_failure: COTTransportError | None,
@@ -1491,6 +1511,19 @@ class FeishuCOTSession:
         if aborting:
             return (
                 self._degraded_terminal_event(),
+                "done",
+                True,
+            )
+        if event is _SEGMENT_END and prior_failure is None:
+            return (
+                self._cot_event(
+                    "RUN_FINISHED",
+                    {
+                        "threadId": self._thread_id,
+                        "runId": self._run_id,
+                        "status": "done",
+                    },
+                ),
                 "done",
                 True,
             )
@@ -2073,6 +2106,254 @@ class FeishuCOTSession:
         self._late_close_degraded(binding)
 
 
+class FeishuCOTStream:
+    """Task-scoped process stream composed of bounded native COT segments.
+
+    Task duration does not rotate the stream. ``ProgrammingCardSession`` asks
+    for a rollover only when its current-segment replay buffer reaches the
+    existing event/byte safety budget. A successful seal makes that old segment
+    authoritative for its own process slice, then a fresh COT continues the same
+    parent task without replaying ACP work.
+    """
+
+    def __init__(
+        self,
+        api: FeishuCOTAPIClient,
+        *,
+        chat_id: str,
+        origin_message_id: str | None,
+        reply_in_thread: bool = False,
+        input_text: str = "",
+        flush_interval: float = _DEFAULT_FLUSH_INTERVAL,
+        queue_capacity: int = _DEFAULT_QUEUE_CAPACITY,
+        request_timeout: float | None = None,
+        close_timeout: float | None = None,
+        max_segments: int = _DEFAULT_MAX_STREAM_SEGMENTS,
+        on_segment_started: Callable[[str], None] | None = None,
+    ) -> None:
+        if (
+            isinstance(max_segments, bool)
+            or not isinstance(max_segments, int)
+            or max_segments <= 0
+        ):
+            raise ValueError("max_segments must be a positive integer")
+        if on_segment_started is not None and not callable(on_segment_started):
+            raise TypeError("on_segment_started must be callable")
+
+        self._api = api
+        self._chat_id = chat_id
+        self._origin_message_id = origin_message_id
+        self._reply_in_thread = reply_in_thread
+        self._input_text = input_text
+        self._flush_interval = flush_interval
+        self._queue_capacity = queue_capacity
+        self._request_timeout = request_timeout
+        self._close_timeout = close_timeout
+        self._max_segments = max_segments
+        self._on_segment_started = on_segment_started
+        self._lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
+        self._segment_index = 1
+        self._message_ids: list[str] = []
+        self._active_anchors: dict[tuple[str, str], CardEvent] = {}
+        self._started = False
+        self._closed = False
+        self._failed = False
+        # Construct eagerly so invalid public arguments fail before the main
+        # card begins delivery, matching the old single-session contract.
+        self._current = self._build_segment(self._segment_index)
+
+    @property
+    def started(self) -> bool:
+        with self._lock:
+            return self._started and not self._closed
+
+    @property
+    def healthy(self) -> bool:
+        with self._lock:
+            return (
+                self._started
+                and not self._closed
+                and not self._failed
+                and self._current.healthy
+            )
+
+    @property
+    def message_id(self) -> str | None:
+        with self._lock:
+            return self._current.message_id
+
+    @property
+    def message_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._message_ids)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started and not self._closed:
+                return
+            if self._closed or self._failed:
+                raise COTTransportError("COT stream is closed")
+            segment = self._current
+            segment.start()
+            self._started = True
+            self._remember_started_segment_locked(segment)
+
+    def emit(self, event: CardEvent) -> bool:
+        with self._lock:
+            if not self.healthy:
+                return False
+            handled = self._current.emit(event)
+            if handled:
+                self._update_active_anchors_locked(event)
+            return handled
+
+    def rollover(self) -> ProcessSegmentRollover:
+        with self._lock:
+            if not self.healthy or self._segment_index >= self._max_segments:
+                return ProcessSegmentRollover(sealed=False, started=False)
+            current = self._current
+            continuation_anchors = tuple(self._active_anchors.values())
+            for closure in self._segment_closure_events_locked():
+                if not current.emit(closure) or not current.healthy:
+                    self._failed = True
+                    self._started = False
+                    return ProcessSegmentRollover(sealed=False, started=False)
+            if not current.seal_segment():
+                self._failed = True
+                self._started = False
+                return ProcessSegmentRollover(sealed=False, started=False)
+
+            next_index = self._segment_index + 1
+            next_segment = self._build_segment(next_index)
+            self._current = next_segment
+            try:
+                next_segment.start()
+            except Exception:
+                self._failed = True
+                self._started = False
+                logger.warning(
+                    "Feishu COT continuation segment failed to start; segment=%d",
+                    next_index,
+                    exc_info=True,
+                )
+                return ProcessSegmentRollover(sealed=False, started=False)
+
+            for anchor in continuation_anchors:
+                if not next_segment.emit(anchor) or not next_segment.healthy:
+                    next_segment.abort()
+                    self._failed = True
+                    self._started = False
+                    logger.warning(
+                        "Feishu COT continuation anchors were rejected; segment=%d",
+                        next_index,
+                    )
+                    return ProcessSegmentRollover(sealed=False, started=False)
+
+            self._segment_index = next_index
+            self._remember_started_segment_locked(next_segment)
+            return ProcessSegmentRollover(
+                sealed=True,
+                started=True,
+                replay_events=continuation_anchors,
+            )
+
+    def complete(self, event: CardEvent) -> bool:
+        with self._lock:
+            if not self._started or self._closed:
+                return False
+            completed = self._current.complete(event)
+            self._closed = True
+            self._started = False
+            if not completed:
+                self._failed = True
+            return completed
+
+    def abort(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._current.abort()
+            self._closed = True
+            self._started = False
+            self._failed = True
+
+    def _build_segment(self, index: int) -> FeishuCOTSession:
+        input_text = (
+            self._input_text
+            if index == 1
+            else f"过程续接 · 第 {index} 段"
+        )
+        return FeishuCOTSession(
+            self._api,
+            chat_id=self._chat_id,
+            origin_message_id=self._origin_message_id,
+            reply_in_thread=self._reply_in_thread,
+            input_text=input_text,
+            flush_interval=self._flush_interval,
+            queue_capacity=self._queue_capacity,
+            request_timeout=self._request_timeout,
+            close_timeout=self._close_timeout,
+        )
+
+    def _remember_started_segment_locked(
+        self,
+        segment: FeishuCOTSession,
+    ) -> None:
+        message_id = segment.message_id
+        if message_id is None:
+            return
+        self._message_ids.append(message_id)
+        callback = self._on_segment_started
+        if callback is None:
+            return
+        try:
+            callback(message_id)
+        except Exception:
+            logger.warning(
+                "Feishu COT segment-link callback failed; segment=%d",
+                self._segment_index,
+                exc_info=True,
+            )
+
+    def _update_active_anchors_locked(self, event: CardEvent) -> None:
+        block_id = event.payload.get("block_id")
+        if not isinstance(block_id, str) or not block_id:
+            return
+        event_type = event.type
+        if event_type is CardEventType.TEXT_STARTED:
+            self._active_anchors[("text", block_id)] = event
+        elif event_type is CardEventType.TEXT_DONE:
+            self._active_anchors.pop(("text", block_id), None)
+        elif event_type is CardEventType.REASONING_STARTED:
+            self._active_anchors[("reasoning", block_id)] = event
+        elif event_type is CardEventType.REASONING_DONE:
+            self._active_anchors.pop(("reasoning", block_id), None)
+        elif event_type is CardEventType.TOOL_STARTED:
+            self._active_anchors[("tool", block_id)] = event
+        elif event_type in {CardEventType.TOOL_DONE, CardEventType.TOOL_FAILED}:
+            self._active_anchors.pop(("tool", block_id), None)
+
+    def _segment_closure_events_locked(self) -> tuple[CardEvent, ...]:
+        """Balance open AG-UI blocks before RUN_FINISHED for one segment."""
+        closures: list[CardEvent] = []
+        for (kind, block_id), _anchor in self._active_anchors.items():
+            if kind == "text":
+                closures.append(CardEvent.text_done(block_id))
+            elif kind == "reasoning":
+                closures.append(CardEvent.reasoning_done(block_id))
+            elif kind == "tool":
+                closures.append(
+                    CardEvent(
+                        type=CardEventType.TOOL_DONE,
+                        payload={
+                            "block_id": block_id,
+                            "tool_output": "工具仍在执行；结果续接下一段。",
+                        },
+                    )
+                )
+        return tuple(closures)
+
+
 def _valid_identifier(value: object) -> bool:
     if not isinstance(value, str) or not value or len(value) > _MAX_IDENTIFIER_CHARS:
         return False
@@ -2139,11 +2420,16 @@ def _encode_events(
             raise COTTransportError("COT event timestamp is invalid")
         try:
             content_json = _encode_event_content(content)
-            content_json.encode("utf-8")
+            content_bytes = content_json.encode("utf-8")
         except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
             raise COTTransportError("COT event content is invalid") from None
-        if len(content_json) > _MAX_EVENT_CONTENT_CHARS:
-            raise COTTransportError("COT event content exceeds 4096 characters")
+        if (
+            len(content_json) > _MAX_EVENT_CONTENT_CHARS
+            or len(content_bytes) > _MAX_EVENT_CONTENT_BYTES
+        ):
+            raise COTTransportError(
+                "COT event content exceeds 4096 characters or UTF-8 bytes"
+            )
         encoded.append(
             {
                 "event_type": event_type,
@@ -2333,7 +2619,9 @@ def _fit_string_to_event_content(
     if prefix_length <= 0:
         if _event_content_fits(content_builder(ellipsis)):
             return ellipsis
-        raise COTTransportError("COT event content envelope exceeds 4096 characters")
+        raise COTTransportError(
+            "COT event content envelope exceeds 4096 characters or UTF-8 bytes"
+        )
     return candidate[:prefix_length] + ellipsis
 
 
@@ -2354,7 +2642,11 @@ def _largest_fitting_prefix(
 
 def _event_content_fits(content: Mapping[str, object]) -> bool:
     try:
-        return len(_encode_event_content(content)) <= _MAX_EVENT_CONTENT_CHARS
+        encoded = _encode_event_content(content)
+        return (
+            len(encoded) <= _MAX_EVENT_CONTENT_CHARS
+            and len(encoded.encode("utf-8")) <= _MAX_EVENT_CONTENT_BYTES
+        )
     except (TypeError, ValueError, UnicodeEncodeError, RecursionError):
         return False
 
@@ -2459,4 +2751,5 @@ __all__ = [
     "COTTransportError",
     "FeishuCOTAPIClient",
     "FeishuCOTSession",
+    "FeishuCOTStream",
 ]

@@ -94,6 +94,10 @@ _COT_DEGRADED_BANNER = (
     "COT 过程通道暂不可用；完整过程已切换到主卡，"
     "任务继续执行，无需重试。"
 )
+_COT_SEGMENTED_DEGRADED_BANNER = (
+    "COT 后续过程已切换到主卡；已完成的过程分段仍保留，"
+    "任务继续执行，无需重试。"
+)
 _SYSTEM_TEXT_BLOCK_IDS = frozenset({
     "_error",
     "_cancelled",
@@ -167,6 +171,7 @@ class ProgrammingCardSession:
         self._native_process_started = False
         self._buffered_process_events: list[CardEvent] = []
         self._buffered_process_bytes = 0
+        self._sealed_process_segments = 0
         self._process_cutover_announced = False
         self._event_gate = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._terminal_fenced = False
@@ -633,10 +638,16 @@ class ProgrammingCardSession:
                     or self._buffered_process_bytes + event_bytes
                     > _PROCESS_REPLAY_MAX_BYTES
                 )
+                if replay_limit_reached and self._rollover_process_sink_locked(sink):
+                    replay_limit_reached = False
                 if replay_limit_reached:
                     handled = False
                     replayed = self._cut_over_to_card_locked(
-                        reason="replay_buffer_limit",
+                        reason=(
+                            "segment_restart_failed"
+                            if self._sealed_process_segments
+                            else "replay_buffer_limit"
+                        ),
                     )
                     sink_to_abort = sink
                     result = replayed and self._dispatch_to_card_locked(event)
@@ -683,6 +694,61 @@ class ProgrammingCardSession:
                 logger.warning("Failed to abort degraded Feishu COT", exc_info=True)
         return result
 
+    def _rollover_process_sink_locked(self, sink: object) -> bool:
+        """Commit one bounded replay segment and continue in a fresh COT.
+
+        Network work is intentionally serialized by ``_dispatch_lock``: no ACP
+        event may cross the segment boundary until the old segment is sealed
+        and the new one is accepting. A rollover happens only at the existing
+        replay safety limit, so the bounded pause is rare and deterministic.
+        """
+        if not self._buffered_process_events:
+            return False
+        rollover = getattr(sink, "rollover", None)
+        if not callable(rollover) or not bool(getattr(sink, "healthy", True)):
+            return False
+        try:
+            outcome = rollover()
+        except Exception:
+            logger.warning(
+                "Feishu COT segment rollover raised; cutting over to the card",
+                exc_info=True,
+            )
+            return False
+        if not bool(getattr(outcome, "sealed", False)):
+            return False
+
+        committed_events = len(self._buffered_process_events)
+        committed_bytes = self._buffered_process_bytes
+        replay_events = tuple(
+            event
+            for event in getattr(outcome, "replay_events", ())
+            if isinstance(event, CardEvent)
+        )
+        self._buffered_process_events = list(replay_events)
+        self._buffered_process_bytes = sum(
+            self._process_event_size(event) for event in replay_events
+        )
+        self._sealed_process_segments += 1
+        started = bool(getattr(outcome, "started", False)) and bool(
+            getattr(sink, "healthy", True)
+        )
+        if (
+            len(self._buffered_process_events) >= _PROCESS_REPLAY_MAX_EVENTS
+            or self._buffered_process_bytes >= _PROCESS_REPLAY_MAX_BYTES
+        ):
+            started = False
+        logger.info(
+            "Feishu COT process segment sealed; segment=%d events=%d bytes=%d "
+            "continuation_anchors=%d continued=%s",
+            self._sealed_process_segments,
+            committed_events,
+            committed_bytes,
+            len(replay_events),
+            started,
+        )
+        return started
+
     def _dispatch_to_card_locked(self, event: CardEvent) -> bool:
         """Reduce one event into the card while ``_dispatch_lock`` is held."""
         if self._capacity_delivery_failed:
@@ -711,10 +777,11 @@ class ProgrammingCardSession:
         self._buffered_process_bytes = 0
         logger.warning(
             "Feishu COT process sidecar degraded; reason=%s buffered_events=%d "
-            "buffered_bytes=%d",
+            "buffered_bytes=%d sealed_segments=%d",
             reason,
             len(buffered),
             buffered_bytes,
+            self._sealed_process_segments,
         )
         for buffered_event in buffered:
             if not self._dispatch_to_card_locked(buffered_event):
@@ -723,7 +790,11 @@ class ProgrammingCardSession:
             banner_event = CardEvent(
                 type=CardEventType.WARNING_UPDATED,
                 payload={
-                    "warning": _COT_DEGRADED_BANNER,
+                    "warning": (
+                        _COT_SEGMENTED_DEGRADED_BANNER
+                        if self._sealed_process_segments
+                        else _COT_DEGRADED_BANNER
+                    ),
                     "warning_type": "info",
                 },
             )

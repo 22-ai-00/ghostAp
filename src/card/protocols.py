@@ -374,6 +374,10 @@ class ProcessEventSink(Protocol):
         """Queue one supported process event; return whether it was handled."""
         ...
 
+    def rollover(self) -> "ProcessSegmentRollover":
+        """Seal the current process segment and start a continuation segment."""
+        ...
+
     def complete(self, event: "CardEvent") -> bool:
         """Close the run and its remote lifecycle for one terminal event."""
         ...
@@ -381,6 +385,19 @@ class ProcessEventSink(Protocol):
     def abort(self) -> None:
         """Best-effort close after local setup or delivery aborts."""
         ...
+
+
+class ProcessSegmentRollover(NamedTuple):
+    """Outcome of replacing one bounded native-process segment.
+
+    ``sealed`` means every event accepted by the old segment is durably visible
+    and no longer needs the card replay buffer. ``started`` means a new segment
+    is ready to accept the next event.
+    """
+
+    sealed: bool
+    started: bool
+    replay_events: tuple[object, ...] = ()
 
 
 __all__ = [
@@ -396,4 +413,5 @@ __all__ = [
     "CardAPIClient",
     "StreamBridge",
     "ProcessEventSink",
+    "ProcessSegmentRollover",
 ]

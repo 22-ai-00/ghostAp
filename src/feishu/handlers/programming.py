@@ -50,7 +50,7 @@ _BTW_EVENT_TEXT_LIMIT = 600
 _BTW_SNAPSHOT_LIMIT = 12_000
 _BTW_STARTUP_TIMEOUT_S = 30.0
 _BTW_PROMPT_TIMEOUT_S = 90
-_PROGRAMMING_COT_REQUEST_TIMEOUT_S = 2.0
+_PROGRAMMING_COT_REQUEST_TIMEOUT_S = 5.0
 _SAFE_FEISHU_APP_ID = re.compile(r"cli_[A-Za-z0-9_-]{1,256}\Z")
 
 
@@ -1254,12 +1254,13 @@ class ProgrammingModeHandler(BaseHandler):
         message_id: str,
         chat_id: str,
         input_text: str,
+        on_segment_started: Callable[[str], None] | None = None,
     ):
         """Build the optional Feishu COT sink without starting network I/O."""
         if getattr(self.settings, "feishu_cot_enabled", None) is not True:
             return None
         try:
-            from ..cot import FeishuCOTAPIClient, FeishuCOTSession
+            from ..cot import FeishuCOTAPIClient, FeishuCOTStream
 
             api = FeishuCOTAPIClient(
                 self.ctx.api_client_factory(),
@@ -1271,13 +1272,14 @@ class ProgrammingModeHandler(BaseHandler):
                 ),
                 trust_revision_provider=self._managed_card_trust_revisions,
             )
-            return FeishuCOTSession(
+            return FeishuCOTStream(
                 api,
                 chat_id=chat_id,
                 origin_message_id=message_id,
                 reply_in_thread=self.settings.default_reply_mode == "thread",
                 input_text=input_text,
                 request_timeout=_PROGRAMMING_COT_REQUEST_TIMEOUT_S,
+                on_segment_started=on_segment_started,
             )
         except Exception:
             logger.warning(
@@ -1355,10 +1357,41 @@ class ProgrammingModeHandler(BaseHandler):
             ),
             trust_revision_provider=self._managed_card_trust_revisions,
         )
+        linked_process_segments: set[str] = set()
+
+        def _link_process_segment(process_message_id: str) -> None:
+            if process_message_id in linked_process_segments:
+                return
+            linked_process_segments.add(process_message_id)
+            try:
+                rid = self.ensure_request_id(
+                    message_id,
+                    chat_id=chat_id,
+                    project_id=project_id,
+                )
+                self.ctx.message_linker.register_origin(
+                    message_id,
+                    request_id=rid,
+                    chat_id=chat_id,
+                    project_id=project_id,
+                )
+                self.ctx.message_linker.link_reply(
+                    message_id,
+                    process_message_id,
+                )
+            except Exception as exc:
+                logger.debug("link消息失败(programming COT segment): %s", exc)
+            if project:
+                try:
+                    self.register_message_project(process_message_id, project)
+                except Exception as exc:
+                    logger.debug("项目消息映射失败(programming COT segment): %s", exc)
+
         process_sink = self._create_programming_process_sink(
             message_id=message_id,
             chat_id=chat_id,
             input_text=_finalization_task_text or text,
+            on_segment_started=_link_process_segment,
         )
         try:
             delivery_timeout = max(
