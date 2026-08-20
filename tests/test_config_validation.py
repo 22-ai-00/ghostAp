@@ -419,5 +419,16 @@ class TestFeishuCOTSettings:
     def test_cot_is_enabled_by_default(self):
         assert Settings(_env_file=None).feishu_cot_enabled is True
 
+    def test_cot_uses_brief_tool_detail_by_default(self):
+        assert Settings(_env_file=None).feishu_cot_detail == "brief"
+
+    @pytest.mark.parametrize("detail", ["brief", "detailed"])
+    def test_cot_accepts_supported_tool_detail_modes(self, detail):
+        assert Settings(_env_file=None, feishu_cot_detail=detail).feishu_cot_detail == detail
+
+    def test_cot_rejects_unknown_tool_detail_mode(self):
+        with pytest.raises(ValueError):
+            Settings(_env_file=None, feishu_cot_detail="full")
+
     def test_cot_emergency_switch_can_disable_transport(self):
         assert Settings(_env_file=None, feishu_cot_enabled=False).feishu_cot_enabled is False

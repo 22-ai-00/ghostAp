@@ -28,7 +28,10 @@ from lark_oapi.core.model.base_response import BaseResponse
 
 from src.card.events import CardEvent, CardEventType
 from src.card.protocols import ProcessSegmentRollover
-from src.card.tool_display import sanitize_full_tool_event_content
+from src.card.tool_display import (
+    sanitize_full_tool_event_content,
+    summarize_tool_call_content,
+)
 from src.utils.text import sanitize_single_line_label
 
 logger = logging.getLogger(__name__)
@@ -51,7 +54,7 @@ _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 10_000
 _MAX_STREAM_CHUNK_BYTES = 4_000
 _MAX_TOOL_CONTENT_BYTES = 4_000
-_DEFAULT_FLUSH_INTERVAL = 0.3
+_DEFAULT_FLUSH_INTERVAL = 0.6
 _DEFAULT_QUEUE_CAPACITY = 256
 _DEFAULT_API_TIMEOUT_SECONDS = 35.0
 _DEFAULT_SESSION_REQUEST_TIMEOUT_SECONDS = 5.0
@@ -740,6 +743,7 @@ class FeishuCOTSession:
         origin_message_id: str | None,
         reply_in_thread: bool = False,
         input_text: str = "",
+        detail: Literal["brief", "detailed"] = "detailed",
         flush_interval: float = _DEFAULT_FLUSH_INTERVAL,
         queue_capacity: int = _DEFAULT_QUEUE_CAPACITY,
         request_timeout: float | None = None,
@@ -757,6 +761,8 @@ class FeishuCOTSession:
             raise ValueError("reply_in_thread must be bool")
         if not isinstance(input_text, str):
             raise TypeError("input_text must be str")
+        if detail not in {"brief", "detailed"}:
+            raise ValueError("detail must be 'brief' or 'detailed'")
         if (
             isinstance(flush_interval, bool)
             or not isinstance(flush_interval, (int, float))
@@ -802,6 +808,7 @@ class FeishuCOTSession:
         self._origin_message_id = origin_message_id
         self._reply_in_thread = reply_in_thread
         self._input_text = _sanitize_unicode(input_text)
+        self._detail = detail
         self._flush_interval = float(flush_interval)
         self._request_timeout = resolved_request_timeout
         self._close_timeout = resolved_close_timeout
@@ -1734,26 +1741,55 @@ class FeishuCOTSession:
                 opaque_id=block_id,
                 tool_call_id=tool_call_id,
             )
+            tool_summary = summarize_tool_call_content(
+                safe_input,
+                fallback=safe_name,
+                max_chars=160,
+            )
+            tool_call_name = safe_name
+            if (
+                self._detail == "brief"
+                and tool_summary
+                and tool_summary.casefold() != safe_name.casefold()
+            ):
+                tool_call_name = sanitize_single_line_label(
+                    f"{safe_name} · {tool_summary}",
+                    fallback=safe_name,
+                    max_chars=240,
+                )
             self._tools[block_id] = {
                 "tool_call_id": tool_call_id,
+                "tool_name": safe_name,
+                "tool_summary": tool_summary,
                 "latest": "",
                 "result_pending": False,
             }
-            return (
+            events = [
                 self._cot_event(
                     "TOOL_CALL_START",
-                    {"toolCallId": tool_call_id, "toolCallName": safe_name},
-                ),
-                self._cot_event(
-                    "TOOL_CALL_ARGS",
-                    {"toolCallId": tool_call_id, "delta": safe_input},
-                ),
+                    {
+                        "toolCallId": tool_call_id,
+                        "toolCallName": tool_call_name,
+                    },
+                )
+            ]
+            if self._detail == "detailed":
+                events.append(
+                    self._cot_event(
+                        "TOOL_CALL_ARGS",
+                        {"toolCallId": tool_call_id, "delta": safe_input},
+                    )
+                )
+            events.append(
                 self._cot_event("TOOL_CALL_END", {"toolCallId": tool_call_id}),
             )
+            return tuple(events)
         if event.type is CardEventType.TOOL_DELTA:
             state = self._tools.get(block_id)
             if state is None or block_id in self._completed_tools:
                 return None
+            if self._detail == "brief":
+                return ()
             state["latest"] = _safe_tool_content(
                 payload.get("content", ""),
                 opaque_id=block_id,
@@ -1765,18 +1801,24 @@ class FeishuCOTSession:
                 return ()
             if state is None:
                 return None
-            if event.type is CardEventType.TOOL_FAILED:
-                candidate = payload.get("error", "")
-                fallback = "Tool failed"
+            if self._detail == "brief":
+                content = _brief_tool_result(
+                    state,
+                    failed=event.type is CardEventType.TOOL_FAILED,
+                )
             else:
-                candidate = payload.get("tool_output", "")
-                fallback = "Tool completed"
-            content = _safe_tool_content(candidate, opaque_id=block_id)
-            if not content:
-                latest = state.get("latest", "")
-                content = latest if isinstance(latest, str) else ""
-            if not content:
-                content = fallback
+                if event.type is CardEventType.TOOL_FAILED:
+                    candidate = payload.get("error", "")
+                    fallback = "Tool failed"
+                else:
+                    candidate = payload.get("tool_output", "")
+                    fallback = "Tool completed"
+                content = _safe_tool_content(candidate, opaque_id=block_id)
+                if not content:
+                    latest = state.get("latest", "")
+                    content = latest if isinstance(latest, str) else ""
+                if not content:
+                    content = fallback
             state["result_pending"] = True
             tool_call_id = state.get("tool_call_id")
             if not isinstance(tool_call_id, str):
@@ -2124,6 +2166,7 @@ class FeishuCOTStream:
         origin_message_id: str | None,
         reply_in_thread: bool = False,
         input_text: str = "",
+        detail: Literal["brief", "detailed"] = "detailed",
         flush_interval: float = _DEFAULT_FLUSH_INTERVAL,
         queue_capacity: int = _DEFAULT_QUEUE_CAPACITY,
         request_timeout: float | None = None,
@@ -2145,6 +2188,7 @@ class FeishuCOTStream:
         self._origin_message_id = origin_message_id
         self._reply_in_thread = reply_in_thread
         self._input_text = input_text
+        self._detail = detail
         self._flush_interval = flush_interval
         self._queue_capacity = queue_capacity
         self._request_timeout = request_timeout
@@ -2289,6 +2333,7 @@ class FeishuCOTStream:
             origin_message_id=self._origin_message_id,
             reply_in_thread=self._reply_in_thread,
             input_text=input_text,
+            detail=self._detail,
             flush_interval=self._flush_interval,
             queue_capacity=self._queue_capacity,
             request_timeout=self._request_timeout,
@@ -2524,6 +2569,27 @@ def _safe_tool_content(value: object, *, opaque_id: str) -> str:
     safe = sanitize_full_tool_event_content(value, opaque_ids=(opaque_id,))
     safe = _sanitize_unicode(safe)
     return _truncate_utf8(safe, _MAX_TOOL_CONTENT_BYTES)
+
+
+def _brief_tool_result(
+    state: Mapping[str, object],
+    *,
+    failed: bool,
+) -> str:
+    """Render a compact tool terminal without carrying raw args or output."""
+    raw_name = state.get("tool_name", "tool")
+    name = raw_name if isinstance(raw_name, str) and raw_name else "tool"
+    raw_summary = state.get("tool_summary", "")
+    summary = raw_summary if isinstance(raw_summary, str) else ""
+    parts = ["❌" if failed else "✅", name]
+    if summary and summary.casefold() != name.casefold():
+        parts.append(summary)
+    parts.append("失败" if failed else "已完成")
+    return sanitize_single_line_label(
+        " · ".join(parts),
+        fallback="工具调用失败" if failed else "工具调用已完成",
+        max_chars=320,
+    )
 
 
 def _safe_tool_arguments(

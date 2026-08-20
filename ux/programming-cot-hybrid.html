@@ -87,6 +87,7 @@
     }
 
     .process-copy { margin: 0 0 10px; }
+    .cot-detail-note { margin: 10px 0 0; color: var(--quiet); font-size: 12px; }
     .tool-list { display: grid; gap: 7px; }
 
     .tool {
@@ -216,6 +217,7 @@
                   <span class="tool-status running">执行中</span>
                 </div>
               </div>
+              <p class="cot-detail-note">默认简略模式：保留工具动作与状态；参数、stdout/stderr 仅在 FEISHU_COT_DETAIL=detailed 时展示。</p>
             </div>
           </section>
 
@@ -347,7 +349,7 @@
     </section>
 
     <aside class="rule">
-      <strong>运输规则</strong>：主卡是任务状态的唯一事实源，COT 只是非权威的过程旁路。任务时长不会结束 COT；当前段接近可回放容量时，先正常封口，再创建“过程续接”段，已确认段不重复回放。通道不可用时只以中性状态收口 COT，将尚未确认的当前段原子回放到主卡，不重跑 ACP，也不改变主任务终态。
+      <strong>运输规则</strong>：主卡是任务状态的唯一事实源，COT 只是非权威的过程旁路。默认 brief 模式保留过程、推理、工具动作与结果状态，以 600ms 窗口合并更新；detailed 模式才附带经过清洗和限长的工具参数/输出。任务时长不会结束 COT；当前段接近可回放容量时，先正常封口，再创建“过程续接”段，已确认段不重复回放。通道不可用时只以中性状态收口 COT，将尚未确认的当前段原子回放到主卡，不重跑 ACP，也不改变主任务终态。
       <div class="legend"><span>COT 过程</span><span>卡片任务总览</span><span>卡片最终结论</span></div>
     </aside>
   </main>

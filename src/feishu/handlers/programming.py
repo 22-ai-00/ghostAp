@@ -1278,6 +1278,7 @@ class ProgrammingModeHandler(BaseHandler):
                 origin_message_id=message_id,
                 reply_in_thread=self.settings.default_reply_mode == "thread",
                 input_text=input_text,
+                detail=self.settings.feishu_cot_detail,
                 request_timeout=_PROGRAMMING_COT_REQUEST_TIMEOUT_S,
                 on_segment_started=on_segment_started,
             )

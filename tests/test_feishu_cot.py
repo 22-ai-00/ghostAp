@@ -669,6 +669,86 @@ def test_tool_failure_emits_one_error_result() -> None:
     assert "secret" not in result["content"]
 
 
+@pytest.mark.parametrize(
+    ("event_type", "terminal_payload", "expected_status"),
+    [
+        (
+            CardEventType.TOOL_DONE,
+            {"tool_output": "raw stdout must stay hidden"},
+            "已完成",
+        ),
+        (
+            CardEventType.TOOL_FAILED,
+            {"error": "raw stderr must stay hidden"},
+            "失败",
+        ),
+    ],
+)
+def test_brief_tool_detail_omits_args_and_raw_output(
+    event_type: CardEventType,
+    terminal_payload: dict[str, str],
+    expected_status: str,
+) -> None:
+    client = _RecordingClient(
+        _create_response(),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+        _empty_response(),
+    )
+    session = FeishuCOTSession(
+        _api(client, timeout_seconds=0.05),
+        chat_id=_CHAT_ID,
+        origin_message_id=_ORIGIN_ID,
+        detail="brief",
+        flush_interval=0.01,
+    )
+    session.start()
+    assert session.emit(
+        CardEvent.tool_started(
+            "brief-tool",
+            "shell",
+            '{"command":"uv run pytest tests/test_auth.py -q"}',
+        )
+    )
+    assert session.emit(
+        CardEvent.tool_delta("brief-tool", "intermediate secret output")
+    )
+    assert session.emit(
+        CardEvent(
+            type=event_type,
+            payload={"block_id": "brief-tool", **terminal_payload},
+        )
+    )
+    assert session.complete(CardEvent.completed())
+
+    batch = _request_events(client.requests[2])
+    assert [event["event_type"] for event in batch] == [
+        "TOOL_CALL_START",
+        "TOOL_CALL_END",
+        "TOOL_CALL_RESULT",
+    ]
+    start = _event_content(batch[0])
+    assert "shell" in start["toolCallName"]
+    assert "pytest tests/test_auth.py" in start["toolCallName"]
+    result = _event_content(batch[-1])
+    assert "pytest tests/test_auth.py" in result["content"]
+    assert expected_status in result["content"]
+    assert "raw stdout" not in result["content"]
+    assert "raw stderr" not in result["content"]
+    assert "intermediate secret output" not in result["content"]
+
+
+def test_cot_rejects_unknown_tool_detail_mode() -> None:
+    with pytest.raises(ValueError, match="detail"):
+        FeishuCOTSession(
+            _api(_RecordingClient()),
+            chat_id=_CHAT_ID,
+            origin_message_id=_ORIGIN_ID,
+            detail="full",  # type: ignore[arg-type]
+        )
+
+
 def test_large_text_delta_is_losslessly_chunked_into_bounded_update_requests() -> None:
     client = _RecordingClient(
         _create_response(),

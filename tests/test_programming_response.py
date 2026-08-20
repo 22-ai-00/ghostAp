@@ -1161,6 +1161,7 @@ def test_programming_handle_response_builds_channel_card_client():
 def test_programming_starts_cot_only_after_card_is_visible_and_links_both_messages():
     handler = _make_handler()
     handler.settings.feishu_cot_enabled = True
+    handler.settings.feishu_cot_detail = "brief"
     handler.settings.default_reply_mode = "thread"
     handler.ctx.channel_client_factory = MagicMock(return_value=object())
     session = _QueuedPromptSession(_completed_result())
@@ -1215,6 +1216,7 @@ def test_programming_starts_cot_only_after_card_is_visible_and_links_both_messag
         origin_message_id="msg-cot-success",
         reply_in_thread=True,
         input_text="raw user task",
+        detail="brief",
         request_timeout=5.0,
         on_segment_started=ANY,
     )

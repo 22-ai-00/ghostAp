@@ -92,6 +92,14 @@ class Settings(BaseSettings):
             "unsupported tenants fall back to the existing streaming card."
         ),
     )
+    feishu_cot_detail: Literal["brief", "detailed"] = Field(
+        default="brief",
+        description=(
+            "Tool detail carried by Feishu COT process messages. Brief keeps "
+            "tool actions and terminal status without raw arguments/output; "
+            "detailed includes sanitized bounded arguments and output."
+        ),
+    )
 
     # ACP session history directory (empty = default ~/.ghostap/acp_history)
     acp_history_dir: str = ""
