@@ -143,6 +143,66 @@ def test_generic_model_probe_uses_late_frame_tolerant_queue(
     asyncio.run(publish_after_close())
 
 
+def test_traex_probe_prefers_config_catalog_over_active_model_sentinel(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    class Connection:
+        async def initialize(self, protocol_version: int = 1) -> None:
+            assert protocol_version == 1
+
+        async def new_session(self, cwd: str):
+            assert cwd == str(tmp_path)
+            return SimpleNamespace(
+                models=SimpleNamespace(
+                    current_model_id="TraeX active model",
+                    available_models=(
+                        SimpleNamespace(
+                            model_id="TraeX active model",
+                            name="TraeX active model",
+                            description="Current model only",
+                        ),
+                    ),
+                ),
+                config_options=(
+                    SimpleNamespace(
+                        root=SimpleNamespace(
+                            id="model",
+                            category="model",
+                            current_value="model-b",
+                            options=(
+                                SimpleNamespace(
+                                    value="model-a",
+                                    name="Model A",
+                                    description="First model",
+                                ),
+                                SimpleNamespace(
+                                    value="model-b",
+                                    name="Model B",
+                                    description="Second model",
+                                ),
+                            ),
+                        )
+                    ),
+                ),
+            )
+
+    @asynccontextmanager
+    async def spawn(*_args, **_kwargs):
+        yield Connection(), object()
+
+    provider = SimpleNamespace(get_serve_command=lambda _model: ("traex", []))
+    monkeypatch.setattr(helper, "get_providers", lambda: {"traex": provider})
+    monkeypatch.setattr(helper, "spawn_agent_process", spawn)
+    monkeypatch.setattr(helper, "load_traex_model_metadata", lambda: ())
+
+    models = asyncio.run(helper._probe_acp_models("traex", str(tmp_path)))
+
+    assert [model.name for model in models] == ["model-a", "model-b"]
+    assert [model.is_default for model in models] == [False, True]
+    assert "TraeX active model" not in {model.name for model in models}
+
+
 def test_coco_model_probe_uses_late_frame_tolerant_queue(
     monkeypatch,
 ) -> None:

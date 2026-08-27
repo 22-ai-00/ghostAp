@@ -573,13 +573,18 @@ async def _probe_acp_models(
             return await discover_codex_model_options(connection, response)
         if tool_name == "dsh":
             return await discover_dsh_model_options(connection, response)
-        models = _response_models(response, None)
         if tool_name == "traex":
+            # Traex applies model changes through ``session/set_config_option``.
+            # Some adapter versions also expose the older ``models`` state but
+            # populate it with only a synthetic "TraeX active model" entry.
+            # Prefer the catalog attached to the authoritative config option so
+            # that this compatibility sentinel cannot hide the real choices.
+            models = _config_models(response, "") or _response_models(response, None)
             return build_traex_model_options(
                 models,
                 load_traex_model_metadata(),
             )
-        return models
+        return _response_models(response, None)
 
 
 def _probe_blocking(
