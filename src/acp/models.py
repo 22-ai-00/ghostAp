@@ -132,6 +132,11 @@ class ACPEvent:
     tool_call: Optional[ToolCallInfo] = None
     plan: Optional[PlanInfo] = None
     source_id: Optional[str] = None
+    # Agent-message identity and final-answer semantics are optional ACP
+    # extensions.  They remain separate from source_id: one identifies a
+    # streamed message, while the other identifies a concurrent agent/task.
+    message_id: Optional[str] = None
+    codex_message_phase: Optional[str] = None
     timestamp: float = field(default_factory=time.time)
 
 

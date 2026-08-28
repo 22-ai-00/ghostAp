@@ -211,6 +211,10 @@ class ProgrammingCardSession:
         # Text batching state
         self._pending_text_by_block: dict[str, str] = {}
         self._main_text_transcript: list[tuple[str, str]] = []
+        # Codex marks its public terminal message separately from process
+        # commentary. Hold that trusted message for the result card instead
+        # of sending it through the COT process stream.
+        self._trusted_final_answer: tuple[str, str] | None = None
         self._flush_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._flush_lock_holder = threading.local()  # per-thread flag for lock ownership assertion
         self._flush_timer: threading.Timer | None = None
@@ -329,6 +333,9 @@ class ProgrammingCardSession:
             text = card_event.payload.get("text", "")
             if text:
                 source_key = self._source_key(acp_event)
+                if self._is_trusted_main_final_answer(acp_event, source_key):
+                    self._record_trusted_final_answer(acp_event, text)
+                    return
                 if self._active_reasoning_sources:
                     # CardState can reopen one reasoning block after a text
                     # interlude, but AG-UI/COT reasoning message IDs are
@@ -492,6 +499,10 @@ class ProgrammingCardSession:
             self._close_reasoning_blocks()
         self._finish_agent_summaries(terminal_status=subagent_status)
         self._terminal_fenced = True
+        # A provider explicitly classified this as public final output.  Keep
+        # it visible even if transport/finalization later reports failure or
+        # cancellation; the terminal card state still conveys that status.
+        publish_trusted_final = self._has_trusted_final_answer()
         if self._native_process_started:
             completed = False
             try:
@@ -506,7 +517,8 @@ class ProgrammingCardSession:
             if completed:
                 self._buffered_process_events.clear()
                 self._buffered_process_bytes = 0
-                self._publish_conclusion_to_card()
+                if not publish_trusted_final:
+                    self._publish_conclusion_to_card()
             else:
                 logger.warning(
                     "Feishu COT terminal delivery failed; replaying process into the card"
@@ -521,6 +533,8 @@ class ProgrammingCardSession:
                             "Failed to abort degraded Feishu COT",
                             exc_info=True,
                         )
+        if publish_trusted_final:
+            self._publish_conclusion_to_card()
         self._dispatch_event(event, route_process=False)
         self._stop_ticker()
 
@@ -604,9 +618,14 @@ class ProgrammingCardSession:
             )
 
     def get_conclusion_text(self) -> str:
-        """Return the last non-empty main-Agent block used as the conclusion."""
+        """Return trusted final output, falling back to the final main text block."""
         self._flush_now()
         with self._flush_lock:
+            if (
+                self._trusted_final_answer is not None
+                and self._trusted_final_answer[1].strip()
+            ):
+                return self._trusted_final_answer[1]
             return next(
                 (
                     content
@@ -617,7 +636,7 @@ class ProgrammingCardSession:
             )
 
     def _publish_conclusion_to_card(self) -> None:
-        """Project only the terminal main-Agent block into the result card."""
+        """Project the selected terminal conclusion into the result card."""
         conclusion = self.get_conclusion_text()
         if not conclusion:
             return
@@ -1287,6 +1306,45 @@ class ProgrammingCardSession:
                 )
             else:
                 self._main_text_transcript.append((block_id, text.lstrip("\n")))
+
+    def _is_trusted_main_final_answer(
+        self,
+        acp_event: "ACPEvent",
+        source_key: str,
+    ) -> bool:
+        """Accept only the Codex bridge's public final-message marker."""
+        return (
+            source_key == "main"
+            and getattr(acp_event, "codex_message_phase", None) == "final_answer"
+        )
+
+    def _record_trusted_final_answer(self, acp_event: "ACPEvent", text: str) -> None:
+        """Accumulate one trusted final agent message without exposing it to COT."""
+        raw_message_id = getattr(acp_event, "message_id", None)
+        message_id = raw_message_id.strip() if isinstance(raw_message_id, str) else ""
+        with self._flush_lock:
+            if (
+                self._trusted_final_answer is not None
+                and self._trusted_final_answer[0] == message_id
+            ):
+                self._trusted_final_answer = (
+                    message_id,
+                    append_stream_text(self._trusted_final_answer[1], text),
+                )
+            else:
+                self._trusted_final_answer = (message_id, text.lstrip("\n"))
+            # The process projection deliberately omits the public final
+            # message, but callers use the transcript for fallback delivery
+            # after a timeout or transport error.  Retain its true stream
+            # position there without creating a visible process/card block.
+            self._record_main_text(f"_trusted_final_answer:{message_id}", text)
+
+    def _has_trusted_final_answer(self) -> bool:
+        with self._flush_lock:
+            return bool(
+                self._trusted_final_answer is not None
+                and self._trusted_final_answer[1].strip()
+            )
 
     def _is_main_source(self, source_key: str) -> bool:
         return source_key == "main" or source_key not in self._agent_summaries

@@ -1822,7 +1822,12 @@ class ProgrammingModeHandler(BaseHandler):
                 else result_text or streamed_response
             )
             if prompt_outcome is PromptOutcome.COMPLETED:
-                if prog_session is not None and not streamed_response and result_text:
+                if (
+                    prog_session is not None
+                    and not streamed_response
+                    and result_text
+                    and not prog_session.get_conclusion_text().strip()
+                ):
                     prog_session.on_text(result_text)
                 final_response = response_text or UI_TEXT["mode_exec_complete"]
                 if prog_session is not None:
@@ -1841,6 +1846,10 @@ class ProgrammingModeHandler(BaseHandler):
                         )
                     else:
                         prog_session.finish()
+                    final_response = (
+                        prog_session.get_conclusion_text().strip()
+                        or final_response
+                    )
             elif prompt_outcome is PromptOutcome.CANCELLED:
                 terminal_notice = UI_TEXT["mode_exec_cancelled_msg"].format(
                     reason=assessment.detail,

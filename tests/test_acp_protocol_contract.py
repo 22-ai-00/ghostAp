@@ -216,7 +216,16 @@ class TestACPEventContract:
     def test_required_fields_exist(self) -> None:
         """ACPEvent must have the documented field set."""
         field_names = {f.name for f in fields(ACPEvent)}
-        expected = {"event_type", "text", "tool_call", "plan", "source_id", "timestamp"}
+        expected = {
+            "event_type",
+            "text",
+            "tool_call",
+            "plan",
+            "source_id",
+            "message_id",
+            "codex_message_phase",
+            "timestamp",
+        }
         assert expected <= field_names
 
     def test_minimal_construction(self) -> None:
@@ -227,6 +236,8 @@ class TestACPEventContract:
         assert event.tool_call is None
         assert event.plan is None
         assert event.source_id is None
+        assert event.message_id is None
+        assert event.codex_message_phase is None
         assert isinstance(event.timestamp, float)
 
 

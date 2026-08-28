@@ -112,6 +112,7 @@ _MARKDOWN_IMAGE_TARGET_RE = re.compile(
     r"""!\[[^\]\r\n]*\]\((?P<target>[^)\r\n]+)\)""",
     re.IGNORECASE,
 )
+_CODEX_MESSAGE_PHASES = frozenset({"commentary", "final_answer"})
 
 
 @dataclass(eq=False)
@@ -873,6 +874,30 @@ def _codex_namespaced_metadata(update: Any) -> tuple[dict, dict, bool]:
     )
 
 
+def _parse_codex_message_metadata(
+    update: AgentMessageChunk,
+) -> tuple[str | None, str | None]:
+    """Keep only the trusted Codex phase used to identify final user output."""
+    raw_message_id = getattr(update, "message_id", None)
+    if raw_message_id is None:
+        raw_message_id = getattr(update, "messageId", None)
+    message_id = (
+        raw_message_id.strip()
+        if isinstance(raw_message_id, str) and raw_message_id.strip()
+        else None
+    )
+
+    meta = getattr(update, "field_meta", None) or getattr(update, "_meta", None)
+    if not isinstance(meta, Mapping):
+        return message_id, None
+    codex = meta.get("codex")
+    if not isinstance(codex, Mapping):
+        return message_id, None
+    raw_phase = codex.get("phase")
+    phase = raw_phase.strip().casefold() if isinstance(raw_phase, str) else ""
+    return message_id, phase if phase in _CODEX_MESSAGE_PHASES else None
+
+
 def _parse_subagent_metadata(update: Any) -> tuple[str, str, str]:
     """Extract the stable child thread, display path, and lifecycle activity."""
     subagent, _, _ = _codex_namespaced_metadata(update)
@@ -1396,11 +1421,19 @@ class GhostAPClient(Client):
     ) -> None:
         content = update.content
         if isinstance(content, TextContentBlock):
+            message_id = None
+            codex_message_phase = None
+            if isinstance(update, AgentMessageChunk):
+                message_id, codex_message_phase = _parse_codex_message_metadata(
+                    update
+                )
             self._on_event(
                 ACPEvent(
                     event_type=event_type,
                     text=content.text,
                     source_id=_extract_update_source_id(update),
+                    message_id=message_id,
+                    codex_message_phase=codex_message_phase,
                 )
             )
         elif image := _parse_acp_image_content(

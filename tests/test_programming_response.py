@@ -90,6 +90,9 @@ class _FakeProgrammingCardSession:
     def get_final_text(self):
         return getattr(self, "final_text", "")
 
+    def get_conclusion_text(self):
+        return getattr(self, "conclusion_text", self.get_final_text())
+
     def finish(self, **kwargs):
         self.finished = True
         self.finish_kwargs = kwargs
@@ -722,6 +725,54 @@ def test_streaming_pending_plan_continues_on_same_session_and_finishes():
     assert adapter.failed_text is None
     assert callable(adapter.kwargs["session_factory"])
     assert adapter.kwargs["continuation_visibility_timeout"] >= 2.0
+
+
+def test_streaming_completion_persists_the_main_card_conclusion() -> None:
+    handler = _make_handler()
+    handler.ctx.channel_client_factory = MagicMock(return_value=object())
+    handler._update_snapshot_on_project = MagicMock()
+    project = MagicMock()
+    project.project_name = "ghostAp"
+    project.root_path = "/tmp/ghostAp"
+    project.project_id = "project-1"
+    session = _QueuedPromptSession(_completed_result("对账状态文本"))
+
+    class _ConclusionProgrammingCardSession(_FakeProgrammingCardSession):
+        def __init__(self, *_args, **kwargs):
+            super().__init__(*_args, **kwargs)
+            self.on_text_calls = 0
+
+        def on_text(self, text):
+            self.on_text_calls += 1
+            super().on_text(text)
+
+        def get_conclusion_text(self):
+            return "主卡权威结论"
+
+    with _streaming_environment(_ConclusionProgrammingCardSession):
+        handler.handle_response(
+            "msg-main-conclusion",
+            "chat-1",
+            "finish",
+            session,
+            project,
+            "/tmp",
+            "/tmp",
+        )
+
+    assistant_conversation = next(
+        call.args[1]
+        for call in project.add_conversation.call_args_list
+        if call.args[0] == "assistant"
+    )
+    assert assistant_conversation == "主卡权威结论"
+    assert _ConclusionProgrammingCardSession.last.on_text_calls == 0
+    assistant_context = next(
+        call.kwargs["conversation"]
+        for call in handler.context_manager.update_context.call_args_list
+        if call.kwargs["conversation"]["role"] == "assistant"
+    )
+    assert assistant_context["content"] == "主卡权威结论"
 
 
 def test_streaming_retries_pending_plan_three_times_then_reports_incomplete():

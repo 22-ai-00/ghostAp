@@ -393,6 +393,168 @@ def test_cot_keeps_plan_on_card_and_publishes_only_terminal_conclusion() -> None
         programming.abort()
 
 
+@pytest.mark.parametrize("complete_mode", [None, "return_false"])
+def test_cot_holds_codex_final_message_for_main_card(
+    complete_mode: str | None,
+) -> None:
+    """A trusted final answer bypasses COT and survives a status-only tail."""
+    sink = _ProcessSink()
+    sink.complete_mode = complete_mode
+    _, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.THOUGHT_CHUNK,
+                text="结论：这段内部推理绝不能被提升到主卡。",
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="过程说明。",
+                message_id="commentary-1",
+                codex_message_phase="commentary",
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="真正",
+                message_id="final-1",
+                codex_message_phase="final_answer",
+            )
+        )
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="结论",
+                message_id="final-1",
+                codex_message_phase="final_answer",
+            )
+        )
+        # A child may also emit a final_answer phase, but it is not the parent
+        # answer. Keep only the main source's explicitly marked message.
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="子代理结论",
+                source_id="child-1",
+                message_id="child-final-1",
+                codex_message_phase="final_answer",
+            )
+        )
+        programming.begin_continuation_turn()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="子代理状态对账完成；此前结论保持不变。",
+                message_id="commentary-2",
+                codex_message_phase="commentary",
+            )
+        )
+        programming._flush_now()
+
+        cot_text = "".join(
+            str(event.payload.get("text", ""))
+            for event in sink.events
+            if event.type is CardEventType.TEXT_DELTA
+        )
+        assert "过程说明" in cot_text
+        assert "子代理状态对账完成" in cot_text
+        assert "真正结论" not in cot_text
+
+        programming.finish()
+
+        assert card_session.state is not None
+        text_blocks = [
+            block
+            for block in card_session.state.blocks
+            if isinstance(block, TextBlock)
+        ]
+        final_answer = next(
+            block.content
+            for block in text_blocks
+            if block.block_id == "_final_answer"
+        )
+        assert final_answer == "真正结论"
+        assert "内部推理" not in final_answer
+        assert "子代理结论" not in final_answer
+    finally:
+        programming.abort()
+
+
+def test_codex_final_message_reaches_main_card_without_cot() -> None:
+    """The public final answer is not lost when native COT is unavailable."""
+    _, card_session, programming = _programming_session()
+
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="主卡最终答复",
+                message_id="final-without-cot",
+                codex_message_phase="final_answer",
+            )
+        )
+        assert programming.get_final_text() == "主卡最终答复"
+
+        programming.finish()
+
+        assert card_session.state is not None
+        assert any(
+            isinstance(block, TextBlock)
+            and block.block_id == "_final_answer"
+            and block.content == "主卡最终答复"
+            for block in card_session.state.blocks
+        )
+    finally:
+        programming.abort()
+
+
+@pytest.mark.parametrize(
+    ("terminal", "expected_terminal"),
+    [("fail", "failed"), ("cancel", "cancelled")],
+)
+def test_codex_final_message_survives_noncompleted_terminal(
+    terminal: str,
+    expected_terminal: str,
+) -> None:
+    """A public final message remains visible if later finalization fails."""
+    _, card_session, programming = _programming_session()
+
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="已公开的终答",
+                message_id="final-before-terminal-error",
+                codex_message_phase="final_answer",
+            )
+        )
+
+        if terminal == "fail":
+            programming.fail("后续收尾失败")
+        else:
+            programming.cancel(reason="用户取消")
+
+        assert card_session.state is not None
+        assert card_session.state.terminal == expected_terminal
+        assert any(
+            isinstance(block, TextBlock)
+            and block.block_id == "_final_answer"
+            and block.content == "已公开的终答"
+            for block in card_session.state.blocks
+        )
+    finally:
+        programming.abort()
+
+
 def test_cot_normalizes_missing_tool_start_without_cutting_over_main_card() -> None:
     """A summarized child tool must not make native COT abandon its process view."""
     cot_client = _COTRecordingClient()

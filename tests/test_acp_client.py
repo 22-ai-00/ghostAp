@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from acp.schema import SessionInfoUpdate
+from acp.schema import AgentMessageChunk, AgentThoughtChunk, SessionInfoUpdate
 
 from src.acp.client import GhostAPClient, _parse_plan, _parse_tool_call
 from src.acp.helper import SessionKeyCodec
@@ -27,6 +27,28 @@ def _session_info_update(codex: dict) -> SessionInfoUpdate:
         {
             "sessionUpdate": "session_info_update",
             "_meta": {"codex": codex},
+        }
+    )
+
+
+def _text_chunk(
+    chunk_type: type[AgentMessageChunk] | type[AgentThoughtChunk],
+    *,
+    text: str,
+    message_id: str,
+    phase: str,
+):
+    session_update = (
+        "agent_message_chunk"
+        if chunk_type is AgentMessageChunk
+        else "agent_thought_chunk"
+    )
+    return chunk_type.model_validate(
+        {
+            "sessionUpdate": session_update,
+            "content": {"type": "text", "text": text},
+            "messageId": message_id,
+            "_meta": {"codex": {"phase": phase}},
         }
     )
 
@@ -117,6 +139,60 @@ def test_codex_goal_session_info_is_control_plane_not_render_event(
     assert info.goal.control_method == "_codex/session/goal_control"
     assert info.thread_status_known is True
     assert info.thread_status == "active"
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_phase"),
+    [("commentary", "commentary"), ("final_answer", "final_answer"), ("unknown", None)],
+)
+def test_codex_agent_message_preserves_only_allowlisted_phase(
+    tmp_path: Path,
+    phase: str,
+    expected_phase: str | None,
+) -> None:
+    events: list[ACPEvent] = []
+    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
+
+    asyncio.run(
+        client.session_update(
+            "session-message",
+            _text_chunk(
+                AgentMessageChunk,
+                text="public message",
+                message_id="message-final-1",
+                phase=phase,
+            ),
+        )
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type.name == "TEXT_CHUNK"
+    assert event.message_id == "message-final-1"
+    assert event.codex_message_phase == expected_phase
+
+
+def test_codex_thought_never_carries_final_answer_marker(tmp_path: Path) -> None:
+    events: list[ACPEvent] = []
+    client = GhostAPClient(on_event=events.append, root_dir=str(tmp_path))
+
+    asyncio.run(
+        client.session_update(
+            "session-thought",
+            _text_chunk(
+                AgentThoughtChunk,
+                text="结论：这仍是内部推理",
+                message_id="thought-final-1",
+                phase="final_answer",
+            ),
+        )
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type.name == "THOUGHT_CHUNK"
+    assert event.message_id is None
+    assert event.codex_message_phase is None
 
 
 @pytest.mark.parametrize("status", ["paused", "completed"])
