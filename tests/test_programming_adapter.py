@@ -1,7 +1,12 @@
 """programming_adapter SectionLayout integration tests."""
 from __future__ import annotations
 
+import json
+import threading
+
 import pytest
+from lark_oapi.core.model.base_response import BaseResponse
+from lark_oapi.core.model.raw_response import RawResponse
 
 from src.acp.models import (
     ACPEvent,
@@ -31,6 +36,7 @@ from src.card.state.models import (
     ToolBlock,
 )
 from src.card.state.runtime_stats import RuntimeStats
+from src.feishu.cot import FeishuCOTAPIClient, FeishuCOTStream
 
 
 class _CardClient:
@@ -119,6 +125,110 @@ class _ProcessSink:
         self.started = False
 
 
+class _COTRecordingClient:
+    """Return valid COT API responses while retaining the real wire requests."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.requests: list[object] = []
+
+    def request(self, request: object) -> BaseResponse:
+        with self._lock:
+            self.requests.append(request)
+        uri = getattr(request, "uri", "")
+        body = getattr(request, "body", None)
+        data: dict[str, str] = {}
+        if (
+            uri == "/open-apis/im/v1/message_cot"
+            and isinstance(body, dict)
+            and "receive_id" in body
+        ):
+            data = {
+                "cot_id": "cot_adapter_lifecycle",
+                "message_id": "om_adapter_lifecycle",
+            }
+        response = BaseResponse()
+        response.code = 0
+        response.raw = RawResponse()
+        response.raw.status_code = 200
+        response.raw.content = json.dumps(
+            {"code": 0, "msg": "success", "data": data},
+        ).encode("utf-8")
+        return response
+
+
+def _cot_wire_event_types(client: _COTRecordingClient) -> list[str]:
+    event_types: list[str] = []
+    for request in client.requests:
+        body = getattr(request, "body", None)
+        if not isinstance(body, dict):
+            continue
+        events = body.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if isinstance(event, dict) and isinstance(event.get("event_type"), str):
+                event_types.append(event["event_type"])
+    return event_types
+
+
+def _cot_wire_contents(client: _COTRecordingClient) -> list[dict[str, object]]:
+    contents: list[dict[str, object]] = []
+    for request in client.requests:
+        body = getattr(request, "body", None)
+        if not isinstance(body, dict):
+            continue
+        events = body.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            raw_content = event.get("content")
+            if not isinstance(raw_content, str):
+                continue
+            content = json.loads(raw_content)
+            if isinstance(content, dict):
+                contents.append(content)
+    return contents
+
+
+def _cot_wire_events(
+    client: _COTRecordingClient,
+) -> list[tuple[str, dict[str, object]]]:
+    events_with_contents: list[tuple[str, dict[str, object]]] = []
+    for request in client.requests:
+        body = getattr(request, "body", None)
+        if not isinstance(body, dict):
+            continue
+        events = body.get("events")
+        if not isinstance(events, list):
+            continue
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("event_type")
+            raw_content = event.get("content")
+            if not isinstance(event_type, str) or not isinstance(raw_content, str):
+                continue
+            content = json.loads(raw_content)
+            if isinstance(content, dict):
+                events_with_contents.append((event_type, content))
+    return events_with_contents
+
+
+def _cot_request_json(client: _COTRecordingClient) -> str:
+    return "\n".join(
+        json.dumps(
+            getattr(request, "body", None),
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        for request in client.requests
+    )
+
+
 def _programming_session(
     *,
     process_sink: _ProcessSink | None = None,
@@ -148,12 +258,14 @@ def _tool_event(
     *,
     status: str,
     content: str,
+    tool_id: str = "tool-1",
+    title: str = "Read",
 ) -> ACPEvent:
     return ACPEvent(
         event_type=event_type,
         tool_call=ToolCallInfo(
-            id="tool-1",
-            title="Read",
+            id=tool_id,
+            title=title,
             kind="read",
             status=status,
             content=content,
@@ -277,6 +389,435 @@ def test_cot_keeps_plan_on_card_and_publishes_only_terminal_conclusion() -> None
         )
         assert card_session.state.terminal == "completed"
         assert [event.type for event in sink.completed] == [CardEventType.COMPLETED]
+    finally:
+        programming.abort()
+
+
+def test_cot_normalizes_missing_tool_start_without_cutting_over_main_card() -> None:
+    """A summarized child tool must not make native COT abandon its process view."""
+    cot_client = _COTRecordingClient()
+    sink = FeishuCOTStream(
+        FeishuCOTAPIClient(cot_client, timeout_seconds=0.2),
+        chat_id="oc_adapter_cot",
+        origin_message_id="om_adapter_origin",
+        input_text="验证缺失工具开始帧",
+        detail="detailed",
+        flush_interval=0.005,
+        request_timeout=0.2,
+    )
+    client, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+
+        # Some providers summarize away TOOL_STARTED, then resume the normal
+        # process feed at UPDATE/DONE.  The adapter must synthesize the missing
+        # start before handing either atom to the strict native COT lifecycle.
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_UPDATE,
+                status="in_progress",
+                content="正在读取契约",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_DONE,
+                status="completed",
+                content="契约读取完成",
+            )
+        )
+
+        assert sink.started is True
+        assert sink.healthy is True
+        assert programming._native_process_started is True
+        assert programming._process_cutover_announced is False
+        assert card_session.state is not None
+        assert card_session.state.footer.warning_banner is None
+        assert not any(
+            "完整过程已切换到主卡" in str(card)
+            for card in client.updated_cards
+        )
+
+        programming.on_text("后续过程仍由 COT 记录")
+        programming._flush_now()
+        programming.finish()
+
+        assert card_session.state is not None
+        assert card_session.state.terminal == "completed"
+        assert card_session.state.footer.warning_banner is None
+        assert any(
+            isinstance(block, TextBlock)
+            and block.block_id == "_final_answer"
+            and block.content == "后续过程仍由 COT 记录"
+            for block in card_session.state.blocks
+        )
+
+        wire_types = _cot_wire_event_types(cot_client)
+        tool_start = wire_types.index("TOOL_CALL_START")
+        tool_result = wire_types.index("TOOL_CALL_RESULT")
+        assert wire_types[tool_start:tool_result + 1] == [
+            "TOOL_CALL_START",
+            "TOOL_CALL_ARGS",
+            "TOOL_CALL_END",
+            "TOOL_CALL_RESULT",
+        ]
+        assert "TEXT_MESSAGE_CONTENT" in wire_types
+        assert any(
+            content.get("status") == "done"
+            for content in _cot_wire_contents(cot_client)
+        )
+    finally:
+        programming.abort()
+
+
+def test_card_keeps_reused_provider_tool_ids_as_distinct_tool_blocks() -> None:
+    """A provider's recycled raw ID still identifies two logical card tools."""
+    raw_tool_id = "provider-raw-tool-id-9b3c"
+    _, card_session, programming = _programming_session()
+
+    try:
+        programming.start()
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_START,
+                status="in_progress",
+                content=f"first-input marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read first",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_DONE,
+                status="completed",
+                content=f"first-result marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read first",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_START,
+                status="in_progress",
+                content=f"second-input marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read second",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_UPDATE,
+                status="in_progress",
+                content=f"second-update marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read second",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_DONE,
+                status="completed",
+                content=f"second-result marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read second",
+            )
+        )
+        programming.finish()
+
+        assert card_session.state is not None
+        assert card_session.state.terminal == "completed"
+        tool_blocks = [
+            block
+            for block in card_session.state.blocks
+            if isinstance(block, ToolBlock)
+        ]
+        assert len(tool_blocks) == 2
+        assert len({block.block_id for block in tool_blocks}) == 2
+        assert raw_tool_id not in {block.block_id for block in tool_blocks}
+        assert [block.tool_name for block in tool_blocks] == [
+            "Read first",
+            "Read second",
+        ]
+        assert all(block.status == "completed" for block in tool_blocks)
+        assert "first-result marker" in str(tool_blocks[0].tool_output)
+        assert "second-result marker" in str(tool_blocks[1].tool_output)
+    finally:
+        programming.abort()
+
+
+def test_native_cot_rekeys_reused_provider_tool_ids_without_cutover_or_leak() -> None:
+    """Native COT must isolate recycled provider IDs and redact their raw form."""
+    raw_tool_id = "provider-raw-tool-id-9b3c"
+    cot_client = _COTRecordingClient()
+    sink = FeishuCOTStream(
+        FeishuCOTAPIClient(cot_client, timeout_seconds=0.2),
+        chat_id="oc_adapter_reused_tool",
+        origin_message_id="om_adapter_reused_tool",
+        input_text="验证重复工具标识",
+        detail="detailed",
+        flush_interval=0.005,
+        request_timeout=0.2,
+    )
+    client, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_START,
+                status="in_progress",
+                content=f"first-input marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title=f"Read first {raw_tool_id}",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_DONE,
+                status="completed",
+                content=f"first-result marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title=f"Read first {raw_tool_id}",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_START,
+                status="in_progress",
+                content=f"second-input marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title=f"Read second {raw_tool_id}",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_UPDATE,
+                status="in_progress",
+                content=f"second-update marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title=f"Read second {raw_tool_id}",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_DONE,
+                status="completed",
+                content=f"second-result marker raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title=f"Read second {raw_tool_id}",
+            )
+        )
+
+        assert sink.started is True
+        assert sink.healthy is True
+        assert programming._native_process_started is True
+        assert programming._process_cutover_announced is False
+        assert card_session.state is not None
+        assert card_session.state.footer.warning_banner is None
+        assert not any(
+            "完整过程已切换到主卡" in str(card)
+            for card in client.updated_cards
+        )
+
+        programming.finish()
+
+        assert card_session.state is not None
+        assert card_session.state.terminal == "completed"
+        assert card_session.state.footer.warning_banner is None
+        wire_events = _cot_wire_events(cot_client)
+        start_ids: list[str] = []
+        result_ids: list[str] = []
+        for event_type, content in wire_events:
+            if event_type == "TOOL_CALL_START":
+                tool_call_id = content.get("toolCallId")
+                assert isinstance(tool_call_id, str)
+                start_ids.append(tool_call_id)
+            if event_type == "TOOL_CALL_RESULT":
+                tool_call_id = content.get("toolCallId")
+                assert isinstance(tool_call_id, str)
+                result_ids.append(tool_call_id)
+
+        assert len(start_ids) == 2
+        assert len(set(start_ids)) == 2
+        assert len(result_ids) == 2
+        assert set(result_ids) == set(start_ids)
+        assert raw_tool_id not in _cot_request_json(cot_client)
+        assert any(
+            content.get("status") == "done"
+            for content in _cot_wire_contents(cot_client)
+        )
+    finally:
+        programming.abort()
+
+
+def test_native_cot_ignores_late_frames_after_a_closed_tool_invocation() -> None:
+    """DONE/DONE/UPDATE after one invocation must not create a phantom result."""
+    raw_tool_id = "provider-raw-tool-id-late-4e2a"
+    cot_client = _COTRecordingClient()
+    sink = FeishuCOTStream(
+        FeishuCOTAPIClient(cot_client, timeout_seconds=0.2),
+        chat_id="oc_adapter_late_tool",
+        origin_message_id="om_adapter_late_tool",
+        input_text="验证迟到工具帧",
+        detail="detailed",
+        flush_interval=0.005,
+        request_timeout=0.2,
+    )
+    client, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_START,
+                status="in_progress",
+                content=f"initial-input raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read once",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_DONE,
+                status="completed",
+                content=f"initial-result raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read once",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_DONE,
+                status="completed",
+                content=f"late-terminal raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read once",
+            )
+        )
+        programming.on_event(
+            _tool_event(
+                ACPEventType.TOOL_CALL_UPDATE,
+                status="in_progress",
+                content=f"late-update raw={raw_tool_id}",
+                tool_id=raw_tool_id,
+                title="Read once",
+            )
+        )
+
+        assert sink.started is True
+        assert sink.healthy is True
+        assert programming._process_cutover_announced is False
+        assert card_session.state is not None
+        assert card_session.state.footer.warning_banner is None
+        assert not any(
+            "完整过程已切换到主卡" in str(card)
+            for card in client.updated_cards
+        )
+
+        programming.finish()
+
+        wire_types = _cot_wire_event_types(cot_client)
+        assert wire_types.count("TOOL_CALL_START") == 1
+        assert wire_types.count("TOOL_CALL_RESULT") == 1
+        assert raw_tool_id not in _cot_request_json(cot_client)
+    finally:
+        programming.abort()
+
+
+def test_cot_reopens_reasoning_after_text_without_cutting_over_main_card() -> None:
+    """Text between thoughts must start a fresh strict-COT reasoning lifecycle."""
+    cot_client = _COTRecordingClient()
+    sink = FeishuCOTStream(
+        FeishuCOTAPIClient(cot_client, timeout_seconds=0.2),
+        chat_id="oc_adapter_reasoning",
+        origin_message_id="om_adapter_reasoning",
+        input_text="验证推理续接",
+        detail="detailed",
+        flush_interval=0.005,
+        request_timeout=0.2,
+    )
+    client, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+
+        programming.on_event(
+            ACPEvent(event_type=ACPEventType.THOUGHT_CHUNK, text="先检查边界")
+        )
+        programming.on_event(
+            ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="中间正文")
+        )
+        programming.on_event(
+            ACPEvent(event_type=ACPEventType.THOUGHT_CHUNK, text="再检查终态")
+        )
+
+        assert sink.started is True
+        assert sink.healthy is True
+        assert programming._native_process_started is True
+        assert programming._process_cutover_announced is False
+        assert card_session.state is not None
+        assert card_session.state.footer.warning_banner is None
+        assert not any(
+            "完整过程已切换到主卡" in str(card)
+            for card in client.updated_cards
+        )
+
+        programming.finish()
+
+        assert card_session.state is not None
+        assert card_session.state.terminal == "completed"
+        assert card_session.state.footer.warning_banner is None
+        assert any(
+            isinstance(block, TextBlock)
+            and block.block_id == "_final_answer"
+            and block.content == "中间正文"
+            for block in card_session.state.blocks
+        )
+
+        reasoning_lifecycle_types = {
+            "REASONING_START",
+            "REASONING_MESSAGE_START",
+            "REASONING_MESSAGE_CONTENT",
+            "REASONING_MESSAGE_END",
+            "REASONING_END",
+        }
+        reasoning_lifecycle: list[tuple[str, str]] = []
+        for event_type, content in _cot_wire_events(cot_client):
+            if event_type not in reasoning_lifecycle_types:
+                continue
+            message_id = content.get("messageId")
+            assert isinstance(message_id, str)
+            reasoning_lifecycle.append((event_type, message_id))
+
+        reasoning_start_ids = [
+            message_id
+            for event_type, message_id in reasoning_lifecycle
+            if event_type == "REASONING_START"
+        ]
+        assert len(reasoning_start_ids) == 2
+        assert len(set(reasoning_start_ids)) == 2
+        first_reasoning_id, second_reasoning_id = reasoning_start_ids
+        assert reasoning_lifecycle == [
+            ("REASONING_START", first_reasoning_id),
+            ("REASONING_MESSAGE_START", first_reasoning_id),
+            ("REASONING_MESSAGE_CONTENT", first_reasoning_id),
+            ("REASONING_MESSAGE_END", first_reasoning_id),
+            ("REASONING_END", first_reasoning_id),
+            ("REASONING_START", second_reasoning_id),
+            ("REASONING_MESSAGE_START", second_reasoning_id),
+            ("REASONING_MESSAGE_CONTENT", second_reasoning_id),
+            ("REASONING_MESSAGE_END", second_reasoning_id),
+            ("REASONING_END", second_reasoning_id),
+        ]
+        assert any(
+            content.get("status") == "done"
+            for content in _cot_wire_contents(cot_client)
+        )
     finally:
         programming.abort()
 
@@ -428,7 +969,7 @@ def test_cot_complete_failure_replays_full_process_once(
         assert [block.block_id for block in process_blocks] == [
             "_active_text",
             "_active_reasoning",
-            "tool-1",
+            "_active_tool",
             "_turn_2_text",
         ]
         assert [

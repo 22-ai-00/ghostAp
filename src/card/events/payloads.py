@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Literal, NotRequired, TypedDict
 
+# Private transport metadata carried with logicalized tool events.  It is not
+# rendered by CardState; process transports use it only to redact a provider's
+# raw tool-call identifier from outbound content.
+OPAQUE_TOOL_CALL_ID_KEY = "_opaque_raw_tool_call_id"
+
 # ---------------------------------------------------------------------------
 # Lifecycle payload TypedDicts
 # ---------------------------------------------------------------------------
@@ -51,12 +56,31 @@ class ToolStartedPayload(TypedDict):
     block_id: str
     tool_name: str
     tool_input: str
+    _opaque_raw_tool_call_id: NotRequired[str]
 
 
 class ToolDeltaPayload(TypedDict):
     """Payload for TOOL_DELTA event."""
     block_id: str
     content: str
+    _opaque_raw_tool_call_id: NotRequired[str]
+
+
+class ToolDonePayload(TypedDict):
+    """Payload for TOOL_DONE event."""
+    block_id: str
+    tool_output: NotRequired[str]
+    tool_summary: NotRequired[str]
+    tool_name: NotRequired[str]
+    _opaque_raw_tool_call_id: NotRequired[str]
+
+
+class ToolFailedPayload(TypedDict):
+    """Payload for TOOL_FAILED event."""
+    block_id: str
+    error: str
+    tool_name: NotRequired[str]
+    _opaque_raw_tool_call_id: NotRequired[str]
 
 
 class ImagePayload(TypedDict):

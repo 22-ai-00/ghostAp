@@ -48,6 +48,7 @@
 | B085 | 2026-08-13 | Workflow 完整结果正文目前按 27 KiB 无损分页，超大模型输出可能产生数十张账本消息；需为用户可见卡片建立总页数/总字节上限，超量部分自动改由已生成的 HTML/Markdown 报告附件交付，同时保留摘要和恢复指引。 | Medium | Workflow 结果账本可读化审计 | Open | — |
 | B086 | 2026-08-13 | Workflow 结果正文分页仍按 Unicode code point 选择切点，极窄边界可能把组合重音、肤色修饰符或 regional-indicator 字素拆到两页；需引入 grapheme-aware split boundary，并覆盖 emoji/组合字符/CJK wire 回归。 | Medium | Workflow 结果账本可读化审计 | Open | — |
 | B087 | 2026-08-13 | 完整工具载荷净化虽已有 64 层/10000 节点上限，但高基数 opaque ID × 文本叶仍可能形成二次复杂度，净化后 mapping key 碰撞也可能覆盖先前值；需增加总字节/opaque 基数预算、线性多模式替换及稳定碰撞后缀。非 full-content JSON 解析也应统一捕获深层递归失败。 | Medium | Workflow 结果账本可读化审计 | Open | — |
+| B088 | 2026-08-28 | `FeishuCOTStream.rollover()` 在旧 segment 已成功 seal、但新 segment 启动或 active-anchor 重放失败时仍返回 `sealed=False`。`ProgrammingCardSession` 因而会把包含已封存内容的完整 replay buffer 投影到主卡，造成过程重复展示。需区分 partial seal、只回放未封存尾部并补故障注入回归。 | Medium | COT 生命周期审计 | Open | — |
 
 > **归档注释**：B020-B048 已按 `fixed`、`already satisfied`、`retired/superseded` 或 `external profile` 逐项记录处置依据；实现文件、精确测试/文档证据与保留边界见 [2026-07-16.md](2026-07-16.md)。强化多副本档的外部验收条件由 [employee runtime profiles ADR](../docs/adr-employee-runtime-profiles.md) 持续承载，不作为本地代码已证明能力。
 

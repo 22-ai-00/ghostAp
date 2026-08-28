@@ -15,6 +15,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Callable
 
 from src.card.events import CardEvent, CardEventType
+from src.card.events.payloads import OPAQUE_TOOL_CALL_ID_KEY
 from src.card.events.projector import (
     attribute_subagent_image,
     finalize_summaries,
@@ -169,6 +170,18 @@ class ProgrammingCardSession:
         self._session_factory = session_factory
         self._process_sink = process_sink
         self._native_process_started = False
+        # ACP may reconnect after the provider has already opened a tool, so
+        # UPDATE/DONE frames can legitimately arrive without a local START.
+        # The main-card route has always materialized that missing start; keep
+        # the same lifecycle ledger while the native COT route is active.
+        self._native_process_open_tool_ids: set[str] = set()
+        # Providers may recycle a raw tool-call ID after it reaches a terminal
+        # frame.  Card/COT block identities are invocation-scoped, so retain
+        # the provider mapping separately and allocate a fresh logical ID for
+        # every later START.
+        self._tool_invocation_ids: dict[tuple[str, str], str] = {}
+        self._active_tool_invocation_keys: set[tuple[str, str]] = set()
+        self._tool_invocation_seq = 0
         self._buffered_process_events: list[CardEvent] = []
         self._buffered_process_bytes = 0
         self._sealed_process_segments = 0
@@ -249,6 +262,8 @@ class ProgrammingCardSession:
             started = False
         with self._dispatch_lock:
             self._native_process_started = started
+            if started:
+                self._native_process_open_tool_ids.clear()
         if not started:
             try:
                 with self._dispatch_lock:
@@ -303,6 +318,10 @@ class ProgrammingCardSession:
             return
 
         card_event = CardEvent.from_acp(acp_event)
+        if card_event.type in _TOOL_CARD_EVENT_TYPES:
+            card_event = self._logicalize_tool_event(acp_event, card_event)
+            if card_event is None:
+                return
 
         # Text delta: accumulate and schedule flush. ACP turns get stable,
         # per-turn block IDs so a later turn never appends to an earlier one.
@@ -311,7 +330,14 @@ class ProgrammingCardSession:
             if text:
                 source_key = self._source_key(acp_event)
                 if self._active_reasoning_sources:
-                    self._close_reasoning_blocks()
+                    # CardState can reopen one reasoning block after a text
+                    # interlude, but AG-UI/COT reasoning message IDs are
+                    # terminal once closed.  Retire those IDs while native
+                    # COT is active so a later thought gets a fresh remote
+                    # lifecycle instead of an emit_rejected cutover.
+                    self._close_reasoning_blocks(
+                        retire=self._native_process_started,
+                    )
                 with self._flush_lock:
                     self._flush_lock_holder.held = True
                     try:
@@ -556,6 +582,7 @@ class ProgrammingCardSession:
                 except Exception:
                     logger.warning("Failed to abort Feishu COT process message", exc_info=True)
                 self._native_process_started = False
+                self._native_process_open_tool_ids.clear()
             with self._dispatch_lock:
                 retired = tuple(self._failed_retired_sessions)
                 self._rotator.close()
@@ -563,6 +590,8 @@ class ProgrammingCardSession:
                     session.close()
                 self._failed_retired_sessions.clear()
                 self._active_tool_snapshots.clear()
+                self._tool_invocation_ids.clear()
+                self._active_tool_invocation_keys.clear()
 
     def get_final_text(self) -> str:
         """Return the complete ordered main-Agent transcript."""
@@ -771,6 +800,7 @@ class ProgrammingCardSession:
     def _cut_over_to_card_locked(self, *, reason: str) -> bool:
         """Atomically replay accepted COT atoms and resume card projection."""
         self._native_process_started = False
+        self._native_process_open_tool_ids.clear()
         buffered = tuple(self._buffered_process_events)
         buffered_bytes = self._buffered_process_bytes
         self._buffered_process_events.clear()
@@ -848,7 +878,7 @@ class ProgrammingCardSession:
         """Dispatch one tool event and retain active state across card pages."""
         with self._dispatch_lock:
             if self._native_process_started:
-                return self._dispatch_card_event(event)
+                return self._dispatch_native_tool_event_locked(event)
             block_id = str((event.payload or {}).get("block_id") or "")
             if (
                 event.type in {
@@ -886,6 +916,137 @@ class ProgrammingCardSession:
             if dispatched:
                 self._sync_active_tool_snapshot(event)
             return dispatched
+
+    def _logicalize_tool_event(
+        self,
+        acp_event: "ACPEvent",
+        event: CardEvent,
+    ) -> CardEvent | None:
+        """Give each provider tool invocation a stable, unique block ID.
+
+        ACP permits reconnect/terminal-only progress and some providers reuse
+        a raw call ID after a terminal frame.  The reducer and native COT
+        protocol both require a fresh lifecycle in that case.  Keep closed
+        mappings so delayed duplicate frames are ignored rather than creating
+        a phantom invocation; a subsequent explicit START opens the next one.
+        """
+        raw_block_id = (event.payload or {}).get("block_id")
+        if not isinstance(raw_block_id, str) or not raw_block_id:
+            return event
+
+        source_key = self._source_key(acp_event)
+        raw_key = (source_key, raw_block_id)
+        with self._dispatch_lock:
+            is_active = raw_key in self._active_tool_invocation_keys
+            logical_id = self._tool_invocation_ids.get(raw_key)
+
+            if event.type is CardEventType.TOOL_STARTED:
+                if not is_active:
+                    logical_id = self._next_tool_invocation_id(source_key)
+                    self._tool_invocation_ids[raw_key] = logical_id
+                    self._active_tool_invocation_keys.add(raw_key)
+            elif event.type is CardEventType.TOOL_DELTA:
+                if logical_id is None:
+                    # A stream may reconnect after the provider already sent
+                    # START.  Materialize the invocation on its first update.
+                    logical_id = self._next_tool_invocation_id(source_key)
+                    self._tool_invocation_ids[raw_key] = logical_id
+                    self._active_tool_invocation_keys.add(raw_key)
+                elif not is_active:
+                    # The previous invocation already ended; without another
+                    # START this is a delayed duplicate, not a new tool call.
+                    return None
+            elif event.type in {CardEventType.TOOL_DONE, CardEventType.TOOL_FAILED}:
+                if logical_id is None:
+                    # Terminal-only progress is valid ACP input.  Let the
+                    # normal missing-start path synthesize the display start.
+                    logical_id = self._next_tool_invocation_id(source_key)
+                    self._tool_invocation_ids[raw_key] = logical_id
+                elif not is_active:
+                    return None
+                self._active_tool_invocation_keys.discard(raw_key)
+
+        if logical_id is None:
+            return event
+        return CardEvent(
+            type=event.type,
+            payload={
+                **event.payload,
+                "block_id": logical_id,
+                OPAQUE_TOOL_CALL_ID_KEY: raw_block_id,
+            },
+        )
+
+    def _next_tool_invocation_id(self, source_key: str) -> str:
+        """Return an opaque logical ID for one provider tool invocation."""
+        self._tool_invocation_seq += 1
+        return self._block_id("tool", self._tool_invocation_seq, source_key)
+
+    def _dispatch_native_tool_event_locked(self, event: CardEvent) -> bool:
+        """Normalize legitimate missing tool starts before sending COT atoms.
+
+        ACP reconnects and terminal-only progress are allowed to emit an
+        UPDATE/DONE without an earlier START.  The normal main-card route
+        materializes a ToolBlock in that case; the native process route must
+        send the equivalent TOOL_STARTED first, otherwise strict AG-UI
+        lifecycle validation rejects the atom and unnecessarily degrades COT.
+        """
+        payload = event.payload or {}
+        block_id = payload.get("block_id")
+        if not isinstance(block_id, str) or not block_id:
+            # There is no safe identity from which to synthesize a COT tool
+            # lifecycle.  This malformed display atom is non-authoritative,
+            # so it must not take a healthy process stream down with it.
+            logger.debug(
+                "Skipping native COT tool atom without a stable block id; "
+                "event_type=%s",
+                event.type.value,
+            )
+            return True
+        opaque_raw_tool_id = payload.get(OPAQUE_TOOL_CALL_ID_KEY)
+
+        if event.type is CardEventType.TOOL_STARTED:
+            dispatched = self._dispatch_card_event(event)
+            if dispatched and self._native_process_started:
+                self._native_process_open_tool_ids.add(block_id)
+            return dispatched
+
+        if block_id not in self._native_process_open_tool_ids:
+            snapshot = self._active_tool_snapshots.get(block_id)
+            raw_name = (
+                snapshot.tool_name
+                if snapshot is not None
+                else payload.get("tool_name") or payload.get("tool_summary") or "tool"
+            )
+            tool_name = raw_name if isinstance(raw_name, str) else "tool"
+            raw_input = (
+                snapshot.tool_input
+                if snapshot is not None
+                else payload.get("tool_input", "")
+            )
+            tool_input = raw_input if isinstance(raw_input, str) else ""
+            synthetic_start = CardEvent(
+                type=CardEventType.TOOL_STARTED,
+                payload={
+                    "block_id": block_id,
+                    "tool_name": tool_name or "tool",
+                    "tool_input": tool_input,
+                    **(
+                        {OPAQUE_TOOL_CALL_ID_KEY: opaque_raw_tool_id}
+                        if isinstance(opaque_raw_tool_id, str)
+                        else {}
+                    ),
+                },
+            )
+            if not self._dispatch_card_event(synthetic_start):
+                return False
+            if self._native_process_started:
+                self._native_process_open_tool_ids.add(block_id)
+
+        dispatched = self._dispatch_card_event(event)
+        if event.type in {CardEventType.TOOL_DONE, CardEventType.TOOL_FAILED}:
+            self._native_process_open_tool_ids.discard(block_id)
+        return dispatched
 
     def _current_card_has_tool(self, block_id: str) -> bool:
         state = self._rotator.current.state

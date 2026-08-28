@@ -27,6 +27,7 @@ from lark_oapi.core.model.base_request import BaseRequest
 from lark_oapi.core.model.base_response import BaseResponse
 
 from src.card.events import CardEvent, CardEventType
+from src.card.events.payloads import OPAQUE_TOOL_CALL_ID_KEY
 from src.card.protocols import ProcessSegmentRollover
 from src.card.tool_display import (
     sanitize_full_tool_event_content,
@@ -1725,12 +1726,13 @@ class FeishuCOTSession:
             if block_id in self._tools or block_id in self._completed_tools:
                 return ()
             tool_call_id = self._hash_id("tool", block_id)
+            opaque_ids = _tool_opaque_ids(payload, block_id)
             raw_name = payload.get("tool_name", "")
             name_text = raw_name if isinstance(raw_name, str) else ""
             safe_name = sanitize_single_line_label(
                 sanitize_full_tool_event_content(
                     name_text,
-                    opaque_ids=(block_id,),
+                    opaque_ids=opaque_ids,
                 ),
                 fallback="tool",
                 max_chars=120,
@@ -1738,7 +1740,7 @@ class FeishuCOTSession:
             raw_input = payload.get("tool_input", "")
             safe_input = _safe_tool_arguments(
                 raw_input,
-                opaque_id=block_id,
+                opaque_ids=opaque_ids,
                 tool_call_id=tool_call_id,
             )
             tool_summary = summarize_tool_call_content(
@@ -1792,7 +1794,7 @@ class FeishuCOTSession:
                 return ()
             state["latest"] = _safe_tool_content(
                 payload.get("content", ""),
-                opaque_id=block_id,
+                opaque_ids=_tool_opaque_ids(payload, block_id),
             )
             return ()
         if event.type in {CardEventType.TOOL_DONE, CardEventType.TOOL_FAILED}:
@@ -1813,7 +1815,10 @@ class FeishuCOTSession:
                 else:
                     candidate = payload.get("tool_output", "")
                     fallback = "Tool completed"
-                content = _safe_tool_content(candidate, opaque_id=block_id)
+                content = _safe_tool_content(
+                    candidate,
+                    opaque_ids=_tool_opaque_ids(payload, block_id),
+                )
                 if not content:
                     latest = state.get("latest", "")
                     content = latest if isinstance(latest, str) else ""
@@ -2565,8 +2570,23 @@ def _sanitize_unicode(value: str) -> str:
         return "".join(safe)
 
 
-def _safe_tool_content(value: object, *, opaque_id: str) -> str:
-    safe = sanitize_full_tool_event_content(value, opaque_ids=(opaque_id,))
+def _tool_opaque_ids(
+    payload: Mapping[str, object],
+    logical_block_id: str,
+) -> tuple[str, ...]:
+    """Return identifiers that must never be sent in rendered COT content."""
+    raw_tool_id = payload.get(OPAQUE_TOOL_CALL_ID_KEY)
+    if (
+        isinstance(raw_tool_id, str)
+        and raw_tool_id
+        and raw_tool_id != logical_block_id
+    ):
+        return logical_block_id, raw_tool_id
+    return (logical_block_id,)
+
+
+def _safe_tool_content(value: object, *, opaque_ids: Sequence[str]) -> str:
+    safe = sanitize_full_tool_event_content(value, opaque_ids=opaque_ids)
     safe = _sanitize_unicode(safe)
     return _truncate_utf8(safe, _MAX_TOOL_CONTENT_BYTES)
 
@@ -2595,11 +2615,11 @@ def _brief_tool_result(
 def _safe_tool_arguments(
     value: object,
     *,
-    opaque_id: str,
+    opaque_ids: Sequence[str],
     tool_call_id: str,
 ) -> str:
     """Return one valid JSON argument delta within the final content limit."""
-    safe = sanitize_full_tool_event_content(value, opaque_ids=(opaque_id,))
+    safe = sanitize_full_tool_event_content(value, opaque_ids=opaque_ids)
     safe = _sanitize_unicode(safe).strip()
     if not safe:
         return "{}"
