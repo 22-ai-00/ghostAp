@@ -16,6 +16,7 @@ import pytest
 import src.acp.codex_rollout_reconciliation as reconciliation
 from src.acp.codex_rollout_reconciliation import (
     enrich_codex_reconciliation_result,
+    enrich_codex_terminal_result,
 )
 from src.acp.models import ACPEventType, PromptResult, ToolCallInfo
 from src.acp.outcome import PromptOutcome, classify_prompt_result
@@ -196,6 +197,48 @@ def _append_list_agents_output(
                 "type": "function_call_output",
                 "call_id": call_id,
                 "output": raw_output,
+            },
+        },
+    ]
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("".join(json.dumps(event) + "\n" for event in events))
+
+
+def _append_generic_function_output(
+    path: Path,
+    *,
+    call_id: str,
+    call_timestamp: str,
+    output_timestamp: str,
+    name: str = "wait",
+    namespace: str | None = None,
+    output: object = None,
+) -> None:
+    function_call: dict[str, object] = {
+        "type": "function_call",
+        "name": name,
+        "arguments": "{}",
+        "call_id": call_id,
+    }
+    if namespace is not None:
+        function_call["namespace"] = namespace
+    events = [
+        {
+            "timestamp": call_timestamp,
+            "type": "response_item",
+            "payload": function_call,
+        },
+        {
+            "timestamp": output_timestamp,
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": (
+                    [{"type": "text", "text": "done"}]
+                    if output is None
+                    else output
+                ),
             },
         },
     ]
@@ -880,6 +923,79 @@ def test_sync_official_codex_enrichment_uses_session_home_and_emits_event(
     assert events[0].tool_call is evidence
 
 
+def test_sync_official_terminal_enrichment_emits_all_evidence(
+    tmp_path: Path,
+) -> None:
+    session = object.__new__(SyncACPSession)
+    session._agent_type = "codex"
+    session._agent_args = ["@agentclientprotocol/codex-acp@1.2.0"]
+    session._cwd = str(tmp_path / "repo")
+    session.session_id = "019fe093-0d77-7fd2-9860-616a2100e71d"
+    session._acp_session = SimpleNamespace(
+        _env_override={"HOME": str(tmp_path / "isolated-home")}
+    )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="call-generic-wait",
+                title="wait",
+                kind="other",
+                status="in_progress",
+            )
+        ],
+    )
+    generic_evidence = ToolCallInfo(
+        id="call-generic-wait",
+        title="wait",
+        kind="other",
+        status="completed",
+    )
+    child_evidence = ToolCallInfo(
+        id="rollout-child-lifecycle:019fe093-0d77-7fd2-9860-616a2100e71d",
+        title="list_agents",
+        kind="other",
+        status="completed",
+    )
+    enriched = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[generic_evidence, child_evidence],
+    )
+    events = []
+
+    with patch(
+        "src.acp.codex_rollout_reconciliation.enrich_codex_terminal_result",
+        return_value=(enriched, (generic_evidence, child_evidence)),
+    ) as enrich:
+        result = SyncACPSession.enrich_terminal_evidence_result(
+            session,
+            original,
+            started_at=1.0,
+            ended_at=2.0,
+            logical_task_started_at=0.5,
+            on_event=events.append,
+        )
+
+    assert result is enriched
+    enrich.assert_called_once_with(
+        original,
+        session_id=session.session_id,
+        cwd=session._cwd,
+        logical_task_started_at=0.5,
+        started_at=1.0,
+        ended_at=2.0,
+        codex_home=str(tmp_path / "isolated-home" / ".codex"),
+    )
+    assert [event.event_type for event in events] == [
+        ACPEventType.TOOL_CALL_DONE,
+        ACPEventType.TOOL_CALL_DONE,
+    ]
+    assert [event.tool_call for event in events] == [
+        generic_evidence,
+        child_evidence,
+    ]
+
+
 def test_sync_non_official_session_does_not_read_codex_rollout(
     tmp_path: Path,
 ) -> None:
@@ -933,8 +1049,13 @@ _INCIDENT_PARENT_ID = "parent-activity-session-0001"
 _INCIDENT_CHILD_IDS = (
     "child-activity-thread-0001",
     "child-activity-thread-0002",
+    "child-activity-thread-0003",
 )
-_INCIDENT_PATHS = ("/root/goal_guardian", "/root/visual_risk_review")
+_INCIDENT_PATHS = (
+    "/root/goal_guardian",
+    "/root/visual_risk_review",
+    "/root/transaction_test_audit",
+)
 _INCIDENT_LOGICAL_START = "2026-08-10T07:58:14.000Z"
 _INCIDENT_STARTED = "2026-08-10T08:25:03.000Z"
 _INCIDENT_ENDED = "2026-08-10T08:25:32.000Z"
@@ -1083,6 +1204,566 @@ def test_parent_activity_identity_recovers_stale_children_after_followups(
         for state in evidence.subagent_states
     } == {(child_id, "completed") for child_id in _INCIDENT_CHILD_IDS}
     assert classify_prompt_result(enriched).outcome is PromptOutcome.COMPLETED
+
+
+def test_terminal_reconciliation_recovers_rejected_spawn_and_children(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id=_INCIDENT_PARENT_ID,
+        cwd=cwd,
+        output_agents=_completed_agents(_INCIDENT_PATHS),
+        activities=_incident_activities("valid"),
+        session_timestamp=_INCIDENT_LOGICAL_START,
+        call_timestamp="2026-08-10T08:25:19.000Z",
+        output_timestamp="2026-08-10T08:25:19.100Z",
+    )
+    _append_generic_function_output(
+        rollout,
+        call_id="call-spawn-rejected",
+        call_timestamp="2026-08-10T08:25:23.000Z",
+        output_timestamp="2026-08-10T08:25:23.100Z",
+        name="spawn_agent",
+        namespace="collaboration",
+        output=(
+            "Full-history forked agents inherit the parent agent type; omit "
+            "agent_type, or spawn without a full-history fork."
+        ),
+    )
+    for child_id, agent_path in zip(
+        _INCIDENT_CHILD_IDS,
+        _INCIDENT_PATHS,
+        strict=True,
+    ):
+        _write_child_rollout(
+            codex_home,
+            parent_session_id=_INCIDENT_PARENT_ID,
+            child_thread_id=child_id,
+            cwd=cwd,
+            agent_path=agent_path,
+            lifecycle=_INCIDENT_LIFECYCLE,
+        )
+    original = _activity_stale_result()
+    original.tool_calls.append(
+        ToolCallInfo(
+            id="call-spawn-rejected",
+            title="spawn_agent",
+            kind="other",
+            status="in_progress",
+        )
+    )
+
+    assessment = classify_prompt_result(original)
+    assert assessment.incomplete_tool_calls == 4
+    assert assessment.incomplete_outer_tool_calls == 1
+    assert assessment.unresolved_child_tool_calls == 3
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id=_INCIDENT_PARENT_ID,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp(_INCIDENT_LOGICAL_START),
+        started_at=_timestamp(_INCIDENT_STARTED),
+        ended_at=_timestamp(_INCIDENT_ENDED),
+        codex_home=str(codex_home),
+    )
+
+    assert {item.id for item in evidence} == {
+        "call-spawn-rejected",
+        f"rollout-child-lifecycle:{_INCIDENT_PARENT_ID}",
+    }
+    evidence_by_id = {item.id: item for item in evidence}
+    assert evidence_by_id["call-spawn-rejected"].status == "failed"
+    assert {
+        (state["source_id"], state["status"])
+        for state in evidence_by_id[
+            f"rollout-child-lifecycle:{_INCIDENT_PARENT_ID}"
+        ].subagent_states
+    } == {(child_id, "completed") for child_id in _INCIDENT_CHILD_IDS}
+    final_assessment = classify_prompt_result(enriched)
+    assert final_assessment.outcome is PromptOutcome.COMPLETED
+    assert final_assessment.incomplete_tool_calls == 0
+    assert final_assessment.incomplete_outer_tool_calls == 0
+    assert final_assessment.unresolved_child_tool_calls == 0
+
+
+def test_terminal_reconciliation_recovers_exact_generic_wait(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id="parent-generic-wait-0001",
+        cwd=cwd,
+        output_agents=[{"agent_name": "/root", "agent_status": "running"}],
+    )
+    _append_generic_function_output(
+        rollout,
+        call_id="call-generic-wait",
+        call_timestamp="2026-08-08T09:26:55.000Z",
+        output_timestamp="2026-08-08T09:26:55.100Z",
+    )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="call-generic-wait",
+                title="wait",
+                kind="other",
+                status="in_progress",
+            )
+        ],
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id="parent-generic-wait-0001",
+        cwd=str(cwd),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert [item.id for item in evidence] == ["call-generic-wait"]
+    assert evidence[0].status == "completed"
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.COMPLETED
+
+
+def test_terminal_reconciliation_ignores_generic_output_after_turn(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id="parent-generic-after-turn-0001",
+        cwd=cwd,
+        output_agents=[{"agent_name": "/root", "agent_status": "running"}],
+    )
+    _append_generic_function_output(
+        rollout,
+        call_id="call-generic-after-turn",
+        call_timestamp="2026-08-08T09:26:55.000Z",
+        output_timestamp="2026-08-08T09:27:00.100Z",
+    )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="call-generic-after-turn",
+                title="wait",
+                kind="other",
+                status="in_progress",
+            )
+        ],
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id="parent-generic-after-turn-0001",
+        cwd=str(cwd),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence == ()
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.INCOMPLETE
+
+
+def test_terminal_reconciliation_rejects_whitespace_altered_call_id(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id="parent-generic-whitespace-0001",
+        cwd=cwd,
+        output_agents=[{"agent_name": "/root", "agent_status": "running"}],
+    )
+    _append_generic_function_output(
+        rollout,
+        call_id="call-generic-whitespace",
+        call_timestamp="2026-08-08T09:26:55.000Z",
+        output_timestamp="2026-08-08T09:26:55.100Z",
+    )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id=" call-generic-whitespace ",
+                title="wait",
+                kind="other",
+                status="in_progress",
+            )
+        ],
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id="parent-generic-whitespace-0001",
+        cwd=str(cwd),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence == ()
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.INCOMPLETE
+
+
+def test_terminal_reconciliation_keeps_unknown_spawn_output_unresolved(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id="parent-unknown-spawn-0001",
+        cwd=cwd,
+        output_agents=[{"agent_name": "/root", "agent_status": "running"}],
+    )
+    _append_generic_function_output(
+        rollout,
+        call_id="call-unknown-spawn",
+        call_timestamp="2026-08-08T09:26:55.000Z",
+        output_timestamp="2026-08-08T09:26:55.100Z",
+        name="spawn_agent",
+        namespace="collaboration",
+        output="unrecognized spawn response",
+    )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="call-unknown-spawn",
+                title="spawn_agent",
+                kind="other",
+                status="in_progress",
+            )
+        ],
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id="parent-unknown-spawn-0001",
+        cwd=str(cwd),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence == ()
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.INCOMPLETE
+
+
+def test_terminal_reconciliation_skips_rollout_without_recoverable_state(
+    tmp_path: Path,
+) -> None:
+    original = PromptResult(stop_reason="end_turn")
+
+    with patch.object(reconciliation, "_find_rollout") as find_rollout:
+        enriched, evidence = enrich_codex_terminal_result(
+            original,
+            session_id="parent-no-recovery-0001",
+            cwd=str(tmp_path),
+            started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+            ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+            codex_home=str(tmp_path / "codex-home"),
+        )
+
+    assert enriched is original
+    assert evidence == ()
+    find_rollout.assert_not_called()
+
+
+def test_terminal_reconciliation_defers_parent_lookup_to_child_reconciliation(
+    tmp_path: Path,
+) -> None:
+    original = _single_child_result()
+
+    with (
+        patch.object(reconciliation, "_find_rollout") as find_rollout,
+        patch.object(
+            reconciliation,
+            "enrich_codex_reconciliation_result",
+            return_value=(original, None),
+        ) as reconcile_children,
+    ):
+        enriched, evidence = enrich_codex_terminal_result(
+            original,
+            session_id="parent-child-only-0001",
+            cwd=str(tmp_path),
+            started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+            ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+            codex_home=str(tmp_path / "codex-home"),
+        )
+
+    assert enriched is original
+    assert evidence == ()
+    find_rollout.assert_not_called()
+    reconcile_children.assert_called_once()
+
+
+def test_terminal_reconciliation_ignores_child_terminal_after_turn(
+    tmp_path: Path,
+) -> None:
+    parent_session_id = "parent-child-after-turn-0001"
+    child_thread_id = "child-after-turn-0001"
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    _write_rollout(
+        codex_home,
+        session_id=parent_session_id,
+        cwd=cwd,
+        output_agents=[
+            {"agent_name": "/root", "agent_status": "running"},
+            {"agent_name": "/root/reviewer", "agent_status": "running"},
+        ],
+        activities=[
+            {
+                "timestamp": "2026-08-08T09:26:55.000Z",
+                "source_id": child_thread_id,
+                "agent_path": "/root/reviewer",
+                "kind": "started",
+            }
+        ],
+    )
+    _write_child_rollout(
+        codex_home,
+        parent_session_id=parent_session_id,
+        child_thread_id=child_thread_id,
+        cwd=cwd,
+        agent_path="/root/reviewer",
+        lifecycle=[
+            ("2026-08-08T09:26:54.100Z", "task_started", "turn-live"),
+            ("2026-08-08T09:27:00.100Z", "task_complete", "turn-live"),
+        ],
+    )
+    original = _single_child_result(
+        source_id=child_thread_id,
+        path="/root/reviewer",
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id=parent_session_id,
+        cwd=str(cwd),
+        logical_task_started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence == ()
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.INCOMPLETE
+
+
+def test_terminal_reconciliation_does_not_upgrade_execute_call(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id="parent-generic-execute-0001",
+        cwd=cwd,
+        output_agents=[{"agent_name": "/root", "agent_status": "running"}],
+    )
+    _append_generic_function_output(
+        rollout,
+        call_id="call-generic-execute",
+        call_timestamp="2026-08-08T09:26:55.000Z",
+        output_timestamp="2026-08-08T09:26:55.100Z",
+    )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="call-generic-execute",
+                title="wait",
+                kind="execute",
+                status="in_progress",
+            )
+        ],
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id="parent-generic-execute-0001",
+        cwd=str(cwd),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence == ()
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.INCOMPLETE
+
+
+def test_terminal_reconciliation_rejects_duplicate_generic_pairs(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id="parent-generic-duplicate-0001",
+        cwd=cwd,
+        output_agents=[{"agent_name": "/root", "agent_status": "running"}],
+    )
+    for suffix in ("55", "56"):
+        _append_generic_function_output(
+            rollout,
+            call_id="call-generic-duplicate",
+            call_timestamp=f"2026-08-08T09:26:{suffix}.000Z",
+            output_timestamp=f"2026-08-08T09:26:{suffix}.100Z",
+        )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="call-generic-duplicate",
+                title="wait",
+                kind="other",
+                status="in_progress",
+            )
+        ],
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id="parent-generic-duplicate-0001",
+        cwd=str(cwd),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence == ()
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.INCOMPLETE
+
+
+def test_terminal_reconciliation_requires_exact_rejected_spawn_call_id(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id="parent-spawn-ambiguity-0001",
+        cwd=cwd,
+        output_agents=[{"agent_name": "/root", "agent_status": "running"}],
+    )
+    _append_generic_function_output(
+        rollout,
+        call_id="call-spawn-rejected",
+        call_timestamp="2026-08-08T09:26:55.000Z",
+        output_timestamp="2026-08-08T09:26:55.100Z",
+        name="spawn_agent",
+        namespace="collaboration",
+        output=(
+            "Full-history forked agents inherit the parent agent type; omit "
+            "agent_type, or spawn without a full-history fork."
+        ),
+    )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="collab-item-rejected-spawn",
+                title="spawn_agent",
+                kind="other",
+                status="in_progress",
+            )
+        ],
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id="parent-spawn-ambiguity-0001",
+        cwd=str(cwd),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence == ()
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.INCOMPLETE
+
+
+def test_terminal_reconciliation_requires_matching_generic_call(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    codex_home = tmp_path / "codex-home"
+    rollout = _write_rollout(
+        codex_home,
+        session_id="parent-generic-output-0001",
+        cwd=cwd,
+        output_agents=[{"agent_name": "/root", "agent_status": "running"}],
+    )
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "timestamp": "2026-08-08T09:26:54.900Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-unpaired",
+                        "output": [{"type": "text", "text": "done"}],
+                    },
+                }
+            )
+            + "\n"
+        )
+    original = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="call-unpaired",
+                title="wait",
+                kind="other",
+                status="in_progress",
+            )
+        ],
+    )
+
+    enriched, evidence = enrich_codex_terminal_result(
+        original,
+        session_id="parent-generic-output-0001",
+        cwd=str(cwd),
+        started_at=_timestamp("2026-08-08T09:26:54.000Z"),
+        ended_at=_timestamp("2026-08-08T09:27:00.000Z"),
+        codex_home=str(codex_home),
+    )
+
+    assert enriched is original
+    assert evidence == ()
+    assert classify_prompt_result(enriched).outcome is PromptOutcome.INCOMPLETE
 
 
 @pytest.mark.parametrize(

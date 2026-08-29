@@ -507,15 +507,24 @@ def merge_tool_call_sequence(
                 previous = None
             else:
                 active_key_by_id[tool_call.id] = key
-            merged = (
-                tool_call
-                if previous is None
-                or (
-                    not _is_child_related(previous)
-                    and not _is_child_related(tool_call)
+            if previous is None:
+                merged = tool_call
+            elif (
+                not _is_child_related(previous)
+                and not _is_child_related(tool_call)
+            ):
+                merged = replace(
+                    tool_call,
+                    is_context_compaction=(
+                        tool_call.is_context_compaction is True
+                        or (
+                            not crosses_turn_boundary
+                            and previous.is_context_compaction is True
+                        )
+                    ),
                 )
-                else merge_tool_call_snapshot(previous, tool_call)
-            )
+            else:
+                merged = merge_tool_call_snapshot(previous, tool_call)
             ordered[key] = merged
             if _is_child_related(tool_call):
                 child_epoch += 1

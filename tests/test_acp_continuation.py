@@ -17,7 +17,7 @@ from src.acp.models import (
     PromptResult,
     ToolCallInfo,
 )
-from src.acp.outcome import PromptOutcome
+from src.acp.outcome import PromptOutcome, classify_prompt_result
 
 
 @dataclass(frozen=True)
@@ -83,6 +83,30 @@ class _FakeSession:
             on_event=on_event,
             timeout=timeout,
         )
+
+
+class _TerminalEvidenceSession(_FakeSession):
+    def __init__(
+        self,
+        *results: PromptResult | BaseException,
+        enriched: PromptResult,
+    ) -> None:
+        super().__init__(*results)
+        self._enriched = enriched
+        self.enrichment_calls: list[tuple[PromptResult, float, float]] = []
+
+    def enrich_terminal_evidence_result(
+        self,
+        result: PromptResult,
+        *,
+        started_at: float,
+        ended_at: float,
+        logical_task_started_at: float | None = None,
+        on_event: Callable[[ACPEvent], None] | None = None,
+    ) -> PromptResult:
+        del logical_task_started_at, on_event
+        self.enrichment_calls.append((result, started_at, ended_at))
+        return self._enriched
 
 
 def _pending_result(
@@ -615,6 +639,72 @@ def test_child_reconciliation_cannot_manufacture_pending_plan(
     assert execution.result.plan is original_plan
 
 
+def test_terminal_evidence_is_applied_before_first_classification() -> None:
+    runner = _runner()
+    initial = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="orphaned-spawn",
+                title="spawn_agent",
+                kind="other",
+                status="in_progress",
+            ),
+            ToolCallInfo(
+                id="stale-child",
+                title="sub_agent_activity",
+                kind="other",
+                status="completed",
+                subagent_source_id="reviewer",
+                subagent_activity="started",
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "running"},
+                ),
+            ),
+        ],
+    )
+    enriched = PromptResult(
+        stop_reason="end_turn",
+        tool_calls=[
+            ToolCallInfo(
+                id="orphaned-spawn",
+                title="spawn_agent",
+                kind="other",
+                status="failed",
+            ),
+            ToolCallInfo(
+                id="rollout-child-lifecycle:parent",
+                title="list_agents",
+                kind="other",
+                status="completed",
+                collaboration_tool="list_agents",
+                collaboration_receivers=("reviewer",),
+                subagent_states=(
+                    {"source_id": "reviewer", "status": "completed"},
+                ),
+            ),
+        ],
+    )
+    session = _TerminalEvidenceSession(initial, enriched=enriched)
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 1
+    assert len(session.enrichment_calls) == 1
+    observed, started_at, ended_at = session.enrichment_calls[0]
+    assert observed is initial
+    assert ended_at >= started_at
+    assert execution.result is enriched
+    assert execution.automatic_continuations == 0
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.assessment.incomplete_tool_calls == 0
+
+
 def test_mixed_state_with_running_outer_tool_does_not_auto_continue() -> None:
     runner = _runner()
     first_result = _with_child_state(
@@ -848,6 +938,56 @@ def test_running_child_snapshot_is_replaced_by_authoritative_terminal_update() -
         {"source_id": "child-a", "status": "completed"},
         {"source_id": "child-b", "status": "pending"},
     )
+
+
+def test_context_compaction_marker_stays_nonblocking_across_updates() -> None:
+    from src.acp.collaboration import merge_tool_call_sequence
+
+    started = ToolCallInfo(
+        id="context-compaction",
+        title="Context compacting",
+        kind="other",
+        status="in_progress",
+        is_context_compaction=True,
+    )
+    unmarked_update = ToolCallInfo(
+        id="context-compaction",
+        title="Context compacting",
+        kind="other",
+        status="in_progress",
+    )
+
+    merged = merge_tool_call_sequence([started, unmarked_update])
+
+    assert merged[0].is_context_compaction is True
+    assert classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    ).outcome is PromptOutcome.COMPLETED
+
+
+def test_context_compaction_marker_does_not_leak_across_turns() -> None:
+    from src.acp.continuation import _merge_tool_calls
+
+    previous = ToolCallInfo(
+        id="provider-reused-id",
+        title="Context compacting",
+        kind="other",
+        status="in_progress",
+        is_context_compaction=True,
+    )
+    current = ToolCallInfo(
+        id="provider-reused-id",
+        title="ordinary tool",
+        kind="other",
+        status="in_progress",
+    )
+
+    merged = _merge_tool_calls([previous], [current])
+
+    assert merged[0].is_context_compaction is False
+    assert classify_prompt_result(
+        PromptResult(stop_reason="end_turn", tool_calls=merged)
+    ).outcome is PromptOutcome.INCOMPLETE
 
 
 

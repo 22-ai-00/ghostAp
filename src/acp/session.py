@@ -646,6 +646,7 @@ class ACPSession:
             on_event=self._dispatch_event,
             root_dir=self._cwd,
             capture_full_tool_content=self._capture_full_tool_content,
+            trust_codex_extensions=self._uses_official_codex_acp(),
         )
         self._client = client
         self._bind_session_info_callback()

@@ -336,6 +336,7 @@ def run_prompt_with_continuation(
             if on_finalization_start is not None:
                 on_finalization_start()
 
+        turn_started_at = time.time()
         result = run_prompt_with_finalization(
             session,
             prompt,
@@ -349,6 +350,28 @@ def run_prompt_with_continuation(
             retire_finalization_session=retire_finalization_session,
             replay_deferred_child_events=replay_deferred_child_events,
         )
+        turn_finished_at = time.time()
+        enrich_result = getattr(
+            session,
+            "enrich_terminal_evidence_result",
+            None,
+        )
+        if callable(enrich_result):
+            try:
+                enriched = enrich_result(
+                    result,
+                    started_at=turn_started_at,
+                    ended_at=turn_finished_at,
+                    logical_task_started_at=logical_task_started_at,
+                    on_event=on_event,
+                )
+                if isinstance(enriched, PromptResult):
+                    result = enriched
+            except Exception:
+                logger.warning(
+                    "Codex terminal evidence enrichment failed closed",
+                    exc_info=True,
+                )
         return result, entered_finalization
 
     first_turn_budget = deadline - _monotonic()

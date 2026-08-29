@@ -1139,6 +1139,73 @@ class SyncACPSession(PromptGenerationTracker):
                 )
         return enriched
 
+    def enrich_terminal_evidence_result(
+        self,
+        result: PromptResult,
+        *,
+        started_at: float,
+        ended_at: float,
+        logical_task_started_at: float | None = None,
+        on_event: Optional[Callable[[ACPEvent], None]] = None,
+    ) -> PromptResult:
+        """Recover strict Codex rollout terminal evidence before classification."""
+        if not self._uses_official_codex_acp():
+            return result
+        from .codex_rollout_reconciliation import (
+            enrich_codex_terminal_result,
+        )
+        from .models import ACPEventType
+
+        acp_session = getattr(self, "_acp_session", None)
+        session_id = str(
+            getattr(self, "session_id", None)
+            or getattr(acp_session, "_session_id", None)
+            or ""
+        )
+        env_override = getattr(acp_session, "_env_override", None)
+        codex_home: str | None = None
+        if isinstance(env_override, dict):
+            raw_codex_home = str(
+                env_override.get("CODEX_HOME") or ""
+            ).strip()
+            if raw_codex_home:
+                codex_home = raw_codex_home
+            else:
+                raw_home = str(env_override.get("HOME") or "").strip()
+                if raw_home:
+                    codex_home = str(Path(raw_home).expanduser() / ".codex")
+        try:
+            enriched, evidence = enrich_codex_terminal_result(
+                result,
+                session_id=session_id,
+                cwd=self._cwd,
+                logical_task_started_at=logical_task_started_at,
+                started_at=started_at,
+                ended_at=ended_at,
+                codex_home=codex_home,
+            )
+        except Exception:
+            logger.warning(
+                "[ACP:CODEX] rollout terminal reconciliation failed closed",
+                exc_info=True,
+            )
+            return result
+        if on_event is not None:
+            for observation in evidence:
+                try:
+                    on_event(
+                        ACPEvent(
+                            event_type=ACPEventType.TOOL_CALL_DONE,
+                            tool_call=observation,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "[ACP:CODEX] reconciled terminal callback failed",
+                        exc_info=True,
+                    )
+        return enriched
+
     def _send_prompt_once(
         self,
         text: str,

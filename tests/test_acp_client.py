@@ -511,12 +511,19 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
     import src.acp.session as session_mod
     from src.acp.session import ACPSession
 
-    calls = {"env": None, "capture_full_tool_content": None}
+    calls = {
+        "env": None,
+        "capture_full_tool_content": None,
+        "trust_codex_extensions": None,
+    }
     real_client = session_mod.GhostAPClient
 
     def capturing_client(*args, **kwargs):
         calls["capture_full_tool_content"] = kwargs.get(
             "capture_full_tool_content"
+        )
+        calls["trust_codex_extensions"] = kwargs.get(
+            "trust_codex_extensions"
         )
         return real_client(*args, **kwargs)
 
@@ -561,8 +568,21 @@ def test_acp_session_start_passes_env_without_claudecode(monkeypatch):
         sid = asyncio.run(s.start())
         assert sid == "s_test"
         assert calls["capture_full_tool_content"] is True
+        assert calls["trust_codex_extensions"] is False
         assert calls["env"] is not None
         assert "CLAUDECODE" not in calls["env"]
+
+        async def allow_full_access(*_args, **_kwargs):
+            return True
+
+        codex_session = ACPSession(
+            agent_cmd="codex",
+            agent_args=["@agentclientprotocol/codex-acp@1.2.0"],
+            cwd="/tmp",
+        )
+        codex_session.set_config_option = allow_full_access
+        assert asyncio.run(codex_session.start()) == "s_test"
+        assert calls["trust_codex_extensions"] is True
 
     async def publish_after_close() -> None:
         queue = calls["queue"]
@@ -903,6 +923,69 @@ class TestParseToolCall:
         )
         tc = _parse_tool_call(update)
         assert "实现后端接口" in tc.content
+
+    def test_codex_context_compaction_is_nonblocking_bookkeeping(self):
+        update = MockToolCallStart(
+            tool_call_id="context-compaction-private",
+            title="Context compacting",
+            kind="other",
+            status="in_progress",
+            field_meta={"contextCompaction": True},
+        )
+
+        tc = _parse_tool_call(update, trust_codex_extensions=True)
+
+        assert tc.is_context_compaction is True
+        assert classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        ).outcome is PromptOutcome.COMPLETED
+
+    @pytest.mark.parametrize(
+        ("kind", "marker", "trust_codex_extensions"),
+        [
+            ("other", "true", True),
+            ("other", True, False),
+            ("execute", True, True),
+        ],
+    )
+    def test_untrusted_context_compaction_marker_remains_blocking(
+        self,
+        kind: str,
+        marker: object,
+        trust_codex_extensions: bool,
+    ):
+        update = MockToolCallStart(
+            tool_call_id="untrusted-context-compaction",
+            title="Context compacting",
+            kind=kind,
+            status="in_progress",
+            field_meta={"contextCompaction": marker},
+        )
+
+        tc = _parse_tool_call(
+            update,
+            trust_codex_extensions=trust_codex_extensions,
+        )
+
+        assert classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        ).outcome is PromptOutcome.INCOMPLETE
+
+    def test_codex_context_compaction_unknown_status_remains_blocking(self):
+        update = MockToolCallStart(
+            tool_call_id="unknown-context-compaction",
+            title="Context compacting",
+            kind="other",
+            status="unknown",
+            field_meta={"contextCompaction": True},
+        )
+
+        tc = _parse_tool_call(update, trust_codex_extensions=True)
+
+        assert tc.is_context_compaction is True
+        assert classify_prompt_result(
+            PromptResult(stop_reason="end_turn", tool_calls=[tc])
+        ).outcome is PromptOutcome.INCOMPLETE
 
     def test_codex_subagent_activity_metadata_is_normalized(self):
         update = MockToolCallStart(

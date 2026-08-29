@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -26,6 +27,7 @@ from src.acp.outcome import (
 from src.feishu.handlers.programming import (
     ClaudeModeHandler,
     _ActiveProgrammingRun,
+    _log_final_unresolved_tool_trace,
     _log_prompt_execution,
 )
 
@@ -488,10 +490,17 @@ def test_prompt_execution_log_identifies_child_only_incompleteness(
         logger="src.feishu.handlers.programming",
     ):
         _log_prompt_execution("Codex", execution)
+        _log_final_unresolved_tool_trace("Codex", assessment)
 
     assert "incomplete_outer_tool_calls=0" in caplog.text
     assert "unresolved_child_tool_calls=1" in caplog.text
     assert "unresolved_tools=wait_agent:completed[running]" in caplog.text
+    assert (
+        "id_sha256="
+        + hashlib.sha256(b"opaque-provider-call-id").hexdigest()[:16]
+    ) in caplog.text
+    assert "diagnostic=wait_agent:completed[running]" in caplog.text
+    assert "child_source_present=0" in caplog.text
     assert "opaque-provider-call-id" not in caplog.text
     assert "opaque-child-id" not in caplog.text
     assert "secret" not in caplog.text
@@ -531,6 +540,7 @@ def test_prompt_execution_log_allowlists_provider_controlled_categories(
         logger="src.feishu.handlers.programming",
     ):
         _log_prompt_execution("Codex", execution)
+        _log_final_unresolved_tool_trace("Codex", assessment)
 
     assert "unresolved_tools=unknown:unknown[unknown]" in caplog.text
     assert "sk-proj" not in caplog.text
@@ -805,8 +815,11 @@ def test_streaming_retries_pending_plan_three_times_then_reports_incomplete():
     assert adapter.fail_kwargs["detail_action"]["action"] == "show_error_details"
 
 
-def test_streaming_stale_child_history_becomes_completed_with_diagnostic() -> None:
+def test_streaming_stale_child_history_becomes_completed_with_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     handler = _make_handler()
+    handler.mode_name = "Codex"
     handler.ctx.channel_client_factory = MagicMock(return_value=object())
     session = MagicMock()
     session.session_id = "stale-child-history"
@@ -836,6 +849,10 @@ def test_streaming_stale_child_history_becomes_completed_with_diagnostic() -> No
     proof.all_observed_children_terminal.return_value = True
 
     with (
+        caplog.at_level(
+            logging.INFO,
+            logger="src.feishu.handlers.programming",
+        ),
         _streaming_environment(_FakeProgrammingCardSession),
         patch(
             "src.feishu.handlers.programming.AuthoritativeChildLifecycleProof",
@@ -862,6 +879,7 @@ def test_streaming_stale_child_history_becomes_completed_with_diagnostic() -> No
     assert "不影响" in adapter.finish_kwargs["warning"]
     assert adapter.finish_kwargs["details"]
     assert adapter.finish_kwargs["detail_action"]["action"] == "show_error_details"
+    assert "ACP未终态工具关联证据" not in caplog.text
 
 
 def test_non_streaming_pending_plan_continues_and_replies_with_success():

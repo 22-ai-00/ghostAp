@@ -1,10 +1,10 @@
-"""Strict Codex rollout fallback for collaboration terminal snapshots.
+"""Strict Codex rollout fallback for omitted terminal observations.
 
-The official Codex ACP adapter currently exposes ``agentsStates`` from the
-app-server item, but does not forward the authoritative ``list_agents``
-function output. This module reads only the active session's bounded rollout
-tail and converts a fully attributable list result into canonical ACP child
-state evidence. Any identity, time-window, or shape ambiguity fails closed.
+The official Codex ACP adapter can omit raw generic function completions and
+authoritative collaboration snapshots from its live stream. This module reads
+only the active session's bounded rollout tail, then projects exact matching
+function output and fully attributable child lifecycle evidence into canonical
+ACP tool calls. Any identity, time-window, or shape ambiguity fails closed.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Any
 
 from .collaboration import merge_tool_call_sequence
 from .models import PromptResult, ToolCallInfo
+from .outcome import has_transient_child_lifecycle
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9-]{16,128}")
 _MAX_HEAD_BYTES = 1024 * 1024
@@ -42,6 +43,16 @@ _SUBAGENT_ACTIVITY_KINDS = frozenset(
     {"started", "interacted", "interrupted"}
 )
 _TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+_TRANSIENT_OUTER_STATUSES = frozenset(
+    {"pending", "in_progress", "running"}
+)
+_KNOWN_COLLAB_SPAWN_FAILURES = frozenset(
+    {
+        "Full-history forked agents inherit the parent agent type; omit "
+        "agent_type, or spawn without a full-history fork.",
+        "collab spawn failed: agent thread limit reached",
+    }
+)
 _STATUS_MAP = {
     "pending": "pending",
     "pendinginit": "pending",
@@ -289,6 +300,202 @@ def _latest_list_agents_output(
     if len(agents) != len(raw_agents):
         return None
     return call_id, agents
+
+
+def _pending_outer_tool_calls(
+    result: PromptResult,
+) -> dict[str, ToolCallInfo]:
+    """Return known transient outer calls keyed by their provider identity."""
+    pending: dict[str, ToolCallInfo] = {}
+    for tool_call in result.tool_calls:
+        if not isinstance(tool_call, ToolCallInfo):
+            continue
+        raw_call_id = tool_call.id
+        raw_status = tool_call.status
+        raw_kind = tool_call.kind
+        if not all(
+            isinstance(value, str)
+            for value in (raw_call_id, raw_status, raw_kind)
+        ):
+            continue
+        if not raw_call_id or raw_call_id != raw_call_id.strip():
+            continue
+        call_id = raw_call_id
+        status = raw_status.strip().casefold()
+        kind = raw_kind.strip().casefold()
+        if (
+            call_id
+            and kind == "other"
+            and status in _TRANSIENT_OUTER_STATUSES
+            and tool_call.is_context_compaction is not True
+        ):
+            pending[call_id] = tool_call
+    return pending
+
+
+def _is_bounded_generic_function_output(payload: Mapping[str, Any]) -> bool:
+    """Accept only the generic output shapes the Codex ACP adapter supports."""
+    if "output" not in payload:
+        return False
+    output = payload.get("output")
+    if isinstance(output, str):
+        return len(output.encode("utf-8")) <= _MAX_FUNCTION_OUTPUT_BYTES
+    if not isinstance(output, list):
+        return False
+    try:
+        encoded = json.dumps(output, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return len(encoded) <= _MAX_FUNCTION_OUTPUT_BYTES
+
+
+def _collaboration_spawn_terminal_status(output: object) -> str | None:
+    """Classify only Codex's strictly known spawn success/failure outputs."""
+    if not isinstance(output, str):
+        return None
+    if len(output.encode("utf-8")) > _MAX_FUNCTION_OUTPUT_BYTES:
+        return None
+    text = output.strip()
+    if text in _KNOWN_COLLAB_SPAWN_FAILURES:
+        return "failed"
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"task_name"}:
+        return None
+    task_name = value.get("task_name")
+    if not isinstance(task_name, str):
+        return None
+    return "completed" if _AGENT_PATH_RE.fullmatch(task_name.strip()) else None
+
+
+def _generic_function_terminal_status(
+    *,
+    name: str,
+    namespace: str | None,
+    output: object,
+) -> str | None:
+    """Map a paired generic function output without guessing tool failures."""
+    if name == "spawn_agent":
+        if namespace != "collaboration":
+            return None
+        return _collaboration_spawn_terminal_status(output)
+    return "completed"
+
+
+def _function_call_output_evidence(
+    path: Path,
+    result: PromptResult,
+    *,
+    started_at: float,
+    ended_at: float,
+) -> tuple[ToolCallInfo, ...]:
+    """Recover only current-turn generic calls with an exact terminal output.
+
+    Codex's live ACP item stream can omit completion updates for generic
+    ``function_call`` records (notably the built-in ``wait`` tool).  A matching
+    ``function_call_output`` in the unique parent rollout is an authoritative
+    terminal observation, but it must be paired with the same call id in this
+    prompt's bounded time window.  Anything malformed, incomplete, or outside
+    that window remains unresolved.
+    """
+    if ended_at < started_at:
+        return ()
+    pending = _pending_outer_tool_calls(result)
+    if not pending:
+        return ()
+    lines, complete = _read_bounded_lines(path, tail=True)
+    if not complete:
+        return ()
+
+    calls: dict[str, list[tuple[float, int, str, str | None]]] = {}
+    outputs: dict[str, list[tuple[float, int, object]]] = {}
+    invalid_calls: set[str] = set()
+    for line_index, raw_line in enumerate(lines):
+        event = _decode_line(raw_line)
+        if event is None:
+            return ()
+        if event.get("type") != "response_item":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        item_type = payload.get("type")
+        if item_type not in {"function_call", "function_call_output"}:
+            continue
+        raw_call_id = payload.get("call_id")
+        if (
+            not isinstance(raw_call_id, str)
+            or not raw_call_id
+            or raw_call_id != raw_call_id.strip()
+        ):
+            continue
+        call_id = raw_call_id
+        if call_id not in pending:
+            continue
+        timestamp = _event_timestamp(event.get("timestamp"))
+        if timestamp is None:
+            invalid_calls.add(call_id)
+            continue
+        if timestamp < started_at or timestamp > ended_at:
+            continue
+        if item_type == "function_call":
+            raw_name = payload.get("name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                invalid_calls.add(call_id)
+                continue
+            raw_namespace = payload.get("namespace")
+            namespace = (
+                raw_namespace.strip()
+                if isinstance(raw_namespace, str) and raw_namespace.strip()
+                else None
+            )
+            calls.setdefault(call_id, []).append(
+                (timestamp, line_index, raw_name.strip(), namespace)
+            )
+            continue
+        if not _is_bounded_generic_function_output(payload):
+            invalid_calls.add(call_id)
+            continue
+        outputs.setdefault(call_id, []).append(
+            (timestamp, line_index, payload.get("output"))
+        )
+
+    evidence: list[ToolCallInfo] = []
+    for call_id, tool_call in pending.items():
+        candidates = calls.get(call_id, [])
+        terminal_outputs = outputs.get(call_id, [])
+        if (
+            call_id in invalid_calls
+            or len(candidates) != 1
+            or len(terminal_outputs) != 1
+        ):
+            continue
+        call_timestamp, call_index, name, namespace = candidates[0]
+        output_timestamp, output_index, output = terminal_outputs[0]
+        if output_timestamp < call_timestamp or output_index <= call_index:
+            continue
+        status = _generic_function_terminal_status(
+            name=name,
+            namespace=namespace,
+            output=output,
+        )
+        if status is not None:
+            evidence.append(replace(tool_call, status=status))
+    return tuple(evidence)
+
+
+def _append_evidence(
+    result: PromptResult,
+    evidence: tuple[ToolCallInfo, ...],
+) -> PromptResult:
+    if not evidence:
+        return result
+    return replace(
+        result,
+        tool_calls=merge_tool_call_sequence([*result.tool_calls, *evidence]),
+    )
 
 
 def _result_child_sources(
@@ -896,4 +1103,78 @@ def enrich_codex_reconciliation_result(
     )
 
 
-__all__ = ["enrich_codex_reconciliation_result"]
+def enrich_codex_terminal_result(
+    result: PromptResult,
+    *,
+    session_id: str,
+    cwd: str,
+    logical_task_started_at: float | None = None,
+    started_at: float,
+    ended_at: float,
+    codex_home: str | None = None,
+) -> tuple[PromptResult, tuple[ToolCallInfo, ...]]:
+    """Recover omitted Codex terminal evidence before outcome classification.
+
+    This is deliberately an observation-only boundary hook.  It first folds
+    exact generic function output pairs from the uniquely attributable parent
+    rollout, then reuses the strict child-turn reconciliation path.  No missing
+    record, ambiguous identity, or partial rollout can turn a transient call
+    into a terminal one.
+    """
+    pending_outer = _pending_outer_tool_calls(result)
+    has_transient_children = has_transient_child_lifecycle(result.tool_calls)
+    if not pending_outer and not has_transient_children:
+        return result, ()
+    evidence: list[ToolCallInfo] = []
+    enriched = result
+    if pending_outer:
+        rollout = _find_rollout(
+            session_id=session_id,
+            cwd=cwd,
+            codex_home=codex_home,
+        )
+    else:
+        rollout = None
+    if rollout is not None:
+        settle_deadline = time.monotonic() + _ROLLOUT_SETTLE_TIMEOUT_S
+        while True:
+            generic_evidence = _function_call_output_evidence(
+                rollout,
+                enriched,
+                started_at=started_at,
+                ended_at=ended_at,
+            )
+            if generic_evidence:
+                enriched = _append_evidence(enriched, generic_evidence)
+                evidence.extend(generic_evidence)
+            if not _pending_outer_tool_calls(enriched):
+                break
+            if time.monotonic() >= settle_deadline:
+                break
+            time.sleep(_ROLLOUT_SETTLE_INTERVAL_S)
+
+    child_sources, child_sources_malformed = _result_child_sources(enriched)
+    if child_sources and not child_sources_malformed:
+        try:
+            child_enriched, child_evidence = enrich_codex_reconciliation_result(
+                enriched,
+                session_id=session_id,
+                cwd=cwd,
+                logical_task_started_at=logical_task_started_at,
+                started_at=started_at,
+                ended_at=ended_at,
+                codex_home=codex_home,
+            )
+        except (OSError, RuntimeError, ValueError):
+            return enriched, tuple(evidence)
+        if child_evidence is not None:
+            enriched = child_enriched
+            evidence.append(child_evidence)
+    return enriched, tuple(evidence)
+
+
+__all__ = [
+    "CodexChildLifecycleMonitor",
+    "enrich_codex_reconciliation_result",
+    "enrich_codex_terminal_result",
+]

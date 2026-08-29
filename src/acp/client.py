@@ -874,6 +874,24 @@ def _codex_namespaced_metadata(update: Any) -> tuple[dict, dict, bool]:
     )
 
 
+def _is_codex_context_compaction(
+    update: Any,
+    *,
+    trust_codex_extensions: bool,
+) -> bool:
+    """Recognize only Codex ACP's explicit internal-compaction marker.
+
+    Codex ACP emits this marker on its context-window housekeeping tool.  That
+    tool is not user-requested work, so an omitted terminal event must not make
+    an otherwise complete task fail.  Do not infer it from the title or text:
+    only the exact boolean extension is trusted.
+    """
+    if not trust_codex_extensions:
+        return False
+    meta = getattr(update, "field_meta", None) or getattr(update, "_meta", None)
+    return isinstance(meta, Mapping) and meta.get("contextCompaction") is True
+
+
 def _parse_codex_message_metadata(
     update: AgentMessageChunk,
 ) -> tuple[str | None, str | None]:
@@ -1033,6 +1051,7 @@ def _parse_tool_call(
     update: ToolCallStart | ToolCallProgress,
     *,
     capture_full_tool_content: bool = False,
+    trust_codex_extensions: bool = False,
 ) -> ToolCallInfo:
     """Extract ToolCallInfo from a ToolCallStart or ToolCallProgress."""
     locations = [loc.path for loc in (update.locations or [])]
@@ -1069,6 +1088,13 @@ def _parse_tool_call(
 
     # Prefer tool kind for rendering decisions; fall back to title heuristics.
     kind = (update.kind or "other").strip() or "other"
+    is_context_compaction = (
+        kind == "other"
+        and _is_codex_context_compaction(
+            update,
+            trust_codex_extensions=trust_codex_extensions,
+        )
+    )
     title_lower = title.lower()
     is_execute = (kind == "execute") or ("bash" in title_lower)
     is_agent_task = (
@@ -1180,6 +1206,7 @@ def _parse_tool_call(
         collaboration_model=collaboration_model or None,
         subagent_states=subagent_states,
         child_metadata_malformed=child_metadata_malformed,
+        is_context_compaction=is_context_compaction,
         full_content=full_content,
     )
 
@@ -1334,11 +1361,13 @@ class GhostAPClient(Client):
         on_session_info: Callable[[str, ACPSessionInfo], None] | None = None,
         root_dir: str = ".",
         capture_full_tool_content: bool = False,
+        trust_codex_extensions: bool = False,
     ):
         self._on_event = on_event
         self._on_session_info = on_session_info
         self._root_dir = os.path.abspath(os.path.expanduser(root_dir or "."))
         self._capture_full_tool_content = bool(capture_full_tool_content)
+        self._trust_codex_extensions = bool(trust_codex_extensions)
         self._command_executor = CommandExecutor()
         self._terminals: dict[str, _TerminalRecord] = {}
         self._terminals_lock = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
@@ -1455,6 +1484,7 @@ class GhostAPClient(Client):
         tool_info = _parse_tool_call(
             update,
             capture_full_tool_content=self._capture_full_tool_content,
+            trust_codex_extensions=self._trust_codex_extensions,
         )
         self._on_event(
             ACPEvent(
@@ -1469,6 +1499,7 @@ class GhostAPClient(Client):
         tool_info = _parse_tool_call(
             update,
             capture_full_tool_content=self._capture_full_tool_content,
+            trust_codex_extensions=self._trust_codex_extensions,
         )
         status = tool_info.status
         if status in ("completed", "failed"):

@@ -23,7 +23,7 @@ from ...acp import (
 )
 from ...acp.collaboration import AuthoritativeChildLifecycleProof
 from ...acp.manager import ACPSessionManager
-from ...acp.outcome import PromptAssessment, PromptOutcome
+from ...acp.outcome import IncompleteToolTrace, PromptAssessment, PromptOutcome
 from ...acp.providers import normalize_acp_model_name
 from ...agent_session import SyncSession
 from ...card.actions import dispatch as card_action_ids
@@ -259,6 +259,41 @@ def _log_prompt_execution(mode_name: str, execution: object) -> None:
         assessment.incomplete_outer_tool_calls,
         assessment.unresolved_child_tool_calls,
         ";".join(assessment.incomplete_tool_diagnostics) or "none",
+    )
+
+
+def _log_final_unresolved_tool_trace(
+    mode_name: str,
+    assessment: PromptAssessment,
+) -> None:
+    """Log Codex-only correlation data once the handler kept the failure."""
+    if str(mode_name or "").strip().casefold() != "codex":
+        return
+    trace = tuple(
+        observation
+        for observation in assessment.incomplete_tool_traces
+        if isinstance(observation, IncompleteToolTrace)
+    )
+    rendered = ";".join(
+        "id_sha256={id_sha256},diagnostic={diagnostic},"
+        "child_source_present={child_source_present},"
+        "context_compaction={context_compaction},"
+        "child_metadata_malformed={child_metadata_malformed}".format(
+            id_sha256=observation.id_sha256,
+            diagnostic=observation.diagnostic,
+            child_source_present=int(observation.child_source_present),
+            context_compaction=int(observation.context_compaction),
+            child_metadata_malformed=int(
+                observation.child_metadata_malformed
+            ),
+        )
+        for observation in trace
+    )
+    logger.info(
+        "%s ACP未终态工具关联证据: tool_count=%d traces=%s",
+        mode_name,
+        assessment.incomplete_tool_calls,
+        rendered or "unavailable",
     )
 
 
@@ -1810,6 +1845,11 @@ class ProgrammingModeHandler(BaseHandler):
                     self.mode_name,
                     assessment.unresolved_child_tool_calls,
                 )
+            if (
+                prompt_outcome is PromptOutcome.INCOMPLETE
+                and assessment.incomplete_tool_calls > 0
+            ):
+                _log_final_unresolved_tool_trace(self.mode_name, assessment)
             result_text = (getattr(result, "text", None) or "").strip()
             streamed_response = (
                 prog_session.get_final_text()

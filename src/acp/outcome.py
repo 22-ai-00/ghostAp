@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -24,6 +25,17 @@ class PromptOutcome(str, Enum):
 
 
 @dataclass(frozen=True)
+class IncompleteToolTrace:
+    """Privacy-safe correlation evidence for one unresolved tool call."""
+
+    id_sha256: str
+    diagnostic: str
+    child_source_present: bool
+    context_compaction: bool
+    child_metadata_malformed: bool
+
+
+@dataclass(frozen=True)
 class PromptAssessment:
     """Normalized outcome and a user-facing diagnostic."""
 
@@ -35,10 +47,15 @@ class PromptAssessment:
     incomplete_outer_tool_calls: int = 0
     unresolved_child_tool_calls: int = 0
     incomplete_tool_diagnostics: tuple[str, ...] = ()
+    # Opaque diagnostics for structured logs only; never render these on cards.
+    incomplete_tool_traces: tuple[IncompleteToolTrace, ...] = ()
 
 
 _CANCELLED_REASONS = frozenset({"cancelled", "canceled"})
 _TERMINAL_TOOL_STATUSES = frozenset({"completed", "failed"})
+_CONTEXT_COMPACTION_TRANSIENT_STATUSES = frozenset(
+    {"pending", "in_progress", "running"}
+)
 _CHILD_GENERATION_ACTIONS = frozenset({"followup_task", "spawn_agent"})
 _PASSIVE_CHILD_ACTIONS = frozenset(
     {"interrupt_agent", "list_agents", "send_message", "wait_agent"}
@@ -77,6 +94,22 @@ def _status(value: Any) -> str:
     return str(getattr(value, "status", "") or "").strip().casefold()
 
 
+def _is_nonblocking_context_compaction(tool: object) -> bool:
+    """Exclude only an explicitly tagged internal Codex bookkeeping item.
+
+    The Codex adapter may emit a context-compaction start without its matching
+    completion.  It does not represent user work, so it cannot by itself keep
+    a completed prompt open.  Require both the exact boolean marker and the
+    provider's ``other`` kind; every normal in-progress tool remains blocking.
+    """
+    return (
+        getattr(tool, "is_context_compaction", False) is True
+        and str(getattr(tool, "kind", "") or "").strip().casefold()
+        == "other"
+        and _status(tool) in _CONTEXT_COMPACTION_TRANSIENT_STATUSES
+    )
+
+
 def _tool_incompleteness_details(
     tool_calls: list[object],
 ) -> tuple[list[object], int, int, bool]:
@@ -84,7 +117,10 @@ def _tool_incompleteness_details(
     incomplete_outer = {
         index
         for index, tool in enumerate(tool_calls)
-        if _status(tool) not in _TERMINAL_TOOL_STATUSES
+        if (
+            _status(tool) not in _TERMINAL_TOOL_STATUSES
+            and not _is_nonblocking_context_compaction(tool)
+        )
     }
     lifecycle_by_source: dict[str, tuple[str, int]] = {}
     invalid_indexes: set[int] = set()
@@ -359,6 +395,32 @@ def _tool_diagnostic(tool: object) -> str:
     return f"{name}:{outer_status}[{child_summary}]"
 
 
+def _tool_id_sha256(value: object) -> str:
+    """Return a bounded opaque correlation value without logging the raw id."""
+    if not isinstance(value, str) or not value:
+        return "missing"
+    if len(value) > 512:
+        return "invalid"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _incomplete_tool_trace(tool: object) -> IncompleteToolTrace:
+    raw_source = getattr(tool, "subagent_source_id", None)
+    return IncompleteToolTrace(
+        id_sha256=_tool_id_sha256(getattr(tool, "id", None)),
+        diagnostic=_tool_diagnostic(tool),
+        child_source_present=bool(
+            isinstance(raw_source, str) and raw_source.strip()
+        ),
+        context_compaction=(
+            getattr(tool, "is_context_compaction", False) is True
+        ),
+        child_metadata_malformed=(
+            getattr(tool, "child_metadata_malformed", False) is not False
+        ),
+    )
+
+
 def classify_prompt_result(result: object) -> PromptAssessment:
     """Classify whether a prompt result proves that requested work is complete.
 
@@ -391,6 +453,9 @@ def classify_prompt_result(result: object) -> PromptAssessment:
         "unresolved_child_tool_calls": unresolved_child_tool_calls,
         "incomplete_tool_diagnostics": tuple(
             _tool_diagnostic(tool) for tool in incomplete_tools
+        )[:_MAX_TOOL_DIAGNOSTICS],
+        "incomplete_tool_traces": tuple(
+            _incomplete_tool_trace(tool) for tool in incomplete_tools
         )[:_MAX_TOOL_DIAGNOSTICS],
     }
 
@@ -467,6 +532,7 @@ def classify_prompt_result(result: object) -> PromptAssessment:
 
 
 __all__ = [
+    "IncompleteToolTrace",
     "PromptAssessment",
     "PromptOutcome",
     "classify_prompt_result",

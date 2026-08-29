@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1278,6 +1279,12 @@ def test_terminal_snapshot_resolves_only_the_matching_child() -> None:
 
     assert assessment.outcome is PromptOutcome.INCOMPLETE
     assert assessment.incomplete_tool_calls == 1
+    assert len(assessment.incomplete_tool_traces) == 1
+    trace = assessment.incomplete_tool_traces[0]
+    assert trace.id_sha256 == hashlib.sha256(
+        b"wait-two-children"
+    ).hexdigest()[:16]
+    assert trace.diagnostic == "other:completed[running]"
 
 
 def test_successful_followup_task_reactivates_terminal_child() -> None:
