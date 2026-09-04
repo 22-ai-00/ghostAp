@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _SCRIPT_GENERATION_MAX_ATTEMPTS = 3
 _GENERATION_ACTIVITY_MAX_CHARS = 180
 _GENERATION_ACTIVITY_BREAKS = frozenset("。！？.!?；;\n")
+_WORKFLOW_STOP_QUIESCENCE_TIMEOUT_S = 5.0
 _UNSET_WORKFLOW_MODEL_STATE = object()
 
 
@@ -94,6 +95,9 @@ class _WorkflowLifecycleOwner:
         default_factory=threading.Event,
     )
     worker_exited_event: threading.Event = field(
+        default_factory=threading.Event,
+    )
+    stop_delivery_fenced_event: threading.Event = field(
         default_factory=threading.Event,
     )
     worker_thread_id: int | None = field(
@@ -2363,6 +2367,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         sessions_to_close: list[tuple[_WorkflowLifecycleOwner, Any]] = []
         artifacts_to_remove: list[str] = []
         runtime_active = False
+        runtime_stop_owner: _WorkflowLifecycleOwner | None = None
         terminal_notice: WorkflowStatus | None = None
         with engine._lock:
             wf_project = engine.project
@@ -2484,6 +2489,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     artifacts_to_remove.append(wf_project.script_path)
 
                 if runtime_active:
+                    runtime_stop_owner = live_start_owner
                     engine.stop()
                 elif wf_project is not None:
                     wf_project.status = WorkflowStatus.CANCELLED
@@ -2558,11 +2564,33 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             )
             return
 
+        if (
+            runtime_stop_owner is not None
+            and runtime_stop_owner.worker_thread_id != threading.get_ident()
+            and not runtime_stop_owner.done_event.wait(
+                timeout=_WORKFLOW_STOP_QUIESCENCE_TIMEOUT_S
+            )
+        ):
+            # No callback may cross the user-visible stop response.  If the
+            # execution owner cannot prove quiescence in time, fence its
+            # cancellation card and report an explicit unconfirmed stop.
+            with runtime_stop_owner.delivery_lock:
+                runtime_stop_owner.stop_delivery_fenced_event.set()
+            self._reply_workflow_error(
+                message_id,
+                "internal_error",
+                detail=(
+                    "Workflow 停止未在限定时间内确认；任务已收到取消信号，"
+                    "当前项目保持停止中，请稍后用 /wf_status 检查。"
+                ),
+            )
+            return
+
         # A delivery that had already passed its ownership check may finish,
         # but it must do so before the stop acknowledgement is sent.
         for lifecycle_owner in delivery_owners:
             with lifecycle_owner.delivery_lock:
-                pass
+                lifecycle_owner.stop_delivery_fenced_event.set()
             if (
                 not runtime_active
                 and not lifecycle_owner.claimed_event.is_set()
@@ -4408,7 +4436,15 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         def on_cancelled(wf_project: "WorkflowProject") -> None:
             """Deliver the stopped run's final stream despite its stop fence."""
             with delivery_lock:
-                if terminal_sent[0]:
+                stop_delivery_fence = getattr(
+                    lifecycle_owner,
+                    "stop_delivery_fenced_event",
+                    None,
+                )
+                if terminal_sent[0] or (
+                    isinstance(stop_delivery_fence, threading.Event)
+                    and stop_delivery_fence.is_set()
+                ):
                     return
                 terminal_sent[0] = True
                 _deliver_terminal_project(

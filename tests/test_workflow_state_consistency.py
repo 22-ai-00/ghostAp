@@ -616,6 +616,44 @@ export default async function workflow() { return "never"; }
     handler.reply_text.assert_called_once_with("stop_msg", "Workflow 任务已停止。")
 
 
+def test_runtime_stop_timeout_never_claims_success_or_delivers_late_cancel(
+    tmp_path,
+    monkeypatch,
+):
+    project = _Project(str(tmp_path))
+    engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
+    engine._project = WorkflowProject(
+        status=WorkflowStatus.RUNNING,
+        initiator_user_id="user_1",
+    )
+    engine._run_state = EngineRunState.RUNNING
+    owner = _WorkflowLifecycleOwner("runtime_session")
+    owner.claimed_event.set()
+    owner.worker_started_event.set()
+    object.__setattr__(owner, "worker_thread_id", 999999)
+    engine._workflow_start_owner = owner
+
+    handler = WorkflowHandler.__new__(WorkflowHandler)
+    handler.ctx = MagicMock()
+    handler.ctx.workflow_engine_manager.get.return_value = engine
+    handler.ctx.settings.admin_user_ids = []
+    handler._get_root_path = MagicMock(return_value=str(tmp_path))
+    handler._reply_workflow_error = MagicMock()
+    handler.reply_text = MagicMock()
+    monkeypatch.setattr(
+        "src.feishu.handlers.workflow._WORKFLOW_STOP_QUIESCENCE_TIMEOUT_S",
+        0.01,
+    )
+
+    with patch("src.thread.get_current_sender_id", return_value="user_1"):
+        handler.stop_workflow("stop_msg", "chat_1", project)
+
+    assert owner.stop_event.is_set()
+    assert owner.stop_delivery_fenced_event.is_set()
+    handler.reply_text.assert_not_called()
+    handler._reply_workflow_error.assert_called_once()
+
+
 def test_stop_workflow_clears_generating_script_state(tmp_path):
     project = _Project(str(tmp_path))
     engine = WorkflowEngine(chat_id="chat_1", root_path=str(tmp_path))
