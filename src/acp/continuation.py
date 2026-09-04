@@ -195,6 +195,21 @@ def _send_child_reconciliation_prompt(
     return session.send_prompt(text, **kwargs)
 
 
+def _reconciliation_status_callback(
+    callback: Callable[[ACPEvent], None] | None,
+) -> Callable[[ACPEvent], None] | None:
+    """Keep a bookkeeping turn out of the public final-answer channel."""
+    if callback is None:
+        return None
+
+    def forward(event: ACPEvent) -> None:
+        if event.codex_message_phase == "final_answer":
+            event = replace(event, codex_message_phase="commentary")
+        callback(event)
+
+    return forward
+
+
 def _retire_reconciliation_timeout(
     session: SessionT,
     callback: Callable[[SessionT, float], None] | None,
@@ -304,6 +319,7 @@ def run_prompt_with_continuation(
     finalization_task_text: str | None = None,
     on_finalization_start: Callable[[], None] | None = None,
     on_continuation_start: Callable[[], None] | None = None,
+    on_child_reconciliation_start: Callable[[], None] | None = None,
     replace_dead_session: Callable[[float], SessionT] | None = None,
     retire_finalization_session: Callable[[SessionT, float], None] | None = None,
 ) -> PromptContinuationResult:
@@ -467,7 +483,15 @@ def run_prompt_with_continuation(
         is_child_reconciliation = (
             continuation_kind == _CHILD_RECONCILIATION
         )
+        if is_child_reconciliation:
+            _notify_continuation_start(on_child_reconciliation_start)
         preserved_reconciliation_plan = result.plan
+        preserved_reconciliation_text = result.text
+        reconciliation_on_event = (
+            _reconciliation_status_callback(on_event)
+            if is_child_reconciliation
+            else on_event
+        )
         if continuation_kind in {
             _PLAN_CONTINUATION,
             _GOAL_RECOVERY,
@@ -496,7 +520,7 @@ def run_prompt_with_continuation(
                 next_result = _send_child_reconciliation_prompt(
                     session,
                     continuation_prompt,
-                    on_event=on_event,
+                    on_event=reconciliation_on_event,
                     timeout=reconciliation_timeout,
                     idle_timeout=idle_timeout_s,
                 )
@@ -527,7 +551,11 @@ def run_prompt_with_continuation(
         automatic_continuations += 1
         result = merge_prompt_results(result, next_result)
         if is_child_reconciliation:
-            result = replace(result, plan=preserved_reconciliation_plan)
+            result = replace(
+                result,
+                plan=preserved_reconciliation_plan,
+                text=preserved_reconciliation_text,
+            )
         if (
             reconciliation_started_at is not None
             and reconciliation_finished_at is not None
@@ -544,7 +572,7 @@ def run_prompt_with_continuation(
                         started_at=reconciliation_started_at,
                         ended_at=reconciliation_finished_at,
                         logical_task_started_at=logical_task_started_at,
-                        on_event=on_event,
+                        on_event=reconciliation_on_event,
                     )
                     if isinstance(enriched, PromptResult):
                         result = enriched
@@ -552,6 +580,7 @@ def run_prompt_with_continuation(
                             result = replace(
                                 result,
                                 plan=preserved_reconciliation_plan,
+                                text=preserved_reconciliation_text,
                             )
                 except Exception:
                     logger.warning(

@@ -103,11 +103,13 @@ class CardEvent(Generic[P]):
         if details:
             payload["details"] = str(details)
         if detail_action:
-            payload["detail_action"] = cls._diagnostic_action(
+            diagnostic_action = cls._diagnostic_action(
                 detail_action,
                 summary=warning or summary or "任务已完成，但检测到状态对账提醒。",
                 details=details,
             )
+            if diagnostic_action:
+                payload["detail_action"] = diagnostic_action
         if duration_seconds is not None:
             if (
                 isinstance(duration_seconds, bool)
@@ -140,11 +142,13 @@ class CardEvent(Generic[P]):
         if details:
             payload["details"] = str(details)
         if detail_action:
-            payload["detail_action"] = cls._diagnostic_action(
+            diagnostic_action = cls._diagnostic_action(
                 detail_action,
                 summary=error,
                 details=details or error,
             )
+            if diagnostic_action:
+                payload["detail_action"] = diagnostic_action
         if retry_action:
             payload["retry_action"] = dict(retry_action)
         if duration_seconds is not None:
@@ -164,13 +168,9 @@ class CardEvent(Generic[P]):
         *,
         summary: str,
         details: str,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | None:
         """Create a callback-safe action backed by the redacted diagnostic store."""
         action_payload = dict(detail_action)
-        if "diagnostic_token" in action_payload:
-            return action_payload
-        from src.card.error_diagnostics import register_error_diagnostic
-
         action_payload = {
             key: value
             for key, value in action_payload.items()
@@ -185,6 +185,15 @@ class CardEvent(Generic[P]):
                 "traceback",
             }
         }
+        # The callback supplies the live chat coordinate.  Other values are
+        # card-controlled and survive forwarding, so they cannot independently
+        # authorize disclosure of stored diagnostics.
+        if not str(action_payload.get("chat_id") or "").strip():
+            return None
+        if "diagnostic_token" in action_payload:
+            return action_payload
+        from src.card.error_diagnostics import register_error_diagnostic
+
         action_payload["diagnostic_token"] = register_error_diagnostic(
             title="诊断详情",
             summary=summary,

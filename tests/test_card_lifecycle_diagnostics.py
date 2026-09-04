@@ -59,6 +59,23 @@ def test_failed_card_renders_bound_diagnostic_action() -> None:
     assert "已脱敏" in rendered
 
 
+def test_failed_card_hides_diagnostics_without_a_chat_binding() -> None:
+    state = reduce_card_state(
+        _started_state(),
+        CardEvent.failed(
+            "boom",
+            details="must not be disclosed from a forwarded card",
+            detail_action={
+                "action": action_ids.SHOW_ERROR_DETAILS,
+                "origin_message_id": "message-1",
+            },
+        ),
+    )
+
+    assert all(button.text != "查看详情" for button in state.buttons)
+    assert "可查看脱敏诊断" not in _block_text(state)
+
+
 def test_completed_card_can_surface_non_blocking_reconciliation_diagnostic() -> None:
     state = reduce_card_state(
         _started_state(),

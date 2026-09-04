@@ -28,6 +28,7 @@ def _enable_and_cleanup():
 
 class TestLockLevel:
     def test_ordering_values(self):
+        assert LockLevel.ACP_ACTIVATION < LockLevel.PROJECT_MANAGER
         assert LockLevel.PROJECT_MANAGER < LockLevel.CHAT_LOCK_CTX
         assert LockLevel.CHAT_LOCK_CTX < LockLevel.CHAT_LOCK_MGR
         assert LockLevel.CHAT_LOCK_MGR < LockLevel.REPO_LOCK
@@ -113,15 +114,30 @@ class TestDisabledChecking:
 
 class TestIntegrationWithRealManagers:
     def test_project_manager_lock_level(self):
-        """ProjectManager._lock should be at level 1."""
+        """ProjectManager._lock should use its declared ordered level."""
         from src.project.manager import ProjectManager
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv("GHOSTAP_LOCK_ORDER_CHECK", "1")
             pm = ProjectManager()
             assert pm._lock._level == int(LockLevel.PROJECT_MANAGER)
 
+    def test_acp_activation_lock_is_outside_project_manager(self):
+        """ACP lifecycle commits may safely enter ProjectManager."""
+        activation = ordered_rlock(
+            LockLevel.ACP_ACTIVATION,
+            name="activation",
+        )
+        project = ordered_rlock(
+            LockLevel.PROJECT_MANAGER,
+            name="project",
+        )
+        enable_lock_order_check(strict=True)
+        with activation:
+            with project:
+                pass
+
     def test_repo_lock_manager_lock_level(self):
-        """RepoLockManager._mu should be at level 4."""
+        """RepoLockManager._mu should use the innermost ordered level."""
         from src.repo_lock import RepoLockManager
         try:
             mgr = RepoLockManager(idle_timeout=999, cleanup_interval=999, hard_timeout=9999)

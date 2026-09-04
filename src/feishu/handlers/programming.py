@@ -780,12 +780,13 @@ class ProgrammingModeHandler(BaseHandler):
         commit_project_state: bool = True,
         activate_mode: bool = True,
         exit_opposite_mode: bool = True,
+        inherit_thread_context: bool = True,
     ) -> bool:
         from ...thread import get_current_thread_id
 
         project_id = project.project_id if project else None
 
-        if thread_id is None:
+        if thread_id is None and inherit_thread_context:
             thread_id = get_current_thread_id()
         if not thread_id and self._is_in_this_mode(chat_id, project_id=project_id):
             manager = self._get_session_manager()
@@ -948,11 +949,15 @@ class ProgrammingModeHandler(BaseHandler):
         chat_id: str,
         model_name: Optional[str],
         project: Optional["ProjectContext"] = None,
+        *,
+        expected_session: SyncSession | None = None,
     ) -> bool:
         """Switch the model for the active programming session.
 
         Active sessions only use ACP ``session/setModel``. Session replacement
         belongs to task startup/recovery, not to this configuration command.
+        The caller owns the selection card lifecycle, so this method is
+        deliberately effect-only and never emits a second success/error card.
         """
         project_id = project.project_id if project else None
         mgr = self._get_session_manager()
@@ -972,6 +977,8 @@ class ProgrammingModeHandler(BaseHandler):
         session = mgr.get_session(chat_id, project_id=project_id)
         set_model_fn = getattr(session, "set_model", None) if session else None
         try:
+            if expected_session is not None and session is not expected_session:
+                raise RuntimeError("ACP 会话已变化，本次模型切换已失效")
             if not backend_model_name or not callable(set_model_fn):
                 raise RuntimeError("当前 ACP 会话不支持在线切换模型")
             if not set_model_fn(backend_model_name):
@@ -981,25 +988,10 @@ class ProgrammingModeHandler(BaseHandler):
                 self.mode_name,
                 backend_model_name,
             )
-            banner = CoreBuilder._build_banner_element(
-                UI_TEXT["mode_model_switched_banner"].format(
-                    name=self.mode_name,
-                    model=model_name,
-                ),
-                type="success",
-            )
-            msg_type, card_content = ProjectBuilder.build_project_response_card(
-                project,
-                UI_TEXT["mode_model_switched_title"].format(name=self.mode_name),
-                UI_TEXT["mode_model_switch_context_kept"],
-                banner=banner,
-            )
-            self.reply_card(message_id, card_content)
             return True
         except Exception as e:
             from ...utils.errors import log_exception
             log_exception(logger, f"切换 {self.mode_name} 模型失败", e)
-            self.reply_error(message_id, UI_TEXT["mode_model_switch_error"].format(name=self.mode_name, error=get_error_detail(e)))
             return False
 
     # ------------------------------------------------------------------
@@ -1070,6 +1062,7 @@ class ProgrammingModeHandler(BaseHandler):
             and was_in_this_mode
         )
 
+        project_state_persisted = True
         if project:
             if session:
                 self._update_snapshot_on_project(
@@ -1088,6 +1081,28 @@ class ProgrammingModeHandler(BaseHandler):
                 )
             if not thread_id:
                 self._set_mode_on_project(project, False)
+                persist = getattr(
+                    self.project_manager,
+                    "persist_project_context",
+                    None,
+                )
+                try:
+                    project_state_persisted = not callable(persist) or bool(
+                        persist(project)
+                    )
+                except Exception:
+                    project_state_persisted = False
+                    logger.exception(
+                        "[%s] project mode exit persistence raised: project=%s",
+                        self.mode_name,
+                        project.project_id,
+                    )
+                if not project_state_persisted:
+                    logger.error(
+                        "[%s] failed to persist project mode exit: project=%s",
+                        self.mode_name,
+                        project.project_id,
+                    )
 
         if not thread_id:
             self.mode_manager.exit_to_smart(chat_id, project_id=project_id)
@@ -1114,14 +1129,39 @@ class ProgrammingModeHandler(BaseHandler):
                 self.add_reaction(message_id, EmojiReaction.on_coco_exit())
 
                 if project:
-                    content = UI_TEXT["mode_exit_msg"].format(name=self.mode_name)
-                    if is_pending_slot or is_mode_only_exit:
+                    if not project_state_persisted:
+                        content = UI_TEXT["mode_exit_persist_failed"]
+                        banner_text = UI_TEXT[
+                            "mode_exit_persist_failed_banner"
+                        ].format(name=self.mode_name)
+                        banner_type = "warning"
+                        card_title = UI_TEXT[
+                            "mode_exit_persist_failed_title"
+                        ]
+                    elif is_pending_slot or is_mode_only_exit:
                         content = UI_TEXT["mode_exit_pending_msg"].format(name=self.mode_name)
+                        banner_text = UI_TEXT["mode_exit_banner"].format(
+                            name=self.mode_name
+                        )
+                        banner_type = "info"
+                        card_title = UI_TEXT["mode_exit_card_title"]
+                    else:
+                        content = UI_TEXT["mode_exit_msg"].format(
+                            name=self.mode_name
+                        )
+                        banner_text = UI_TEXT["mode_exit_banner"].format(
+                            name=self.mode_name
+                        )
+                        banner_type = "info"
+                        card_title = UI_TEXT["mode_exit_card_title"]
 
-                    banner = CoreBuilder._build_banner_element(UI_TEXT["mode_exit_banner"].format(name=self.mode_name), type="info")
+                    banner = CoreBuilder._build_banner_element(
+                        banner_text,
+                        type=banner_type,
+                    )
                     msg_type, card_content = ProjectBuilder.build_project_response_card(
                         project,
-                        UI_TEXT["mode_exit_card_title"],
+                        card_title,
                         content,
                         show_buttons=True,
                         banner=banner,
@@ -1151,12 +1191,34 @@ class ProgrammingModeHandler(BaseHandler):
     # ------------------------------------------------------------------
     # handle_message
     # ------------------------------------------------------------------
-    def handle_message(self, message_id: str, chat_id: str, text: str, project: Optional["ProjectContext"] = None):
+    def handle_message(
+        self,
+        message_id: str,
+        chat_id: str,
+        text: str,
+        project: Optional["ProjectContext"] = None,
+        *,
+        expected_session: Optional[SyncSession] = None,
+    ):
         from ...thread import get_current_thread_id
 
         project_id = project.project_id if project else None
         thread_id = get_current_thread_id()
         session = self._get_session_manager().get_session(chat_id, project_id=project_id, thread_id=thread_id)
+
+        if expected_session is not None and session is not expected_session:
+            # A model activation dispatches its pending prompt only to the exact
+            # session it committed.  If /exit or a newer activation replaced that
+            # session in the narrow hand-off window, do not recover/re-enter it.
+            logger.info(
+                "[%s] pending prompt skipped because the committed ACP session "
+                "is no longer current: chat=%s project=%s thread=%s",
+                self.mode_name,
+                chat_id[:12] if chat_id else "?",
+                project_id or "-",
+                (thread_id or "-")[:12],
+            )
+            return
 
         if not session:
             # Recovery 路径：silent=True 避免在仍未拿到 session 时再 reply "已开启 X 编程模式"，
@@ -1772,6 +1834,15 @@ class ProgrammingModeHandler(BaseHandler):
                     if prog_session is not None
                     else None
                 ),
+                on_child_reconciliation_start=(
+                    getattr(
+                        prog_session,
+                        "freeze_result_conclusion_fallback",
+                        None,
+                    )
+                    if prog_session is not None
+                    else None
+                ),
                 replace_dead_session=_replace_dead_session,
                 retire_finalization_session=_retire_session,
             )
@@ -1862,6 +1933,12 @@ class ProgrammingModeHandler(BaseHandler):
                 else result_text or streamed_response
             )
             if prompt_outcome is PromptOutcome.COMPLETED:
+                if (
+                    prog_session is not None
+                    and result_text
+                    and not streamed_response
+                ):
+                    prog_session.set_result_conclusion_fallback(result_text)
                 if (
                     prog_session is not None
                     and not streamed_response
@@ -2138,14 +2215,15 @@ class ProgrammingModeHandler(BaseHandler):
         self.enter_mode(message_id, chat_id)
 
     def handle_card_exit(self, message_id: str, chat_id: str, project_id: str, value: Optional[dict] = None):
-        from ...thread import get_current_thread_id
         if project_id:
             project = self.project_manager.get_project_for_chat(project_id, chat_id)
-            if project and not get_current_thread_id():
-                self._set_mode_on_project(project, False)
-            self.exit_mode(message_id, chat_id, project=project)
+        else:
+            project = None
+        system = self.get_handler("system")
+        if system is not None and hasattr(system, "exit_current_mode"):
+            system.exit_current_mode(message_id, chat_id, project=project)
             return
-        self.exit_mode(message_id, chat_id)
+        self.exit_mode(message_id, chat_id, project=project)
 
 # ======================================================================
 # Concrete subclasses

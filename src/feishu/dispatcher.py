@@ -258,7 +258,7 @@ class MessageDispatcher:
                 self._handle_enter_acp_mode(mode, message_id, chat_id, project)
             return
         if intent_name.startswith("EXIT_") and intent_name[5:].lower() in self._PROGRAMMING_MODES:
-            self.handlers[intent_name[5:].lower()].exit_mode(message_id, chat_id, project=project)
+            self.system.exit_current_mode(message_id, chat_id, project=project)
             return
         if intent_name.endswith("_MESSAGE") and intent_name[:-8].lower() in self._PROGRAMMING_MODES:
             self._handle_mode_message(intent_name[:-8].lower(), data, message_id, chat_id, original_text, project)

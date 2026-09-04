@@ -215,6 +215,7 @@ class ProgrammingCardSession:
         # commentary. Hold that trusted message for the result card instead
         # of sending it through the COT process stream.
         self._trusted_final_answer: tuple[str, str] | None = None
+        self._result_conclusion_fallback = ""
         self._flush_lock = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._flush_lock_holder = threading.local()  # per-thread flag for lock ownership assertion
         self._flush_timer: threading.Timer | None = None
@@ -422,6 +423,12 @@ class ProgrammingCardSession:
         with self._event_gate:
             if self._terminal_fenced:
                 return
+            # A child-reconciliation boundary may have frozen the preceding
+            # business conclusion.  Any later continuation is implementation
+            # work again, so its newer main-Agent output must be eligible to
+            # become the final conclusion.
+            with self._flush_lock:
+                self._result_conclusion_fallback = ""
             self._flush_now()
             if self._reasoning_blocks_by_source:
                 self._close_reasoning_blocks(retire=True)
@@ -499,10 +506,14 @@ class ProgrammingCardSession:
             self._close_reasoning_blocks()
         self._finish_agent_summaries(terminal_status=subagent_status)
         self._terminal_fenced = True
-        # A provider explicitly classified this as public final output.  Keep
-        # it visible even if transport/finalization later reports failure or
-        # cancellation; the terminal card state still conveys that status.
-        publish_trusted_final = self._has_trusted_final_answer()
+        # Keep the provider-classified final answer, or the terminal
+        # PromptResult fallback selected by the handler, visible even if later
+        # transport/finalization reports failure or cancellation. The terminal
+        # card state still conveys that status.
+        publish_selected_conclusion = (
+            self._has_trusted_final_answer()
+            or self._has_result_conclusion_fallback()
+        )
         if self._native_process_started:
             completed = False
             try:
@@ -517,7 +528,7 @@ class ProgrammingCardSession:
             if completed:
                 self._buffered_process_events.clear()
                 self._buffered_process_bytes = 0
-                if not publish_trusted_final:
+                if not publish_selected_conclusion:
                     self._publish_conclusion_to_card()
             else:
                 logger.warning(
@@ -533,7 +544,7 @@ class ProgrammingCardSession:
                             "Failed to abort degraded Feishu COT",
                             exc_info=True,
                         )
-        if publish_trusted_final:
+        if publish_selected_conclusion:
             self._publish_conclusion_to_card()
         self._dispatch_event(event, route_process=False)
         self._stop_ticker()
@@ -626,6 +637,8 @@ class ProgrammingCardSession:
                 and self._trusted_final_answer[1].strip()
             ):
                 return self._trusted_final_answer[1]
+            if self._result_conclusion_fallback.strip():
+                return self._result_conclusion_fallback
             return next(
                 (
                     content
@@ -634,6 +647,31 @@ class ProgrammingCardSession:
                 ),
                 "",
             )
+
+    def set_result_conclusion_fallback(self, text: str) -> None:
+        """Retain a provider result only when no stream text was available."""
+        value = str(text or "").strip()
+        if not value:
+            return
+        with self._flush_lock:
+            self._result_conclusion_fallback = value
+
+    def freeze_result_conclusion_fallback(self) -> None:
+        """Freeze the latest main-Agent text before bookkeeping starts."""
+        self._flush_now()
+        with self._flush_lock:
+            if self._has_trusted_final_answer():
+                return
+            candidate = next(
+                (
+                    content
+                    for _, content in reversed(self._main_text_transcript)
+                    if content.strip()
+                ),
+                "",
+            )
+            if candidate:
+                self._result_conclusion_fallback = candidate
 
     def _publish_conclusion_to_card(self) -> None:
         """Project the selected terminal conclusion into the result card."""
@@ -1345,6 +1383,10 @@ class ProgrammingCardSession:
                 self._trusted_final_answer is not None
                 and self._trusted_final_answer[1].strip()
             )
+
+    def _has_result_conclusion_fallback(self) -> bool:
+        with self._flush_lock:
+            return bool(self._result_conclusion_fallback.strip())
 
     def _is_main_source(self, source_key: str) -> bool:
         return source_key == "main" or source_key not in self._agent_summaries

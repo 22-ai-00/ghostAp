@@ -149,6 +149,34 @@ class SystemBuilder:
             quick_actions = exc.quick_actions
             context = exc.context
 
+        detail_binding = {
+            **SystemBuilder._safe_action_payload(context),
+            **SystemBuilder._safe_action_payload(detail_action),
+        }
+        has_trusted_detail_binding = bool(detail_binding.get("chat_id"))
+        exposes_details = has_trusted_detail_binding and (
+            severity == "degraded"
+            or (bool(detail_action) and not quick_actions)
+        )
+        exposes_retry = bool(
+            severity != "degraded" and not quick_actions and retry_action
+        )
+        exposes_quick_actions = bool(
+            severity != "degraded" and quick_actions
+        )
+        status_text = SystemBuilder._current_status_text(
+            severity,
+            continue_action,
+            context,
+            has_details=exposes_details,
+            has_retry=exposes_retry,
+            has_quick_actions=exposes_quick_actions,
+        )
+        detail_hint = (
+            f"\n\n{UI_TEXT['card_lifecycle_details_collapsed']}"
+            if exposes_details
+            else ""
+        )
         elements = []
         if project:
             elements.append(CoreBuilder._build_directory_element(project))
@@ -159,8 +187,8 @@ class SystemBuilder:
                 f"{severity_label}\n{severity_hint}\n\n"
                 f"❌ **错误摘要**\n{message}\n\n"
                 f"**错误场景**\n{title}\n\n"
-                f"**当前状态**\n{SystemBuilder._current_status_text(severity, continue_action, context)}\n\n"
-                f"{UI_TEXT['card_lifecycle_details_collapsed']}"
+                f"**当前状态**\n{status_text}"
+                f"{detail_hint}"
             )
         )
 
@@ -168,7 +196,7 @@ class SystemBuilder:
         # is often used for generic errors. Original code had optional project.
         # We'll stick to a simpler interactive card here or wrap it.
 
-        if severity == "degraded":
+        if severity == "degraded" and exposes_details:
             detail_payload = SystemBuilder._build_detail_action(
                 detail_action,
                 title=title,
@@ -196,7 +224,7 @@ class SystemBuilder:
             elements.extend(build_responsive_layout(buttons))
         else:
             buttons = []
-            if detail_action:
+            if exposes_details:
                 safe_detail_action = SystemBuilder._build_detail_action(
                     detail_action,
                     title=title,
@@ -223,7 +251,23 @@ class SystemBuilder:
             if buttons:
                 elements.extend(build_responsive_layout(buttons))
 
-        card = CoreBuilder._wrap_card(UI_TEXT["system_error_prompt_title"], header_template, elements)
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_error_prompt_title"],
+            header_template,
+            elements,
+        )
+        notification_summary = {
+            "recoverable": "操作遇到可恢复错误，打开卡片查看处理建议",
+            "degraded": (
+                "功能已降级，打开卡片查看当前状态与诊断"
+                if exposes_details
+                else "功能已降级，打开卡片查看当前状态"
+            ),
+            "fatal": "操作已停止，打开卡片查看错误摘要与处理建议",
+        }.get(severity, "操作状态异常，打开卡片查看错误摘要")
+        card["config"]["summary"] = {
+            "content": notification_summary
+        }
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
@@ -260,15 +304,37 @@ class SystemBuilder:
         return str(payload.get("degraded_to") or "")
 
     @staticmethod
-    def _current_status_text(severity: str, continue_action: Optional[dict], context: Optional[dict]) -> str:
+    def _current_status_text(
+        severity: str,
+        continue_action: Optional[dict],
+        context: Optional[dict],
+        *,
+        has_details: bool,
+        has_retry: bool,
+        has_quick_actions: bool,
+    ) -> str:
         if severity == "degraded":
             mode = SystemBuilder._resolve_degraded_mode(continue_action, context)
             if mode:
                 return f"可继续使用 {SystemBuilder._display_mode_label(mode)}；原能力恢复由系统自动处理。"
             return "当前暂未确定可继续模式；系统将继续安全的可执行部分，或进入明确失败终态。"
+        if has_quick_actions:
+            return "当前操作未完成；可按卡片操作继续处理。"
         if severity == "recoverable":
-            return "可查看脱敏诊断，也可以按卡片按钮重试。"
-        return "当前操作已停止；可查看脱敏诊断并按提示重新发起。"
+            if has_details and has_retry:
+                return "当前操作未完成；可查看脱敏诊断或按卡片按钮重试。"
+            if has_details:
+                return "当前操作未完成；可查看脱敏诊断后重新发起。"
+            if has_retry:
+                return "当前操作未完成；可按卡片按钮重试。"
+            return "当前操作未完成；请按错误摘要中的提示重新发起。"
+        if has_details and has_retry:
+            return "当前操作已停止；可查看脱敏诊断或按卡片按钮重试。"
+        if has_details:
+            return "当前操作已停止；可查看脱敏诊断并按提示重新发起。"
+        if has_retry:
+            return "当前操作已停止；可按卡片按钮重试。"
+        return "当前操作已停止；请按错误摘要中的提示重新发起。"
 
     @staticmethod
     def _display_mode_label(mode: str) -> str:
@@ -964,6 +1030,9 @@ class SystemBuilder:
                 }
             ],
         )
+        card["config"]["summary"] = {
+            "content": "编程模式正在初始化，打开卡片查看进度"
+        }
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
@@ -1005,6 +1074,9 @@ class SystemBuilder:
             "green",
             elements,
         )
+        card["config"]["summary"] = {
+            "content": "编程模式已就绪，打开卡片查看当前模型"
+        }
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod
@@ -1057,7 +1129,7 @@ class SystemBuilder:
                     SystemBuilder._callback_button(
                         text=UI_TEXT["system_acp_retry_activation_btn"],
                         action=retry_value,
-                        button_type="danger",
+                        button_type="primary",
                     ),
                     SystemBuilder._callback_button(
                         text=UI_TEXT["system_acp_back_to_models_btn"],
@@ -1069,9 +1141,44 @@ class SystemBuilder:
         ]
         card = CoreBuilder._wrap_card(
             UI_TEXT["system_acp_programming_failed_title"].format(tool=tool.capitalize()),
-            "red",
+            "orange",
             elements,
         )
+        card["config"]["summary"] = {
+            "content": "编程模式初始化失败，可在卡片中重试"
+        }
+        return "interactive", json.dumps(card, ensure_ascii=False)
+
+    @staticmethod
+    def build_acp_programming_superseded_card(
+        tool_name: str,
+        model_name: Optional[str],
+        reason: str,
+    ) -> tuple[str, str]:
+        """Build a terminal frame for an activation that cannot take effect."""
+        tool = str(tool_name or "").strip().lower()
+        model = str(model_name or UI_TEXT["system_acp_default_model_option"])
+        safe_reason = SystemBuilder._sanitize_card_text(
+            reason,
+            fallback=UI_TEXT["system_acp_activation_superseded"],
+        )
+        card = CoreBuilder._wrap_card(
+            UI_TEXT["system_acp_programming_superseded_title"].format(
+                tool=tool.capitalize()
+            ),
+            "grey",
+            [
+                {
+                    "tag": "markdown",
+                    "content": UI_TEXT[
+                        "system_acp_programming_superseded_body"
+                    ].format(model=model, reason=safe_reason),
+                }
+            ],
+        )
+        card["config"]["summary"] = {
+            "content": "本次模型初始化未生效，打开卡片查看状态"
+        }
         return "interactive", json.dumps(card, ensure_ascii=False)
 
     @staticmethod

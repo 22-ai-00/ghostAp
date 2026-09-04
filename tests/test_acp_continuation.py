@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from unittest.mock import patch
 
 import pytest
@@ -11,6 +11,7 @@ import pytest
 import src.acp as acp
 from src.acp.models import (
     ACPEvent,
+    ACPEventType,
     ACPGoalInfo,
     PlanEntryInfo,
     PlanInfo,
@@ -83,6 +84,29 @@ class _FakeSession:
             on_event=on_event,
             timeout=timeout,
         )
+
+
+class _FinalAnswerEmittingReconciliationSession(_FakeSession):
+    """Expose the reconciliation turn's public-message event to the caller."""
+
+    def send_reconciliation_prompt(
+        self,
+        text: str,
+        on_event: Callable[[ACPEvent], None] | None = None,
+        timeout: float | int | None = None,
+        idle_timeout: float | int | None = None,
+    ) -> PromptResult:
+        del idle_timeout
+        if on_event is not None:
+            on_event(
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="仅状态对账",
+                    message_id="reconciliation-final",
+                    codex_message_phase="final_answer",
+                )
+            )
+        return self.send_prompt(text, on_event=on_event, timeout=timeout)
 
 
 class _TerminalEvidenceSession(_FakeSession):
@@ -366,6 +390,67 @@ def test_unresolved_child_gets_a_bounded_reconciliation_turn() -> None:
     assert execution.assessment.incomplete_tool_calls == 0
 
 
+def test_child_reconciliation_cannot_replace_the_public_conclusion() -> None:
+    """A bookkeeping turn remains process status, not a new task answer."""
+    runner = _runner()
+    first_result = _with_child_state(
+        PromptResult(stop_reason="end_turn", text="原始主结论"),
+        "running",
+        tool_id="list-before-reconciliation",
+    )
+    reconciled_result = _with_child_state(
+        PromptResult(stop_reason="end_turn", text="仅状态对账"),
+        "completed",
+        tool_id="list-after-reconciliation",
+    )
+    session = _FinalAnswerEmittingReconciliationSession(
+        first_result,
+        reconciled_result,
+    )
+    projected_events: list[ACPEvent] = []
+
+    execution = runner(
+        session,
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+        on_event=projected_events.append,
+    )
+
+    assert execution.result.text == "原始主结论"
+    assert [
+        (event.text, event.codex_message_phase)
+        for event in projected_events
+    ] == [("仅状态对账", "commentary")]
+
+
+def test_child_reconciliation_exposes_a_distinct_pre_bookkeeping_boundary() -> None:
+    runner = _runner()
+    first_result = _with_child_state(
+        PromptResult(stop_reason="end_turn", text="原始主结论"),
+        "running",
+        tool_id="list-before-reconciliation",
+    )
+    reconciled_result = _with_child_state(
+        PromptResult(stop_reason="end_turn", text="仅状态对账"),
+        "completed",
+        tool_id="list-after-reconciliation",
+    )
+    boundaries: list[str] = []
+
+    execution = runner(
+        _FakeSession(first_result, reconciled_result),
+        "original task",
+        timeout_s=90,
+        finalization_reserve_s=30,
+        on_continuation_start=lambda: boundaries.append("turn"),
+        on_child_reconciliation_start=lambda: boundaries.append("freeze"),
+    )
+
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert boundaries == ["turn", "freeze"]
+
+
 def test_child_reconciliation_applies_session_terminal_evidence_once() -> None:
     runner = _runner()
     running = _with_child_state(
@@ -525,7 +610,10 @@ def test_mixed_child_reconciliation_preserves_plan_before_continuing() -> None:
     )
     session = _FakeSession(
         _with_child_state(
-            _pending_result(pending_count=2),
+            replace(
+                _pending_result(pending_count=2),
+                text="首轮临时结论",
+            ),
             "running",
             tool_id="list-before-reconciliation",
         ),
@@ -538,7 +626,7 @@ def test_mixed_child_reconciliation_preserves_plan_before_continuing() -> None:
             "completed",
             tool_id="list-after-reconciliation",
         ),
-        _complete_result(),
+        _complete_result("续做后的最终结论"),
     )
 
     execution = runner(
@@ -554,6 +642,7 @@ def test_mixed_child_reconciliation_preserves_plan_before_continuing() -> None:
     assert "结构化计划仍有 2 项未完成" in session.calls[2].text
     assert execution.automatic_continuations == 2
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.result.text == "续做后的最终结论"
 
 
 def test_mixed_pending_plan_stops_when_child_remains_running() -> None:

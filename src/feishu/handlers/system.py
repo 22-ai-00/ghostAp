@@ -18,15 +18,16 @@ from ...acp.helper import (
     is_programming_tool_available,
     list_acp_tools,
 )
-from ...acp.providers import get_providers
+from ...acp.providers import get_providers, normalize_acp_model_name
 from ...card.builders.project import ProjectBuilder
 from ...card.builders.system import SystemBuilder
 from ...card.render.model_cascade import compose_model_selection, parse_model_selection
 from ...card.ui_text import UI_TEXT
 from ...coco_model import get_coco_model_manager
 from ...mode import PROGRAMMING_MODE_VALUES, PROGRAMMING_MODES, InteractionMode
-from ...tasking import TaskPriority, TaskSpec
+from ...tasking import TaskPriority, TaskSpec, TaskStatus
 from ...utils.errors import safe_error_message
+from ...utils.lock_order import LockLevel, ordered_rlock
 from ..emoji import EmojiReaction
 from ..message_formatter import FeishuMessageFormatter as fmt
 from ..product_catalog import retired_command_tokens
@@ -40,6 +41,29 @@ if TYPE_CHECKING:
     from ..handler_context import HandlerContext
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ACPActivationOwner:
+    """One visible activation writer for an exact session coordinate."""
+
+    generation: int
+    fence_epoch: int
+    origin_message_id: str
+    status_message_id: str
+    explicit_card: bool
+    tool_name: str
+    model_name: Optional[str]
+    terminal: bool = False
+    committed: bool = False
+
+
+@dataclass(frozen=True)
+class _ACPActivationEffect:
+    """Exact session result and whether this activation mutated its lifecycle."""
+
+    session: object
+    changed: bool
 
 
 @dataclass(frozen=True)
@@ -66,6 +90,22 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
     def __init__(self, ctx: "HandlerContext") -> None:
         super().__init__(ctx)
         self.employee = EmployeeHandler(ctx)
+        # All state transitions for one activation generation share this
+        # re-entrant lock.  The critical sections are deliberately limited to
+        # generation/card writes and the short durable commit + mode transition;
+        # ACP startup and prompt execution remain outside it.
+        self._acp_activation_lock = ordered_rlock(
+            LockLevel.ACP_ACTIVATION,
+            name="SystemHandler._acp_activation_lock",
+        )
+        self._acp_activation_generations: dict[tuple[str, str, str], int] = {}
+        self._acp_activation_fence_epochs: dict[tuple[str, str, str], int] = {}
+        self._acp_activation_owners: dict[
+            tuple[str, str, str], _ACPActivationOwner
+        ] = {}
+        self._acp_activation_task_owners: dict[
+            tuple[str, str, str], dict[int, _ACPActivationOwner]
+        ] = {}
         self._init_command_registry()
         self.help_commands = _SystemSubcommands(self, ("show_help", "show_full_help", "handle_help_category", "handle_menu_command"))
         self.shell_commands = _SystemSubcommands(self, ("submit_shell_command", "execute_shell_and_reply", "change_directory"))
@@ -75,6 +115,243 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
     def _project_id(project: Optional["ProjectContext"]) -> Optional[str]:
         project_id = getattr(project, "project_id", None) if project else None
         return project_id if isinstance(project_id, str) else None
+
+    @staticmethod
+    def _acp_activation_key(
+        chat_id: str,
+        project_id: str | None,
+        thread_id: str | None,
+    ) -> tuple[str, str, str]:
+        return (chat_id, project_id or "", thread_id or "")
+
+    @staticmethod
+    def _canonical_acp_thread_id(thread_id: str | None) -> str | None:
+        normalized = str(thread_id or "").strip()
+        if not normalized:
+            return None
+        try:
+            from ...thread import get_thread_manager
+
+            context = get_thread_manager().get(normalized)
+            canonical = str(
+                getattr(context, "thread_root_id", "") or ""
+            ).strip()
+            return canonical or normalized
+        except Exception:
+            logger.debug(
+                "failed to canonicalize ACP thread coordinate",
+                exc_info=True,
+            )
+            return normalized
+
+    def _claim_acp_activation(
+        self,
+        chat_id: str,
+        project_id: str | None,
+        thread_id: str | None,
+        *,
+        message_id: str,
+        explicit_card: bool,
+        tool_name: str,
+        model_name: str | None,
+    ) -> tuple[_ACPActivationOwner, _ACPActivationOwner | None]:
+        key = self._acp_activation_key(chat_id, project_id, thread_id)
+        with self._acp_activation_lock:
+            fence_epoch = self._acp_activation_fence_epochs.get(key, 0)
+            if explicit_card:
+                generation = self._acp_activation_generations.get(key, 0) + 1
+                self._acp_activation_generations[key] = generation
+                previous = self._acp_activation_owners.get(key)
+            else:
+                # User tasks are FIFO work, not configuration writes.  They
+                # must never supersede one another merely because both need to
+                # recover the same saved ACP session.
+                generation = 0
+                previous = None
+            owner = _ACPActivationOwner(
+                generation=generation,
+                fence_epoch=fence_epoch,
+                origin_message_id=message_id,
+                status_message_id=message_id,
+                explicit_card=explicit_card,
+                tool_name=tool_name,
+                model_name=model_name,
+            )
+            if explicit_card:
+                self._acp_activation_owners[key] = owner
+            else:
+                self._acp_activation_task_owners.setdefault(key, {})[
+                    id(owner)
+                ] = owner
+            return owner, previous
+
+    def _owns_acp_activation(
+        self,
+        chat_id: str,
+        project_id: str | None,
+        thread_id: str | None,
+        owner: _ACPActivationOwner,
+    ) -> bool:
+        key = self._acp_activation_key(chat_id, project_id, thread_id)
+        with self._acp_activation_lock:
+            if (
+                owner.terminal
+                or self._acp_activation_fence_epochs.get(key, 0)
+                != owner.fence_epoch
+            ):
+                return False
+            if owner.explicit_card:
+                return (
+                    self._acp_activation_generations.get(key)
+                    == owner.generation
+                    and self._acp_activation_owners.get(key) is owner
+                )
+            return (
+                self._acp_activation_task_owners.get(key, {}).get(id(owner))
+                is owner
+            )
+
+    def _invalidate_acp_activation(
+        self,
+        chat_id: str,
+        project_id: str | None,
+        thread_id: str | None,
+    ) -> list[_ACPActivationOwner]:
+        key = self._acp_activation_key(chat_id, project_id, thread_id)
+        with self._acp_activation_lock:
+            self._acp_activation_fence_epochs[key] = (
+                self._acp_activation_fence_epochs.get(key, 0) + 1
+            )
+            invalidated = []
+            visible_owner = self._acp_activation_owners.pop(key, None)
+            if visible_owner is not None:
+                invalidated.append(visible_owner)
+            invalidated.extend(
+                self._acp_activation_task_owners.pop(key, {}).values()
+            )
+            self._acp_activation_generations.pop(key, None)
+            self._acp_activation_fence_epochs.pop(key, None)
+            return invalidated
+
+    def _release_acp_activation(
+        self,
+        chat_id: str,
+        project_id: str | None,
+        thread_id: str | None,
+        owner: _ACPActivationOwner,
+        *,
+        committed: bool = False,
+    ) -> bool:
+        """Mark exactly one still-current activation terminal."""
+
+        key = self._acp_activation_key(chat_id, project_id, thread_id)
+        with self._acp_activation_lock:
+            if not self._owns_acp_activation(
+                chat_id,
+                project_id,
+                thread_id,
+                owner,
+            ):
+                return False
+            owner.committed = committed
+            owner.terminal = True
+            if owner.explicit_card:
+                if self._acp_activation_owners.get(key) is owner:
+                    self._acp_activation_owners.pop(key, None)
+            else:
+                task_owners = self._acp_activation_task_owners.get(key)
+                if task_owners is not None:
+                    task_owners.pop(id(owner), None)
+                    if not task_owners:
+                        self._acp_activation_task_owners.pop(key, None)
+            if (
+                key not in self._acp_activation_owners
+                and key not in self._acp_activation_task_owners
+            ):
+                self._acp_activation_generations.pop(key, None)
+                self._acp_activation_fence_epochs.pop(key, None)
+            return True
+
+    def _invalidate_acp_project_activations(
+        self,
+        chat_id: str,
+        project_id: str | None,
+    ) -> list[_ACPActivationOwner]:
+        """Fence every direct/topic activation for one project coordinate."""
+
+        normalized_project_id = project_id or ""
+        with self._acp_activation_lock:
+            keys = {
+                key
+                for key in (
+                    set(self._acp_activation_owners)
+                    | set(self._acp_activation_task_owners)
+                )
+                if key[0] == chat_id and key[1] == normalized_project_id
+            }
+            invalidated: list[_ACPActivationOwner] = []
+            for key in keys:
+                invalidated.extend(
+                    self._invalidate_acp_activation(
+                        key[0],
+                        key[1] or None,
+                        key[2] or None,
+                    )
+                )
+            return invalidated
+
+    def _finish_invalidated_acp_cards(
+        self,
+        owners: list[_ACPActivationOwner],
+    ) -> None:
+        """Close visible selector cards invalidated by an exit or project switch."""
+
+        for owner in owners:
+            if not owner.explicit_card or owner.terminal:
+                continue
+            _msg_type, cancelled_content = (
+                SystemBuilder.build_acp_programming_superseded_card(
+                    owner.tool_name,
+                    owner.model_name,
+                    UI_TEXT["system_acp_activation_cancelled"],
+                )
+            )
+            if not self.update_card(owner.status_message_id, cancelled_content):
+                self.reply_card(owner.status_message_id, cancelled_content)
+            owner.terminal = True
+
+    def switch_active_project_with_acp_fence(
+        self,
+        message_id: str,
+        chat_id: str,
+        old_project: "ProjectContext",
+        new_project_id: str,
+    ) -> tuple[bool, str]:
+        """Atomically fence old-project activation and move the active binding."""
+
+        old_project_id = old_project.project_id
+        with self._acp_activation_lock:
+            invalidated = self._invalidate_acp_project_activations(
+                chat_id,
+                old_project_id,
+            )
+            self._finish_invalidated_acp_cards(invalidated)
+            current_mode = self.mode_manager.get_mode(
+                chat_id,
+                project_id=old_project_id,
+            )
+            if current_mode in PROGRAMMING_MODES:
+                handler = self.get_handler(current_mode.value)
+                if handler is not None:
+                    handler.exit_mode(
+                        message_id,
+                        chat_id,
+                        project=old_project,
+                    )
+            return self.project_manager.set_active_project(
+                chat_id,
+                new_project_id,
+            )
 
     def _init_command_registry(self):
         """Initialize the command dispatch registry."""
@@ -957,56 +1234,171 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         model_name: Optional[str],
         project: Optional["ProjectContext"] = None,
         thread_id: Optional[str] = None,
-    ) -> bool:
+    ) -> _ACPActivationEffect | bool | None:
         target_project = project or self.project_manager.get_active_project(chat_id)
 
-        _TOOL_HANDLER_MAP = [
-            ("coco",   "is_coco_mode"),
-            ("claude", "is_claude_mode"),
-            ("aiden",  "is_aiden_mode"),
-            ("codex",  "is_codex_mode"),
-            ("gemini", "is_gemini_mode"),
-            ("traex", "is_traex_mode"),
-            ("grok", "is_grok_mode"),
-            ("dsh", "is_dsh_mode"),
-        ]
-        for _tool, _mode_check in _TOOL_HANDLER_MAP:
+        _TOOL_HANDLER_MAP = (
+            "coco",
+            "claude",
+            "aiden",
+            "codex",
+            "gemini",
+            "traex",
+            "grok",
+            "dsh",
+        )
+        for _tool in _TOOL_HANDLER_MAP:
             if tool_name != _tool:
                 continue
             handler = self.get_handler(_tool)
             if not handler:
                 break
-            if hasattr(handler, "current_model"):
-                handler.current_model = model_name
-            # If already in this mode, switch model on the active session instead of
-            # calling enter_mode() which would return early with an "already in mode" warning.
+            # Persistent programming mode intentionally outlives an ACP transport.
+            # Probe the exact direct/topic coordinate instead of inferring liveness
+            # from that persistent flag.  A missing session takes the ordinary
+            # startup path; an existing session is either hot-switched (only when
+            # the exact direct backend supports it) or identity-guarded replaced.
             _project_id = target_project.project_id if target_project else None
-            mode_checker = getattr(self.mode_manager, _mode_check, None)
-            if callable(mode_checker) and mode_checker(chat_id, project_id=_project_id) and hasattr(handler, "switch_model"):
-                return bool(
-                    handler.switch_model(
-                        message_id,
-                        chat_id,
-                        model_name,
-                        project=target_project,
-                    )
+            manager_getter = getattr(handler, "_get_session_manager", None)
+            manager = manager_getter() if callable(manager_getter) else None
+            live_session = (
+                manager.get_session(
+                    chat_id,
+                    project_id=_project_id,
+                    thread_id=thread_id,
                 )
-            else:
-                # silent=True: model selection card already informs the user, no need for redundant "已开启" notification
-                enter_kwargs = {"project": target_project, "silent": True}
-                if target_project is not None:
-                    enter_kwargs.update(
-                        model_override=model_name,
-                        commit_project_state=False,
-                        activate_mode=False,
-                        exit_opposite_mode=False,
+                if manager is not None
+                else None
+            )
+
+            def _replace_live_session() -> _ACPActivationEffect | None:
+                replace_session = getattr(manager, "replace_session", None)
+                if not callable(replace_session) or live_session is None:
+                    return None
+                cwd = (
+                    target_project.root_path
+                    if target_project is not None
+                    else self.get_working_dir(chat_id)
+                )
+                agent_override_getter = getattr(
+                    handler,
+                    "_get_agent_type_override",
+                    None,
+                )
+                agent_type_override = (
+                    agent_override_getter(target_project)
+                    if callable(agent_override_getter)
+                    else None
+                )
+                replacement = replace_session(
+                    chat_id,
+                    cwd=cwd,
+                    expected_session=live_session,
+                    startup_timeout=getattr(
+                        self.settings,
+                        "acp_startup_timeout",
+                        20,
+                    ),
+                    project_id=_project_id,
+                    agent_type_override=agent_type_override,
+                    model_name=model_name,
+                    thread_id=thread_id,
+                )
+                replacement_session = getattr(replacement, "session", None)
+                if (
+                    not getattr(replacement, "created", False)
+                    or replacement_session is None
+                ):
+                    return None
+                return _ACPActivationEffect(
+                    session=replacement_session,
+                    changed=True,
+                )
+
+            if (
+                live_session is not None
+                and model_name is not None
+            ):
+                backend_model_name = (
+                    model_name
+                    if _tool == "traex"
+                    else normalize_acp_model_name(_tool, model_name)
+                )
+                active_model_name = str(
+                    getattr(live_session, "_model_name", "") or ""
+                ).strip()
+                if (
+                    backend_model_name
+                    and active_model_name == backend_model_name
+                ):
+                    return _ACPActivationEffect(
+                        session=live_session,
+                        changed=False,
                     )
-                if thread_id is not None:
-                    enter_kwargs["thread_id"] = thread_id
-                return bool(handler.enter_mode(message_id, chat_id, **enter_kwargs))
+            if (
+                live_session is not None
+                and model_name is not None
+                and thread_id is None
+                and callable(getattr(live_session, "set_model", None))
+                and callable(getattr(handler, "switch_model", None))
+            ):
+                switched = handler.switch_model(
+                    message_id,
+                    chat_id,
+                    model_name,
+                    project=target_project,
+                    expected_session=live_session,
+                )
+                return (
+                    _ACPActivationEffect(
+                        session=live_session,
+                        changed=True,
+                    )
+                    if switched
+                    else None
+                )
+            if live_session is not None and model_name is not None:
+                return _replace_live_session()
+            if live_session is not None and model_name is None:
+                active_model = getattr(live_session, "_model_name", None)
+                if hasattr(live_session, "_model_name") and not str(
+                    active_model or ""
+                ).strip():
+                    return _ACPActivationEffect(
+                        session=live_session,
+                        changed=False,
+                    )
+                return _replace_live_session()
+            # silent=True: the selection card owns the visible lifecycle.
+            enter_kwargs = {"project": target_project, "silent": True}
+            if target_project is not None:
+                enter_kwargs.update(
+                    model_override=model_name,
+                    commit_project_state=False,
+                    activate_mode=False,
+                    exit_opposite_mode=False,
+                    inherit_thread_context=False,
+                )
+            if thread_id is not None:
+                enter_kwargs["thread_id"] = thread_id
+            entered = bool(handler.enter_mode(message_id, chat_id, **enter_kwargs))
+            if not entered:
+                return None
+            if target_project is None:
+                return True
+            if manager is None:
+                return None
+            session = manager.get_session(
+                chat_id,
+                project_id=_project_id,
+                thread_id=thread_id,
+            )
+            if session is None:
+                return None
+            return _ACPActivationEffect(session=session, changed=True)
 
         self.reply_error(message_id, UI_TEXT["system_acp_unsupported_tool"].format(tool_name=tool_name))
-        return False
+        return None
 
     def _configuration_project(
         self,
@@ -1433,38 +1825,129 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             from ...thread import get_current_thread_id
 
             raw_thread_id = get_current_thread_id()
-            thread_root_id = (
+            thread_root_id = self._canonical_acp_thread_id(
                 raw_thread_id.strip()
                 if isinstance(raw_thread_id, str) and raw_thread_id.strip()
                 else None
             )
         project_id = self._project_id(target_project)
         status_message_id = message_id
+        activation_owner, previous_owner = self._claim_acp_activation(
+            chat_id,
+            project_id,
+            thread_root_id,
+            message_id=message_id,
+            explicit_card=explicit_card,
+            tool_name=tool,
+            model_name=model,
+        )
+
+        if (
+            previous_owner is not None
+            and previous_owner.explicit_card
+            and not previous_owner.terminal
+            and not previous_owner.committed
+            and previous_owner.origin_message_id != message_id
+        ):
+            _msg_type, superseded_content = (
+                SystemBuilder.build_acp_programming_superseded_card(
+                    previous_owner.tool_name,
+                    previous_owner.model_name,
+                    UI_TEXT["system_acp_activation_superseded"],
+                )
+            )
+            if not self.update_card(
+                previous_owner.status_message_id,
+                superseded_content,
+            ):
+                self.reply_card(
+                    previous_owner.status_message_id,
+                    superseded_content,
+                )
+            previous_owner.terminal = True
+
+        def _owns_activation() -> bool:
+            return self._owns_acp_activation(
+                chat_id,
+                project_id,
+                thread_root_id,
+                activation_owner,
+            )
 
         def _replace_status_card(card_content: str) -> None:
             nonlocal status_message_id
-            if self.update_card(status_message_id, card_content):
-                return
-            replacement_id = self.reply_card(status_message_id, card_content)
-            if isinstance(replacement_id, str) and replacement_id:
-                status_message_id = replacement_id
+            with self._acp_activation_lock:
+                if not _owns_activation():
+                    return
+                if self.update_card(status_message_id, card_content):
+                    return
+                replacement_id = self.reply_card(status_message_id, card_content)
+                if isinstance(replacement_id, str) and replacement_id:
+                    status_message_id = replacement_id
+                    activation_owner.status_message_id = replacement_id
+
+        def _mark_terminal(*, committed: bool = False) -> None:
+            self._release_acp_activation(
+                chat_id,
+                project_id,
+                thread_root_id,
+                activation_owner,
+                committed=committed,
+            )
 
         def _publish_failure(reason: str) -> None:
-            failure_reason = reason or UI_TEXT["system_acp_activation_failed_safe"]
-            if not explicit_card:
-                self.reply_error(message_id, failure_reason)
-                return
-            _msg_type, failed_content = SystemBuilder.build_acp_programming_failed_card(
-                tool,
-                model,
-                failure_reason,
-                project_id,
-                None,
-                model_group=model_group,
-                model_profile=model_profile,
-                model_effort=model_effort,
-            )
-            _replace_status_card(failed_content)
+            with self._acp_activation_lock:
+                if not _owns_activation():
+                    return
+                failure_reason = (
+                    reason or UI_TEXT["system_acp_activation_failed_safe"]
+                )
+                if not explicit_card:
+                    self.reply_error(
+                        message_id,
+                        failure_reason,
+                        chat_id=chat_id,
+                        severity="recoverable",
+                    )
+                    _mark_terminal()
+                    return
+                _msg_type, failed_content = (
+                    SystemBuilder.build_acp_programming_failed_card(
+                        tool,
+                        model,
+                        failure_reason,
+                        project_id,
+                        thread_root_id,
+                        model_group=model_group,
+                        model_profile=model_profile,
+                        model_effort=model_effort,
+                    )
+                )
+                _replace_status_card(failed_content)
+                _mark_terminal()
+
+        def _publish_cancelled() -> None:
+            with self._acp_activation_lock:
+                if not _owns_activation():
+                    return
+                if not explicit_card:
+                    self.reply_error(
+                        message_id,
+                        UI_TEXT["system_acp_activation_cancelled"],
+                        chat_id=chat_id,
+                        severity="recoverable",
+                    )
+                    _mark_terminal()
+                    return
+                _msg_type, cancelled_content = (
+                    SystemBuilder.build_acp_programming_superseded_card(
+                        tool,
+                        model,
+                        UI_TEXT["system_acp_activation_cancelled"],
+                    )
+                )
+                _replace_status_card(cancelled_content)
+                _mark_terminal()
 
         if explicit_card:
             _msg_type, initializing_content = (
@@ -1484,27 +1967,57 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             project_id=project_id,
             message_id=message_id,
             origin_message_id=message_id,
-            priority=TaskPriority.HIGH,
+            # Configuration clicks and task-bearing recovery share the project
+            # queue in arrival order.  HIGH requeues with appendleft and can
+            # otherwise let a later model click overtake an earlier user task.
+            priority=TaskPriority.NORMAL,
         )
 
         def _run_activation(_ctx) -> bool:
-            previous_handler_model = (
-                handler.current_model
-                if handler and hasattr(handler, "current_model")
-                else None
-            )
-            if handler and hasattr(handler, "current_model"):
-                # ``enter_mode`` receives the same explicit override.  This
-                # assignment keeps existing handler display/context behavior
-                # while the explicit input prevents a later selection from
-                # changing an already-running callback's startup model.
-                handler.current_model = model
+            with self._acp_activation_lock:
+                if not _owns_activation():
+                    return False
+                activation_model = model
+                if (
+                    not explicit_card
+                    and target_project is not None
+                    and getattr(target_project, "acp_tool_name", None) == tool
+                ):
+                    # A selector queued just before this user task may have
+                    # committed a newer model while the task was waiting.  A
+                    # saved-selection task consumes that committed value; it
+                    # must not switch the session or project back to the stale
+                    # value captured at ingress.
+                    activation_model = getattr(
+                        target_project,
+                        "acp_model_name",
+                        None,
+                    )
+                previous_handler_model = (
+                    handler.current_model
+                    if (
+                        thread_root_id is None
+                        and handler
+                        and hasattr(handler, "current_model")
+                    )
+                    else None
+                )
+                if (
+                    thread_root_id is None
+                    and handler
+                    and hasattr(handler, "current_model")
+                ):
+                    # ``enter_mode`` receives the same explicit override.  This
+                    # assignment keeps existing handler display/context behavior
+                    # while the explicit input prevents a later selection from
+                    # changing an already-running callback's startup model.
+                    handler.current_model = activation_model
             try:
-                entered = self._enter_mode_with_acp_model(
+                activation_effect = self._enter_mode_with_acp_model(
                     message_id,
                     chat_id,
                     tool,
-                    model,
+                    activation_model,
                     target_project,
                     thread_id=thread_root_id,
                 )
@@ -1514,91 +2027,267 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
                     chat_id,
                     project_id or "-",
                     tool,
-                    model or "<default>",
+                    activation_model or "<default>",
                 )
-                if handler and hasattr(handler, "current_model"):
+                if (
+                    _owns_activation()
+                    and thread_root_id is None
+                    and handler
+                    and hasattr(handler, "current_model")
+                ):
                     handler.current_model = previous_handler_model
                 _publish_failure(safe_error_message(exc))
                 return False
 
-            if not entered:
-                if handler and hasattr(handler, "current_model"):
+            if not activation_effect:
+                if (
+                    _owns_activation()
+                    and thread_root_id is None
+                    and handler
+                    and hasattr(handler, "current_model")
+                ):
                     handler.current_model = previous_handler_model
                 _publish_failure(UI_TEXT["system_acp_activation_failed_safe"])
                 return False
 
-            try:
-                if target_project:
-                    manager = getattr(handler, "_get_session_manager", lambda: None)()
-                    session = (
-                        manager.get_session(
-                            chat_id,
-                            project_id=project_id,
-                            thread_id=thread_root_id,
-                        )
-                        if manager
-                        else None
-                    )
-                    if session is None:
-                        if handler and hasattr(handler, "current_model"):
-                            handler.current_model = previous_handler_model
-                        _publish_failure(UI_TEXT["system_acp_activation_failed_safe"])
-                        return False
-                    committed = self.project_manager.commit_acp_programming_activation(
-                        target_project,
-                        tool_name=tool,
-                        model_name=model,
-                        session_id=session.session_id,
-                        query_count=session.message_count,
-                        activate_mode=thread_root_id is None,
-                    )
-                    if not committed:
-                        if handler and hasattr(handler, "current_model"):
-                            handler.current_model = previous_handler_model
-                        _publish_failure(UI_TEXT["system_acp_config_save_failed"])
-                        return False
-                    if not thread_root_id:
-                        # Preserve the normal successful-switch cleanup only after
-                        # the project selection is durably committed.
-                        handler._exit_opposite_mode(
-                            message_id,
-                            chat_id,
-                            project=target_project,
-                            silent=True,
-                        )
-                        handler._enter_mode_on_manager(chat_id, project_id=project_id)
+            if isinstance(activation_effect, _ACPActivationEffect):
+                effect_session = activation_effect.session
+                effect_changed = activation_effect.changed
+            elif activation_effect is True:
+                effect_session = None
+                effect_changed = False
+            else:
+                # Compatibility for narrow test/custom handlers that still
+                # return the historical raw session object.
+                effect_session = activation_effect
+                effect_changed = True
 
-                if pending_prompt and handler and hasattr(handler, "handle_message"):
-                    handler.handle_message(
-                        message_id,
+            def _retire_changed_effect() -> None:
+                # Close only the exact session created/replaced by this stale
+                # activation.  The manager identity guard cannot remove a
+                # newer owner installed at the same coordinate.
+                if effect_session is None or not effect_changed:
+                    return
+                effect_manager = getattr(
+                    handler,
+                    "_get_session_manager",
+                    lambda: None,
+                )()
+                retire_session = getattr(
+                    effect_manager,
+                    "retire_session",
+                    None,
+                )
+                if not callable(retire_session):
+                    return
+                try:
+                    retire_session(
                         chat_id,
-                        pending_prompt,
-                        target_project,
+                        project_id=project_id,
+                        thread_id=thread_root_id,
+                        expected_session=effect_session,
+                        timeout=getattr(
+                            self.settings,
+                            "acp_startup_timeout",
+                            20,
+                        ),
                     )
-                if explicit_card:
-                    _msg_type, ready_content = SystemBuilder.build_acp_programming_ready_card(
+                except Exception:
+                    logger.warning(
+                        "[ACP] failed to retire stale activation session "
+                        "chat=%s project=%s tool=%s",
+                        chat_id,
+                        project_id or "-",
                         tool,
-                        model,
-                        project_id,
-                        None,
+                        exc_info=True,
                     )
-                    _replace_status_card(ready_content)
+
+            if not _owns_activation():
+                # `/exit` or a newer explicit selection won while startup was
+                # outside the lifecycle lock.
+                _retire_changed_effect()
+                return False
+
+            session = None
+            try:
+                # Linearization point: a newer selection or /exit either wins
+                # before this block (and this activation becomes stale), or waits
+                # until durable project state, direct-mode state, and the visible
+                # ready card all describe the same session.
+                with self._acp_activation_lock:
+                    if not _owns_activation():
+                        return False
+                    if target_project:
+                        if (
+                            self.project_manager.get_active_project(chat_id)
+                            is not target_project
+                        ):
+                            _retire_changed_effect()
+                            _publish_failure(
+                                UI_TEXT["system_acp_activation_failed_safe"]
+                            )
+                            return False
+                        manager = getattr(
+                            handler,
+                            "_get_session_manager",
+                            lambda: None,
+                        )()
+                        session = (
+                            manager.get_session(
+                                chat_id,
+                                project_id=project_id,
+                                thread_id=thread_root_id,
+                            )
+                            if manager
+                            else None
+                        )
+                        if session is None or (
+                            effect_session is not None
+                            and session is not effect_session
+                        ):
+                            _retire_changed_effect()
+                            if (
+                                thread_root_id is None
+                                and handler
+                                and hasattr(handler, "current_model")
+                            ):
+                                handler.current_model = previous_handler_model
+                            _publish_failure(
+                                UI_TEXT["system_acp_activation_failed_safe"]
+                            )
+                            return False
+                        committed = True
+                        if thread_root_id is None:
+                            committed = self.project_manager.commit_acp_programming_activation(
+                                target_project,
+                                tool_name=tool,
+                                model_name=activation_model,
+                                session_id=session.session_id,
+                                query_count=session.message_count,
+                                activate_mode=True,
+                            )
+                        if not committed:
+                            # Startup/replacement and live setModel have already
+                            # changed the backend at this point.  If the durable
+                            # project commit fails, retire that exact owner so
+                            # runtime state cannot silently diverge from the
+                            # saved tool/model selection.
+                            _retire_changed_effect()
+                            if (
+                                thread_root_id is None
+                                and handler
+                                and hasattr(handler, "current_model")
+                            ):
+                                handler.current_model = previous_handler_model
+                            _publish_failure(
+                                UI_TEXT["system_acp_config_save_failed"]
+                            )
+                            return False
+                        if thread_root_id is None:
+                            # Keep durable project selection and runtime mode on
+                            # the same side of the activation/exit boundary.
+                            handler._exit_opposite_mode(
+                                message_id,
+                                chat_id,
+                                project=target_project,
+                                silent=True,
+                            )
+                            handler._enter_mode_on_manager(
+                                chat_id,
+                                project_id=project_id,
+                            )
+                    elif effect_session is not None:
+                        session = effect_session
+
+                    if explicit_card:
+                        _msg_type, ready_content = (
+                            SystemBuilder.build_acp_programming_ready_card(
+                                tool,
+                                activation_model,
+                                project_id,
+                                thread_root_id,
+                            )
+                        )
+                        _replace_status_card(ready_content)
+                        _mark_terminal(committed=True)
+                    else:
+                        # Keep a task-bearing owner live until its pending
+                        # prompt has actually been handed to the exact session.
+                        activation_owner.committed = True
             except Exception as exc:
+                _retire_changed_effect()
                 logger.exception(
                     "[ACP] model activation finalization failed chat=%s project=%s tool=%s model=%s",
                     chat_id,
                     project_id or "-",
                     tool,
-                    model or "<default>",
+                    activation_model or "<default>",
                 )
-                if handler and hasattr(handler, "current_model"):
+                if (
+                    _owns_activation()
+                    and thread_root_id is None
+                    and handler
+                    and hasattr(handler, "current_model")
+                ):
                     handler.current_model = previous_handler_model
                 _publish_failure(safe_error_message(exc))
                 return False
+
+            if (
+                pending_prompt
+                and handler
+                and hasattr(handler, "handle_message")
+            ):
+                if not _owns_activation():
+                    return False
+                try:
+                    handle_kwargs = (
+                        {"expected_session": session}
+                        if session is not None
+                        else {}
+                    )
+                    handler.handle_message(
+                        message_id,
+                        chat_id,
+                        pending_prompt,
+                        target_project,
+                        **handle_kwargs,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[ACP] pending prompt dispatch failed after activation "
+                        "chat=%s project=%s tool=%s",
+                        chat_id,
+                        project_id or "-",
+                        tool,
+                    )
+                    _publish_failure(
+                        UI_TEXT["system_acp_activation_failed_safe"]
+                    )
+                    return False
+            if not explicit_card:
+                _mark_terminal(committed=True)
             return True
 
         try:
-            self.scheduler.submit(spec, _run_activation)
+            activation_handle = self.scheduler.submit(spec, _run_activation)
+            add_done_callback = getattr(
+                activation_handle,
+                "add_done_callback",
+                None,
+            )
+            if callable(add_done_callback):
+                add_done_callback(
+                    lambda event: (
+                        _publish_cancelled()
+                        if event.status is TaskStatus.CANCELED
+                        else _publish_failure(
+                            UI_TEXT["system_acp_activation_failed_safe"]
+                        )
+                        if event.status is TaskStatus.FAILED
+                        else None
+                    )
+                )
         except Exception as exc:
             logger.exception(
                 "[ACP] failed to schedule model activation chat=%s project=%s tool=%s",
@@ -1711,41 +2400,61 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         from ...thread import get_current_thread_id, get_thread_manager, set_current_thread_id
 
         _pid = project.project_id if project else None
-        current_mode = self.mode_manager.get_mode(chat_id, project_id=_pid)
-
         thread_id = get_current_thread_id()
-        if thread_id:
-            thread_ctx = get_thread_manager().get(thread_id)
-            if thread_ctx and thread_ctx.mode in {"deep", "spec", "workflow"}:
-                removed = get_thread_manager().remove(thread_ctx.thread_root_id)
-                set_current_thread_id(None)
-                engine_name = {
-                    "deep": "Deep",
-                    "spec": "Spec",
-                    "workflow": "WF",
-                }.get(thread_ctx.mode, thread_ctx.mode)
-                if removed:
-                    self.reply_text(
-                        message_id,
-                        UI_TEXT["topic_engine_exit_msg"].format(engine=engine_name),
-                    )
-                else:
-                    self.reply_text(message_id, UI_TEXT["system_already_in_mode"])
-                return
-            if thread_ctx and thread_ctx.mode != "smart" and current_mode == InteractionMode.SMART:
-                try:
-                    current_mode = InteractionMode(thread_ctx.mode)
-                except ValueError:
-                    logger.debug("invalid InteractionMode value: %s", thread_ctx.mode, exc_info=True)
-
-        if current_mode in PROGRAMMING_MODES:
-            self.get_handler(current_mode.value).exit_mode(
-                message_id,
+        thread_coordinate = self._canonical_acp_thread_id(thread_id)
+        # The exit and activation commit share one lifecycle boundary.  Whichever
+        # acquires it first becomes authoritative: a completed activation is then
+        # exited normally, while an already-invalidated activation cannot commit
+        # or re-enter the mode afterward.
+        with self._acp_activation_lock:
+            invalidated_owners = self._invalidate_acp_activation(
                 chat_id,
-                project,
+                _pid,
+                thread_coordinate,
             )
-            return
-        self.reply_text(message_id, UI_TEXT["system_already_in_mode"])
+            self._finish_invalidated_acp_cards(invalidated_owners)
+            current_mode = self.mode_manager.get_mode(chat_id, project_id=_pid)
+
+            if thread_id:
+                thread_ctx = get_thread_manager().get(thread_id)
+                if thread_ctx and thread_ctx.mode in {"deep", "spec", "workflow"}:
+                    removed = get_thread_manager().remove(thread_ctx.thread_root_id)
+                    set_current_thread_id(None)
+                    engine_name = {
+                        "deep": "Deep",
+                        "spec": "Spec",
+                        "workflow": "WF",
+                    }.get(thread_ctx.mode, thread_ctx.mode)
+                    if removed:
+                        self.reply_text(
+                            message_id,
+                            UI_TEXT["topic_engine_exit_msg"].format(engine=engine_name),
+                        )
+                    else:
+                        self.reply_text(message_id, UI_TEXT["system_already_in_mode"])
+                    return
+                if (
+                    thread_ctx
+                    and thread_ctx.mode != "smart"
+                    and current_mode == InteractionMode.SMART
+                ):
+                    try:
+                        current_mode = InteractionMode(thread_ctx.mode)
+                    except ValueError:
+                        logger.debug(
+                            "invalid InteractionMode value: %s",
+                            thread_ctx.mode,
+                            exc_info=True,
+                        )
+
+            if current_mode in PROGRAMMING_MODES:
+                self.get_handler(current_mode.value).exit_mode(
+                    message_id,
+                    chat_id,
+                    project,
+                )
+                return
+            self.reply_text(message_id, UI_TEXT["system_already_in_mode"])
 
     # ------------------------------------------------------------------
     # Shell command submission

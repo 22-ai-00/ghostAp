@@ -8,11 +8,13 @@ import pytest
 from lark_oapi.core.model.base_response import BaseResponse
 from lark_oapi.core.model.raw_response import RawResponse
 
+from src.acp.continuation import run_prompt_with_continuation
 from src.acp.models import (
     ACPEvent,
     ACPEventType,
     PlanEntryInfo,
     PlanInfo,
+    PromptResult,
     ToolCallInfo,
 )
 from src.card.delivery.engine import CardDelivery
@@ -273,6 +275,82 @@ def _tool_event(
     )
 
 
+class _CardReconciliationSession:
+    def __init__(self) -> None:
+        self._force_dead = False
+        self.calls = 0
+
+    def send_prompt(
+        self,
+        _text: str,
+        on_event=None,
+        timeout=None,
+        idle_timeout=None,
+    ) -> PromptResult:
+        del timeout, idle_timeout
+        self.calls += 1
+        if on_event is not None:
+            on_event(
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="原始业务结论",
+                    message_id="business-final",
+                    codex_message_phase="final_answer",
+                )
+            )
+        return PromptResult(
+            stop_reason="end_turn",
+            text="原始业务结论",
+            tool_calls=[
+                ToolCallInfo(
+                    id="wait-before-reconciliation",
+                    title="wait_agent",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="wait_agent",
+                    subagent_states=(
+                        {"source_id": "reviewer", "status": "running"},
+                    ),
+                )
+            ],
+        )
+
+    def send_reconciliation_prompt(
+        self,
+        _text: str,
+        on_event=None,
+        timeout=None,
+        idle_timeout=None,
+    ) -> PromptResult:
+        del timeout, idle_timeout
+        self.calls += 1
+        if on_event is not None:
+            on_event(
+                ACPEvent(
+                    event_type=ACPEventType.TEXT_CHUNK,
+                    text="内部状态对账完成",
+                    message_id="reconciliation-final",
+                    codex_message_phase="final_answer",
+                )
+            )
+        return PromptResult(
+            stop_reason="end_turn",
+            text="内部状态对账完成",
+            tool_calls=[
+                ToolCallInfo(
+                    id="list-after-reconciliation",
+                    title="list_agents",
+                    kind="other",
+                    status="completed",
+                    collaboration_tool="list_agents",
+                    subagent_states=(
+                        {"source_id": "reviewer", "status": "completed"},
+                    ),
+                )
+            ],
+        )
+
+
 def test_programming_direct_mode_omits_redundant_phase_banner():
     state = CardState(
         metadata=CardMetadata(
@@ -393,6 +471,126 @@ def test_cot_keeps_plan_on_card_and_publishes_only_terminal_conclusion() -> None
         programming.abort()
 
 
+def test_reconciliation_final_answer_cannot_replace_the_rendered_conclusion() -> None:
+    """Exercise continuation, adapter, reducer, and renderer as one card path."""
+    _, card_session, programming = _programming_session()
+    session = _CardReconciliationSession()
+
+    try:
+        programming.start()
+        execution = run_prompt_with_continuation(
+            session,
+            "original task",
+            on_event=programming.on_event,
+            timeout_s=90,
+            finalization_reserve_s=30,
+            on_continuation_start=programming.begin_continuation_turn,
+        )
+        assert execution.result.text == "原始业务结论"
+        assert session.calls == 2
+
+        programming.finish()
+
+        assert card_session.state is not None
+        final_answer = next(
+            block.content
+            for block in card_session.state.blocks
+            if isinstance(block, TextBlock)
+            and block.block_id == "_final_answer"
+        )
+        assert final_answer == "原始业务结论"
+        rendered = render_card(card_session.state, RenderBudget())
+        rendered_text = json.dumps(
+            rendered[0]._card_json,
+            ensure_ascii=False,
+        )
+        assert "原始业务结论" in rendered_text
+        assert "内部状态对账完成" in rendered_text
+        assert final_answer != "内部状态对账完成"
+    finally:
+        programming.abort()
+
+
+def test_result_fallback_outranks_an_unmarked_reconciliation_status_tail() -> None:
+    """Providers without final-answer metadata still keep the business result."""
+    _, card_session, programming = _programming_session()
+
+    try:
+        programming.start()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="原始业务输出",
+                message_id="unmarked-business-output",
+            )
+        )
+        programming.begin_continuation_turn()
+        programming.freeze_result_conclusion_fallback()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="内部状态对账完成",
+                message_id="unmarked-reconciliation-output",
+                codex_message_phase="commentary",
+            )
+        )
+        programming.finish()
+
+        assert card_session.state is not None
+        final_answer = next(
+            block.content
+            for block in card_session.state.blocks
+            if isinstance(block, TextBlock)
+            and block.block_id == "_final_answer"
+        )
+        assert final_answer == "原始业务输出"
+    finally:
+        programming.abort()
+
+
+def test_later_implementation_continuation_supersedes_frozen_conclusion() -> None:
+    sink = _ProcessSink()
+    _, card_session, programming = _programming_session(process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="首轮临时结论",
+            )
+        )
+        programming.begin_continuation_turn()
+        programming.freeze_result_conclusion_fallback()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="内部状态对账完成",
+                codex_message_phase="commentary",
+            )
+        )
+        programming.begin_continuation_turn()
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TEXT_CHUNK,
+                text="续做后的最终结论",
+            )
+        )
+        programming.finish()
+
+        assert card_session.state is not None
+        final_answer = next(
+            block.content
+            for block in card_session.state.blocks
+            if isinstance(block, TextBlock)
+            and block.block_id == "_final_answer"
+        )
+        assert final_answer == "续做后的最终结论"
+    finally:
+        programming.abort()
+
+
 @pytest.mark.parametrize("complete_mode", [None, "return_false"])
 def test_cot_holds_codex_final_message_for_main_card(
     complete_mode: str | None,
@@ -481,6 +679,13 @@ def test_cot_holds_codex_final_message_for_main_card(
             if block.block_id == "_final_answer"
         )
         assert final_answer == "真正结论"
+        rendered = render_card(card_session.state, RenderBudget())
+        notification_summary = rendered[0]._card_json["config"]["summary"][
+            "content"
+        ]
+        assert "最终结论" in notification_summary
+        assert "真正结论" not in notification_summary
+        assert 8 <= len(notification_summary) <= 60
         assert "内部推理" not in final_answer
         assert "子代理结论" not in final_answer
     finally:

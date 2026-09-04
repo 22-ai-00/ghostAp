@@ -110,6 +110,8 @@ class TestSystemBuilderE2E:
         msg_type, card_json = SystemBuilder.build_error_card(exc)
         assert msg_type == "interactive"
         card = json.loads(card_json)
+        summary = card.get("config", {}).get("summary", {}).get("content", "")
+        assert 8 <= len(summary) <= 60
         body_elements = card.get("body", {}).get("elements", card.get("elements", []))
         content_texts = [
             el.get("content", "")
@@ -124,6 +126,105 @@ class TestSystemBuilderE2E:
 
         _, card_json = SystemBuilder.build_error_card(TimeoutError())
         assert "超时" in card_json or "未知错误" in card_json
+
+    def test_card_only_promises_details_when_the_button_exists(self):
+        from src.card.builders.system import SystemBuilder
+
+        _, without_details = SystemBuilder.build_error_card("failed")
+        _, with_details = SystemBuilder.build_error_card(
+            "failed",
+            detail_action={
+                "action": "show_error_details",
+                "chat_id": "chat-1",
+                "origin_message_id": "message-1",
+            },
+        )
+
+        assert "点击“查看详情”" not in without_details
+        assert "show_error_details" not in without_details
+        assert "点击“查看详情”" in with_details
+        assert "show_error_details" in with_details
+
+        _, origin_only = SystemBuilder.build_error_card(
+            "failed",
+            detail_action={
+                "action": "show_error_details",
+                "origin_message_id": "message-1",
+            },
+        )
+        assert "show_error_details" not in origin_only
+
+    def test_card_hides_detail_action_without_trusted_origin_binding(self):
+        from src.card.builders.system import SystemBuilder
+
+        _, card_json = SystemBuilder.build_error_card(
+            "failed",
+            detail_action={"action": "show_error_details"},
+        )
+
+        assert "show_error_details" not in card_json
+        assert "查看详情" not in card_json
+        assert "可查看脱敏诊断" not in card_json
+
+    @pytest.mark.parametrize("severity", ["fatal", "recoverable"])
+    def test_card_status_does_not_promise_missing_actions(self, severity):
+        from src.card.builders.system import SystemBuilder
+
+        _, card_json = SystemBuilder.build_error_card(
+            "failed",
+            severity=severity,
+        )
+
+        assert "可查看脱敏诊断" not in card_json
+        assert "卡片按钮重试" not in card_json
+        assert "请按错误摘要中的提示重新发起" in card_json
+
+    @pytest.mark.parametrize("severity", ["fatal", "recoverable", "degraded"])
+    def test_error_notification_summary_never_copies_exception_text(
+        self,
+        severity,
+    ):
+        from src.card.builders.system import SystemBuilder
+
+        secret = "Bearer private-token /private/customer/path"
+        _, card_json = SystemBuilder.build_error_card(
+            secret,
+            title="执行失败",
+            severity=severity,
+        )
+        card = json.loads(card_json)
+        summary = card["config"]["summary"]["content"]
+
+        assert 8 <= len(summary) <= 60
+        assert "private-token" not in summary
+        assert "/private/customer/path" not in summary
+
+    def test_degraded_card_hides_unusable_details_without_a_trusted_binding(self):
+        from src.card.builders.system import SystemBuilder
+
+        _, card_json = SystemBuilder.build_error_card(
+            "degraded",
+            severity="degraded",
+        )
+
+        assert "show_error_details" not in card_json
+        assert "查看详情" not in card_json
+        assert "诊断" not in json.loads(card_json)["config"]["summary"]["content"]
+
+    def test_degraded_card_exposes_details_with_a_trusted_origin_binding(self):
+        from src.card.builders.system import SystemBuilder
+
+        _, card_json = SystemBuilder.build_error_card(
+            "degraded",
+            severity="degraded",
+            detail_action={
+                "chat_id": "chat-1",
+                "origin_message_id": "om_trusted",
+            },
+        )
+
+        assert "show_error_details" in card_json
+        assert "查看详情" in card_json
 
 
 # ---------------------------------------------------------------------------

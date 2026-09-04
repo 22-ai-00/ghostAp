@@ -2,6 +2,7 @@ import json
 import logging
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from src.card.builders.project import ProjectBuilder
@@ -110,6 +111,7 @@ class TestOptimizationTraceUI(unittest.TestCase):
     def test_reply_error(self):
         """Test BaseHandler.reply_error."""
         ctx = MagicMock()
+        ctx.message_linker.query.return_value = None
         handler = BaseHandler(ctx)
 
         # reply_error now delegates to send_error_card, which calls reply_card internally.
@@ -119,8 +121,96 @@ class TestOptimizationTraceUI(unittest.TestCase):
         handler.reply_error("msg_1", "Something went wrong", title="Error Title")
 
         handler.send_error_card.assert_called_once_with(
-            chat_id="unknown", exc="Something went wrong", title="Error Title", origin_message_id="msg_1"
+            chat_id="",
+            exc="Something went wrong",
+            title="Error Title",
+            origin_message_id="msg_1",
+            severity="fatal",
         )
+
+    def test_reply_error_binds_diagnostics_to_the_real_origin_chat(self):
+        """A real card click must not be rejected by an ``unknown`` binding."""
+        from src.card.error_diagnostics import render_error_diagnostic
+
+        ctx = MagicMock()
+        ctx.message_linker.query.return_value = {"chat_id": "chat_real"}
+        handler = BaseHandler(ctx)
+        handler.reply_card = MagicMock(return_value="card_reply")
+
+        handler.reply_error("msg_1", "Something went wrong", title="Error Title")
+
+        card = json.loads(handler.reply_card.call_args.args[1])
+        nodes = [card]
+        detail_action = None
+        while nodes:
+            node = nodes.pop()
+            if isinstance(node, dict):
+                value = node.get("value")
+                if isinstance(value, dict) and value.get("action") == "show_error_details":
+                    detail_action = value
+                    break
+                nodes.extend(node.values())
+            elif isinstance(node, list):
+                nodes.extend(node)
+
+        self.assertIsNotNone(detail_action)
+        assert detail_action is not None
+        self.assertEqual(detail_action.get("chat_id"), "chat_real")
+        self.assertNotIn("unknown", json.dumps(card))
+        rendered = render_error_diagnostic(
+            detail_action.get("diagnostic_token"),
+            chat_id="chat_real",
+            origin_message_id="msg_1",
+        )
+        self.assertIn("Something went wrong", rendered)
+        self.assertNotIn("当前会话与原始错误卡不匹配", rendered)
+
+        from src.feishu.action_registry import init_action_registry
+
+        handlers = {
+            name: MagicMock()
+            for name in (
+                "project",
+                "system",
+                "deep",
+                "spec",
+                "workflow",
+                "claude",
+                "aiden",
+                "codex",
+                "gemini",
+                "traex",
+                "grok",
+                "dsh",
+            )
+        }
+        handlers["coco"] = handler
+        handler.handle_card_exit = MagicMock()
+        client = SimpleNamespace(
+            _handler_ctx=SimpleNamespace(handlers=handlers),
+            _project_manager=MagicMock(),
+        )
+        handler.reply_text = MagicMock()
+        actions = init_action_registry(client)
+        actions["show_error_details"](
+            "card_reply",
+            "chat_real",
+            None,
+            detail_action,
+        )
+        callback_text = handler.reply_text.call_args.args[1]
+        self.assertIn("Something went wrong", callback_text)
+        self.assertNotIn("当前会话与原始错误卡不匹配", callback_text)
+
+        handler.reply_text.reset_mock()
+        actions["show_error_details"](
+            "card_reply",
+            "chat_other",
+            None,
+            detail_action,
+        )
+        rejected_text = handler.reply_text.call_args.args[1]
+        self.assertIn("当前会话与原始错误卡不匹配", rejected_text)
 
     def test_handler_error_refactoring(self):
         """Verify that ProjectHandler uses reply_error."""

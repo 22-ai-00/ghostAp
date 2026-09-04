@@ -12,6 +12,8 @@ GhostAP uses two layers of locking for multi-chat isolation:
 2. **Repo Lock** (`RepoLockManager._mu`) — handler-execution level; prevents concurrent modifications to the same repository from different chats.
 
 Additionally, `ProjectContext._chat_lock` protects mutation of `allowed_chat_ids` / `evicted_chat_ids`, and `ProjectManager._lock` (an `RLock`) guards the project registry.
+`SystemHandler._acp_activation_lock` linearizes ACP startup, durable project
+selection and `/exit` so a stale activation cannot re-enter a mode.
 
 Inconsistent acquisition order across call paths would create a deadlock risk.
 
@@ -20,10 +22,13 @@ Inconsistent acquisition order across call paths would create a deadlock risk.
 All code paths **must** acquire locks in this strict partial order:
 
 ```
-ProjectManager._lock  (RLock, outermost)
-  → ProjectContext._chat_lock  (Lock)
-    → ChatLockManager._mu  (Lock)
-      → RepoLockManager._mu  (Lock)
+BaseEngineManager._lock  (Lock, outermost)
+  → BaseEngine._lock  (RLock)
+    → SystemHandler._acp_activation_lock  (RLock)
+      → ProjectManager._lock  (RLock)
+        → ProjectContext._chat_lock  (Lock)
+          → ChatLockManager._mu  (Lock)
+            → RepoLockManager._mu  (Lock, innermost)
 ```
 
 Rules:
@@ -32,6 +37,9 @@ Rules:
 2. `ChatLockManager` checks (`should_block`, `is_locked`) execute **before** any handler code that might touch `RepoLockManager`.
 3. `ProjectContext._chat_lock` is only acquired while `ProjectManager._lock` is held (via `add_chat_id` called from `ProjectManager` methods).
 4. Callback closures registered on lock managers (e.g. `_on_hard_timeout_reclaim`, `on_eviction`) run **outside** the lock that triggers them, in a separate daemon thread, to avoid re-entrant acquisition.
+5. ACP activation may hold its control-plane lock while committing or exiting a
+   project mode. Project and lower-level lock holders must never call back into
+   ACP activation ownership methods.
 
 ## TOCTOU in retry-command probe
 

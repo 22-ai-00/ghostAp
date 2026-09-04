@@ -194,6 +194,10 @@ UI_TEXT = {
     "system_acp_programming_ready_body": "ACP 会话已使用 `{model}` 启动，现在可以直接发送需求。",
     "system_acp_programming_failed_title": "{tool} 编程模式初始化失败",
     "system_acp_programming_failed_body": "模型 `{model}` 未能启动。\n\n{reason}",
+    "system_acp_programming_superseded_title": "{tool} 编程模式选择已更新",
+    "system_acp_programming_superseded_body": "模型 `{model}` 的这次初始化未再生效。\n\n{reason}",
+    "system_acp_activation_superseded": "已被更新的模型选择取代。",
+    "system_acp_activation_cancelled": "初始化任务已取消，请重新选择模型。",
     "system_acp_switch_model_btn": "切换模型",
     "system_acp_retry_activation_btn": "重试初始化",
     "system_acp_back_to_models_btn": "返回模型选择",
@@ -440,6 +444,13 @@ UI_TEXT = {
     "mode_already_in_msg": "已经在{name}编程模式中\n\n{info}\n\n说「退出模式」或发送 /exit 退出",
     "mode_exit_msg": "👋 已退出{name}编程模式\n\n会话已保存，下次可以恢复\n\n当前为 💭 智能模式",
     "mode_exit_pending_msg": "👋 已退出{name}编程模式\n\n当前为 💭 智能模式",
+    "mode_exit_persist_failed": (
+        "运行会话已退出，但项目模式状态保存失败。"
+        "当前进程已回到智能模式；服务重启后可能恢复旧模式。"
+        "请先检查项目配置存储，再重新进入该模式并退出一次。"
+    ),
+    "mode_exit_persist_failed_banner": "已退出 {name}，但状态保存失败",
+    "mode_exit_persist_failed_title": "模式退出未完全保存",
     "mode_not_in_msg": "当前不在 {name} 模式中",
     "mode_thinking_msg": "{emoji} {name} 正在思考…",
     "mode_resume_msg": "🔄 已恢复 {name} 会话\n\n• 会话 ID: `{session_id}`\n• 历史对话: {query_count} 条\n\n{hint}",

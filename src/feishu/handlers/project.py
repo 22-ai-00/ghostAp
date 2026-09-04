@@ -191,16 +191,48 @@ class ProjectHandler(BaseHandler):
             return
 
         old_project = self.project_manager.get_active_project(chat_id)
+        switch_result = None
         if old_project and old_project.project_id != project.project_id:
             self.preserve_project_context(chat_id, old_project)
 
-            from ...mode import InteractionMode
+            system_handler = self.get_handler("system")
+            switch_with_fence = getattr(
+                system_handler,
+                "switch_active_project_with_acp_fence",
+                None,
+            )
+            if callable(switch_with_fence):
+                switch_result = switch_with_fence(
+                    message_id,
+                    chat_id,
+                    old_project,
+                    project.project_id,
+                )
+            else:
+                from ...mode import PROGRAMMING_MODES, InteractionMode
 
-            current_mode = self.mode_manager.get_mode(chat_id, project_id=old_project.project_id)
-            if current_mode == InteractionMode.COCO and coco_handler:
-                coco_handler.exit_mode(message_id, chat_id, project=old_project)
-            elif current_mode == InteractionMode.CLAUDE and claude_handler:
-                claude_handler.exit_mode(message_id, chat_id, project=old_project)
+                current_mode = self.mode_manager.get_mode(
+                    chat_id,
+                    project_id=old_project.project_id,
+                )
+                if current_mode in PROGRAMMING_MODES and system_handler is not None:
+                    system_handler.exit_current_mode(
+                        message_id,
+                        chat_id,
+                        project=old_project,
+                    )
+                elif current_mode == InteractionMode.COCO and coco_handler:
+                    coco_handler.exit_mode(
+                        message_id,
+                        chat_id,
+                        project=old_project,
+                    )
+                elif current_mode == InteractionMode.CLAUDE and claude_handler:
+                    claude_handler.exit_mode(
+                        message_id,
+                        chat_id,
+                        project=old_project,
+                    )
 
             old_ctx = self.context_manager.store.get(old_project.project_id, chat_id=chat_id)
             if old_ctx:
@@ -210,7 +242,12 @@ class ProjectHandler(BaseHandler):
                     summary=f"Switched to project {project.project_name}",
                 )
 
-        success, msg = self.project_manager.set_active_project(chat_id, project.project_id)
+        if switch_result is None:
+            switch_result = self.project_manager.set_active_project(
+                chat_id,
+                project.project_id,
+            )
+        success, msg = switch_result
         if not success:
             self.reply_error(message_id, UI_TEXT["project_switch_error"].format(error=msg))
             return

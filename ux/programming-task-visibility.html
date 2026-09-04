@@ -80,6 +80,10 @@
       <article class="card completed-warning">
         <header><h2>任务已完成</h2></header>
         <div class="body">
+          <section class="action">
+            <strong>✅ 最终结论</strong>
+            <div>当前 ACP 后端正常；此前失败由“模式仍开启但会话已回收”被误判为在线切模导致。已改为无会话时新建恢复，原始任务结论不会再被内部状态对账覆盖。</div>
+          </section>
           <section class="outcome success">
             <div class="outcome-title">✅ 结果已完整交付</div>
             <div>计划项 3/3 完成，外层工具调用全部终态，并行子任务 3/3 完成。</div>
@@ -102,7 +106,7 @@
         </div>
       </article>
     </section>
-    <p class="note">终态卡不再显示残留的 Context compacting 或“执行中”；历史记录异常与任务失败分层展示。“查看诊断”只在真实、安全绑定的回调存在时出现，不再用“查看状态”冒充。</p>
+    <p class="note">终态卡先展示原始任务结论，再展示完成状态与内部对账提醒；对账结果只能补充状态，不能替换结论。“查看诊断”只在真实、安全绑定的回调存在时出现。</p>
   </main>
 </body>
 </html>

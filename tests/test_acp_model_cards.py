@@ -254,9 +254,11 @@ def test_activation_cards_cover_initializing_ready_and_retryable_failure() -> No
     loading_card = _card(initializing("codex", "gpt-5.6-sol/high", "project-3", None))
     assert "gpt-5.6-sol/high" in json.dumps(loading_card, ensure_ascii=False)
     assert not _nodes(loading_card, "button")
+    assert 8 <= len(loading_card["config"]["summary"]["content"]) <= 60
 
     ready_card = _card(ready("codex", "gpt-5.6-sol/high", "project-3", None))
     ready_actions = [_callback_value(button) for button in _nodes(ready_card, "button")]
+    assert 8 <= len(ready_card["config"]["summary"]["content"]) <= 60
     assert ready_actions == [
         {
             "action": action_ids.REFRESH_ACP_MODELS,
@@ -279,7 +281,10 @@ def test_activation_cards_cover_initializing_ready_and_retryable_failure() -> No
         )
     )
     assert "startup rejected" in json.dumps(failed_card, ensure_ascii=False)
+    assert failed_card["header"]["template"] == "orange"
+    assert 8 <= len(failed_card["config"]["summary"]["content"]) <= 60
     failed_actions = [_callback_value(button) for button in _nodes(failed_card, "button")]
+    assert _nodes(failed_card, "button")[0]["type"] == "primary"
     assert failed_actions[0] == {
         "action": action_ids.SELECT_ACP_MODEL,
         "tool_name": "codex",

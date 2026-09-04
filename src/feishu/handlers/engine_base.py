@@ -240,6 +240,7 @@ class BaseEngineHandler(BaseHandler):
                         details=f"engine={engine_name}; task_id={task_id}; request_id={request_id or 'n/a'}",
                         detail_action={
                             "action": "show_error_details",
+                            "chat_id": chat_id,
                             "engine_type": action_prefix,
                             "task_id": task_id,
                             "request_id": request_id or "",

@@ -95,6 +95,10 @@ class _FakeProgrammingCardSession:
     def get_conclusion_text(self):
         return getattr(self, "conclusion_text", self.get_final_text())
 
+    def set_result_conclusion_fallback(self, text):
+        if not hasattr(self, "conclusion_text"):
+            self.conclusion_text = text
+
     def finish(self, **kwargs):
         self.finished = True
         self.finish_kwargs = kwargs

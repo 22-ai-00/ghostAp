@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 from lark_channel.event.callback.model.p2_card_action_trigger import (
@@ -35,6 +36,7 @@ from src.feishu.ws_client import FeishuWSClient
 from src.mode import InteractionMode
 from src.project.context import ProjectContext
 from src.project.manager import ProjectManager
+from src.tasking import TaskStatus
 from src.thread import set_current_thread_id
 from tests.helpers.session_call_recorder import SessionCallRecorder
 
@@ -227,6 +229,454 @@ def test_backend_start_failure_can_retry_on_the_next_feishu_activation():
     assert attempts == ["codex", "codex"]
 
 
+@pytest.mark.parametrize("model_name", ["gpt-5.6-sol/high", None])
+def test_active_mode_without_session_recovers_instead_of_hot_switching(
+    model_name: str | None,
+):
+    """Persistent mode may outlive its transport; model selection must recover it."""
+    manager = MagicMock()
+    recovered_session = SimpleNamespace(session_id="recovered-session")
+    manager.get_session.side_effect = [None, recovered_session]
+    ctx = _context("codex", manager)
+    ctx.mode_manager.is_codex_mode.return_value = True
+    system = SystemHandler(ctx)
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    handler._get_agent_type_override.return_value = None
+    handler.enter_mode.return_value = True
+    ctx.handlers["codex"] = handler
+    project = _project("codex", "old-model")
+
+    assert system._enter_mode_with_acp_model(
+        "selector",
+        "chat-direct",
+        "codex",
+        model_name,
+        project,
+        thread_id=None,
+    )
+
+    handler.switch_model.assert_not_called()
+    handler.enter_mode.assert_called_once_with(
+        "selector",
+        "chat-direct",
+        project=project,
+        silent=True,
+        model_override=model_name,
+        commit_project_state=False,
+        activate_mode=False,
+        exit_opposite_mode=False,
+        inherit_thread_context=False,
+    )
+
+
+def test_live_direct_session_still_uses_effect_only_hot_switch() -> None:
+    manager = MagicMock()
+    live_session = SimpleNamespace(
+        session_id="live-session",
+        set_model=MagicMock(return_value=True),
+    )
+    manager.get_session.return_value = live_session
+    ctx = _context("codex", manager)
+    ctx.mode_manager.is_codex_mode.return_value = True
+    system = SystemHandler(ctx)
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    handler.switch_model.return_value = True
+    ctx.handlers["codex"] = handler
+    project = _project("codex", "old-model")
+
+    assert system._enter_mode_with_acp_model(
+        "selector",
+        "chat-direct",
+        "codex",
+        "gpt-5.6-sol/high",
+        project,
+        thread_id=None,
+    )
+
+    manager.get_session.assert_called_once_with(
+        "chat-direct",
+        project_id=project.project_id,
+        thread_id=None,
+    )
+    handler.switch_model.assert_called_once_with(
+        "selector",
+        "chat-direct",
+        "gpt-5.6-sol/high",
+        project=project,
+        expected_session=live_session,
+    )
+    handler.enter_mode.assert_not_called()
+
+
+def test_live_custom_session_resets_to_backend_default_with_cas_replacement(
+    tmp_path,
+) -> None:
+    manager = MagicMock()
+    live_session = SimpleNamespace(
+        session_id="custom-session",
+        _model_name="gpt-5.6-sol/high",
+    )
+    default_session = SimpleNamespace(
+        session_id="default-session",
+        _model_name=None,
+    )
+    manager.get_session.return_value = live_session
+    manager.replace_session.return_value = SimpleNamespace(
+        session=default_session,
+        created=True,
+    )
+    ctx = _context("codex", manager)
+    ctx.settings.acp_startup_timeout = 37
+    ctx.mode_manager.is_codex_mode.return_value = True
+    system = SystemHandler(ctx)
+    handler = MagicMock()
+    handler.current_model = "gpt-5.6-sol/high"
+    handler._get_session_manager.return_value = manager
+    handler._get_agent_type_override.return_value = None
+    ctx.handlers["codex"] = handler
+    project = _project("codex", "gpt-5.6-sol/high")
+    project.root_path = str(tmp_path)
+
+    assert system._enter_mode_with_acp_model(
+        "selector",
+        "chat-direct",
+        "codex",
+        None,
+        project,
+        thread_id=None,
+    )
+
+    manager.replace_session.assert_called_once_with(
+        "chat-direct",
+        cwd=str(tmp_path),
+        expected_session=live_session,
+        startup_timeout=37,
+        project_id=project.project_id,
+        agent_type_override=None,
+        model_name=None,
+        thread_id=None,
+    )
+    handler.switch_model.assert_not_called()
+    handler.enter_mode.assert_not_called()
+
+
+def test_live_session_without_set_model_uses_cas_replacement(tmp_path) -> None:
+    manager = MagicMock()
+    live_session = SimpleNamespace(
+        session_id="claude-cli-session",
+        _model_name="old-model",
+    )
+    replacement_session = SimpleNamespace(
+        session_id="replacement-session",
+        _model_name="claude-sonnet-4-5",
+    )
+    manager.get_session.return_value = live_session
+    manager.replace_session.return_value = SimpleNamespace(
+        session=replacement_session,
+        created=True,
+    )
+    ctx = _context("claude", manager)
+    system = SystemHandler(ctx)
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    handler._get_agent_type_override.return_value = None
+    ctx.handlers["claude"] = handler
+    project = _project("claude", "old-model")
+    project.root_path = str(tmp_path)
+
+    result = system._enter_mode_with_acp_model(
+        "selector",
+        "chat-direct",
+        "claude",
+        "claude-sonnet-4-5",
+        project,
+        thread_id=None,
+    )
+
+    assert result.session is replacement_session
+    assert result.changed is True
+    handler.switch_model.assert_not_called()
+    manager.replace_session.assert_called_once_with(
+        "chat-direct",
+        cwd=str(tmp_path),
+        expected_session=live_session,
+        startup_timeout=20,
+        project_id=project.project_id,
+        agent_type_override=None,
+        model_name="claude-sonnet-4-5",
+        thread_id=None,
+    )
+
+
+def test_topic_activation_replaces_only_the_exact_topic_session() -> None:
+    manager = MagicMock()
+    topic_session = SimpleNamespace(
+        session_id="topic-session",
+        _model_name="old-model",
+    )
+    replacement_session = SimpleNamespace(
+        session_id="replacement-topic-session",
+        _model_name="gpt-5.6-sol/high",
+    )
+    manager.get_session.return_value = topic_session
+    manager.replace_session.return_value = SimpleNamespace(
+        session=replacement_session,
+        created=True,
+    )
+    ctx = _context("codex", manager)
+    ctx.mode_manager.is_codex_mode.return_value = True
+    system = SystemHandler(ctx)
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    handler._get_agent_type_override.return_value = None
+    handler.enter_mode.return_value = True
+    ctx.handlers["codex"] = handler
+    project = _project("codex", "old-model")
+
+    assert system._enter_mode_with_acp_model(
+        "selector",
+        "chat-direct",
+        "codex",
+        "gpt-5.6-sol/high",
+        project,
+        thread_id="topic-root",
+    )
+
+    manager.get_session.assert_called_once_with(
+        "chat-direct",
+        project_id=project.project_id,
+        thread_id="topic-root",
+    )
+    handler.switch_model.assert_not_called()
+    handler.enter_mode.assert_not_called()
+    manager.replace_session.assert_called_once_with(
+        "chat-direct",
+        cwd=project.root_path,
+        expected_session=topic_session,
+        startup_timeout=20,
+        project_id=project.project_id,
+        agent_type_override=None,
+        model_name="gpt-5.6-sol/high",
+        thread_id="topic-root",
+    )
+
+
+def test_topic_custom_session_resets_to_default_on_the_exact_topic_key() -> None:
+    manager = MagicMock()
+    topic_session = SimpleNamespace(
+        session_id="topic-custom",
+        _model_name="custom-model",
+    )
+    default_session = SimpleNamespace(
+        session_id="topic-default",
+        _model_name=None,
+    )
+    manager.get_session.return_value = topic_session
+    manager.replace_session.return_value = SimpleNamespace(
+        session=default_session,
+        created=True,
+    )
+    ctx = _context("codex", manager)
+    system = SystemHandler(ctx)
+    handler = MagicMock()
+    handler.current_model = "custom-model"
+    handler._get_session_manager.return_value = manager
+    handler._get_agent_type_override.return_value = None
+    ctx.handlers["codex"] = handler
+    project = _project("codex", "custom-model")
+
+    result = system._enter_mode_with_acp_model(
+        "selector",
+        "chat-direct",
+        "codex",
+        None,
+        project,
+        thread_id="topic-root",
+    )
+
+    assert result.session is default_session
+    assert result.changed is True
+    manager.replace_session.assert_called_once_with(
+        "chat-direct",
+        cwd=project.root_path,
+        expected_session=topic_session,
+        startup_timeout=20,
+        project_id=project.project_id,
+        agent_type_override=None,
+        model_name=None,
+        thread_id="topic-root",
+    )
+
+
+def test_unknown_live_model_state_is_replaced_when_selecting_default() -> None:
+    manager = MagicMock()
+    unknown_session = SimpleNamespace(session_id="unknown-model-session")
+    default_session = SimpleNamespace(
+        session_id="known-default-session",
+        _model_name=None,
+    )
+    manager.get_session.return_value = unknown_session
+    manager.replace_session.return_value = SimpleNamespace(
+        session=default_session,
+        created=True,
+    )
+    ctx = _context("codex", manager)
+    system = SystemHandler(ctx)
+    handler = MagicMock()
+    handler._get_session_manager.return_value = manager
+    handler._get_agent_type_override.return_value = None
+    ctx.handlers["codex"] = handler
+    project = _project("codex", "old-model")
+
+    result = system._enter_mode_with_acp_model(
+        "selector",
+        "chat-direct",
+        "codex",
+        None,
+        project,
+        thread_id=None,
+    )
+
+    assert result.session is default_session
+    assert result.changed is True
+    manager.replace_session.assert_called_once()
+
+
+def test_missing_direct_session_recovery_ignores_stale_thread_context(
+    tmp_path,
+) -> None:
+    recorder = SessionCallRecorder()
+    manager = ACPSessionManager(
+        "codex",
+        session_starter=recorder.session_factory,
+    )
+    _storage, _projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    ctx.codex_manager = manager
+    ctx.managers["codex"] = manager
+    ctx.mode_manager.is_codex_mode.return_value = True
+    handler = CodexModeHandler(ctx)
+    handler.add_reaction = MagicMock()
+    handler.reply_card = MagicMock()
+    handler.reply_text = MagicMock()
+    ctx.handlers["codex"] = handler
+
+    set_current_thread_id("stale-topic-context")
+    try:
+        assert system._enter_mode_with_acp_model(
+            "selector",
+            "chat-first",
+            "codex",
+            "gpt-5.6-sol/high",
+            project,
+            thread_id=None,
+        )
+    finally:
+        set_current_thread_id(None)
+
+    assert manager.get_session(
+        "chat-first",
+        project_id=project.project_id,
+        thread_id=None,
+    ) is not None
+    assert manager.get_session(
+        "chat-first",
+        project_id=project.project_id,
+        thread_id="stale-topic-context",
+    ) is None
+    manager.cleanup_all()
+
+
+def test_live_switch_failure_is_rendered_only_on_the_selector_card(
+    tmp_path,
+) -> None:
+    """The inner protocol effect must not emit a second generic fatal card."""
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="old-model",
+    )
+    live_session = SimpleNamespace(
+        session_id="live-session",
+        message_count=3,
+        set_model=MagicMock(return_value=False),
+    )
+    manager = ctx.managers["codex"]
+    manager.get_session.return_value = live_session
+    codex = CodexModeHandler(ctx)
+    codex.reply_card = MagicMock()
+    codex.reply_error = MagicMock()
+    ctx.handlers["codex"] = codex
+    ctx.mode_manager.is_codex_mode.return_value = True
+    ctx.scheduler.submit.side_effect = lambda _spec, callback: callback(None)
+    system.update_card = MagicMock(return_value=True)
+
+    system._activate_acp_selection(
+        "om-selector",
+        "chat-first",
+        "codex",
+        "gpt-5.6-sol/high",
+        project,
+        explicit_card=True,
+        model_group="gpt-5.6-sol",
+        model_profile=None,
+        model_effort="high",
+    )
+
+    assert len(system.update_card.call_args_list) == 2
+    cards = [
+        _card_dict(call.args[1])
+        for call in system.update_card.call_args_list
+    ]
+    assert "正在初始化" in json.dumps(cards[0], ensure_ascii=False)
+    assert "初始化失败" in json.dumps(cards[1], ensure_ascii=False)
+    assert cards[1]["header"]["template"] == "orange"
+    codex.reply_card.assert_not_called()
+    codex.reply_error.assert_not_called()
+    system.reply_error.assert_not_called()
+
+
+def test_hot_switch_rejects_a_replaced_session_owner() -> None:
+    original = SimpleNamespace(
+        session_id="session-a",
+        set_model=MagicMock(return_value=True),
+    )
+    replacement = SimpleNamespace(
+        session_id="session-b",
+        set_model=MagicMock(return_value=True),
+    )
+    manager = MagicMock()
+    manager.get_session.side_effect = [original, replacement]
+    ctx = _context("codex", manager)
+    ctx.mode_manager.is_codex_mode.return_value = True
+    system = SystemHandler(ctx)
+    handler = CodexModeHandler(ctx)
+    ctx.handlers["codex"] = handler
+    project = _project("codex", "old-model")
+
+    assert not system._enter_mode_with_acp_model(
+        "selector",
+        "chat-direct",
+        "codex",
+        "gpt-5.6-sol/high",
+        project,
+        thread_id=None,
+    )
+
+    original.set_model.assert_not_called()
+    replacement.set_model.assert_not_called()
+
+
 def _configuration_lane(tmp_path):
     storage = tmp_path / "projects.json"
     projects = ProjectManager(str(storage))
@@ -248,6 +698,668 @@ def _configuration_lane(tmp_path):
     system.reply_error = MagicMock()
     system.reply_card = MagicMock()
     return storage, projects, first, second, ctx, system
+
+
+def test_latest_model_selection_generation_owns_commit_and_terminal_card(
+    tmp_path,
+) -> None:
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="old-model",
+    )
+    session = SimpleNamespace(session_id="session", message_count=0)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    handler._enter_mode_on_manager.side_effect = (
+        lambda chat_id, project_id=None: ctx.mode_manager.enter_programming_mode(
+            chat_id,
+            InteractionMode.CODEX,
+            project_id=project_id,
+        )
+    )
+    ctx.handlers["codex"] = handler
+    callbacks = []
+    ctx.scheduler.submit.side_effect = (
+        lambda _spec, callback: callbacks.append(callback)
+        or SimpleNamespace(run_id=f"activation-{len(callbacks)}")
+    )
+    system.update_card = MagicMock(return_value=True)
+    system._enter_mode_with_acp_model = MagicMock(return_value=True)
+
+    system._activate_acp_selection(
+        "om-selector",
+        "chat-first",
+        "codex",
+        "model-a",
+        project,
+        explicit_card=True,
+    )
+    system._activate_acp_selection(
+        "om-selector",
+        "chat-first",
+        "codex",
+        "model-b",
+        project,
+        explicit_card=True,
+    )
+
+    assert len(callbacks) == 2
+    assert callbacks[0](None) is False
+    assert callbacks[1](None) is True
+    assert project.acp_model_name == "model-b"
+    rendered_updates = [
+        call.args[1] for call in system.update_card.call_args_list
+    ]
+    assert sum("编程模式已就绪" in card for card in rendered_updates) == 1
+    assert "model-b" in rendered_updates[-1]
+    assert "model-a" not in rendered_updates[-1]
+
+
+def test_terminal_activation_releases_generation_state(tmp_path) -> None:
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="old-model",
+    )
+    session = SimpleNamespace(session_id="session", message_count=0)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    handler._enter_mode_on_manager.side_effect = (
+        lambda chat_id, project_id=None: ctx.mode_manager.enter_programming_mode(
+            chat_id,
+            InteractionMode.CODEX,
+            project_id=project_id,
+        )
+    )
+    ctx.handlers["codex"] = handler
+    ctx.scheduler.submit.side_effect = lambda _spec, callback: callback(None)
+    system.update_card = MagicMock(return_value=True)
+    system._enter_mode_with_acp_model = MagicMock(return_value=True)
+
+    system._activate_acp_selection(
+        "selector",
+        "chat-first",
+        "codex",
+        "new-model",
+        project,
+        explicit_card=True,
+    )
+
+    assert system._acp_activation_generations == {}
+    assert system._acp_activation_fence_epochs == {}
+    assert system._acp_activation_owners == {}
+    assert system._acp_activation_task_owners == {}
+
+
+def test_topic_activations_use_independent_generations_and_forward_both_tasks(
+    tmp_path,
+) -> None:
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="saved-model",
+    )
+    sessions = {
+        "topic-a": SimpleNamespace(session_id="session-a", message_count=0),
+        "topic-b": SimpleNamespace(session_id="session-b", message_count=0),
+    }
+    manager = MagicMock()
+    manager.get_session.side_effect = (
+        lambda _chat_id, *, project_id=None, thread_id=None: sessions[thread_id]
+    )
+    handler = MagicMock()
+    handler.current_model = "saved-model"
+    handler._get_session_manager.return_value = manager
+    ctx.handlers["codex"] = handler
+    callbacks = []
+    ctx.scheduler.submit.side_effect = (
+        lambda _spec, callback: callbacks.append(callback)
+        or SimpleNamespace(run_id=f"topic-activation-{len(callbacks)}")
+    )
+    system._enter_mode_with_acp_model = MagicMock(return_value=True)
+
+    try:
+        set_current_thread_id("topic-a")
+        system.handle_enter_acp_saved_selection(
+            "message-a",
+            "chat-first",
+            "codex",
+            project,
+            pending_prompt="task a",
+        )
+        set_current_thread_id("topic-b")
+        system.handle_enter_acp_saved_selection(
+            "message-b",
+            "chat-first",
+            "codex",
+            project,
+            pending_prompt="task b",
+        )
+    finally:
+        set_current_thread_id(None)
+
+    assert len(callbacks) == 2
+    assert callbacks[0](None) is True
+    assert callbacks[1](None) is True
+    assert handler.handle_message.call_args_list == [
+        call(
+            "message-a",
+            "chat-first",
+            "task a",
+            project,
+            expected_session=sessions["topic-a"],
+        ),
+        call(
+            "message-b",
+            "chat-first",
+            "task b",
+            project,
+            expected_session=sessions["topic-b"],
+        ),
+    ]
+
+
+def test_late_topic_activation_cannot_overwrite_new_direct_configuration(
+    tmp_path,
+) -> None:
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="old-model",
+    )
+    direct_session = SimpleNamespace(session_id="direct", message_count=0)
+    topic_session = SimpleNamespace(session_id="topic", message_count=0)
+    manager = MagicMock()
+    manager.get_session.side_effect = (
+        lambda _chat_id, *, project_id=None, thread_id=None: (
+            topic_session if thread_id == "topic-root" else direct_session
+        )
+    )
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    ctx.handlers["codex"] = handler
+    callbacks = []
+    ctx.scheduler.submit.side_effect = (
+        lambda _spec, callback: callbacks.append(callback)
+        or SimpleNamespace(run_id=f"activation-{len(callbacks)}")
+    )
+    system._enter_mode_with_acp_model = MagicMock(return_value=True)
+    system.update_card = MagicMock(return_value=True)
+
+    try:
+        set_current_thread_id("topic-root")
+        system.handle_enter_acp_saved_selection(
+            "topic-message",
+            "chat-first",
+            "codex",
+            project,
+            pending_prompt="topic task",
+        )
+    finally:
+        set_current_thread_id(None)
+    system._activate_acp_selection(
+        "direct-selector",
+        "chat-first",
+        "codex",
+        "new-model",
+        project,
+        explicit_card=True,
+    )
+
+    assert callbacks[1](None) is True
+    assert project.acp_model_name == "new-model"
+    assert callbacks[0](None) is True
+    assert project.acp_model_name == "new-model"
+    assert handler.current_model == "new-model"
+
+
+def test_a_new_selector_card_finishes_the_superseded_card(tmp_path) -> None:
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="old-model",
+    )
+    session = SimpleNamespace(session_id="session", message_count=0)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    ctx.handlers["codex"] = handler
+    callbacks = []
+    ctx.scheduler.submit.side_effect = (
+        lambda _spec, callback: callbacks.append(callback)
+        or SimpleNamespace(run_id=f"activation-{len(callbacks)}")
+    )
+    system.update_card = MagicMock(return_value=True)
+    system._enter_mode_with_acp_model = MagicMock(return_value=True)
+
+    system._activate_acp_selection(
+        "selector-a",
+        "chat-first",
+        "codex",
+        "model-a",
+        project,
+        explicit_card=True,
+    )
+    system._activate_acp_selection(
+        "selector-b",
+        "chat-first",
+        "codex",
+        "model-b",
+        project,
+        explicit_card=True,
+    )
+
+    assert callbacks[0](None) is False
+    assert callbacks[1](None) is True
+    selector_a_updates = [
+        call.args[1]
+        for call in system.update_card.call_args_list
+        if call.args[0] == "selector-a"
+    ]
+    assert len(selector_a_updates) == 2
+    assert "正在初始化" in selector_a_updates[0]
+    assert "选择已更新" in selector_a_updates[1]
+    assert "已被更新的模型选择取代" in selector_a_updates[1]
+
+
+def test_scheduler_cancellation_finishes_the_initializing_selector_card(
+    tmp_path,
+) -> None:
+    _storage, _projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+
+    class _CancelledHandle:
+        def add_done_callback(self, callback) -> None:
+            callback(SimpleNamespace(status=TaskStatus.CANCELED))
+
+    ctx.scheduler.submit.return_value = _CancelledHandle()
+    system.update_card = MagicMock(return_value=True)
+
+    system._activate_acp_selection(
+        "selector",
+        "chat-first",
+        "codex",
+        "model-a",
+        project,
+        explicit_card=True,
+    )
+
+    assert len(system.update_card.call_args_list) == 2
+    assert "正在初始化" in system.update_card.call_args_list[0].args[1]
+    assert "初始化任务已取消" in system.update_card.call_args_list[1].args[1]
+
+
+def test_exit_during_startup_invalidates_the_activation_before_commit(
+    tmp_path,
+) -> None:
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="old-model",
+    )
+    session = SimpleNamespace(session_id="new-session", message_count=0)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    ctx.handlers["codex"] = handler
+    callback_holder = []
+    ctx.scheduler.submit.side_effect = (
+        lambda _spec, callback: callback_holder.append(callback)
+        or SimpleNamespace(run_id="activation")
+    )
+    startup_entered = threading.Event()
+    allow_startup = threading.Event()
+
+    def _startup(*_args, **_kwargs):
+        startup_entered.set()
+        assert allow_startup.wait(timeout=2)
+        return session
+
+    system._enter_mode_with_acp_model = _startup
+    system.update_card = MagicMock(return_value=True)
+    system._activate_acp_selection(
+        "selector",
+        "chat-first",
+        "codex",
+        "new-model",
+        project,
+        explicit_card=True,
+    )
+    activation_result = []
+    worker = threading.Thread(
+        target=lambda: activation_result.append(callback_holder[0](None))
+    )
+    worker.start()
+    assert startup_entered.wait(timeout=2)
+
+    system.exit_current_mode("exit", "chat-first", project)
+    allow_startup.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert activation_result == [False]
+    assert project.acp_model_name == "old-model"
+    handler._enter_mode_on_manager.assert_not_called()
+    manager.retire_session.assert_called_once_with(
+        "chat-first",
+        project_id=project.project_id,
+        thread_id=None,
+        expected_session=session,
+        timeout=20,
+    )
+    assert "初始化任务已取消" in system.update_card.call_args_list[-1].args[1]
+
+
+def test_exit_waits_for_atomic_activation_commit_then_wins_final_mode(
+    tmp_path,
+) -> None:
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="old-model",
+    )
+    session = SimpleNamespace(session_id="new-session", message_count=0)
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    handler = MagicMock()
+    handler.current_model = "old-model"
+    handler._get_session_manager.return_value = manager
+    ctx.handlers["codex"] = handler
+    callbacks = []
+    ctx.scheduler.submit.side_effect = (
+        lambda _spec, callback: callbacks.append(callback)
+        or SimpleNamespace(run_id="activation")
+    )
+    system._enter_mode_with_acp_model = MagicMock(return_value=session)
+    system.update_card = MagicMock(return_value=True)
+
+    mode = {"value": InteractionMode.SMART}
+    events = []
+    ctx.mode_manager.get_mode.side_effect = (
+        lambda _chat_id, project_id=None: mode["value"]
+    )
+    handler._enter_mode_on_manager.side_effect = lambda *_args, **_kwargs: (
+        events.append("enter"),
+        mode.__setitem__("value", InteractionMode.CODEX),
+    )
+    handler.exit_mode.side_effect = lambda *_args, **_kwargs: (
+        events.append("exit"),
+        mode.__setitem__("value", InteractionMode.SMART),
+    )
+
+    commit_entered = threading.Event()
+    allow_commit = threading.Event()
+    original_commit = projects.commit_acp_programming_activation
+
+    def _blocking_commit(*args, **kwargs):
+        commit_entered.set()
+        assert allow_commit.wait(timeout=2)
+        committed = original_commit(*args, **kwargs)
+        events.append("commit")
+        return committed
+
+    projects.commit_acp_programming_activation = _blocking_commit
+    system._activate_acp_selection(
+        "selector",
+        "chat-first",
+        "codex",
+        "new-model",
+        project,
+        explicit_card=True,
+    )
+    activation_worker = threading.Thread(target=lambda: callbacks[0](None))
+    activation_worker.start()
+    assert commit_entered.wait(timeout=2)
+
+    exit_finished = threading.Event()
+
+    def _exit() -> None:
+        system.exit_current_mode("exit", "chat-first", project)
+        exit_finished.set()
+
+    exit_worker = threading.Thread(target=_exit)
+    exit_worker.start()
+    assert not exit_finished.wait(timeout=0.05)
+    allow_commit.set()
+    activation_worker.join(timeout=2)
+    exit_worker.join(timeout=2)
+
+    assert not activation_worker.is_alive()
+    assert not exit_worker.is_alive()
+    assert events == ["commit", "enter", "exit"]
+    assert mode["value"] is InteractionMode.SMART
+
+
+def test_programming_exit_persists_project_mode_off(tmp_path) -> None:
+    storage, projects, project, _second, ctx, _system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_programming_activation(
+        project,
+        tool_name="codex",
+        model_name="model-a",
+        session_id="session-a",
+    )
+    manager = MagicMock()
+    manager.get_session.return_value = None
+    manager.end_session.return_value = None
+    ctx.codex_manager = manager
+    ctx.managers["codex"] = manager
+    ctx.mode_manager.get_mode.return_value = InteractionMode.CODEX
+    handler = CodexModeHandler(ctx)
+    handler.add_reaction = MagicMock()
+    handler.reply_card = MagicMock()
+    handler.reply_text = MagicMock()
+
+    handler.exit_mode("exit", "chat-first", project=project)
+
+    reloaded = ProjectManager(str(storage)).get_project_for_chat(
+        project.project_id,
+        "chat-first",
+    )
+    assert reloaded is not None
+    assert reloaded.codex_mode is False
+
+
+def test_programming_exit_reports_when_project_mode_cannot_be_persisted(
+    tmp_path,
+) -> None:
+    _storage, projects, project, _second, ctx, _system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_programming_activation(
+        project,
+        tool_name="codex",
+        model_name="model-a",
+        session_id="session-a",
+    )
+    projects._save_projects = MagicMock(return_value=False)
+    manager = MagicMock()
+    manager.get_session.return_value = None
+    manager.end_session.return_value = None
+    ctx.codex_manager = manager
+    ctx.managers["codex"] = manager
+    ctx.mode_manager.get_mode.return_value = InteractionMode.CODEX
+    handler = CodexModeHandler(ctx)
+    handler.add_reaction = MagicMock()
+    handler.reply_card = MagicMock()
+    handler.reply_text = MagicMock()
+
+    handler.exit_mode("exit", "chat-first", project=project)
+
+    assert ctx.mode_manager.exit_to_smart.called
+    card = handler.reply_card.call_args.args[1]
+    assert "模式退出未完全保存" in card
+    assert "服务重启后可能恢复旧模式" in card
+    assert "会话已保存" not in card
+
+
+def test_live_model_switch_retires_session_when_project_commit_fails(
+    tmp_path,
+) -> None:
+    _storage, projects, project, _second, ctx, system = _configuration_lane(
+        tmp_path
+    )
+    assert projects.commit_acp_configuration(
+        project,
+        tool_name="codex",
+        model_name="old-model",
+    )
+    session = SimpleNamespace(
+        session_id="live-session",
+        message_count=3,
+        _model_name="old-model",
+        set_model=MagicMock(return_value=True),
+    )
+    manager = MagicMock()
+    manager.get_session.return_value = session
+    handler = CodexModeHandler(ctx)
+    handler.current_model = "old-model"
+    handler._get_session_manager = MagicMock(return_value=manager)
+    ctx.handlers["codex"] = handler
+    ctx.scheduler.submit.side_effect = lambda _spec, callback: callback(None)
+    system.update_card = MagicMock(return_value=True)
+    projects._save_projects = MagicMock(return_value=False)
+
+    system._activate_acp_selection(
+        "selector",
+        "chat-first",
+        "codex",
+        "new-model",
+        project,
+        explicit_card=True,
+    )
+
+    session.set_model.assert_called_once()
+    manager.retire_session.assert_called_once_with(
+        "chat-first",
+        project_id=project.project_id,
+        thread_id=None,
+        expected_session=session,
+        timeout=20,
+    )
+    assert (project.acp_tool_name, project.acp_model_name) == (
+        "codex",
+        "old-model",
+    )
+    assert handler.current_model == "old-model"
+    assert "初始化失败" in system.update_card.call_args_list[-1].args[1]
+
+
+def test_typed_programming_exit_routes_through_the_system_fence() -> None:
+    system = MagicMock()
+    codex = MagicMock()
+    handlers = {
+        "system": system,
+        "project": MagicMock(),
+        "coco": MagicMock(),
+        "codex": codex,
+    }
+    client = SimpleNamespace(
+        _handler_ctx=SimpleNamespace(handlers=handlers),
+        _mode_manager=MagicMock(),
+    )
+    dispatcher = MessageDispatcher(client)
+    project = _project("codex", "model-a")
+    task = SimpleNamespace(
+        intent=SimpleNamespace(name="EXIT_CODEX"),
+        data={},
+    )
+
+    dispatcher.execute_single_task(
+        "exit-message",
+        "chat-direct",
+        task,
+        "/exit_codex",
+        project,
+    )
+
+    system.exit_current_mode.assert_called_once_with(
+        "exit-message",
+        "chat-direct",
+        project=project,
+    )
+    codex.exit_mode.assert_not_called()
+
+
+def test_programming_card_exit_routes_through_the_system_fence() -> None:
+    manager = MagicMock()
+    ctx = _context("codex", manager)
+    project = _project("codex", "model-a")
+    ctx.project_manager.get_project_for_chat.return_value = project
+    system = MagicMock()
+    ctx.handlers["system"] = system
+    handler = CodexModeHandler(ctx)
+
+    handler.handle_card_exit(
+        "exit-card",
+        "chat-direct",
+        project.project_id,
+    )
+
+    system.exit_current_mode.assert_called_once_with(
+        "exit-card",
+        "chat-direct",
+        project=project,
+    )
+    manager.end_session.assert_not_called()
+
+
+def test_pending_prompt_never_recovers_a_replaced_committed_session() -> None:
+    expected = SimpleNamespace(session_id="expected")
+    replacement = SimpleNamespace(session_id="replacement")
+    manager = MagicMock()
+    manager.get_session.return_value = replacement
+    ctx = _context("codex", manager)
+    handler = CodexModeHandler(ctx)
+    handler.enter_mode = MagicMock()
+    handler.handle_response = MagicMock()
+    project = _project("codex", "model-a")
+
+    handler.handle_message(
+        "task-message",
+        "chat-direct",
+        "implement it",
+        project,
+        expected_session=expected,
+    )
+
+    handler.enter_mode.assert_not_called()
+    handler.handle_response.assert_not_called()
 
 
 def _install_catalogs(system: SystemHandler, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -400,6 +1512,7 @@ def test_saved_configuration_auto_activates_and_forwards_the_pending_task(
         "chat-first",
         "implement the pending task",
         first,
+        expected_session=session,
     )
     assert first.codex_mode is True
     system.reply_error.assert_not_called()
@@ -1509,7 +2622,7 @@ def test_explicit_activation_failure_paths_finish_on_the_same_failed_card(
     ]
     assert len(patched_cards) == 2
     assert "正在初始化" in json.dumps(patched_cards[0], ensure_ascii=False)
-    assert patched_cards[1]["header"]["template"] == "red"
+    assert patched_cards[1]["header"]["template"] == "orange"
     assert "初始化失败" in json.dumps(patched_cards[1], ensure_ascii=False)
     system.reply_error.assert_not_called()
     assert codex.current_model == "old-model"

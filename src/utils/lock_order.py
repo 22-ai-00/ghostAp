@@ -4,10 +4,11 @@ Implements the partial order defined in ``docs/adr-lock-ordering.md``::
 
     BaseEngineManager._lock  (level -1, outermost)
       → BaseEngine._lock  (level 0)
-        → ProjectManager._lock  (level 1)
-          → ProjectContext._chat_lock  (level 2)
-            → ChatLockManager._mu  (level 3)
-              → RepoLockManager._mu  (level 4, innermost)
+        → SystemHandler._acp_activation_lock  (level 1)
+          → ProjectManager._lock  (level 2)
+            → ProjectContext._chat_lock  (level 3)
+              → ChatLockManager._mu  (level 4)
+                → RepoLockManager._mu  (level 5, innermost)
 
 Each thread tracks the *highest* level it currently holds.  Acquiring a lock
 whose level is ≤ the current max constitutes a potential deadlock and is
@@ -53,10 +54,11 @@ class LockLevel(IntEnum):
 
     ENGINE_MANAGER = -1  # BaseEngineManager._lock (Lock)
     ENGINE_INSTANCE = 0  # BaseEngine._lock (RLock)
-    PROJECT_MANAGER = 1  # ProjectManager._lock (RLock)
-    CHAT_LOCK_CTX = 2  # ProjectContext._chat_lock
-    CHAT_LOCK_MGR = 3  # ChatLockManager._mu
-    REPO_LOCK = 4  # RepoLockManager._mu
+    ACP_ACTIVATION = 1  # SystemHandler._acp_activation_lock (RLock)
+    PROJECT_MANAGER = 2  # ProjectManager._lock (RLock)
+    CHAT_LOCK_CTX = 3  # ProjectContext._chat_lock
+    CHAT_LOCK_MGR = 4  # ChatLockManager._mu
+    REPO_LOCK = 5  # RepoLockManager._mu
 
 
 # ---------------------------------------------------------------------------

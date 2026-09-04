@@ -1063,6 +1063,7 @@ def _assemble_card_json(
         "config": {
             "wide_screen_mode": True,
             "update_multi": True,
+            "summary": {"content": _notification_summary(state)},
         },
         "header": render_header(state, page_index=page_index, total_pages=total_pages),
         "body": {"elements": body_elements},
@@ -1072,6 +1073,24 @@ def _assemble_card_json(
         card["config"]["streaming_mode"] = True
 
     return card
+
+
+def _notification_summary(state: CardState) -> str:
+    """Build a bounded notification summary without copying task content."""
+    terminal_labels = {
+        "completed": "编程任务已完成，打开卡片查看最终结论",
+        "failed": "编程任务失败，打开卡片查看错误摘要与处理建议",
+        "cancelled": "编程任务已取消，打开卡片查看已保留结果",
+        "paused": "编程任务已暂停，打开卡片查看当前状态",
+        "blocked": "编程任务受阻，打开卡片查看所需操作",
+        "archived": "编程任务已归档，打开卡片查看历史结果",
+        "running": "编程任务执行中，打开卡片查看实时进展",
+    }
+    summary = terminal_labels.get(
+        state.terminal,
+        "编程任务状态已更新，打开卡片查看详情",
+    )
+    return summary
 
 
 def _render_criteria_panel(atom: RenderAtom, state: CardState) -> dict:

@@ -97,6 +97,7 @@ class SpecHandler(BaseEngineHandler):
             error_details=f"engine={engine_name}; action=spec; request_id={request_id or 'n/a'}",
             detail_action={
                 "action": "show_error_details",
+                "chat_id": chat_id,
                 "engine_type": "spec",
                 "request_id": request_id or "",
             },

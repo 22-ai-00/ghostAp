@@ -178,6 +178,7 @@ class BaseHandler:
         details: Optional[str] = None,
         detail_action: Optional[dict] = None,
         retry_action: Optional[dict] = None,
+        severity: str = "fatal",
     ):
         """Send a structured error card (schema 2.0) with QuickActions if available."""
         from ...card.builders.system import SystemBuilder
@@ -190,17 +191,19 @@ class BaseHandler:
             if detail_value is None:
                 detail_value = {
                     "action": "show_error_details",
-                    "chat_id": chat_id,
                     "origin_message_id": origin_message_id or "",
                     "title": title,
                     "summary": get_error_detail(exc),
                 }
+                if chat_id:
+                    detail_value["chat_id"] = chat_id
             _, card_json_str = SystemBuilder.build_error_card(
                 exc,
                 title=title,
                 details=details or f"错误上下文：chat={chat_id}，message={origin_message_id or '未绑定原消息'}",
                 detail_action=detail_value,
                 retry_action=retry_action,
+                severity=severity,
             )
 
             if origin_message_id:
@@ -224,9 +227,32 @@ class BaseHandler:
         exc: Exception | str,
         title: str = "",
         chat_id: Optional[str] = None,
+        *,
+        severity: str = "fatal",
     ):
         """Convenience wrapper for send_error_card to reply to a message."""
-        self.send_error_card(chat_id=chat_id or "unknown", exc=exc, title=title, origin_message_id=message_id)
+        resolved_chat_id = str(chat_id or "").strip()
+        if not resolved_chat_id or resolved_chat_id == "unknown":
+            try:
+                provenance = self.ctx.message_linker.query(message_id)
+            except Exception:
+                provenance = None
+            if isinstance(provenance, Mapping):
+                candidate = provenance.get("chat_id")
+                resolved_chat_id = (
+                    candidate.strip()
+                    if isinstance(candidate, str) and candidate.strip()
+                    else ""
+                )
+            else:
+                resolved_chat_id = ""
+        self.send_error_card(
+            chat_id=resolved_chat_id,
+            exc=exc,
+            title=title,
+            origin_message_id=message_id,
+            severity=severity,
+        )
 
     # ------------------------------------------------------------------
     # Unified messaging API
