@@ -439,7 +439,10 @@ def test_delivery_deadline_keeps_inflight_transport_and_owned_resources(
             nonlocal calls
             calls += 1
             entered.set()
-            assert release.wait(2)
+            # The test owns the release boundary. A wall-clock timeout here
+            # can expire under a loaded full-suite run and invalidate the
+            # in-flight premise before close() observes it.
+            release.wait()
             return "om_warning_reply"
 
     transport = BlockingTransport()

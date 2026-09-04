@@ -517,6 +517,14 @@ class MainBotWarningOutbox:
             try:
                 remaining = self._remaining(deadline)
                 receipt_id = future.result(timeout=remaining)
+            except MainBotWarningRetryableDeliveryError:
+                # The deadline can expire after submission but before entering
+                # Future.result().  That must retain a still-running transport
+                # as the unique owner; otherwise close/recovery can overlap or
+                # block forever while the executor still owns the call.
+                if future.done():
+                    self._delivery_futures.pop(warning_id, None)
+                raise
             except FutureTimeoutError as exc:
                 if future.done():
                     try:
