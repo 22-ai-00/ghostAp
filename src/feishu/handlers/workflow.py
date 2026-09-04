@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from ...card.text_stream import append_stream_text
 from ...utils.text import generate_task_id
+from ...workflow_engine.storage import workflow_scripts_dir
 from ..emoji import EmojiReaction
 from ..slash_command_parser import SlashCommandParser
 from .engine_base import BaseEngineHandler
@@ -3237,7 +3238,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
     @staticmethod
     def _new_workflow_script_path(root_path: str) -> str:
         """Allocate a generation-owned script path without sharing file state."""
-        script_dir = os.path.join(root_path, ".ghostap", "workflow_scripts")
+        script_dir = workflow_scripts_dir(root_path)
         os.makedirs(script_dir, exist_ok=True)
         return os.path.join(
             script_dir,
@@ -3261,7 +3262,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
 
         candidate = os.path.realpath(os.path.abspath(path))
         basename = os.path.basename(candidate)
-        script_dir = os.path.realpath(os.path.join(root_path, ".ghostap", "workflow_scripts"))
+        script_dir = os.path.realpath(workflow_scripts_dir(root_path))
         temp_root = os.path.realpath(tempfile.gettempdir())
         candidate_dir = os.path.dirname(candidate)
 
@@ -3432,7 +3433,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             if engine and engine.project and engine.project.pending and engine.project.pending.orchestrator_agent
             else DEFAULT_ORCHESTRATOR_AGENT
         )
-        script_dir = os.path.join(root_path, ".ghostap", "workflow_scripts")
+        script_dir = workflow_scripts_dir(root_path)
         os.makedirs(script_dir, exist_ok=True)
         script_path = output_path
         if (
@@ -3591,7 +3592,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             orchestrator_agent_id=orchestrator_agent_id,
         )
 
-        script_dir = os.path.join(root_path, ".ghostap", "workflow_scripts")
+        script_dir = workflow_scripts_dir(root_path)
         os.makedirs(script_dir, exist_ok=True)
         if (
             os.path.realpath(os.path.dirname(output_path)) != os.path.realpath(script_dir)

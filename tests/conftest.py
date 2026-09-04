@@ -15,6 +15,18 @@ from src.utils.retry import RetryPolicy
 
 
 @pytest.fixture(autouse=True)
+def _isolate_workflow_storage(monkeypatch, tmp_path):
+    """Keep Workflow-owned artifacts inside each test's temporary tree."""
+    from src.workflow_engine import storage
+
+    monkeypatch.setattr(
+        storage,
+        "DEFAULT_WORKFLOW_STORAGE_ROOT",
+        str(tmp_path / "workflow-storage"),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_delivery_registry(monkeypatch, request):
     """Give each test an isolated registry and close it through production APIs."""
     real_monotonic = time.monotonic

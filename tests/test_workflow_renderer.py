@@ -557,8 +557,8 @@ class TestRenderCompletionCard(unittest.TestCase):
             markdown = Path(files.markdown_path).read_text(encoding="utf-8")
 
         self.assertIn(f"{cache_root}", files.html_path)
-        self.assertIn("workflow_reports", files.html_path)
-        self.assertNotIn(".ghostap", files.html_path)
+        self.assertIn("reports", files.html_path)
+        self.assertNotIn(str(project_root / ".ghostap"), files.html_path)
         self.assertIn(sentinel, html)
         self.assertIn(sentinel, markdown)
         self.assertIn("原始结果 JSON", html)

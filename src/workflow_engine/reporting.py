@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import html
 import json
-import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -18,9 +17,14 @@ from pathlib import Path
 from typing import Any
 
 from .models import AgentStatus, WorkflowProject
+from .storage import (
+    DEFAULT_WORKFLOW_STORAGE_ROOT,
+    workflow_project_storage_root,
+    workflow_reports_dir,
+    workflow_storage_root,
+)
 
-DEFAULT_WORKFLOW_CACHE_ROOT = "~/.cache/ghostAp"
-_REPORT_DIR = "workflow_reports"
+DEFAULT_WORKFLOW_CACHE_ROOT = DEFAULT_WORKFLOW_STORAGE_ROOT
 
 
 @dataclass(frozen=True)
@@ -47,19 +51,13 @@ def _safe_slug(value: str, *, default: str = "workflow") -> str:
 
 
 def workflow_cache_root(cache_root: str | None = None) -> str:
-    """Return the local cache root shared by Workflow runtime artifacts."""
-    root = cache_root or DEFAULT_WORKFLOW_CACHE_ROOT
-    return os.path.abspath(os.path.expanduser(root))
+    """Compatibility alias for the centralized Workflow storage root."""
+    return workflow_storage_root(cache_root)
 
 
 def workflow_project_cache_root(root_path: str, cache_root: str | None = None) -> str:
-    """Mirror an absolute project path under ``~/.cache/ghostAp``."""
-    abs_project = os.path.abspath(os.path.expanduser(root_path or "."))
-    drive, tail = os.path.splitdrive(abs_project)
-    parts = [part for part in Path(tail).parts if part not in (os.sep, "")]
-    if drive:
-        parts.insert(0, drive.rstrip(":"))
-    return os.path.join(workflow_cache_root(cache_root), *parts)
+    """Compatibility alias for one project's Workflow storage root."""
+    return workflow_project_storage_root(root_path, cache_root)
 
 
 def _status_text(value: Any) -> str:
@@ -800,8 +798,7 @@ def write_workflow_report_files(
     cache_root: str | None = None,
 ) -> WorkflowReportFiles:
     """Write full Workflow report files under the mirrored GhostAP cache root."""
-    root = Path(workflow_project_cache_root(root_path, cache_root))
-    report_dir = root / _REPORT_DIR
+    report_dir = Path(workflow_reports_dir(root_path, cache_root))
     report_dir.mkdir(parents=True, exist_ok=True)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

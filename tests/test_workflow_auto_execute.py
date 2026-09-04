@@ -1,12 +1,14 @@
 """Contracts for the confirmed-pool Workflow generation path."""
 
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.feishu.handlers.workflow import WorkflowHandler, _WorkflowLifecycleOwner
 from src.workflow_engine.agent_pool import WorkflowAgentBinding
 from src.workflow_engine.models import PendingWorkflow, WorkflowProject, WorkflowStatus
+from src.workflow_engine.storage import workflow_scripts_dir
 
 _VALID_SCRIPT = """
 export const meta = {
@@ -60,6 +62,7 @@ def _engine() -> SimpleNamespace:
 
 
 def test_script_generation_retries_then_accepts_valid_output(tmp_path) -> None:
+    output = Path(workflow_scripts_dir(str(tmp_path))) / "generated.js"
     session = MagicMock()
     session.send_prompt.side_effect = [
         SimpleNamespace(stop_reason="end_turn", text="not javascript"),
@@ -74,7 +77,7 @@ def test_script_generation_retries_then_accepts_valid_output(tmp_path) -> None:
             str(tmp_path),
             ["coco"],
             _engine(),
-            output_path=str(tmp_path / ".ghostap" / "workflow_scripts" / "generated.js"),
+            output_path=str(output),
         )
 
     assert session.send_prompt.call_count == 2
@@ -85,6 +88,7 @@ def test_script_generation_retries_then_accepts_valid_output(tmp_path) -> None:
 def test_unsupported_generated_tool_uses_pool_bound_fallback_after_retries(
     tmp_path,
 ) -> None:
+    output = Path(workflow_scripts_dir(str(tmp_path))) / "generated.js"
     unsupported = _VALID_SCRIPT.replace('["coco"]', '["missing"]', 1)
     session = MagicMock()
     session.send_prompt.return_value = SimpleNamespace(
@@ -100,12 +104,12 @@ def test_unsupported_generated_tool_uses_pool_bound_fallback_after_retries(
             str(tmp_path),
             ["coco"],
             _engine(),
-            output_path=str(tmp_path / ".ghostap" / "workflow_scripts" / "generated.js"),
+            output_path=str(output),
         )
 
     assert session.send_prompt.call_count == 3
     assert script_path.endswith("generated.js")
     assert meta["tools"] == ["coco"]
-    generated = (tmp_path / ".ghostap" / "workflow_scripts" / "generated.js").read_text()
+    generated = output.read_text()
     assert "missing" not in generated
     assert 'agentId: "A-1"' in generated

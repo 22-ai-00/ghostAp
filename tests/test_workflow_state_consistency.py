@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from src.card.events import CardEvent
@@ -21,6 +22,7 @@ from src.workflow_engine.models import (
     WorkflowStatus,
 )
 from src.workflow_engine.run_spec import WorkflowRunSpec
+from src.workflow_engine.storage import workflow_scripts_dir
 
 
 class _Project:
@@ -1065,9 +1067,7 @@ class TestStateManagerMetricsAtomicity:
 
 def test_cancelled_generator_does_not_recreate_owned_script(tmp_path):
     script_path = (
-        tmp_path
-        / ".ghostap"
-        / "workflow_scripts"
+        Path(workflow_scripts_dir(str(tmp_path)))
         / "generated-workflow-cancelled.js"
     )
     prompt_started = threading.Event()
@@ -1266,9 +1266,7 @@ export default async function workflow() { return "never"; }
 
 def test_engine_cleanup_removes_queued_owner_artifacts(tmp_path):
     source_path = (
-        tmp_path
-        / ".ghostap"
-        / "workflow_scripts"
+        Path(workflow_scripts_dir(str(tmp_path)))
         / "generated-workflow-queued.js"
     )
     source_path.parent.mkdir(parents=True)

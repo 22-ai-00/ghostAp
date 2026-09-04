@@ -12,8 +12,9 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 
-from .constants import DEFAULT_CACHE_MAX_ENTRIES, JOURNAL_DIR
+from .constants import DEFAULT_CACHE_MAX_ENTRIES
 from .models import AgentCallResult, JournalEntry
+from .storage import workflow_journal_dir
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class WorkflowJournal:
 
     Storage layout::
 
-        {root_path}/{JOURNAL_DIR}/{run_id}/
+        ~/.ghostap/workflow/projects/{absolute-project-path}/journal/{run_id}/
             _index.json          # full-key -> filename mapping
             {key[:16]}.json      # individual JournalEntry serialized
 
@@ -48,7 +49,7 @@ class WorkflowJournal:
     ) -> None:
         self._root_path = root_path
         self._run_id = run_id
-        self._journal_dir = Path(root_path) / JOURNAL_DIR / run_id
+        self._journal_dir = Path(workflow_journal_dir(root_path)) / run_id
         self._index_path = self._journal_dir / "_index.json"
         self._max_entries = max_entries
 

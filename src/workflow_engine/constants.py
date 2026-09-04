@@ -48,7 +48,6 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 }
 
 # --- Journal ---
-JOURNAL_DIR: str = ".ghostap/workflow_journal"
 DEFAULT_CACHE_MAX_ENTRIES: int = 100  # Hard cap for in-memory LRU cache size
 
 # --- Schema retry ---

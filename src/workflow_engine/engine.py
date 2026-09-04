@@ -41,6 +41,7 @@ from .progress_coalescer import ProgressCoalescer
 from .renderer import WorkflowProgressRenderer
 from .run_spec import WorkflowRunSpec
 from .state_manager import WorkflowStateManager
+from .storage import workflow_project_storage_root, workflow_scripts_dir
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ def _remove_owned_script_artifact(path: str | None, root_path: str) -> None:
         return
     candidate = os.path.realpath(os.path.abspath(path))
     basename = os.path.basename(candidate)
-    generated_dir = os.path.realpath(os.path.join(root_path, ".ghostap", "workflow_scripts"))
+    generated_dir = os.path.realpath(workflow_scripts_dir(root_path))
     temp_root = os.path.realpath(tempfile.gettempdir())
     generated_source = bool(
         os.path.dirname(candidate) == generated_dir
@@ -217,8 +218,8 @@ class WorkflowEngine(BaseEngine):
     _gc_label: str = "Workflow"
     _gc_threshold_default: float = 85.0
 
-    # Cache root for workflow state (mirrors project path under ~/.cache/ghostAp)
-    _CACHE_ROOT: str = "~/.cache/ghostAp"
+    # Optional test/config override for the centralized Workflow storage root.
+    _CACHE_ROOT: str | None = None
 
     def __init__(
         self,
@@ -288,24 +289,11 @@ class WorkflowEngine(BaseEngine):
         return self._cancel_event
 
     def _state_dir(self) -> str:
-        """Return the cache directory for workflow state (outside project tree).
-
-        Mirrors the project absolute path under ``~/.cache/ghostAp`` so that
-        state files do not pollute the project directory or git status.
-        Example: project at ``/data00/home/user/work/proj``
-        → ``~/.cache/ghostAp/data00/home/user/work/proj/``
-        """
-        import os
-        from pathlib import Path
-
-        cache_root = os.path.abspath(os.path.expanduser(self._CACHE_ROOT))
-        abs_project = os.path.abspath(self.root_path)
-        _, tail = os.path.splitdrive(abs_project)
-        parts = [part for part in Path(tail).parts if part not in (os.sep, "")]
-        return os.path.join(cache_root, *parts)
+        """Return this project's state directory outside the project tree."""
+        return workflow_project_storage_root(self.root_path, self._CACHE_ROOT)
 
     def save_state(self, filepath: Optional[str] = None) -> str:
-        """Persist workflow state to ~/.cache/ghostAp/<project_path>/ instead of project root."""
+        """Persist state below ``~/.ghostap/workflow/projects``."""
         import os
 
         if not filepath:

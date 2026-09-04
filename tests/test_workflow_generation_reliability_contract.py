@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -13,6 +14,7 @@ from src.tasking.scheduler import TaskStatus
 from src.workflow_engine.agent_pool import WorkflowAgentBinding
 from src.workflow_engine.engine import WorkflowEngine
 from src.workflow_engine.models import PendingWorkflow, WorkflowProject, WorkflowStatus
+from src.workflow_engine.storage import workflow_scripts_dir
 
 
 def _binding(agent_id: str, tool: str, model: str) -> WorkflowAgentBinding:
@@ -135,7 +137,7 @@ def _generate(
     *,
     cancel_event: threading.Event | None = None,
 ):
-    output = tmp_path / ".ghostap" / "workflow_scripts" / "generated.js"
+    output = Path(workflow_scripts_dir(str(tmp_path))) / "generated.js"
     with (
         patch("src.agent_session.create_engine_session", side_effect=session_factory),
         patch(
@@ -462,7 +464,7 @@ def test_bad_provider_stop_reason_uses_deterministic_pool_fallback(
         MagicMock(return_value=session),
     )
 
-    content = (tmp_path / ".ghostap" / "workflow_scripts" / "generated.js").read_text()
+    content = Path(output_path).read_text()
     assert output_path.endswith("generated.js")
     assert meta["agentPlan"][0]["agentId"] == "A-1"
     assert 'agentId: "A-1"' in content
@@ -528,9 +530,7 @@ def test_explicit_owner_stop_wins_before_deterministic_fallback_write(tmp_path) 
                 cancel_event=stop_event,
             )
 
-    assert not (
-        tmp_path / ".ghostap" / "workflow_scripts" / "generated.js"
-    ).exists()
+    assert not (Path(workflow_scripts_dir(str(tmp_path))) / "generated.js").exists()
 
 
 def test_workflow_internal_error_card_never_tells_user_to_contact_admin() -> None:
@@ -616,7 +616,7 @@ def test_create_bind_race_rejects_new_workflow_and_keeps_original_prompt(tmp_pat
                 ["codex", "gemini"],
                 engine,
                 output_path=str(
-                    tmp_path / ".ghostap" / "workflow_scripts" / output_name
+                    Path(workflow_scripts_dir(str(tmp_path))) / output_name
                 ),
                 cancel_event=owner.stop_event,
             )

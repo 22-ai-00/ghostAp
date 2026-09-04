@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,7 @@ from src.workflow_engine.models import (
     WorkflowProject,
     WorkflowStatus,
 )
+from src.workflow_engine.storage import workflow_scripts_dir
 
 
 def test_cleanup_waits_for_started_preclaim_closure_and_fences_repo_lock(
@@ -33,7 +35,7 @@ def test_cleanup_waits_for_started_preclaim_closure_and_fences_repo_lock(
     cancel it without forging ``done_event`` or reporting quiescence early.
     Once released, the stale closure must retire before touching the repo lock.
     """
-    script_dir = tmp_path / ".ghostap" / "workflow_scripts"
+    script_dir = Path(workflow_scripts_dir(str(tmp_path)))
     script_dir.mkdir(parents=True)
     script_path = script_dir / "generated-workflow-preclaim.js"
     script_text = (
