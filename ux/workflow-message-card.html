@@ -596,13 +596,13 @@
         <p class="eyebrow">GhostAP / Workflow</p>
         <h1>消息卡片状态预览</h1>
       </div>
-      <p class="page-intro">首条消息保留 Workflow 总览；每次直接 Agent 调用紧随一张普通编程样式执行卡，文本、思考与工具调用按发生顺序完整保留。</p>
+      <p class="page-intro">一张 Workflow 主卡承载进度与终态；Agent 文本、思考和工具过程合并进入一条原生 COT 过程消息，完整结果由 HTML 报告附件兜底。</p>
     </header>
 
     <section class="preview-section" aria-labelledby="running-title">
       <div class="section-head">
         <h2 id="running-title">1. 运行态</h2>
-        <p>总览卡与执行卡分开更新；活动块原位增长，完成块冻结</p>
+        <p>主卡原位更新；所有 Agent 的过程进入同一条原生 COT</p>
       </div>
       <article class="card" aria-label="Workflow 运行态卡片">
         <header class="card-header">
@@ -655,18 +655,18 @@
         </div>
       </article>
 
-      <div class="message-sequence-note">同一任务流的下一条消息 · 稳定绑定 #004 / A2</div>
+      <div class="message-sequence-note">同一任务流的唯一过程消息 · 原生 COT · 非权威过程面</div>
 
-      <article class="card execution-message" aria-label="直接 Agent 调用完整执行卡">
+      <article class="card execution-message" aria-label="Workflow 原生 COT 过程消息">
         <header class="card-header">
           <div class="title-wrap">
             <span class="status-dot" aria-hidden="true"></span>
-            <span class="header-title">#004 · A2 · implementation-agent</span>
+            <span class="header-title">Workflow 执行过程 · COT</span>
           </div>
-          <span class="header-meta">Codex · 执行中</span>
+          <span class="header-meta">A2 / Codex · 执行中</span>
         </header>
         <div class="card-body">
-          <section class="execution-call" role="status" aria-live="polite" aria-label="直接 Agent 调用完整执行流">
+          <section class="execution-call" role="status" aria-live="polite" aria-label="跨 Agent 合并执行流">
             <header class="execution-head">
               <span class="agent-badge">A2</span>
               <span class="execution-title">
@@ -705,20 +705,20 @@
 
     <section class="preview-section" aria-labelledby="continuation-title">
       <div class="section-head">
-        <h2 id="continuation-title">2. 容量续接态</h2>
-        <p>仅当单次 Agent 执行卡超出容量才续页；新页可见后冻结前页，代码围栏不被截断</p>
+        <h2 id="continuation-title">2. COT 容量续接态</h2>
+        <p>仅当过程流达到容量上限才创建下一段 COT；不会为 Agent 单独新增卡片</p>
       </div>
       <div class="continuation-grid">
-        <article class="card frozen-card" aria-label="Workflow 容量续接前卡">
+        <article class="card frozen-card" aria-label="Workflow COT 已完成分段">
           <header class="card-header frozen">
             <div class="title-wrap">
               <span class="status-dot" aria-hidden="true"></span>
-              <span class="header-title">#004 · A2 执行流</span>
+              <span class="header-title">Workflow 执行过程 · COT</span>
             </div>
-            <span class="header-meta">第 1 / 2 卡 · 已冻结</span>
+            <span class="header-meta">第 1 / 2 段 · 已完成</span>
           </header>
           <div class="card-body">
-            <div class="continuation-note"><strong>前页已冻结。</strong> 本页完整保留先前文本、思考和工具调用，后续内容只进入第 2 卡。</div>
+            <div class="continuation-note"><strong>前段已完成。</strong> 本段完整保留先前文本、思考和工具调用，后续内容只进入第 2 段。</div>
             <ol class="result-list">
               <li class="result-item" data-result-index="001">
                 <span class="result-index">#001</span>
@@ -738,21 +738,21 @@
             </ol>
             <div class="terminal-footer">
               <span>结果范围 #001–#003</span>
-              <strong>下一结果见第 2 卡</strong>
+              <strong>下一结果见第 2 段</strong>
             </div>
           </div>
         </article>
 
-        <article class="card" aria-label="Workflow 容量续接当前卡">
+        <article class="card" aria-label="Workflow COT 当前分段">
           <header class="card-header">
             <div class="title-wrap">
               <span class="status-dot" aria-hidden="true"></span>
-              <span class="header-title">#004 · A2 执行流续接</span>
+              <span class="header-title">Workflow 执行过程续接 · COT</span>
             </div>
-            <span class="header-meta">第 2 / 2 卡 · 当前卡</span>
+            <span class="header-meta">第 2 / 2 段 · 当前段</span>
           </header>
           <div class="card-body">
-            <div class="continuation-note"><strong>从下一语义块继续。</strong> 所有前序执行内容保留在第 1 卡，没有截断或合并。</div>
+            <div class="continuation-note"><strong>从下一语义块继续。</strong> 所有前序执行内容保留在第 1 段，主卡仍只有一张。</div>
             <ol class="result-list" start="4">
               <li class="result-item" data-result-index="004">
                 <span class="result-index">#004</span>
@@ -782,7 +782,7 @@
     <section class="preview-section" aria-labelledby="terminal-title">
       <div class="section-head">
         <h2 id="terminal-title">3. 成功 / 失败终态</h2>
-        <p>终态保留每个 Agent 与 Reviewer 结果，不再显示停止操作</p>
+        <p>主卡展示结论并移除停止操作；COT 收口过程，完整细节进入报告附件</p>
       </div>
       <div class="terminal-grid">
         <article class="card" aria-label="Workflow 成功终态卡片">
@@ -842,13 +842,13 @@
           </div>
         </article>
 
-        <article class="card ledger-preview" aria-label="Workflow 独立结果账本卡片">
+        <article class="card ledger-preview" aria-label="Workflow 完整报告附件">
           <header class="card-header">
             <div class="title-wrap">
               <span class="status-dot" aria-hidden="true"></span>
-              <span class="header-title">📚 Workflow · 结果账本 · 1 / 1</span>
+              <span class="header-title">📎 Workflow 完整报告.html</span>
             </div>
-            <span class="header-meta">独立消息</span>
+            <span class="header-meta">附件消息 · 非卡片</span>
           </header>
           <div class="card-body">
             <section class="final-result" aria-label="Workflow 结构化最终结果">

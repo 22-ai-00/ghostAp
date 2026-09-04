@@ -87,9 +87,9 @@ class Settings(BaseSettings):
     feishu_cot_enabled: bool = Field(
         default=True,
         description=(
-            "Use Feishu IM COT/AG-UI for ordinary programming process events. "
-            "Task summaries and terminal conclusions remain Card 2.0 messages; "
-            "unsupported tenants fall back to the existing streaming card."
+            "Use Feishu IM COT/AG-UI for ordinary programming and Workflow "
+            "process events. Task summaries and terminal conclusions remain "
+            "Card 2.0 messages; unsupported tenants fall back to card pages."
         ),
     )
     feishu_cot_detail: Literal["brief", "detailed"] = Field(

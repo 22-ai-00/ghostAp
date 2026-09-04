@@ -120,8 +120,13 @@ class TestAC4AgentDonePayloadStripped(unittest.TestCase):
         """On cache-hit path the state manager's on_agent_done records only
         meta info (token_usage/duration_s/cached), never output/parsed."""
         observed_sm: list[tuple[str, dict]] = []
+        observed_callback: list[tuple[str, dict]] = []
 
-        engine = self._make_engine()
+        engine = self._make_engine(
+            on_agent_done_cb=lambda label, payload: observed_callback.append(
+                (label, payload)
+            )
+        )
         original_sm_done = engine._state_manager.on_agent_done
 
         def spy_on_agent_done(label: str, result: dict) -> None:
@@ -170,6 +175,12 @@ class TestAC4AgentDonePayloadStripped(unittest.TestCase):
         self.assertIn("token_usage", sm_payload)
         self.assertIn("duration_s", sm_payload)
         self.assertTrue(sm_payload.get("cached"))
+        self.assertEqual(len(observed_callback), 1)
+        callback_label, callback_payload = observed_callback[0]
+        self.assertEqual(callback_label, "ac4-cache")
+        self.assertTrue(callback_payload.get("cached"))
+        self.assertNotIn("output", callback_payload)
+        self.assertNotIn("parsed", callback_payload)
 
 
 # ===========================================================================

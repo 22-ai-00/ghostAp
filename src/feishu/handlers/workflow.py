@@ -30,6 +30,8 @@ _SCRIPT_GENERATION_MAX_ATTEMPTS = 3
 _GENERATION_ACTIVITY_MAX_CHARS = 180
 _GENERATION_ACTIVITY_BREAKS = frozenset("。！？.!?；;\n")
 _WORKFLOW_STOP_QUIESCENCE_TIMEOUT_S = 5.0
+_WORKFLOW_COT_REQUEST_TIMEOUT_S = 5.0
+_WORKFLOW_COT_CLOSE_TIMEOUT_S = 2.5
 _UNSET_WORKFLOW_MODEL_STATE = object()
 
 
@@ -3028,6 +3030,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             chat_id,
                             project,
                             lifecycle_owner=start_owner,
+                            requirement=run_spec.task,
                         )
                         engine.execute_workflow(
                             script_path=immutable_script_path,
@@ -4250,6 +4253,97 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             orchestrator_agent_id=orchestrator_agent_id,
         )
 
+    def _create_workflow_process_sink(
+        self,
+        *,
+        message_id: str,
+        chat_id: str,
+        project: Optional["ProjectContext"],
+        project_id: str,
+        input_text: str,
+    ):
+        """Build the optional task-scoped COT sink without starting it."""
+        if getattr(self.settings, "feishu_cot_enabled", None) is not True:
+            return None
+        try:
+            from ..cot import FeishuCOTAPIClient, FeishuCOTStream
+
+            linked_segments: set[str] = set()
+
+            def link_segment(process_message_id: str) -> None:
+                if process_message_id in linked_segments:
+                    return
+                linked_segments.add(process_message_id)
+                try:
+                    request_id = self.ensure_request_id(
+                        message_id,
+                        chat_id=chat_id,
+                        project_id=project_id or None,
+                    )
+                    self.ctx.message_linker.register_origin(
+                        message_id,
+                        request_id=request_id,
+                        chat_id=chat_id,
+                        project_id=project_id or None,
+                    )
+                    self.ctx.message_linker.link_reply(
+                        message_id,
+                        process_message_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to link Workflow COT segment",
+                        exc_info=True,
+                    )
+                if project is not None:
+                    try:
+                        self.register_message_project(process_message_id, project)
+                    except Exception:
+                        logger.debug(
+                            "Failed to register Workflow COT project",
+                            exc_info=True,
+                        )
+
+            api = FeishuCOTAPIClient(
+                self.ctx.api_client_factory(),
+                outbound_audit=self.ctx.main_bot_outbound_audit,
+                outbound_audit_failure=self.ctx.main_bot_outbound_audit_failure,
+                tenant_key_resolver=self.ctx.tenant_key_resolver,
+                outbound_target_aliases=lambda target: self._reply_audit_aliases(
+                    self._resolve_origin(target)
+                ),
+                trust_revision_provider=self._managed_card_trust_revisions,
+            )
+            return FeishuCOTStream(
+                api,
+                chat_id=chat_id,
+                origin_message_id=message_id,
+                reply_in_thread=self.settings.default_reply_mode == "thread",
+                input_text=input_text,
+                detail=self.settings.feishu_cot_detail,
+                request_timeout=_WORKFLOW_COT_REQUEST_TIMEOUT_S,
+                close_timeout=_WORKFLOW_COT_CLOSE_TIMEOUT_S,
+                on_segment_started=link_segment,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to initialize Workflow COT; using card pages",
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _workflow_process_terminal_event(wf_project: "WorkflowProject"):
+        """Map Workflow terminal state onto the non-authoritative COT."""
+        from ...card.events import CardEvent
+        from ...workflow_engine.models import WorkflowStatus
+
+        if wf_project.status == WorkflowStatus.COMPLETED:
+            return CardEvent.completed()
+        if wf_project.status == WorkflowStatus.CANCELLED:
+            return CardEvent.cancelled(reason=wf_project.error or "Workflow cancelled")
+        return CardEvent.failed(wf_project.error or "Workflow failed")
+
     def _build_workflow_callbacks(
         self,
         message_id: str,
@@ -4257,9 +4351,11 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         project: Optional["ProjectContext"],
         *,
         lifecycle_owner: _WorkflowLifecycleOwner | None = None,
+        requirement: str = "",
     ):
-        """Build WorkflowEngineCallbacks that update the Feishu card."""
+        """Build one-card Workflow callbacks with optional native COT process."""
         from ...workflow_engine.engine import WorkflowEngineCallbacks
+        from ...workflow_engine.process_stream import WorkflowProcessStream
         from .workflow_card_pages import WorkflowCardPageDelivery
 
         card_message_id: list[str | None] = [message_id]  # Mutable ref for card updates
@@ -4272,6 +4368,37 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         )
         project_id = getattr(project, "project_id", "") or ""
         origin_message_id = self._resolve_origin(message_id)
+        process_stream = WorkflowProcessStream(
+            self._create_workflow_process_sink(
+                message_id=origin_message_id,
+                chat_id=chat_id,
+                project=project,
+                project_id=project_id,
+                input_text=requirement or "Workflow 执行过程",
+            )
+        )
+        process_stream.start()
+
+        def process_replaces_detail_cards() -> bool:
+            return process_stream.active
+
+        def _status_pages(
+            card_data: dict[str, Any] | list[dict[str, Any]],
+        ) -> dict[str, Any] | list[dict[str, Any]]:
+            if isinstance(card_data, dict):
+                return card_data
+            status_pages = [
+                card
+                for index, card in enumerate(card_data)
+                if (
+                    (page_key := card.get("_workflow_page_key")) is not None
+                    and isinstance(page_key, (list, tuple))
+                    and page_key
+                    and page_key[0] == "status"
+                )
+                or (page_key is None and index == 0)
+            ]
+            return (status_pages or card_data[:1])[:1]
 
         def on_progress(
             card_data: dict[str, Any] | list[dict[str, Any]],
@@ -4294,7 +4421,11 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                             is_running=self._workflow_is_running_for_card(chat_id, project),
                         )
                     delivery_result = page_delivery.deliver(
-                        card_data,
+                        (
+                            _status_pages(card_data)
+                            if process_replaces_detail_cards()
+                            else card_data
+                        ),
                         replace_or_send=self._replace_or_send_workflow_rendered_card,
                         chat_id=chat_id,
                         origin_message_id=origin_message_id,
@@ -4320,9 +4451,35 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             report_status: dict[str, Any] | None = None
             failed_page_indexes: tuple[int, ...] = ()
             try:
+                from ...workflow_engine.models import WorkflowStatus
                 from ...workflow_engine.renderer import render_completion_cards
 
-                card_data = render_completion_cards(wf_project)
+                process_complete = process_stream.complete(
+                    self._workflow_process_terminal_event(wf_project)
+                )
+                if (
+                    process_complete
+                    and wf_project.status != WorkflowStatus.CANCELLED
+                ):
+                    report_status = self._send_workflow_completion_report(
+                        wf_project=wf_project,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        project=project,
+                    ) or {}
+                compact_terminal = bool(
+                    process_complete
+                    and (
+                        wf_project.status == WorkflowStatus.CANCELLED
+                        or (report_status or {}).get("attachment_sent")
+                    )
+                )
+                card_data = render_completion_cards(
+                    wf_project,
+                    report_status=report_status,
+                )
+                if compact_terminal:
+                    card_data = _status_pages(card_data)
                 delivery_result = page_delivery.deliver(
                     card_data,
                     replace_or_send=self._replace_or_send_workflow_rendered_card,
@@ -4336,12 +4493,13 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     return
 
                 failed_page_indexes = delivery_result.failed_page_indexes
-                report_status = self._send_workflow_completion_report(
-                    wf_project=wf_project,
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    project=project,
-                )
+                if report_status is None:
+                    report_status = self._send_workflow_completion_report(
+                        wf_project=wf_project,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        project=project,
+                    )
                 if (
                     not allow_stopped_owner
                     and lifecycle_owner is not None
@@ -4356,6 +4514,8 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     wf_project,
                     report_status=report_status,
                 )
+                if compact_terminal:
+                    retry_cards = _status_pages(retry_cards)
                 retry_result = page_delivery.deliver(
                     retry_cards,
                     replace_or_send=self._replace_or_send_workflow_rendered_card,
@@ -4403,6 +4563,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             # callback before report generation/upload and terminal delivery.
             with delivery_lock:
                 if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
+                    process_stream.abort()
                     return
                 terminal_sent[0] = True
                 _deliver_terminal_project(wf_project)
@@ -4414,11 +4575,13 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
             """Deliver an execution failure, or a project-less setup error."""
             with delivery_lock:
                 if terminal_sent[0] or (lifecycle_owner is not None and lifecycle_owner.stop_event.is_set()):
+                    process_stream.abort()
                     return
                 terminal_sent[0] = True
                 if wf_project is not None:
                     _deliver_terminal_project(wf_project)
                     return
+                process_stream.abort()
 
                 from ...workflow_engine.errors import _strip_internal_details
 
@@ -4446,6 +4609,7 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
                     isinstance(stop_delivery_fence, threading.Event)
                     and stop_delivery_fence.is_set()
                 ):
+                    process_stream.abort()
                     return
                 terminal_sent[0] = True
                 _deliver_terminal_project(
@@ -4456,10 +4620,22 @@ class WorkflowHandler(WorkflowScriptMixin, BaseEngineHandler):
         def on_log(msg: str) -> None:
             logger.debug("[WorkflowHandler] log: %s", msg)
 
+        def on_agent_start(label: str, tool: str) -> None:
+            process_stream.agent_started(label, tool)
+
+        def on_agent_event(label: str, event: Any) -> None:
+            process_stream.emit(label, event)
+
+        def on_agent_done(label: str, payload: dict[str, Any]) -> None:
+            process_stream.agent_done(label, payload)
+
         return WorkflowEngineCallbacks(
             on_progress=on_progress,
             on_done=on_done,
             on_cancelled=on_cancelled,
             on_error=on_error,
             on_log=on_log,
+            on_agent_start=on_agent_start,
+            on_agent_event=on_agent_event,
+            on_agent_done=on_agent_done,
         )

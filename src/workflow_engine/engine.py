@@ -189,6 +189,7 @@ class WorkflowEngineCallbacks:
     on_log: Optional[Callable[[str], None]] = None
     on_phase: Optional[Callable[[str], None]] = None
     on_agent_start: Optional[Callable[[str, str], None]] = None  # (label, tool)
+    on_agent_event: Optional[Callable[[str, CardEvent], None]] = None
     # AC4: on_agent_done is a lightweight meta-info callback; the payload
     # deliberately excludes the agent output/parsed body so that handler-layer
     # subscribers cannot accidentally leak intermediate results into the main
@@ -1388,6 +1389,20 @@ class WorkflowEngine(BaseEngine):
                             "result": _agent_card_result_text(cached_result),
                         },
                     )
+                if self._callbacks and self._callbacks.on_agent_done:
+                    self._callbacks.on_agent_done(
+                        label,
+                        {
+                            "label": label,
+                            "agent_id": params.agent_id,
+                            "tool": params.tool,
+                            "model": cached_result.model,
+                            "token_usage": 0,
+                            "duration_s": 0.0,
+                            "cached": True,
+                            "error": None,
+                        },
+                    )
                 self._fire_progress()
                 return cached_result
 
@@ -1485,6 +1500,14 @@ class WorkflowEngine(BaseEngine):
             return
         if not self._state_manager.record_agent_card_event(label, event):
             return
+        if self._callbacks and self._callbacks.on_agent_event:
+            try:
+                self._callbacks.on_agent_event(label, event)
+            except Exception:
+                logger.debug(
+                    "Workflow process event callback failed",
+                    exc_info=True,
+                )
 
         if event.type in {
             CardEventType.TEXT_DELTA,
