@@ -14,7 +14,18 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.config import Settings
+from src.access_control import build_ingress_access_policy
+from src.config import IngressAccessMode, Settings
+
+
+def test_fresh_install_defaults_to_open_feishu_ingress() -> None:
+    settings = Settings.model_construct()
+
+    assert settings.ingress_access_mode == IngressAccessMode.LEGACY_ALLOW_ALL.value
+    assert (
+        build_ingress_access_policy(settings).mode
+        is IngressAccessMode.LEGACY_ALLOW_ALL
+    )
 
 
 class TestMinTimeoutGtTimeoutRejected:

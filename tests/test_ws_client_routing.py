@@ -2691,6 +2691,79 @@ def test_handle_message_system_command_routing(mock_ws_client: FeishuWSClient):
     # System commands should not block behind regular project tasks (often goes to control queue or no strict project queue)
 
 
+def test_default_open_ingress_routes_dsh_from_unknown_project_group(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    """Open mode must cross every trust gate before /dsh dispatch."""
+    unknown_group = EffectiveTrust(
+        zone=TrustZone.EXTERNAL_OR_UNKNOWN_GROUP,
+        actor=ActorKind.UNKNOWN,
+        managed_group=None,
+        group_revision=None,
+        grant_revision=None,
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(
+        return_value=unknown_group
+    )
+    system = mock_ws_client._handler_ctx.handlers["system"]
+    system.handle_intercepted_command = MagicMock()
+    event = create_mock_message(
+        "/dsh",
+        message_id="om_open_project_dsh",
+        chat_id="oc_open_project",
+    )
+
+    mock_ws_client._handle_message(event)
+
+    spec, callback = mock_ws_client._scheduler.submit.call_args.args
+    assert spec.task_type == "feishu_message"
+    assert spec.is_system_command is True
+    callback(SimpleNamespace(run_id="run_open_project_dsh"))
+    system.handle_intercepted_command.assert_called_once()
+    assert system.handle_intercepted_command.call_args.args[:3] == (
+        "om_open_project_dsh",
+        "oc_open_project",
+        "/dsh",
+    )
+    assert system.handle_intercepted_command.call_args.kwargs[
+        "command_match"
+    ].command == "/dsh"
+
+
+def test_explicit_enforced_ingress_still_denies_unknown_project_group_dsh(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    owner_id = "ou_owner"
+    mock_ws_client._ingress_access_policy_provider.swap(
+        IngressAccessPolicy(
+            admin_ids=frozenset({owner_id}),
+            allowed_user_ids=frozenset({owner_id}),
+            allowed_chat_ids=frozenset({"oc_open_project"}),
+            mode=IngressAccessMode.ENFORCED,
+            admin_bootstrap_scope="p2p_only",
+        )
+    )
+    mock_ws_client._resolve_effective_trust = MagicMock(
+        return_value=EffectiveTrust(
+            zone=TrustZone.EXTERNAL_OR_UNKNOWN_GROUP,
+            actor=ActorKind.UNKNOWN,
+            managed_group=None,
+            group_revision=None,
+            grant_revision=None,
+        )
+    )
+    event = create_mock_message(
+        "/dsh",
+        message_id="om_enforced_project_dsh",
+        chat_id="oc_open_project",
+    )
+    event.event.sender.sender_id.open_id = owner_id
+
+    mock_ws_client._handle_message(event)
+
+    mock_ws_client._scheduler.submit.assert_not_called()
+
+
 def test_unconfigured_enforced_private_help_uses_narrow_bootstrap_route(
     mock_ws_client: FeishuWSClient,
 ) -> None:

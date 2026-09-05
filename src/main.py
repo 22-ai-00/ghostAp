@@ -118,18 +118,23 @@ def _print_validate_summary(settings):
         print("GhostAP 配置校验")
     print()
 
-    # Group 1: 会话超时
+    # Group 1: Feishu ingress
+    print("[飞书入口]")
+    print(f"  INGRESS_ACCESS_MODE = {settings.ingress_access_mode}")
+    print()
+
+    # Group 2: 会话超时
     print("[会话超时]")
     print(f"  CARD_SESSION_IDLE_TIMEOUT           = {_format_duration(settings.card.session_idle_timeout)}")
     print(f"  CARD_SESSION_IDLE_WARN_AT_REMAINING = {_format_duration(settings.card.session_idle_warn_at_remaining)}")
     print()
 
-    # Group 2: 锁定参数
+    # Group 3: 锁定参数
     print("[锁定参数]")
     print(f"  LOCK_UNDO_WINDOW_SECONDS = {_format_duration(settings.lock_undo_window_seconds)}")
     print()
 
-    # Group 3: 高级参数
+    # Group 4: 高级参数
     print("[高级参数]")
     print(f"  CARD_DELIVERY_POOL_MAX_WORKERS = {settings.card.delivery_pool_max_workers} (threads)")
     print(f"  CARD_DELIVERY_API_TIMEOUT      = {_format_seconds(settings.card.delivery_api_timeout)}")

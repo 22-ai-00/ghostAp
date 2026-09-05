@@ -89,7 +89,7 @@ APP_ID=your_app_id
 APP_SECRET=your_app_secret
 DEFAULT_ACP_TOOL=coco
 ADMIN_USER_IDS=
-INGRESS_ACCESS_MODE=enforced
+INGRESS_ACCESS_MODE=legacy_allow_all
 ADMIN_BOOTSTRAP_SCOPE=p2p_only
 EMPLOYEE_GROUP_CONTEXT_RETENTION_DAYS=30
 ```
@@ -107,7 +107,9 @@ WORKFLOW_SCRIPT_GEN_TIMEOUT_S=180
 
 ```
 
-`INGRESS_ACCESS_MODE` 和管理员列表只控制谁可以通过飞书入口操作服务；Shell、
+`INGRESS_ACCESS_MODE` 默认使用 `legacy_allow_all`，当前飞书 App 收到的私聊和群聊可
+直接使用 `/dsh` 等普通功能；需要用户与群双白名单隔离时可显式改为 `enforced`。
+该配置和管理员列表只控制谁可以通过飞书入口操作服务；Shell、
 ACP、Workflow 和 Employee 执行不再叠加 GhostAP 自己的风险策略、工具过滤或
 进程沙箱。Codex、Claude 等后端按各自权限模型处理执行请求。
 

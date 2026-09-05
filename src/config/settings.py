@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     command_max_output_length: int = 4000
     ingress_access_mode: Literal[
         "enforced", "shadow", "legacy_allow_all"
-    ] = "enforced"
+    ] = "legacy_allow_all"
     admin_bootstrap_scope: Literal["any_chat", "p2p_only"] = "p2p_only"
     employee_group_context_retention_days: int = Field(
         default=30,

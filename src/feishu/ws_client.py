@@ -2047,11 +2047,18 @@ class FeishuWSClient:
         *,
         chat_type: str,
     ) -> AccessDecision | None:
-        """Let the access policy own first-run P2P bootstrap admission."""
+        """Let open ingress and first-run P2P use the access policy."""
 
+        policy = self._current_ingress_access_policy()
+        if (
+            trust is not None
+            and trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
+            and policy.mode is IngressAccessMode.LEGACY_ALLOW_ALL
+        ):
+            return None
         if (
             chat_type == "p2p"
-            and not self._current_ingress_access_policy().admin_ids
+            and not policy.admin_ids
         ):
             return None
         return self._managed_trust_access_decision(trust)
@@ -2066,6 +2073,12 @@ class FeishuWSClient:
         if trust is None:
             return True
         del text, command_match
+        if (
+            trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
+            and self._current_ingress_access_policy().mode
+            is IngressAccessMode.LEGACY_ALLOW_ALL
+        ):
+            return True
         return trust.zone is not TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
 
     def _current_trust_can_dispatch(
@@ -2075,6 +2088,12 @@ class FeishuWSClient:
         project=None,
     ) -> bool:
         if trust is None:
+            return True
+        if (
+            trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP
+            and self._current_ingress_access_policy().mode
+            is IngressAccessMode.LEGACY_ALLOW_ALL
+        ):
             return True
         current_group_revision = None
         current_grant_revision = None

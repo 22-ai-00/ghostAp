@@ -160,6 +160,10 @@ class TestValidateParameterSummary:
         mock_settings.card.max_chars = overrides.get("max_chars", 28000)
         mock_settings.card.session_lock_ttl = overrides.get("lock_ttl", 600)
         mock_settings.card.session_lock_max = overrides.get("lock_max", 10000)
+        mock_settings.ingress_access_mode = overrides.get(
+            "ingress_access_mode",
+            "legacy_allow_all",
+        )
         return mock_settings
 
     def test_validate_prints_session_idle_timeout(self, capsys):
@@ -176,6 +180,20 @@ class TestValidateParameterSummary:
         assert "CARD_SESSION_IDLE_TIMEOUT" in captured.out
         assert "1800 秒" in captured.out
         assert "30 分钟" in captured.out
+
+    def test_validate_prints_effective_ingress_access_mode(self, capsys):
+        """Operators can see whether an existing .env still enforces ACLs."""
+        from src.main import main
+
+        settings = self._make_mock_settings(ingress_access_mode="enforced")
+        with patch("src.main.get_settings", return_value=settings):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["--validate"])
+
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "[飞书入口]" in captured.out
+        assert "INGRESS_ACCESS_MODE = enforced" in captured.out
 
     def test_validate_prints_delivery_pool_max_workers(self, capsys):
         from src.main import main

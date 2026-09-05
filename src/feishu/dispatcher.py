@@ -49,7 +49,9 @@ class MessageDispatcher:
             from ..trust.models import TrustZone
 
             if effective_trust.zone is TrustZone.EXTERNAL_OR_UNKNOWN_GROUP:
-                return
+                gate = getattr(self.client, "_current_trust_can_dispatch", None)
+                if not callable(gate) or gate(effective_trust, project=project) is not True:
+                    return
 
         def current_dispatch_allowed() -> bool:
             if effective_trust is None:
