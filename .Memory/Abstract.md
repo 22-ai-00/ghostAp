@@ -1,6 +1,8 @@
 # GhostAP 项目记忆索引
 
 > **维护性 Backlog**: 后续 Review/Audit 发现的非紧急维护项按分级规则录入 [Backlog.md](Backlog.md) 并在维护窗口集中处理；本轮 Refactoring Analysis 1–28 的问题矩阵入口是 [.Memory/2026-05-11.md](2026-05-11.md) 顶部最终矩阵，2026-05-12 是执行验证日志。
+## 2026-09-05
+- **项目群命令默认开放** - legacy-open贯穿trust门禁，/dsh直达且enforced仍可选 → [2026-09-05.md](2026-09-05.md)
 ## 2026-09-04
 - **Workflow产物移出项目** - 脚本、Journal、状态和报告统一到用户级项目隔离目录 → [2026-09-04.md](2026-09-04.md)
 - **Workflow单主卡+COT** - Agent过程合并原生COT，报告附件与完整分页回退闭环 → [2026-09-04.md](2026-09-04.md)
