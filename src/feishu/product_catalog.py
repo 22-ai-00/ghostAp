@@ -112,7 +112,7 @@ def _action(
 
 # This is the pre-catalog main Slash registration, moved here verbatim.  The
 # Feishu registration module only projects this tuple; it owns no command list.
-PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
+_RAW_PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/help", "查看 GhostAP 完整帮助"),
     _action("/menu", "打开 GhostAP 快捷操作菜单"),
     _action("/tools", "查看可用的 AI 编程工具"),
@@ -183,6 +183,42 @@ PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     ),
     _action("/history", "查看数字员工执行历史", "/history <员工名>"),
     _action("/employee-memory", "查看数字员工权威 L1 记忆", "/employee-memory <员工名>"),
+)
+
+# Commands kept out of the Feishu slash-command auto-completion panel.
+# They stay fully resolvable when typed explicitly (and keep working via
+# cards/buttons); this only trims the discovery surface down to the ~19
+# most-used commands.  The SlashCommandReconciler deletes any panel entries
+# whose action leaves the discoverable set, so removing a name here prunes it
+# from Feishu automatically on the next startup.
+HIDDEN_SLASH_COMMANDS: frozenset[str] = frozenset({
+    # tool introspection / low-level ACP
+    "/tools", "/tools_status", "/acp", "/btw",
+    "/coco_status",
+    "/coco_info", "/claude_info", "/aiden_info", "/codex_info",
+    "/gemini_info", "/traex_info", "/grok_info", "/dsh_info",
+    # project administration (board stays reachable via cards)
+    "/new-chat", "/close", "/tasks", "/diff", "/trace",
+    "/lock", "/unlock", "/setadmin",
+    # Deep Engine auxiliaries
+    "/deep_status", "/deep_update", "/stop_deep",
+    # Spec Engine auxiliaries
+    "/spec_status", "/spec_history", "/spec_metrics", "/spec_config",
+    "/spec_export", "/spec_save", "/spec_guide", "/stop_spec",
+    # Workflow auxiliaries
+    "/wf_status", "/wf_help", "/stop_wf",
+    # persistent digital employees
+    "/hire", "/fire", "/employees", "/employee-role",
+    "/history", "/employee-memory",
+    # hidden local CLI bridge — type it explicitly, never advertised
+    "/claude-w",
+})
+
+PUBLIC_ACTIONS: tuple[ProductAction, ...] = tuple(
+    replace(action, slash_discoverable=False)
+    if action.command in HIDDEN_SLASH_COMMANDS
+    else action
+    for action in _RAW_PUBLIC_ACTIONS
 )
 
 
