@@ -1109,3 +1109,5 @@
 - **隐藏命令 /claude-w** — 本地 claude-w CLI 桥接，与 /claude 同构但不进斜杠面板/工具发现，手打触发 → [2026-09-10.md](2026-09-10.md)
 - **飞书斜杠面板精简 59→19** — HIDDEN_SLASH_COMMANDS SSOT 投影，隐藏命令仍可手打解析，reconciler 启动自动下架 → [2026-09-10.md](2026-09-10.md)
 - **watchdog 继承管道 flaky 修复** — 测试时序赌博（deadline 早于解释器冷启动、barrier 1s 被打满 CPU 突破）；marker 就绪屏障 + 预算放宽；压测复现法（yes 打满 + 并行 pytest）→ [2026-09-10.md](2026-09-10.md)
+- **/claude-w 激活映射修复** — 新增同构工具须同步第三处：system.py `_TOOL_HANDLER_MAP` 硬编码工具→handler 分发，漏登记则模型卡点选报"不支持的 ACP 工具" → [2026-09-10.md](2026-09-10.md)
+- **Claude reasoning effort 复合值** — `base[1m]/effort` 原样存 acp_model_name；`claude_selection.py` SSOT + default 双哨兵（伪 base 不传 --model、default effort 不传 --effort）；helper 静态合成矩阵免探测；capabilities 只作用 base 段使 1M/env/门禁正交感知；CLI 每 prompt 重传 --effort（含 resume）；hire 路径同覆盖 claude/claude_w → [2026-09-10.md](2026-09-10.md)
