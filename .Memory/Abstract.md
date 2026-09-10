@@ -1108,3 +1108,4 @@
 - **模型卡按钮 vs 下拉框根因** — `has_dimensions = bool(profiles or efforts)`；7 类机器差异来源 → [2026-09-10.md](2026-09-10.md)
 - **隐藏命令 /claude-w** — 本地 claude-w CLI 桥接，与 /claude 同构但不进斜杠面板/工具发现，手打触发 → [2026-09-10.md](2026-09-10.md)
 - **飞书斜杠面板精简 59→19** — HIDDEN_SLASH_COMMANDS SSOT 投影，隐藏命令仍可手打解析，reconciler 启动自动下架 → [2026-09-10.md](2026-09-10.md)
+- **watchdog 继承管道 flaky 修复** — 测试时序赌博（deadline 早于解释器冷启动、barrier 1s 被打满 CPU 突破）；marker 就绪屏障 + 预算放宽；压测复现法（yes 打满 + 并行 pytest）→ [2026-09-10.md](2026-09-10.md)
