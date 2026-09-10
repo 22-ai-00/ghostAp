@@ -10,6 +10,7 @@ class InteractionMode(Enum):
     SMART = "smart"
     COCO = "coco"
     CLAUDE = "claude"
+    CLAUDE_W = "claude_w"
     AIDEN = "aiden"
     CODEX = "codex"
     GEMINI = "gemini"
@@ -23,6 +24,7 @@ PROGRAMMING_MODES: frozenset[InteractionMode] = frozenset(
     {
         InteractionMode.COCO,
         InteractionMode.CLAUDE,
+        InteractionMode.CLAUDE_W,
         InteractionMode.AIDEN,
         InteractionMode.CODEX,
         InteractionMode.GEMINI,
@@ -195,6 +197,10 @@ class ModeManager:
         """进入 Claude 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.CLAUDE, auto=auto, project_id=project_id)
 
+    def enter_claude_w_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
+        """进入 Claude-W 桥接模式。"""
+        return self.enter_programming_mode(chat_id, InteractionMode.CLAUDE_W, auto=auto, project_id=project_id)
+
     def enter_aiden_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
         """进入 Aiden 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.AIDEN, auto=auto, project_id=project_id)
@@ -234,6 +240,10 @@ class ModeManager:
     def is_claude_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断当前是否为 Claude 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.CLAUDE
+
+    def is_claude_w_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
+        """判断当前是否为 Claude-W 桥接模式。"""
+        return self.get_mode(chat_id, project_id) == InteractionMode.CLAUDE_W
 
     def is_aiden_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断当前是否为 Aiden 模式。"""
@@ -279,6 +289,7 @@ class ModeManager:
             InteractionMode.SMART: "🧠 智能模式",
             InteractionMode.COCO: "🤖 Coco 编程模式",
             InteractionMode.CLAUDE: "🔮 Claude 编程模式",
+            InteractionMode.CLAUDE_W: "🪄 Claude-W 编程模式",
             InteractionMode.AIDEN: "🎯 Aiden 编程模式",
             InteractionMode.CODEX: "⚡ Codex 编程模式",
             InteractionMode.GEMINI: "✨ Gemini 编程模式",

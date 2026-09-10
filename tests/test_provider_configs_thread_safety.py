@@ -136,7 +136,7 @@ class TestProvidersCacheInvalidation:
              patch.object(providers_mod, "_make_resolve_checker", return_value=lambda: True):
             providers = get_providers()
 
-        expected_names = {"coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"}
+        expected_names = {"coco", "claude", "claude_w", "aiden", "codex", "gemini", "traex", "grok", "dsh"}
         assert set(providers.keys()) == expected_names
 
     def test_single_lock_no_intermediate_caches(self) -> None:

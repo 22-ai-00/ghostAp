@@ -73,6 +73,9 @@ class ProjectContext:
     claude_session_snapshot: Optional[SessionSnapshot] = None
     claude_mode: bool = False
 
+    claude_w_session_snapshot: Optional[SessionSnapshot] = None
+    claude_w_mode: bool = False
+
     aiden_session_snapshot: Optional[SessionSnapshot] = None
     aiden_mode: bool = False
 
@@ -252,6 +255,7 @@ class ProjectContext:
     _MODE_ATTRS: ClassVar[dict[str, tuple[str, str]]] = {
         "coco": ("coco_mode", "coco_session_snapshot"),
         "claude": ("claude_mode", "claude_session_snapshot"),
+        "claude_w": ("claude_w_mode", "claude_w_session_snapshot"),
         "aiden": ("aiden_mode", "aiden_session_snapshot"),
         "codex": ("codex_mode", "codex_session_snapshot"),
         "gemini": ("gemini_mode", "gemini_session_snapshot"),
@@ -405,6 +409,12 @@ class ProjectContext:
     def update_claude_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
         self.update_programming_snapshot("claude", query, query_count, session_id)
 
+    def set_claude_w_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
+        self.set_programming_mode("claude_w", enabled, session_id, query_count)
+
+    def update_claude_w_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
+        self.update_programming_snapshot("claude_w", query, query_count, session_id)
+
     def set_aiden_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
         self.set_programming_mode("aiden", enabled, session_id, query_count)
 
@@ -528,6 +538,7 @@ class ProjectContext:
             last_active=data.get("last_active", time.time()),
             coco_mode=data.get("coco_mode", False),
             claude_mode=data.get("claude_mode", False),
+            claude_w_mode=data.get("claude_w_mode", False),
             aiden_mode=data.get("aiden_mode", False),
             codex_mode=data.get("codex_mode", False),
             gemini_mode=data.get("gemini_mode", False),

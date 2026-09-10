@@ -35,7 +35,10 @@ from .transport import LateFrameTolerantMessageQueue
 
 logger = logging.getLogger(__name__)
 
-_TOOLS = ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh")
+_TOOLS = ("coco", "claude", "claude_w", "aiden", "codex", "gemini", "traex", "grok", "dsh")
+# Tools hidden from auto-discovered listings (e.g. /tools panel) but still
+# fully routable when invoked explicitly — see the hidden /claude-w command.
+_HIDDEN_TOOLS = frozenset({"claude_w"})
 _PROBE_TTL = 1800.0
 _CODEX_PROBE_TTL = 1800.0
 _NEGATIVE_TTL = 300.0
@@ -157,9 +160,9 @@ def is_programming_tool_available(
         from ..agent_session.backend_resolver import is_cli_backend
 
         if is_cli_backend(tool):
-            from ..agent_session.claude_cli import ClaudeCLIConfig
+            from ..agent_session.backend_resolver import cli_command_for_agent
 
-            command = str(ClaudeCLIConfig().command or "").strip()
+            command = cli_command_for_agent(tool)
             return bool(command and shutil.which(command))
 
         return bool(
@@ -184,6 +187,8 @@ def list_acp_tools() -> list[ACPToolOption]:
     descriptions = get_acp_result_header_text()
     tools: list[ACPToolOption] = []
     for name in _TOOLS:
+        if name in _HIDDEN_TOOLS:
+            continue
         provider = providers.get(name)
         if provider is None:
             continue

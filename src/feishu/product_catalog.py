@@ -119,6 +119,7 @@ PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/tools_status", "查看 AI 编程工具状态"),
     _action("/coco", "进入 Coco 编程模式", aliases=("/enter_coco",), enters_programming_mode=True, programming_mode_id="coco", protects_from_auto_activation=True),
     _action("/claude", "进入 Claude 编程模式", aliases=("/enter_claude",), enters_programming_mode=True, programming_mode_id="claude", protects_from_auto_activation=True),
+    _action("/claude-w", "进入 Claude-W 桥接模式", aliases=("/enter_claude_w",), enters_programming_mode=True, programming_mode_id="claude_w", protects_from_auto_activation=True, slash_discoverable=False),
     _action("/aiden", "进入 Aiden 编程模式", aliases=("/enter_aiden",), enters_programming_mode=True, programming_mode_id="aiden", protects_from_auto_activation=True),
     _action("/codex", "进入 Codex 编程模式", aliases=("/enter_codex",), enters_programming_mode=True, programming_mode_id="codex", protects_from_auto_activation=True),
     _action("/gemini", "进入 Gemini 编程模式", aliases=("/enter_gemini",), enters_programming_mode=True, programming_mode_id="gemini", protects_from_auto_activation=True),
@@ -127,7 +128,7 @@ PUBLIC_ACTIONS: tuple[ProductAction, ...] = (
     _action("/dsh", "进入 DSH 编程模式", aliases=("/enter_dsh",), enters_programming_mode=True, programming_mode_id="dsh", protects_from_auto_activation=True),
     _action("/acp", "查看或设置项目 ACP 工具", "/acp [工具]", protects_from_auto_activation=True),
     _action("/model", "自适应查看或设置当前编程工具模型", "/model [模型名|default]"),
-    _action("/exit", "退出当前编程模式", aliases=("/quit", "/end_coco", "/exit_coco", "/end_claude", "/exit_claude", "/end_aiden", "/exit_aiden", "/end_codex", "/exit_codex", "/end_gemini", "/exit_gemini", "/end_traex", "/exit_traex", "/end_grok", "/exit_grok")),
+    _action("/exit", "退出当前编程模式", aliases=("/quit", "/end_coco", "/exit_coco", "/end_claude", "/exit_claude", "/end_claude_w", "/exit_claude_w", "/end_aiden", "/exit_aiden", "/end_codex", "/exit_codex", "/end_gemini", "/exit_gemini", "/end_traex", "/exit_traex", "/end_grok", "/exit_grok")),
     _action("/btw", "在当前编程会话中提出旁路问题", "/btw <问题>"),
     _action("/coco_status", "查看 Coco 会话状态"),
     _action("/coco_info", "查看 Coco 会话与模型信息"),
@@ -242,7 +243,7 @@ _EXECUTION_LANE_DESCRIPTORS: tuple[ExecutionLaneDescriptor, ...] = (
         CompletionLabel.MATURE,
         RuntimeHealth.AVAILABLE,
         tuple(
-            mode.value for mode in InteractionMode if mode in PROGRAMMING_MODES
+            mode.value.replace("_", "-") for mode in InteractionMode if mode in PROGRAMMING_MODES
         ),
     ),
     ExecutionLaneDescriptor(ExecutionLane.DEEP, "deep", "Deep", CompletionLabel.MATURE, RuntimeHealth.AVAILABLE),

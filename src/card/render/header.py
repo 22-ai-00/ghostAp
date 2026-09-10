@@ -11,6 +11,7 @@ from src.utils.text import summarize_question_title
 _TOOL_DISPLAY = {
     "coco": "Coco",
     "claude": "Claude",
+    "claude_w": "Claude-W",
     "aiden": "Aiden",
     "codex": "Codex",
     "gemini": "Gemini",

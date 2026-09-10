@@ -363,6 +363,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/enter_coco": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "coco", p),
             "/claude": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude", p),
             "/enter_claude": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude", p),
+            "/claude-w": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude_w", p),
+            "/enter_claude_w": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "claude_w", p),
             "/aiden": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "aiden", p),
             "/enter_aiden": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "aiden", p),
             "/codex": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "codex", p),
@@ -381,6 +383,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_coco": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_claude": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/exit_claude": lambda m, c, t, p: self.exit_current_mode(m, c, p),
+            "/end_claude_w": lambda m, c, t, p: self.exit_current_mode(m, c, p),
+            "/exit_claude_w": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_aiden": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/exit_aiden": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_codex": lambda m, c, t, p: self.exit_current_mode(m, c, p),
@@ -554,6 +558,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_coco",
             "/end_claude",
             "/exit_claude",
+            "/end_claude_w",
+            "/exit_claude_w",
             "/end_aiden",
             "/exit_aiden",
             "/end_codex",
@@ -641,6 +647,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/enter_coco",
             "/claude",
             "/enter_claude",
+            "/claude-w",
+            "/enter_claude_w",
             "/aiden",
             "/enter_aiden",
             "/codex",
@@ -659,6 +667,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/exit_coco",
             "/end_claude",
             "/exit_claude",
+            "/end_claude_w",
+            "/exit_claude_w",
             "/end_aiden",
             "/exit_aiden",
             "/end_codex",
@@ -1801,7 +1811,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             self.reply_error(message_id, UI_TEXT["system_acp_select_model_prompt"])
             return
         if (
-            tool == "claude"
+            tool in {"claude", "claude_w"}
             and model
             and is_1m_variant(model)
             and not model_supports_1m(strip_1m_suffix(model))
@@ -2366,7 +2376,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             )
             return
         if (
-            tool_name == "claude"
+            tool_name in {"claude", "claude_w"}
             and model_name
             and is_1m_variant(model_name)
             and not model_supports_1m(strip_1m_suffix(model_name))
@@ -2607,9 +2617,9 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
 
     def show_tools_list(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
         """Show a list of all available ACP tools with quick access buttons."""
-        names = [
-            mode.value for mode in InteractionMode if mode in PROGRAMMING_MODES
-        ]
+        # Only user-visible programming tools; hidden bridges (e.g. claude-w)
+        # stay out of the discovery surfaces even though they are full modes.
+        names = ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"]
         emojis = {
             "coco": "🤖",
             "claude": "🔮",

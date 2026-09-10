@@ -897,6 +897,7 @@ class BaseHandler:
             InteractionMode.SMART: ContextSourceMode.SMART,
             InteractionMode.COCO: ContextSourceMode.COCO,
             InteractionMode.CLAUDE: ContextSourceMode.CLAUDE,
+            InteractionMode.CLAUDE_W: ContextSourceMode.CLAUDE_W,
             InteractionMode.AIDEN: ContextSourceMode.AIDEN,
             InteractionMode.CODEX: ContextSourceMode.CODEX,
             InteractionMode.GEMINI: ContextSourceMode.GEMINI,

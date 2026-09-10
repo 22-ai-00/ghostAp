@@ -44,6 +44,7 @@ def _make_handler_context(**settings_overrides) -> HandlerContext:
         message_callback=mock(),
         coco_manager=mock(),
         claude_manager=mock(),
+        claude_w_manager=mock(),
         aiden_manager=mock(),
         codex_manager=mock(),
         gemini_manager=mock(),

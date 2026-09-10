@@ -16,6 +16,7 @@ class IntentType(Enum):
     EXIT_COCO = "exit_coco"
     ENTER_CLAUDE = "enter_claude"
     EXIT_CLAUDE = "exit_claude"
+    ENTER_CLAUDE_W = "enter_claude_w"
     ENTER_AIDEN = "enter_aiden"
     EXIT_AIDEN = "exit_aiden"
     ENTER_CODEX = "enter_codex"
@@ -32,6 +33,7 @@ class IntentType(Enum):
     SHELL_COMMAND = "shell"
     COCO_MESSAGE = "coco_message"
     CLAUDE_MESSAGE = "claude_message"
+    CLAUDE_W_MESSAGE = "claude_w_message"
     AIDEN_MESSAGE = "aiden_message"
     CODEX_MESSAGE = "codex_message"
     GEMINI_MESSAGE = "gemini_message"
@@ -134,6 +136,8 @@ class IntentRecognizer:
         "exit_coco": IntentType.EXIT_COCO,
         "enter_claude": IntentType.ENTER_CLAUDE,
         "exit_claude": IntentType.EXIT_CLAUDE,
+        "enter_claude_w": IntentType.ENTER_CLAUDE_W,
+        "claude_w_message": IntentType.CLAUDE_W_MESSAGE,
         "enter_aiden": IntentType.ENTER_AIDEN,
         "exit_aiden": IntentType.EXIT_AIDEN,
         "enter_codex": IntentType.ENTER_CODEX,
@@ -184,6 +188,8 @@ class IntentRecognizer:
         "/exit_coco": (IntentType.EXIT_COCO, "退出 Coco 编程模式"),
         "/claude": (IntentType.ENTER_CLAUDE, "进入 Claude 编程模式"),
         "/enter_claude": (IntentType.ENTER_CLAUDE, "进入 Claude 编程模式"),
+        "/claude-w": (IntentType.ENTER_CLAUDE_W, "进入 Claude-W 桥接模式"),
+        "/enter_claude_w": (IntentType.ENTER_CLAUDE_W, "进入 Claude-W 桥接模式"),
         "/end_claude": (IntentType.EXIT_CLAUDE, "退出 Claude 编程模式"),
         "/exit_claude": (IntentType.EXIT_CLAUDE, "退出 Claude 编程模式"),
         "/aiden": (IntentType.ENTER_AIDEN, "进入 Aiden 编程模式"),
@@ -210,6 +216,8 @@ class IntentRecognizer:
         "/enter_dsh": (IntentType.ENTER_DSH, "进入 DSH 编程模式"),
         "/exit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/quit": (IntentType.EXIT_MODE, "退出当前模式"),
+        "/end_claude_w": (IntentType.EXIT_MODE, "退出 Claude-W 桥接模式"),
+        "/exit_claude_w": (IntentType.EXIT_MODE, "退出 Claude-W 桥接模式"),
         "/projects": (IntentType.LIST_PROJECTS, "查看项目列表"),
         "/switch": (IntentType.SWITCH_PROJECT, "切换项目（打开项目看板）"),
         "/project": (IntentType.PROJECT_STATUS, "查看当前项目"),
@@ -960,6 +968,8 @@ class IntentRecognizer:
             return IntentType.COCO_MESSAGE
         elif current_mode == "claude":
             return IntentType.CLAUDE_MESSAGE
+        elif current_mode == "claude_w":
+            return IntentType.CLAUDE_W_MESSAGE
         elif current_mode == "aiden":
             return IntentType.AIDEN_MESSAGE
         elif current_mode == "codex":

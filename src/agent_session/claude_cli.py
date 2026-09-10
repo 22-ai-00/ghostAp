@@ -449,9 +449,11 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
         raise RuntimeError("Claude CLI failed to terminate subprocess")
 
     def to_snapshot(self) -> dict:
+        from .backend_resolver import agent_type_for_cli_command
+
         return {
             "session_id": self.session_id,
-            "agent_type": "claude",
+            "agent_type": agent_type_for_cli_command(self._cfg.command),
             "cwd": self._cwd,
             "created_at": self.created_at,
             "last_active": self.last_active,

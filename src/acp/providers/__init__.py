@@ -435,6 +435,14 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
                 model_style="model_long",
             ),
             _ProviderConfig(
+                tool_name="claude_w",
+                serve_args=["acp", "serve"],
+                # Bridges to the separate local ``claude-w`` executable; like
+                # ``claude`` it runs over the CLI transport, never ACP serve.
+                availability_checker=_make_resolve_checker("claude-w"),
+                model_style="model_long",
+            ),
+            _ProviderConfig(
                 tool_name="aiden",
                 serve_args=["acp"],
                 availability_checker=_aiden_checker,

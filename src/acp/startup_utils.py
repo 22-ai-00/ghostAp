@@ -109,7 +109,9 @@ class SessionStartupResult:
 
 
 def select_startup_backend(agent_type: str) -> StartupBackend:
-    if agent_type == "claude":
+    from ..agent_session.backend_resolver import is_cli_backend
+
+    if is_cli_backend(agent_type):
         return StartupBackend.CLI
     return StartupBackend.ACP
 
@@ -276,7 +278,14 @@ class AcpRetryStarter:
         cli_session_cls: Any,
     ) -> Any:
         if backend == StartupBackend.CLI:
-            return cli_session_cls(cwd=cwd or ".", model_name=model_name)
+            from ..agent_session.backend_resolver import cli_command_for_agent
+            from ..agent_session.claude_cli import ClaudeCLIConfig
+
+            return cli_session_cls(
+                cwd=cwd or ".",
+                config=ClaudeCLIConfig(command=cli_command_for_agent(agent_type)),
+                model_name=model_name,
+            )
         if model_name:
             try:
                 return acp_session_cls(agent_type=agent_type, cwd=cwd or ".", model_name=model_name)

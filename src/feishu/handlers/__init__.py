@@ -7,6 +7,7 @@ from .employee import EmployeeHandler
 from .programming import (
     AidenModeHandler,
     ClaudeModeHandler,
+    ClaudeWModeHandler,
     CocoModeHandler,
     CodexModeHandler,
     DSHModeHandler,
@@ -25,6 +26,7 @@ __all__ = [
     "ProgrammingModeHandler",
     "CocoModeHandler",
     "ClaudeModeHandler",
+    "ClaudeWModeHandler",
     "AidenModeHandler",
     "CodexModeHandler",
     "DSHModeHandler",

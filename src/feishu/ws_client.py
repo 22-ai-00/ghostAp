@@ -106,6 +106,7 @@ from .handler_context import HandlerContext
 from .handlers import (
     AidenModeHandler,
     ClaudeModeHandler,
+    ClaudeWModeHandler,
     CocoModeHandler,
     CodexModeHandler,
     DeepHandler,
@@ -596,6 +597,7 @@ class FeishuWSClient:
         manager_timeouts = {
             "coco": self.settings.coco_session_timeout,
             "claude": self.settings.claude_session_timeout,
+            "claude_w": self.settings.claude_session_timeout,
             "aiden": self.settings.coco_session_timeout,
             "codex": self.settings.coco_session_timeout,
             "gemini": self.settings.coco_session_timeout,
@@ -771,6 +773,7 @@ class FeishuWSClient:
             message_callback=self.message_callback,
             coco_manager=acp_managers["coco"],
             claude_manager=acp_managers["claude"],
+            claude_w_manager=acp_managers["claude_w"],
             aiden_manager=acp_managers["aiden"],
             codex_manager=acp_managers["codex"],
             gemini_manager=acp_managers["gemini"],
@@ -850,6 +853,7 @@ class FeishuWSClient:
         handler_types = {
             "coco": CocoModeHandler,
             "claude": ClaudeModeHandler,
+            "claude_w": ClaudeWModeHandler,
             "aiden": AidenModeHandler,
             "codex": CodexModeHandler,
             "gemini": GeminiModeHandler,

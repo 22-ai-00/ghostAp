@@ -50,6 +50,7 @@ class HandlerContext:
     # Session managers (ACP-based)
     coco_manager: "ACPSessionManager"
     claude_manager: "ACPSessionManager"
+    claude_w_manager: "ACPSessionManager"
     aiden_manager: "ACPSessionManager"
     codex_manager: "ACPSessionManager"
     gemini_manager: "ACPSessionManager"

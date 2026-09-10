@@ -45,7 +45,7 @@ def _session_matches_requested_model(
     return requested in " ".join(existing_args or [])
 def _normalize_manager_acp_model(agent_type: str, model_name: Optional[str]) -> Optional[str]:
     agent = (agent_type or "").strip().lower()
-    if not model_name or agent in {"claude", "traex"}:
+    if not model_name or agent in {"claude", "claude_w", "traex"}:
         return model_name
     try:
         from .providers import normalize_acp_model_name

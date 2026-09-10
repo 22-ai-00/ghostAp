@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 _MODE_DISPLAY: dict[str, tuple[str, str]] = {
     "coco": ("🤖", "Coco"),
     "claude": ("🧠", "Claude"),
+    "claude_w": ("🪄", "Claude-W"),
     "aiden": ("⚡", "Aiden"),
     "codex": ("📝", "Codex"),
     "gemini": ("💎", "Gemini"),

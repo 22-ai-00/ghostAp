@@ -26,6 +26,7 @@ class ContextSourceMode(Enum):
     SMART = "smart"
     COCO = "coco"
     CLAUDE = "claude"
+    CLAUDE_W = "claude_w"
     AIDEN = "aiden"
     CODEX = "codex"
     GEMINI = "gemini"

@@ -341,6 +341,7 @@ class SystemBuilder:
         labels = {
             "coco": "Coco",
             "claude": "Claude",
+            "claude_w": "Claude-W",
             "claude cli": "Claude CLI",
             "aiden": "Aiden",
             "codex": "Codex",

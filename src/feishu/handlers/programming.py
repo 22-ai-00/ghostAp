@@ -390,6 +390,7 @@ class ProgrammingModeHandler(BaseHandler):
     _PROGRAMMING_MODE_KEYS = (
         (InteractionMode.COCO, "is_coco_mode", "coco"),
         (InteractionMode.CLAUDE, "is_claude_mode", "claude"),
+        (InteractionMode.CLAUDE_W, "is_claude_w_mode", "claude_w"),
         (InteractionMode.AIDEN, "is_aiden_mode", "aiden"),
         (InteractionMode.CODEX, "is_codex_mode", "codex"),
         (InteractionMode.GEMINI, "is_gemini_mode", "gemini"),
@@ -2250,6 +2251,15 @@ class ClaudeModeHandler(ProgrammingModeHandler):
 
     def _uses_claude_cli(self) -> bool:
         return True
+
+
+class ClaudeWModeHandler(ClaudeModeHandler):
+    mode_name = "Claude-W"
+    mode_emoji = "🪄"
+    interaction_mode = InteractionMode.CLAUDE_W
+    mode_key = "claude_w"
+    context_source = ContextSourceMode.CLAUDE_W
+    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🪄", name="Claude-W")
 
 
 class AidenModeHandler(ProgrammingModeHandler):

@@ -176,6 +176,7 @@ class TestOptimizationTraceUI(unittest.TestCase):
                 "spec",
                 "workflow",
                 "claude",
+                "claude_w",
                 "aiden",
                 "codex",
                 "gemini",
