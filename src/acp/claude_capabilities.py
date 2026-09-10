@@ -12,6 +12,8 @@ hot-swap and persistence) and the env as a defensive fallback.
 
 from __future__ import annotations
 
+from .claude_selection import split_claude_model_selection
+
 # ---------------------------------------------------------------------------
 # Public constants
 # ---------------------------------------------------------------------------
@@ -37,38 +39,61 @@ SUFFIX_1M = "[1m]"
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _split_base_effort(model_id: str) -> tuple[str, str | None]:
+    """Split a possible ``base/effort`` composite into its segments.
+
+    Only a recognised Claude effort token is treated as a suffix, so other
+    identifiers containing ``/`` are returned untouched.
+    """
+    base, effort = split_claude_model_selection(model_id)
+    return (base or "", effort)
+
+
+def _join_base_effort(base: str, effort: str | None) -> str:
+    return f"{base}/{effort}" if effort else base
+
+
 def strip_1m_suffix(model_id: str) -> str:
     """Return *model_id* with the ``[1m]`` suffix stripped, if present.
 
-    Idempotent on inputs that don't carry the suffix.  Whitespace is
-    preserved as-is so callers retain control over normalisation.
+    Idempotent on inputs that don't carry the suffix.  For composite
+    ``base[1m]/effort`` selections only the base segment is stripped while
+    the effort segment is preserved.  Whitespace is preserved as-is so
+    callers retain control over normalisation.
     """
-    s = str(model_id or "")
-    if s.endswith(SUFFIX_1M):
-        return s[: -len(SUFFIX_1M)]
-    return s
+    base, effort = _split_base_effort(str(model_id or ""))
+    if base.endswith(SUFFIX_1M):
+        base = base[: -len(SUFFIX_1M)]
+    return _join_base_effort(base, effort)
 
 
 def is_1m_variant(model_id: str) -> bool:
-    """True iff *model_id* is the 1M-suffixed variant of a Claude model."""
-    return str(model_id or "").endswith(SUFFIX_1M)
+    """True iff *model_id* is the 1M-suffixed variant of a Claude model.
+
+    The check runs on the base segment of a possible ``base/effort``
+    composite selection.
+    """
+    base, _effort = _split_base_effort(str(model_id or ""))
+    return base.endswith(SUFFIX_1M)
 
 
 def with_1m_suffix(model_id: str) -> str:
-    """Return *model_id* with ``[1m]`` appended (idempotent)."""
-    s = str(model_id or "")
-    if s.endswith(SUFFIX_1M):
-        return s
-    return s + SUFFIX_1M
+    """Return *model_id* with ``[1m]`` appended to its base (idempotent)."""
+    base, effort = _split_base_effort(str(model_id or ""))
+    if not base.endswith(SUFFIX_1M):
+        base = base + SUFFIX_1M
+    return _join_base_effort(base, effort)
 
 
 def model_supports_1m(model_id: str) -> bool:
     """True iff the *base* of *model_id* is in :data:`CLAUDE_1M_PREFIXES`.
 
-    The ``[1m]`` suffix is stripped before matching so callers may pass
-    either form.  Matching is by prefix to cover date-stamped releases.
+    The ``[1m]`` suffix and any ``/effort`` segment are stripped before
+    matching so callers may pass either form.  Matching is by prefix to
+    cover date-stamped releases.
     """
-    base = strip_1m_suffix(str(model_id or "")).strip()
+    base, _effort = _split_base_effort(str(model_id or ""))
+    base = base.removesuffix(SUFFIX_1M).strip()
     if not base:
         return False
     return any(base.startswith(p) for p in CLAUDE_1M_PREFIXES)

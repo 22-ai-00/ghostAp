@@ -9,8 +9,15 @@ from src.acp import helper
 @pytest.mark.parametrize(
     ("current_model", "expected_models"),
     [
-        (None, []),
-        ("claude-opus-4-8[1m]", [("claude-opus-4-8[1m]", True)]),
+        # No saved model: the synthetic "default" pseudo-base is active and
+        # carries the effort dimension; it never resolves to a --model flag.
+        (None, [("default", True)]),
+        # A saved composite round-trips as an extra base flagged default,
+        # ahead of the still-present "let the gateway pick" pseudo-base.
+        (
+            "claude-opus-4-8[1m]",
+            [("default", False), ("claude-opus-4-8[1m]", True)],
+        ),
     ],
 )
 def test_claude_cli_model_discovery_never_starts_an_acp_server_probe(
@@ -19,10 +26,11 @@ def test_claude_cli_model_discovery_never_starts_an_acp_server_probe(
     current_model: str | None,
     expected_models: list[tuple[str, bool]],
 ) -> None:
-    """Claude's default is represented by no explicit model override.
+    """Claude CLI discovery is a purely synthetic base[1m]/effort matrix.
 
-    A saved explicit model remains selectable, but neither case may ask the
-    CLI-only backend for the unsupported ``claude acp serve`` transport.
+    The catalog is built without probing, so neither a fresh nor a saved
+    selection may ask the CLI-only backend for the unsupported
+    ``claude acp serve`` transport.
     """
     get_serve_command = MagicMock(
         side_effect=RuntimeError("Claude CLI has no ACP server mode")

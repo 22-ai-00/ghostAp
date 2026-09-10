@@ -112,6 +112,42 @@ class TestCapabilities(unittest.TestCase):
         self.assertEqual(CONTEXT_1M_BETA, "context-1m-2025-08-07")
 
 
+class TestCapabilitiesCompositeEffort(unittest.TestCase):
+    """The four helpers must operate on the base of ``base[1m]/effort``."""
+
+    def test_strip_suffix_preserves_effort(self):
+        self.assertEqual(
+            strip_1m_suffix("claude-opus-4-8[1m]/high"),
+            "claude-opus-4-8/high",
+        )
+
+    def test_strip_suffix_without_suffix_preserves_effort(self):
+        self.assertEqual(
+            strip_1m_suffix("claude-sonnet-4-5/xhigh"),
+            "claude-sonnet-4-5/xhigh",
+        )
+
+    def test_is_1m_variant_checks_base_only(self):
+        self.assertTrue(is_1m_variant("claude-opus-4-8[1m]/max"))
+        self.assertFalse(is_1m_variant("claude-opus-4-8/max"))
+
+    def test_with_1m_suffix_keeps_effort_after_base(self):
+        self.assertEqual(
+            with_1m_suffix("claude-opus-4-8/high"),
+            "claude-opus-4-8[1m]/high",
+        )
+        # Idempotent on an already-suffixed composite.
+        self.assertEqual(
+            with_1m_suffix("claude-opus-4-8[1m]/high"),
+            "claude-opus-4-8[1m]/high",
+        )
+
+    def test_supports_1m_matches_base_of_composite(self):
+        self.assertTrue(model_supports_1m("claude-opus-4-8[1m]/high"))
+        self.assertTrue(model_supports_1m("claude-sonnet-4-5/xhigh"))
+        self.assertFalse(model_supports_1m("claude-haiku-4-5/low"))
+
+
 # ---------------------------------------------------------------------------
 # apply_anthropic_betas
 # ---------------------------------------------------------------------------
@@ -154,6 +190,18 @@ class TestApplyAnthropicBetas(unittest.TestCase):
         env = {"ANTHROPIC_BETAS": "preserved-beta"}
         apply_anthropic_betas(env, "claude-opus-4-8")
         self.assertEqual(env["ANTHROPIC_BETAS"], "preserved-beta")
+
+    def test_sets_beta_for_1m_composite_with_effort(self):
+        env = {"ANTHROPIC_BETAS": "other-beta"}
+        apply_anthropic_betas(env, "claude-opus-4-8[1m]/max")
+        self.assertEqual(
+            env["ANTHROPIC_BETAS"], f"other-beta,{CONTEXT_1M_BETA}"
+        )
+
+    def test_noop_for_non_1m_composite_even_with_effort(self):
+        env: dict[str, str] = {}
+        apply_anthropic_betas(env, "claude-haiku-4-5/high")
+        self.assertNotIn("ANTHROPIC_BETAS", env)
 
 
 # ---------------------------------------------------------------------------

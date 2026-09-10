@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ..acp.claude_capabilities import strip_1m_suffix
+from ..acp.claude_selection import (
+    CLAUDE_DEFAULT_MODEL_TOKEN,
+    split_claude_model_selection,
+)
 from ..acp.client import (
     emit_referenced_changed_local_image_events,
     snapshot_local_image_artifacts,
@@ -183,8 +187,11 @@ class SyncClaudeCLISession(_PromptRetryMixin, PromptGenerationTracker):
             args: list[str] = [self._cfg.command, "-p"]
             if self._cfg.add_dir:
                 args += ["--add-dir", self._cwd]
-            if self._model_name:
-                args += ["--model", strip_1m_suffix(self._model_name)]
+            base_model, effort = split_claude_model_selection(self._model_name)
+            if base_model and base_model != CLAUDE_DEFAULT_MODEL_TOKEN:
+                args += ["--model", strip_1m_suffix(base_model)]
+            if effort:
+                args += ["--effort", effort]
 
             if resumed:
                 args += ["--resume", self.session_id]

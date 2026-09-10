@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from .claude_selection import (
+    CLAUDE_REASONING_EFFORTS,
+    compose_claude_model_selection,
+    split_claude_model_selection,
+)
 from .model_selection import (
     CODEX_REASONING_EFFORTS,
     compose_codex_model_selection,
@@ -23,6 +28,10 @@ def validate_employee_model_components(
         _, embedded_effort = split_codex_model_selection(selected_model)
         if embedded_effort:
             raise ValueError("Codex model must not include an effort suffix")
+    elif normalized_tool in {"claude", "claude_w"}:
+        _, embedded_effort = split_claude_model_selection(selected_model)
+        if embedded_effort:
+            raise ValueError("Claude model must not include an effort suffix")
     elif normalized_tool in {"traex", "trae"}:
         base_model, embedded_profile, embedded_effort = split_traex_model_selection(selected_model)
         if base_model != selected_model or embedded_profile != "standard" or embedded_effort:
@@ -52,6 +61,19 @@ def compose_employee_model_selection(
         if embedded_effort and embedded_effort != requested_effort:
             raise ValueError("conflicting Codex effort selection")
         return compose_codex_model_selection(
+            base_model or "",
+            requested_effort or embedded_effort,
+        )
+    if normalized_tool in {"claude", "claude_w"}:
+        if selected_profile not in {"", "default", "standard"}:
+            raise ValueError("Claude ACP does not support employee profiles")
+        if selected_effort not in {"", "default", *CLAUDE_REASONING_EFFORTS}:
+            raise ValueError("unsupported Claude effort")
+        base_model, embedded_effort = split_claude_model_selection(selected_model)
+        requested_effort = None if selected_effort in {"", "default"} else selected_effort
+        if embedded_effort and embedded_effort != requested_effort:
+            raise ValueError("conflicting Claude effort selection")
+        return compose_claude_model_selection(
             base_model or "",
             requested_effort or embedded_effort,
         )

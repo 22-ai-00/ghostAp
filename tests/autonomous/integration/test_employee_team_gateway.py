@@ -2846,7 +2846,10 @@ def test_projected_persona_and_effort_are_bound_into_direct_prompt_and_model(
 
 
 def test_employee_model_selection_uses_real_backend_contracts() -> None:
-    from src.acp.employee_selection import compose_employee_model_selection
+    from src.acp.employee_selection import (
+        compose_employee_model_selection,
+        validate_employee_model_components,
+    )
 
     assert (
         compose_employee_model_selection("traex", "gpt-5.6-sol", "max", "xhigh")
@@ -2866,6 +2869,45 @@ def test_employee_model_selection_uses_real_backend_contracts() -> None:
     assert compose_employee_model_selection(
         "codex", "gpt-5.6-sol/xhigh", "standard", "xhigh"
     ) == "gpt-5.6-sol/xhigh"
+    # Claude / claude-w share the same base[1m]/effort contract.
+    assert (
+        compose_employee_model_selection(
+            "claude", "claude-sonnet-4-5", "standard", "xhigh"
+        )
+        == "claude-sonnet-4-5/xhigh"
+    )
+    assert (
+        compose_employee_model_selection(
+            "claude_w", "claude-opus-4-8[1m]", "standard", "max"
+        )
+        == "claude-opus-4-8[1m]/max"
+    )
+    assert (
+        compose_employee_model_selection(
+            "claude", "claude-sonnet-4-5/high", "standard", "high"
+        )
+        == "claude-sonnet-4-5/high"
+    )
+    assert (
+        compose_employee_model_selection(
+            "claude", "claude-sonnet-4-5", "standard", "default"
+        )
+        == "claude-sonnet-4-5"
+    )
+    with pytest.raises(ValueError, match="does not support employee profiles"):
+        compose_employee_model_selection("claude", "claude-sonnet-4-5", "max", "xhigh")
+    with pytest.raises(ValueError, match="unsupported Claude effort"):
+        compose_employee_model_selection(
+            "claude", "claude-sonnet-4-5", "standard", "potato"
+        )
+    with pytest.raises(ValueError, match="conflicting"):
+        compose_employee_model_selection(
+            "claude", "claude-sonnet-4-5/xhigh", "standard", "high"
+        )
+    with pytest.raises(ValueError, match="must not include an effort suffix"):
+        validate_employee_model_components(
+            "claude", "claude-sonnet-4-5/high", "standard", "high"
+        )
     with pytest.raises(ValueError, match="does not support employee profiles"):
         compose_employee_model_selection("codex", "gpt-5.6-sol", "max", "xhigh")
     with pytest.raises(ValueError, match="unsupported Codex effort"):

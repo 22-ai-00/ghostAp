@@ -110,3 +110,104 @@ def test_claude_cli_never_injects_permission_bypass() -> None:
         session.send_prompt("inspect the project")
 
     assert "--dangerously-skip-permissions" not in popen.call_args.args[0]
+
+
+def test_effort_selection_reaches_real_cli_argv() -> None:
+    session = SyncClaudeCLISession(
+        cwd="/tmp",
+        model_name="claude-sonnet-4-5/xhigh",
+        config=ClaudeCLIConfig(add_dir=False),
+    )
+    session.session_id = "session-1"
+
+    with patch(
+        "src.agent_session.claude_cli.subprocess.Popen",
+        return_value=_completed_process(),
+    ) as popen:
+        result = session.send_prompt("think harder")
+
+    assert result.stop_reason == "end_turn"
+    argv = popen.call_args.args[0]
+    assert argv[argv.index("--model") + 1] == "claude-sonnet-4-5"
+    assert argv[argv.index("--effort") + 1] == "xhigh"
+
+
+def test_composite_1m_effort_strips_suffix_and_sets_betas() -> None:
+    session = SyncClaudeCLISession(
+        cwd="/tmp",
+        model_name="claude-opus-4-8[1m]/max",
+        config=ClaudeCLIConfig(add_dir=False),
+    )
+    session.session_id = "session-1"
+
+    with patch(
+        "src.agent_session.claude_cli.subprocess.Popen",
+        return_value=_completed_process(),
+    ) as popen:
+        session.send_prompt("long context deep think")
+
+    argv = popen.call_args.args[0]
+    env = popen.call_args.kwargs["env"]
+    assert argv[argv.index("--model") + 1] == "claude-opus-4-8"
+    assert argv[argv.index("--effort") + 1] == "max"
+    assert env["ANTHROPIC_BETAS"] == "context-1m-2025-08-07"
+
+
+def test_default_model_token_omits_model_but_keeps_effort() -> None:
+    # The "default" pseudo-base must preserve the gateway wrapper's own model
+    # selection: no --model is emitted, but an explicit effort still is.
+    session = SyncClaudeCLISession(
+        cwd="/tmp",
+        model_name="default/high",
+        config=ClaudeCLIConfig(add_dir=False),
+    )
+    session.session_id = "session-1"
+
+    with patch(
+        "src.agent_session.claude_cli.subprocess.Popen",
+        return_value=_completed_process(),
+    ) as popen:
+        session.send_prompt("pick my default model")
+
+    argv = popen.call_args.args[0]
+    assert "--model" not in argv
+    assert argv[argv.index("--effort") + 1] == "high"
+
+
+def test_default_model_token_without_effort_omits_both_flags() -> None:
+    session = SyncClaudeCLISession(
+        cwd="/tmp",
+        model_name="default",
+        config=ClaudeCLIConfig(add_dir=False),
+    )
+    session.session_id = "session-1"
+
+    with patch(
+        "src.agent_session.claude_cli.subprocess.Popen",
+        return_value=_completed_process(),
+    ) as popen:
+        session.send_prompt("pure defaults")
+
+    argv = popen.call_args.args[0]
+    assert "--model" not in argv
+    assert "--effort" not in argv
+
+
+def test_resumed_prompt_retransmits_effort() -> None:
+    session = SyncClaudeCLISession(
+        cwd="/tmp",
+        model_name="claude-sonnet-4-5/low",
+        config=ClaudeCLIConfig(add_dir=False),
+    )
+    session.session_id = "prior-session"
+    session.is_resumed = True
+
+    with patch(
+        "src.agent_session.claude_cli.subprocess.Popen",
+        return_value=_completed_process(),
+    ) as popen:
+        session.send_prompt("continue")
+
+    argv = popen.call_args.args[0]
+    assert argv[argv.index("--effort") + 1] == "low"
+    assert argv[argv.index("--resume") + 1] == "prior-session"

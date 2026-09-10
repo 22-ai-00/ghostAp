@@ -15,6 +15,13 @@ from acp.stdio import spawn_agent_process
 from ..config import get_settings
 from ..utils.async_helpers import safe_wait_for
 from ..utils.text import get_acp_result_header_text
+from .claude_selection import (
+    CLAUDE_DEFAULT_EFFORT_TOKEN,
+    CLAUDE_DEFAULT_MODEL_TOKEN,
+    CLAUDE_REASONING_EFFORTS,
+    compose_claude_model_selection,
+    split_claude_model_selection,
+)
 from .client import GhostAPClient
 from .dsh_selection import (
     DSH_MODEL_CONFIG_ID,
@@ -222,6 +229,61 @@ def _fallback(tool_name: str, current_model: str | None) -> list[ACPModelOption]
     if not selected or tool_name == "codex":
         return []
     return [ACPModelOption(name=selected, description=selected, is_default=True)]
+
+
+def _claude_cli_fallback(current_model: str | None) -> list[ACPModelOption]:
+    """Synthetic effort dimension for the local ``claude``/``claude-w`` CLIs.
+
+    CLI backends expose no model catalog over ACP, so the card would render
+    plain buttons and reasoning effort could never be picked.  The Claude
+    Code CLI accepts a static ``--effort`` set (low/medium/high/xhigh/max),
+    hence we synthesise the matrix ourselves:
+
+    - one pseudo-model :data:`CLAUDE_DEFAULT_MODEL_TOKEN` meaning "let the
+      CLI/gateway pick the model" (the bridge then omits ``--model``);
+    - plus the saved explicit base (if any), so a previously stored
+      ``base[1m]/effort`` selection round-trips;
+    - every base gets a "default effort" variant (``--effort`` omitted) plus
+      one variant per supported level.
+
+    The matrix is intentionally static: it never depends on probing.
+    """
+    saved_base, saved_effort = split_claude_model_selection(current_model)
+    bases: list[str] = [CLAUDE_DEFAULT_MODEL_TOKEN]
+    if saved_base and saved_base != CLAUDE_DEFAULT_MODEL_TOKEN:
+        bases.append(saved_base)
+
+    options: list[ACPModelOption] = []
+    for base in bases:
+        variants: list[ACPModelSelectionVariant] = [
+            ACPModelSelectionVariant(
+                name=base,
+                model=base,
+                effort=CLAUDE_DEFAULT_EFFORT_TOKEN,
+                is_default=(base == saved_base and saved_effort is None)
+                or (base == CLAUDE_DEFAULT_MODEL_TOKEN and saved_base is None),
+            )
+        ]
+        for level in CLAUDE_REASONING_EFFORTS:
+            variants.append(
+                ACPModelSelectionVariant(
+                    name=compose_claude_model_selection(base, level),
+                    model=base,
+                    effort=level,
+                    is_default=base == saved_base and level == saved_effort,
+                )
+            )
+        options.append(
+            ACPModelOption(
+                name=base,
+                description=base,
+                is_default=base == saved_base
+                or (base == CLAUDE_DEFAULT_MODEL_TOKEN and saved_base is None),
+                selection_variants=tuple(variants),
+                reasoning_efforts=CLAUDE_REASONING_EFFORTS,
+            )
+        )
+    return options
 
 
 def _coco_models(current_model: str | None) -> list[ACPModelOption]:
@@ -631,13 +693,16 @@ def fetch_acp_models(
         if models:
             return models
 
-    # CLI backends do not expose an ACP session model catalog. Preserve a
-    # saved explicit model when present; an empty result represents the
-    # backend default without attempting an unsupported ACP server process.
+    # CLI backends do not expose an ACP session model catalog.  The Claude
+    # Code CLI (and the claude-w sibling) accepts a static --effort set, so
+    # synthesise a base[1m]/effort dimension rather than a bare saved value;
+    # other CLI tools preserve just the saved explicit model.  An empty
+    # result represents the backend default without spawning an unsupported
+    # ACP server process.
     from ..agent_session.backend_resolver import is_cli_backend
 
     if is_cli_backend(tool):
-        return _fallback(tool, current_model)
+        return _claude_cli_fallback(current_model)
 
     key = _key(tool, cwd)
     timeout = _probe_timeout(probe_timeout)
