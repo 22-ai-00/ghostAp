@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from contextlib import ExitStack, suppress
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -219,8 +220,15 @@ def test_claude_watchdog_kills_term_ignoring_process_with_blocked_stdout() -> No
 def test_cli_watchdog_kills_descendant_that_inherits_stdout(
     leader_tail: str,
     expected_stop_reason: str,
+    tmp_path: Path,
 ) -> None:
     """Killing only the CLI leader must not leave stdout held by a child."""
+    # The leader touches this marker right after flushing "ready". The test
+    # blocks on it before letting production start its prompt deadline, so the
+    # outcome no longer depends on how slowly the freshly-exec'd interpreter
+    # boots (imports + child spawn) under load. Without this barrier the test
+    # gambled that a 0.2 s prompt deadline would still see "ready" arrive.
+    ready_marker = tmp_path / "leader-ready"
     child_code = (
         "import signal,time;"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
@@ -232,6 +240,7 @@ def test_cli_watchdog_kills_descendant_that_inherits_stdout(
         f"subprocess.Popen([sys.executable, '-c', {child_code!r}],"
         " stdout=sys.stdout, stderr=sys.stderr);"
         "print('ready', flush=True);"
+        f"open({str(ready_marker)!r}, 'w').close();"
         f"{leader_tail}"
     )
     real_popen = subprocess.Popen
@@ -247,11 +256,33 @@ def test_cli_watchdog_kills_descendant_that_inherits_stdout(
             [sys.executable, "-c", leader_code],
             **kwargs,
         )
-        if not leader_tail:
-            # Make completion precedence deterministic: the CLI leader has
-            # already exited before production computes its prompt deadline,
-            # while the descendant still owns the output pipes.
-            process.wait(timeout=1)
+        if leader_tail:
+            # Leader stays running: wait until it has flushed "ready" so the
+            # bytes are already buffered in the stdout pipe before production
+            # computes its prompt deadline. The watchdog path under test is
+            # still fully exercised — the leader and descendant both ignore
+            # SIGTERM and must be reaped via SIGKILL on the process group.
+            # The budget only bounds a wedged probe; a cold interpreter under
+            # heavy machine load may take seconds to import and spawn, so it
+            # must not share the tight prompt-timeout budget.
+            barrier_deadline = time.monotonic() + 30.0
+            while time.monotonic() < barrier_deadline:
+                if ready_marker.exists():
+                    break
+                if process.poll() is not None:
+                    raise AssertionError("watchdog probe leader exited unexpectedly")
+                time.sleep(0.01)
+            else:
+                process.kill()
+                raise AssertionError("watchdog probe leader never signalled readiness")
+        else:
+            # Leader exits immediately: wait for it so completion precedence is
+            # deterministic — the leader has already exited before production
+            # computes its prompt deadline, while the descendant still owns the
+            # output pipes. Generous budget: a cold interpreter start under load
+            # can blow past a 1 s wait, and TimeoutExpired here would surface
+            # upstream as a bogus stop_reason="error".
+            process.wait(timeout=30.0)
         spawned.append(process)
         return process
 
@@ -273,7 +304,12 @@ def test_cli_watchdog_kills_descendant_that_inherits_stdout(
 
     observed: list[object] = []
     completed_without_external_kill = False
-    prompt_timeout = 0.2 if leader_tail else 1e-9
+    # leader-running: keep the deadline loose. The point of this case is the
+    # watchdog/group-kill path (leader + descendant ignore SIGTERM, the group
+    # is SIGKILLed and the pipes converge), not prompt-timeout precision — a
+    # tight 0.2 s deadline gambles on thread scheduling for the reader to win
+    # one readline() before the watchdog fires, which is load-dependent.
+    prompt_timeout = 2.0 if leader_tail else 1e-9
     try:
         with ExitStack() as stack:
             for patcher in patches:
@@ -285,16 +321,16 @@ def test_cli_watchdog_kills_descendant_that_inherits_stdout(
                 daemon=True,
             )
             worker.start()
-            worker.join(timeout=1.5)
+            worker.join(timeout=10.0)
             completed_without_external_kill = not worker.is_alive()
     finally:
         for process in spawned:
             with suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
             with suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=1)
+                process.wait(timeout=30.0)
         if "worker" in locals() and worker.is_alive():
-            worker.join(timeout=1)
+            worker.join(timeout=10.0)
 
     assert requested_new_session == [True]
     assert completed_without_external_kill
