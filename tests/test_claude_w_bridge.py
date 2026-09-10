@@ -11,6 +11,7 @@ The ``claude_w`` mode is a sibling of ``claude``:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.acp.startup_utils import AcpRetryStarter, StartupBackend, select_startup_backend
@@ -196,3 +197,50 @@ def test_claude_w_registered_as_provider_but_hidden_from_tools_list() -> None:
         name = getattr(tool, "name", tool)
         listed.add(str(name).strip().lower())
     assert "claude_w" not in listed
+
+
+# ── model-card activation path ─────────────────────────────────────
+
+
+def test_model_card_activation_accepts_claude_w_tool() -> None:
+    """Regression: selecting a model on the /claude-w card used to fail with
+    "不支持的 ACP 工具: claude_w" because the activation handler map omitted it."""
+    from src.feishu.handlers.system import SystemHandler
+
+    project = ProjectContext(
+        project_id="p1",
+        project_name="n",
+        root_path="/tmp",
+    )
+    project.acp_tool_name = "claude_w"
+
+    manager = MagicMock()
+    fresh_session = SimpleNamespace(session_id="fresh-session")
+    manager.get_session.side_effect = [None, fresh_session]
+
+    handler = MagicMock()
+    handler._get_session_manager.return_value = manager
+    handler.enter_mode.return_value = True
+
+    system = SystemHandler.__new__(SystemHandler)
+    system.ctx = SimpleNamespace(project_manager=MagicMock())
+    system.get_handler = MagicMock(return_value=handler)
+    system.reply_error = MagicMock()
+
+    effect = system._enter_mode_with_acp_model(
+        "selector",
+        "chat-1",
+        "claude_w",
+        None,
+        project,
+    )
+
+    # No "unsupported tool" error must be emitted.
+    system.reply_error.assert_not_called()
+    handler.enter_mode.assert_called_once()
+    enter_kwargs = handler.enter_mode.call_args.kwargs
+    assert enter_kwargs["silent"] is True
+    assert effect is not None
+    assert getattr(effect, "session", None) is fresh_session
+    assert getattr(effect, "changed", None) is True
+

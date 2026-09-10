@@ -1250,6 +1250,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         _TOOL_HANDLER_MAP = (
             "coco",
             "claude",
+            "claude_w",
             "aiden",
             "codex",
             "gemini",
