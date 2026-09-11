@@ -13,6 +13,7 @@ class InteractionMode(Enum):
     CLAUDE_W = "claude_w"
     AIDEN = "aiden"
     CODEX = "codex"
+    CODEX_W = "codex_w"
     GEMINI = "gemini"
     TRAEX = "traex"
     GROK = "grok"
@@ -27,6 +28,7 @@ PROGRAMMING_MODES: frozenset[InteractionMode] = frozenset(
         InteractionMode.CLAUDE_W,
         InteractionMode.AIDEN,
         InteractionMode.CODEX,
+        InteractionMode.CODEX_W,
         InteractionMode.GEMINI,
         InteractionMode.TRAEX,
         InteractionMode.GROK,
@@ -209,6 +211,10 @@ class ModeManager:
         """进入 Codex 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.CODEX, auto=auto, project_id=project_id)
 
+    def enter_codex_w_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
+        """进入 Codex-W 桥接模式。"""
+        return self.enter_programming_mode(chat_id, InteractionMode.CODEX_W, auto=auto, project_id=project_id)
+
     def enter_gemini_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
         """进入 Gemini 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.GEMINI, auto=auto, project_id=project_id)
@@ -253,6 +259,10 @@ class ModeManager:
         """判断当前是否为 Codex 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.CODEX
 
+    def is_codex_w_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
+        """判断当前是否为 Codex-W 桥接模式。"""
+        return self.get_mode(chat_id, project_id) == InteractionMode.CODEX_W
+
     def is_gemini_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断当前是否为 Gemini 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.GEMINI
@@ -292,6 +302,7 @@ class ModeManager:
             InteractionMode.CLAUDE_W: "🪄 Claude-W 编程模式",
             InteractionMode.AIDEN: "🎯 Aiden 编程模式",
             InteractionMode.CODEX: "⚡ Codex 编程模式",
+            InteractionMode.CODEX_W: "🌩️ Codex-W 编程模式",
             InteractionMode.GEMINI: "✨ Gemini 编程模式",
             InteractionMode.TRAEX: "🚀 Traex 编程模式",
             InteractionMode.GROK: "🌌 Grok 编程模式",

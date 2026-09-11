@@ -53,6 +53,7 @@ class HandlerContext:
     claude_w_manager: "ACPSessionManager"
     aiden_manager: "ACPSessionManager"
     codex_manager: "ACPSessionManager"
+    codex_w_manager: "ACPSessionManager"
     gemini_manager: "ACPSessionManager"
     traex_manager: "ACPSessionManager"
     grok_manager: "ACPSessionManager"

@@ -55,6 +55,7 @@ _MODE_DISPLAY: dict[str, tuple[str, str]] = {
     "claude_w": ("🪄", "Claude-W"),
     "aiden": ("⚡", "Aiden"),
     "codex": ("📝", "Codex"),
+    "codex_w": ("🌩️", "Codex-W"),
     "gemini": ("💎", "Gemini"),
     "traex": ("🚀", "Traex"),
     "grok": ("🌌", "Grok"),

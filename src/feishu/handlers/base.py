@@ -900,6 +900,7 @@ class BaseHandler:
             InteractionMode.CLAUDE_W: ContextSourceMode.CLAUDE_W,
             InteractionMode.AIDEN: ContextSourceMode.AIDEN,
             InteractionMode.CODEX: ContextSourceMode.CODEX,
+            InteractionMode.CODEX_W: ContextSourceMode.CODEX_W,
             InteractionMode.GEMINI: ContextSourceMode.GEMINI,
             InteractionMode.TRAEX: ContextSourceMode.TRAEX,
             InteractionMode.GROK: ContextSourceMode.GROK,

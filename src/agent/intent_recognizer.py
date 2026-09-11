@@ -21,6 +21,7 @@ class IntentType(Enum):
     EXIT_AIDEN = "exit_aiden"
     ENTER_CODEX = "enter_codex"
     EXIT_CODEX = "exit_codex"
+    ENTER_CODEX_W = "enter_codex_w"
     ENTER_GEMINI = "enter_gemini"
     EXIT_GEMINI = "exit_gemini"
     ENTER_TRAEX = "enter_traex"
@@ -36,6 +37,7 @@ class IntentType(Enum):
     CLAUDE_W_MESSAGE = "claude_w_message"
     AIDEN_MESSAGE = "aiden_message"
     CODEX_MESSAGE = "codex_message"
+    CODEX_W_MESSAGE = "codex_w_message"
     GEMINI_MESSAGE = "gemini_message"
     TRAEX_MESSAGE = "traex_message"
     GROK_MESSAGE = "grok_message"
@@ -142,6 +144,7 @@ class IntentRecognizer:
         "exit_aiden": IntentType.EXIT_AIDEN,
         "enter_codex": IntentType.ENTER_CODEX,
         "exit_codex": IntentType.EXIT_CODEX,
+        "enter_codex_w": IntentType.ENTER_CODEX_W,
         "enter_gemini": IntentType.ENTER_GEMINI,
         "exit_gemini": IntentType.EXIT_GEMINI,
         "enter_traex": IntentType.ENTER_TRAEX,
@@ -154,6 +157,7 @@ class IntentRecognizer:
         "claude_message": IntentType.CLAUDE_MESSAGE,
         "aiden_message": IntentType.AIDEN_MESSAGE,
         "codex_message": IntentType.CODEX_MESSAGE,
+        "codex_w_message": IntentType.CODEX_W_MESSAGE,
         "gemini_message": IntentType.GEMINI_MESSAGE,
         "traex_message": IntentType.TRAEX_MESSAGE,
         "grok_message": IntentType.GROK_MESSAGE,
@@ -200,6 +204,8 @@ class IntentRecognizer:
         "/enter_codex": (IntentType.ENTER_CODEX, "进入 Codex 编程模式"),
         "/end_codex": (IntentType.EXIT_CODEX, "退出 Codex 编程模式"),
         "/exit_codex": (IntentType.EXIT_CODEX, "退出 Codex 编程模式"),
+        "/codex-w": (IntentType.ENTER_CODEX_W, "进入 Codex-W 桥接模式"),
+        "/enter_codex_w": (IntentType.ENTER_CODEX_W, "进入 Codex-W 桥接模式"),
         "/gemini": (IntentType.ENTER_GEMINI, "进入 Gemini 编程模式"),
         "/enter_gemini": (IntentType.ENTER_GEMINI, "进入 Gemini 编程模式"),
         "/end_gemini": (IntentType.EXIT_GEMINI, "退出 Gemini 编程模式"),
@@ -218,6 +224,8 @@ class IntentRecognizer:
         "/quit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/end_claude_w": (IntentType.EXIT_MODE, "退出 Claude-W 桥接模式"),
         "/exit_claude_w": (IntentType.EXIT_MODE, "退出 Claude-W 桥接模式"),
+        "/end_codex_w": (IntentType.EXIT_MODE, "退出 Codex-W 桥接模式"),
+        "/exit_codex_w": (IntentType.EXIT_MODE, "退出 Codex-W 桥接模式"),
         "/projects": (IntentType.LIST_PROJECTS, "查看项目列表"),
         "/switch": (IntentType.SWITCH_PROJECT, "切换项目（打开项目看板）"),
         "/project": (IntentType.PROJECT_STATUS, "查看当前项目"),
@@ -974,6 +982,8 @@ class IntentRecognizer:
             return IntentType.AIDEN_MESSAGE
         elif current_mode == "codex":
             return IntentType.CODEX_MESSAGE
+        elif current_mode == "codex_w":
+            return IntentType.CODEX_W_MESSAGE
         elif current_mode == "gemini":
             return IntentType.GEMINI_MESSAGE
         elif current_mode == "traex":

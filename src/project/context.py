@@ -82,6 +82,9 @@ class ProjectContext:
     codex_session_snapshot: Optional[SessionSnapshot] = None
     codex_mode: bool = False
 
+    codex_w_session_snapshot: Optional[SessionSnapshot] = None
+    codex_w_mode: bool = False
+
     gemini_session_snapshot: Optional[SessionSnapshot] = None
     gemini_mode: bool = False
 
@@ -258,6 +261,7 @@ class ProjectContext:
         "claude_w": ("claude_w_mode", "claude_w_session_snapshot"),
         "aiden": ("aiden_mode", "aiden_session_snapshot"),
         "codex": ("codex_mode", "codex_session_snapshot"),
+        "codex_w": ("codex_w_mode", "codex_w_session_snapshot"),
         "gemini": ("gemini_mode", "gemini_session_snapshot"),
         "traex": ("traex_mode", "traex_session_snapshot"),
         "grok": ("grok_mode", "grok_session_snapshot"),
@@ -427,6 +431,12 @@ class ProjectContext:
     def update_codex_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
         self.update_programming_snapshot("codex", query, query_count, session_id)
 
+    def set_codex_w_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
+        self.set_programming_mode("codex_w", enabled, session_id, query_count)
+
+    def update_codex_w_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
+        self.update_programming_snapshot("codex_w", query, query_count, session_id)
+
     def set_gemini_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
         self.set_programming_mode("gemini", enabled, session_id, query_count)
 
@@ -541,6 +551,7 @@ class ProjectContext:
             claude_w_mode=data.get("claude_w_mode", False),
             aiden_mode=data.get("aiden_mode", False),
             codex_mode=data.get("codex_mode", False),
+            codex_w_mode=data.get("codex_w_mode", False),
             gemini_mode=data.get("gemini_mode", False),
             traex_mode=data.get("traex_mode", False),
             grok_mode=data.get("grok_mode", False),

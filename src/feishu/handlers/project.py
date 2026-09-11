@@ -137,6 +137,17 @@ class ProjectHandler(BaseHandler):
                     session_snapshot={"data": session.to_snapshot(), "source_mode": ContextSourceMode.CLAUDE_W.value},
                     chat_id=chat_id,
                 )
+        elif current_mode == InteractionMode.CODEX_W:
+            session = self.ctx.codex_w_manager.get_session(chat_id, project_id=pid)
+            if session:
+                project.update_codex_w_snapshot(
+                    query=session.last_query, query_count=session.message_count, session_id=session.session_id
+                )
+                self.context_manager.update_context(
+                    pid,
+                    session_snapshot={"data": session.to_snapshot(), "source_mode": ContextSourceMode.CODEX_W.value},
+                    chat_id=chat_id,
+                )
 
     def restore_project_context(self, project: "ProjectContext", *, chat_id: str = "") -> dict:
         ctx = self.context_manager.store.get(project.project_id, chat_id=chat_id)

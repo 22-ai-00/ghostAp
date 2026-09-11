@@ -393,6 +393,7 @@ class ProgrammingModeHandler(BaseHandler):
         (InteractionMode.CLAUDE_W, "is_claude_w_mode", "claude_w"),
         (InteractionMode.AIDEN, "is_aiden_mode", "aiden"),
         (InteractionMode.CODEX, "is_codex_mode", "codex"),
+        (InteractionMode.CODEX_W, "is_codex_w_mode", "codex_w"),
         (InteractionMode.GEMINI, "is_gemini_mode", "gemini"),
         (InteractionMode.TRAEX, "is_traex_mode", "traex"),
         (InteractionMode.GROK, "is_grok_mode", "grok"),
@@ -2278,6 +2279,15 @@ class CodexModeHandler(ProgrammingModeHandler):
     mode_key = "codex"
     context_source = ContextSourceMode.CODEX
     thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="⚡", name="Codex")
+
+
+class CodexWModeHandler(CodexModeHandler):
+    mode_name = "Codex-W"
+    mode_emoji = "🌩️"
+    interaction_mode = InteractionMode.CODEX_W
+    mode_key = "codex_w"
+    context_source = ContextSourceMode.CODEX_W
+    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🌩️", name="Codex-W")
 
 
 class GeminiModeHandler(ProgrammingModeHandler):

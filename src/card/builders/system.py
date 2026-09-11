@@ -345,6 +345,7 @@ class SystemBuilder:
             "claude cli": "Claude CLI",
             "aiden": "Aiden",
             "codex": "Codex",
+            "codex_w": "Codex-W",
             "gemini": "Gemini",
         }
         raw = str(mode or "").strip()
