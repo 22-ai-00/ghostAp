@@ -1111,3 +1111,4 @@
 - **watchdog 继承管道 flaky 修复** — 测试时序赌博（deadline 早于解释器冷启动、barrier 1s 被打满 CPU 突破）；marker 就绪屏障 + 预算放宽；压测复现法（yes 打满 + 并行 pytest）→ [2026-09-10.md](2026-09-10.md)
 - **/claude-w 激活映射修复** — 新增同构工具须同步第三处：system.py `_TOOL_HANDLER_MAP` 硬编码工具→handler 分发，漏登记则模型卡点选报"不支持的 ACP 工具" → [2026-09-10.md](2026-09-10.md)
 - **Claude reasoning effort 复合值** — `base[1m]/effort` 原样存 acp_model_name；`claude_selection.py` SSOT + default 双哨兵（伪 base 不传 --model、default effort 不传 --effort）；helper 静态合成矩阵免探测；capabilities 只作用 base 段使 1M/env/门禁正交感知；CLI 每 prompt 重传 --effort（含 resume）；hire 路径同覆盖 claude/claude_w → [2026-09-10.md](2026-09-10.md)
+- **隐藏命令 /codex-w** — 与 /claude-w 对称的 codex-w CLI 桥接；-c 覆盖必须在 exec 之前否则 HTTP 400；同构模式第 4 同步点=测试自建 handlers 字典需补 action_registry 键 → [2026-09-11.md](2026-09-11.md)
