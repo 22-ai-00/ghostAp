@@ -24,7 +24,7 @@ def validate_employee_model_components(
     """Validate the typed persistence contract before anchoring a hire."""
     normalized_tool = str(tool or "").strip().casefold()
     selected_model = str(model or "").strip()
-    if normalized_tool == "codex":
+    if normalized_tool in {"codex", "codex_w"}:
         _, embedded_effort = split_codex_model_selection(selected_model)
         if embedded_effort:
             raise ValueError("Codex model must not include an effort suffix")
@@ -51,7 +51,7 @@ def compose_employee_model_selection(
     selected_model = str(model or "").strip()
     selected_profile = str(profile or "standard").strip().casefold()
     selected_effort = str(effort or "").strip().casefold()
-    if normalized_tool == "codex":
+    if normalized_tool in {"codex", "codex_w"}:
         if selected_profile not in {"", "default", "standard"}:
             raise ValueError("Codex ACP does not support employee profiles")
         if selected_effort not in {"", "default", *CODEX_REASONING_EFFORTS}:

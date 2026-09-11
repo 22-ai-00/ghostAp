@@ -278,12 +278,29 @@ class AcpRetryStarter:
         cli_session_cls: Any,
     ) -> Any:
         if backend == StartupBackend.CLI:
-            from ..agent_session.backend_resolver import cli_command_for_agent
+            from ..agent_session.backend_resolver import (
+                cli_command_for_agent,
+                is_codex_cli_backend,
+            )
+
+            command = cli_command_for_agent(agent_type)
+            if is_codex_cli_backend(agent_type):
+                from ..agent_session.codex_cli import (
+                    CodexCLIConfig,
+                    SyncCodexCLISession,
+                )
+
+                return SyncCodexCLISession(
+                    cwd=cwd or ".",
+                    config=CodexCLIConfig(command=command),
+                    model_name=model_name,
+                )
+
             from ..agent_session.claude_cli import ClaudeCLIConfig
 
             return cli_session_cls(
                 cwd=cwd or ".",
-                config=ClaudeCLIConfig(command=cli_command_for_agent(agent_type)),
+                config=ClaudeCLIConfig(command=command),
                 model_name=model_name,
             )
         if model_name:

@@ -17,6 +17,28 @@ CODEX_REASONING_EFFORTS = frozenset(
     }
 )
 
+#: Ordered effort levels for the static codex-w CLI bridge catalog.  Mirrors the
+#: ascending ladder exposed by the Codex CLI/gateway (the ACP path instead reads
+#: the order straight from the backend's config options).
+CODEX_REASONING_EFFORT_ORDER: tuple[str, ...] = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
+
+#: Pseudo-model meaning "CLI/gateway default model": the codex-w bridge omits
+#: the model override entirely and lets the wrapper keep its own selection.
+CODEX_DEFAULT_MODEL_TOKEN = "default"
+
+#: Sentinel effort shown in the card dropdown for "do not pass an effort
+#: override" (inherit ~/.codex/config.toml).
+CODEX_DEFAULT_EFFORT_TOKEN = "default"
+
 
 def split_codex_model_selection(
     value: Optional[str],

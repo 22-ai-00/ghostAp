@@ -12,8 +12,13 @@ from typing import Callable, Optional
 from ..acp.providers import normalize_acp_model_name
 from ..config import get_settings
 from ..utils.errors import get_error_detail
-from .backend_resolver import cli_command_for_agent, is_cli_backend
+from .backend_resolver import (
+    cli_command_for_agent,
+    is_cli_backend,
+    is_codex_cli_backend,
+)
 from .claude_cli import ClaudeCLIConfig, SyncClaudeCLISession
+from .codex_cli import CodexCLIConfig, SyncCodexCLISession
 from .protocol import SyncSession
 from .wrappers import ModelFailureAwareSession, RateLimitAwareSession
 
@@ -46,7 +51,7 @@ def current_employee_session_environment() -> dict[str, str] | None:
 
 
 def _normalize_model(agent_type: str, model_name: str | None) -> str | None:
-    if not model_name or agent_type in {"claude", "claude_w", "traex"}:
+    if not model_name or agent_type in {"claude", "claude_w", "codex_w", "traex"}:
         return model_name
     normalized = normalize_acp_model_name(agent_type, model_name)
     if normalized != model_name:
@@ -101,15 +106,23 @@ def _start_base_session(
     """Start exactly one CLI or ACP transport with shared startup arguments."""
     if is_cli_backend(agent_type):
         command = cli_command_for_agent(agent_type)
-        cli_kwargs: dict[str, object] = {}
-        if command != "claude":
-            cli_kwargs["config"] = ClaudeCLIConfig(command=command)
-        session: SyncSession = SyncClaudeCLISession(
-            cwd=cwd,
-            model_name=model_name,
-            employee_process_env=employee_env,
-            **cli_kwargs,
-        )
+        if is_codex_cli_backend(agent_type):
+            session: SyncSession = SyncCodexCLISession(
+                cwd=cwd,
+                model_name=model_name,
+                employee_process_env=employee_env,
+                config=CodexCLIConfig(command=command),
+            )
+        else:
+            cli_kwargs: dict[str, object] = {}
+            if command != "claude":
+                cli_kwargs["config"] = ClaudeCLIConfig(command=command)
+            session = SyncClaudeCLISession(
+                cwd=cwd,
+                model_name=model_name,
+                employee_process_env=employee_env,
+                **cli_kwargs,
+            )
         session.start()
         return session
 

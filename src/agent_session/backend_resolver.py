@@ -5,13 +5,25 @@ from __future__ import annotations
 # Agent types that bridge to a local shell CLI instead of speaking ACP.
 # ``claude``    → the ``claude`` executable
 # ``claude_w``  → the separate ``claude-w`` executable (hidden /claude-w command)
-CLI_BACKEND_AGENTS: frozenset[str] = frozenset({"claude", "claude_w"})
+# ``codex_w``   → the separate ``codex-w`` executable (hidden /codex-w command)
+CLI_BACKEND_AGENTS: frozenset[str] = frozenset({"claude", "claude_w", "codex_w"})
 
 # agent_type → shell executable name used to spawn the CLI bridge.
 CLI_COMMAND_FOR_AGENT: dict[str, str] = {
     "claude": "claude",
     "claude_w": "claude-w",
+    "codex_w": "codex-w",
 }
+
+# CLI agent types grouped by their argument/session family. ``codex exec`` uses
+# a different subcommand/resume/option shape than ``claude -p``, so factory and
+# startup code select the concrete session class from this grouping.
+CODEX_CLI_BACKEND_AGENTS: frozenset[str] = frozenset({"codex_w"})
+
+
+def is_codex_cli_backend(agent_type: str) -> bool:
+    """Shorthand: does this agent type bridge to a Codex-style shell CLI?"""
+    return agent_type.lower().strip() in CODEX_CLI_BACKEND_AGENTS
 
 
 def is_cli_backend(agent_type: str) -> bool:

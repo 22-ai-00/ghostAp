@@ -30,7 +30,14 @@ from .dsh_selection import (
     decode_dsh_model_value,
     decode_dsh_reasoning_value,
 )
-from .model_selection import CODEX_REASONING_EFFORTS, compose_codex_model_selection
+from .model_selection import (
+    CODEX_DEFAULT_EFFORT_TOKEN,
+    CODEX_DEFAULT_MODEL_TOKEN,
+    CODEX_REASONING_EFFORT_ORDER,
+    CODEX_REASONING_EFFORTS,
+    compose_codex_model_selection,
+    split_codex_model_selection,
+)
 from .options import ACPModelOption, ACPModelSelectionVariant, ACPToolOption
 from .providers import get_providers, tool_registry
 from .traex_selection import (
@@ -42,10 +49,22 @@ from .transport import LateFrameTolerantMessageQueue
 
 logger = logging.getLogger(__name__)
 
-_TOOLS = ("coco", "claude", "claude_w", "aiden", "codex", "gemini", "traex", "grok", "dsh")
+_TOOLS = (
+    "coco",
+    "claude",
+    "claude_w",
+    "aiden",
+    "codex",
+    "codex_w",
+    "gemini",
+    "traex",
+    "grok",
+    "dsh",
+)
 # Tools hidden from auto-discovered listings (e.g. /tools panel) but still
-# fully routable when invoked explicitly — see the hidden /claude-w command.
-_HIDDEN_TOOLS = frozenset({"claude_w"})
+# fully routable when invoked explicitly — see the hidden /claude-w and
+# /codex-w bridge commands.
+_HIDDEN_TOOLS = frozenset({"claude_w", "codex_w"})
 _PROBE_TTL = 1800.0
 _CODEX_PROBE_TTL = 1800.0
 _NEGATIVE_TTL = 300.0
@@ -281,6 +300,62 @@ def _claude_cli_fallback(current_model: str | None) -> list[ACPModelOption]:
                 or (base == CLAUDE_DEFAULT_MODEL_TOKEN and saved_base is None),
                 selection_variants=tuple(variants),
                 reasoning_efforts=CLAUDE_REASONING_EFFORTS,
+            )
+        )
+    return options
+
+
+def _codex_cli_fallback(current_model: str | None) -> list[ACPModelOption]:
+    """Synthetic effort dimension for the local ``codex-w`` CLI.
+
+    Mirrors :func:`_claude_cli_fallback`: the codex-w bridge speaks no ACP
+    catalog, so the model card would render plain buttons and reasoning effort
+    could never be chosen.  The Codex CLI accepts a static effort ladder (see
+    :data:`CODEX_REASONING_EFFORT_ORDER`), hence we synthesise:
+
+    - one pseudo-model :data:`CODEX_DEFAULT_MODEL_TOKEN` meaning "let the
+      codex-w gateway wrapper pick the model" (the bridge then omits the model
+      override);
+    - plus the saved explicit base (if any), so a stored ``model/effort``
+      selection round-trips;
+    - every base gets a "default effort" variant (override omitted) plus one
+      variant per supported level.
+
+    The matrix is static and never depends on probing.
+    """
+    saved_base, saved_effort = split_codex_model_selection(current_model)
+    bases: list[str] = [CODEX_DEFAULT_MODEL_TOKEN]
+    if saved_base and saved_base != CODEX_DEFAULT_MODEL_TOKEN:
+        bases.append(saved_base)
+
+    options: list[ACPModelOption] = []
+    for base in bases:
+        variants: list[ACPModelSelectionVariant] = [
+            ACPModelSelectionVariant(
+                name=base,
+                model=base,
+                effort=CODEX_DEFAULT_EFFORT_TOKEN,
+                is_default=(base == saved_base and saved_effort is None)
+                or (base == CODEX_DEFAULT_MODEL_TOKEN and saved_base is None),
+            )
+        ]
+        for level in CODEX_REASONING_EFFORT_ORDER:
+            variants.append(
+                ACPModelSelectionVariant(
+                    name=compose_codex_model_selection(base, level),
+                    model=base,
+                    effort=level,
+                    is_default=base == saved_base and level == saved_effort,
+                )
+            )
+        options.append(
+            ACPModelOption(
+                name=base,
+                description=base,
+                is_default=base == saved_base
+                or (base == CODEX_DEFAULT_MODEL_TOKEN and saved_base is None),
+                selection_variants=tuple(variants),
+                reasoning_efforts=CODEX_REASONING_EFFORT_ORDER,
             )
         )
     return options
@@ -696,12 +771,15 @@ def fetch_acp_models(
     # CLI backends do not expose an ACP session model catalog.  The Claude
     # Code CLI (and the claude-w sibling) accepts a static --effort set, so
     # synthesise a base[1m]/effort dimension rather than a bare saved value;
-    # other CLI tools preserve just the saved explicit model.  An empty
-    # result represents the backend default without spawning an unsupported
-    # ACP server process.
-    from ..agent_session.backend_resolver import is_cli_backend
+    # the codex-w bridge accepts a model + model_reasoning_effort pair and gets
+    # its own matrix.  Other CLI tools preserve just the saved explicit model.
+    # An empty result represents the backend default without spawning an
+    # unsupported ACP server process.
+    from ..agent_session.backend_resolver import is_cli_backend, is_codex_cli_backend
 
     if is_cli_backend(tool):
+        if is_codex_cli_backend(tool):
+            return _codex_cli_fallback(current_model)
         return _claude_cli_fallback(current_model)
 
     key = _key(tool, cwd)

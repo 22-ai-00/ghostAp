@@ -458,6 +458,15 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
                 help_blob_loader=_codex_help_loader,
             ),
             _ProviderConfig(
+                tool_name="codex_w",
+                serve_args=["acp", "serve"],
+                # Bridges to the separate local ``codex-w`` executable; it runs
+                # over the CLI transport (``codex exec``), never ACP serve. The
+                # composite model/effort value is passed through untouched.
+                availability_checker=_make_resolve_checker("codex-w"),
+                model_style="model_long",
+            ),
+            _ProviderConfig(
                 tool_name="gemini",
                 serve_args=["--acp"],
                 availability_checker=_gemini_checker,
