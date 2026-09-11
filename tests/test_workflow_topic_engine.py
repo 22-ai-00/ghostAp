@@ -47,6 +47,7 @@ def _make_handler_context(**settings_overrides) -> HandlerContext:
         claude_w_manager=mock(),
         aiden_manager=mock(),
         codex_manager=mock(),
+        codex_w_manager=mock(),
         gemini_manager=mock(),
         traex_manager=mock(),
         grok_manager=mock(),

@@ -56,11 +56,13 @@ def _context(backend: str, manager) -> HandlerContext:
     managers = {name: MagicMock() for name, _handler, _model in BACKENDS}
     managers[backend] = manager
     managers["claude_w"] = MagicMock()
+    managers["codex_w"] = MagicMock()
     mode_manager = MagicMock()
     mode_manager.get_mode.return_value = InteractionMode.SMART
     for name, _handler, _model in BACKENDS:
         getattr(mode_manager, f"is_{name}_mode").return_value = False
     mode_manager.is_claude_w_mode.return_value = False
+    mode_manager.is_codex_w_mode.return_value = False
     project_manager = MagicMock()
     project_manager.get_active_project.return_value = None
     project_manager.validate_project_path.return_value = (True, "")
@@ -81,6 +83,7 @@ def _context(backend: str, manager) -> HandlerContext:
         claude_w_manager=managers["claude_w"],
         aiden_manager=managers["aiden"],
         codex_manager=managers["codex"],
+        codex_w_manager=managers["codex_w"],
         gemini_manager=managers["gemini"],
         traex_manager=managers["traex"],
         grok_manager=managers["grok"],
@@ -1292,6 +1295,7 @@ def test_typed_programming_exit_routes_through_the_system_fence() -> None:
         "coco": MagicMock(),
         "claude_w": MagicMock(),
         "codex": codex,
+        "codex_w": MagicMock(),
     }
     client = SimpleNamespace(
         _handler_ctx=SimpleNamespace(handlers=handlers),
@@ -1879,6 +1883,7 @@ def test_pure_enter_intent_uses_selector_but_pending_task_stays_automatic(
         name: MagicMock() for name, _handler_type, _model in BACKENDS
     }
     handlers["claude_w"] = MagicMock()
+    handlers["codex_w"] = MagicMock()
     handlers.update(
         system=system,
         project=MagicMock(),
@@ -1946,6 +1951,7 @@ def _action_registry_client(project, system):
         name: MagicMock() for name, _handler_type, _model in BACKENDS
     }
     handlers["claude_w"] = MagicMock()
+    handlers["codex_w"] = MagicMock()
     handlers.update(
         system=system,
         project=MagicMock(),
@@ -2366,6 +2372,7 @@ def test_model_selector_card_action_flow_patches_one_card_and_finishes_atomicall
         name: MagicMock() for name, _handler_type, _model in BACKENDS
     }
     handlers["claude_w"] = MagicMock()
+    handlers["codex_w"] = MagicMock()
     codex = handlers["codex"]
     codex.current_model = "gpt-5.6-sol/ultra"
     session_manager = MagicMock()

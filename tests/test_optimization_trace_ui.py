@@ -179,6 +179,7 @@ class TestOptimizationTraceUI(unittest.TestCase):
                 "claude_w",
                 "aiden",
                 "codex",
+                "codex_w",
                 "gemini",
                 "traex",
                 "grok",
