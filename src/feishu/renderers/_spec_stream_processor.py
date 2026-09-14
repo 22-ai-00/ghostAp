@@ -11,19 +11,16 @@ import logging
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from ...acp import ACPEventType
-from ...card.events import CardEvent, card_event_from_acp
-from ...card.orchestrator import (
-    UNCONFIRMED_SUBAGENT_SUMMARY,
-    TaskOrchestrator,
-)
+from ...card.events import CardEvent
 from ...card.render.budget import RenderBudget
 from ...card.render.build_heartbeat import BuildHeartbeat
 from ...card.render.throttle import StreamThrottle
+from ...card.spec_adapter import SpecCardSession
 from ...card.state.models import CardMetadata
-from ...card.stream_bridge import ACPStreamBridge
 from ...card.ui_text import UI_TEXT
 from ...spec_engine import SpecEngineCallbacks
 from ...spec_engine.artifact_display import build_plan_display_payload, build_task_display_payloads
+from ...spec_engine.artifacts import parse_spec_artifact
 from ...spec_engine.models import (
     ReviewResult,
     SpecCycle,
@@ -116,97 +113,26 @@ class SpecStreamProcessor(BaseStreamProcessor):
         self._footer_status: Optional[str] = None
         self._last_phase_content: str = ""
         self._current_cycle: int = 0
-        # Rotation guard: minimum dispatched events before allowing rotation
-        self._events_since_rotation: int = 0
         # Build phase tool tracking
         self._build_tool_count: int = 0
         self._build_file_set: set[str] = set()
         self._build_tool_ids: set[str] = set()
-        self._build_started_tool_ids: set[str] = set()
         self._build_heartbeat: BuildHeartbeat | None = None
 
-        # TaskOrchestrator for optional task-level cards within a Spec cycle's Build phase
-        def _task_session_creator(task_id: str):
-            from dataclasses import replace as _replace
-            task_item = self._orchestrator.registry.get(task_id)
-            task_label = task_item.name if task_item else task_id
-            task_metadata = _replace(
-                metadata,
-                unit_kind="task",
-                unit_label=task_label,
-                unit_id=task_id,
-                iteration_index=self._current_cycle or None,
-                iteration_total=self._max_cycles or None,
+        def session_factory(next_metadata):
+            return renderer.create_session(
+                chat_id, message_id, next_metadata, hooks=hooks, budget=budget,
+                ttl_seconds=float(renderer.settings.spec_execution_timeout),
             )
-            return renderer.create_session(chat_id, message_id, task_metadata, hooks=hooks, budget=budget)
 
-        from ...config import get_settings
-        self._multi_card_enabled = get_settings().card.task_level_cards_enabled
-
-        self._orchestrator = TaskOrchestrator.from_settings(
-            chat_id=chat_id,
-            session_creator=_task_session_creator,
-            thinking_session=self._rotator,
-            bridge_class=lambda session: ACPStreamBridge(
-                session,
-                image_uploader=self._image_uploader,
-            ),
+        self._rotator = SpecCardSession(
+            rotator.current,
+            budget=budget,
+            base_metadata=metadata,
+            image_uploader=self._image_uploader,
+            session_factory=session_factory,
         )
-
-    # ------------------------------------------------------------------
-    # Private helpers (previously nested closures)
-    # ------------------------------------------------------------------
-
-    # Minimum events before allowing a card rotation (prevents ultra-short cards)
-    _MIN_EVENTS_BEFORE_ROTATION: int = 3
-
-    def _rotate_session(self, cycle_num: int) -> bool:
-        """Conditionally rotate to a new session at cycle boundary.
-
-        Skips rotation if the current session hasn't accumulated enough content
-        (prevents very short cards being sent). In that case, just continues on
-        the same session with a cycle_started event as visual separator.
-
-        Returns True if rotation was performed, False if skipped.
-        """
-        current_session = self._rotator.current
-        # Skip rotation if:
-        # 1. Session hasn't been delivered to Feishu yet (card doesn't exist), OR
-        # 2. Too few events have been dispatched since last rotation
-        if not current_session.delivered_message_id or self._events_since_rotation < self._MIN_EVENTS_BEFORE_ROTATION:
-            logger.debug(
-                "SpecStreamProcessor: skipping rotation for cycle %d "
-                "(delivered=%s, events_since=%d)",
-                cycle_num, bool(current_session.delivered_message_id),
-                self._events_since_rotation,
-            )
-            return False
-
-        cont_meta = self._renderer.build_unit_metadata(
-            self._metadata,
-            unit_id=str(cycle_num),
-            unit_kind="cycle",
-            unit_label=UI_TEXT["spec_cycle_label"].format(cycle_num=cycle_num),
-            iteration_index=cycle_num,
-            iteration_total=self._max_cycles or None,
-            continuation_seq=self._rotator.rotation_count + 1,
-        )
-        if self._renderer._pending_split_hint:
-            from dataclasses import replace
-            if isinstance(cont_meta, CardMetadata):
-                cont_meta = replace(cont_meta, bridge_phrase="续接：")
-            self._renderer._pending_split_hint = None
-        old_msg_id = self._rotator.current.delivered_message_id or self._message_id
-        renderer = self._renderer
-        chat_id = self._chat_id
-        hooks = self._hooks
-        budget = self._budget
-        self._rotator.rotate(
-            lambda: renderer.create_session(chat_id, old_msg_id, cont_meta, hooks=hooks, budget=budget)
-        )
-        self._stream_bridge.bind(self._rotator)
-        self._events_since_rotation = 0
-        return True
+        self._renderer._current_session = self._rotator
 
     def _get_engine_and_state(self) -> _EngineContext:
         """Return structured engine context."""
@@ -226,29 +152,23 @@ class SpecStreamProcessor(BaseStreamProcessor):
         self._dispatch_started_once()
         content = self._reporter.format_analyzing_start(requirement)
         self._rotator.dispatch(CardEvent.text_delta("_main", content))
-        self._events_since_rotation += 1
 
     def on_analyzing_done(self, spec_project: SpecProject) -> None:
         self._renderer.update_ui_state(self._spec_project_id, view_mode="status", view_context={})
         self._dispatch_started_once()
         content = self._reporter.format_analyzing_done(spec_project)
         self._rotator.dispatch(CardEvent.text_delta("_main", content))
-        self._events_since_rotation += 1
 
     def on_cycle_start(self, current: int, max_cycles: int) -> None:
         self._max_cycles = max_cycles
         self._current_cycle = current
         self._renderer.update_ui_state(self._spec_project_id, view_mode="status", view_context={})
         self._renderer.notify_cycle_change(current_cycle=current, perspective=None)
-        self._orchestrator.reset()
-        rotated = self._rotate_session(current)
-        if rotated:
-            self._rotator.dispatch(CardEvent.started())
+        self._rotator.begin_continuation_turn()
 
         _, spec_project, state, _ = self._get_engine_and_state()
 
         self._rotator.dispatch(CardEvent.cycle_started(current, max_cycles))
-        self._events_since_rotation += 1
 
         if spec_project:
             criteria_section = self._reporter.format_criteria_section(spec_project)
@@ -266,7 +186,7 @@ class SpecStreamProcessor(BaseStreamProcessor):
         self._renderer.update_ui_state(
             self._spec_project_id, view_mode="cycle_done", view_context={"cycle_num": cycle_num}
         )
-        self._stream_bridge.close_open_blocks()
+        self._rotator.begin_continuation_turn()
 
         _, spec_project, state, _ = self._get_engine_and_state()
         if spec_project:
@@ -326,7 +246,7 @@ class SpecStreamProcessor(BaseStreamProcessor):
 
     def on_project_done(self, spec_project: SpecProject) -> None:
         self._renderer.update_ui_state(self._spec_project_id, view_mode="status", view_context={})
-        self._stream_bridge.close_open_blocks()
+        self._rotator.begin_continuation_turn()
         content = self._reporter.format_project_done(spec_project)
         _dispatch_text_block(self._rotator, "_project_done", content)
 
@@ -337,39 +257,25 @@ class SpecStreamProcessor(BaseStreamProcessor):
             total_count=spec_project.total_criteria,
         ))
 
-        # Terminal event (hooks fire emoji automatically)
-        self._orchestrator.finalize_unfinished_subagents(
-            status="cancelled",
-            summary=UNCONFIRMED_SUBAGENT_SUMMARY,
-        )
+        self._stop_build_heartbeat()
         if spec_project.status.value == "completed":
-            self._orchestrator.close(terminal_status="completed")
-            self._rotator.dispatch(CardEvent.completed())
+            self._rotator.finish()
+        elif spec_project.status.value == "cancelled":
+            self._rotator.cancel(reason=UI_TEXT["card_project_failed"])
         else:
-            self._orchestrator.close(
-                terminal_status="failed",
-                summary=UI_TEXT["card_project_failed"],
-            )
-            self._rotator.dispatch(CardEvent.failed(UI_TEXT["card_project_failed"]))
+            self._rotator.fail(UI_TEXT["card_project_failed"])
         self._renderer._current_session = None
 
     def on_error(self, error: str) -> None:
         self._renderer.update_ui_state(
             self._spec_project_id, view_mode="error", view_context={"error": error}
         )
-
-        self._orchestrator.finalize_unfinished_subagents(
-            status="cancelled",
-            summary=UNCONFIRMED_SUBAGENT_SUMMARY,
-        )
-        self._orchestrator.close(
-            terminal_status="failed",
-            summary=error,
-        )
-
-        self._dispatch_failed(error)
+        self._stop_build_heartbeat()
+        self._rotator.fail(error)
+        self._renderer._current_session = None
 
     def on_phase_start(self, cycle_num: int, phase: SpecPhase) -> None:
+        self._rotator.begin_continuation_turn()
         self._acp_renderer.reset()
         self._footer_status = "tool_running"
         phase_name = phase.value if hasattr(phase, "value") else str(phase)
@@ -382,14 +288,12 @@ class SpecStreamProcessor(BaseStreamProcessor):
         self._rotator.dispatch(
             CardEvent.phase_started(cycle_num, phase_name, subtitle=subtitle, content=content)
         )
-        self._events_since_rotation += 1
 
         if phase == SpecPhase.BUILD:
             # Build phase: use tool panels, no text content needed
             self._build_tool_count = 0
             self._build_file_set = set()
             self._build_tool_ids = set()
-            self._build_started_tool_ids = set()
             self._start_build_heartbeat()
 
     def on_phase_event(self, cycle_num: int, phase: SpecPhase, event) -> None:
@@ -409,78 +313,20 @@ class SpecStreamProcessor(BaseStreamProcessor):
             activity = "tool_running" if self._footer_status == "tool_running" else "thinking"
             self._build_heartbeat.reset(activity)
 
-        # Codex child lifecycle is independent from whether the model emits a
-        # PLAN_UPDATE. Once a stable child source is registered, keep its text
-        # and thought stream on that child card in every Spec phase.
-        source_id = str(getattr(event, "source_id", "") or "").strip()
-        tool_call = getattr(event, "tool_call", None)
-        is_dynamic_agent_event = (
-            tool_call is not None
-            and TaskOrchestrator.is_agent_task_event(event)
-        )
-        is_bound_child_event = bool(
-            source_id and self._orchestrator.registry.get(source_id) is not None
-        )
         if (
-            is_dynamic_agent_event
-            or is_bound_child_event
+            phase in _STRUCTURED_ARTIFACT_PHASES
+            and event.event_type == ACPEventType.TEXT_CHUNK
+            and getattr(event, "source_id", "") in {None, "", "main"}
         ):
-            self._orchestrator.route_acp_event(event, self._stream_bridge)
             return
 
-        # SPEC/PLAN/TASK are structured artifact phases whose model output is
-        # intentionally JSON-like for parsing. Streaming those chunks verbatim
-        # makes the Feishu card unreadable; keep the raw output in the engine
-        # tracker/artifact path and render a concise phase summary on done.
-        if phase in _STRUCTURED_ARTIFACT_PHASES and event.event_type == ACPEventType.TEXT_CHUNK:
-            return
-
-        # Detect PLAN_UPDATE for optional task-level cards in BUILD phase
-        if self._multi_card_enabled and event.event_type == ACPEventType.PLAN_UPDATE and phase == SpecPhase.BUILD:
-            self._orchestrator.handle_plan_update(event, self._stream_bridge)
-
-        if phase == SpecPhase.BUILD:
-            # Build phase: route through orchestrator if multi-card enabled
-            if self._orchestrator.has_plan and not self._orchestrator.is_fallback_mode:
-                self._orchestrator.route_acp_event(event, self._stream_bridge)
-            else:
-                self._dispatch_build_event(event)
-        else:
-            self._stream_bridge.on_event(event)
-
-    def _dispatch_build_event(self, event) -> None:
-        """Dispatch Build-phase ACP events as native tool/plan CardEvents."""
-        if event.event_type == ACPEventType.IMAGE_CHUNK:
-            self._stream_bridge.on_event(event)
-            return
-        card_evt = card_event_from_acp(event)
-
-        if event.event_type == ACPEventType.TOOL_CALL_START:
-            self._mark_build_tool_started(event)
-            self._rotator.dispatch(card_evt)
+        self._rotator.on_event(event)
+        if phase == SpecPhase.BUILD and event.event_type in {
+            ACPEventType.TOOL_CALL_START,
+            ACPEventType.TOOL_CALL_UPDATE,
+            ACPEventType.TOOL_CALL_DONE,
+        }:
             self._dispatch_build_progress(event)
-            return
-
-        if event.event_type in (ACPEventType.TOOL_CALL_UPDATE, ACPEventType.TOOL_CALL_DONE):
-            self._dispatch_synthetic_tool_start_if_needed(event)
-            self._dispatch_build_progress(event)
-
-        self._rotator.dispatch(card_evt)
-
-    def _mark_build_tool_started(self, event) -> None:
-        tc = getattr(event, "tool_call", None)
-        tool_id = str(getattr(tc, "id", "") or "").strip()
-        if tool_id:
-            self._build_started_tool_ids.add(tool_id)
-
-    def _dispatch_synthetic_tool_start_if_needed(self, event) -> None:
-        tc = getattr(event, "tool_call", None)
-        tool_id = str(getattr(tc, "id", "") or "").strip()
-        if not tool_id or tool_id in self._build_started_tool_ids:
-            return
-        tool_name = str(getattr(tc, "title", "") or getattr(tc, "kind", "") or "Tool")
-        self._rotator.dispatch(CardEvent.tool_started(tool_id, tool_name, ""))
-        self._build_started_tool_ids.add(tool_id)
 
     def _dispatch_build_progress(self, event) -> None:
         tc = getattr(event, "tool_call", None)
@@ -558,7 +404,7 @@ class SpecStreamProcessor(BaseStreamProcessor):
         self._stop_build_heartbeat()
         _, spec_project, state, max_c = self._get_engine_and_state()
         self._footer_status = None
-        self._stream_bridge.close_open_blocks()
+        self._rotator.begin_continuation_turn()
         status_content = self._reporter.format_phase_done_content(cycle_num, phase, max_c, output)
         subtitle = self._reporter.format_phase_subtitle(cycle_num, max_c, phase, completed=True)
 
@@ -568,13 +414,23 @@ class SpecStreamProcessor(BaseStreamProcessor):
             status_content,
             subtitle=subtitle,
         ))
-        self._events_since_rotation += 1
 
         if phase == SpecPhase.BUILD:
             # Build phase: tool panels already rendered, just show summary
             summary = self._reporter._extract_phase_summary(phase, output)
             done_text = UI_TEXT["spec_build_done"].format(summary=summary) if summary else UI_TEXT["spec_build_done_plain"]
             _dispatch_text_block(self._rotator, f"_phase_done_{cycle_num}_{phase.value}", done_text)
+        elif phase == SpecPhase.SPEC:
+            artifact, _errors = parse_spec_artifact(output)
+            if artifact is not None and artifact.required_experts:
+                roles = "\n".join(
+                    f"- **{expert.role}**：{expert.purpose}"
+                    for expert in artifact.required_experts
+                )
+                _dispatch_text_block(
+                    self._rotator, f"_role_plan_{cycle_num}",
+                    f"**本轮专家与审查分工**\n{roles}\n- **完成度把控**：独立核验用户目标与交付证据",
+                )
         elif phase == SpecPhase.PLAN:
             plan_payload = build_plan_display_payload(output, cycle_num)
             self._rotator.dispatch(CardEvent.spec_plan_updated(cycle_num, plan_payload))

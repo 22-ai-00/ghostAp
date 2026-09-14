@@ -122,6 +122,8 @@ class SpecRenderer(RotatingRendererMixin, BaseRenderer):
             model_name=model_name or None,
             working_dir=project.root_path if project else None,
             project_name=project.project_name if project else None,
+            programming_text_sections=True,
+            retain_full_history=True,
         )
 
         hooks = self._build_hooks(message_id)

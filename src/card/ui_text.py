@@ -37,16 +37,21 @@ UI_TEXT = {
     "deep_stop_all_success": "⏹ 已发送停止信号：{count} 个 Deep Agent 任务将在当前步骤完成后停止",
     "deep_no_active_tasks": "📊 当前没有正在执行的 Deep Agent 任务",
     # Spec Engine
-    "spec_status_empty": "📊 当前没有 Spec 任务\n\n发送 `/spec 你的需求` 开始结构化开发闭环",
+    "spec_status_empty": "📊 当前没有 Spec 任务\n\n发送 `/spec 你的需求` 开始结构化任务闭环",
     "spec_cmd_guide_usage": "📝 请提供引导信息\n\n用法: `/spec_guide <引导描述>`\n\n例如: `/spec_guide 优先考虑性能优化`",
     "spec_cmd_help_usage": (
-        "📋 **Spec 模式：结构化开发闭环**\n\n"
+        "📋 **Spec 模式：结构化任务闭环**\n\n"
         "用法：`/spec <你的需求描述>`\n"
         "示例：`/spec 实现用户登录注册功能，支持邮箱和手机号`\n\n"
         "**Spec vs Deep**\n"
         "- Spec：按 `Spec→Plan→Task→Build→Review` 产出结构化产物并迭代收敛\n"
+        "- 支持编程、写作、研究与其他领域任务；先分析需要的专家，再进行多角色深查\n"
+        "- 写作覆盖思路、读者、编辑、审稿视角，并按题材补充领域专家\n"
+        "- 进度、子任务与审查结论汇总到主卡，容量不足时续接\n"
         "- Deep：一次性深度拆解并执行一个复杂任务（更偏单次冲刺）\n\n"
         "**最小示例（推荐命令组合）**\n"
+        "- 写作：`/spec 为新手写一篇城市观鸟指南` → `/spec_status`\n"
+        "- 研究：`/spec 分析社区养老服务方案的可行性` → `/spec_status`\n"
         "- Web：`/spec 做一个登录页+登录接口` → `/spec_status` → `/spec_guide 优先补测试与错误提示`\n"
         "- API：`/spec 新增 /v1/users 查询接口` → `/spec_status`\n"
         "- 脚本：`/spec 写一个批量重命名脚本，支持dry-run` → `/spec_status`\n\n"
@@ -251,7 +256,7 @@ UI_TEXT = {
         "`/deep_status` · 查看任务进度\n"
         "`/stop_deep` · 停止任务"
     ),
-    "system_help_section_spec": "📋 Spec Engine · 结构化开发闭环",
+    "system_help_section_spec": "📋 Spec Engine · 结构化任务闭环",
     "system_help_section_spec_body": (
         "`/spec <需求>` · 启动  ·  `/spec_status` · 查看进度\n"
         "`/spec_guide <引导>` · 补充约束/偏好\n"
@@ -706,7 +711,7 @@ UI_TEXT = {
     "phase_spec": "规格定义中",
     "phase_plan": "方案规划中",
     "phase_task": "任务分解中",
-    "phase_build": "执行构建中",
+    "phase_build": "执行交付中",
     "spec_review_phase_done": "多角色审查完成",
     "phase_testing": "测试中",
     "phase_building": "构建中",
@@ -783,8 +788,8 @@ UI_TEXT = {
     "spec_build_heartbeat_thinking": " · 思考中 ({seconds}s)",
     "spec_build_heartbeat_tool_running": " · 执行中 ({seconds}s)",
     "spec_build_heartbeat_idle": "🔨 正在编码 · 思考中 ({seconds}s)",
-    "spec_build_done": "🔨 **构建完成**  {summary}",
-    "spec_build_done_plain": "🔨 **构建完成**",
+    "spec_build_done": "🔨 **本轮执行结束**  {summary}",
+    "spec_build_done_plain": "🔨 **本轮执行结束**",
     # Workflow header colors by phase
     "workflow_header_colors": {
         "agent_select": "blue",      # Orchestrator agent selection phase

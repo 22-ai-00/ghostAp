@@ -133,7 +133,9 @@ def render_card(
     }
 
     # 1. Flatten blocks to atoms and build SectionLayout skeleton.
-    is_programming_card = state.metadata.engine_type is None
+    is_programming_card = state.metadata.engine_type is None or (
+        state.metadata.engine_type == "spec" and state.metadata.programming_text_sections
+    )
     segmented_text = bool(
         state.metadata.programming_text_sections
         and is_programming_card
@@ -395,7 +397,7 @@ def _render_atom_text(atom: RenderAtom, state: CardState, budget: RenderBudget, 
     block = block_index.get(atom.block_id)
     if (
         state.metadata.programming_text_sections
-        and state.metadata.engine_type is None
+        and state.metadata.engine_type in {None, "spec"}
         and block is not None
         and block.kind == "text"
         and is_programming_thought_block(block)
@@ -1090,7 +1092,7 @@ def _notification_summary(state: CardState) -> str:
         state.terminal,
         "编程任务状态已更新，打开卡片查看详情",
     )
-    return summary
+    return summary.replace("编程任务", "Spec 任务") if state.metadata.engine_type == "spec" else summary
 
 
 def _render_criteria_panel(atom: RenderAtom, state: CardState) -> dict:

@@ -38,7 +38,7 @@ def reduce_cycle(state: CardState, event: CardEvent) -> CardState:
             # accumulation in truncation mode (when session rotation is capped).
             # For fresh sessions after successful rotation, blocks is already ()
             # so this is effectively a no-op.
-            if state.blocks:
+            if state.blocks and not state.metadata.retain_full_history:
                 changes["blocks"] = ()
             return replace(state, **changes)
 

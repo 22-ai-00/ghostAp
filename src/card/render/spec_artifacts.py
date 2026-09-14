@@ -44,16 +44,16 @@ def render_spec_plan_panel(block: ContentBlock) -> dict | None:
     if steps:
         header_parts.append(f"{len(steps)} 步")
     if file_changes:
-        header_parts.append(f"{len(file_changes)} 处文件")
+        header_parts.append(f"{len(file_changes)} 项交付物")
 
     body_lines: list[str] = ["**方案规划**"]
     if architecture:
         body_lines.append(f"**架构/方案**：{architecture}")
     if tech_stack:
-        body_lines.append(f"**技术栈**：{'、'.join(tech_stack)}")
+        body_lines.append(f"**工具/资料**：{'、'.join(tech_stack)}")
     _append_numbered_section(body_lines, "执行步骤", steps)
-    _append_bulleted_section(body_lines, "文件变更", file_changes)
-    _append_numbered_section(body_lines, "测试计划", test_plan)
+    _append_bulleted_section(body_lines, "交付物变更", file_changes)
+    _append_numbered_section(body_lines, "验证方案", test_plan)
     _append_bulleted_section(body_lines, "风险", risks)
     _append_bulleted_section(body_lines, "说明", notes)
 
