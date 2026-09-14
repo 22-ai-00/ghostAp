@@ -235,9 +235,12 @@ def generate_specs_from_discovery(
     "risks": ["..."],
     "clarification_questions": ["..."],
     "decisions": ["..."],
+    "required_experts": [{{"role":"任务真正需要的专家", "purpose":"该角色为何必要", "focus":["具体关注点"], "checks":["必须验证的事项"]}}],
     "version": "1.0"
   }}
 }}
+
+每个 spec 的 required_experts 必须有 3–7 个任务推断出的独立角色；名称归一化后不得重复，且每项 role、purpose、focus、checks 均非空。写作问题必须涵盖创意/选题、目标读者、编辑、审稿/事实或论证核查四种视角。
 """
 
     chunks: list[str] = []
@@ -295,8 +298,8 @@ def generate_specs_from_discovery(
             question = str(d.get("question") or "").strip() or qid
             minimal = {
                 "goals": [f"解决问题：{question}"],
-                "functional_spec": ["实现必要的改动以满足问题要求"],
-                "non_functional_requirements": ["不引入回归，保持可测试性"],
+                "functional_spec": ["完成满足问题要求的必要交付"],
+                "non_functional_requirements": ["不引入回归，保持可验证性"],
                 "acceptance_criteria": [f"问题被解决：{question}"],
                 "out_of_scope": [],
                 "risks": [],

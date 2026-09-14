@@ -86,99 +86,79 @@ def _completion_role() -> ReviewRoleSpec:
     )
 
 
-def _programming_roles() -> list[ReviewRoleSpec]:
+def _missing_artifacts_roles() -> list[ReviewRoleSpec]:
     return [
         _role(
-            perspective.value,
-            perspective.display_name,
-            "software",
-            f"从{perspective.display_name}视角审查任务结果",
-            (perspective.review_focus,),
-            (perspective.review_focus,),
-            perspective=perspective,
-        )
-        for perspective in ReviewPerspective
+            "missing_artifacts_domain",
+            "领域审查员",
+            "task_derived",
+            "审查交付物是否符合任务领域约束；审查产物缺失时必须失败关闭。",
+            ("领域约束",),
+            ("审查产物是否可用",),
+        ),
+        _role(
+            "missing_artifacts_audience",
+            "目标受众代表",
+            "task_derived",
+            "审查交付物是否服务目标受众；审查产物缺失时必须失败关闭。",
+            ("受众需要",),
+            ("审查产物是否可用",),
+        ),
     ]
 
 
-_NON_CODE_ROLES = {
-    "writing": (
-        ("editor", "主编", "writing", "审查结构与叙事", ("结构", "主题"), ("主线是否清晰",)),
-        ("style", "风格编辑", "writing", "审查语气与节奏", ("语气", "措辞"), ("是否简洁易读",)),
-        ("fact", "事实核查员", "research", "核查事实和来源", ("事实", "来源"), ("关键事实是否可验证",)),
-        ("reader", "目标读者", "writing", "审查理解成本", ("可读性",), ("目标读者能否理解",)),
-    ),
-    "research": (
-        ("researcher", "研究员", "research", "审查问题覆盖", ("覆盖面",), ("是否遗漏关键维度",)),
-        ("source", "来源核查员", "research", "审查来源可信度", ("来源",), ("结论是否交叉验证",)),
-        ("method", "方法审查员", "research", "审查方法与口径", ("样本", "口径"), ("结论是否超出证据",)),
-        ("opposition", "反方审查员", "research", "寻找反例", ("反例",), ("是否忽略相反证据",)),
-    ),
-    "design": (
-        ("creative", "创意总监", "design", "审查方向一致性", ("创意方向",), ("视觉是否服务目标",)),
-        ("visual", "视觉设计师", "design", "审查版式层级", ("版式", "配色"), ("层级是否清晰",)),
-        ("user", "用户体验审查员", "design", "审查用户路径", ("理解成本",), ("交互是否可达",)),
-        ("accessibility", "可访问性审查员", "design", "审查包容性", ("对比度",), ("小屏是否可用",)),
-    ),
-    "other": (
-        ("product", "产品经理", "general", "审查目标价值", ("目标",), ("目标是否完整",)),
-        ("user", "用户代表", "general", "审查可用性", ("可理解性",), ("结果是否可使用",)),
-        ("tester", "验收审查员", "general", "审查验收边界", ("验收",), ("结果是否可验证",)),
-        ("domain", "领域审查员", "domain", "审查领域合理性", ("领域约束",), ("是否符合任务语境",)),
-    ),
-}
+def _expert_role_id(role: str, used: set[str]) -> str:
+    stem = re.sub(r"[^a-z0-9]+", "_", role.lower()).strip("_") or "domain_expert"
+    candidate = f"expert_{stem}"
+    suffix = 2
+    while candidate in used or candidate == COMPLETION_ROLE:
+        candidate = f"expert_{stem}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
 
 
-def _task_kind(artifacts) -> str:
-    text = " ".join(
-        filter(None, (
-            artifacts.requirement,
-            artifacts.spec_output,
-            artifacts.plan_output,
-            artifacts.build_output,
-            " ".join(artifacts.touched_files or ()),
+def _task_derived_roles(artifacts) -> list[ReviewRoleSpec]:
+    """Translate the Spec phase's inferred experts into review roles.
+
+    The Spec model determines expertise from the actual task before execution;
+    this function deliberately does not classify keywords into canned domains.
+    """
+    roles: list[ReviewRoleSpec] = []
+    used: set[str] = set()
+    for item in getattr(artifacts, "required_experts", []) or ():
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("role") or "").strip()
+        purpose = str(item.get("purpose") or "").strip()
+        if not name or not purpose:
+            continue
+        raw_focus = item.get("focus", [])
+        raw_checks = item.get("checks", [])
+        focus = [str(value).strip() for value in raw_focus if str(value).strip()] if isinstance(raw_focus, list) else []
+        checks = [str(value).strip() for value in raw_checks if str(value).strip()] if isinstance(raw_checks, list) else []
+        roles.append(_role(
+            _expert_role_id(name, used), name, "task_derived", purpose,
+            focus or ["任务目标与交付物"], checks or ["是否满足该专家定义的质量要求"],
         ))
-    ).lower()
-    files = [path.lower() for path in artifacts.touched_files or ()]
-    if any(token in text for token in ("代码", "实现", "修复", "bug", "api", "测试", "python", "typescript")) or any(
-        path.startswith(("src/", "tests/")) or re.search(r"\.(py|ts|tsx|js|jsx|go|rs)$", path)
-        for path in files
-    ):
-        return "programming"
-    for kind, markers in (
-        ("research", ("调研", "研究", "来源", "市场", "竞品", "报告")),
-        ("writing", ("文章", "博客", "文案", "稿件", "写一篇")),
-        ("design", ("设计", "视觉", "版式", "海报", "ui", "ux")),
-    ):
-        if any(marker in text for marker in markers):
-            return kind
-    return "other"
+    if roles:
+        return roles
 
-
-def _specialized_roles(artifacts) -> list[ReviewRoleSpec]:
-    text = " ".join((artifacts.requirement or "", artifacts.diff_patch or "", " ".join(artifacts.touched_files or ()))).lower()
-    specs = (
-        (("auth", "权限", "token", "secret", "安全", "password"), ("security", "安全审查员", "security", "审查认证授权", ("认证", "secret"), ("是否越权或泄密",))),
-        (("api", "接口", "schema", "payload", "contract"), ("api_contract", "API 契约审查员", "api", "审查接口兼容", ("schema",), ("是否破坏调用方",))),
-        (("mobile", "移动", "手机", "响应式"), ("mobile_ux", "移动端审查员", "ux", "审查小屏体验", ("布局",), ("移动端是否可操作",))),
-        (("性能", "latency", "timeout", "并发", "队列"), ("performance", "性能审查员", "performance", "审查性能并发", ("延迟",), ("是否存在无界资源",))),
-    )
-    return [_role(*spec) for markers, spec in specs if any(marker in text for marker in markers)]
+    requirement = str(getattr(artifacts, "requirement", "") or "").strip()
+    target = requirement[:120] or "当前任务"
+    return [
+        _role("task_domain_expert", f"{target}领域专家", "task_derived", f"从任务领域专业性审查：{target}", ("领域约束",), ("结论是否符合领域事实",)),
+        _role("task_audience_representative", "目标受众代表", "task_derived", f"从目标受众审查交付物是否实现：{target}", ("受众需要",), ("受众能否理解和使用交付物",)),
+        _role("task_evidence_reviewer", "证据与验收审查员", "task_derived", f"从证据与验收审查：{target}", ("验收证据",), ("每项承诺是否有可检查证据",)),
+    ]
 
 
 def _plan_roles(ctx: ReviewContext) -> tuple[list[ReviewRoleSpec], str]:
     if ctx.role_plan_override:
         roles = list(ctx.role_plan_override)
     else:
-        kind = _task_kind(ctx.artifacts)
         limit = max(2, int(getattr(ctx.settings, "spec_review_total_roles_max", 8) or 8))
-        if kind == "programming":
-            roles = _programming_roles()
-            if getattr(ctx.settings, "spec_review_dynamic_roles_enabled", True):
-                dynamic = max(0, int(getattr(ctx.settings, "spec_review_dynamic_roles_max", 3) or 0))
-                roles += _specialized_roles(ctx.artifacts)[:dynamic]
-        else:
-            roles = [_role(*spec) for spec in _NON_CODE_ROLES[kind]]
+        roles = _task_derived_roles(ctx.artifacts)
         roles = roles[:limit - 1] + [_completion_role()]
     if not any(role.role_id == COMPLETION_ROLE for role in roles):
         roles.append(_completion_role())
@@ -615,7 +595,7 @@ def conduct_review(ctx: ReviewContext) -> AdaptiveReviewResult:
     started = time.monotonic()
     completion = bool(getattr(ctx.settings, "spec_completion_gate_enabled", True))
     if ctx.artifacts is None:
-        roles = _programming_roles() + [_completion_role()]
+        roles = _missing_artifacts_roles() + [_completion_role()]
         outcomes = [_failure(role, "审查产物缺失，无法验证完成度", "missing_artifacts") for role in roles]
         result = _build_result(outcomes, ctx.cycle, completion)
         _record_failure(ctx, outcomes, 0)

@@ -31,7 +31,7 @@ def format_criteria_status(project: Optional[SpecProject]) -> str:
 
 
 def build_spec_prompt(requirement: str, root_path: str, guidance: str, criteria_status: str) -> str:
-    return f"""你是一个专业的软件架构师。请使用 spec-kit 风格产出"规格（Spec）"。
+    return f"""你是跨领域的需求与交付架构师。请使用 spec-kit 风格产出"规格（Spec）"；任务可以是写作、研究、设计、运营、规划或软件工作，绝不可预设为编码任务。
 
 目标：只描述 **做什么/为什么/范围与约束**，不讨论具体怎么实现。
 
@@ -45,7 +45,7 @@ def build_spec_prompt(requirement: str, root_path: str, guidance: str, criteria_
 ## 输出要求（必须严格遵守）
 仅输出一个 JSON 对象，放在 ```json fenced code block``` 中，不要输出任何其他文字。
 
-Schema（字段必须存在；数组元素为字符串）：
+Schema（字段必须存在；required_experts 为对象数组，其余数组元素为字符串）：
 {{
   "goals": ["..."],
   "functional_spec": ["..."],
@@ -55,6 +55,7 @@ Schema（字段必须存在；数组元素为字符串）：
   "risks": ["风险/约束..."],
   "clarification_questions": ["已识别的模糊点（仅记录，不等待用户回答）..."],
   "decisions": ["已确认/可接受的假设（必须显式标注为假设）..."],
+  "required_experts": [{{"role":"任务真正需要的专家角色", "purpose":"该角色为何对本任务必要", "focus":["具体关注点"], "checks":["该角色必须验证的事项"]}}],
   "version": "1.0"
 }}
 
@@ -63,6 +64,8 @@ Schema（字段必须存在；数组元素为字符串）：
 - 遇到信息不足时，不要停下等待用户——基于项目上下文和行业最佳实践自主选择最优方案
 - 将模糊点记录在 clarification_questions 中（仅供参考），将你的决策记录在 decisions 中
 - 如果用户引导中提供了相关信息，优先使用用户的指示
+- 先从目标、受众、交付物、风险和验收标准推断完成与深度审查本任务所需的 3–7 个不同专家；角色必须来自任务语境，不能套用固定的软件、产品或设计角色模板
+- 写作任务必须在 required_experts 中包含创意/选题、目标读者、编辑、审稿/事实或论证核查四种独立视角，并写明各自理由
 """
 
 
@@ -72,7 +75,7 @@ def build_plan_prompt(spec: str, root_path: str, spec_artifact: Optional["SpecAr
     else:
         spec_section = spec
 
-    return f"""你是一个资深工程师。基于下述 Spec（规格），产出 Plan（规划），强调可执行、可验证。
+    return f"""你是跨领域交付规划师。基于下述 Spec（规格），产出 Plan（规划），强调可执行、可验证；按任务本身选择合适的方法、材料、工具和交付物，不要假定这是软件工程。
 
 ## Spec 输入
 {spec_section}
@@ -86,18 +89,18 @@ def build_plan_prompt(spec: str, root_path: str, spec_artifact: Optional["SpecAr
 
 Schema（字段必须存在；数组元素为字符串）：
 {{
-  "architecture": "总体架构与关键决策（文本）",
-  "tech_stack": ["语言/框架/库..."],
+  "architecture": "总体方法、结构或关键决策（文本）",
+  "tech_stack": ["适用的工具、材料、渠道、语言、框架或资料..."],
   "steps": ["按优先级的一句话步骤..."],
-  "file_changes": ["新增/修改文件路径..."],
-  "test_plan": ["将新增/更新的测试与验证方式..."],
+  "file_changes": ["将创建/修改的文件、交付物或工作对象..."],
+  "test_plan": ["验证、审阅、试读、试用、测量或其他验收方式..."],
   "risks": ["风险与应对..."],
   "version": "1.0"
 }}
 
 规划约束：
-- steps 中请优先识别可并行的独立工作包；如果当前工具支持 subagent / 子任务委托，应把无共享文件写入、无依赖顺序冲突的工作设计为可委托执行
-- 对可能冲突的改动（同文件、同 API 契约、同迁移/配置入口）必须在 steps 或 risks 中标注串行顺序与合并风险
+- steps 中请优先识别可并行的独立工作包；如果当前工具支持 subagent / 子任务委托，应把无共享交付物、无依赖顺序冲突的工作设计为可委托执行
+- 对可能冲突的工作（同一交付物、同一事实来源、同一受众承诺或同一配置入口）必须在 steps 或 risks 中标注串行顺序与合并风险
 """
 
 
@@ -107,7 +110,7 @@ def build_task_prompt(plan: str, plan_artifact: Optional["PlanArtifact"] = None)
     else:
         plan_section = plan
 
-    return f"""将以下实现方案分解为可执行的具体任务。
+    return f"""将以下方案分解为可执行的具体任务。任务可以是任何领域的研究、创作、设计、运营或实现工作；保持原方案的领域语境。
 
 ## 实现方案
 {plan_section}
@@ -126,9 +129,9 @@ def build_task_prompt(plan: str, plan_artifact: Optional["PlanArtifact"] = None)
 ...
 
 要求：
-- 每个任务应可独立测试
+- 每个任务应有独立的验收或审阅方式
 - 任务粒度适中，不要过大或过小
-- 标注依赖关系以确定执行顺序；没有依赖且不触碰相同文件/接口契约的任务应被拆成可并行、可委托给 subagent 的独立任务
+- 标注依赖关系以确定执行顺序；没有依赖且不争用同一交付物、事实来源或关键决策的任务应被拆成可并行、可委托给 subagent 的独立任务
 - 如果任务存在潜在冲突，请用依赖关系把它们串起来，不要把冲突任务伪装成并行任务
 """
 
@@ -140,7 +143,7 @@ def build_build_prompt(tasks: list[SpecTask], plan: str, root_path: str, guidanc
     else:
         plan_section = plan
 
-    return f"""按以下任务列表逐步执行实现。
+    return f"""按以下任务列表逐步完成交付；保持任务原有领域，不要把非编码任务改写成代码实现。
 
 ## 实现方案
 {plan_section}
@@ -153,12 +156,12 @@ def build_build_prompt(tasks: list[SpecTask], plan: str, root_path: str, guidanc
 {guidance}
 {SPEC_BUILD_GRILL_ME_PROTOCOL}
 ## 要求
-1. 严格按照依赖关系推进；不要让有冲突的任务并发修改同一文件、同一 API 契约或同一迁移/配置入口
+1. 严格按照依赖关系推进；不要让有冲突的任务并发修改同一交付物、同一事实来源、同一受众承诺或同一迁移/配置入口
 2. 对依赖已满足且改动范围互不冲突的任务，优先使用当前工具支持的 subagent / 子任务委托并行执行
 3. 如果无法使用 subagent，也要按可并行工作包组织执行，避免把互不相关的任务强制串行化
 4. 每个任务完成后进行自检
-5. 确保代码质量：无安全漏洞、有适当的错误处理
-6. 完成所有任务后输出总结，说明哪些任务并行/委托执行、哪些任务因冲突或依赖而串行执行
+5. 确保交付质量：准确、适合目标受众、遵守领域约束，并对适用风险采取措施
+6. 完成所有任务后输出总结，说明哪些任务并行/委托执行、哪些任务因冲突或依赖而串行执行，以及每项验收证据
 """
 
 
@@ -173,7 +176,7 @@ def build_review_prompt(requirement: str) -> str:
             perspective_sections.append(f"- **{p.value.upper()}**: {p.review_focus}")
     perspectives_desc = "\n".join(perspective_sections)
 
-    return f"""请从以下五个视角审查当前的实现质量，并给出结构化的审查结果。
+    return f"""这是兼容旧调用的通用交付审查提示。请从任务实际需要的专业、受众、验收、风险和可用性视角审查当前交付质量，并给出结构化的审查结果；不要假设任务是软件实现。
 
 ## 项目目标
 {requirement}

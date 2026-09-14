@@ -10,8 +10,9 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from pydantic import ValidationError
@@ -143,6 +144,28 @@ from .session_utils import (
 from .storage import state_path_candidates as _state_path_candidates
 from .tracker import PhaseTracker
 from .validation import SpecInput
+
+
+def _normalized_expert_role_name(role: str) -> str:
+    return re.sub(r"[\W_]+", "", str(role or "").casefold())
+
+
+def _has_valid_required_experts(spec) -> bool:
+    """Validate newly generated role plans without rejecting historic artifacts."""
+    experts = list(getattr(spec, "required_experts", []) or ())
+    if not 3 <= len(experts) <= 7:
+        return False
+    names: set[str] = set()
+    for expert in experts:
+        name = _normalized_expert_role_name(getattr(expert, "role", ""))
+        if not name or name in names:
+            return False
+        names.add(name)
+        if not str(getattr(expert, "purpose", "") or "").strip():
+            return False
+        if not list(getattr(expert, "focus", []) or ()) or not list(getattr(expert, "checks", []) or ()):
+            return False
+    return True
 
 logger = logging.getLogger(__name__)
 
@@ -781,20 +804,50 @@ class SpecEngine(BaseEngine):
     ) -> str:
         """Execute the SPEC phase and return spec output text."""
         cycle.phase = SpecPhase.SPEC
-        if work_item and work_item.spec_path and _should_load_spec_directly(work_item):
+
+        def run_spec_prompt(prompt: str) -> str:
+            return self._run_phase(
+                cycle_num,
+                SpecPhase.SPEC,
+                prompt,
+                replace(callbacks, on_phase_done=None),
+                timeout,
+            )
+
+        loaded_directly = bool(work_item and work_item.spec_path and _should_load_spec_directly(work_item))
+        if loaded_directly:
             # spec 文件本身就是 spec-kit 规格产物：直接加载进入下一阶段
             spec_output = _read_text_file_best_effort(work_item.spec_path)
         else:
-            spec_output = self._run_phase(
-                cycle_num,
-                SpecPhase.SPEC,
+            spec_output = run_spec_prompt(
                 build_spec_prompt(spec_input, self.root_path, self._consume_guidance(), format_criteria_status(self._project)),
-                callbacks,
-                timeout,
             )
+        parsed_spec, _ = parse_spec_artifact(spec_output)
+        if not _has_valid_required_experts(parsed_spec):
+            repair_prompt = f"""上一份 Spec 缺少完成任务所需专家的推断，不能进入后续规划。
+请保留原 Spec 的目标、范围、验收标准与决策，重新输出完整且严格的 JSON Spec。
+必须从该任务的目标、受众、交付物、风险和验收标准推断 3–7 个真正需要的不同专家，写入 required_experts；角色名称必须归一化后互不重复，每项必须有非空 role、purpose、focus 和 checks。不得套用固定领域模板。
+
+## 原始任务
+{spec_input}
+
+## 工作目录
+{self.root_path}
+
+## 原 Spec
+{spec_output}
+"""
+            spec_output = run_spec_prompt(repair_prompt)
+            repaired_spec, _ = parse_spec_artifact(spec_output)
+            if not _has_valid_required_experts(repaired_spec):
+                raise RuntimeError("Spec 专家角色推断修复后仍不满足 3–7 个独立完整角色，无法进行任务派发与深度审查")
+        elif loaded_directly and callbacks.on_phase_start:
+            callbacks.on_phase_start(cycle_num, SpecPhase.SPEC)
         cycle.spec_content = _truncate_output(spec_output, self.settings)
         cycle.spec_artifact, cycle.spec_artifact_errors = parse_spec_artifact(spec_output)
         self._finish_phase(cycle, cycle_num, SpecPhase.SPEC, spec_output, ext="json")
+        if callbacks.on_phase_done:
+            callbacks.on_phase_done(cycle_num, SpecPhase.SPEC, spec_output)
 
         if work_item:
             work_item.status = SpecWorkItemStatus.DONE

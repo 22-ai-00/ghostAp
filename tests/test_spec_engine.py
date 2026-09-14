@@ -862,12 +862,12 @@ class TestSpecEngineExecution:
         s.spec_cycle_artifact_retention = 1
         mock_settings.return_value = s
 
-        spec_json = """```json\n{\"goals\":[\"G\"],\"functional_spec\":[\"F\"],\"non_functional_requirements\":[],\"acceptance_criteria\":[\"实现登录功能\"],\"out_of_scope\":[],\"risks\":[],\"clarification_questions\":[],\"decisions\":[],\"version\":\"1.0\"}\n```"""
+        spec_json = """```json\n{\"goals\":[\"G\"],\"functional_spec\":[\"F\"],\"non_functional_requirements\":[],\"acceptance_criteria\":[\"实现登录功能\"],\"out_of_scope\":[],\"risks\":[],\"clarification_questions\":[],\"decisions\":[],\"required_experts\":[{\"role\":\"认证领域专家\",\"purpose\":\"验证登录交付\",\"focus\":[\"认证\"],\"checks\":[\"登录可用\"]},{\"role\":\"用户代表\",\"purpose\":\"验证使用体验\",\"focus\":[\"登录流程\"],\"checks\":[\"步骤清晰\"]},{\"role\":\"验收审查员\",\"purpose\":\"验证验收标准\",\"focus\":[\"结果\"],\"checks\":[\"目标完成\"]}],\"version\":\"1.0\"}\n```"""
         plan_json = """```json\n{\"architecture\":\"A\",\"tech_stack\":[],\"steps\":[\"S\"],\"file_changes\":[],\"test_plan\":[],\"risks\":[],\"version\":\"1.0\"}\n```"""
         discovery1 = (
             """```json\n[{"id":"Q-1","question":"如何提升错误提示可用性？","why":"用户体验","priority":"P1"}]\n```"""
         )
-        gen1 = """```json\n[{"id":"Q-1","spec":{"goals":["提升错误提示"],"functional_spec":["完善错误提示"],"non_functional_requirements":[],"acceptance_criteria":["错误提示清晰可读"],"out_of_scope":[],"risks":[],"clarification_questions":[],"decisions":[],"version":"1.0"}}]\n```"""
+        gen1 = """```json\n[{"id":"Q-1","spec":{"goals":["提升错误提示"],"functional_spec":["完善错误提示"],"non_functional_requirements":[],"acceptance_criteria":["错误提示清晰可读"],"out_of_scope":[],"risks":[],"clarification_questions":[],"decisions":[],"required_experts":[{"role":"文案领域专家","purpose":"验证错误提示准确性","focus":["错误语义"],"checks":["提示准确"]},{"role":"用户代表","purpose":"验证提示易懂","focus":["可理解性"],"checks":["用户可行动"]},{"role":"验收证据审查员","purpose":"验证验收条件","focus":["验收标准"],"checks":["结果可验证"]}],"version":"1.0"}}]\n```"""
 
         # Cycle 1: spec, plan, task, build, criteria(FAIL), discovery, gen
         # Cycle 2: (spec loaded from file), plan, task, build, criteria(PASS)
@@ -881,6 +881,7 @@ class TestSpecEngineExecution:
                 "CRITERIA_1: FAIL",
                 discovery1,
                 gen1,
+                spec_json,
                 plan_json,
                 "1. T2 (依赖: 无)",
                 "build ok 2",
@@ -1037,7 +1038,7 @@ class TestSpecEngineCycleResilience:
     """Tests for cycle-level exception digestion: exceptions inside a cycle
     should NOT abort the engine but instead mark the cycle failed and continue."""
 
-    _SPEC_JSON = '```json\n{"goals":["G"],"functional_spec":["F"],"non_functional_requirements":[],"acceptance_criteria":["实现功能"],"out_of_scope":[],"risks":[],"clarification_questions":[],"decisions":[],"version":"1.0"}\n```'
+    _SPEC_JSON = '```json\n{"goals":["G"],"functional_spec":["F"],"non_functional_requirements":[],"acceptance_criteria":["实现功能"],"out_of_scope":[],"risks":[],"clarification_questions":[],"decisions":[],"required_experts":[{"role":"任务领域专家","purpose":"验证任务交付","focus":["目标"],"checks":["验收标准满足"]},{"role":"目标受众代表","purpose":"验证可用性","focus":["受众"],"checks":["可理解"]},{"role":"验收审查员","purpose":"验证证据","focus":["验收"],"checks":["目标完成"]}],"version":"1.0"}\n```'
     _PLAN_JSON = '```json\n{"architecture":"A","tech_stack":[],"steps":["S1"],"file_changes":[],"test_plan":[],"risks":[],"version":"1.0"}\n```'
 
     def _mock_settings(self):

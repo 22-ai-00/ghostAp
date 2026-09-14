@@ -71,6 +71,7 @@ def parse_spec_artifact(text: str) -> tuple[Optional[SpecArtifact], list[str]]:
             "risks": normalize_list(data.get("risks")),
             "clarification_questions": normalize_list(data.get("clarification_questions")),
             "decisions": normalize_list(data.get("decisions")),
+            "required_experts": data.get("required_experts") if isinstance(data.get("required_experts"), list) else [],
         }
     )
     return artifact, errors

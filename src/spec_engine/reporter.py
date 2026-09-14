@@ -120,7 +120,7 @@ class SpecReporter:
             return ""
         elif phase == SpecPhase.BUILD:
             line_count = len([line for line in output.split("\n") if line.strip()])
-            return f"构建输出 {line_count} 行"
+            return f"执行输出 {line_count} 行"
         return ""
 
     def _format_cycle_phase_details(self, cycle: SpecCycle) -> str:
@@ -167,7 +167,7 @@ class SpecReporter:
 
         if cycle.build_output:
             line_count = len([line for line in cycle.build_output.split("\n") if line.strip()])
-            parts.append(f"🔨 **执行构建**: 输出 {line_count} 行")
+            parts.append(f"🔨 **执行交付**: 输出 {line_count} 行")
 
         if cycle.review_result:
             r = cycle.review_result

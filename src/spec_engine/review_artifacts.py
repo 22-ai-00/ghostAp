@@ -57,6 +57,7 @@ class ReviewArtifacts:
     verify_command: str = ""
     verify_passed: Optional[bool] = None
     verify_output: str = ""
+    required_experts: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -83,6 +84,7 @@ class ReviewArtifacts:
             verify_command=str(data.get("verify_command") or ""),
             verify_passed=data.get("verify_passed"),
             verify_output=str(data.get("verify_output") or ""),
+            required_experts=[item for item in data.get("required_experts", []) if isinstance(item, dict)],
         )
 
 
@@ -164,4 +166,8 @@ def collect_review_artifacts(
         verify_command=str(getattr(project, "verify_command", "") or ""),
         verify_passed=verify_passed,
         verify_output=truncate_text(verify_output or "", 4_000),
+        required_experts=[
+            expert.to_dict()
+            for expert in getattr(getattr(cycle, "spec_artifact", None), "required_experts", [])
+        ],
     )

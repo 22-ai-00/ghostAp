@@ -20,6 +20,7 @@ from ..engine_base import CriteriaTracker, PerspectiveReview, ReviewPerspective,
 __all__ = [
     # Artifacts
     "SpecArtifact",
+    "SpecExpertRole",
     "PlanArtifact",
     "SpecPhase",
     "SpecProjectStatus",
@@ -288,6 +289,41 @@ class ReviewContext:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SpecExpertRole:
+    """A task-specific expert inferred during the Spec phase."""
+
+    role: str
+    purpose: str
+    focus: list[str] = field(default_factory=list)
+    checks: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "role": self.role,
+            "purpose": self.purpose,
+            "focus": self.focus,
+            "checks": self.checks,
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> "SpecExpertRole | None":
+        if not isinstance(data, dict):
+            return None
+        role = str(data.get("role") or "").strip()
+        purpose = str(data.get("purpose") or "").strip()
+        if not role or not purpose:
+            return None
+        focus = data.get("focus", [])
+        checks = data.get("checks", [])
+        return cls(
+            role=role,
+            purpose=purpose,
+            focus=[str(item).strip() for item in focus if str(item).strip()] if isinstance(focus, list) else [],
+            checks=[str(item).strip() for item in checks if str(item).strip()] if isinstance(checks, list) else [],
+        )
+
+
 @dataclass
 class SpecArtifact:
     """结构化规格产物（JSON，可机器解析）。"""
@@ -300,6 +336,7 @@ class SpecArtifact:
     risks: list[str] = field(default_factory=list)
     clarification_questions: list[str] = field(default_factory=list)
     decisions: list[str] = field(default_factory=list)
+    required_experts: list[SpecExpertRole] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -311,6 +348,7 @@ class SpecArtifact:
             "risks": self.risks,
             "clarification_questions": self.clarification_questions,
             "decisions": self.decisions,
+            "required_experts": [expert.to_dict() for expert in self.required_experts],
         }
 
     @classmethod
@@ -326,6 +364,11 @@ class SpecArtifact:
             risks=[str(x) for x in data.get("risks", []) if x],
             clarification_questions=[str(x) for x in data.get("clarification_questions", []) if x],
             decisions=[str(x) for x in data.get("decisions", []) if x],
+            required_experts=[
+                expert
+                for item in data.get("required_experts", [])
+                if (expert := SpecExpertRole.from_dict(item)) is not None
+            ],
         )
 
 
@@ -384,7 +427,7 @@ class SpecPhase(Enum):
             SpecPhase.SPEC: "规格定义",
             SpecPhase.PLAN: "方案规划",
             SpecPhase.TASK: "任务分解",
-            SpecPhase.BUILD: "执行构建",
+            SpecPhase.BUILD: "执行交付",
             SpecPhase.REVIEW: "多角色审查",
         }[self]
 
