@@ -47,7 +47,7 @@ from .traex_selection import (
     load_traex_model_metadata,
     split_traex_model_selection,
 )
-from .transport import LateFrameTolerantMessageQueue
+from .transport import LateFrameTolerantMessageQueue, build_acp_process_env
 
 logger = logging.getLogger(__name__)
 
@@ -723,14 +723,12 @@ async def _probe_acp_models_once(
         return []
     command, args = provider.get_serve_command(bootstrap_model)
 
-    from ..utils.env import build_clean_env
-
     client = GhostAPClient(on_event=lambda _event: None)
     async with spawn_agent_process(
         client,
         command,
         *args,
-        env=build_clean_env(),
+        env=build_acp_process_env(command, args),
         cwd=cwd or str(Path.cwd()),
         queue=LateFrameTolerantMessageQueue(),
     ) as (connection, _process):

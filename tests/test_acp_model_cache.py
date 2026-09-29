@@ -204,6 +204,31 @@ def test_traex_probe_prefers_config_catalog_over_active_model_sentinel(
     assert "TraeX active model" not in {model.name for model in models}
 
 
+def test_codex_discovery_passes_local_cli_to_official_adapter(monkeypatch, tmp_path):
+    captured = {}
+
+    class Connection:
+        async def initialize(self, **kwargs):
+            pass
+
+        async def new_session(self, **kwargs):
+            return SimpleNamespace(config_options=())
+
+    @asynccontextmanager
+    async def spawn(*args, **kwargs):
+        captured.update(kwargs)
+        yield Connection(), object()
+
+    monkeypatch.delenv("CODEX_PATH", raising=False)
+    monkeypatch.setattr("src.acp.transport.shutil.which", lambda name, **kwargs: "/local/codex")
+    monkeypatch.setattr(helper, "get_providers", lambda: {"codex": SimpleNamespace(
+        get_serve_command=lambda model: ("npx", ["--yes", "@agentclientprotocol/codex-acp@1.2.0"]),
+    )})
+    monkeypatch.setattr(helper, "spawn_agent_process", spawn)
+    assert asyncio.run(helper._probe_acp_models("codex", str(tmp_path))) == []
+    assert captured["env"]["CODEX_PATH"] == "/local/codex"
+
+
 def test_traex_retired_default_bootstraps_live_catalog_with_profiles_and_efforts(
     monkeypatch, tmp_path,
 ) -> None:

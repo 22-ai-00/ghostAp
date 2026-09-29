@@ -39,7 +39,7 @@ from .models import (
     PromptResult,
 )
 from .outcome import has_transient_child_lifecycle
-from .transport import LateFrameTolerantMessageQueue
+from .transport import LateFrameTolerantMessageQueue, build_acp_process_env
 
 logger = logging.getLogger(__name__)
 
@@ -661,9 +661,8 @@ class ACPSession:
         # Claude Code CLI refuses to launch inside another Claude Code session when
         # `CLAUDECODE` is present. Even when we spawn an ACP server (e.g. `claude acp serve`)
         # via an override, we must explicitly drop this guard env to avoid nested-session crash.
-        from ..utils.env import build_clean_env
         base = dict(self._env_override) if isinstance(self._env_override, dict) else None
-        env = build_clean_env(base)
+        env = build_acp_process_env(self._agent_cmd, self._agent_args, base)
 
         self._ctx_manager = spawn_agent_process(
             client,

@@ -66,3 +66,7 @@
 - 当前修复可从根父 rollout 补齐缺 path 的 direct child；若 ACP 同时缺失 nested child path，仍会安全地保持 incomplete。后续应使用已知 parent thread 的有界 rollout 闭包支持嵌套身份发现，并保持 parent/session/cwd/generation 一致性校验。
 - `_rollout_candidates()` 仍按精确 session ID 在 `CODEX_HOME/sessions` 下执行目录遍历；真实事故三次定位约 39 ms，但历史持续增长后可能成为同步延迟。应引入 UUIDv7 日期分区定位或可信 session 索引，禁止退化为读取全历史 rollout 内容。
 - 卡片 projector 与 ACP outcome 仍使用不同粒度的生命周期归并。后续应抽取共享、带 provenance/generation/malformed 语义的 reducer；在此之前不要让 outer `TOOL_CALL_DONE` 作为 child 权威终态进入最终 outcome。
+
+## ACP 分组能力兼容（2026-09-29，中）
+
+- SDK 0.12.0 的 select options 可分组；`_reasoning_effort_capability` 与 Codex 顶层模型解析未展开分组，可能丢能力。当前本机 codex-acp 1.2.0 使用平铺响应，非本次线上缺失根因。后续统一选项展开并以真实 SDK schema 补回归，不以静态 Effort 填充未知能力。
