@@ -70,3 +70,7 @@
 ## ACP 分组能力兼容（2026-09-29，中）
 
 - SDK 0.12.0 的 select options 可分组；`_reasoning_effort_capability` 与 Codex 顶层模型解析未展开分组，可能丢能力。当前本机 codex-acp 1.2.0 使用平铺响应，非本次线上缺失根因。后续统一选项展开并以真实 SDK schema 补回归，不以静态 Effort 填充未知能力。
+
+## Claude-W 完成上下文回写（2026-09-29，中）
+
+- 线上 `programming._execute_programming_response` 用显示名 `claude-w` 回写 ContextSourceMode，但枚举只接受 `claude_w`，导致后处理异常并丢该轮上下文更新。执行及卡片终态不受该异常影响。后续改用模式SSOT规范化backend标识并补回归。
