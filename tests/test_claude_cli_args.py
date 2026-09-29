@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.agent_session.claude_cli import ClaudeCLIConfig, SyncClaudeCLISession
 from src.agent_session.factory import create_engine_session
 
@@ -96,12 +98,15 @@ def test_employee_claude_1m_uses_direct_argv_and_copied_env() -> None:
     assert original_env == original_snapshot
 
 
-def test_claude_cli_never_injects_permission_bypass() -> None:
+@pytest.mark.parametrize("command", ["claude", "claude-w"])
+@pytest.mark.parametrize("resumed", [False, True])
+def test_claude_cli_autonomous_permission_mode_survives_resume(command, resumed) -> None:
     session = SyncClaudeCLISession(
         cwd="/tmp",
-        config=ClaudeCLIConfig(add_dir=False),
+        config=ClaudeCLIConfig(command=command, add_dir=False),
     )
     session.session_id = "session-1"
+    session.is_resumed = resumed
 
     with patch(
         "src.agent_session.claude_cli.subprocess.Popen",
@@ -109,7 +114,16 @@ def test_claude_cli_never_injects_permission_bypass() -> None:
     ) as popen:
         session.send_prompt("inspect the project")
 
-    assert "--dangerously-skip-permissions" not in popen.call_args.args[0]
+    argv = popen.call_args.args[0]
+    assert argv[:2] == [command, "-p"]
+    assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
+    policy = argv[argv.index("--append-system-prompt") + 1]
+    assert "优先采用推荐项" in policy
+    assert "不要等待用户确认" in policy
+    assert "明确报告失败" in policy
+    assert ("--resume" in argv) is resumed
+    assert ("--session-id" in argv) is not resumed
+    assert argv[-2:] == ["--", "inspect the project"]
 
 
 def test_effort_selection_reaches_real_cli_argv() -> None:
