@@ -6,6 +6,8 @@ import json
 from types import SimpleNamespace
 from typing import Any, Iterable
 
+import pytest
+
 from src.card.actions import dispatch as action_ids
 from src.card.builders.system import SystemBuilder
 
@@ -208,7 +210,9 @@ def test_pending_cascade_dimensions_override_saved_selection_and_confirm_exact_v
     assert refresh["model_effort"] == "medium"
 
 
-def test_plain_model_card_has_default_refresh_and_current_model_actions() -> None:
+@pytest.mark.parametrize("tool", ["codex", "coco"])
+@pytest.mark.parametrize("pending,expected", [(None, "model-a"), ("model-b", "model-b")])
+def test_plain_model_card_keeps_dropdown_and_confirms_selected_model(tool, pending, expected) -> None:
     build = getattr(SystemBuilder, "build_acp_model_cascade_card", None)
     assert callable(build)
     models = [
@@ -231,18 +235,42 @@ def test_plain_model_card_has_default_refresh_and_current_model_actions() -> Non
     ]
 
     card = _card(
-        build(models, "coco", project_id="project-2", current_model="model-a")
+        build(models, tool, project_id="project-2", current_model="model-a",
+              pending_group=pending, thread_root_id="thread-1")
     )
+    selects = _nodes(card, "select_static")
+    assert len(selects) == 1
+    select = selects[0]
+    assert select["name"] == "model_group"
+    assert select["initial_option"] == expected
+    assert [option["value"] for option in select["options"]] == ["model-a", "model-b"]
+    assert _callback_value(select)["action"] == action_ids.SELECT_ACP_MODEL_GROUP
+    assert _callback_value(select)["thread_root_id"] == "thread-1"
+    assert _callback_value(select)["project_id"] == "project-2"
     buttons = _nodes(card, "button")
+    assert len(buttons) == 3  # Default, confirm, refresh; no per-model buttons.
     callbacks = [_callback_value(button) for button in buttons]
     default = next(value for value in callbacks if value.get("use_default_model") is True)
     assert default["action"] == action_ids.SELECT_ACP_MODEL
-    assert default["tool_name"] == "coco"
-    current = next(value for value in callbacks if value.get("model_name") == "model-a")
-    assert current["model_group"] == "model-a"
+    assert default["tool_name"] == tool
+    current = next(value for value in callbacks if value.get("model_name") == expected)
+    assert current["model_group"] == expected
+    assert current["model_profile"] is None
+    assert current["model_effort"] is None
+    assert current["use_default_model"] is False
     current_button = buttons[callbacks.index(current)]
     assert current_button["type"] == "primary"
     assert any(value["action"] == action_ids.REFRESH_ACP_MODELS for value in callbacks)
+
+
+def test_empty_model_catalog_only_offers_default_and_refresh() -> None:
+    card = _card(SystemBuilder.build_acp_model_cascade_card([], "codex"))
+    assert not _nodes(card, "select_static")
+    callbacks = [_callback_value(button) for button in _nodes(card, "button")]
+    assert len(callbacks) == 2
+    assert callbacks[0]["use_default_model"] is True
+    assert callbacks[0]["model_name"] is None
+    assert callbacks[1]["action"] == action_ids.REFRESH_ACP_MODELS
 
 
 def test_activation_cards_cover_initializing_ready_and_retryable_failure() -> None:

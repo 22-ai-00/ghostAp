@@ -95,13 +95,10 @@
       margin-left: 6px;
     }
     .hint { color: var(--muted); margin: 10px 0 0; }
-    .model-btn-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-    .model-btn-grid button { flex: 1 1 40%; }
     @media (max-width: 560px) {
       main { margin: 12px auto; }
       .button-row { flex-direction: column; }
       button { width: 100%; }
-      .model-btn-grid button { flex: 1 1 100%; }
     }
   </style>
 </head>
@@ -211,27 +208,35 @@
       </div>
     </div>
 
-    <!-- Case 3: Coco — no splittable variants, falls back to button list -->
+    <!-- Case 3: Codex — plain catalog still uses a model dropdown -->
     <div class="card">
-      <div class="header">Coco 模型选择</div>
+      <div class="header">Codex 模型选择</div>
       <div class="body">
-        <div class="prompt">请为 <strong>coco</strong> 选择模型：</div>
+        <div class="prompt">请选择本次编程会话使用的模型配置。显式选择完成后才会初始化会话。</div>
         <div class="section">
-          <div class="model-btn-grid">
+          <label for="plain-model">模型</label>
+          <select id="plain-model">
+            <option selected>gpt-6-astra</option>
+            <option>gpt-5.6-sol</option>
+            <option>gpt-5.6-terra</option>
+            <option>gpt-5.6-luna</option>
+            <option>gpt-5.5</option>
+          </select>
+          <div class="button-row">
             <button>默认模型（推荐）</button>
-            <button>test-o-new</button>
-            <button class="primary">deepseek-v4-pro</button>
+            <button class="primary" id="plain-confirm">确认此模型: gpt-6-astra</button>
           </div>
           <hr>
-          <div class="button-row">
-            <button>刷新模型</button>
-          </div>
-          <p class="hint">
-            无可拆分变体的小模型列表回退为原分页按钮卡（当前模型高亮），级联下拉不介入。
-          </p>
+          <div class="button-row"><button>刷新模型</button></div>
+          <p class="hint">模型始终使用下拉框；仅在后端提供时显示 Profile / Effort。选择后确认生效。</p>
         </div>
       </div>
     </div>
   </main>
+  <script>
+    document.getElementById('plain-model').addEventListener('change', (event) => {
+      document.getElementById('plain-confirm').textContent = '确认此模型: ' + event.target.value;
+    });
+  </script>
 </body>
 </html>

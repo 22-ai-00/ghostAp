@@ -825,8 +825,8 @@ class SystemBuilder:
             elements.append({"tag": "markdown", "content": str(context_markdown)})
         elements.append({"tag": "hr"})
 
-        has_dimensions = bool(state.profiles or state.efforts)
-        if has_dimensions:
+        # The model picker must not depend on optional profile/effort metadata.
+        if state.model_names:
             elements.extend(
                 [
                     {
@@ -907,21 +907,6 @@ class SystemBuilder:
                     button_type="primary" if not current_model else "default",
                 )
             ]
-            for model_name in state.model_names:
-                buttons.append(
-                    SystemBuilder._callback_button(
-                        text=model_name,
-                        action=payload(
-                            select_action,
-                            model_group=model_name,
-                            model_profile=None,
-                            model_effort=None,
-                            model_name=model_name,
-                            use_default_model=False,
-                        ),
-                        button_type="primary" if model_name == current_model else "default",
-                    )
-                )
             elements.extend(build_responsive_layout(buttons, layout="mobile"))
             if not state.model_names:
                 elements.append(
