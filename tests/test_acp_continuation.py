@@ -306,6 +306,38 @@ def test_safe_choice_uses_default_and_continues_without_user_input() -> None:
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
 
 
+@pytest.mark.parametrize("blocked_text", [
+    "请二选一：放开权限，或手动执行命令。",
+    "放开权限后回复继续。",
+    "当前权限模式阻止了一切实际执行。",
+    "当前权限模式阻止了一切实际执行。请二选一：放开权限后回复继续，"
+    "或你手动执行mkdir。当前远程仓库没有任何新增提交。",
+])
+@pytest.mark.parametrize("recovered", [False, True])
+def test_permission_block_text_recovers_once_without_false_completion(
+    blocked_text: str, recovered: bool,
+) -> None:
+    session = _FakeSession(
+        PromptResult(stop_reason="end_turn", text=blocked_text),
+        _complete_result() if recovered else PromptResult(
+            stop_reason="end_turn", text=blocked_text,
+        ),
+    )
+
+    execution = _runner()(
+        session, "完成原任务", timeout_s=90, finalization_reserve_s=0,
+    )
+
+    assert len(session.calls) == 2
+    assert execution.automatic_continuations == 1
+    assert "自动续做默认决策" in session.calls[1].text
+    assert execution.assessment.outcome is (
+        PromptOutcome.COMPLETED if recovered else PromptOutcome.INCOMPLETE
+    )
+    if not recovered:
+        assert execution.result.text == blocked_text
+
+
 def test_destructive_confirmation_uses_same_automatic_default_path() -> None:
     runner = _runner()
     session = _FakeSession(
