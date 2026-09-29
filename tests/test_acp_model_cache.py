@@ -4,9 +4,10 @@ import asyncio
 import threading
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from acp.exceptions import RequestError
 
 from src.acp import helper
 from src.acp.options import ACPModelOption
@@ -201,6 +202,77 @@ def test_traex_probe_prefers_config_catalog_over_active_model_sentinel(
     assert [model.name for model in models] == ["model-a", "model-b"]
     assert [model.is_default for model in models] == [False, True]
     assert "TraeX active model" not in {model.name for model in models}
+
+
+def test_traex_retired_default_bootstraps_live_catalog_with_profiles_and_efforts(
+    monkeypatch, tmp_path,
+) -> None:
+    from src.acp.traex_selection import TraexModelMetadata, TraexProfileMetadata
+    from src.card.render.model_cascade import resolve_model_cascade
+
+    metadata = (
+        TraexModelMetadata("first", "First", (TraexProfileMetadata("standard", "first"),)),
+        TraexModelMetadata("model-b", "Model B", (
+            TraexProfileMetadata("standard", "model-b", ("low", "high"), "high"),
+            TraexProfileMetadata("max", "model-b__max", ("high", "max"), "max"),
+        )),
+    )
+    starts = []
+
+    def command(model):
+        starts.append(model)
+        return "traex", []
+
+    class Connection:
+        async def initialize(self, **kwargs):
+            pass
+
+        async def new_session(self, cwd):
+            if starts[-1] is None:
+                raise RequestError(-32603, "Internal error", 'model `retired` metadata could not be resolved')
+            return SimpleNamespace(config_options=(SimpleNamespace(
+                id="model", current_value="model-b", options=(
+                    SimpleNamespace(value="model-b", name="Model B"),
+                ),
+            ),))
+
+    @asynccontextmanager
+    async def spawn(*args, **kwargs):
+        yield Connection(), object()
+
+    monkeypatch.setattr(helper, "get_providers", lambda: {"traex": SimpleNamespace(get_serve_command=command)})
+    monkeypatch.setattr(helper, "spawn_agent_process", spawn)
+    monkeypatch.setattr(helper, "load_traex_model_metadata", lambda: metadata)
+
+    models = helper.fetch_acp_models("traex", str(tmp_path), "model-b/max/high")
+    assert starts == [None, "model-b"]
+    assert [model.name for model in models] == ["model-b"]  # Never expose cache-only models.
+    state = resolve_model_cascade(models, current_model="model-b/max/high")
+    assert state.profiles == ("standard", "max")
+    assert state.efforts == ("high", "max")
+    assert state.selection == "model-b/max/high"
+
+
+@pytest.mark.parametrize("tool,detail,expected_attempts", [
+    ("traex", "metadata could not be resolved", 2),
+    ("traex", "authentication failed", 1),
+    ("codex", "metadata could not be resolved", 1),
+])
+def test_model_probe_retry_is_bounded_and_only_for_traex_retired_metadata(
+    monkeypatch, tmp_path, tool, detail, expected_attempts,
+) -> None:
+    from src.acp.traex_selection import TraexModelMetadata
+
+    probe = AsyncMock(side_effect=RequestError(-32603, "Internal error", detail))
+    monkeypatch.setattr(helper, "_probe_acp_models_once", probe)
+    monkeypatch.setattr(helper, "load_traex_model_metadata", lambda: (
+        TraexModelMetadata("available", "Available", ()),
+    ))
+    with pytest.raises(RequestError):
+        asyncio.run(helper._probe_acp_models(tool, str(tmp_path)))
+    assert probe.await_count == expected_attempts
+    if expected_attempts == 2:
+        assert probe.call_args.args == (tool, str(tmp_path), "available")
 
 
 def test_coco_model_probe_uses_late_frame_tolerant_queue(

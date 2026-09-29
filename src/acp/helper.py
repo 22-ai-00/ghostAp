@@ -10,6 +10,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from acp.exceptions import RequestError
 from acp.stdio import spawn_agent_process
 
 from ..config import get_settings
@@ -44,6 +45,7 @@ from .traex_selection import (
     TraexModelMetadata,
     compose_traex_model_selection,
     load_traex_model_metadata,
+    split_traex_model_selection,
 )
 from .transport import LateFrameTolerantMessageQueue
 
@@ -692,11 +694,34 @@ async def discover_dsh_model_options(
 async def _probe_acp_models(
     tool_name: str, cwd: str | None, current_model: str | None = None
 ) -> list[ACPModelOption]:
+    try:
+        return await _probe_acp_models_once(tool_name, cwd)
+    except RequestError as exc:
+        # A retired model in traecli.toml can prevent session/new from exposing
+        # any capabilities. Bootstrap only this disposable discovery session;
+        # the returned catalog must still come from the live ACP connection.
+        if tool_name != "traex" or "metadata could not be resolved" not in str(exc.data):
+            raise
+        metadata = load_traex_model_metadata()
+        if not metadata:
+            raise
+        selected, _, _ = split_traex_model_selection(current_model)
+        candidate = next(
+            (model for model in metadata if selected in {model.config_name, model.slug}),
+            metadata[0],
+        )
+        logger.info("[ACP] retry Traex discovery with available bootstrap model=%s", candidate.config_name)
+        return await _probe_acp_models_once(tool_name, cwd, candidate.config_name)
+
+
+async def _probe_acp_models_once(
+    tool_name: str, cwd: str | None, bootstrap_model: str | None = None
+) -> list[ACPModelOption]:
     """Start one provider-neutral ACP session and read its declared models."""
     provider = get_providers().get(tool_name)
     if provider is None:
         return []
-    command, args = provider.get_serve_command(None)
+    command, args = provider.get_serve_command(bootstrap_model)
 
     from ..utils.env import build_clean_env
 
