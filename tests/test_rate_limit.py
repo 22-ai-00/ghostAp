@@ -2,6 +2,7 @@
 
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -595,23 +596,25 @@ class TestRateLimitAwareSession:
 
         wrapped = RateLimitAwareSession(inner)
 
-        # Check rate_limit_until is set during the wait window
+        # Observe the wait boundary directly: a sleeping observer thread can
+        # run before the retry loop publishes its deadline under CI load.
         observed_until = []
+        now = [100.0]
 
-        def _observer():
-            time.sleep(0.2)
+        def _observe_wait(timeout):
             observed_until.append(wrapped.rate_limit_until)
+            now[0] += timeout
+            return False
 
-        t = threading.Thread(target=_observer, daemon=True)
-        t.start()
-
-        result = wrapped.send_prompt("test")
-        t.join(timeout=5)
+        with (
+            patch("src.agent_session.wrappers.time", SimpleNamespace(monotonic=lambda: now[0])),
+            patch.object(wrapped._cancel_event, "wait", side_effect=_observe_wait),
+        ):
+            result = wrapped.send_prompt("test")
 
         assert result == expected
-        # During the wait, rate_limit_until should have been a non-None monotonic deadline
-        assert len(observed_until) == 1
-        assert observed_until[0] is not None
+        assert observed_until and all(deadline == 102.0 for deadline in observed_until)
+        assert wrapped.rate_limit_until is None
 
     def test_to_snapshot_delegates(self):
         inner = _make_mock_session()
