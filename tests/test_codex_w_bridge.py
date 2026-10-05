@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.acp import helper
+from src.acp.execution_instructions import AUTONOMOUS_EXECUTION_PROMPT
 from src.acp.startup_utils import AcpRetryStarter, StartupBackend, select_startup_backend
 from src.agent.intent_recognizer import IntentRecognizer, IntentType
 from src.agent_session.backend_resolver import (
@@ -146,15 +147,16 @@ def test_codex_exec_argv_shape_for_plain_prompt() -> None:
     popen = _run_with_mocked_process(session, "do the thing")
 
     argv = popen.call_args.args[0]
-    assert argv == [
+    assert argv[:-1] == [
         "codex-w",
         "exec",
         "--json",
         "--skip-git-repo-check",
         "-C",
         "/repo",
-        "do the thing",
     ]
+    assert argv[-1].startswith("do the thing\n\n---\nGhostAP 执行约定：")
+    assert argv[-1].endswith(AUTONOMOUS_EXECUTION_PROMPT)
     # first prompt establishes the thread from thread.started
     assert session.session_id == "thread-1"
     assert session.is_resumed is True
@@ -232,7 +234,8 @@ def test_resumed_prompt_uses_exec_resume_and_retransmits_effort() -> None:
     resume_at = argv.index("resume")
     assert argv[resume_at : resume_at + 2] == ["resume", "prior-thread"]
     assert resume_at > argv.index("exec")
-    assert argv[-1] == "continue"
+    assert argv[-1].startswith("continue\n\n---\nGhostAP 执行约定：")
+    assert argv[-1].endswith(AUTONOMOUS_EXECUTION_PROMPT)
 
 
 # ── synthetic model/effort card catalog ─────────────────────────────

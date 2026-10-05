@@ -17,6 +17,7 @@ from ..acp.client import (
     emit_referenced_changed_local_image_events,
     snapshot_local_image_artifacts,
 )
+from ..acp.execution_instructions import append_execution_instructions
 from ..acp.model_selection import (
     CODEX_DEFAULT_MODEL_TOKEN,
     split_codex_model_selection,
@@ -213,7 +214,7 @@ class SyncCodexCLISession(_PromptRetryMixin, PromptGenerationTracker):
             ]
             if resumed and self.session_id:
                 args += ["resume", self.session_id]
-            args.append(text)
+            args.append(append_execution_instructions(text))
             return args
 
         def _run_once(resumed: bool) -> tuple[int, str, str, str, str]:

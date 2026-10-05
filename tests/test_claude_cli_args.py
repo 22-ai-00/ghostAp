@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from src.acp.execution_instructions import AUTONOMOUS_EXECUTION_PROMPT
 from src.agent_session.claude_cli import ClaudeCLIConfig, SyncClaudeCLISession
 from src.agent_session.factory import create_engine_session
 
@@ -118,9 +119,11 @@ def test_claude_cli_autonomous_permission_mode_survives_resume(command, resumed)
     assert argv[:2] == [command, "-p"]
     assert argv[argv.index("--permission-mode") + 1] == "bypassPermissions"
     policy = argv[argv.index("--append-system-prompt") + 1]
+    assert policy == AUTONOMOUS_EXECUTION_PROMPT
     assert "优先采用推荐项" in policy
     assert "不要等待用户确认" in policy
     assert "明确报告失败" in policy
+    assert "明确限定只做分析" in policy
     assert ("--resume" in argv) is resumed
     assert ("--session-id" in argv) is not resumed
     assert argv[-2:] == ["--", "inspect the project"]

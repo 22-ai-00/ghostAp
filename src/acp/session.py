@@ -30,6 +30,7 @@ from .client import (
     emit_referenced_changed_local_image_events,
 )
 from .collaboration import merge_tool_call_sequence
+from .execution_instructions import AUTONOMOUS_EXECUTION_PROMPT
 from .models import (
     ACPEvent,
     ACPEventType,
@@ -1191,7 +1192,7 @@ class ACPSession:
 
             response: PromptResponse = await self._conn.prompt(
                 session_id=self._session_id,
-                prompt=[text_block(text)],
+                prompt=[text_block(AUTONOMOUS_EXECUTION_PROMPT), text_block(text)],
             )
 
             while True:

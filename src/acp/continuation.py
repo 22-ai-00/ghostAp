@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 MAX_ORDINARY_CONTINUATIONS = 3
 MAX_CHILD_RECONCILIATIONS = 1
-MAX_AUTOMATIC_DECISIONS = 1
+MAX_AUTOMATIC_DECISIONS = 8
 MAX_GOAL_RECOVERIES = 1
 MAX_INTERRUPTION_RECOVERIES = 1
 _monotonic = time.monotonic
@@ -41,10 +41,16 @@ _USER_INPUT_MARKERS = (
     "请二选一",
     "放开权限后回复",
     "当前权限模式阻止",
+    "确认后继续",
+    "回复继续",
+    "等待你的回复",
+    "等待用户确认",
     "please confirm",
     "please choose",
     "please reply",
     "need your confirmation",
+    "waiting for your approval",
+    "waiting for your reply",
     "can i ",
     "may i ",
     "should i ",
@@ -89,7 +95,7 @@ def _build_continuation_prompt(pending_plan_entries: int) -> str:
         "记录该选择及理由后继续，不要仅因这类选择停下来询问。\n"
         "GhostAP 不增加二次授权或风险判断；遇到 provider 自身的权限交互时"
         "直接使用 provider 提供的继续方式，并完成原任务。"
-        "本轮结束时如实说明已完成、验证和仍需用户决定的事项。"
+        "本轮结束时如实说明已完成、验证和无法恢复的失败原因。"
     )
 
 
@@ -156,8 +162,10 @@ def _normalize_user_input_assessment(
 def _build_confirmation_default_prompt() -> str:
     return (
         "[GhostAP 自动续做默认决策]\n"
-        "上一步出现了“请选择/请确认”等提示。请直接采用文档推荐项；没有推荐项时"
-        "使用最符合原任务目标的默认值继续，不要再次询问。GhostAP 不做二次风险"
+        "用户已明确要求原任务全程无需确认。上一步出现了“请选择/请确认”等提示，"
+        "请直接采用你提供的推荐项或文档推荐项；没有推荐项时"
+        "使用最符合原任务目标的默认值继续。后续每个选择也使用同一规则，"
+        "不要调用提问工具、等待回复或要求用户手动执行。GhostAP 不做二次风险"
         "分类或权限拦截，provider 自身的权限机制仍由 provider 处理。"
     )
 
@@ -175,9 +183,9 @@ def _build_interruption_recovery_prompt() -> str:
     return (
         "[GhostAP ACP 中断恢复指令]\n"
         "上一轮被 provider 或权限交互中断；这不是用户取消。请在同一会话中"
-        "继续原任务，按 provider 自身提供的方式完成权限交互，不要等待 GhostAP"
-        "进行额外批准。完成后如实给出结果；若仍无法完成，明确"
-        "报告剩余阻塞，不要再次自行恢复。"
+        "继续原任务，采用推荐项或合理默认值，按 provider 自身提供的方式完成"
+        "权限交互，不要询问用户或等待 GhostAP 进行额外批准。"
+        "完成后如实给出结果；若遇到无法恢复的错误，明确报告失败原因。"
     )
 
 
@@ -594,12 +602,6 @@ def run_prompt_with_continuation(
             result,
             classify_prompt_result(result),
         )
-        if (
-            continuation_kind == _INTERRUPTION_RECOVERY
-            and assessment.outcome is PromptOutcome.INCOMPLETE
-        ):
-            break
-
     return PromptContinuationResult(
         result=result,
         assessment=assessment,

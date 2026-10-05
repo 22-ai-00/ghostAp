@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 import src.acp as acp
+from src.acp.continuation import MAX_AUTOMATIC_DECISIONS
 from src.acp.models import (
     ACPEvent,
     ACPEventType,
@@ -306,6 +307,46 @@ def test_safe_choice_uses_default_and_continues_without_user_input() -> None:
     assert execution.assessment.outcome is PromptOutcome.COMPLETED
 
 
+def test_sequential_confirmations_each_use_recommended_defaults() -> None:
+    session = _FakeSession(
+        PromptResult(stop_reason="end_turn", text="请选择实现方案，推荐 A。"),
+        PromptResult(stop_reason="end_turn", text="请确认测试方案，推荐完整回归。"),
+        PromptResult(stop_reason="end_turn", text="是否按推荐方案提交并推送？"),
+        _complete_result("实现、验证、提交和推送均完成"),
+    )
+    execution = _runner()(
+        session, "完成开发并提交推送", timeout_s=90, finalization_reserve_s=0,
+    )
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.automatic_continuations == 3
+    assert len(session.calls) == 4
+    for call in session.calls[1:]:
+        assert "你提供的推荐项" in call.text
+        assert "后续每个选择" in call.text
+        assert "不要调用提问工具" in call.text
+
+
+def test_confirmation_recovery_respects_deadline_and_explicit_user_cancel() -> None:
+    cancelled = _FakeSession(
+        PromptResult(stop_reason="end_turn", text="请确认是否继续。"),
+        PromptResult(stop_reason="cancelled", cancellation_source="user"),
+    )
+    execution = _runner()(cancelled, "原任务", timeout_s=90, finalization_reserve_s=0)
+    assert execution.assessment.outcome is PromptOutcome.CANCELLED
+    assert len(cancelled.calls) == 2
+
+    clock = _FakeClock()
+    pending = _FakeSession(
+        PromptResult(stop_reason="end_turn", text="请确认是否继续。"),
+        on_send=lambda _: clock.advance(90),
+    )
+    with patch("src.acp.continuation._monotonic", clock):
+        execution = _runner()(pending, "原任务", timeout_s=90, finalization_reserve_s=0)
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.automatic_continuations == 0
+    assert len(pending.calls) == 1
+
+
 @pytest.mark.parametrize("blocked_text", [
     "请二选一：放开权限，或手动执行命令。",
     "放开权限后回复继续。",
@@ -314,22 +355,24 @@ def test_safe_choice_uses_default_and_continues_without_user_input() -> None:
     "或你手动执行mkdir。当前远程仓库没有任何新增提交。",
 ])
 @pytest.mark.parametrize("recovered", [False, True])
-def test_permission_block_text_recovers_once_without_false_completion(
+def test_permission_block_text_recovers_with_bound_without_false_completion(
     blocked_text: str, recovered: bool,
 ) -> None:
     session = _FakeSession(
         PromptResult(stop_reason="end_turn", text=blocked_text),
-        _complete_result() if recovered else PromptResult(
-            stop_reason="end_turn", text=blocked_text,
-        ),
+        *([_complete_result()] if recovered else [
+            PromptResult(stop_reason="end_turn", text=blocked_text)
+            for _ in range(MAX_AUTOMATIC_DECISIONS)
+        ]),
     )
 
     execution = _runner()(
         session, "完成原任务", timeout_s=90, finalization_reserve_s=0,
     )
 
-    assert len(session.calls) == 2
-    assert execution.automatic_continuations == 1
+    expected_decisions = 1 if recovered else MAX_AUTOMATIC_DECISIONS
+    assert len(session.calls) == 1 + expected_decisions
+    assert execution.automatic_continuations == expected_decisions
     assert "自动续做默认决策" in session.calls[1].text
     assert execution.assessment.outcome is (
         PromptOutcome.COMPLETED if recovered else PromptOutcome.INCOMPLETE
@@ -1321,8 +1364,8 @@ def test_permission_denied_cancelled_gets_one_safe_recovery() -> None:
     assert execution.automatic_continuations == 1
 
 
-def test_incomplete_interruption_recovery_does_not_switch_continuation_kind() -> None:
-    """One interrupted turn gets one retry, never a second prompt of another kind."""
+def test_recovered_interruption_continues_remaining_plan_without_stopping() -> None:
+    """Recovering the provider must still allow remaining work to finish."""
     runner = _runner()
     interrupted = PromptResult(
         stop_reason="cancelled",
@@ -1338,9 +1381,9 @@ def test_incomplete_interruption_recovery_does_not_switch_continuation_kind() ->
         finalization_reserve_s=0,
     )
 
-    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
-    assert execution.automatic_continuations == 1
-    assert len(session.calls) == 2
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.automatic_continuations == 2
+    assert len(session.calls) == 3
 
 
 def test_manager_marked_user_cancel_never_continues() -> None:
