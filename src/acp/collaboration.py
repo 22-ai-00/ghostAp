@@ -393,6 +393,7 @@ def merge_tool_call_snapshot(
             reset_sources.add(activity_source)
     return replace(
         current,
+        title=current.title or previous.title,
         collaboration_tool=(
             current.collaboration_tool or previous.collaboration_tool
         ),
@@ -515,6 +516,10 @@ def merge_tool_call_sequence(
             ):
                 merged = replace(
                     tool_call,
+                    title=(
+                        tool_call.title
+                        or (previous.title if not crosses_turn_boundary else "")
+                    ),
                     is_context_compaction=(
                         tool_call.is_context_compaction is True
                         or (

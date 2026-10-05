@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from acp.task import InMemoryMessageQueue
+from acp.task import InMemoryMessageQueue, RpcTask, RpcTaskKind
 
 from ..utils.env import build_clean_env
 
@@ -52,6 +53,30 @@ class LateFrameTolerantMessageQueue(InMemoryMessageQueue):
     async def publish(self, task: Any) -> None:
         if not self._accepting:
             return
+        # Some adapters send partial lifecycle updates with the start-event
+        # discriminator. A start requires a title; progress does not. Preserve
+        # the partial update as progress instead of losing its terminal status
+        # at the SDK's validation boundary. Other invalid fields still fail.
+        if isinstance(task, RpcTask) and task.kind is RpcTaskKind.NOTIFICATION:
+            message = task.message
+            params = message.get("params")
+            update = params.get("update") if isinstance(params, dict) else None
+            if (
+                message.get("method") == "session/update"
+                and isinstance(update, dict)
+                and update.get("sessionUpdate") == "tool_call"
+                and update.get("title") is None
+            ):
+                task = replace(
+                    task,
+                    message={
+                        **message,
+                        "params": {
+                            **params,
+                            "update": {**update, "sessionUpdate": "tool_call_update"},
+                        },
+                    },
+                )
         try:
             await super().publish(task)
         except RuntimeError:

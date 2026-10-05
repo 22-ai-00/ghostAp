@@ -16,6 +16,7 @@
 
 | ID | 日期 | Gap 描述 | Severity | 来源 | 状态 | 解决 Commit |
 |----|------|----------|----------|------|------|-------------|
+| B091 | 2026-10-05 | 近期日志有 3682 条 card hook executor 背压警告（24 slots occupied），同期间任务仍成功完成，尚无任务失败因果证据。需定位具体慢 hook、等待持锁和线程资源生命周期，增加脱敏 hook 名称/耗时观测及持续运行验证，不把投递旁路拥塞误报为任务失败。 | Medium | 飞书任务中断诊断 | Open | — |
 | B090 | 2026-09-14 | 活跃 Spec 运行期间 SIGTERM，scheduler 十秒 drain 超时后仍有阶段回调，Python executor 已关闭而触发 cannot schedule new futures after shutdown；restart.sh 三十秒宽限后只能强停。需梳理引擎取消、状态保存、scheduler drain 和 callback executor 生命周期，补活跃 Spec 停机回归；本次新服务已正常就绪，不代表旧任务续跑。 | Medium | Spec 优化部署重启日志 | Open | — |
 | B049 | 2026-07-16 | Feishu API 硬超时后 daemon SDK worker 无法取消；本地删除 binding 后，迟到 PATCH 可能越过新代际远端写入。需设计 request generation/远端见证并做故障注入。 | Medium | Deep 卡片顺序分页审计 | Open | — |
 | B051 | 2026-07-16 | 员工 Contact/Context/群历史 SDK 调用缺少 endpoint、员工 app、message_id、平台错误码与分段耗时关联；异常目前多被压缩为 false/unknown，现场只能结合 Journal 推断。需补脱敏结构化观测。 | Medium | Team 员工延迟日志审计 | Open | — |
