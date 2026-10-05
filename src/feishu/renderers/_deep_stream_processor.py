@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 
 from ...acp import ACPEvent, ACPEventType
 from ...card.events import CardEvent, CardEventType
-from ...card.orchestrator import TaskOrchestrator
+from ...card.events.projector import (
+    extract_agent_task_label,
+    is_agent_task,
+    is_generic_task_label,
+)
 from ...card.render.build_heartbeat import BuildHeartbeat
 from ...card.task_registry import TaskRegistry, tasks_from_plan_entries
 from ...card.ui_text import UI_TEXT
@@ -376,7 +380,7 @@ class DeepStreamProcessor(BaseStreamProcessor):
         label = str(value or "").strip()
         if label.startswith("🧬 "):
             label = label[2:].strip()
-        return TaskOrchestrator._is_generic_task_label(label)
+        return is_generic_task_label(label)
 
     def _handle_plan_task_list(self, event: ACPEvent) -> bool:
         if event.event_type != ACPEventType.PLAN_UPDATE or not event.plan:
@@ -411,7 +415,7 @@ class DeepStreamProcessor(BaseStreamProcessor):
         if collaboration_route is not None:
             return collaboration_route
 
-        is_agent_task_event = TaskOrchestrator.is_agent_task_event(event)
+        is_agent_task_event = is_agent_task(tool_call)
         task_id = str(
             getattr(tool_call, "subagent_source_id", "")
             or getattr(tool_call, "id", "")
@@ -437,7 +441,7 @@ class DeepStreamProcessor(BaseStreamProcessor):
             status = "failed" if raw_status == "failed" else "completed"
         else:
             status = "in_progress"
-        label = TaskOrchestrator._extract_agent_task_label(tool_call)
+        label = extract_agent_task_label(tool_call)
         if is_agent_task_event and not label.startswith("🧬 "):
             label = f"🧬 {label}"
         self._upsert_task(task_id, label, status)
@@ -488,7 +492,7 @@ class DeepStreamProcessor(BaseStreamProcessor):
             "not_found": "failed",
             "interrupted": "cancelled",
         }
-        label = TaskOrchestrator._extract_agent_task_label(tool_call)
+        label = extract_agent_task_label(tool_call)
         if not label.startswith("🧬 "):
             label = f"🧬 {label}"
         current_task_id = ""

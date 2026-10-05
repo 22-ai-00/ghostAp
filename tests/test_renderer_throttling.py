@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.acp import ACPEventType
+from src.acp.models import ACPEvent, ToolCallInfo
 from src.card.builders.system import SystemBuilder
 from src.deep_engine.models import DeepProjectStatus
 from src.feishu.renderers.deep_renderer import DeepRenderer
@@ -95,6 +96,86 @@ class TestRendererThrottling:
             calls = [c.args[0] for c in mock_session.dispatch.call_args_list]
             types = [c.type.value for c in calls]
             assert "completed" in types
+
+    def test_deep_subagent_events_update_main_card_task(self, mock_handler):
+        renderer = DeepRenderer(mock_handler)
+        project = MagicMock(project_id="test_proj")
+
+        with patch("src.feishu.renderers.base.BaseRenderer.create_session") as create:
+            session = create.return_value
+            callbacks = renderer.create_deep_callbacks("msg_id", "chat_id", project)
+
+            for event_type, path, status in (
+                (ACPEventType.TOOL_CALL_START, None, "in_progress"),
+                (ACPEventType.TOOL_CALL_UPDATE, "/root/card-audit", "in_progress"),
+                (ACPEventType.TOOL_CALL_DONE, "/root/card-audit", "completed"),
+            ):
+                callbacks.on_event(ACPEvent(
+                    event_type=event_type,
+                    tool_call=ToolCallInfo(
+                        id="call-1",
+                        title="Task",
+                        kind="agent",
+                        status=status,
+                        subagent_source_id="child-1",
+                        subagent_path=path,
+                    ),
+                ))
+
+            task_lists = [
+                call.args[0].payload["tasks"]
+                for call in session.dispatch.call_args_list
+                if call.args[0].type.value == "task_list_updated"
+            ]
+            child_snapshots = [
+                next((task for task in tasks if task["task_id"] == "child-1"), None)
+                for tasks in task_lists
+            ]
+            child_snapshots = [task for task in child_snapshots if task is not None]
+            assert [(task["name"], task["status"]) for task in child_snapshots] == [
+                ("🧬 子任务", "in_progress"),
+                ("🧬 card-audit", "in_progress"),
+                ("🧬 card-audit", "completed"),
+            ]
+            assert all(
+                task["task_id"] != "call-1"
+                for tasks in task_lists for task in tasks
+            )
+
+    def test_deep_collaboration_snapshot_reaches_main_card(self, mock_handler):
+        renderer = DeepRenderer(mock_handler)
+        project = MagicMock(project_id="test_proj")
+
+        with patch("src.feishu.renderers.base.BaseRenderer.create_session") as create:
+            session = create.return_value
+            callbacks = renderer.create_deep_callbacks("msg_id", "chat_id", project)
+
+            for event_type, child_status, call_status in (
+                (ACPEventType.TOOL_CALL_START, "running", "in_progress"),
+                (ACPEventType.TOOL_CALL_DONE, "completed", "completed"),
+            ):
+                callbacks.on_event(ACPEvent(
+                    event_type=event_type,
+                    tool_call=ToolCallInfo(
+                        id="collab-1",
+                        title="Task",
+                        kind="agent",
+                        status=call_status,
+                        collaboration_tool="spawn_agent",
+                        collaboration_receivers=("child-1",),
+                        subagent_states=({"source_id": "child-1", "status": child_status},),
+                    ),
+                ))
+
+            task_lists = [
+                call.args[0].payload["tasks"]
+                for call in session.dispatch.call_args_list
+                if call.args[0].type.value == "task_list_updated"
+            ]
+            assert [
+                next(task["status"] for task in tasks if task["task_id"] == "child-1")
+                for tasks in task_lists if any(task["task_id"] == "child-1" for task in tasks)
+            ] == ["in_progress", "completed"]
 
     def test_help_card_structure(self):
         """Test that build_help_card returns valid structure"""
