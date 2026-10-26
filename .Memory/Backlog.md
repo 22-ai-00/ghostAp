@@ -16,6 +16,7 @@
 
 | ID | 日期 | Gap 描述 | Severity | 来源 | 状态 | 解决 Commit |
 |----|------|----------|----------|------|------|-------------|
+| B092 | 2026-10-26 | 主 Bot reply-chain readiness 目前只验证审计回调 callable，不反映运行期间的审计存储故障；磁盘恢复后的单帧补锚已修复，但持续故障时的健康观测仍不足。需区分消息写入可用性与 activation_fence_ready 的历史完整性，增加无业务外发的健康状态，避免将 audit incomplete 直接等同于整个进程不可用。 | Medium | 最近任务静默停滞诊断 | Open | — |
 | B091 | 2026-10-05 | 近期日志有 3682 条 card hook executor 背压警告（24 slots occupied），同期间任务仍成功完成，尚无任务失败因果证据。需定位具体慢 hook、等待持锁和线程资源生命周期，增加脱敏 hook 名称/耗时观测及持续运行验证，不把投递旁路拥塞误报为任务失败。 | Medium | 飞书任务中断诊断 | Open | — |
 | B090 | 2026-09-14 | 活跃 Spec 运行期间 SIGTERM，scheduler 十秒 drain 超时后仍有阶段回调，Python executor 已关闭而触发 cannot schedule new futures after shutdown；restart.sh 三十秒宽限后只能强停。需梳理引擎取消、状态保存、scheduler drain 和 callback executor 生命周期，补活跃 Spec 停机回归；本次新服务已正常就绪，不代表旧任务续跑。 | Medium | Spec 优化部署重启日志 | Open | — |
 | B049 | 2026-07-16 | Feishu API 硬超时后 daemon SDK worker 无法取消；本地删除 binding 后，迟到 PATCH 可能越过新代际远端写入。需设计 request generation/远端见证并做故障注入。 | Medium | Deep 卡片顺序分页审计 | Open | — |

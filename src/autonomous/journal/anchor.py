@@ -196,6 +196,34 @@ class FileAnchor:
             self._write_unlocked(AnchorState(new_sequence, new_hash))
             return True
 
+    def confirm_durable(self, state: AnchorState) -> bool:
+        """Confirm an ambiguous CAS replacement and durably sync its directory.
+
+        A CAS can replace the file before its directory fsync raises. Keep the
+        anchor lock through comparison and the repeat fsync so a competing CAS
+        cannot change the file being confirmed.
+        """
+
+        with self._locked(fcntl.LOCK_EX):
+            if self._read_unlocked() != state:
+                return False
+            fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise AnchorCorruptionError("anchor is not a regular file")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            directory_fd = os.open(
+                self.path.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            return True
+
     def _write_unlocked(self, state: AnchorState) -> None:
         payload = json.dumps(
             {

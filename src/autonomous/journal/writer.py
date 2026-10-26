@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import logging
 import math
 import os
 import threading
@@ -15,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol, Sequence
 
-from .anchor import AnchorProvider, AnchorState
+from .anchor import AnchorProvider, AnchorState, FileAnchor
 from .blob_store import BlobRef
 from .frame import (
     FRAME_MAGIC,
@@ -30,6 +31,7 @@ from .frame import (
 JOURNAL_FILENAME = "journal.jsonl"
 LOCK_FILENAME = "writer.lock"
 _FRAME_CHAIN_PREFIX = f'"magic":"{FRAME_MAGIC}","previous_hash":"'.encode()
+logger = logging.getLogger(__name__)
 
 
 class WriterLockError(RuntimeError):
@@ -105,6 +107,7 @@ class JournalWriter:
         fs_ops: FileSystemOperations | None = None,
         blob_ref_validator: Any = None,
         _tail_checkpoint_aggregate_id: str | None = None,
+        _recover_unanchored_tail: bool = False,
     ) -> None:
         if not isinstance(hmac_key, bytes) or len(hmac_key) < 32:
             raise ValueError("journal hmac key must be at least 32 bytes")
@@ -120,6 +123,8 @@ class JournalWriter:
             or _tail_checkpoint_aggregate_id != _tail_checkpoint_aggregate_id.strip()
         ):
             raise ValueError("tail checkpoint aggregate id must be non-empty")
+        if _recover_unanchored_tail and _tail_checkpoint_aggregate_id is None:
+            raise ValueError("unanchored tail recovery requires a dedicated aggregate")
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.base_dir.chmod(0o700)
@@ -131,6 +136,7 @@ class JournalWriter:
         self._fs_ops = fs_ops or DefaultFileSystemOperations()
         self._blob_ref_validator = blob_ref_validator
         self._tail_checkpoint_aggregate_id = _tail_checkpoint_aggregate_id
+        self._recover_unanchored_tail = _recover_unanchored_tail
         self._mutex = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
         # Serialize cross-domain projection refresh + commit without reusing the
         # writer's non-reentrant leaf lock. Public writer operations called in a
@@ -138,6 +144,7 @@ class JournalWriter:
         self._transaction_mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._closed = False
         self._write_disabled = False
+        self._pending_anchor_recovery = False
         self._lock_file = open(self.lock_path, "a+b")
         os.chmod(self.lock_path, 0o600)
         try:
@@ -202,6 +209,7 @@ class JournalWriter:
         writer_epoch: int = 0,
         aggregate_id: str,
         fs_ops: FileSystemOperations | None = None,
+        recover_unanchored_tail: bool = False,
     ) -> JournalWriter:
         """Open a dedicated single-aggregate Journal from its anchored tail.
 
@@ -217,6 +225,7 @@ class JournalWriter:
             writer_epoch=writer_epoch,
             fs_ops=fs_ops,
             _tail_checkpoint_aggregate_id=aggregate_id,
+            _recover_unanchored_tail=recover_unanchored_tail,
         )
 
     def __enter__(self) -> JournalWriter:
@@ -323,7 +332,9 @@ class JournalWriter:
             self._fs_ops.fsync_directory(self.base_dir)
         return frames
 
-    def _load_tail_checkpoint(self) -> list[TransactionFrame]:
+    def _load_tail_checkpoint(
+        self, *, expected_tail: TransactionFrame | None = None
+    ) -> list[TransactionFrame]:
         """Verify the raw hash chain and materialize only its authenticated tail."""
 
         aggregate_id = self._tail_checkpoint_aggregate_id
@@ -332,6 +343,7 @@ class JournalWriter:
         anchored = self.anchor.read()
         expected_previous_hash = GENESIS_HASH.encode("ascii")
         record_count = 0
+        predecessor_record = b""
         tail_record = b""
         with open(self.journal_path, "rb", buffering=1024 * 1024) as file:
             for record in file:
@@ -350,14 +362,54 @@ class JournalWriter:
                     raise JournalIntegrityError("journal previous hash chain mismatch")
                 expected_previous_hash = hashlib.sha256(record).hexdigest().encode("ascii")
                 record_count += 1
+                predecessor_record = tail_record
                 tail_record = record
 
         if record_count == 0:
             if anchored != AnchorState(0, GENESIS_HASH):
                 raise AnchorMismatchError("journal and monotonic anchor high-water mark differ")
             return []
+        if record_count == anchored.sequence + 1 and self._recover_unanchored_tail:
+            if anchored.sequence:
+                predecessor = decode_frame(predecessor_record, self._hmac_key)
+                self._validate_checkpoint_frame(predecessor, aggregate_id)
+                if (
+                    predecessor.sequence != anchored.sequence
+                    or predecessor.frame_hash != anchored.frame_hash
+                ):
+                    raise AnchorMismatchError("anchored predecessor does not match Journal")
+            elif anchored != AnchorState():
+                raise AnchorMismatchError("genesis anchor hash mismatch")
+            frame = decode_frame(tail_record, self._hmac_key)
+            self._validate_checkpoint_frame(frame, aggregate_id)
+            if expected_tail is not None and frame.to_bytes() != expected_tail.to_bytes():
+                raise JournalIntegrityError("pending Journal tail changed on disk")
+            if (
+                frame.sequence != record_count
+                or frame.previous_hash != anchored.frame_hash
+                or frame.frame_hash.encode("ascii") != expected_previous_hash
+            ):
+                raise AnchorMismatchError("unanchored Journal tail is discontinuous")
+            with open(self.journal_path, "rb") as file:
+                self._fs_ops.fsync_file(file)
+            self._fs_ops.fsync_directory(self.base_dir)
+            try:
+                advanced = self.anchor.compare_and_swap(
+                    anchored.sequence,
+                    anchored.frame_hash,
+                    frame.sequence,
+                    frame.frame_hash,
+                )
+            except Exception:
+                logger.exception("Journal tail recovery anchor CAS failed")
+                advanced = False
+            if not advanced and not self._confirm_file_anchor(frame):
+                raise AnchorMismatchError("unanchored Journal tail could not be anchored")
+            logger.info("Journal unanchored tail recovered at sequence %d", frame.sequence)
+            return [frame]
         frame = decode_frame(tail_record, self._hmac_key)
-        self._validate_blob_refs(frame.events)
+        if expected_tail is not None and frame.to_bytes() != expected_tail.to_bytes():
+            raise JournalIntegrityError("pending Journal tail changed on disk")
         if (
             record_count != anchored.sequence
             or expected_previous_hash != anchored.frame_hash.encode("ascii")
@@ -365,10 +417,64 @@ class JournalWriter:
             or frame.frame_hash != anchored.frame_hash
         ):
             raise AnchorMismatchError("journal and monotonic anchor high-water mark differ")
+        self._validate_checkpoint_frame(frame, aggregate_id)
+        if self._recover_unanchored_tail and isinstance(self.anchor, FileAnchor):
+            if not self._confirm_file_anchor(frame):
+                raise AnchorMismatchError("anchored Journal tail could not be confirmed")
+        return [frame]
 
+    def _confirm_file_anchor(self, frame: TransactionFrame) -> bool:
+        return isinstance(self.anchor, FileAnchor) and self.anchor.confirm_durable(
+            AnchorState(frame.sequence, frame.frame_hash)
+        )
+
+    @property
+    def pending_anchor_recovery(self) -> bool:
+        with self._mutex:
+            return self._pending_anchor_recovery and not self._closed
+
+    def recover_pending_anchor(self) -> bool:
+        """Make one audited, disabled tail writable after disk verification.
+
+        Only a dedicated opt-in writer may use this path. A failed attempt
+        leaves the same writer disabled; it never appends or retries a send.
+        """
+
+        with self._mutex:
+            if self._closed:
+                raise JournalClosedError("journal writer is closed for writes")
+            if not self._recover_unanchored_tail or not self._pending_anchor_recovery:
+                return False
+            known_frame = self._frames[-1]
+            if (
+                not isinstance(self.anchor, FileAnchor)
+                and self.anchor.read() == AnchorState(known_frame.sequence, known_frame.frame_hash)
+            ):
+                raise AnchorMismatchError("ambiguous non-file Journal anchor state")
+            recovered = self._load_tail_checkpoint(expected_tail=known_frame)
+            if len(recovered) != 1 or recovered[0] != known_frame:
+                raise JournalIntegrityError("pending Journal tail changed on disk")
+            if self.anchor.read() != AnchorState(known_frame.sequence, known_frame.frame_hash):
+                raise AnchorMismatchError("pending Journal tail is not anchored")
+            if isinstance(self.anchor, FileAnchor) and not self._confirm_file_anchor(known_frame):
+                raise AnchorMismatchError("pending Journal anchor could not be confirmed")
+            self._frames[:] = recovered
+            self._aggregate_versions = dict(known_frame.aggregate_versions)
+            self._sequence = known_frame.sequence
+            self._previous_hash = known_frame.frame_hash
+            self._pending_anchor_recovery = False
+            self._write_disabled = False
+            logger.info("Journal pending anchor recovered at sequence %d", known_frame.sequence)
+            return True
+
+    def _validate_checkpoint_frame(
+        self, frame: TransactionFrame, aggregate_id: str
+    ) -> None:
+        self._validate_blob_refs(frame.events)
         event_aggregate_ids = {event.aggregate_id for event in frame.events}
         if (
-            event_aggregate_ids != {aggregate_id}
+            frame.sequence < 1
+            or event_aggregate_ids != {aggregate_id}
             or set(frame.expected_versions) != {aggregate_id}
             or set(frame.aggregate_versions) != {aggregate_id}
             or frame.expected_versions[aggregate_id] != frame.sequence - 1
@@ -377,7 +483,6 @@ class JournalWriter:
             raise JournalIntegrityError(
                 "tail checkpoint requires a dedicated single-aggregate Journal"
             )
-        return [frame]
 
     @staticmethod
     def _rebuild_aggregate_versions(
@@ -525,12 +630,14 @@ class JournalWriter:
                     frame.frame_hash,
                 )
             except Exception:
+                logger.exception("Journal anchor compare-and-swap failed")
                 anchored = False
             if anchored:
                 if self._tail_checkpoint_aggregate_id is not None:
                     self._frames[:] = [frame]
                 return CommitResult(frame=frame, state=CommitState.ANCHORED)
             self._write_disabled = True
+            self._pending_anchor_recovery = self._recover_unanchored_tail
             return CommitResult(
                 frame=frame,
                 state=CommitState.DURABLE_NOT_ANCHORED,

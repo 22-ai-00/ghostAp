@@ -50,6 +50,7 @@ class MainBotSendAuditLog:
                 hmac_key=hmac_key,
                 writer_epoch=writer_epoch if writer_epoch is not None else time.time_ns(),
                 aggregate_id=_AGGREGATE_ID,
+                recover_unanchored_tail=True,
             ),
             external_audit=external_audit,
         )
@@ -84,6 +85,8 @@ class MainBotSendAuditLog:
         target_hash = hashlib.sha256(target.encode("utf-8")).hexdigest()
         with self._lock:
             try:
+                if self.writer.pending_anchor_recovery:
+                    self.writer.recover_pending_anchor()
                 timestamp = time.time() if attempted_at is None else attempted_at
                 event = JournalEvent(
                     event_type=_EVENT_TYPE,

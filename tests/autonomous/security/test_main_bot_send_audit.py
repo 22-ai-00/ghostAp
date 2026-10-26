@@ -5,6 +5,8 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -13,6 +15,7 @@ from src.autonomous.acceptance.main_bot_audit import MainBotSendAuditLog
 from src.autonomous.journal.anchor import FileAnchor
 from src.autonomous.journal.frame import JournalIntegrityError
 from src.autonomous.journal.writer import JournalWriter
+from src.feishu.im_client import FeishuIMClient
 
 
 def _audit(tmp_path: Path) -> MainBotSendAuditLog:
@@ -102,6 +105,108 @@ def test_main_bot_audit_reopens_from_anchored_tail_without_history_replay(
         verified.close()
 
 
+@pytest.mark.parametrize("restart", [False, True], ids=["live", "restart"])
+@pytest.mark.parametrize("replaced", [False, True], ids=["before-replace", "after-replace"])
+def test_final_reply_recovers_after_anchor_storage_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    restart: bool,
+    replaced: bool,
+) -> None:
+    """A failed progress audit must not permanently swallow the final reply."""
+    anchor = FileAnchor(tmp_path / "audit.anchor")
+    audit = MainBotSendAuditLog.open(
+        tmp_path / "audit",
+        anchor_path=anchor.path,
+        anchor=anchor,
+        hmac_key=b"a" * 32,
+    )
+    original_write = anchor._write_unlocked
+    unavailable = True
+
+    def write(state):
+        if not unavailable or replaced:
+            original_write(state)
+        if unavailable:
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(anchor, "_write_unlocked", write)
+    reply = Mock(return_value=SimpleNamespace(success=lambda: True))
+    sdk = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(reply=reply))))
+
+    def client() -> FeishuIMClient:
+        return FeishuIMClient(
+            lambda: sdk,
+            SimpleNamespace(im_api_max_retries=1),
+            outbound_audit=audit.record_attempt,
+            outbound_audit_failure=audit.mark_incomplete,
+        )
+
+    def send() -> object:
+        return client().reply_message(
+            "om_task",
+            '{"text":"Task finished"}',
+            audit_aliases=("oc_chat",),
+        )
+
+    try:
+        with pytest.raises(RuntimeError, match="anchored"):
+            send()
+        reply.assert_not_called()
+        before_recovery = audit.writer.journal_path.read_bytes()
+        assert audit.activation_fence_ready is False
+        unavailable = False
+        if restart:
+            audit.close()
+            audit = MainBotSendAuditLog.open(
+                tmp_path / "audit",
+                anchor_path=anchor.path,
+                hmac_key=b"a" * 32,
+            )
+        assert send() is reply.return_value
+        reply.assert_called_once()
+        assert audit.writer.journal_path.read_bytes().startswith(before_recovery)
+        frames = list(audit.writer.replay())
+        assert [frame.sequence for frame in frames] == [1, 2, 3]
+        assert anchor.read().sequence == frames[-1].sequence
+        assert len({event.payload["attempt_id"] for frame in frames for event in frame.events}) == 3
+        if not restart:
+            # Resuming delivery does not erase the historical audit gap.
+            assert audit.activation_fence_ready is False
+    finally:
+        audit.close()
+
+
+def test_persistent_anchor_failure_stays_bounded_without_appending_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = FileAnchor(tmp_path / "audit.anchor")
+    audit = MainBotSendAuditLog.open(
+        tmp_path / "audit",
+        anchor_path=anchor.path,
+        anchor=anchor,
+        hmac_key=b"a" * 32,
+    )
+    failures = []
+
+    def unavailable(_state):
+        failures.append(True)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(anchor, "_write_unlocked", unavailable)
+    try:
+        for _ in range(3):
+            with pytest.raises((OSError, RuntimeError, JournalIntegrityError)):
+                audit.record_attempt("tenant", "reply", "om_task")
+        assert len(audit.writer.journal_path.read_bytes().splitlines()) == 1
+        assert 1 <= len(failures) <= 6
+        assert anchor.read().sequence == 0
+        assert audit.activation_fence_ready is False
+    finally:
+        audit.close()
+
+
 def test_history_replay_failure_marks_fast_opened_audit_incomplete(
     tmp_path: Path,
 ) -> None:
@@ -127,11 +232,14 @@ def test_history_replay_failure_marks_fast_opened_audit_incomplete(
     first = json.loads(records[0])
     digest = first["hmac_digest"]
     first["hmac_digest"] = ("0" if digest[0] != "0" else "1") + digest[1:]
-    records[0] = json.dumps(
-        first,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode() + b"\n"
+    records[0] = (
+        json.dumps(
+            first,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
     (directory / "journal.jsonl").write_bytes(b"".join(records))
 
     try:

@@ -84,6 +84,29 @@ def test_file_anchor_atomically_replaces_and_fsyncs_file_then_directory(
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+def test_file_anchor_confirms_replaced_state_after_directory_fsync_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "anchor.json"
+    anchor = FileAnchor(path)
+    real_fsync = os.fsync
+    fail_directory_once = True
+
+    def transient_fsync(fd: int) -> None:
+        nonlocal fail_directory_once
+        if fail_directory_once and stat.S_ISDIR(os.fstat(fd).st_mode):
+            fail_directory_once = False
+            raise OSError("transient directory fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", transient_fsync)
+    state = AnchorState(1, "c" * 64)
+    with pytest.raises(OSError, match="directory fsync"):
+        anchor.compare_and_swap(0, GENESIS_HASH, state.sequence, state.frame_hash)
+    assert anchor.confirm_durable(state) is True
+    assert anchor.confirm_durable(AnchorState(1, "d" * 64)) is False
+
+
 @pytest.mark.parametrize(
     "payload",
     [

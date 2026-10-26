@@ -482,6 +482,112 @@ def test_anchor_exception_is_durable_but_closes_writes(
     writer.close()
 
 
+def test_opted_tail_recovery_preserves_frame_and_next_sequence(tmp_path: Path) -> None:
+    base_dir = tmp_path / "journal"
+    anchor = MemoryAnchor()
+    with JournalWriter.open_at_verified_tail(
+        base_dir, anchor=RejectingAnchor(anchor), hmac_key=HMAC_KEY,
+        aggregate_id="goal_1", recover_unanchored_tail=True,
+    ) as writer:
+        result = writer.commit([event()], {"goal_1": 0})
+        assert result.state is CommitState.DURABLE_NOT_ANCHORED
+    original = journal_path(base_dir).read_bytes()
+
+    with JournalWriter.open_at_verified_tail(
+        base_dir, anchor=anchor, hmac_key=HMAC_KEY,
+        aggregate_id="goal_1", recover_unanchored_tail=True,
+    ) as writer:
+        assert journal_path(base_dir).read_bytes() == original
+        assert anchor.read().sequence == 1
+        result = writer.commit([event(value="next")], {"goal_1": 1})
+        assert result.state is CommitState.ANCHORED
+        assert result.frame.sequence == 2
+        assert journal_path(base_dir).read_bytes().startswith(original)
+
+
+def test_opted_live_recovery_requires_verified_pending_tail(tmp_path: Path) -> None:
+    base_dir = tmp_path / "journal"
+    anchor = MemoryAnchor()
+    rejecting = RejectingAnchor(anchor)
+    with JournalWriter.open_at_verified_tail(
+        base_dir, anchor=rejecting, hmac_key=HMAC_KEY,
+        aggregate_id="goal_1", recover_unanchored_tail=True,
+    ) as writer:
+        writer.commit([event()], {"goal_1": 0})
+        original = journal_path(base_dir).read_bytes()
+        assert writer.pending_anchor_recovery is True
+        with pytest.raises(AnchorMismatchError):
+            writer.recover_pending_anchor()
+        assert journal_path(base_dir).read_bytes() == original
+        with pytest.raises(JournalClosedError):
+            writer.commit([event(value="blocked")], {"goal_1": 1})
+        writer.anchor = anchor
+        assert writer.recover_pending_anchor() is True
+        assert writer.pending_anchor_recovery is False
+        assert journal_path(base_dir).read_bytes() == original
+        assert writer.commit([event(value="next")], {"goal_1": 1}).frame.sequence == 2
+    with pytest.raises(JournalClosedError):
+        writer.recover_pending_anchor()
+
+
+def test_live_recovery_does_not_anchor_a_different_signed_tail(tmp_path: Path) -> None:
+    base_dir = tmp_path / "journal"
+    anchor = MemoryAnchor()
+    with JournalWriter.open_at_verified_tail(
+        base_dir, anchor=RejectingAnchor(anchor), hmac_key=HMAC_KEY,
+        aggregate_id="goal_1", recover_unanchored_tail=True,
+    ) as writer:
+        writer.commit([event()], {"goal_1": 0})
+        original = writer.get_last_frame()
+        assert original is not None
+        replacement = TransactionFrame.seal(
+            tx_id="tx_replacement", sequence=1, writer_epoch=7,
+            timestamp=original.timestamp, expected_versions={"goal_1": 0},
+            aggregate_versions={"goal_1": 1}, previous_hash=GENESIS_HASH,
+            events=(event(value="different"),), hmac_key=HMAC_KEY,
+        )
+        journal_path(base_dir).write_bytes(replacement.to_bytes())
+        writer.anchor = anchor
+        with pytest.raises(JournalIntegrityError, match="changed on disk"):
+            writer.recover_pending_anchor()
+        assert anchor.read().sequence == 0
+        assert writer.pending_anchor_recovery is True
+
+
+@pytest.mark.parametrize("damage", ["partial", "tampered", "two_ahead"])
+def test_opted_tail_recovery_rejects_invalid_or_multiple_frames(
+    tmp_path: Path, damage: str,
+) -> None:
+    base_dir = tmp_path / "journal"
+    anchor = MemoryAnchor()
+    with JournalWriter.open_at_verified_tail(
+        base_dir, anchor=RejectingAnchor(anchor), hmac_key=HMAC_KEY,
+        aggregate_id="goal_1", recover_unanchored_tail=True,
+    ) as writer:
+        first = writer.commit([event()], {"goal_1": 0}).frame
+    path = journal_path(base_dir)
+    if damage == "partial":
+        path.write_bytes(path.read_bytes() + b'{"magic":')
+    elif damage == "tampered":
+        rewrite_record(path, 0, corrupt_hmac)
+    else:
+        second = TransactionFrame.seal(
+            tx_id="tx_extra", sequence=2, writer_epoch=7,
+            timestamp=first.timestamp, expected_versions={"goal_1": 1},
+            aggregate_versions={"goal_1": 2}, previous_hash=first.frame_hash,
+            events=(event(value="extra"),), hmac_key=HMAC_KEY,
+        )
+        path.write_bytes(path.read_bytes() + second.to_bytes())
+    before = path.read_bytes()
+    with pytest.raises((AnchorMismatchError, JournalIntegrityError)):
+        JournalWriter.open_at_verified_tail(
+            base_dir, anchor=anchor, hmac_key=HMAC_KEY,
+            aggregate_id="goal_1", recover_unanchored_tail=True,
+        )
+    assert path.read_bytes() == before
+    assert anchor.read() == MemoryAnchor().read()
+
+
 def test_short_append_fails_closed_before_anchor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
