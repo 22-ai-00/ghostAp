@@ -9,7 +9,6 @@ TRUNCATION_LIMITS: dict[str, int] = {
     "bash_max_chars": 240,
     "bash_max_lines": 8,
     "reasoning_tail_max": 500,
-    "terminal_message_max": 1600,
 }
 
 # ──────────────────────────────────────────────────────────────

@@ -319,20 +319,6 @@ class DeepBuilder:
         elif state.working_dir:
             working_path = state.working_dir
 
-        # 结构化内容（折叠面板）：非 compact 模式下，如果有 rendered_content，
-        # 使用 to_elements(collapsible=True) 替代纯 markdown
-        content_elements = None
-        use_content_markdown = display_content
-        if state.rendered_content is not None and not state.compact:
-            try:
-                els = state.rendered_content.to_elements(collapsible=True)
-                if els:  # 仅当结构化内容非空时才替代 markdown
-                    content_elements = els
-                    use_content_markdown = None
-                # else: 保留 markdown 内容作为 fallback
-            except Exception:
-                logger.debug("failed to render structured content, falling back to markdown", exc_info=True)
-
         spec = CardLayoutSpec(
             project_path=working_path,
             progress_bar=state.progress_bar,
@@ -340,8 +326,7 @@ class DeepBuilder:
             duration_line=state.duration_line,
             engine_meta_separator=meta_sep,
             warning_banner=state.warning_banner,
-            content_markdown=use_content_markdown,
-            content_elements=content_elements,
+            content_markdown=display_content,
             criteria_section=criteria,
             footer_note=state.footer_note,
             button_elements=btn_elements,

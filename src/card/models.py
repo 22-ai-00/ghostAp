@@ -36,9 +36,6 @@ class EngineCardState:
     action_prefix: str = "deep"
     extra_buttons: Optional[list[dict]] = None
     warning_banner: Optional[str] = None
-    # 结构化内容（Phase 2: 引擎折叠面板支持）
-    # 当 rendered_content 存在时，DeepBuilder 会使用 to_elements(collapsible=True) 替代纯 markdown
-    rendered_content: Optional[object] = None  # RenderedContent from acp.renderer
     # ── 消息卡片优化新增字段 ──
     terminal_state: Optional[str] = None  # running/completed/failed/cancelled/blocked/denied/continued
     is_read: bool = True  # 未读标记 (False → 标题前缀 🔴)
