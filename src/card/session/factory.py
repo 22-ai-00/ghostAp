@@ -7,7 +7,6 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from src.card.delivery.engine import CardDelivery
@@ -157,55 +156,3 @@ class CardSessionFactory:
         )
         self._sessions[session.session_id] = session
         return session
-
-    def create_subagent(
-        self,
-        parent: CardSession,
-        *,
-        branch_id: str,
-        tool_name: str,
-        model_name: str | None = None,
-        metadata: CardMetadata | None = None,
-        chat_id: str | None = None,
-        session_id: str | None = None,
-        reply_to: str | None = None,
-        budget: RenderBudget | None = None,
-        callbacks: SessionCallbacks | None = None,
-        ttl_seconds: float | None = None,
-        clock: Callable[[], float] | None = None,
-        retry_delay: float = 3.0,
-    ) -> CardSession:
-        """Create an independent subagent CardSession linked to a parent card."""
-        parent_metadata = getattr(parent, "_metadata", CardMetadata())
-        base_metadata = metadata or parent_metadata
-        parent_seq = str(parent.sequence)
-        subagent_metadata = replace(
-            base_metadata,
-            tool_name=tool_name,
-            model_name=model_name if model_name is not None else base_metadata.model_name,
-            card_sequence=f"{parent_seq}.{branch_id}",
-            session_started_at=parent.session_started_at,
-            is_subagent=True,
-            parent_card_seq=parent_seq,
-            frozen=False,
-            frozen_total_elapsed=None,
-            bridge_phrase=None,
-        )
-        parent_callbacks = callbacks or SessionCallbacks(
-            notify_callback=getattr(parent, "_notify_callback", None),
-            cancel_callback=getattr(parent, "_cancel_callback", None),
-            reply_text_fn=getattr(parent, "_reply_text_fn", None),
-            action_registry=getattr(parent, "_action_registry", {}),
-            hooks=getattr(parent, "_hooks", ()),
-        )
-        return self.create(
-            chat_id=chat_id if chat_id is not None else getattr(parent, "_chat_id", ""),
-            metadata=subagent_metadata,
-            session_id=session_id,
-            reply_to=reply_to if reply_to is not None else getattr(parent, "_reply_to", None),
-            budget=budget,
-            callbacks=parent_callbacks,
-            ttl_seconds=ttl_seconds,
-            clock=clock,
-            retry_delay=retry_delay,
-        )

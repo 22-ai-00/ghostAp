@@ -233,14 +233,6 @@ class CardSession:
     # Private helpers split from __init__ for readability
     # ------------------------------------------------------------------
 
-    def add_hook(self, hook: "SessionHook") -> None:
-        """Append a lifecycle hook after construction.
-
-        Thread-safe; delegates to HookFirer.append_hook().
-        Should be called before the session is exposed to concurrent dispatch.
-        """
-        self._hook_firer.append_hook(hook)
-
     @staticmethod
     def _merge_callbacks(
         callbacks: SessionCallbacks | None,

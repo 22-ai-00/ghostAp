@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -165,60 +164,3 @@ class KeyEvent:
     axis_key: Optional[str] = None
     mode: Optional[str] = None  # Normal/Deep/Spec
     meta: dict = field(default_factory=dict)
-
-
-def build_sample_key_events(now: Optional[float] = None) -> list[KeyEvent]:
-    """生成一组可复用的样例关键事件（用于测试/回归/演示）。"""
-
-    base = now if now is not None else time.time()
-    return [
-        KeyEvent(
-            event_id="run:start",
-            ts=base,
-            kind=KeyEventKind.STAGE,
-            title="执行开始",
-            body="模式=Deep · engine=Coco",
-            axis_key="stage:run",
-            mode="Deep",
-        ),
-        KeyEvent(
-            event_id="plan:1",
-            ts=base + 1,
-            kind=KeyEventKind.PLAN,
-            title="计划更新",
-            body="- ⏳ 读取代码\n- ⏳ 修改卡片渲染\n- ⏳ 运行测试",
-            axis_key="stage:plan",
-            mode="Deep",
-        ),
-        KeyEvent(
-            event_id="tool:read:1",
-            ts=base + 2,
-            kind=KeyEventKind.TOOL,
-            title="读取文件 src/acp/models.py",
-            body="读取并解析 ACPEvent 定义",
-            axis_key="stage:task",
-            mode="Deep",
-        ),
-        KeyEvent(
-            event_id="issue:1",
-            ts=base + 3,
-            kind=KeyEventKind.ISSUE,
-            title="发现卡片存在折叠区块",
-            body="需要移除 expand/collapse 交互，保证无折叠/省略。",
-            severity=KeyEventSeverity.WARNING,
-            disposition=IssueDisposition.IN_PROGRESS,
-            refs=("tool:read:1",),
-            axis_key="stage:analysis",
-            mode="Deep",
-        ),
-        KeyEvent(
-            event_id="run:done",
-            ts=base + 10,
-            kind=KeyEventKind.CONCLUSION,
-            title="执行完成",
-            body="状态=成功 · 产物=卡片渲染契约与测试通过",
-            refs=("plan:1", "issue:1"),
-            axis_key="stage:finish",
-            mode="Deep",
-        ),
-    ]

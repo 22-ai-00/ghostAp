@@ -77,16 +77,6 @@ def _ends_sentence(line: str) -> bool:
     return bool(stripped and stripped[-1] in _SENTENCE_END_CHARS)
 
 
-def _looks_like_stream_fragment(left_line: str, right_line: str) -> bool:
-    if _ends_sentence(left_line):
-        return False
-    return _visible_len(left_line) <= 24 or _visible_len(right_line) <= 24
-
-
-def _visible_len(text: str) -> int:
-    return len("".join(str(text or "").split()))
-
-
 def _soft_join_separator(left: str, right: str) -> str:
     if not left or not right or left[-1].isspace() or right[0].isspace():
         return ""

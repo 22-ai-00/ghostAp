@@ -79,17 +79,3 @@ def cap_reasoning_tail(
     if len(value) <= max_chars:
         return value
     return "...\n" + value[-max_chars:]
-
-
-def truncate_terminal_message(
-    value: str,
-    max_chars: int | None = None,
-) -> str:
-    """Truncate terminal / completion messages."""
-    if not value:
-        return value
-    if max_chars is None:
-        max_chars = TRUNCATION_LIMITS["terminal_message_max"]
-    if len(value) <= max_chars:
-        return value
-    return value[: max_chars - 1] + "…"

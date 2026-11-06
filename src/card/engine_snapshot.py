@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -61,16 +61,3 @@ class EngineSnapshot:
         """Wrap ext dict in MappingProxyType to enforce true immutability."""
         if not isinstance(self.ext, MappingProxyType):
             object.__setattr__(self, "ext", MappingProxyType(self.ext))
-
-
-@runtime_checkable
-class Snapshotable(Protocol):
-    """Protocol for engine managers that can produce snapshots."""
-
-    def snapshot(self, chat_id: str, root_path: str) -> Optional[EngineSnapshot]:
-        """Return a frozen snapshot of the engine's current state, or None if not found."""
-        ...
-
-    def snapshot_active(self, chat_id: str) -> list[EngineSnapshot]:
-        """Return snapshots of all active engines for a given chat."""
-        ...

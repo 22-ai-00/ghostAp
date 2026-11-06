@@ -199,14 +199,6 @@ class PromptResult:
         if chunk:
             self.text += chunk
 
-    def add_tool_call(self, tool_call: ToolCallInfo) -> None:
-        if not tool_call:
-            return
-        self.tool_calls.append(tool_call)
-        for p in tool_call.locations or []:
-            if p:
-                self.modified_files.add(p)
-
     def add_modified_file(self, path: str) -> None:
         if path:
             self.modified_files.add(path)

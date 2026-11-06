@@ -520,13 +520,6 @@ class CliStartupBackendStrategy(AcpStartupBackendStrategy):
         )
 
 
-def _coco_acp_args(model_name: Optional[str]) -> list[str]:
-    args: list[str] = ["acp", "serve"]
-    if model_name:
-        args.extend(["-c", f"model.name={model_name}"])
-    return args
-
-
 class SessionStartupCoordinator:
     """Coordinates backend session startup within the ACP startup boundary."""
 

@@ -148,14 +148,6 @@ class SessionTimerManager:
                 self._retry_delay, callback, session_id=self._session_id
             )
 
-    def schedule_immediate(self, callback: Callable[[], None]) -> None:
-        """Schedule a callback to run immediately (delay=0) on the timer thread."""
-        scheduler = get_timer_scheduler()
-        with self._timer_lock:
-            if self._terminal_closed:
-                return
-            scheduler.schedule(0, callback, session_id=self._session_id)
-
     def cancel_all(self) -> None:
         """Cancel all active timers. Thread-safe via internal _timer_lock."""
         scheduler = get_timer_scheduler()

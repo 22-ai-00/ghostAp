@@ -12,9 +12,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
-from src.utils.text import get_acp_result_header_text
-
-from .models import ACPEvent, ACPEventType, PlanInfo, PromptResult, ToolCallInfo
+from .models import ACPEvent, ACPEventType, PlanInfo, ToolCallInfo
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +62,6 @@ class RenderedContent:
     sections: list[ContentSection] = field(default_factory=list)
 
     # ---- backward-compat helpers ----
-
-    def to_markdown(self) -> str:
-        """Join all sections into a single markdown string (same output as legacy _render)."""
-        parts = [s.markdown for s in self.sections if s.markdown]
-        return "\n".join(parts) if parts else ""
 
     def to_elements(self, *, collapsible: bool = True) -> list[dict]:
         """Convert sections to Feishu card Schema 2.0 elements.
@@ -314,19 +307,6 @@ class ACPEventRenderer:
         self._ingest_event(event)
         return self._render()
 
-    def ingest_event(self, event: ACPEvent) -> None:
-        """Process an event without rendering legacy markdown output.
-
-        Card v2 callers use this to maintain turn snapshots while avoiding the
-        cost of rebuilding the legacy markdown string for every streamed event.
-        """
-        self._ingest_event(event)
-
-    def process_event_structured(self, event: ACPEvent) -> RenderedContent:
-        """Process an event and return structured content for collapsible rendering."""
-        self._ingest_event(event)
-        return self._render_structured()
-
     def get_final_content(self) -> str:
         """Return the final rendered content (no active tools shown).
 
@@ -447,57 +427,6 @@ class ACPEventRenderer:
 
         return "\n".join(parts) if parts else ""
 
-    def _render_structured(self) -> RenderedContent:
-        """Render content as structured sections for collapsible-panel output.
-
-        Groups consecutive tool-run summary lines into ``tool_group`` sections
-        (collapsed by default), interleaved with ``text`` sections for agent prose.
-        Thought chunks become a single ``thought`` section (collapsed by default).
-        """
-        sections: list[ContentSection] = []
-
-        # Plan
-        if self._plan:
-            plan_md = self._render_plan()
-            if plan_md:
-                sections.append(ContentSection(section_type="plan", markdown=plan_md))
-
-        # Todo
-        if self._todo_content:
-            sections.append(ContentSection(section_type="todo", markdown=f"**📝 任务进度**\n{self._todo_content}"))
-
-        # Active tools (not collapsed — they represent in-progress work)
-        if self._active_tools:
-            active_md = self._render_active_tools()
-            if active_md:
-                sections.append(ContentSection(section_type="active_tools", markdown=active_md, is_complete=False))
-
-        # Text chunks — split into text vs tool_group stages
-        text_sections = self._split_text_into_stages()
-        sections.extend(text_sections)
-
-        # Thought chunks — apply reasoning tail truncation
-        if self._thought_chunks:
-            thought_text = "".join(self._thought_chunks).strip()
-            if thought_text:
-                from src.card.truncation import cap_reasoning_tail
-                truncated_thought = cap_reasoning_tail(thought_text)
-                sections.append(
-                    ContentSection(section_type="thought", markdown=truncated_thought, collapsed_by_default=True)
-                )
-
-        return RenderedContent(sections=sections)
-
-    def _split_text_into_stages(self) -> list[ContentSection]:
-        """Return accumulated text as a single text section."""
-        if not self._text_chunks:
-            return []
-
-        md = "".join(self._text_chunks).strip()
-        if not md:
-            return []
-        return [ContentSection(section_type="text", markdown=md)]
-
     def _render_plan(self) -> str:
         """Render plan as a checklist."""
         if not self._plan or not self._plan.entries:
@@ -548,44 +477,6 @@ class ACPEventRenderer:
                 lines.append(f"{icon} {len(items)} 个进行中: {sample}{more}...")
         return "\n".join(lines) if lines else ""
 
-    def render_summary(self) -> str:
-        """Render a compact summary of completed work."""
-        parts = []
-        if self._completed_tool_count:
-            parts.append(f"🛠️ {self._completed_tool_count} 次工具调用")
-        if self._modified_files:
-            parts.append(f"🗂️ {len(self._modified_files)} 个文件")
-        return "  ·  ".join(parts)
-
-    def render_continuation_summary(self) -> str:
-        """Render a rich summary for continuation card header (前文摘要).
-
-        Called just before ``reset_for_continuation()`` to capture the
-        current state as a compact summary for the new card.
-        """
-        parts: list[str] = []
-
-        if self._plan and self._plan.entries:
-            completed = sum(1 for e in self._plan.entries if e.status == "completed")
-            total = len(self._plan.entries)
-            parts.append(f"📋 执行计划: {completed}/{total} 已完成")
-
-        if self._completed_tool_count:
-            parts.append(f"🛠️ 已完成 {self._completed_tool_count} 次工具调用")
-
-        if self._modified_files:
-            files = sorted(self._modified_files)
-            if len(files) <= 5:
-                file_list = ", ".join(f"`{f}`" for f in files)
-            else:
-                file_list = ", ".join(f"`{f}`" for f in files[:5]) + f" (+{len(files) - 5})"
-            parts.append(f"🗂️ 涉及文件: {file_list}")
-
-        if not parts:
-            return ""
-
-        return "**📄 前文摘要**\n" + "\n".join(parts) + "\n\n---\n"
-
     def reset_for_continuation(self, summary: str = "") -> None:
         """Reset state for a continuation card, optionally seeding a summary prefix.
 
@@ -598,88 +489,3 @@ class ACPEventRenderer:
             self._record_text_turn(summary)
             self._text_chunks.append(summary)
             self._text_content = summary
-
-    def render_plan_view(self) -> str:
-        """Render plan + todo + active tools only (no text history). For plan update cards."""
-        parts: list[str] = []
-
-        if self._plan:
-            rendered_plan = self._render_plan()
-            if rendered_plan:
-                parts.append(rendered_plan)
-
-        if self._todo_content:
-            parts.append(f"**📝 任务进度**\n{self._todo_content}")
-
-        if self._active_tools:
-            rendered_tools = self._render_active_tools()
-            if rendered_tools:
-                parts.append(rendered_tools)
-
-        return "\n".join(parts) if parts else ""
-
-
-def render_prompt_result_markdown(result: PromptResult, max_text_chars: int = 8000, max_items: int = 50) -> str:
-    """Render a compact Markdown summary for a :class:`PromptResult`.
-
-    该函数位于渲染层（而非模型层），负责将 PromptResult 中累积的文本、计划、
-    工具调用与改动文件信息转换为适合 Feishu/终端展示的 Markdown 片段。
-
-    文案配置（各小节标题等）统一通过 :func:`get_acp_result_header_text` 注入，
-    从而避免在核心模型层引入对文案模块的直接依赖。
-    """
-
-    parts: list[str] = []
-
-    headers = get_acp_result_header_text()
-
-    # Header
-    parts.append(f"**✅ PromptResult** · stop_reason=`{result.stop_reason}`")
-
-    # Text
-    if result.text:
-        text = result.text
-        if max_text_chars > 0 and len(text) > max_text_chars:
-            text = text[:max_text_chars] + "\n... (truncated)"
-        parts.append(f"\n**{headers.get('text', 'Text')}**")
-        parts.append(text)
-
-    # Plan
-    if result.plan and result.plan.entries:
-        parts.append(f"\n**{headers.get('plan', 'Plan')}**")
-        for ent in result.plan.entries[:max_items]:
-            icon = {"completed": "✅", "in_progress": "🔄", "pending": "⏳"}.get(ent.status, "⬜")
-            parts.append(f"- {icon} {ent.content}")
-
-    # Tool calls
-    if result.tool_calls:
-        parts.append(f"\n**{headers.get('tools', 'Tool calls')}**")
-        for tc in result.tool_calls[:max_items]:
-            loc = f" `{tc.locations[0]}`" if tc.locations else ""
-            parts.append(f"- `{tc.kind}` {tc.title}{loc} · `{tc.status}`")
-
-    # Tool results
-    if result.tool_results:
-        parts.append(f"\n**{headers.get('tool_results', 'Tool results')}**")
-        for e in result.tool_results[:max_items]:
-            kind = e.get("kind", "unknown")
-            data = e.get("data") if isinstance(e.get("data"), dict) else {}
-            if kind == "execute":
-                cmd = data.get("command", "")
-                code = data.get("exit_code")
-                parts.append(f"- `execute` `{cmd}` · exit_code={code}")
-            elif kind in ("read_file", "write_file"):
-                p = data.get("path", "")
-                parts.append(f"- `{kind}` `{p}`")
-            elif kind == "permission":
-                parts.append(f"- `permission` {data.get('outcome', '')} · {data.get('reason', '')}")
-            else:
-                parts.append(f"- `{kind}`")
-
-    # Modified files
-    if result.modified_files:
-        parts.append(f"\n**{headers.get('files', 'Modified files')}**")
-        for p in sorted(result.modified_files)[:max_items]:
-            parts.append(f"- `{p}`")
-
-    return "\n".join(parts).strip() + "\n"

@@ -153,11 +153,6 @@ class _HookExecutorManager:
 _hook_executor_manager = _HookExecutorManager()
 
 
-def shutdown_hook_executor() -> None:
-    """Shut down the global hook executor (called during graceful shutdown)."""
-    _hook_executor_manager.shutdown()
-
-
 def _reset_hook_executor() -> None:
     """Reset the global hook executor manager (test isolation only).
 
@@ -352,15 +347,6 @@ class HookFirer:
         self._dispatched_condition = threading.Condition(threading.Lock())  # leaf lock: never held while acquiring a LockLevel lock
         self._dispatched_pending = 0
         self._dispatched_self_drainers = 0
-
-    def append_hook(self, hook: SessionHook) -> None:
-        """Append a hook after construction (thread-safe atomic tuple replacement).
-
-        Used by orchestrator to inject backfill hooks on continuation sessions
-        before they are exposed to concurrent dispatch.
-        """
-        with self._fire_lock:
-            self._hooks = self._hooks + (hook,)
 
     @property
     def has_hooks(self) -> bool:

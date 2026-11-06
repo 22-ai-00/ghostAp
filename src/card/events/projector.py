@@ -116,10 +116,6 @@ def is_agent_task(tool_call: Any) -> bool:
     return kind == "other" and "子代理：" in content
 
 
-def is_task_tool(tool_call: Any) -> bool:
-    return str(getattr(tool_call, "title", "") or "").strip().lower() == "task"
-
-
 def is_generic_task_label(value: object) -> bool:
     return str(value or "").strip().lower() in GENERIC_TASK_LABELS
 

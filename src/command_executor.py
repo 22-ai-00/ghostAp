@@ -65,19 +65,6 @@ class CommandExecutionResult:
     return_code: int
     error_message: Optional[str] = None
 
-    def to_message(self) -> str:
-        if self.error_message:
-            return f"❌ 执行失败: {self.error_message}"
-        parts = []
-        if self.stdout:
-            parts.append(f"📤 输出:\n```\n{self.stdout}\n```")
-        if self.stderr:
-            parts.append(f"⚠️ 错误输出:\n```\n{self.stderr}\n```")
-        if not parts:
-            parts.append("✅ 命令执行成功（无输出）")
-        parts.append(f"🔢 返回码: {self.return_code}")
-        return "\n".join(parts)
-
 
 class CommandExecutor:
     """Execute a command directly without GhostAP policy checks or isolation."""

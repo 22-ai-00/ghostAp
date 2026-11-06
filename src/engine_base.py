@@ -146,9 +146,6 @@ class ReviewResult:
     def failed_perspectives(self) -> list[PerspectiveReview]:
         return [r for r in self.reviews if not r.passed]
 
-    def suggestions_by_perspective(self) -> dict[ReviewPerspective, list[str]]:
-        return {r.perspective: r.suggestions for r in self.reviews if r.suggestions}
-
     def to_dict(self) -> dict:
         return {
             "reviews": [r.to_dict() for r in self.reviews],

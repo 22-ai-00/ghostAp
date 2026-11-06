@@ -66,23 +66,6 @@ class ToolDeltaPayload(TypedDict):
     _opaque_raw_tool_call_id: NotRequired[str]
 
 
-class ToolDonePayload(TypedDict):
-    """Payload for TOOL_DONE event."""
-    block_id: str
-    tool_output: NotRequired[str]
-    tool_summary: NotRequired[str]
-    tool_name: NotRequired[str]
-    _opaque_raw_tool_call_id: NotRequired[str]
-
-
-class ToolFailedPayload(TypedDict):
-    """Payload for TOOL_FAILED event."""
-    block_id: str
-    error: str
-    tool_name: NotRequired[str]
-    _opaque_raw_tool_call_id: NotRequired[str]
-
-
 class ImagePayload(TypedDict):
     """Payload for IMAGE_ADDED/IMAGE_FAILED events."""
     image_id: str
