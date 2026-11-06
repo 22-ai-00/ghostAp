@@ -1,7 +1,7 @@
 """Navigation link formatting for card continuation (续卡).
 
 Provides a single source of truth for deep-link and fallback text
-used by both SessionRotator and TaskOrchestrator when archiving cards.
+used by SessionRotator when archiving cards.
 """
 
 from __future__ import annotations

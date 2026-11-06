@@ -123,7 +123,7 @@ class TaskRegistry:
             return len(self._tasks)
 
 def tasks_from_plan_entries(entries: list[PlanEntryInfo]) -> list[dict]:
-    """Convert ACP PlanEntryInfo list to task dicts for TaskOrchestrator.
+    """Convert ACP PlanEntryInfo list to task dicts for card task registries.
 
     Each entry becomes a task with task_id = "step_{index}" and name = entry.content.
     Only entries with non-empty content are included.
