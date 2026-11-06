@@ -9,7 +9,6 @@ entry points — a single-line decision replacing ~110 lines of inline code.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 from ..card.ui_text import UI_TEXT
@@ -40,17 +39,6 @@ class GateHandler(Protocol):
     def send_chat_lock_throttled_reply(
         self, message_id: str, chat_id: str, manager: Any,
     ) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# Result dataclass
-# ---------------------------------------------------------------------------
-
-@dataclass(slots=True)
-class CheckResult:
-    """Outcome of a gate check."""
-    blocked: bool
-    reason: str = ""
 
 
 # ---------------------------------------------------------------------------

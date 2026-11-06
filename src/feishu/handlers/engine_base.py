@@ -38,28 +38,6 @@ class BaseEngineHandler(BaseHandler):
             body_fn, root_path, chat_id, message_id, command_text,
         )
 
-    def _run_engine_with_conflict_card(
-        self,
-        body_fn,
-        project: Optional["ProjectContext"],
-        chat_id: str,
-        message_id: str,
-        command_text: str,
-    ) -> None:
-        """Engine-level facade for repo-lock guarded scheduled bodies."""
-        root_path = project.root_path if project else self.get_working_dir(chat_id)
-        self._run_with_repo_lock_or_conflict_card(root_path, chat_id, body_fn, message_id, command_text)
-
-    def _build_engine_callbacks(
-        self, message_id: str, chat_id: str, project: Optional["ProjectContext"], engine_name: str, root_path: str
-    ):
-        """Engine-level facade for subclass callback factories."""
-        return self._create_callbacks(message_id, chat_id, project, engine_name, root_path)
-
-    def _show_engine_status(self, message_id: str, chat_id: str, project: Optional["ProjectContext"] = None):
-        """Engine-level facade for subclass status rendering."""
-        return self._show_status(message_id, chat_id, project=project)
-
     def _get_engine_manager(self):
         """Subclasses must return their specific engine manager."""
         raise NotImplementedError

@@ -43,7 +43,6 @@ class CardActionContext:
     project: "Optional[Any]" = None
 
 if TYPE_CHECKING:
-    from ...acp.manager import ACPSessionManager
     from ...project import ContextSourceMode, ProjectContext
     from ...repo_lock import LockConflictError
     from ..handler_context import HandlerContext
@@ -133,10 +132,6 @@ class BaseHandler:
     def get_handler(self, key: str) -> Optional[Any]:
         """Get a handler from the registry."""
         return self.ctx.handlers.get(key)
-
-    def get_manager(self, key: str) -> Optional["ACPSessionManager"]:
-        """Get a manager from the registry."""
-        return self.ctx.managers.get(key)
 
     def upload_acp_image(self, image) -> str | None:
         """Validate and upload a typed ACP image without logging its payload."""

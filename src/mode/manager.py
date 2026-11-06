@@ -187,10 +187,6 @@ class ModeManager:
     # Alias for callers preferring the shorter name
     enter_mode = enter_programming_mode
 
-    def is_mode(self, chat_id: str, mode: InteractionMode, project_id: Optional[str] = None) -> bool:
-        """Generic mode check — replaces per-mode is_*_mode methods."""
-        return self.get_mode(chat_id, project_id) == mode
-
     def enter_coco_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
         """进入 Coco 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.COCO, auto=auto, project_id=project_id)
@@ -203,14 +199,6 @@ class ModeManager:
         """进入 Claude-W 桥接模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.CLAUDE_W, auto=auto, project_id=project_id)
 
-    def enter_aiden_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Aiden 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.AIDEN, auto=auto, project_id=project_id)
-
-    def enter_codex_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Codex 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.CODEX, auto=auto, project_id=project_id)
-
     def enter_codex_w_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
         """进入 Codex-W 桥接模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.CODEX_W, auto=auto, project_id=project_id)
@@ -219,10 +207,6 @@ class ModeManager:
         """进入 Gemini 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.GEMINI, auto=auto, project_id=project_id)
 
-    def enter_traex_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Traex 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.TRAEX, auto=auto, project_id=project_id)
-
     def enter_grok_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
         """进入 Grok 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.GROK, auto=auto, project_id=project_id)
@@ -230,10 +214,6 @@ class ModeManager:
     def enter_dsh_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
         """进入 DSH 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.DSH, auto=auto, project_id=project_id)
-
-    def enter_shell_mode(self, chat_id: str, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Shell 模式。"""
-        return self.set_mode(chat_id, InteractionMode.SHELL, auto_entered=False, project_id=project_id)
 
     def exit_to_smart(self, chat_id: str, project_id: Optional[str] = None) -> InteractionMode:
         """退出到 SMART 模式。"""
@@ -278,14 +258,6 @@ class ModeManager:
     def is_dsh_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断当前是否为 DSH 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.DSH
-
-    def is_smart_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 SMART 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.SMART
-
-    def is_shell_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Shell 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.SHELL
 
     def is_programming_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断是否处于编程模式。"""

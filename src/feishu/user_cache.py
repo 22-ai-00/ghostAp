@@ -213,10 +213,3 @@ def _fetch_display_name(
     except Exception:
         logger.debug("Failed to fetch display name for user_id=%s", user_id[:12], exc_info=True)
         return _FetchResult(fallback, _NEGATIVE_TTL_SECONDS)
-
-
-def _reset_user_cache_for_testing() -> None:
-    """Clear the user cache.  **Test-only.**"""
-    with _cache_lock:
-        _cache.clear()
-        _refreshing.clear()

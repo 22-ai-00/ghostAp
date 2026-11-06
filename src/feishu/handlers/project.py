@@ -54,20 +54,6 @@ class ProjectHandler(BaseHandler):
         if response_id and active_project:
             self.register_message_project(response_id, active_project)
 
-    def show_current_project(self, message_id: str, chat_id: str, project: Optional["ProjectContext"]):
-        if not project:
-            self.reply_text(
-                message_id,
-                UI_TEXT["project_board_empty"],
-            )
-            return
-
-        global_working_dir = self.get_working_dir(chat_id)
-        msg_type, card_content = ProjectBuilder.build_current_project_card(project, global_working_dir)
-        response_id = self.reply_card(message_id, card_content)
-        if response_id:
-            self.register_message_project(response_id, project)
-
     def show_project_status(
         self,
         message_id: str,

@@ -318,22 +318,10 @@ EXECUTION_ACTIONS = tuple(
 _LANE_BY_NAME = {action.lane: action for action in EXECUTION_ACTIONS}
 
 
-def get_public_actions() -> tuple[ProductAction, ...]:
-    """All currently implemented Owner-visible commands, never a rollout filter."""
-
-    return PUBLIC_ACTIONS
-
-
 def get_slash_discoverable_actions() -> tuple[ProductAction, ...]:
     """Public commands whose user journey is complete in Feishu chat."""
 
     return tuple(action for action in PUBLIC_ACTIONS if action.slash_discoverable)
-
-
-def get_compatibility_actions() -> tuple[ProductAction, ...]:
-    """Aliases and retired spellings retained for deterministic compatibility."""
-
-    return COMPATIBILITY_ACTIONS + tuple(action for action in PUBLIC_ACTIONS if action.aliases)
 
 
 def retired_command_tokens() -> frozenset[str]:
@@ -367,18 +355,6 @@ def is_programming_entry_command(text: str) -> bool:
     return bool(resolved and resolved.action.enters_programming_mode)
 
 
-def is_same_programming_mode_entry(mode_id: str, text: str) -> bool:
-    """Whether *text* re-enters the programming mode already active in a topic."""
-
-    token = (text or "").strip().split(maxsplit=1)[0].lower() if text else ""
-    resolved = resolve_command(token)
-    return bool(resolved and resolved.action.programming_mode_id == mode_id)
-
-
-def get_execution_action(lane: ExecutionLane) -> ProductAction:
-    return _LANE_BY_NAME[lane]
-
-
 def get_owner_actions() -> tuple[ProductAction, ...]:
     """The Owner menu's lane projection; completion is explanatory only."""
 
@@ -393,9 +369,3 @@ def format_owner_execution_lane_summary() -> str:
         if action.blocking_reason:
             lines.append(f"  当前缺口：{action.blocking_reason}")
     return "\n".join(lines)
-
-
-def is_explicit_protected_command(text: str) -> bool:
-    token = (text or "").strip().split(maxsplit=1)[0].lower() if text else ""
-    resolved = resolve_command(token)
-    return bool(resolved and resolved.action.protects_from_auto_activation)

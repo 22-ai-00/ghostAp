@@ -12,8 +12,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from .product_catalog import is_programming_entry_command
-
 if TYPE_CHECKING:
     from ..trust.models import EffectiveTrust
 
@@ -72,8 +70,3 @@ class CommandRouter:
     def is_workflow_command(text: str) -> bool:
         from .handlers.system import SystemHandler
         return SystemHandler.is_workflow_command(text)
-
-
-    @staticmethod
-    def is_programming_entry(text: str) -> bool:
-        return is_programming_entry_command(text)

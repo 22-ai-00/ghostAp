@@ -94,22 +94,9 @@ class BaseStreamProcessor:
     # Shared: warning banner
     # ------------------------------------------------------------------
 
-    def _dispatch_warning_if_needed(self, *, is_executing: bool = True) -> None:
-        """Check and dispatch warning banner based on elapsed time."""
-        elapsed = time.time() - self._start_time
-        warning = self._renderer.check_warning_banner(elapsed, is_executing=is_executing)
-        if warning:
-            self._rotator.dispatch(CardEvent.warning_updated(warning))
-
     # ------------------------------------------------------------------
     # Shared: terminal lifecycle
     # ------------------------------------------------------------------
-
-    def _dispatch_completed(self, summary: str = "") -> None:
-        """Close open blocks, dispatch completed event, clear renderer session."""
-        self._stream_bridge.close_open_blocks()
-        self._rotator.dispatch(CardEvent.completed(summary=summary))
-        self._renderer._current_session = None
 
     def _dispatch_failed(
         self,

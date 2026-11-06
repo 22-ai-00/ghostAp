@@ -293,24 +293,6 @@ class ProjectContext:
                 if session_id:
                     snap.session_id = session_id
 
-    def get_programming_snapshot(
-        self,
-        mode_type: str,
-    ) -> Optional[SessionSnapshot]:
-        """Read one programming snapshot under the context mutation lock."""
-        _, snap_attr = self._MODE_ATTRS[mode_type]
-        with self._chat_lock:
-            return getattr(self, snap_attr)
-
-    def clear_programming_snapshot(self, mode_type: str) -> bool:
-        """Atomically clear one programming snapshot."""
-        _, snap_attr = self._MODE_ATTRS[mode_type]
-        with self._chat_lock:
-            if getattr(self, snap_attr) is None:
-                return False
-            setattr(self, snap_attr, None)
-            return True
-
     def clear_programming_snapshot_if_matches(
         self,
         mode_type: str,
@@ -401,14 +383,8 @@ class ProjectContext:
 
     # ── Backward-compatible delegates ──
 
-    def set_coco_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("coco", enabled, session_id, query_count)
-
     def update_coco_snapshot(self, query: str, query_count: int):
         self.update_programming_snapshot("coco", query, query_count)
-
-    def set_claude_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("claude", enabled, session_id, query_count)
 
     def update_claude_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
         self.update_programming_snapshot("claude", query, query_count, session_id)
@@ -419,35 +395,11 @@ class ProjectContext:
     def update_claude_w_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
         self.update_programming_snapshot("claude_w", query, query_count, session_id)
 
-    def set_aiden_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("aiden", enabled, session_id, query_count)
-
-    def update_aiden_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("aiden", query, query_count, session_id)
-
-    def set_codex_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("codex", enabled, session_id, query_count)
-
-    def update_codex_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("codex", query, query_count, session_id)
-
     def set_codex_w_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
         self.set_programming_mode("codex_w", enabled, session_id, query_count)
 
     def update_codex_w_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
         self.update_programming_snapshot("codex_w", query, query_count, session_id)
-
-    def set_gemini_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("gemini", enabled, session_id, query_count)
-
-    def update_gemini_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("gemini", query, query_count, session_id)
-
-    def set_traex_mode(self, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
-        self.set_programming_mode("traex", enabled, session_id, query_count)
-
-    def update_traex_snapshot(self, query: str, query_count: int, session_id: Optional[str] = None):
-        self.update_programming_snapshot("traex", query, query_count, session_id)
 
     def get_status_emoji(self) -> str:
         status_map = {

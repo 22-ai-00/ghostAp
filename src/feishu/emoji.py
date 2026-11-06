@@ -47,10 +47,6 @@ class EmojiReaction:
         return emoji_type in EmojiReaction._ALLOWED_AUTO_REACTIONS
 
     @staticmethod
-    def on_message_received() -> str:
-        return EmojiType.GET
-
-    @staticmethod
     def on_processing() -> str:
         return EmojiType.TYPING
 
@@ -67,10 +63,6 @@ class EmojiReaction:
         return EmojiType.WAVE
 
     @staticmethod
-    def on_coco_response() -> str:
-        return EmojiType.LGTM
-
-    @staticmethod
     def on_multi_task_start() -> str:
         return EmojiType.ROCKET
 
@@ -85,10 +77,6 @@ class EmojiReaction:
     @staticmethod
     def on_shell_executed() -> str:
         return EmojiType.DONE
-
-    @staticmethod
-    def on_blocked() -> str:
-        return EmojiType.CROSS_MARK
 
     @staticmethod
     def on_smart_mode() -> str:

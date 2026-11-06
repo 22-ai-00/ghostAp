@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from src.card.render.throttle import StreamThrottle
@@ -38,29 +38,6 @@ class EngineRenderStrategy:
     def __init__(self, renderer: "BaseRenderer") -> None:
         self.renderer = renderer
 
-    def dispatch_card_split(
-        self,
-        session,
-        *,
-        reason: str,
-        hint: str | None = None,
-        bridge_phrase: str | None = None,
-    ) -> None:
-        self.renderer._dispatch_card_split(
-            session,
-            reason=reason,
-            hint=hint,
-            bridge_phrase=bridge_phrase or self.DEFAULT_BRIDGE_PHRASE,
-        )
-
-    def dispatch_terminal(self, session, *, completed: bool, summary: str | None = None, error: str | None = None) -> None:
-        from ...card.events import CardEvent
-
-        if completed:
-            session.dispatch(CardEvent.completed(summary=summary))
-        else:
-            session.dispatch(CardEvent.failed(error or ""))
-
 
 def _dispatch_text_block(dispatchable, block_id: str, content: str) -> None:
     """Dispatch a completed text block when content is non-empty."""
@@ -71,30 +48,6 @@ def _dispatch_text_block(dispatchable, block_id: str, content: str) -> None:
     dispatchable.dispatch(CardEvent.text_started(block_id))
     dispatchable.dispatch(CardEvent.text_delta(block_id, content))
     dispatchable.dispatch(CardEvent.text_done(block_id))
-
-
-class _ACPStreamBridge:
-    """Normalize ACP streaming into programming-mode-like card blocks.
-
-    Reused by Deep/Spec renderers so text, reasoning and tool panels follow
-    the same event sequencing as direct programming mode.
-
-    DEPRECATED: Use src.card.stream_bridge.ACPStreamBridge directly.
-    This class is kept for backward-compatible imports only.
-    """
-
-    def __init__(self, dispatchable) -> None:
-        from src.card.stream_bridge import ACPStreamBridge as _Impl
-        self._impl = _Impl(dispatchable)
-
-    def bind(self, dispatchable) -> None:
-        self._impl.bind(dispatchable)
-
-    def on_event(self, acp_event) -> None:
-        self._impl.on_event(acp_event)
-
-    def close_open_blocks(self) -> None:
-        self._impl.close_open_blocks()
 
 
 @dataclass(frozen=True)
@@ -161,34 +114,6 @@ class BaseRenderer:
     def _on_card_split_completed(self, reason: str, hint: str | None, bridge_phrase: str | None = None) -> None:
         """Hook for subclasses to start a fresh continuation session."""
         return None
-
-    def build_unit_metadata(
-        self,
-        metadata,
-        *,
-        unit_id: str | None = None,
-        unit_kind: str | None = None,
-        unit_label: str | None = None,
-        iteration_index: int | None = None,
-        iteration_total: int | None = None,
-        continuation_seq: int | None = None,
-    ):
-        """Clone base metadata with iteration/cycle-scoped labeling."""
-        changes: dict[str, Any] = {}
-        if unit_id is not None:
-            changes["unit_id"] = unit_id
-        if unit_kind is not None:
-            changes["unit_kind"] = unit_kind
-        if unit_label is not None:
-            changes["unit_label"] = unit_label
-        if iteration_index is not None:
-            changes["iteration_index"] = iteration_index
-        if iteration_total is not None:
-            changes["iteration_total"] = iteration_total
-        if continuation_seq is not None:
-            changes["continuation_seq"] = continuation_seq
-            changes["card_sequence"] = continuation_seq + 1
-        return replace(metadata, **changes) if changes else metadata
 
     def _build_hooks(
         self,
@@ -503,10 +428,3 @@ class BaseRenderer:
         )
         self._current_session = rotator
         return rotator
-
-    def _render_empty_status(self, engine_cmd: str) -> str:
-        """Render a default empty-status placeholder when no engine snapshot is available.
-
-        Template method — subclasses may override for engine-specific wording.
-        """
-        return f"等待 {engine_cmd} 引擎启动…"

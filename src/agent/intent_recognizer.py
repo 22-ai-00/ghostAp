@@ -1,5 +1,4 @@
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -903,14 +902,6 @@ class IntentRecognizer:
 
     def _quick_match(self, text: str, current_mode: str = "smart") -> Optional[IntentResult]:
         return self.intent_matcher.match(self, text, current_mode)
-
-    def _normalize_path(self, path: str) -> str:
-        if not path:
-            return ""
-        path = path.strip()
-        if path.startswith("~"):
-            path = os.path.expanduser(path)
-        return path
 
     @staticmethod
     def _looks_like_shell_token(first_word: str, text_lower: str) -> bool:

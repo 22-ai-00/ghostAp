@@ -67,9 +67,6 @@ class DeepHandler(BaseEngineHandler):
     def _refresh_card_view(self, message_id: str, chat_id: str, project=None):
         self.show_deep_status(message_id, chat_id, project, origin_message_id=message_id)
 
-    def _create_deep_callbacks(self, *args, **kwargs):
-        return self.renderer.create_deep_callbacks(*args, **kwargs)
-
     def _get_ui_state(self, deep_project_id: str) -> dict:
         """Deprecated: Delegate to renderer"""
         return self.renderer.get_ui_state(deep_project_id)

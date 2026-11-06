@@ -105,10 +105,6 @@ class ManagedGroupConflictError(ManagedGroupRegistryError):
     """A retry conflicts with an already persisted lifecycle fact."""
 
 
-class ManagedGroupValidationError(ManagedGroupRegistryError):
-    """External migration/adoption validation did not establish provenance."""
-
-
 class _AtomicReplaceError(OSError):
     def __init__(self, cause: OSError, *, committed: bool) -> None:
         super().__init__(str(cause))
