@@ -141,13 +141,6 @@ def format_friendly_duration(seconds: float) -> str:
     return f"约 {days} 天"
 
 
-def append_duration_to_title(title: str, duration_secs: float | None) -> str:
-    """Append formatted duration to title if available. E.g. '🔄 执行中 · 3分钟45秒'."""
-    if duration_secs:
-        return f"{title} · {format_duration(duration_secs)}"
-    return title
-
-
 def summarize_question_title(
     value: str | None,
     *,

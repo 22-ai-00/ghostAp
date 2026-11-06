@@ -336,8 +336,3 @@ def redact_sensitive(text: str) -> str:
         result = pattern.sub("[redacted]", result)
 
     return result
-
-
-def _contains_sensitive(text: str) -> bool:
-    """Check if text contains any sensitive patterns."""
-    return any(pattern.search(text) for pattern in _SENSITIVE_PATTERNS)

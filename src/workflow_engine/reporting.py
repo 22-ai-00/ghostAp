@@ -19,9 +19,7 @@ from typing import Any
 from .models import AgentStatus, WorkflowProject
 from .storage import (
     DEFAULT_WORKFLOW_STORAGE_ROOT,
-    workflow_project_storage_root,
     workflow_reports_dir,
-    workflow_storage_root,
 )
 
 DEFAULT_WORKFLOW_CACHE_ROOT = DEFAULT_WORKFLOW_STORAGE_ROOT
@@ -48,16 +46,6 @@ class _ReportSection:
 def _safe_slug(value: str, *, default: str = "workflow") -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip("-._")
     return slug[:80] or default
-
-
-def workflow_cache_root(cache_root: str | None = None) -> str:
-    """Compatibility alias for the centralized Workflow storage root."""
-    return workflow_storage_root(cache_root)
-
-
-def workflow_project_cache_root(root_path: str, cache_root: str | None = None) -> str:
-    """Compatibility alias for one project's Workflow storage root."""
-    return workflow_project_storage_root(root_path, cache_root)
 
 
 def _status_text(value: Any) -> str:

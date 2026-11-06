@@ -2,61 +2,14 @@
 
 import logging
 import re
-from typing import Callable, Optional
+from typing import Callable
 
 from ..acp import ACPEvent, ACPEventType
 from ..utils.errors import get_error_detail
 from ..utils.retry import RetryPolicy
-from .artifacts import extract_criteria_from_llm_response
 from .utils import CRITERIA_PATTERNS as _CRITERIA_PATTERNS
 
 logger = logging.getLogger(__name__)
-
-
-def decompose_criteria_with_llm(
-    text: str,
-    settings,
-    send_fn: Optional[Callable[[str], str]] = None,
-) -> list[str]:
-    """Use the current ACP tool to decompose colloquial input into criteria.
-
-    Parameters
-    ----------
-    text:
-        Raw user requirement text.
-    settings:
-        Application settings (kept for interface compat).
-    send_fn:
-        ``(prompt) -> response_text`` callable backed by an ACP sub-session.
-        When *None*, returns ``[]`` (fallback to single-criterion path).
-    """
-    if not send_fn:
-        return []
-
-    prompt = f"""请分析以下用户需求，提取并拆解为明确的验收标准。
-
-用户需求（口语化描述）：
-{text}
-
-要求：
-1. 先理解用户的核心诉求
-2. 将需求拆解为 3-8 条具体、可验证的验收标准
-3. 每条标准应该是独立可验证的（能明确判断 PASS/FAIL）
-4. 标准应覆盖用户提到的所有功能点
-5. 用简洁的技术语言描述，不要过于笼统
-
-输出格式（严格按此格式，每行一条，以 "- " 开头）：
-- 验收标准1
-- 验收标准2
-- 验收标准3
-..."""
-
-    try:
-        response = send_fn(prompt)
-        return extract_criteria_from_llm_response(response)
-    except Exception as e:
-        logger.warning("[Spec] ACP 需求拆解失败: %s, 将使用原始文本", get_error_detail(e))
-        return []
 
 
 def run_objective_verify(

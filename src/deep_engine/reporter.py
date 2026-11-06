@@ -3,22 +3,6 @@ from .models import DeepProject, DeepProjectStatus
 
 
 class ProgressReporter:
-    def format_planning_start(self, requirement: str) -> str:
-        return f"""🧠 **Deep Agent 启动**
-
-📝 正在分析需求...
-> {requirement}
-
-⏳ 请稍候，正在规划任务..."""
-
-    def format_planning_done(self, project: DeepProject) -> str:
-        return f"""✅ **任务规划完成**
-
-📂 项目: {project.name}
-📍 目录: `{project.root_path}`
-
-🚀 准备开始执行..."""
-
     def format_project_done(self, project: DeepProject) -> str:
         if project.status == DeepProjectStatus.COMPLETED:
             lines = [
@@ -98,12 +82,6 @@ class ProgressReporter:
 将在下一个任务执行前生效。"""
 
     # --- Card title helpers ---
-
-    def get_planning_start_title(self) -> str:
-        return "🧠 Deep Agent 启动"
-
-    def get_planning_done_title(self) -> str:
-        return "✅ 任务规划完成"
 
     def get_project_done_title(self, project: DeepProject) -> str:
         if project.status == DeepProjectStatus.COMPLETED:

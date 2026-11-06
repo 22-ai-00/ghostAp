@@ -5,11 +5,10 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Optional
 
-from ..engine_base import ReviewPerspective, ReviewResult
+from ..engine_base import ReviewResult
 from ..grill_me import (
     SPEC_BUILD_GRILL_ME_PROTOCOL,
     SPEC_PHASE_GRILL_ME_PROTOCOL,
-    SPEC_REVIEW_GRILL_ME_PROTOCOL,
     SPEC_TASK_GRILL_ME_PROTOCOL,
 )
 
@@ -162,158 +161,6 @@ def build_build_prompt(tasks: list[SpecTask], plan: str, root_path: str, guidanc
 4. 每个任务完成后进行自检
 5. 确保交付质量：准确、适合目标受众、遵守领域约束，并对适用风险采取措施
 6. 完成所有任务后输出总结，说明哪些任务并行/委托执行、哪些任务因冲突或依赖而串行执行，以及每项验收证据
-"""
-
-
-def build_review_prompt(requirement: str) -> str:
-    perspective_sections = []
-    for p in ReviewPerspective:
-        if p == ReviewPerspective.PRODUCT:
-            perspective_sections.append(
-                "- **PRODUCT**: Apple 风格产品审查（高审美/高标准/完美主义）。关注：信息架构与心智模型、关键路径是否一气呵成、默认行为是否聪明、边界与异常是否体面、文案是否克制清晰、细节一致性与打磨程度。"
-            )
-        else:
-            perspective_sections.append(f"- **{p.value.upper()}**: {p.review_focus}")
-    perspectives_desc = "\n".join(perspective_sections)
-
-    return f"""这是兼容旧调用的通用交付审查提示。请从任务实际需要的专业、受众、验收、风险和可用性视角审查当前交付质量，并给出结构化的审查结果；不要假设任务是软件实现。
-
-## 项目目标
-{requirement}
-
-## 审查视角
-{perspectives_desc}
-
-## PRODUCT 视角加严要求（Apple 风格）
-- 以"少即是多"的审美判断：删繁就简，不为功能堆砌找理由。
-- 以默认体验为王：默认路径必须顺滑、可预期、可解释；拒绝把复杂度转嫁给用户。
-- 以细节一致性为底线：命名/状态/交互/错误提示/边界行为必须统一。
-- 以体面为标准：失败与异常也要有尊严（清晰提示、可恢复、不给用户添堵）。
-- 建议要具体可落地：每条建议最好能对应到 1 个明确改动点（文案/交互/流程/边界/信息层级）。
-
-{SPEC_REVIEW_GRILL_ME_PROTOCOL}
-
-<output_format>
-严格按照以下格式输出每个视角的审查结果（每个视角占一个区块）。
-不要使用 markdown 表格、JSON、编号列表等任何其他格式。
-必须使用 [TAG] 作为区块分隔符。
-
-[ARCHITECT]
-PASS 或 FAIL
-- 改进建议1（如果FAIL）
-- 改进建议2（如果FAIL）
-
-[PRODUCT]
-PASS 或 FAIL
-- 改进建议1（如果FAIL）
-
-[USER]
-PASS 或 FAIL
-- 改进建议1（如果FAIL）
-
-[TESTER]
-PASS 或 FAIL
-- 改进建议1（如果FAIL）
-
-[DESIGNER]
-PASS 或 FAIL
-- 改进建议1（如果FAIL）
-- 改进建议2（如果FAIL）
-- (请重点关注: UI视觉、交互体验、移动端适配)
-</output_format>
-
-<example>
-[ARCHITECT]
-PASS
-
-[PRODUCT]
-FAIL
-- 缺少错误提示文案
-- 搜索结果无分页
-
-[USER]
-PASS
-
-[TESTER]
-FAIL
-- 缺少边界条件测试
-
-[DESIGNER]
-FAIL
-- 按钮间距过小，容易误触
-- 错误提示颜色对比度不足
-</example>
-
-## 审查标准
-- PASS: 该视角认为当前实现质量良好，无需改进
-- FAIL: 该视角发现可改进之处，请列出具体建议
-- 建议应具体、可操作，而非泛泛而谈
-- 如果某视角为 PASS，不需要列出建议
-"""
-
-
-def build_single_perspective_review_prompt(
-    perspective: ReviewPerspective,
-    *,
-    requirement: str,
-    diff_patch: str = "",
-    touched_files: Optional[list[str]] = None,
-    spec_output: str = "",
-    plan_output: str = "",
-    build_output: str = "",
-    max_diff_bytes: int = 40_000,
-) -> str:
-    """Single-perspective review prompt. Small context, single [TAG] output.
-
-    Designed for PerspectiveWorker — each worker sends exactly this prompt to
-    its own (possibly ephemeral) session. Avoids the 5-in-1 context bloat that
-    caused Invalid params / timeout cascades.
-    """
-    tag = perspective.name  # ARCHITECT / PRODUCT / USER / TESTER / DESIGNER
-    if perspective == ReviewPerspective.PRODUCT:
-        focus_block = (
-            "Apple 风格产品审查（高审美/高标准/完美主义）。关注：信息架构与心智模型、"
-            "关键路径是否一气呵成、默认行为是否聪明、边界与异常是否体面、文案是否克制"
-            "清晰、细节一致性与打磨程度。"
-        )
-    else:
-        focus_block = perspective.review_focus
-
-    diff_section = ""
-    if diff_patch:
-        patch = diff_patch
-        if len(patch) > max_diff_bytes:
-            patch = patch[:max_diff_bytes] + f"\n...[truncated {len(diff_patch) - max_diff_bytes} bytes]"
-        diff_section = f"\n## 代码变更 (git diff HEAD)\n```diff\n{patch}\n```\n"
-
-    files_section = ""
-    if touched_files:
-        files_section = "\n## 涉及文件\n" + "\n".join(f"- {f}" for f in touched_files[:50]) + "\n"
-
-    spec_section = f"\n## Spec 摘要\n{spec_output}\n" if spec_output else ""
-    plan_section = f"\n## Plan 摘要\n{plan_output}\n" if plan_output else ""
-    build_section = f"\n## Build 摘要\n{build_output}\n" if build_output else ""
-
-    return f"""你是 **{perspective.display_name}** 视角的评审员。只从这一个视角给出判断，不要覆盖其它视角。
-
-## 项目目标
-{requirement}
-
-## 视角关注点
-{focus_block}
-{spec_section}{plan_section}{build_section}{files_section}{diff_section}
-<output_format>
-严格按以下格式输出，不要输出其他任何内容：
-
-[{tag}]
-PASS 或 FAIL
-- 改进建议1（如果 FAIL）
-- 改进建议2（如果 FAIL）
-</output_format>
-
-## 标准
-- PASS: 本视角认为当前实现质量良好，无需改进
-- FAIL: 发现可改进之处，列出具体、可落地的建议（每条对应一个明确改动点）
 """
 
 

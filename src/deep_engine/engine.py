@@ -5,7 +5,6 @@ the new Deep Engine sends a single comprehensive prompt to the agent and
 monitors its plan/tool-call/text progress via ACP events.
 """
 
-import json
 import logging
 import os
 import time
@@ -96,7 +95,6 @@ class _RetryingPromptSession:
 class DeepEngine(BaseEngine):
     """ACP-driven Deep Engine — the agent plans and executes autonomously."""
 
-    _state_filename = ".deep_engine_state.json"
     _gc_label = "Deep"
     _gc_threshold_default = 80.0
 
@@ -553,22 +551,6 @@ class DeepEngine(BaseEngine):
                 lines.append(f"\n⏱️ 总耗时: {self._project.duration():.1f}s")
 
         return "\n".join(lines)
-
-    def load_state(self, filepath: Optional[str] = None) -> bool:
-        if not filepath:
-            filepath = os.path.join(self.root_path, self._state_filename)
-
-        if not os.path.exists(filepath):
-            return False
-
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            self._project = DeepProject.from_dict(state["project"])
-            return True
-        except Exception as e:
-            logger.error("加载状态失败: %s", get_error_detail(e))
-            return False
 
     def cleanup(self):
         super().cleanup()

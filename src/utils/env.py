@@ -77,16 +77,6 @@ def set_test_environment_checker(checker: Optional[TestEnvironmentChecker]) -> N
         _test_environment_checker = checker
 
 
-def get_test_environment_checker() -> Optional[TestEnvironmentChecker]:
-    """Get the current test environment checker function.
-
-    Returns:
-        The current checker function if set, None otherwise.
-    """
-    with _test_environment_lock:
-        return _test_environment_checker
-
-
 def _ensure_npm_global_in_path(
     env: dict[str, str],
     *,

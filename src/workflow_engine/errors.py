@@ -83,23 +83,6 @@ _USER_MESSAGES: dict[ErrorCategory, str] = {
     ),
 }
 
-
-# Mapping from legacy detailed categories to unified surface categories
-_LEGACY_TO_UNIFIED: dict[ErrorCategory, ErrorCategory] = {
-    ErrorCategory.AGENT_LIMIT: ErrorCategory.INVALID_STATE,
-    ErrorCategory.TOOL_NOT_ALLOWED: ErrorCategory.FORBIDDEN,
-    ErrorCategory.SCRIPT_VALIDATION: ErrorCategory.INVALID_ARGUMENT,
-    ErrorCategory.RUNTIME_TIMEOUT: ErrorCategory.RUNTIME_TIMEOUT,
-    ErrorCategory.INTERNAL_ERROR: ErrorCategory.INVALID_STATE,
-    ErrorCategory.CANCELLED: ErrorCategory.INVALID_STATE,
-    ErrorCategory.BUDGET_EXHAUSTED: ErrorCategory.INVALID_STATE,  # deprecated
-}
-
-
-def to_unified_category(category: ErrorCategory) -> ErrorCategory:
-    """Map a legacy detailed category to the unified four-category surface."""
-    return _LEGACY_TO_UNIFIED.get(category, category)
-
 # Patterns considered internal-only and stripped from user-facing messages.
 # These are intentionally conservative — we only strip things that clearly
 # look like file paths / tracebacks, NOT user-facing slash commands (e.g.

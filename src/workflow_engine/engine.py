@@ -1696,17 +1696,3 @@ class WorkflowEngine(BaseEngine):
         if self._renderer_wf:
             return self._renderer_wf.render_compact_status()
         return "Workflow: idle"
-
-    def get_progress_card(self) -> Optional[dict[str, Any]]:
-        """Return current Feishu card JSON for the workflow progress."""
-        if self._renderer_wf:
-            if self._state_manager:
-                return self._renderer_wf.render_progress_card(self._state_manager.snapshot())
-            return self._renderer_wf.render_progress_card()
-        return None
-
-    def get_journal_stats(self) -> dict:
-        """Return journal cache statistics."""
-        if self._journal:
-            return self._journal.stats()
-        return {"total": 0, "hits": 0, "misses": 0}

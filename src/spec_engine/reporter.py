@@ -177,24 +177,6 @@ class SpecReporter:
 
         return "\n".join(parts)
 
-    def format_cycle_start(self, cycle_number: int, max_cycles: int, criteria_status: str = "") -> str:
-        progress = self.format_phase_progress(SpecPhase.SPEC, completed=False)
-        base = progress
-        if criteria_status:
-            return f"{base}\n\n{criteria_status}"
-        return base
-
-    def format_phase_start(self, cycle: int, phase: SpecPhase) -> str:
-        return f"{phase.emoji} **{phase.display_name}** [循环 {cycle}]\n\n⏳ 执行中..."
-
-    def format_phase_done(self, cycle: int, phase: SpecPhase, content: str) -> str:
-        body = content if content else "(无输出)"
-        return f"""{phase.emoji} **{phase.display_name}完成** [循环 {cycle}]
-
-```
-{body}
-```"""
-
     def format_cycle_done(self, cycle_number: int, cycle: SpecCycle) -> str:
         status_emoji = "✅" if cycle.status == "completed" else "❌"
         status_text = "完成" if cycle.status == "completed" else "失败"
@@ -290,23 +272,6 @@ class SpecReporter:
             satisfied = tracker.satisfied.get(i, False)
             marker = "✅" if satisfied else "🔲"
             lines.append(f"  {marker} {criterion}")
-        return "\n".join(lines)
-
-    def format_criteria_update(self, project: SpecProject) -> str:
-        lines = ["📋 **验收标准进度**\n"]
-        tracker = project.criteria_tracker
-
-        for i, criterion in enumerate(tracker.criteria):
-            satisfied = tracker.satisfied.get(i, False)
-            if satisfied:
-                cycle_num = tracker.satisfied_at_iteration.get(i, "?")
-                lines.append(f"  ✅ {i + 1}. {criterion} (循环{cycle_num})")
-            else:
-                lines.append(f"  🔲 {i + 1}. {criterion}")
-
-        progress_bar = self._make_progress_bar(tracker.satisfied_count, tracker.total_count)
-        lines.append(f"\n{progress_bar}")
-
         return "\n".join(lines)
 
     def format_project_done(self, project: SpecProject) -> str:
@@ -625,28 +590,6 @@ class SpecReporter:
     # Title helpers (for card headers)
     # ------------------------------------------------------------------
 
-    def get_analyzing_start_title(self) -> str:
-        return "📋 Spec Agent 启动"
-
-    def get_analyzing_done_title(self) -> str:
-        return "✅ 需求分析完成"
-
-    def get_cycle_start_title(self, cycle: int, max_cycles: int) -> str:
-        return f"🔄 Spec 循环 [{cycle}/{max_cycles}]"
-
-    def get_cycle_done_title(self, cycle: int, success: bool) -> str:
-        if success:
-            return f"✅ 循环完成 [{cycle}]"
-        return f"❌ 循环失败 [{cycle}]"
-
-    def get_phase_title(self, cycle: int, phase: SpecPhase) -> str:
-        return f"{phase.emoji} {phase.display_name} [循环 {cycle}]"
-
-    def get_review_title(self, cycle: int, all_passed: bool) -> str:
-        if all_passed:
-            return f"✅ 审查通过 [循环 {cycle}]"
-        return f"🔍 多角色审查 [循环 {cycle}]"
-
     def get_project_done_title(self, project: SpecProject) -> str:
         if project.status == SpecProjectStatus.COMPLETED:
             return "🎉 Spec 模式完成！"
@@ -684,35 +627,6 @@ class SpecReporter:
     # ------------------------------------------------------------------
     # Structured card sections (for build_info_card params)
     # ------------------------------------------------------------------
-
-    def format_status_line(self, project: SpecProject) -> str:
-        """One-line status for card metadata area."""
-        status_map = {
-            SpecProjectStatus.IDLE: "⏳ 等待开始",
-            SpecProjectStatus.ANALYZING: "🧠 分析中",
-            SpecProjectStatus.RUNNING: "🔄 循环执行中",
-            SpecProjectStatus.COMPLETED: "✅ 已完成",
-            SpecProjectStatus.FAILED: "❌ 已失败",
-            SpecProjectStatus.CANCELLED: "⏹️ 已停止",
-        }
-        status_text = status_map.get(project.status, "❓ 未知")
-        cycle_info = f"循环 {project.current_cycle_number}"
-        criteria_info = f"标准 {project.satisfied_count}/{project.total_criteria}"
-
-        # 增加规格单元计数提示，解决极简主义偏差导致的状态可见性缺失
-        work_item_info = ""
-        total_items = getattr(project, "work_items_total", 0)
-        if total_items > 0:
-            done_items = sum(1 for w in getattr(project, "work_items", []) if w.status == SpecWorkItemStatus.DONE)
-            work_item_info = f" · 单元 {done_items}/{total_items}"
-
-        return f"{status_text} · {cycle_info} · {criteria_info}{work_item_info}"
-
-    def format_duration_line(self, project: SpecProject) -> str:
-        """Duration line for card metadata area."""
-        if not project.duration():
-            return ""
-        return f"⏱️ {format_duration(project.duration())}"
 
     def format_criteria_section(self, project: SpecProject) -> str:
         """Standalone criteria section for card layout."""

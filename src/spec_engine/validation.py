@@ -17,16 +17,3 @@ class SpecInput(BaseModel):
         if len(v) > 50000:  # Reasonable upper limit
             raise ValueError("Requirement text is too long (max 50000 chars)")
         return v
-
-class SpecConfig(BaseModel):
-    """
-    Validation model for SpecEngine configuration.
-    """
-    max_cycles: int = Field(default=10, ge=1, le=100)
-    execution_timeout: int = Field(default=300, ge=30)
-
-    @field_validator('max_cycles')
-    def validate_max_cycles(cls, v):
-        if v < 1:
-            raise ValueError("max_cycles must be at least 1")
-        return v
