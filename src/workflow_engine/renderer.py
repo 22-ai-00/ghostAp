@@ -1115,7 +1115,7 @@ def _prepare_execution_blocks_for_wire(blocks: tuple) -> tuple:
 
 
 _AGENT_CARD_CACHE_MAX = 512
-_AGENT_CARD_CACHE_LOCK = threading.Lock()
+_AGENT_CARD_CACHE_LOCK = threading.Lock()  # leaf lock: never held while acquiring a LockLevel lock
 _AGENT_CARD_CACHE: OrderedDict[tuple[Any, ...], str] = OrderedDict()
 
 
