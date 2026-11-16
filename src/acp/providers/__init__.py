@@ -399,6 +399,10 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
             ],
             ["@dsh-enhanced/acp"],
         )
+        agy = _make_custom_help_checker_with_cache_handle(
+            ["agy", "acp", "--help"],
+            ["usage:", "agy acp", "stdio"],
+        )
         _checkers = {
             "aiden": aiden,
             "codex": codex,
@@ -406,6 +410,7 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
             "traex": traex,
             "grok": grok,
             "dsh": dsh,
+            "agy": agy,
         }
 
         _aiden_checker, _aiden_help_loader, _ = aiden
@@ -414,6 +419,7 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
         _traex_checker, _traex_help_loader, _ = traex
         _grok_checker, _grok_help_loader, _ = grok
         _dsh_checker, _dsh_help_loader, _ = dsh
+        _agy_checker, _agy_help_loader, _ = agy
 
         # --- 2) build configs ---
         configs = [
@@ -491,6 +497,12 @@ def _ensure_providers() -> dict[str, GenericACPProvider]:
                 serve_args=["--profile", "acp"],
                 availability_checker=_dsh_checker,
                 help_blob_loader=_dsh_help_loader,
+            ),
+            _ProviderConfig(
+                tool_name="agy",
+                serve_args=["acp"],
+                availability_checker=_agy_checker,
+                help_blob_loader=_agy_help_loader,
             ),
         ]
 
@@ -575,6 +587,7 @@ GeminiProvider = type("GeminiProvider", (), {"__new__": lambda cls: _ensure_prov
 TraexProvider = type("TraexProvider", (), {"__new__": lambda cls: _ensure_providers()["traex"]})
 GrokProvider = type("GrokProvider", (), {"__new__": lambda cls: _ensure_providers()["grok"]})
 DSHProvider = type("DSHProvider", (), {"__new__": lambda cls: _ensure_providers()["dsh"]})
+AGYProvider = type("AGYProvider", (), {"__new__": lambda cls: _ensure_providers()["agy"]})
 
 
 def _get_aiden_acp_serve_help_blob() -> str:
@@ -620,6 +633,14 @@ def _get_dsh_acp_profile_blob() -> str:
 _get_dsh_acp_profile_blob.cache_clear = lambda: _get_checker("dsh")[2]()  # type: ignore[attr-defined]
 
 
+def _get_agy_acp_serve_help_blob() -> str:
+    _, loader, _ = _get_checker("agy")
+    return loader()
+
+
+_get_agy_acp_serve_help_blob.cache_clear = lambda: _get_checker("agy")[2]()  # type: ignore[attr-defined]
+
+
 __all__ = [
     "ACPProvider",
     "ToolRegistry",
@@ -635,6 +656,7 @@ __all__ = [
     "TraexProvider",
     "GrokProvider",
     "DSHProvider",
+    "AGYProvider",
     "GenericACPProvider",
     "CodexACPProvider",
     "GrokACPProvider",
@@ -645,4 +667,5 @@ __all__ = [
     "_get_traex_acp_serve_help_blob",
     "_get_grok_acp_serve_help_blob",
     "_get_dsh_acp_profile_blob",
+    "_get_agy_acp_serve_help_blob",
 ]

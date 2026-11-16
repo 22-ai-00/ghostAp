@@ -97,6 +97,9 @@ class ProjectContext:
     dsh_session_snapshot: Optional[SessionSnapshot] = None
     dsh_mode: bool = False
 
+    agy_session_snapshot: Optional[SessionSnapshot] = None
+    agy_mode: bool = False
+
     acp_tool_name: Optional[str] = None
     acp_model_name: Optional[str] = None
 
@@ -266,6 +269,7 @@ class ProjectContext:
         "traex": ("traex_mode", "traex_session_snapshot"),
         "grok": ("grok_mode", "grok_session_snapshot"),
         "dsh": ("dsh_mode", "dsh_session_snapshot"),
+        "agy": ("agy_mode", "agy_session_snapshot"),
     }
 
     def set_programming_mode(self, mode_type: str, enabled: bool, session_id: Optional[str] = None, query_count: int = 0):
@@ -508,6 +512,7 @@ class ProjectContext:
             traex_mode=data.get("traex_mode", False),
             grok_mode=data.get("grok_mode", False),
             dsh_mode=data.get("dsh_mode", False),
+            agy_mode=data.get("agy_mode", False),
             acp_tool_name=acp_tool_name,
             acp_model_name=data.get("acp_model_name") if acp_tool_name else None,
             theme_color=data.get("theme_color", "green"),

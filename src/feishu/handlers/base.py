@@ -900,6 +900,7 @@ class BaseHandler:
             InteractionMode.TRAEX: ContextSourceMode.TRAEX,
             InteractionMode.GROK: ContextSourceMode.GROK,
             InteractionMode.DSH: ContextSourceMode.DSH,
+            InteractionMode.AGY: ContextSourceMode.AGY,
         }
         return mapping.get(mode, ContextSourceMode.SMART)
 

@@ -52,6 +52,7 @@ def _make_handler_context(**settings_overrides) -> HandlerContext:
         traex_manager=mock(),
         grok_manager=mock(),
         dsh_manager=mock(),
+        agy_manager=mock(),
         intent_recognizer=mock(),
         scheduler=mock(),
         project_manager=mock(),

@@ -104,6 +104,7 @@ from .card_callback_contract import (
 from .emoji import EmojiReaction
 from .handler_context import HandlerContext
 from .handlers import (
+    AGYModeHandler,
     AidenModeHandler,
     ClaudeModeHandler,
     ClaudeWModeHandler,
@@ -606,6 +607,7 @@ class FeishuWSClient:
             "traex": self.settings.coco_session_timeout,
             "grok": self.settings.coco_session_timeout,
             "dsh": self.settings.coco_session_timeout,
+            "agy": self.settings.coco_session_timeout,
         }
         acp_managers = {
             name: ACPSessionManager(
@@ -783,6 +785,7 @@ class FeishuWSClient:
             traex_manager=acp_managers["traex"],
             grok_manager=acp_managers["grok"],
             dsh_manager=acp_managers["dsh"],
+            agy_manager=acp_managers["agy"],
             intent_recognizer=self._intent_recognizer,
             scheduler=self._scheduler,
             project_manager=self._project_manager,
@@ -864,6 +867,7 @@ class FeishuWSClient:
             "traex": TraexModeHandler,
             "grok": GrokModeHandler,
             "dsh": DSHModeHandler,
+            "agy": AGYModeHandler,
             "deep": DeepHandler,
             "spec": SpecHandler,
             "project": ProjectHandler,

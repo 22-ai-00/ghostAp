@@ -28,6 +28,7 @@ BUTTON_CONFIG = {
     "enter_traex": {"text": "🚀 进入 Traex 模式", "type": "default"},
     "enter_grok": {"text": "🌌 进入 Grok 模式", "type": "default"},
     "enter_dsh": {"text": "🧭 进入 DSH 模式", "type": "default"},
+    "enter_agy": {"text": "🪐 进入 AGY 模式", "type": "default"},
     "switch_project": {"text": "🔄 切换项目", "type": "default"},
     # Reducer escalation button — rendered to user by DeepBuilder in escalation scenarios.
     # Also used in confirm dialogs when user initiates force-stop.

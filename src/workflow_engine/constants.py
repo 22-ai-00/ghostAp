@@ -45,6 +45,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
     "gemini": "Google 多模态推理",
     "grok": "xAI 原生 ACP 编程",
     "dsh": "DeepSeek Harness 原生 ACP 编程",
+    "agy": "Google Antigravity 原生 ACP 编程",
 }
 
 # --- Journal ---

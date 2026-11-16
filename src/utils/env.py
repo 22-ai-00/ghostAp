@@ -11,7 +11,15 @@ from typing import Callable, Optional
 
 # Keys that must be removed to avoid nested-session guard crashes
 # when spawning ACP / CLI subprocesses from within a wrapper environment.
-_GUARD_KEYS = ("CLAUDECODE",)
+_GUARD_KEYS = (
+    "CLAUDECODE",
+    "ANTIGRAVITY_AGENT",
+    "ANTIGRAVITY_LS_ADDRESS",
+    "ANTIGRAVITY_CSRF_TOKEN",
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "ANTIGRAVITY_TRAJECTORY_ID",
+    "ANTIGRAVITY_SOURCE_METADATA",
+)
 
 # Type alias for test environment checker function
 TestEnvironmentChecker = Callable[[], bool]

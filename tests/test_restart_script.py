@@ -239,7 +239,7 @@ def test_application_startup_can_preheat_model_capabilities_when_explicitly_enab
     app.run()
 
     assert preheat_calls == [
-        (["claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"], "/repo")
+        (["claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"], "/repo")
     ]
     assert events == [
         "coco-preheat",

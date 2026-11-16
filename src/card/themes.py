@@ -124,6 +124,7 @@ MODE_TEMPLATES: dict[str, str] = {
     "Coco": "blue",
     "Claude": "purple",
     "Gemini": "turquoise",
+    "AGY": "wathet",
     "Deep": "violet",
     "Deep Agent": "violet",
     "Spec": "green",

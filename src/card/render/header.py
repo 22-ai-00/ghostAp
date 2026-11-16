@@ -19,6 +19,7 @@ _TOOL_DISPLAY = {
     "traex": "Traex",
     "grok": "Grok",
     "dsh": "DSH",
+    "agy": "AGY",
 }
 
 _SUBTASK_STATUS_LABELS = {

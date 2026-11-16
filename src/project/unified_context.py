@@ -34,6 +34,7 @@ class ContextSourceMode(Enum):
     TRAEX = "traex"
     GROK = "grok"
     DSH = "dsh"
+    AGY = "agy"
     SHELL = "shell"
     DEEP_ENGINE = "deep_engine"
 

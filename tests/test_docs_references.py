@@ -169,6 +169,7 @@ def test_readme_discovers_all_programming_session_info_commands() -> None:
         "/traex_info",
         "/grok_info",
         "/dsh_info",
+        "/agy_info",
     ):
         assert f"`{command}`" in modes_section
 

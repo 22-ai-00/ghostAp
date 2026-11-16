@@ -23,6 +23,7 @@ from src.tasking import TaskSpec
         (InteractionMode.TRAEX, "traex"),
         (InteractionMode.GROK, "grok"),
         (InteractionMode.DSH, "dsh"),
+        (InteractionMode.AGY, "agy"),
     ],
 )
 def test_exit_current_mode_delegates_for_every_programming_backend(
@@ -33,7 +34,7 @@ def test_exit_current_mode_delegates_for_every_programming_backend(
     ctx.mode_manager.get_mode.return_value = mode
     programming_handlers = {
         name: MagicMock()
-        for name in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh")
+        for name in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy")
     }
     ctx.handlers.get.side_effect = programming_handlers.get
     handler = SystemHandler(ctx)

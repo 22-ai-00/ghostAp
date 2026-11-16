@@ -251,7 +251,7 @@ class Application:
 
                 get_coco_model_manager().kickoff_preheat()
                 kickoff_acp_model_preheat(
-                    ["claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"],
+                    ["claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"],
                     cwd=os.getcwd(),
                 )
         except Exception:

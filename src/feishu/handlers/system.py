@@ -380,6 +380,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/enter_grok": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "grok", p),
             "/dsh": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "dsh", p),
             "/enter_dsh": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "dsh", p),
+            "/agy": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "agy", p),
+            "/enter_agy": lambda m, c, t, p: self._handle_direct_mode_enter(m, c, "agy", p),
             "/exit": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/quit": lambda m, c, t, p: self.exit_current_mode(m, c, p),
             "/end_coco": lambda m, c, t, p: self.exit_current_mode(m, c, p),
@@ -409,6 +411,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/traex_info": lambda m, c, t, p: self.get_handler("traex").show_info(m, c, p),
             "/grok_info": lambda m, c, t, p: self.get_handler("grok").show_info(m, c, p),
             "/dsh_info": lambda m, c, t, p: self.get_handler("dsh").show_info(m, c, p),
+            "/agy_info": lambda m, c, t, p: self.get_handler("agy").show_info(m, c, p),
             "/projects": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/project": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
             "/switch": lambda m, c, t, p: self.get_handler("project").show_project_board(m, c),
@@ -670,6 +673,8 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/enter_grok",
             "/dsh",
             "/enter_dsh",
+            "/agy",
+            "/enter_agy",
             "/exit",
             "/quit",
             "/end_coco",
@@ -699,6 +704,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "/traex_info",
             "/grok_info",
             "/dsh_info",
+            "/agy_info",
             "/projects",
             "/status",
             "/project",
@@ -1269,6 +1275,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "traex",
             "grok",
             "dsh",
+            "agy",
         )
         for _tool in _TOOL_HANDLER_MAP:
             if tool_name != _tool:
@@ -2634,7 +2641,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
         """Show a list of all available ACP tools with quick access buttons."""
         # Only user-visible programming tools; hidden bridges (e.g. claude-w)
         # stay out of the discovery surfaces even though they are full modes.
-        names = ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"]
+        names = ["coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"]
         emojis = {
             "coco": "🤖",
             "claude": "🔮",
@@ -2644,6 +2651,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             "traex": "🚀",
             "grok": "🌌",
             "dsh": "🧭",
+            "agy": "🪐",
         }
 
         # Cached-first availability check: avoid blocking user-path on external probe.
@@ -2679,6 +2687,7 @@ class SystemHandler(LockCommandsMixin, BaseHandler):
             {"name": "traex", "emoji": "🚀", "manager": self.ctx.traex_manager},
             {"name": "grok", "emoji": "🌌", "manager": self.ctx.grok_manager},
             {"name": "dsh", "emoji": "🧭", "manager": self.ctx.dsh_manager},
+            {"name": "agy", "emoji": "🪐", "manager": self.ctx.agy_manager},
         ]
 
         def _format_last_used(ts: float) -> str:

@@ -18,6 +18,7 @@ class InteractionMode(Enum):
     TRAEX = "traex"
     GROK = "grok"
     DSH = "dsh"
+    AGY = "agy"
     SHELL = "shell"
 
 
@@ -33,6 +34,7 @@ PROGRAMMING_MODES: frozenset[InteractionMode] = frozenset(
         InteractionMode.TRAEX,
         InteractionMode.GROK,
         InteractionMode.DSH,
+        InteractionMode.AGY,
     }
 )
 PROGRAMMING_MODE_VALUES: frozenset[str] = frozenset(
@@ -215,6 +217,10 @@ class ModeManager:
         """进入 DSH 编程模式。"""
         return self.enter_programming_mode(chat_id, InteractionMode.DSH, auto=auto, project_id=project_id)
 
+    def enter_agy_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
+        """进入 AGY 编程模式。"""
+        return self.enter_programming_mode(chat_id, InteractionMode.AGY, auto=auto, project_id=project_id)
+
     def exit_to_smart(self, chat_id: str, project_id: Optional[str] = None) -> InteractionMode:
         """退出到 SMART 模式。"""
         return self.set_mode(chat_id, InteractionMode.SMART, auto_entered=False, project_id=project_id)
@@ -259,6 +265,10 @@ class ModeManager:
         """判断当前是否为 DSH 模式。"""
         return self.get_mode(chat_id, project_id) == InteractionMode.DSH
 
+    def is_agy_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
+        """判断当前是否为 AGY 模式。"""
+        return self.get_mode(chat_id, project_id) == InteractionMode.AGY
+
     def is_programming_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断是否处于编程模式。"""
         mode = self.get_mode(chat_id, project_id)
@@ -279,5 +289,6 @@ class ModeManager:
             InteractionMode.TRAEX: "🚀 Traex 编程模式",
             InteractionMode.GROK: "🌌 Grok 编程模式",
             InteractionMode.DSH: "🧭 DSH 编程模式",
+            InteractionMode.AGY: "🪐 AGY 编程模式",
             InteractionMode.SHELL: "💻 Shell 模式",
         }.get(mode, "未知模式")

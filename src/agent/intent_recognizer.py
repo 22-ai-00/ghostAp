@@ -28,6 +28,7 @@ class IntentType(Enum):
     ENTER_GROK = "enter_grok"
     EXIT_GROK = "exit_grok"
     ENTER_DSH = "enter_dsh"
+    ENTER_AGY = "enter_agy"
     EXIT_MODE = "exit_mode"
     CHANGE_DIR = "change_dir"
     SHELL_COMMAND = "shell"
@@ -41,6 +42,7 @@ class IntentType(Enum):
     TRAEX_MESSAGE = "traex_message"
     GROK_MESSAGE = "grok_message"
     DSH_MESSAGE = "dsh_message"
+    AGY_MESSAGE = "agy_message"
     CREATE_PROJECT = "create_project"
     SWITCH_PROJECT = "switch_project"
     LIST_PROJECTS = "list_projects"
@@ -151,6 +153,7 @@ class IntentRecognizer:
         "enter_grok": IntentType.ENTER_GROK,
         "exit_grok": IntentType.EXIT_GROK,
         "enter_dsh": IntentType.ENTER_DSH,
+        "enter_agy": IntentType.ENTER_AGY,
         "exit_mode": IntentType.EXIT_MODE,
         "coco_message": IntentType.COCO_MESSAGE,
         "claude_message": IntentType.CLAUDE_MESSAGE,
@@ -161,6 +164,7 @@ class IntentRecognizer:
         "traex_message": IntentType.TRAEX_MESSAGE,
         "grok_message": IntentType.GROK_MESSAGE,
         "dsh_message": IntentType.DSH_MESSAGE,
+        "agy_message": IntentType.AGY_MESSAGE,
         "change_dir": IntentType.CHANGE_DIR,
         "shell": IntentType.SHELL_COMMAND,
         "create_project": IntentType.CREATE_PROJECT,
@@ -219,6 +223,8 @@ class IntentRecognizer:
         "/exit_grok": (IntentType.EXIT_GROK, "退出 Grok 编程模式"),
         "/dsh": (IntentType.ENTER_DSH, "进入 DSH 编程模式"),
         "/enter_dsh": (IntentType.ENTER_DSH, "进入 DSH 编程模式"),
+        "/agy": (IntentType.ENTER_AGY, "进入 AGY 编程模式"),
+        "/enter_agy": (IntentType.ENTER_AGY, "进入 AGY 编程模式"),
         "/exit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/quit": (IntentType.EXIT_MODE, "退出当前模式"),
         "/end_claude_w": (IntentType.EXIT_MODE, "退出 Claude-W 桥接模式"),
@@ -416,6 +422,7 @@ class IntentRecognizer:
     ENTER_TRAEX_KEYWORDS = {"进入traex模式", "traex模式", "进入traex", "使用traex"}
     ENTER_GROK_KEYWORDS = {"进入grok模式", "grok模式", "进入grok", "使用grok"}
     ENTER_DSH_KEYWORDS = {"进入dsh模式", "dsh模式", "进入dsh", "使用dsh"}
+    ENTER_AGY_KEYWORDS = {"进入agy模式", "agy模式", "进入agy", "使用agy"}
     EXIT_MODE_KEYWORDS = {"退出模式", "退出编程模式"}
 
     DEEP_MODE_KEYWORDS = {"deep模式", "深度模式", "deep agent", "复杂任务", "大任务"}
@@ -478,6 +485,7 @@ class IntentRecognizer:
             ("enter_traex_keyword", IntentRecognizer._match_enter_traex_keyword),
             ("enter_grok_keyword", IntentRecognizer._match_enter_grok_keyword),
             ("enter_dsh_keyword", IntentRecognizer._match_enter_dsh_keyword),
+            ("enter_agy_keyword", IntentRecognizer._match_enter_agy_keyword),
             ("programming_exit_keyword", IntentRecognizer._match_programming_exit_keyword),
             ("project_list_keyword", IntentRecognizer._match_project_list_keyword),
             ("cd_command", IntentRecognizer._match_cd_command),
@@ -744,6 +752,7 @@ class IntentRecognizer:
             "/traex_info": (IntentType.TRAEX_MESSAGE, "Traex"),
             "/grok_info": (IntentType.GROK_MESSAGE, "Grok"),
             "/dsh_info": (IntentType.DSH_MESSAGE, "DSH"),
+            "/agy_info": (IntentType.AGY_MESSAGE, "AGY"),
         }
         if text_lower in info_commands:
             intent, name = info_commands[text_lower]
@@ -826,6 +835,18 @@ class IntentRecognizer:
                 original_text=text,
                 reasoning="检测到进入 DSH 编程模式关键词",
                 description="进入 DSH 编程模式",
+            )
+        return None
+
+    def _match_enter_agy_keyword(self, text: str, current_mode: str) -> Optional[IntentResult]:
+        text_lower = self._lower(text)
+        if any(kw in text_lower for kw in self.ENTER_AGY_KEYWORDS):
+            return IntentResult.single(
+                intent=IntentType.ENTER_AGY,
+                confidence=0.95,
+                original_text=text,
+                reasoning="检测到进入 AGY 编程模式关键词",
+                description="进入 AGY 编程模式",
             )
         return None
 
@@ -983,6 +1004,8 @@ class IntentRecognizer:
             return IntentType.GROK_MESSAGE
         elif current_mode == "dsh":
             return IntentType.DSH_MESSAGE
+        elif current_mode == "agy":
+            return IntentType.AGY_MESSAGE
         else:
             return IntentType.SHELL_COMMAND
 
@@ -1003,6 +1026,7 @@ class IntentRecognizer:
                 "traex": IntentType.ENTER_TRAEX,
                 "grok": IntentType.ENTER_GROK,
                 "dsh": IntentType.ENTER_DSH,
+                "agy": IntentType.ENTER_AGY,
             }
             intent = _TOOL_INTENT_MAP.get(default_tool.lower())
             if intent:

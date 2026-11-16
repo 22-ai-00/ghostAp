@@ -22,6 +22,7 @@ from src.feishu.action_registry import init_action_registry
 from src.feishu.dispatcher import MessageDispatcher
 from src.feishu.handler_context import HandlerContext
 from src.feishu.handlers.programming import (
+    AGYModeHandler,
     AidenModeHandler,
     ClaudeModeHandler,
     CocoModeHandler,
@@ -49,6 +50,7 @@ BACKENDS = (
     ("traex", TraexModeHandler, "traex-model"),
     ("grok", GrokModeHandler, "grok-build"),
     ("dsh", DSHModeHandler, '["deepseek-official","deepseek-v4-flash","high"]'),
+    ("agy", AGYModeHandler, "gemini-4-hydrogen/xhigh"),
 )
 
 
@@ -88,6 +90,7 @@ def _context(backend: str, manager) -> HandlerContext:
         traex_manager=managers["traex"],
         grok_manager=managers["grok"],
         dsh_manager=managers["dsh"],
+        agy_manager=managers["agy"],
         intent_recognizer=MagicMock(),
         scheduler=MagicMock(),
         project_manager=project_manager,
@@ -1763,6 +1766,7 @@ def test_tools_list_uses_programming_availability_without_acp_probe(
         "traex",
         "grok",
         "dsh",
+        "agy",
     ]
     assert all(
         call.kwargs
@@ -1784,7 +1788,7 @@ def test_tools_status_uses_programming_availability_without_acp_probe(
         "src.feishu.handlers.system.is_programming_tool_available",
         availability,
     )
-    for name in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh"):
+    for name in ("coco", "claude", "aiden", "codex", "gemini", "traex", "grok", "dsh", "agy"):
         getattr(ctx, f"{name}_manager").list_active_sessions.return_value = []
     system.reply_interactive_card = MagicMock()
 
@@ -1799,6 +1803,7 @@ def test_tools_status_uses_programming_availability_without_acp_probe(
         "traex",
         "grok",
         "dsh",
+        "agy",
     ]
     assert all(
         call.kwargs

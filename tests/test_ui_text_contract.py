@@ -139,6 +139,7 @@ def test_programming_help_discovers_all_session_info_commands():
         "/traex_info",
         "/grok_info",
         "/dsh_info",
+        "/agy_info",
     ):
         assert f"`{command}`" in body
 

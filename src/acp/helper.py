@@ -16,6 +16,12 @@ from acp.stdio import spawn_agent_process
 from ..config import get_settings
 from ..utils.async_helpers import safe_wait_for
 from ..utils.text import get_acp_result_header_text
+from .agy_selection import (
+    AGY_MODEL_CONFIG_ID,
+    AGY_REASONING_EFFORTS,
+    AGY_THOUGHT_LEVEL_CONFIG_ID,
+    compose_agy_model_selection,
+)
 from .claude_selection import (
     CLAUDE_DEFAULT_EFFORT_TOKEN,
     CLAUDE_DEFAULT_MODEL_TOKEN,
@@ -62,6 +68,7 @@ _TOOLS = (
     "traex",
     "grok",
     "dsh",
+    "agy",
 )
 # Tools hidden from auto-discovered listings (e.g. /tools panel) but still
 # fully routable when invoked explicitly — see the hidden /claude-w and
@@ -691,6 +698,82 @@ async def discover_dsh_model_options(
     return discovered
 
 
+def _agy_thought_level_capability(response: object) -> tuple[tuple[str, ...], str | None]:
+    root = _config_option(response, AGY_THOUGHT_LEVEL_CONFIG_ID, "reasoning_effort")
+    if root is None:
+        return (), None
+    values: list[str] = []
+    for option in getattr(root, "options", None) or ():
+        effort = str(getattr(option, "value", "") or "").strip().lower()
+        if effort in AGY_REASONING_EFFORTS and effort not in values:
+            values.append(effort)
+    current = str(getattr(root, "current_value", "") or "").strip().lower()
+    return tuple(values), current if current in values else None
+
+
+async def discover_agy_model_options(
+    connection: object,
+    response: object,
+) -> list[ACPModelOption]:
+    """Build a per-model AGY matrix from live ACP model and thought_level options."""
+    model_root = _config_option(response, AGY_MODEL_CONFIG_ID)
+    if model_root is None:
+        return _response_models(response, None)
+    current_model = str(getattr(model_root, "current_value", "") or "").strip()
+    raw_options: list[object] = []
+    for option in getattr(model_root, "options", None) or ():
+        nested = getattr(option, "options", None)
+        raw_options.extend(list(nested) if nested is not None else [option])
+    live_models = _options(raw_options, current_model, value_field="value")
+    session_id = str(getattr(response, "session_id", "") or "").strip()
+    discovered: list[ACPModelOption] = []
+    for live in live_models:
+        authority = response if live.name == current_model else None
+        if authority is None and session_id:
+            try:
+                authority = await connection.set_config_option(
+                    config_id=AGY_MODEL_CONFIG_ID,
+                    session_id=session_id,
+                    value=live.name,
+                )
+            except Exception as exc:
+                from ..utils.errors import get_error_detail
+
+                logger.warning(
+                    "[ACP] AGY model capability probe failed model=%s err=%s",
+                    live.name,
+                    get_error_detail(exc),
+                )
+        efforts, default_effort = _agy_thought_level_capability(authority)
+        variants = tuple(
+            ACPModelSelectionVariant(
+                name=compose_agy_model_selection(live.name, effort),
+                model=live.name,
+                effort=effort,
+                is_default=effort == default_effort,
+            )
+            for effort in efforts
+        )
+        if not variants:
+            variants = (
+                ACPModelSelectionVariant(
+                    name=live.name,
+                    model=live.name,
+                    is_default=True,
+                ),
+            )
+        discovered.append(
+            dataclasses.replace(
+                live,
+                is_default=live.name == current_model,
+                selection_variants=variants,
+                reasoning_efforts=efforts,
+                default_reasoning_effort=default_effort,
+            )
+        )
+    return discovered
+
+
 async def _probe_acp_models(
     tool_name: str, cwd: str | None, current_model: str | None = None
 ) -> list[ACPModelOption]:
@@ -738,6 +821,8 @@ async def _probe_acp_models_once(
             return await discover_codex_model_options(connection, response)
         if tool_name == "dsh":
             return await discover_dsh_model_options(connection, response)
+        if tool_name == "agy":
+            return await discover_agy_model_options(connection, response)
         if tool_name == "traex":
             # Traex applies model changes through ``session/set_config_option``.
             # Some adapter versions also expose the older ``models`` state but

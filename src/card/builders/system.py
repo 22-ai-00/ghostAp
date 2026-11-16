@@ -580,6 +580,7 @@ class SystemBuilder:
             InteractionMode.TRAEX: UI_TEXT["system_mode_traex"],
             InteractionMode.GROK: UI_TEXT["system_mode_grok"],
             InteractionMode.DSH: UI_TEXT["system_mode_dsh"],
+            InteractionMode.AGY: UI_TEXT["system_mode_agy"],
         }
 
         current_mode_str = mode_emoji.get(current_mode, UI_TEXT["system_mode_smart"])

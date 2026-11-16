@@ -5,6 +5,7 @@ from .deep import DeepHandler
 from .diagnostics import DiagnosticsHandler
 from .employee import EmployeeHandler
 from .programming import (
+    AGYModeHandler,
     AidenModeHandler,
     ClaudeModeHandler,
     ClaudeWModeHandler,
@@ -32,6 +33,7 @@ __all__ = [
     "CodexModeHandler",
     "CodexWModeHandler",
     "DSHModeHandler",
+    "AGYModeHandler",
     "GeminiModeHandler",
     "GrokModeHandler",
     "TraexModeHandler",

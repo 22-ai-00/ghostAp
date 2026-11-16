@@ -169,7 +169,7 @@
   <main>
     <h1>编程卡片 footer 收敛</h1>
     <p class="lede">
-      /model 是所有 ACP 编程工具共享的模型入口，会自动适配当前 Codex、Traex、DSH 等后端；
+      /model 是所有 ACP 编程工具共享的模型入口，会自动适配当前 Codex、Traex、DSH、AGY 等后端；
       所有编程卡片也复用同一个退出动作，避免为每个工具维护专用命令和按钮。
     </p>
 
@@ -198,6 +198,23 @@
             <div class="status">DeepSeek / DeepSeek-V4-Flash · high</div>
             <p>DSH 的 provider、model 与 reasoning effort 来自 ACP 实时目录。</p>
             <p class="meta">/model 自动定位 DSH；权限请求保持一次性、默认拒绝。</p>
+            <div class="footer">
+              <button type="button">退出编程模式</button>
+              <button type="button">切换项目</button>
+            </div>
+          </div>
+        </div>
+      </article>
+
+      <article class="sample">
+        <div class="label">AGY native ACP ready</div>
+        <div class="card">
+          <div class="header">🪐 AGY 编程模式已就绪</div>
+          <div class="body">
+            <span class="path">/data00/home/jiataorui/work/github/ghostAp</span>
+            <div class="status">gemini-4-hydrogen / xhigh</div>
+            <p>AGY 的模型与思考档位（thought_level）来自 ACP 实时目录。</p>
+            <p class="meta">/model 自动定位 AGY；权限请求保持一次性、默认拒绝。</p>
             <div class="footer">
               <button type="button">退出编程模式</button>
               <button type="button">切换项目</button>
@@ -236,7 +253,7 @@
     <aside class="decision">
       保留：共享 /model、刷新模型、统一 /exit 与项目切换。<br>
       移除：默认、SMART、Codex、Aiden 卡片中的 enter_coco / enter_claude /
-      enter_gemini / enter_traex / enter_dsh 引导，以及所有新卡片中的 exit_&lt;tool&gt; 动作。<br>
+      enter_gemini / enter_traex / enter_dsh / enter_agy 引导，以及所有新卡片中的 exit_&lt;tool&gt; 动作。<br>
       CardKit 缺权只降级输出传输；纯文本先回执运行状态，并提供应用绑定的一键申请链接。
     </aside>
   </main>

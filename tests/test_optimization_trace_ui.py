@@ -184,6 +184,7 @@ class TestOptimizationTraceUI(unittest.TestCase):
                 "traex",
                 "grok",
                 "dsh",
+                "agy",
             )
         }
         handlers["coco"] = handler

@@ -124,6 +124,7 @@ def select_auto_orchestrator(
         "codex",
         "grok",
         "dsh",
+        "agy",
         "aiden",
         "gemini",
         "coco",

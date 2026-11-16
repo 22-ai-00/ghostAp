@@ -368,6 +368,8 @@ class BaseEngineManager(Generic[T]):
             mode = InteractionMode.GROK
         elif normalized.startswith("dsh"):
             mode = InteractionMode.DSH
+        elif normalized.startswith("agy"):
+            mode = InteractionMode.AGY
         else:
             mode = InteractionMode.COCO
 

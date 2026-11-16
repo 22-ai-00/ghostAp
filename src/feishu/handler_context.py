@@ -58,6 +58,7 @@ class HandlerContext:
     traex_manager: "ACPSessionManager"
     grok_manager: "ACPSessionManager"
     dsh_manager: "ACPSessionManager"
+    agy_manager: "ACPSessionManager"
 
     # Core services
     intent_recognizer: "IntentRecognizer"

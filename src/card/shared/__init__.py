@@ -151,11 +151,13 @@ def resolve_title_and_template(
         mode_icon, header_template = "🌌", "indigo"
     elif mode == InteractionMode.DSH:
         mode_icon, header_template = "🧭", "blue"
+    elif mode == InteractionMode.AGY:
+        mode_icon, header_template = "🪐", "wathet"
     else:
         mode_icon, header_template = "🧠", "turquoise"
 
     # If a theme_color is provided (from project), use it for the template
-    if theme_color and mode not in [InteractionMode.CLAUDE, InteractionMode.COCO, InteractionMode.GEMINI, InteractionMode.TRAEX, InteractionMode.GROK, InteractionMode.DSH]:
+    if theme_color and mode not in [InteractionMode.CLAUDE, InteractionMode.COCO, InteractionMode.GEMINI, InteractionMode.TRAEX, InteractionMode.GROK, InteractionMode.DSH, InteractionMode.AGY]:
         header_template = get_theme(theme_color).header_template
 
     if project_name:
@@ -171,6 +173,8 @@ def resolve_title_and_template(
             title = f"🌌 {project_name} · Grok"
         elif mode == InteractionMode.DSH:
             title = f"🧭 {project_name} · DSH"
+        elif mode == InteractionMode.AGY:
+            title = f"🪐 {project_name} · AGY"
         else:
             title = f"🧠 {project_name}"
     else:
@@ -186,6 +190,8 @@ def resolve_title_and_template(
             mode_name = UI_TEXT["mode_name_grok"]
         elif mode == InteractionMode.DSH:
             mode_name = UI_TEXT["mode_name_dsh"]
+        elif mode == InteractionMode.AGY:
+            mode_name = UI_TEXT["mode_name_agy"]
         else:
             mode_name = UI_TEXT["mode_name_smart"]
         title = f"{mode_icon} {mode_name}"

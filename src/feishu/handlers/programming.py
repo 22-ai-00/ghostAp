@@ -398,6 +398,7 @@ class ProgrammingModeHandler(BaseHandler):
         (InteractionMode.TRAEX, "is_traex_mode", "traex"),
         (InteractionMode.GROK, "is_grok_mode", "grok"),
         (InteractionMode.DSH, "is_dsh_mode", "dsh"),
+        (InteractionMode.AGY, "is_agy_mode", "agy"),
     )
 
     def __init__(self, ctx):
@@ -2324,3 +2325,12 @@ class DSHModeHandler(ProgrammingModeHandler):
     mode_key = "dsh"
     context_source = ContextSourceMode.DSH
     thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🧭", name="DSH")
+
+
+class AGYModeHandler(ProgrammingModeHandler):
+    mode_name = "AGY"
+    mode_emoji = "🪐"
+    interaction_mode = InteractionMode.AGY
+    mode_key = "agy"
+    context_source = ContextSourceMode.AGY
+    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🪐", name="AGY")
