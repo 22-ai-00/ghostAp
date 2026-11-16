@@ -12,8 +12,6 @@ dependencies = [
     "psutil>=7.2.2",
     "lark-channel-sdk==1.2.0",
     "cryptography==49.0.0",
-    "a2a-sdk==1.1.2",
-    "httpx==0.28.1",
 ]
 
 [dependency-groups]
@@ -108,8 +106,6 @@ exclude = [
     "tests",
     "scripts",
     # 聚焦核心流转模块：调度 / 模式 / WS 路由
-    "src/agent_session.py",
-    "src/config.py",
     "src/main.py",
     "src/acp",
     "src/agent",
@@ -122,7 +118,6 @@ exclude = [
     # feishu 子模块暂不纳入 docstring 覆盖率（保留 ws_client.py）
     "src/feishu/handlers",
     "src/feishu/renderers",
-    "src/feishu/action_dispatcher.py",
     "src/feishu/emoji.py",
     "src/feishu/handler_context.py",
     "src/feishu/im_client.py",

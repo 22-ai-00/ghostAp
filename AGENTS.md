@@ -80,7 +80,7 @@ uv run python scripts/test_inventory.py tests/
 - `src/autonomous/provisioning/composition.py`：Employee Department 生产组装根。
 - `src/autonomous/provisioning/hire_service.py`：员工创建与配置编排。
 - `src/autonomous/gateway/coordinator.py`：现役 Effect 派发与恢复协调。
-- `src/autonomous/domain/state_machine.py`：纯状态转换函数（`transition_run/plan/step/effect`）。
+- `src/autonomous/domain/employees.py`：冻结员工身份、生命周期状态与凭据引用域模型。
 - `src/autonomous/journal/writer.py`：单写入者，fsync + flock。
 - `src/autonomous/runtime/employee_actor.py`：现役员工 actor 执行循环。
 - `src/autonomous/supervisor/employee_channels.py`：员工 Channel SDK 进程生命周期。
