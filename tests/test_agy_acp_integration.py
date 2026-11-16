@@ -3,22 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+from lark_oapi.core.model.base_response import BaseResponse
+from lark_oapi.core.model.raw_response import RawResponse
 
 import src.acp.helper as helper_mod
 import src.acp.providers as providers_mod
 import src.feishu.handlers.programming as programming_mod
 from src.acp.agy_selection import compose_agy_model_selection, split_agy_model_selection
+from src.acp.models import ACPEvent, ACPEventType, ToolCallInfo
 from src.acp.sync_adapter import SyncACPSession
 from src.agent.intent_recognizer import IntentRecognizer, IntentType
 from src.agent_session.backend_resolver import is_cli_backend
-from src.card.programming_adapter import build_programming_metadata
+from src.card.delivery.engine import CardDelivery
+from src.card.programming_adapter import ProgrammingCardSession, build_programming_metadata
 from src.card.render.model_cascade import resolve_model_cascade
+from src.card.session import CardSession
+from src.card.session.config import SessionConfig
 from src.card.shared import build_mode_buttons
+from src.card.state.models import TextBlock
+from src.feishu.cot import FeishuCOTAPIClient, FeishuCOTStream
 from src.feishu.dispatcher import MessageDispatcher
 from src.feishu.product_catalog import PUBLIC_ACTIONS
 from src.mode import InteractionMode, ModeManager
@@ -313,3 +323,142 @@ def test_agy_handler_dispatch_identity_card_and_workflow_pool() -> None:
     invalidate_cache()
     assert TOOL_DESCRIPTIONS["agy"] == "Google Antigravity 原生 ACP 编程"
     assert get_available_tools()["agy"] == "Google Antigravity 原生 ACP 编程"
+
+
+def test_agy_sync_session_enables_background_tool_continuation_only_for_agy() -> None:
+    agy_session = SyncACPSession("agy", "/tmp", agent_cmd="agy", agent_args=["acp"])
+    codex_session = SyncACPSession("codex", "/tmp", agent_cmd="codex", agent_args=[])
+    claude_session = SyncACPSession("claude", "/tmp", agent_cmd="claude", agent_args=[])
+    traex_session = SyncACPSession("traex", "/tmp", agent_cmd="traex", agent_args=[])
+
+    assert agy_session.supports_background_tool_continuation is True
+    assert codex_session.supports_background_tool_continuation is False
+    assert claude_session.supports_background_tool_continuation is False
+    assert traex_session.supports_background_tool_continuation is False
+
+
+class _AgyCardClient:
+    def __init__(self) -> None:
+        self.created = 0
+        self.updated_cards: list[dict] = []
+
+    def create_card(
+        self,
+        chat_id,
+        card_json,
+        *,
+        reply_to=None,
+        reply_in_thread=None,
+        idempotency_key=None,
+    ):
+        del chat_id, card_json, reply_to, reply_in_thread, idempotency_key
+        self.created += 1
+        return f"msg-{self.created}", f"card-{self.created}"
+
+    def update_card(self, card_id, card_json, *, sequence=0) -> None:
+        del card_id, sequence
+        self.updated_cards.append(card_json)
+
+    def update_element(self, card_id, element_id, content, *, sequence=0) -> None:
+        del card_id, element_id, content, sequence
+        return None
+
+
+class _AgyCOTRecordingClient:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.requests: list[object] = []
+
+    def request(self, request: object) -> BaseResponse:
+        with self._lock:
+            self.requests.append(request)
+        uri = getattr(request, "uri", "")
+        body = getattr(request, "body", None)
+        data: dict[str, str] = {}
+        if uri == "/open-apis/im/v1/message_cot" and isinstance(body, dict) and "receive_id" in body:
+            data = {"cot_id": "cot_agy_bg", "message_id": "om_agy_cot_bg"}
+        response = BaseResponse()
+        response.code = 0
+        response.raw = RawResponse()
+        response.raw.status_code = 200
+        response.raw.content = json.dumps({"code": 0, "msg": "success", "data": data}).encode("utf-8")
+        return response
+
+
+def test_agy_cot_and_card_complete_cleanly_across_continuation_turn() -> None:
+    cot_client = _AgyCOTRecordingClient()
+    sink = FeishuCOTStream(
+        FeishuCOTAPIClient(cot_client, timeout_seconds=0.2),
+        chat_id="oc_agy_bg",
+        origin_message_id="om_agy_bg_origin",
+        input_text="分析仓库",
+        detail="brief",
+        flush_interval=0.005,
+        request_timeout=0.2,
+    )
+    card_client = _AgyCardClient()
+    metadata = build_programming_metadata("agy", model_name="gemini-pro-orchestrator")
+    card_session = CardSession(
+        chat_id="oc_agy_bg",
+        config=SessionConfig(metadata=metadata, reply_to="om_agy_bg_origin", sync_delivery=True),
+        delivery=CardDelivery(card_client),
+        session_id="agy-bg-continuation-test",
+    )
+    programming = ProgrammingCardSession(card_session, base_metadata=metadata, process_sink=sink)
+
+    try:
+        programming.start()
+        assert programming.activate_process_sink() is True
+
+        # Turn 1 starts a background schedule tool and yields end_turn before TOOL_CALL_DONE arrives.
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_START,
+                tool_call=ToolCallInfo(
+                    id="call_sched_bg",
+                    title="Run schedule",
+                    kind="other",
+                    status="in_progress",
+                ),
+            )
+        )
+        programming.on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="正在等待调度完成"))
+        programming.begin_continuation_turn()
+
+        # Turn 2 receives the deferred TOOL_CALL_DONE and final conclusion text.
+        programming.on_event(
+            ACPEvent(
+                event_type=ACPEventType.TOOL_CALL_DONE,
+                tool_call=ToolCallInfo(
+                    id="call_sched_bg",
+                    title="Run schedule",
+                    kind="other",
+                    status="completed",
+                ),
+            )
+        )
+        programming.on_event(ACPEvent(event_type=ACPEventType.TEXT_CHUNK, text="完整分析结论"))
+        programming._flush_now()
+        assert sink.healthy is True
+        programming.finish()
+
+        assert sink._failed is False
+        assert programming._process_cutover_announced is False
+        assert card_session.state is not None
+        assert card_session.state.terminal == "completed"
+        assert card_session.state.footer.warning_banner is None
+        assert any(
+            isinstance(block, TextBlock) and block.block_id == "_final_answer" and block.content == "完整分析结论"
+            for block in card_session.state.blocks
+        )
+        cot_contents = [
+            json.loads(ev["content"])
+            for req in cot_client.requests
+            if isinstance(getattr(req, "body", None), dict)
+            for ev in (req.body.get("events") or [])
+            if isinstance(ev, dict) and isinstance(ev.get("content"), str)
+        ]
+        assert any(c.get("status") == "done" for c in cot_contents)
+        assert not any(c.get("status") == "error" for c in cot_contents)
+    finally:
+        programming.abort()

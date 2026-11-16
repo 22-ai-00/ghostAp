@@ -769,6 +769,11 @@ class SyncACPSession(PromptGenerationTracker):
     def _uses_agy_acp(self) -> bool:
         return (self._agent_type or "").strip().lower() == "agy"
 
+    @property
+    def supports_background_tool_continuation(self) -> bool:
+        """Whether end_turn with in-progress outer tools represents a reactive background yield."""
+        return self._uses_agy_acp()
+
     async def _apply_official_codex_selection(self, selection: str) -> bool:
         """Apply a persisted Codex model/Effort selection over ACP config options."""
         if not self._acp_session:

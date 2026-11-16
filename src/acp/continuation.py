@@ -23,12 +23,14 @@ from .outcome import (
 logger = logging.getLogger(__name__)
 
 MAX_ORDINARY_CONTINUATIONS = 3
+MAX_BACKGROUND_TOOL_CONTINUATIONS = 2
 MAX_CHILD_RECONCILIATIONS = 1
 MAX_AUTOMATIC_DECISIONS = 8
 MAX_GOAL_RECOVERIES = 1
 MAX_INTERRUPTION_RECOVERIES = 1
 _monotonic = time.monotonic
 _PLAN_CONTINUATION = "plan"
+_BACKGROUND_TOOL_CONTINUATION = "background_tool_continuation"
 _CHILD_RECONCILIATION = "child_reconciliation"
 _GOAL_RECOVERY = "goal_recovery"
 _INTERRUPTION_RECOVERY = "interruption_recovery"
@@ -179,6 +181,25 @@ def _build_goal_recovery_prompt(status: str) -> str:
     )
 
 
+def _supports_background_tool_continuation(session: object) -> bool:
+    return getattr(session, "supports_background_tool_continuation", False) is True
+
+
+def _build_background_tool_continuation_prompt(
+    incomplete_outer_tool_calls: int,
+) -> str:
+    return (
+        "[GhostAP 后台工具续做指令]\n"
+        f"上一轮结束时仍有 {incomplete_outer_tool_calls} 个后台工具调用未进入终态"
+        "（例如 `schedule` 定时器、后台命令或异步子代理）。\n"
+        "由于本会话没有可操作的交互终端，请立即检查并收口当前后台任务与子代理："
+        "若存在处于 `waiting_for_input` 或挂起状态的后台任务/子代理，请立即"
+        "取消或终止它并直接在当前主会话内完成原任务。\n"
+        "严禁再次创建 `schedule` 定时器或额外挂起回合；请在本轮完成全部必要操作"
+        "并直接输出最终结论。"
+    )
+
+
 def _build_interruption_recovery_prompt() -> str:
     return (
         "[GhostAP ACP 中断恢复指令]\n"
@@ -283,6 +304,7 @@ def _continuation_kind(
     assessment: PromptAssessment,
     *,
     entered_finalization: bool,
+    supports_background_tools: bool = False,
 ) -> str | None:
     if entered_finalization or assessment.outcome is not PromptOutcome.INCOMPLETE:
         return None
@@ -292,6 +314,8 @@ def _continuation_kind(
         return None
     if _requests_explicit_user_input(result):
         return None
+    if supports_background_tools and assessment.incomplete_outer_tool_calls > 0:
+        return _BACKGROUND_TOOL_CONTINUATION
     goal = result.goal
     goal_status = (
         str(goal.status or "").strip().casefold()
@@ -410,16 +434,19 @@ def run_prompt_with_continuation(
     )
     automatic_continuations = 0
     plan_continuations = 0
+    background_tool_continuations = 0
     child_reconciliations = 0
     automatic_decisions = 0
     goal_recoveries = 0
     interruption_recoveries = 0
+    supports_background_tools = _supports_background_tool_continuation(session)
 
     while True:
         continuation_kind = _continuation_kind(
             result,
             assessment,
             entered_finalization=ever_entered_finalization,
+            supports_background_tools=supports_background_tools,
         )
 
         if continuation_kind is None:
@@ -457,6 +484,9 @@ def run_prompt_with_continuation(
             continuation_kind == _PLAN_CONTINUATION
             and plan_continuations >= MAX_ORDINARY_CONTINUATIONS
         ) or (
+            continuation_kind == _BACKGROUND_TOOL_CONTINUATION
+            and background_tool_continuations >= MAX_BACKGROUND_TOOL_CONTINUATIONS
+        ) or (
             continuation_kind == _CHILD_RECONCILIATION
             and child_reconciliations >= MAX_CHILD_RECONCILIATIONS
         ) or (
@@ -475,6 +505,10 @@ def run_prompt_with_continuation(
         continuation_prompt = (
             _build_continuation_prompt(assessment.pending_plan_entries)
             if continuation_kind == _PLAN_CONTINUATION
+            else _build_background_tool_continuation_prompt(
+                assessment.incomplete_outer_tool_calls
+            )
+            if continuation_kind == _BACKGROUND_TOOL_CONTINUATION
             else _build_goal_recovery_prompt(goal_status)
             if continuation_kind == _GOAL_RECOVERY
             else _build_interruption_recovery_prompt()
@@ -505,6 +539,7 @@ def run_prompt_with_continuation(
         )
         if continuation_kind in {
             _PLAN_CONTINUATION,
+            _BACKGROUND_TOOL_CONTINUATION,
             _GOAL_RECOVERY,
             _INTERRUPTION_RECOVERY,
         }:
@@ -515,6 +550,8 @@ def run_prompt_with_continuation(
             )
             if continuation_kind == _PLAN_CONTINUATION:
                 plan_continuations += 1
+            elif continuation_kind == _BACKGROUND_TOOL_CONTINUATION:
+                background_tool_continuations += 1
             elif continuation_kind == _GOAL_RECOVERY:
                 goal_recoveries += 1
             else:

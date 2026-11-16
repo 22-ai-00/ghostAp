@@ -1471,3 +1471,85 @@ def test_continuation_prompt_uses_defaults_without_ghostap_policy() -> None:
     assert "GhostAP 不增加二次授权或风险判断" in continuation_prompt
     assert "provider 提供的继续方式" in continuation_prompt
     assert "sandbox" not in continuation_prompt
+
+
+class _BackgroundToolSession(_FakeSession):
+    supports_background_tool_continuation = True
+
+
+def test_background_tool_continuation_resolves_agy_deferred_tool_completion() -> None:
+    runner = _runner()
+    pending_bg_tool = ToolCallInfo(
+        id="call_sched_1",
+        title="Run schedule",
+        kind="other",
+        status="in_progress",
+    )
+    completed_bg_tool = ToolCallInfo(
+        id="call_sched_1",
+        title="Run schedule",
+        kind="other",
+        status="completed",
+    )
+    session = _BackgroundToolSession(
+        PromptResult(
+            stop_reason="end_turn",
+            text="WAIT",
+            tool_calls=[pending_bg_tool],
+        ),
+        PromptResult(
+            stop_reason="end_turn",
+            text="FINAL_OK",
+            tool_calls=[completed_bg_tool],
+        ),
+    )
+    boundaries: list[str] = []
+
+    execution = runner(
+        session,
+        "analyze project",
+        timeout_s=90,
+        finalization_reserve_s=30,
+        on_continuation_start=lambda: boundaries.append("boundary"),
+    )
+
+    assert len(session.calls) == 2
+    assert len(session.continuation_calls) == 1
+    assert "后台工具续做指令" in session.calls[1].text
+    assert "waiting_for_input" in session.calls[1].text
+    assert boundaries == ["boundary"]
+    assert execution.automatic_continuations == 1
+    assert execution.assessment.outcome is PromptOutcome.COMPLETED
+    assert execution.assessment.incomplete_tool_calls == 0
+    assert execution.assessment.incomplete_outer_tool_calls == 0
+    assert execution.result.text == "FINAL_OK"
+    assert [tc.status for tc in execution.result.tool_calls] == ["completed"]
+
+
+def test_background_tool_continuation_is_bounded_and_fails_closed() -> None:
+    runner = _runner()
+    still_running = ToolCallInfo(
+        id="call_sched_stuck",
+        title="Run schedule",
+        kind="other",
+        status="in_progress",
+    )
+    session = _BackgroundToolSession(
+        PromptResult(stop_reason="end_turn", text="WAIT", tool_calls=[still_running]),
+        PromptResult(stop_reason="end_turn", text="STILL", tool_calls=[still_running]),
+        PromptResult(stop_reason="end_turn", text="STILL", tool_calls=[still_running]),
+        AssertionError("background tool continuation bound exceeded"),
+    )
+
+    execution = runner(
+        session,
+        "analyze project",
+        timeout_s=90,
+        finalization_reserve_s=30,
+    )
+
+    assert len(session.calls) == 3
+    assert execution.automatic_continuations == 2
+    assert execution.assessment.outcome is PromptOutcome.INCOMPLETE
+    assert execution.assessment.incomplete_outer_tool_calls == 1
+    assert "未进入终态" in execution.assessment.detail

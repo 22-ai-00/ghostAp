@@ -14,6 +14,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from src.acp.models import PromptResult
 from src.acp.startup_utils import AcpRetryStarter, StartupBackend, select_startup_backend
 from src.agent.intent_recognizer import IntentRecognizer, IntentType
 from src.agent_session.backend_resolver import (
@@ -31,8 +32,7 @@ from src.feishu.product_catalog import (
 from src.mode import PROGRAMMING_MODE_VALUES
 from src.mode.manager import InteractionMode, ModeManager
 from src.project.context import ProjectContext
-from src.project.unified_context import ContextSourceMode
-
+from src.project.unified_context import ContextSourceMode, ProjectContextManager
 
 # ── backend resolution ──────────────────────────────────────────────
 
@@ -243,4 +243,48 @@ def test_model_card_activation_accepts_claude_w_tool() -> None:
     assert effect is not None
     assert getattr(effect, "session", None) is fresh_session
     assert getattr(effect, "changed", None) is True
+
+
+def test_claude_w_completion_persists_canonical_context_source_mode() -> None:
+    handler = ClaudeWModeHandler.__new__(ClaudeWModeHandler)
+    context_manager = ProjectContextManager()
+    handler.ctx = SimpleNamespace(
+        settings=SimpleNamespace(
+            coco_execution_timeout=60,
+            claude_execution_timeout=60,
+            programming_finalization_reserve_s=0,
+            programming_max_execution_windows=1,
+            programming_agent_idle_timeout_s=0,
+        ),
+        context_manager=context_manager,
+        message_mapper=MagicMock(),
+    )
+    project = ProjectContext("p-claude-w", "demo", "/tmp/demo")
+    session = SimpleNamespace(
+        session_id="sess-cw",
+        message_count=1,
+        send_prompt=lambda *_args, **_kwargs: PromptResult(stop_reason="end_turn", text="CW_OK"),
+    )
+
+    with (
+        patch.object(handler, "_get_active_programming_run", return_value=None),
+        patch.object(handler, "reply_text"),
+        patch.object(handler, "add_reaction"),
+    ):
+        handler._execute_programming_response(
+            "om_cw",
+            "oc_cw",
+            "fix bug",
+            session,
+            project,
+            "/tmp/demo",
+            "/tmp/demo",
+        )
+
+    uc = context_manager.get("p-claude-w", chat_id="oc_cw")
+    assert uc is not None
+    assert [entry.source_mode for entry in uc.entries] == [
+        ContextSourceMode.CLAUDE_W,
+        ContextSourceMode.CLAUDE_W,
+    ]
 
