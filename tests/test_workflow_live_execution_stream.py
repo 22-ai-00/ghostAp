@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import threading
@@ -33,6 +34,7 @@ from src.workflow_engine.models import (
 )
 from src.workflow_engine.renderer import (
     WorkflowProgressRenderer,
+    clear_agent_execution_card_cache,
     render_completion_cards,
 )
 from src.workflow_engine.state_manager import WorkflowStateManager
@@ -1379,3 +1381,91 @@ def test_workflow_renderer_disambiguates_default_call_indexes_across_snapshots()
         if "EARLIER_STREAM" in _all_text(card) or "LATER_STREAM" in _all_text(card)
     }
     assert restored_keys_by_stream == keys_by_stream
+
+
+def test_workflow_renderer_caches_finished_agent_cards_and_isolates_mutations() -> None:
+    clear_agent_execution_card_cache()
+    done_agent = AgentProgress(
+        label="done-call",
+        agent_id="A1",
+        tool="codex",
+        model="gpt-5.4",
+        call_index=0,
+        status=AgentStatus.DONE,
+        started_at=100.0,
+        finished_at=112.5,
+        duration_s=12.5,
+        execution_blocks=[
+            ContentBlock(
+                kind="text",
+                block_id="done-text",
+                content="FINISHED_STREAM",
+                status="completed",
+            ),
+            ContentBlock(
+                kind="task_list",
+                block_id="done-tasks",
+                tasks=[{"content": "Verify B063 cache", "status": "completed"}],
+            ),
+        ],
+    )
+    running_agent = AgentProgress(
+        label="running-call",
+        agent_id="A2",
+        tool="claude",
+        call_index=1,
+        status=AgentStatus.RUNNING,
+        started_at=200.0,
+        duration_s=3.0,
+        execution_blocks=[
+            ContentBlock(
+                kind="text",
+                block_id="run-text-1",
+                content="STEP_1",
+                status="active",
+            )
+        ],
+    )
+    project = WorkflowProject(
+        name="cache-regression",
+        status=WorkflowStatus.RUNNING,
+        phases=[PhaseProgress(title="build", agents=[done_agent, running_agent])],
+    )
+    renderer = WorkflowProgressRenderer(project)
+    render_calls = 0
+    real_render_card = render_card
+
+    def counting_render(state, budget=None):
+        nonlocal render_calls
+        render_calls += 1
+        return real_render_card(state, budget)
+
+    with patch("src.workflow_engine.renderer.render_card", side_effect=counting_render):
+        first_cards = renderer.render_progress_cards(project)
+        assert render_calls == 2
+
+        # Mutate returned dict to ensure cache returns fresh clones
+        first_done_card = next(
+            c for c in first_cards if "FINISHED_STREAM" in _all_text(c)
+        )
+        first_done_expected = copy.deepcopy(first_done_card)
+        first_done_card["body"]["elements"].append({"tag": "markdown", "content": "MUTATED"})
+
+        # Advance running agent block -> only running agent re-renders; done agent hits cache
+        running_agent.execution_blocks.append(
+            ContentBlock(
+                kind="text",
+                block_id="run-text-2",
+                content="STEP_2",
+                status="active",
+            )
+        )
+        running_agent.duration_s = 5.0
+        second_cards = renderer.render_progress_cards(project)
+        assert render_calls == 3
+
+    second_done_card = next(
+        c for c in second_cards if "FINISHED_STREAM" in _all_text(c)
+    )
+    assert second_done_card == first_done_expected
+    assert isinstance(second_done_card["_workflow_page_key"], tuple)

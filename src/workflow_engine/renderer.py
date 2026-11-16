@@ -8,6 +8,7 @@ import json
 import re
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -1113,9 +1114,37 @@ def _prepare_execution_blocks_for_wire(blocks: tuple) -> tuple:
     return tuple(normalized)
 
 
+_AGENT_CARD_CACHE_MAX = 512
+_AGENT_CARD_CACHE_LOCK = threading.Lock()
+_AGENT_CARD_CACHE: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+
+
+def clear_agent_execution_card_cache() -> None:
+    """Clear the bounded LRU cache of rendered workflow agent execution cards."""
+    with _AGENT_CARD_CACHE_LOCK:
+        _AGENT_CARD_CACHE.clear()
+
+
+def _block_cache_token(block: Any) -> Any:
+    """Return a hashable cache token for an execution ContentBlock."""
+    try:
+        return (type(block).__name__, hash(block), block)
+    except TypeError:
+        return (
+            type(block).__name__,
+            json.dumps(
+                dataclasses.asdict(block),
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
+
 def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, Any]]:
     """Render one ordinary-format, losslessly paginated stream per direct call."""
     cards: list[dict[str, Any]] = []
+    project_name = _safe_dynamic_text(project.name or "Workflow")
     for agent, page_identity in _identified_direct_agents(project):
         raw_blocks = list(getattr(agent, "execution_blocks", ()) or ())
         blocks = tuple(
@@ -1125,8 +1154,6 @@ def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, An
         )
         if not blocks:
             continue
-        blocks = _terminalize_execution_blocks(blocks, agent)
-        blocks = _prepare_execution_blocks_for_wire(blocks)
 
         display_index = max(1, int(getattr(agent, "call_index", 0) or 0) + 1)
         agent_id = _safe_dynamic_text(
@@ -1135,55 +1162,98 @@ def _render_agent_execution_cards(project: WorkflowProject) -> list[dict[str, An
         )
         label = _safe_dynamic_text(agent.label or "agent", one_line=True)
         terminal = _execution_terminal(agent)
+        header_template = _execution_header_template(agent)
+        mode_name = _safe_dynamic_text(agent.tool or "Agent", one_line=True)
+        tool_name = (
+            _safe_dynamic_text(agent.tool, one_line=True)
+            if agent.tool
+            else None
+        )
+        model_name = (
+            _safe_dynamic_text(agent.model, one_line=True)
+            if agent.model
+            else None
+        )
         elapsed = max(0.0, float(agent.duration_s or 0.0))
         if elapsed <= 0 and agent.started_at:
             elapsed = max(
                 0.0,
                 float((agent.finished_at or time.time()) - agent.started_at),
             )
+        elapsed_key = round(elapsed, 3) if terminal != "running" else int(elapsed)
+        cache_key = (
+            display_index,
+            agent_id,
+            label,
+            terminal,
+            header_template,
+            agent.status == AgentStatus.FAILED,
+            project_name,
+            mode_name,
+            tool_name,
+            model_name,
+            agent.started_at,
+            elapsed_key,
+            _WORKFLOW_FRAGMENT_MAX_BYTES,
+            _WORKFLOW_FRAGMENT_MAX_NODES,
+            tuple(_block_cache_token(block) for block in blocks),
+        )
 
-        state = CardState(
-            blocks=blocks,
-            terminal=terminal,
-            header=HeaderState(
-                title=f"#{display_index} · {agent_id} · {label}",
-                template=_execution_header_template(agent),
-            ),
-            metadata=CardMetadata(
-                project_name=_safe_dynamic_text(project.name or "Workflow"),
-                mode_name=_safe_dynamic_text(agent.tool or "Agent", one_line=True),
-                tool_name=(
-                    _safe_dynamic_text(agent.tool, one_line=True)
-                    if agent.tool
-                    else None
+        with _AGENT_CARD_CACHE_LOCK:
+            cached_json = _AGENT_CARD_CACHE.get(cache_key)
+            if cached_json is not None:
+                _AGENT_CARD_CACHE.move_to_end(cache_key)
+
+        if cached_json is not None:
+            page_dicts: list[dict[str, Any]] = json.loads(cached_json)
+        else:
+            wire_blocks = _terminalize_execution_blocks(blocks, agent)
+            wire_blocks = _prepare_execution_blocks_for_wire(wire_blocks)
+            state = CardState(
+                blocks=wire_blocks,
+                terminal=terminal,
+                header=HeaderState(
+                    title=f"#{display_index} · {agent_id} · {label}",
+                    template=header_template,
                 ),
-                model_name=(
-                    _safe_dynamic_text(agent.model, one_line=True)
-                    if agent.model
-                    else None
+                metadata=CardMetadata(
+                    project_name=project_name,
+                    mode_name=mode_name,
+                    tool_name=tool_name,
+                    model_name=model_name,
+                    unit_id=str(display_index),
+                    unit_kind="workflow_agent",
+                    unit_label=f"{agent_id} · {label}",
+                    card_sequence=display_index,
+                    session_started_at=agent.started_at,
+                    programming_text_sections=True,
+                    full_execution_blocks=True,
                 ),
-                unit_id=str(display_index),
-                unit_kind="workflow_agent",
-                unit_label=f"{agent_id} · {label}",
-                card_sequence=display_index,
-                session_started_at=agent.started_at,
-                programming_text_sections=True,
-                full_execution_blocks=True,
-            ),
-            runtime_stats=RuntimeStats(elapsed_seconds=elapsed),
-            version=len(blocks),
-            structural_version=len(blocks),
-        )
-        rendered_pages = render_card(
-            state,
-            RenderBudget(
-                byte_budget=_WORKFLOW_FRAGMENT_MAX_BYTES,
-                node_budget=_WORKFLOW_FRAGMENT_MAX_NODES,
-                engine_cmd="/wf",
-            ),
-        )
-        for local_page_index, rendered in enumerate(rendered_pages):
-            card = rendered.to_feishu_json()
+                runtime_stats=RuntimeStats(elapsed_seconds=elapsed),
+                version=len(wire_blocks),
+                structural_version=len(wire_blocks),
+            )
+            rendered_pages = render_card(
+                state,
+                RenderBudget(
+                    byte_budget=_WORKFLOW_FRAGMENT_MAX_BYTES,
+                    node_budget=_WORKFLOW_FRAGMENT_MAX_NODES,
+                    engine_cmd="/wf",
+                ),
+            )
+            page_dicts = [rendered.to_feishu_json() for rendered in rendered_pages]
+            serialized = json.dumps(
+                page_dicts,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            with _AGENT_CARD_CACHE_LOCK:
+                _AGENT_CARD_CACHE[cache_key] = serialized
+                _AGENT_CARD_CACHE.move_to_end(cache_key)
+                while len(_AGENT_CARD_CACHE) > _AGENT_CARD_CACHE_MAX:
+                    _AGENT_CARD_CACHE.popitem(last=False)
+
+        for local_page_index, card in enumerate(page_dicts):
             _set_workflow_page_key(
                 card,
                 kind="agent",
