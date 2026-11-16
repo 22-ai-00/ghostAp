@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -40,6 +42,66 @@ PROGRAMMING_MODES: frozenset[InteractionMode] = frozenset(
 PROGRAMMING_MODE_VALUES: frozenset[str] = frozenset(
     mode.value for mode in PROGRAMMING_MODES
 )
+
+
+_MODE_DISPLAY_NAMES: dict[InteractionMode, str] = {
+    InteractionMode.SMART: "🧠 智能模式",
+    InteractionMode.COCO: "🤖 Coco 编程模式",
+    InteractionMode.CLAUDE: "🔮 Claude 编程模式",
+    InteractionMode.CLAUDE_W: "🪄 Claude-W 编程模式",
+    InteractionMode.AIDEN: "🎯 Aiden 编程模式",
+    InteractionMode.CODEX: "⚡ Codex 编程模式",
+    InteractionMode.CODEX_W: "🌩️ Codex-W 编程模式",
+    InteractionMode.GEMINI: "✨ Gemini 编程模式",
+    InteractionMode.TRAEX: "🚀 Traex 编程模式",
+    InteractionMode.GROK: "🌌 Grok 编程模式",
+    InteractionMode.DSH: "🧭 DSH 编程模式",
+    InteractionMode.AGY: "🪐 AGY 编程模式",
+    InteractionMode.SHELL: "💻 Shell 模式",
+}
+
+
+def _make_enter_mode_method(target_mode: InteractionMode):
+    """Build a typed ``enter_<mode>_mode`` bound accessor for ModeManager."""
+
+    def _enter(
+        self: ModeManager,
+        chat_id: str,
+        auto: bool = False,
+        project_id: Optional[str] = None,
+    ) -> InteractionMode:
+        return self.enter_programming_mode(chat_id, target_mode, auto=auto, project_id=project_id)
+
+    _enter.__name__ = f"enter_{target_mode.value}_mode"
+    _enter.__doc__ = f"进入 {target_mode.value} 编程模式。"
+    return _enter
+
+
+def _make_is_mode_method(target_mode: InteractionMode):
+    """Build a typed ``is_<mode>_mode`` predicate accessor for ModeManager."""
+
+    def _is(
+        self: ModeManager,
+        chat_id: str,
+        project_id: Optional[str] = None,
+    ) -> bool:
+        return self.get_mode(chat_id, project_id) == target_mode
+
+    _is.__name__ = f"is_{target_mode.value}_mode"
+    _is.__doc__ = f"判断当前是否为 {target_mode.value} 模式。"
+    return _is
+
+
+def _register_programming_mode_accessors(cls: type[ModeManager]) -> type[ModeManager]:
+    """Attach symmetric ``enter_<mode>_mode`` / ``is_<mode>_mode`` helpers from PROGRAMMING_MODES."""
+    for mode in PROGRAMMING_MODES:
+        enter_name = f"enter_{mode.value}_mode"
+        is_name = f"is_{mode.value}_mode"
+        if not hasattr(cls, enter_name):
+            setattr(cls, enter_name, _make_enter_mode_method(mode))
+        if not hasattr(cls, is_name):
+            setattr(cls, is_name, _make_is_mode_method(mode))
+    return cls
 
 
 @dataclass
@@ -189,85 +251,9 @@ class ModeManager:
     # Alias for callers preferring the shorter name
     enter_mode = enter_programming_mode
 
-    def enter_coco_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Coco 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.COCO, auto=auto, project_id=project_id)
-
-    def enter_claude_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Claude 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.CLAUDE, auto=auto, project_id=project_id)
-
-    def enter_claude_w_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Claude-W 桥接模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.CLAUDE_W, auto=auto, project_id=project_id)
-
-    def enter_codex_w_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Codex-W 桥接模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.CODEX_W, auto=auto, project_id=project_id)
-
-    def enter_gemini_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Gemini 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.GEMINI, auto=auto, project_id=project_id)
-
-    def enter_grok_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 Grok 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.GROK, auto=auto, project_id=project_id)
-
-    def enter_dsh_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 DSH 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.DSH, auto=auto, project_id=project_id)
-
-    def enter_agy_mode(self, chat_id: str, auto: bool = False, project_id: Optional[str] = None) -> InteractionMode:
-        """进入 AGY 编程模式。"""
-        return self.enter_programming_mode(chat_id, InteractionMode.AGY, auto=auto, project_id=project_id)
-
     def exit_to_smart(self, chat_id: str, project_id: Optional[str] = None) -> InteractionMode:
         """退出到 SMART 模式。"""
         return self.set_mode(chat_id, InteractionMode.SMART, auto_entered=False, project_id=project_id)
-
-    def is_coco_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Coco 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.COCO
-
-    def is_claude_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Claude 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.CLAUDE
-
-    def is_claude_w_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Claude-W 桥接模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.CLAUDE_W
-
-    def is_aiden_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Aiden 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.AIDEN
-
-    def is_codex_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Codex 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.CODEX
-
-    def is_codex_w_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Codex-W 桥接模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.CODEX_W
-
-    def is_gemini_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Gemini 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.GEMINI
-
-    def is_traex_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Traex 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.TRAEX
-
-    def is_grok_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 Grok 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.GROK
-
-    def is_dsh_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 DSH 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.DSH
-
-    def is_agy_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
-        """判断当前是否为 AGY 模式。"""
-        return self.get_mode(chat_id, project_id) == InteractionMode.AGY
 
     def is_programming_mode(self, chat_id: str, project_id: Optional[str] = None) -> bool:
         """判断是否处于编程模式。"""
@@ -277,18 +263,7 @@ class ModeManager:
     def get_mode_display_name(self, chat_id: str, project_id: Optional[str] = None) -> str:
         """返回当前模式的 UI 展示名。"""
         mode = self.get_mode(chat_id, project_id)
-        return {
-            InteractionMode.SMART: "🧠 智能模式",
-            InteractionMode.COCO: "🤖 Coco 编程模式",
-            InteractionMode.CLAUDE: "🔮 Claude 编程模式",
-            InteractionMode.CLAUDE_W: "🪄 Claude-W 编程模式",
-            InteractionMode.AIDEN: "🎯 Aiden 编程模式",
-            InteractionMode.CODEX: "⚡ Codex 编程模式",
-            InteractionMode.CODEX_W: "🌩️ Codex-W 编程模式",
-            InteractionMode.GEMINI: "✨ Gemini 编程模式",
-            InteractionMode.TRAEX: "🚀 Traex 编程模式",
-            InteractionMode.GROK: "🌌 Grok 编程模式",
-            InteractionMode.DSH: "🧭 DSH 编程模式",
-            InteractionMode.AGY: "🪐 AGY 编程模式",
-            InteractionMode.SHELL: "💻 Shell 模式",
-        }.get(mode, "未知模式")
+        return _MODE_DISPLAY_NAMES.get(mode, "未知模式")
+
+
+_register_programming_mode_accessors(ModeManager)

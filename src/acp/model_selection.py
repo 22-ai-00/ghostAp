@@ -40,21 +40,48 @@ CODEX_DEFAULT_MODEL_TOKEN = "default"
 CODEX_DEFAULT_EFFORT_TOKEN = "default"
 
 
-def split_codex_model_selection(
+def split_slash_model_effort(
     value: Optional[str],
+    *,
+    allowed_efforts: frozenset[str] | set[str],
 ) -> tuple[Optional[str], Optional[str]]:
-    """Split a persisted ``model/effort`` Codex selection.
+    """Split a persisted ``model/effort`` selection against *allowed_efforts*.
 
-    Only a recognized final effort token is removed. Provider-qualified model
-    identifiers containing ``/`` remain intact.
+    Only a recognized final effort token is removed when a non-empty base model
+    precedes ``/``.  Provider-qualified model identifiers containing ``/``
+    remain intact when the trailing token is not in *allowed_efforts*.
     """
     selection = str(value or "").strip()
     if not selection:
         return None, None
     model_id, separator, suffix = selection.rpartition("/")
-    if separator and model_id and suffix.lower() in CODEX_REASONING_EFFORTS:
-        return model_id, suffix.lower()
+    normalized_suffix = suffix.strip().lower()
+    if separator and model_id.strip() and normalized_suffix in allowed_efforts:
+        return model_id.strip(), normalized_suffix
     return selection, None
+
+
+def compose_slash_model_effort(
+    model_id: str,
+    effort: Optional[str],
+    *,
+    allowed_efforts: frozenset[str] | set[str],
+) -> str:
+    """Compose ``model/effort`` when *effort* is in *allowed_efforts*, else ``model``."""
+    model = str(model_id or "").strip()
+    if not model:
+        return ""
+    level = str(effort or "").strip().lower()
+    if level in allowed_efforts:
+        return f"{model}/{level}"
+    return model
+
+
+def split_codex_model_selection(
+    value: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Split a persisted ``model/effort`` Codex selection."""
+    return split_slash_model_effort(value, allowed_efforts=CODEX_REASONING_EFFORTS)
 
 
 def compose_codex_model_selection(
@@ -62,10 +89,8 @@ def compose_codex_model_selection(
     effort: Optional[str],
 ) -> str:
     """Compose the stable UI/persistence value for a Codex selection."""
-    model = str(model_id or "").strip()
-    reasoning_effort = str(effort or "").strip().lower()
-    if not model:
-        return ""
-    if reasoning_effort in CODEX_REASONING_EFFORTS:
-        return f"{model}/{reasoning_effort}"
-    return model
+    return compose_slash_model_effort(
+        model_id,
+        effort,
+        allowed_efforts=CODEX_REASONING_EFFORTS,
+    )

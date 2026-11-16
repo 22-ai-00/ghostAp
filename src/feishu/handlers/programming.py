@@ -2233,108 +2233,92 @@ class ProgrammingModeHandler(BaseHandler):
         self.exit_mode(message_id, chat_id, project=project)
 
 # ======================================================================
-# Concrete subclasses
+# Concrete subclasses (declarative spec-driven bindings)
 # ======================================================================
 
 
+@dataclass(frozen=True, slots=True)
+class _ProgrammingBackendSpec:
+    mode_name: str
+    mode_emoji: str
+    interaction_mode: InteractionMode
+    context_source: ContextSourceMode
+    is_coco: bool = False
+    uses_claude_cli: bool = False
+
+
+def _bind_programming_backend(spec: _ProgrammingBackendSpec):
+    """Attach canonical mode metadata and transport traits to a handler class."""
+
+    def _decorator(cls: type[ProgrammingModeHandler]) -> type[ProgrammingModeHandler]:
+        cls.mode_name = spec.mode_name
+        cls.mode_emoji = spec.mode_emoji
+        cls.interaction_mode = spec.interaction_mode
+        cls.mode_key = spec.interaction_mode.value
+        cls.context_source = spec.context_source
+        cls.thinking_text = UI_TEXT["mode_thinking_msg"].format(
+            emoji=spec.mode_emoji,
+            name=spec.mode_name,
+        )
+        if spec.is_coco:
+            cls.is_coco = True
+        if spec.uses_claude_cli:
+            cls._uses_claude_cli = lambda self: True
+        return cls
+
+    return _decorator
+
+
+@_bind_programming_backend(_ProgrammingBackendSpec("Coco", "🤖", InteractionMode.COCO, ContextSourceMode.COCO, is_coco=True))
 class CocoModeHandler(ProgrammingModeHandler):
-    mode_name = "Coco"
-    mode_emoji = "🤖"
-    is_coco = True
-    interaction_mode = InteractionMode.COCO
-    mode_key = "coco"
-    context_source = ContextSourceMode.COCO
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🤔", name="Coco")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("Claude", "🔮", InteractionMode.CLAUDE, ContextSourceMode.CLAUDE, uses_claude_cli=True))
 class ClaudeModeHandler(ProgrammingModeHandler):
-    mode_name = "Claude"
-    mode_emoji = "🔮"
-    interaction_mode = InteractionMode.CLAUDE
-    mode_key = "claude"
-    context_source = ContextSourceMode.CLAUDE
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🔮", name="Claude")
-
-    def _uses_claude_cli(self) -> bool:
-        return True
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("Claude-W", "🪄", InteractionMode.CLAUDE_W, ContextSourceMode.CLAUDE_W))
 class ClaudeWModeHandler(ClaudeModeHandler):
-    mode_name = "Claude-W"
-    mode_emoji = "🪄"
-    interaction_mode = InteractionMode.CLAUDE_W
-    mode_key = "claude_w"
-    context_source = ContextSourceMode.CLAUDE_W
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🪄", name="Claude-W")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("Aiden", "🎯", InteractionMode.AIDEN, ContextSourceMode.AIDEN))
 class AidenModeHandler(ProgrammingModeHandler):
-    mode_name = "Aiden"
-    mode_emoji = "🎯"
-    interaction_mode = InteractionMode.AIDEN
-    mode_key = "aiden"
-    context_source = ContextSourceMode.AIDEN
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🎯", name="Aiden")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("Codex", "⚡", InteractionMode.CODEX, ContextSourceMode.CODEX))
 class CodexModeHandler(ProgrammingModeHandler):
-    mode_name = "Codex"
-    mode_emoji = "⚡"
-    interaction_mode = InteractionMode.CODEX
-    mode_key = "codex"
-    context_source = ContextSourceMode.CODEX
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="⚡", name="Codex")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("Codex-W", "🌩️", InteractionMode.CODEX_W, ContextSourceMode.CODEX_W))
 class CodexWModeHandler(CodexModeHandler):
-    mode_name = "Codex-W"
-    mode_emoji = "🌩️"
-    interaction_mode = InteractionMode.CODEX_W
-    mode_key = "codex_w"
-    context_source = ContextSourceMode.CODEX_W
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🌩️", name="Codex-W")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("Gemini", "✨", InteractionMode.GEMINI, ContextSourceMode.GEMINI))
 class GeminiModeHandler(ProgrammingModeHandler):
-    mode_name = "Gemini"
-    mode_emoji = "✨"
-    interaction_mode = InteractionMode.GEMINI
-    mode_key = "gemini"
-    context_source = ContextSourceMode.GEMINI
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="✨", name="Gemini")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("Traex", "🚀", InteractionMode.TRAEX, ContextSourceMode.TRAEX))
 class TraexModeHandler(ProgrammingModeHandler):
-    mode_name = "Traex"
-    mode_emoji = "🚀"
-    interaction_mode = InteractionMode.TRAEX
-    mode_key = "traex"
-    context_source = ContextSourceMode.TRAEX
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🚀", name="Traex")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("Grok", "🌌", InteractionMode.GROK, ContextSourceMode.GROK))
 class GrokModeHandler(ProgrammingModeHandler):
-    mode_name = "Grok"
-    mode_emoji = "🌌"
-    interaction_mode = InteractionMode.GROK
-    mode_key = "grok"
-    context_source = ContextSourceMode.GROK
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🌌", name="Grok")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("DSH", "🧭", InteractionMode.DSH, ContextSourceMode.DSH))
 class DSHModeHandler(ProgrammingModeHandler):
-    mode_name = "DSH"
-    mode_emoji = "🧭"
-    interaction_mode = InteractionMode.DSH
-    mode_key = "dsh"
-    context_source = ContextSourceMode.DSH
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🧭", name="DSH")
+    pass
 
 
+@_bind_programming_backend(_ProgrammingBackendSpec("AGY", "🪐", InteractionMode.AGY, ContextSourceMode.AGY))
 class AGYModeHandler(ProgrammingModeHandler):
-    mode_name = "AGY"
-    mode_emoji = "🪐"
-    interaction_mode = InteractionMode.AGY
-    mode_key = "agy"
-    context_source = ContextSourceMode.AGY
-    thinking_text = UI_TEXT["mode_thinking_msg"].format(emoji="🪐", name="AGY")
+    pass

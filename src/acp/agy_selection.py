@@ -2,20 +2,15 @@
 
 from __future__ import annotations
 
+from .model_selection import (
+    CODEX_REASONING_EFFORTS,
+    compose_slash_model_effort,
+    split_slash_model_effort,
+)
+
 AGY_MODEL_CONFIG_ID = "model"
 AGY_THOUGHT_LEVEL_CONFIG_ID = "thought_level"
-AGY_REASONING_EFFORTS = frozenset(
-    {
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max",
-        "ultra",
-    }
-)
+AGY_REASONING_EFFORTS = CODEX_REASONING_EFFORTS
 
 
 def compose_agy_model_selection(
@@ -27,11 +22,13 @@ def compose_agy_model_selection(
     if not model:
         raise ValueError("invalid AGY model selection: empty model")
     normalized_effort = str(effort or "").strip().lower()
-    if not normalized_effort:
-        return model
-    if normalized_effort not in AGY_REASONING_EFFORTS:
+    if normalized_effort and normalized_effort not in AGY_REASONING_EFFORTS:
         raise ValueError(f"invalid AGY thought level: {effort}")
-    return f"{model}/{normalized_effort}"
+    return compose_slash_model_effort(
+        model,
+        normalized_effort or None,
+        allowed_efforts=AGY_REASONING_EFFORTS,
+    )
 
 
 def split_agy_model_selection(
@@ -41,16 +38,10 @@ def split_agy_model_selection(
     raw = str(selection or "").strip()
     if not raw:
         raise ValueError(f"invalid AGY model selection: {selection}")
-    if "/" in raw:
-        model_id, _, suffix = raw.rpartition("/")
-        model = model_id.strip()
-        effort = suffix.strip().lower()
-        if (
-            not model
-            or not effort
-            or effort not in AGY_REASONING_EFFORTS
-            or "/" in model
-        ):
-            raise ValueError(f"invalid AGY model selection: {selection}")
-        return model, effort
-    return raw, None
+    model, effort = split_slash_model_effort(
+        raw,
+        allowed_efforts=AGY_REASONING_EFFORTS,
+    )
+    if not model or "/" in model:
+        raise ValueError(f"invalid AGY model selection: {selection}")
+    return model, effort

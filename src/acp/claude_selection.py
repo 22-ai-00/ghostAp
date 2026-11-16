@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .model_selection import compose_slash_model_effort, split_slash_model_effort
+
 #: Effort levels accepted by ``claude --effort`` (verified via --help).
 #: Ordered for stable card rendering.
 CLAUDE_REASONING_EFFORTS: tuple[str, ...] = (
@@ -48,13 +50,10 @@ def split_claude_model_selection(
 
     Returns ``(base, effort)``; either component may be ``None`` when absent.
     """
-    selection = str(value or "").strip()
-    if not selection:
-        return None, None
-    base, separator, suffix = selection.rpartition("/")
-    if separator and suffix.lower() in _CLAUDE_REASONING_EFFORT_SET:
-        return base, suffix.lower()
-    return selection, None
+    return split_slash_model_effort(
+        value,
+        allowed_efforts=_CLAUDE_REASONING_EFFORT_SET,
+    )
 
 
 def compose_claude_model_selection(
@@ -62,10 +61,8 @@ def compose_claude_model_selection(
     effort: Optional[str],
 ) -> str:
     """Compose the stable UI/persistence value for a Claude selection."""
-    model = str(base or "").strip()
-    level = str(effort or "").strip().lower()
-    if not model:
-        return ""
-    if level in _CLAUDE_REASONING_EFFORT_SET:
-        return f"{model}/{level}"
-    return model
+    return compose_slash_model_effort(
+        base,
+        effort,
+        allowed_efforts=_CLAUDE_REASONING_EFFORT_SET,
+    )
