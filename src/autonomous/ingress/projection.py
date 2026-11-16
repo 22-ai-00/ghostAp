@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import re
@@ -114,7 +113,17 @@ class IngressProjectionState:
     cursor_hash: str = ""
 
     def clone(self) -> IngressProjectionState:
-        return copy.deepcopy(self)
+        return IngressProjectionState(
+            by_dedup_key=dict(self.by_dedup_key),
+            by_acceptance_id=dict(self.by_acceptance_id),
+            message_acceptance_winners=dict(self.message_acceptance_winners),
+            message_transport_witnesses=dict(self.message_transport_witnesses),
+            message_acceptance_denials=dict(self.message_acceptance_denials),
+            message_denied_acceptances=dict(self.message_denied_acceptances),
+            closed_employees=set(self.closed_employees),
+            cursor_sequence=self.cursor_sequence,
+            cursor_hash=self.cursor_hash,
+        )
 
 
 _INGRESS_EVENT_TYPES = frozenset(

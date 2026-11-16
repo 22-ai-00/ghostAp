@@ -32,6 +32,7 @@ from .service import (
     OutboxBlobError,
     OutboxClosedError,
     OutboxConflictError,
+    OutboxNotFoundError,
     OutboxWriteDisabledError,
 )
 
@@ -57,6 +58,7 @@ __all__ = [
     "OutboxBlobError",
     "OutboxClosedError",
     "OutboxConflictError",
+    "OutboxNotFoundError",
     "OutboxWriteDisabledError",
     "advance_snapshot",
     "employee_outbox_effect_id",

@@ -17,6 +17,7 @@ from typing import Iterator, Protocol
 
 from src.utils.path import canonicalize_user_home_path
 
+from ..journal.anchor import AnchorCorruptionError
 from ..journal.blob_store import (
     AesGcmEncryptionProvider,
     BlobError,
@@ -25,8 +26,14 @@ from ..journal.blob_store import (
     BlobStore,
     KeyResolutionError,
 )
-from ..journal.frame import GENESIS_HASH, JournalEvent, TransactionFrame
+from ..journal.frame import (
+    GENESIS_HASH,
+    JournalEvent,
+    JournalIntegrityError,
+    TransactionFrame,
+)
 from ..journal.writer import (
+    AnchorMismatchError,
     CommitResult,
     CommitState,
     JournalDeadlineExceededError,
@@ -149,6 +156,7 @@ class EmployeeIngressService:
         self._retained_shared_blob_ids: set[str] = set()
         self._admission_closed = False
         self._closed = False
+        self._projection_verified = False
         self.rebuild_projection()
 
     @classmethod
@@ -898,18 +906,135 @@ class EmployeeIngressService:
         *,
         deadline: float | None = None,
     ) -> None:
-        anchor = self._writer.anchor.read()
+        hard_deadline = self._validated_deadline(deadline)
         self._ensure_before_deadline(
-            deadline,
+            hard_deadline,
             operation="ingress projection synchronization",
         )
-        sequence = anchor.sequence
+        if not getattr(self, "_projection_verified", False) or not hasattr(
+            self._writer,
+            "committed_tail",
+        ):
+            self.rebuild_projection(deadline=hard_deadline)
+            return
+        try:
+            anchor, frames = self._writer.committed_tail(
+                self._state.cursor_sequence + 1,
+                deadline=hard_deadline,
+            )
+        except JournalDeadlineExceededError as exc:
+            raise IngressWriteDisabledError(
+                "ingress projection deadline expired"
+            ) from exc
+        except AnchorMismatchError as exc:
+            if "anchor is ahead of the verified Journal cache" in str(exc):
+                self.rebuild_projection(deadline=hard_deadline)
+                return
+            raise IngressWriteDisabledError(
+                "ingress projection cannot verify the Journal anchor"
+            ) from exc
+        except JournalIntegrityError as exc:
+            if "verified tail cache does not contain the requested history" in str(
+                exc
+            ):
+                self.rebuild_projection(deadline=hard_deadline)
+                return
+            raise IngressWriteDisabledError(
+                "ingress projection cannot verify the Journal anchor"
+            ) from exc
+        except (AnchorCorruptionError, OSError) as exc:
+            raise IngressWriteDisabledError(
+                "ingress projection cannot verify the Journal anchor"
+            ) from exc
+
         frame_hash = "" if anchor.sequence == 0 else anchor.frame_hash
-        if (self._state.cursor_sequence, self._state.cursor_hash) != (
-            sequence,
+        if (self._state.cursor_sequence, self._state.cursor_hash) == (
+            anchor.sequence,
             frame_hash,
         ):
-            self.rebuild_projection(deadline=deadline)
+            return
+        if self._state.cursor_sequence > anchor.sequence or not frames:
+            raise IngressWriteDisabledError(
+                "ingress projection cannot verify the Journal anchor"
+            )
+
+        known_acceptance_ids = frozenset(self._state.by_acceptance_id)
+        inbox_retry_identities: set[tuple[str, str]] = set()
+        next_state = self._state.clone()
+        expected_sequence = self._state.cursor_sequence + 1
+        expected_previous_hash = self._state.cursor_hash or GENESIS_HASH
+        for frame in frames:
+            self._ensure_before_deadline(
+                hard_deadline,
+                operation="ingress projection synchronization",
+            )
+            if (
+                frame.sequence != expected_sequence
+                or frame.previous_hash != expected_previous_hash
+            ):
+                raise IngressWriteDisabledError(
+                    "ingress projection cannot verify the Journal anchor"
+                )
+            for event in frame.events:
+                if is_ingress_event(event.event_type):
+                    reduce_ingress_event(
+                        next_state,
+                        event,
+                        frame_sequence=frame.sequence,
+                        frame_hash=frame.frame_hash,
+                    )
+                elif event.event_type == "employee.ingress.router_inbox_retry":
+                    acceptance_id = (
+                        event.payload.get("acceptance_id")
+                        if isinstance(event.payload, dict)
+                        else None
+                    )
+                    if isinstance(acceptance_id, str):
+                        inbox_retry_identities.add(
+                            (event.aggregate_id, acceptance_id)
+                        )
+            next_state.cursor_sequence = frame.sequence
+            next_state.cursor_hash = frame.frame_hash
+            expected_sequence += 1
+            expected_previous_hash = frame.frame_hash
+        if (
+            next_state.cursor_sequence != anchor.sequence
+            or next_state.cursor_hash != anchor.frame_hash
+        ):
+            raise IngressWriteDisabledError(
+                "ingress projection cannot verify the Journal anchor"
+            )
+        for record in next_state.by_acceptance_id.values():
+            self._ensure_before_deadline(
+                hard_deadline,
+                operation="ingress projection synchronization",
+            )
+            if record.terminal or record.payload_tombstoned:
+                continue
+            if (
+                record.aggregate_id,
+                record.acceptance.acceptance_id,
+            ) in inbox_retry_identities:
+                continue
+            if record.acceptance.acceptance_id in known_acceptance_ids:
+                continue
+            try:
+                self._read_record_payload(record)
+            except IngressBlobRetryableError:
+                continue
+            except (
+                BlobError,
+                IngressBlobError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                next_state.closed_employees.add(record.employee_key)
+        self._ensure_before_deadline(
+            hard_deadline,
+            operation="ingress projection synchronization",
+        )
+        self._replace_state_unlocked(next_state)
 
     @staticmethod
     def _validated_deadline(deadline: float | None) -> float | None:

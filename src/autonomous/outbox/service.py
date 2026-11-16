@@ -12,9 +12,11 @@ from typing import Iterator, Protocol
 
 from src.utils.path import canonicalize_user_home_path
 
+from ..journal.anchor import AnchorCorruptionError
 from ..journal.blob_store import AesGcmEncryptionProvider, BlobError, BlobRef, BlobStore
-from ..journal.frame import GENESIS_HASH, JournalEvent
+from ..journal.frame import GENESIS_HASH, JournalEvent, JournalIntegrityError
 from ..journal.writer import (
+    AnchorMismatchError,
     CommitResult,
     CommitState,
     JournalDeadlineExceededError,
@@ -64,6 +66,10 @@ class OutboxDeadlineExceededError(TimeoutError, OutboxServiceError):
     """An Outbox operation could not begin before its absolute deadline."""
 
 
+class OutboxNotFoundError(OutboxServiceError, KeyError):
+    """Requested Outbox record, snapshot, or effect does not exist."""
+
+
 class EmployeeKeyring(Protocol):
     active_key_id: str
 
@@ -96,6 +102,7 @@ class EmployeeOutboxService:
         self._mutex = threading.RLock()  # leaf lock: never held while acquiring a LockLevel lock
         self._admission_closed = False
         self._closed = False
+        self._projection_verified = False
         self.rebuild_projection()
 
     @classmethod
@@ -231,7 +238,7 @@ class EmployeeOutboxService:
             self._synchronize_projection_unlocked(deadline=deadline)
             record = self._state.by_outbox_id.get(outbox_id)
             if record is None:
-                raise KeyError(outbox_id)
+                raise OutboxNotFoundError(outbox_id)
             selected = record.latest_version if version is None else version
             metadata = record.snapshots.get(selected)
             if metadata is None or selected in record.tombstoned_versions:
@@ -251,7 +258,7 @@ class EmployeeOutboxService:
             self._synchronize_projection_unlocked(deadline=deadline)
             record = self._state.by_outbox_id.get(outbox_id)
             if record is None:
-                raise KeyError(outbox_id)
+                raise OutboxNotFoundError(outbox_id)
             return record
 
     def list_pending_delivery_records(
@@ -362,9 +369,9 @@ class EmployeeOutboxService:
         self._synchronize_projection_unlocked(deadline=deadline)
         record = self._state.by_outbox_id.get(outbox_id)
         if record is None:
-            raise KeyError(outbox_id)
+            raise OutboxNotFoundError(outbox_id)
         if snapshot_version not in record.snapshots:
-            raise KeyError(snapshot_version)
+            raise OutboxNotFoundError(snapshot_version)
         if snapshot_version in record.tombstoned_versions:
             raise OutboxBlobError("Outbox delivery snapshot is tombstoned")
         active = sorted(
@@ -576,6 +583,7 @@ class EmployeeOutboxService:
             self._replace_state_unlocked(fresh)
             if deadline is None:
                 self._quarantine_unreferenced_blobs_unlocked()
+            self._projection_verified = True
             return self._state
 
     def quarantine_unreferenced_blobs(self) -> int:
@@ -659,7 +667,7 @@ class EmployeeOutboxService:
             effect = record.effects.get(effect_id)
             if effect is not None:
                 return record, effect
-        raise KeyError(effect_id)
+        raise OutboxNotFoundError(effect_id)
 
     def _verify_snapshot_blob(
         self,
@@ -682,13 +690,103 @@ class EmployeeOutboxService:
         deadline: float | None = None,
     ) -> None:
         self._require_deadline(deadline, "projection synchronization")
-        anchor = self._writer.anchor.read()
+        if not getattr(self, "_projection_verified", False) or not hasattr(
+            self._writer,
+            "committed_tail",
+        ):
+            self.rebuild_projection(deadline=deadline)
+            return
+        try:
+            anchor, frames = self._writer.committed_tail(
+                self._state.cursor_sequence + 1,
+                deadline=deadline,
+            )
+        except JournalDeadlineExceededError as exc:
+            raise OutboxDeadlineExceededError(
+                "employee Outbox projection deadline exceeded"
+            ) from exc
+        except AnchorMismatchError as exc:
+            if "anchor is ahead of the verified Journal cache" in str(exc):
+                self.rebuild_projection(deadline=deadline)
+                return
+            raise OutboxWriteDisabledError(
+                "Outbox projection cannot verify the Journal anchor"
+            ) from exc
+        except JournalIntegrityError as exc:
+            if "verified tail cache does not contain the requested history" in str(
+                exc
+            ):
+                self.rebuild_projection(deadline=deadline)
+                return
+            raise OutboxWriteDisabledError(
+                "Outbox projection cannot verify the Journal anchor"
+            ) from exc
+        except (AnchorCorruptionError, OSError) as exc:
+            raise OutboxWriteDisabledError(
+                "Outbox projection cannot verify the Journal anchor"
+            ) from exc
+
         cursor_hash = "" if anchor.sequence == 0 else anchor.frame_hash
-        if (self._state.cursor_sequence, self._state.cursor_hash) != (
+        if (self._state.cursor_sequence, self._state.cursor_hash) == (
             anchor.sequence,
             cursor_hash,
         ):
-            self.rebuild_projection(deadline=deadline)
+            return
+        if self._state.cursor_sequence > anchor.sequence or not frames:
+            raise OutboxWriteDisabledError(
+                "Outbox projection cannot verify the Journal anchor"
+            )
+
+        prior_versions = {
+            outbox_id: frozenset(record.snapshots)
+            for outbox_id, record in self._state.by_outbox_id.items()
+        }
+        next_state = self._state.clone()
+        expected_sequence = self._state.cursor_sequence + 1
+        expected_previous_hash = self._state.cursor_hash or GENESIS_HASH
+        for frame in frames:
+            self._require_deadline(deadline, "projection replay")
+            if (
+                frame.sequence != expected_sequence
+                or frame.previous_hash != expected_previous_hash
+            ):
+                raise OutboxWriteDisabledError(
+                    "Outbox projection cannot verify the Journal anchor"
+                )
+            for event in frame.events:
+                if is_outbox_event(event.event_type):
+                    reduce_outbox_event(next_state, event)
+            next_state.cursor_sequence = frame.sequence
+            next_state.cursor_hash = frame.frame_hash
+            expected_sequence += 1
+            expected_previous_hash = frame.frame_hash
+        if (
+            next_state.cursor_sequence != anchor.sequence
+            or next_state.cursor_hash != anchor.frame_hash
+        ):
+            raise OutboxWriteDisabledError(
+                "Outbox projection cannot verify the Journal anchor"
+            )
+        for outbox_id, record in next_state.by_outbox_id.items():
+            known_versions = prior_versions.get(outbox_id, frozenset())
+            for version, metadata in record.snapshots.items():
+                if (
+                    version in known_versions
+                    or version in record.tombstoned_versions
+                ):
+                    continue
+                self._require_deadline(deadline, "projection hydration")
+                try:
+                    self._read_snapshot(record, metadata)
+                except (
+                    BlobError,
+                    OutboxBlobError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    next_state.closed_employees.add(record.employee_key)
+                    break
+        self._replace_state_unlocked(next_state)
 
     def _replace_state_unlocked(self, fresh: OutboxProjectionState) -> None:
         self._state.by_outbox_id = fresh.by_outbox_id
@@ -828,6 +926,7 @@ __all__ = [
     "OutboxBlobError",
     "OutboxClosedError",
     "OutboxConflictError",
+    "OutboxNotFoundError",
     "OutboxServiceError",
     "OutboxWriteDisabledError",
 ]

@@ -20,7 +20,7 @@ from ..journal.blob_store import (
 )
 from .cards import build_employee_status_card
 from .models import EmployeeCardState, EmployeeOutboxSnapshot, employee_outbox_id
-from .service import EmployeeOutboxService, OutboxBlobError
+from .service import EmployeeOutboxService, OutboxBlobError, OutboxNotFoundError
 
 
 class EmployeeOutboxLifecycle:
@@ -43,7 +43,7 @@ class EmployeeOutboxLifecycle:
         outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
         try:
             record = self._outbox.get_record(outbox_id)
-        except KeyError:
+        except OutboxNotFoundError:
             return False
         binding = record.binding
         return (
@@ -91,7 +91,7 @@ class EmployeeOutboxLifecycle:
         )
         try:
             return self._outbox.get_snapshot(outbox_id)
-        except KeyError:
+        except OutboxNotFoundError:
             pass
         except (BlobMissingError, BlobReadError, KeyResolutionError) as exc:
             raise EmployeeDispatchReportingDeferredError(
@@ -161,7 +161,7 @@ class EmployeeOutboxLifecycle:
         outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
         try:
             current = self._outbox.get_snapshot(outbox_id)
-        except KeyError:
+        except OutboxNotFoundError:
             created_at = datetime.now(UTC).isoformat(timespec="microseconds").replace(
                 "+00:00", "Z"
             )
@@ -218,7 +218,7 @@ class EmployeeOutboxLifecycle:
         outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
         try:
             current = self._outbox.get_snapshot(outbox_id)
-        except KeyError:
+        except OutboxNotFoundError:
             created_at = datetime.now(UTC).isoformat(timespec="microseconds").replace(
                 "+00:00", "Z"
             )
@@ -269,7 +269,7 @@ class EmployeeOutboxLifecycle:
         outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
         try:
             current = self._outbox.get_snapshot(outbox_id)
-        except KeyError:
+        except OutboxNotFoundError:
             created_at = datetime.now(UTC).isoformat(timespec="microseconds").replace(
                 "+00:00", "Z"
             )
@@ -318,7 +318,7 @@ class EmployeeOutboxLifecycle:
         outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
         try:
             current = self._outbox.get_snapshot(outbox_id)
-        except KeyError:
+        except OutboxNotFoundError:
             created_at = datetime.now(UTC).isoformat(
                 timespec="microseconds"
             ).replace("+00:00", "Z")
@@ -363,7 +363,7 @@ class EmployeeOutboxLifecycle:
         outbox_id = employee_outbox_id(tenant_key, agent_id, attempt_id)
         try:
             current = self._outbox.get_snapshot(outbox_id)
-        except KeyError:
+        except OutboxNotFoundError:
             created_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
             current = self._append_control(
                 tenant_key=tenant_key,
