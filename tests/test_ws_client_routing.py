@@ -4536,3 +4536,61 @@ class TestChatLockInterceptFallback:
         args = handler.reply_text.call_args[0]
         assert args[0] == "msg_1"
         assert "🔒" in args[1] or "locked" in args[1].lower() or "锁定" in args[1]
+
+
+def test_sync_main_bot_identity_releases_lock_during_http_and_singleflights(
+    mock_ws_client: FeishuWSClient,
+) -> None:
+    """Slow HTTP bot identity lookup does not hold lock and coalesces callers."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from lark_oapi.core.model.base_response import BaseResponse
+    from lark_oapi.core.model.raw_response import RawResponse
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_request(_request):
+        entered.set()
+        assert release.wait(timeout=5.0)
+        result = BaseResponse()
+        result.code = 0
+        result.raw = RawResponse()
+        result.raw.status_code = 200
+        result.raw.content = json.dumps(
+            {
+                "code": 0,
+                "bot": {
+                    "app_id": "test_app_id",
+                    "open_id": "ou_singleflight_bot",
+                },
+            }
+        ).encode()
+        return result
+
+    mock_api_request = MagicMock(side_effect=slow_request)
+    mock_ws_client._api_client = SimpleNamespace(request=mock_api_request)
+    mock_ws_client._main_bot_open_id = ""
+    mock_ws_client._main_bot_identity_next_retry_at = 0.0
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        first_future = pool.submit(mock_ws_client._sync_main_bot_identity)
+        assert entered.wait(timeout=2.0)
+
+        # Lock MUST NOT be held across slow SDK I/O
+        acquired = mock_ws_client._main_bot_identity_lock.acquire(timeout=0.5)
+        assert acquired is True
+        mock_ws_client._main_bot_identity_lock.release()
+
+        # Concurrent callers wait on condition without issuing extra HTTP calls
+        other_futures = [
+            pool.submit(mock_ws_client._sync_main_bot_identity) for _ in range(3)
+        ]
+        release.set()
+
+        results = [first_future.result(timeout=5.0)] + [
+            fut.result(timeout=5.0) for fut in other_futures
+        ]
+
+    assert results == ["ou_singleflight_bot"] * 4
+    assert mock_api_request.call_count == 1
